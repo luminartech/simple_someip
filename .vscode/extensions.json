@@ -1,0 +1,10 @@
+{
+    "recommendations": [
+        "streetsidesoftware.code-spell-checker",
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "bierner.markdown-preview-github-styles",
+        "bierner.markdown-mermaid",
+        "davidanson.vscode-markdownlint"
+    ]
+}
