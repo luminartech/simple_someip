@@ -19,7 +19,13 @@
 //! - [SOME/IP Specification R23-11](https://www.autosar.org/fileadmin/standards/R23-11/FO/AUTOSAR_FO_PRS_SOMEIPProtocol.pdf)
 //! - [AUTOSAR Website](https://www.autosar.org/)
 
-/// Bit flag in message_type field indicating that the message is a SOME/IP TP message.
-pub const MESSAGE_TYPE_TP_FLAG: u8 = 0x20;
+pub const SD_MULTICAST_IP: &str = "239.255.0.255";
+pub const SD_MULTICAST_PORT: u16 = 30490;
 
-pub mod someip;
+#[cfg(feature = "client")]
+mod client;
+#[cfg(feature = "client")]
+pub use client::*;
+
+mod someip;
+pub use someip::*;
