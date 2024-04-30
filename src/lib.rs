@@ -27,5 +27,4 @@ mod client;
 #[cfg(feature = "client")]
 pub use client::*;
 
-mod someip;
-pub use someip::*;
+pub mod protocol;

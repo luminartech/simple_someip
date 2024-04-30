@@ -48,4 +48,8 @@ impl Header {
         writer.write_u8(u8::from(self.return_code))?;
         Ok(16)
     }
+
+    pub fn payload_size(&self) -> usize {
+        self.length as usize - 8
+    }
 }
