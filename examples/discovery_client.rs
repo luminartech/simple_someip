@@ -60,10 +60,11 @@ fn main() -> Result<(), Error> {
                             println!("Discovered SOME/IP Endpoints:\n[");
                             for endpoint in &discovered_endpoints {
                                 println!(
-                                    "    Service ID: {}, Instance ID: {}, IP: {}, Port: {},",
+                                    "    Service ID: {}, Instance ID: {}, IP: {}, Transport: {:?}, Port: {},",
                                     endpoint.service_id,
                                     endpoint.instance_id,
                                     endpoint.ip,
+                                    endpoint.protocol,
                                     endpoint.port
                                 );
                             }

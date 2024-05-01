@@ -12,11 +12,13 @@ pub trait SomeIpMessageHandler {
     fn handle_message(&self, message: &Message);
 }
 
+#[derive(Debug)]
 pub struct ClientConfig {
     pub client_ip: Ipv4Addr,
     pub read_timeout: Option<Duration>,
 }
 
+#[derive(Debug)]
 pub struct SomeIPClient {
     config: ClientConfig,
     discovery_socket: Option<UdpSocket>,
@@ -41,6 +43,17 @@ impl SomeIPClient {
             .unwrap();
         discovery_socket.set_read_timeout(self.config.read_timeout)?;
         self.discovery_socket = Some(discovery_socket);
+        Ok(())
+    }
+
+    pub fn unbind_discovery(&mut self) -> Result<(), Error> {
+        if let Some(discovery_socket) = self.discovery_socket.as_ref() {
+            discovery_socket.leave_multicast_v4(
+                &Ipv4Addr::from_str(SD_MULTICAST_IP).unwrap(),
+                &self.config.client_ip,
+            )?;
+        }
+        self.discovery_socket = None;
         Ok(())
     }
 
