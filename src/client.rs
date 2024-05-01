@@ -3,7 +3,6 @@ use crate::{
     SD_MULTICAST_IP,
 };
 use std::{
-    borrow::BorrowMut,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     str::FromStr,
     time::Duration,
@@ -64,9 +63,7 @@ impl SomeIPClient {
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-            Err(e) => {
-                return Err(Error::from(e));
-            }
+            Err(e) => Err(Error::from(e)),
         }
     }
 }
