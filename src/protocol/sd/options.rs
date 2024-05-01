@@ -75,6 +75,19 @@ pub enum Options {
 }
 
 impl Options {
+    pub fn size(&self) -> u32 {
+        match self {
+            Options::Configuration => todo!("Options::Configuration not implemented"),
+            Options::LoadBalancing => todo!("Options::Configuration not implemented"),
+            Options::IpV4Endpoint { .. } => 12,
+            Options::IpV6Endpoint => todo!("Options::Configuration not implemented"),
+            Options::IpV4Multicast => todo!("Options::Configuration not implemented"),
+            Options::IpV6Multicast => todo!("Options::Configuration not implemented"),
+            Options::IpV4SD => todo!("Options::Configuration not implemented"),
+            Options::IpV6SD => todo!("Options::Configuration not implemented"),
+        }
+    }
+
     pub fn write<T: Write>(&self, _writer: &mut T) -> Result<usize, Error> {
         todo!("Options::write not implemented");
     }

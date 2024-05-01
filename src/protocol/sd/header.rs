@@ -49,9 +49,14 @@ impl Header {
             }
         }
 
+        let mut remaining_options_size = message_bytes.read_u32::<BigEndian>()?;
         let mut options = Vec::with_capacity(options_count as usize);
-        for _ in 0..options_count {
+        for i in 0..options_count {
             options.push(Options::read(message_bytes)?);
+            remaining_options_size -= options[i as usize].size();
+        }
+        if remaining_options_size != 0 {
+            return Err(Error::IncorrectOptionsSize(remaining_options_size));
         }
         Ok(Self {
             flags,
