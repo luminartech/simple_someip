@@ -11,7 +11,7 @@ mod header;
 pub use header::Header;
 
 mod options;
-pub use options::Options;
+pub use options::{Options, TransportProtocol};
 
 mod service_entry;
 pub use service_entry::ServiceEntry;

@@ -2,7 +2,7 @@ use std::{net::Ipv4Addr, time::Duration};
 
 use simple_someip::{
     protocol::{
-        sd::{Entry, EntryType, Options},
+        sd::{Entry, EntryType, Options, TransportProtocol},
         Error,
     },
     ClientConfig,
@@ -13,6 +13,7 @@ struct DiscoveredIpV4Endpoint {
     service_id: u16,
     instance_id: u16,
     ip: Ipv4Addr,
+    protocol: TransportProtocol,
     port: u16,
 }
 fn main() -> Result<(), Error> {
@@ -46,7 +47,8 @@ fn main() -> Result<(), Error> {
                         let discovered = DiscoveredIpV4Endpoint {
                             service_id,
                             instance_id,
-                            ip: ip,
+                            ip,
+                            protocol: *protocol,
                             port: *port,
                         };
                         if discovered_endpoints.contains(&discovered) {
@@ -54,7 +56,7 @@ fn main() -> Result<(), Error> {
                         } else {
                             discovered_endpoints.push(discovered);
                             print!("{}[2J", 27 as char);
-
+                            print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
                             println!("Discovered SOME/IP Endpoints:\n[");
                             for endpoint in &discovered_endpoints {
                                 println!(
@@ -72,5 +74,4 @@ fn main() -> Result<(), Error> {
             }
         }
     }
-    Ok(())
 }
