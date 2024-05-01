@@ -1,0 +1,76 @@
+use std::{net::Ipv4Addr, time::Duration};
+
+use simple_someip::{
+    protocol::{
+        sd::{Entry, EntryType, Options},
+        Error,
+    },
+    ClientConfig,
+};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiscoveredIpV4Endpoint {
+    service_id: u16,
+    instance_id: u16,
+    ip: Ipv4Addr,
+    port: u16,
+}
+fn main() -> Result<(), Error> {
+    let config = ClientConfig {
+        client_ip: Ipv4Addr::new(0, 0, 0, 0),
+        read_timeout: Some(Duration::from_millis(5)),
+    };
+    let mut client = simple_someip::SomeIPClient::new(config);
+    client.bind_discovery()?;
+    let mut discovered_endpoints = Vec::new();
+
+    loop {
+        if let Some(header) = client.attempt_discovery()? {
+            for entry in header.entries {
+                if let Entry::Service(entry_type, service_entry) = entry {
+                    if entry_type != EntryType::OfferService {
+                        continue;
+                    }
+                    let service_id = service_entry.service_id;
+                    let instance_id = service_entry.instance_id;
+                    if service_entry.options_count.first_options_count == 0 {
+                        continue;
+                    }
+                    let endpoint_index = service_entry.index_first_options_run as usize;
+                    if endpoint_index >= header.options.len() {
+                        continue;
+                    }
+                    let endpoint_option = &header.options[endpoint_index];
+                    if let Options::IpV4Endpoint { ip, protocol, port } = endpoint_option {
+                        let ip = Ipv4Addr::from(*ip);
+                        let discovered = DiscoveredIpV4Endpoint {
+                            service_id,
+                            instance_id,
+                            ip: ip,
+                            port: *port,
+                        };
+                        if discovered_endpoints.contains(&discovered) {
+                            continue;
+                        } else {
+                            discovered_endpoints.push(discovered);
+                            print!("{}[2J", 27 as char);
+
+                            println!("Discovered SOME/IP Endpoints:\n[");
+                            for endpoint in &discovered_endpoints {
+                                println!(
+                                    "    Service ID: {}, Instance ID: {}, IP: {}, Port: {},",
+                                    endpoint.service_id,
+                                    endpoint.instance_id,
+                                    endpoint.ip,
+                                    endpoint.port
+                                );
+                            }
+                            println!("]");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}

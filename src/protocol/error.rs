@@ -6,6 +6,8 @@ use thiserror::Error;
 pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error("Invalid protocol version: {0:X}")]
+    InvalidProtocolVersion(u8),
     #[error("Invalid value in MessageType field: {0:X}")]
     InvalidMessageTypeField(u8),
     #[error("Invalid value in ReturnCode field: {0:X}")]

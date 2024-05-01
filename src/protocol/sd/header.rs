@@ -10,9 +10,9 @@ use super::{
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Header {
-    flags: Flags,
-    entries: Vec<Entry>,
-    options: Vec<Options>,
+    pub flags: Flags,
+    pub entries: Vec<Entry>,
+    pub options: Vec<Options>,
 }
 
 impl Header {

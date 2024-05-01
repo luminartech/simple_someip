@@ -1,4 +1,4 @@
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 
 use crate::protocol::Error;
@@ -104,7 +104,6 @@ impl Entry {
 
     pub fn read<T: Read>(message_bytes: &mut T) -> Result<Self, Error> {
         let entry_type = EntryType::try_from(message_bytes.read_u8()?)?;
-        println!("entry_type: {:?}", entry_type);
         match entry_type {
             EntryType::FindService | EntryType::OfferService | EntryType::StopOfferService => {
                 let service_entry = ServiceEntry::read(message_bytes)?;

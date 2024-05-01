@@ -24,6 +24,9 @@ impl Header {
         let length = message_bytes.read_u32::<BigEndian>()?;
         let request_id = message_bytes.read_u32::<BigEndian>()?;
         let protocol_version = message_bytes.read_u8()?;
+        if protocol_version != 0x01 {
+            return Err(Error::InvalidProtocolVersion(protocol_version));
+        }
         let interface_version = message_bytes.read_u8()?;
         let message_type = MessageTypeField::try_from(message_bytes.read_u8()?)?;
         let return_code = ReturnCode::try_from(message_bytes.read_u8()?)?;
