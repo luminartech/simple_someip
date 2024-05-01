@@ -37,14 +37,14 @@ impl SomeIPClient {
             .unwrap();
         discover_socket.set_read_timeout(Some(Duration::from_millis(1)))?;
         println!("Successfully bound Discovery Socket");
-        let mut rx_buffer = vec![0; 1400];
+        let mut rx_buffer = vec![0; 100];
         loop {
             match discover_socket.recv(&mut rx_buffer) {
-                Ok(_) => {
+                Ok(packet_size) => {
                     let message = Message::read(&mut rx_buffer.as_slice())?;
                     assert!(message.header().message_id.is_sd());
                     assert!(!message.header().message_type.is_tp());
-                    println!("Received SD message: {:?}", message);
+                    assert!(message.header().length as usize == packet_size - 8);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     continue;

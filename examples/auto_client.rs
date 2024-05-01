@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 
-use simple_someip::{ClientConfig, Error};
+use simple_someip::{protocol::Error, ClientConfig};
 
 fn main() -> Result<(), Error> {
     let config = ClientConfig {
