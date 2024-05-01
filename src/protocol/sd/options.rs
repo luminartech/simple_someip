@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{BigEndian, ReadBytesExt};
 
 use crate::protocol::Error;
 
@@ -75,8 +75,8 @@ pub enum Options {
 }
 
 impl Options {
-    pub fn write<T: Write>(&self, writer: &mut T) -> Result<usize, Error> {
-        Ok(0)
+    pub fn write<T: Write>(&self, _writer: &mut T) -> Result<usize, Error> {
+        todo!("Options::write not implemented");
     }
 
     pub fn read<T: Read>(message_bytes: &mut T) -> Result<Self, Error> {

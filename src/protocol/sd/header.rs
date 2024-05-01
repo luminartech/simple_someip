@@ -3,10 +3,7 @@ use std::io::{Read, Write};
 
 use crate::protocol::Error;
 
-use super::{
-    entry::{OptionsCount, ENTRY_SIZE},
-    service_entry, Entry, Flags, Options, ServiceEntry,
-};
+use super::{entry::ENTRY_SIZE, Entry, Flags, Options};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Header {
@@ -51,7 +48,6 @@ impl Header {
                 Entry::EventGroup(..) => (),
             }
         }
-        let mut options_bytes_remaining = message_bytes.read_u32::<BigEndian>()?;
 
         let mut options = Vec::with_capacity(options_count as usize);
         for _ in 0..options_count {
