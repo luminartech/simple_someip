@@ -6,19 +6,19 @@ use crate::protocol::Error;
 use super::entry::OptionsCount;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ServiceEntry {
-    pub index_first_options_run: u8,
-    pub index_second_options_run: u8,
-    pub options_count: OptionsCount,
-    pub service_id: u16,
-    pub instance_id: u16,
-    pub major_version: u8,
+pub struct EventGroupEntry {
+    index_first_options_run: u8,
+    index_second_options_run: u8,
+    options_count: OptionsCount,
+    service_id: u16,
+    instance_id: u16,
+    major_version: u8,
     /// ttl is a u24 value
-    pub ttl: u32,
-    pub minor_version: u32,
+    ttl: u32,
+    minor_version: u32,
 }
 
-impl ServiceEntry {
+impl EventGroupEntry {
     pub fn write<T: Write>(&self, writer: &mut T) -> Result<usize, Error> {
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;

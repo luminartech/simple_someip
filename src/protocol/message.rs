@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 
 use super::sd;
-use crate::protocol::{Error, Header};
+use crate::protocol::{Error, Header, MessageType, ReturnCode};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MessagePayload {
@@ -48,8 +48,34 @@ impl Message {
 
     pub fn read<T: Read>(message_bytes: &mut T) -> Result<Self, Error> {
         let header = Header::read(message_bytes)?;
-        let mut payload = vec![0; (header.length - 8) as usize];
-        message_bytes.read_exact(&mut payload)?;
-        Ok(Self::new(header, payload))
+        if header.message_id.is_sd() {
+            assert!(header.payload_size() >= 12, "SD message too short");
+            assert!(
+                header.protocol_version == 0x01,
+                "SD protocol version mismatch"
+            );
+            assert!(
+                header.interface_version == 0x01,
+                "SD interface version mismatch"
+            );
+            assert!(
+                header.message_type.message_type() == MessageType::Notification,
+                "SD message type mismatch"
+            );
+            assert!(
+                header.return_code == ReturnCode::Ok,
+                "SD return code mismatch"
+            );
+            let sd_header = sd::Header::read(message_bytes)?;
+
+            Ok(Self::new(
+                header,
+                MessagePayload::ServiceDiscovery(sd_header),
+            ))
+        } else {
+            let mut payload = vec![0; header.payload_size()];
+            message_bytes.read_exact(&mut payload)?;
+            Ok(Self::new(header, MessagePayload::Custom(payload)))
+        }
     }
 }

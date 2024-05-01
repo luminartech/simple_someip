@@ -1,39 +1,32 @@
-/// Newtype for the flags byte in the SD protocol.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Flags(u8);
+const REBOOT_FLAG: u8 = 0b1000_0000;
+const UNICAST_FLAG: u8 = 0b0100_0000;
+
+/// Flags byte in the SD protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Flags {
+    reboot: bool,
+    unicast: bool,
+}
 
 impl From<u8> for Flags {
     /// Only the two least significant bits are used.
     fn from(value: u8) -> Self {
-        Self(value & 0b0000_0011)
+        Self {
+            reboot: value & REBOOT_FLAG != 0,
+            unicast: value & UNICAST_FLAG != 0,
+        }
     }
 }
 
 impl From<Flags> for u8 {
     fn from(flags: Flags) -> u8 {
-        flags.0
-    }
-}
-
-impl Flags {
-    pub fn reboot_flag(&self) -> bool {
-        self.0 & 0b0000_0001 != 0
-    }
-    pub fn set_reboot_flag(&mut self, value: bool) {
-        if value {
-            self.0 |= 0b0000_0001;
-        } else {
-            self.0 &= 0b1111_1110;
+        let mut value = 0;
+        if flags.reboot {
+            value |= REBOOT_FLAG;
         }
-    }
-    pub fn unicast_flag(&self) -> bool {
-        self.0 & 0b0000_0010 != 0
-    }
-    pub fn set_unicast_flag(&mut self, value: bool) {
-        if value {
-            self.0 |= 0b0000_0010;
-        } else {
-            self.0 &= 0b1111_1101;
+        if flags.unicast {
+            value |= UNICAST_FLAG;
         }
+        value
     }
 }
