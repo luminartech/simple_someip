@@ -1,5 +1,3 @@
-use std::io::{Read, Write};
-
 use super::Error;
 
 /// Bit flag in message_type field indicating that the message is a SOME/IP TP message.

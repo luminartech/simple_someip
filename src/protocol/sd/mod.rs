@@ -1,5 +1,5 @@
 mod entry;
-pub use entry::Entry;
+pub use entry::{Entry, EntryType};
 
 mod event_group_entry;
 pub use event_group_entry::EventGroupEntry;

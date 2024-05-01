@@ -1,8 +1,9 @@
 use crate::{
-    protocol::{Error, Message},
+    protocol::{sd, Error, Message, MessagePayload},
     SD_MULTICAST_IP,
 };
 use std::{
+    borrow::BorrowMut,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     str::FromStr,
     time::Duration,
@@ -14,11 +15,13 @@ pub trait SomeIpMessageHandler {
 
 pub struct ClientConfig {
     pub client_ip: Ipv4Addr,
+    pub read_timeout: Option<Duration>,
 }
 
 pub struct SomeIPClient {
     config: ClientConfig,
     discovery_socket: Option<UdpSocket>,
+    buffer: [u8; 1400],
 }
 
 impl SomeIPClient {
@@ -26,34 +29,44 @@ impl SomeIPClient {
         Self {
             config,
             discovery_socket: None,
+            buffer: [0; 1400],
         }
     }
-    pub fn connect(&mut self) -> Result<(), Error> {
+
+    pub fn bind_discovery(&mut self) -> Result<(), Error> {
         let discovery_address = Ipv4Addr::from_str(SD_MULTICAST_IP).unwrap();
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 30490);
-        let discover_socket = UdpSocket::bind(bind_addr)?;
-        discover_socket
+        let discovery_socket = UdpSocket::bind(bind_addr)?;
+        discovery_socket
             .join_multicast_v4(&discovery_address, &self.config.client_ip)
             .unwrap();
-        discover_socket.set_read_timeout(Some(Duration::from_millis(1)))?;
-        println!("Successfully bound Discovery Socket");
-        let mut rx_buffer = vec![0; 100];
-        loop {
-            match discover_socket.recv(&mut rx_buffer) {
-                Ok(packet_size) => {
-                    let message = Message::read(&mut rx_buffer.as_slice())?;
-                    assert!(message.header().message_id.is_sd());
-                    assert!(!message.header().message_type.is_tp());
-                    assert!(message.header().length as usize == packet_size - 8);
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    continue;
-                }
-                Err(e) => {
-                    return Err(Error::from(e));
+        discovery_socket.set_read_timeout(self.config.read_timeout)?;
+        self.discovery_socket = Some(discovery_socket);
+        Ok(())
+    }
+
+    pub fn attempt_discovery(&mut self) -> Result<Option<sd::Header>, Error> {
+        match self
+            .discovery_socket
+            .as_mut()
+            .unwrap()
+            .recv(&mut self.buffer)
+        {
+            Ok(packet_size) => {
+                let message = Message::read(&mut self.buffer.as_slice())?;
+                assert!(message.header().message_id.is_sd());
+                assert!(!message.header().message_type.is_tp());
+                assert!(message.header().length as usize == packet_size - 8);
+                if let MessagePayload::ServiceDiscovery(header) = message.payload() {
+                    Ok(Some(header.to_owned()))
+                } else {
+                    Ok(None)
                 }
             }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => {
+                return Err(Error::from(e));
+            }
         }
-        Ok(())
     }
 }
