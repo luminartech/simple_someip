@@ -8,7 +8,7 @@ use super::{EventGroupEntry, ServiceEntry};
 pub const ENTRY_SIZE: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EntryType {
+enum EntryType {
     FindService,
     OfferService,
     StopOfferService,
@@ -43,7 +43,7 @@ impl From<EntryType> for u8 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OptionsCount {
+pub(crate) struct OptionsCount {
     pub first_options_count: u8,
     pub second_options_count: u8,
 }
@@ -84,19 +84,70 @@ impl OptionsCount {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Entry {
-    Service(EntryType, ServiceEntry),
-    EventGroup(EntryType, EventGroupEntry),
+    FindService(ServiceEntry),
+    OfferService(ServiceEntry),
+    StopOfferService(ServiceEntry),
+    SubscribeEventGroup(EventGroupEntry),
+    SubscribeAckEventGroup(EventGroupEntry),
 }
 
 impl Entry {
+    pub fn first_options_count(&self) -> u8 {
+        match self {
+            Entry::FindService(service_entry) => service_entry.options_count.first_options_count,
+            Entry::OfferService(service_entry) => service_entry.options_count.first_options_count,
+            Entry::StopOfferService(service_entry) => {
+                service_entry.options_count.first_options_count
+            }
+            Entry::SubscribeEventGroup(event_group_entry) => {
+                event_group_entry.options_count.first_options_count
+            }
+            Entry::SubscribeAckEventGroup(event_group_entry) => {
+                event_group_entry.options_count.first_options_count
+            }
+        }
+    }
+
+    pub fn second_options_count(&self) -> u8 {
+        match self {
+            Entry::FindService(service_entry) => service_entry.options_count.second_options_count,
+            Entry::OfferService(service_entry) => service_entry.options_count.second_options_count,
+            Entry::StopOfferService(service_entry) => {
+                service_entry.options_count.second_options_count
+            }
+            Entry::SubscribeEventGroup(event_group_entry) => {
+                event_group_entry.options_count.second_options_count
+            }
+            Entry::SubscribeAckEventGroup(event_group_entry) => {
+                event_group_entry.options_count.second_options_count
+            }
+        }
+    }
+
+    pub fn total_options_count(&self) -> u8 {
+        self.first_options_count() + self.second_options_count()
+    }
+
     pub fn write<T: Write>(&self, writer: &mut T) -> Result<usize, Error> {
         match self {
-            Entry::Service(entry_type, service_entry) => {
-                writer.write_u8(u8::from(*entry_type))?;
+            Entry::FindService(service_entry) => {
+                writer.write_u8(u8::from(EntryType::FindService))?;
                 service_entry.write(writer)
             }
-            Entry::EventGroup(entry_type, event_group_entry) => {
-                writer.write_u8(u8::from(*entry_type))?;
+            Entry::OfferService(service_entry) => {
+                writer.write_u8(u8::from(EntryType::OfferService))?;
+                service_entry.write(writer)
+            }
+            Entry::StopOfferService(service_entry) => {
+                writer.write_u8(u8::from(EntryType::StopOfferService))?;
+                service_entry.write(writer)
+            }
+            Entry::SubscribeEventGroup(event_group_entry) => {
+                writer.write_u8(u8::from(EntryType::Subscribe))?;
+                event_group_entry.write(writer)
+            }
+            Entry::SubscribeAckEventGroup(event_group_entry) => {
+                writer.write_u8(u8::from(EntryType::SubscribeAck))?;
                 event_group_entry.write(writer)
             }
         }
@@ -107,11 +158,23 @@ impl Entry {
         match entry_type {
             EntryType::FindService | EntryType::OfferService | EntryType::StopOfferService => {
                 let service_entry = ServiceEntry::read(message_bytes)?;
-                Ok(Entry::Service(entry_type, service_entry))
+                Ok(Entry::FindService(service_entry))
+            }
+            EntryType::OfferService => {
+                let service_entry = ServiceEntry::read(message_bytes)?;
+                Ok(Entry::OfferService(service_entry))
+            }
+            EntryType::StopOfferService => {
+                let service_entry = ServiceEntry::read(message_bytes)?;
+                Ok(Entry::StopOfferService(service_entry))
             }
             EntryType::Subscribe | EntryType::SubscribeAck => {
                 let event_group_entry = EventGroupEntry::read(message_bytes)?;
-                Ok(Entry::EventGroup(entry_type, event_group_entry))
+                Ok(Entry::SubscribeEventGroup(event_group_entry))
+            }
+            EntryType::SubscribeAck => {
+                let event_group_entry = EventGroupEntry::read(message_bytes)?;
+                Ok(Entry::SubscribeAckEventGroup(event_group_entry))
             }
         }
     }

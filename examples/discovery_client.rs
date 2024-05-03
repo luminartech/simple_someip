@@ -2,7 +2,7 @@ use std::{net::Ipv4Addr, time::Duration};
 
 use simple_someip::{
     protocol::{
-        sd::{Entry, EntryType, Options, TransportProtocol},
+        sd::{Entry, Options, TransportProtocol},
         Error,
     },
     ClientConfig,
@@ -28,13 +28,10 @@ fn main() -> Result<(), Error> {
     loop {
         if let Some(header) = client.attempt_discovery()? {
             for entry in header.entries {
-                if let Entry::Service(entry_type, service_entry) = entry {
-                    if entry_type != EntryType::OfferService {
-                        continue;
-                    }
+                if let Entry::OfferService(service_entry) = &entry {
                     let service_id = service_entry.service_id;
                     let instance_id = service_entry.instance_id;
-                    if service_entry.options_count.first_options_count == 0 {
+                    if entry.total_options_count() == 0 {
                         continue;
                     }
                     let endpoint_index = service_entry.index_first_options_run as usize;

@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use byteorder::{BigEndian, ReadBytesExt};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::protocol::Error;
 
@@ -58,6 +58,21 @@ impl TryFrom<u8> for OptionType {
     }
 }
 
+impl From<OptionType> for u8 {
+    fn from(option_type: OptionType) -> u8 {
+        match option_type {
+            OptionType::Configuration => 0x01,
+            OptionType::LoadBalancing => 0x02,
+            OptionType::IpV4Endpoint => 0x04,
+            OptionType::IpV6Endpoint => 0x06,
+            OptionType::IpV4Multicast => 0x14,
+            OptionType::IpV6Multicast => 0x16,
+            OptionType::IpV4SD => 0x24,
+            OptionType::IpV6SD => 0x26,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Options {
     Configuration,
@@ -75,7 +90,7 @@ pub enum Options {
 }
 
 impl Options {
-    pub fn size(&self) -> u32 {
+    pub fn size(&self) -> usize {
         match self {
             Options::Configuration => todo!("Options::Configuration not implemented"),
             Options::LoadBalancing => todo!("Options::Configuration not implemented"),
@@ -88,8 +103,26 @@ impl Options {
         }
     }
 
-    pub fn write<T: Write>(&self, _writer: &mut T) -> Result<usize, Error> {
-        todo!("Options::write not implemented");
+    pub fn write<T: Write>(&self, writer: &mut T) -> Result<usize, Error> {
+        writer.write_u16::<BigEndian>((self.size() - 3) as u16)?;
+        match self {
+            Options::Configuration => todo!("Options::Configuration not implemented"),
+            Options::LoadBalancing => todo!("Options::Configuration not implemented"),
+            Options::IpV4Endpoint { ip, protocol, port } => {
+                writer.write_u8(u8::from(OptionType::IpV4Endpoint))?;
+                writer.write_u8(0)?;
+                writer.write_u32::<BigEndian>(*ip)?;
+                writer.write_u8(0)?;
+                writer.write_u8(u8::from(*protocol))?;
+                writer.write_u16::<BigEndian>(*port)?;
+                Ok(12)
+            }
+            Options::IpV6Endpoint => todo!("Options::Configuration not implemented"),
+            Options::IpV4Multicast => todo!("Options::Configuration not implemented"),
+            Options::IpV6Multicast => todo!("Options::Configuration not implemented"),
+            Options::IpV4SD => todo!("Options::Configuration not implemented"),
+            Options::IpV6SD => todo!("Options::Configuration not implemented"),
+        }
     }
 
     pub fn read<T: Read>(message_bytes: &mut T) -> Result<Self, Error> {

@@ -9,16 +9,38 @@ use super::entry::OptionsCount;
 pub struct EventGroupEntry {
     index_first_options_run: u8,
     index_second_options_run: u8,
-    options_count: OptionsCount,
+    pub(crate) options_count: OptionsCount,
     service_id: u16,
     instance_id: u16,
     major_version: u8,
     /// ttl is a u24 value
     ttl: u32,
-    minor_version: u32,
+    counter: u16,
+    event_group_id: u16,
 }
 
 impl EventGroupEntry {
+    pub fn new_subscription(
+        service_id: u16,
+        instance_id: u16,
+        major_version: u8,
+        ttl: u32,
+        counter: u8,
+        event_group_id: u16,
+    ) -> Self {
+        Self {
+            index_first_options_run: 0,
+            index_second_options_run: 0,
+            options_count: OptionsCount::new(0, 0),
+            service_id,
+            instance_id,
+            major_version,
+            ttl,
+            counter: (counter & 0x000f) as u16,
+            event_group_id,
+        }
+    }
+
     pub fn write<T: Write>(&self, writer: &mut T) -> Result<usize, Error> {
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;
@@ -27,7 +49,8 @@ impl EventGroupEntry {
         writer.write_u16::<BigEndian>(self.instance_id)?;
         writer.write_u8(self.major_version)?;
         writer.write_u24::<BigEndian>(self.ttl)?;
-        writer.write_u32::<BigEndian>(self.minor_version)?;
+        writer.write_u16::<BigEndian>(self.counter)?;
+        writer.write_u16::<BigEndian>(self.event_group_id)?;
         Ok(16)
     }
 
@@ -39,7 +62,8 @@ impl EventGroupEntry {
         let instance_id = message_bytes.read_u16::<BigEndian>()?;
         let major_version = message_bytes.read_u8()?;
         let ttl = message_bytes.read_u24::<BigEndian>()?;
-        let minor_version = message_bytes.read_u32::<BigEndian>()?;
+        let counter = message_bytes.read_u16::<BigEndian>()? & 0x000f;
+        let event_group_id = message_bytes.read_u16::<BigEndian>()?;
         Ok(Self {
             index_first_options_run,
             index_second_options_run,
@@ -48,7 +72,8 @@ impl EventGroupEntry {
             instance_id,
             major_version,
             ttl,
-            minor_version,
+            counter,
+            event_group_id,
         })
     }
 }

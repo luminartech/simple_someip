@@ -57,6 +57,10 @@ impl MessageTypeField {
         MessageTypeField(message_type_byte)
     }
 
+    pub fn new_sd() -> Self {
+        Self::new(MessageType::Notification, false)
+    }
+
     /// Returns the message type of the message
     pub fn message_type(&self) -> MessageType {
         // This unwrap is safe because the private message_type_byte is always a valid MessageType

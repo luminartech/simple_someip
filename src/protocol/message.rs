@@ -20,6 +20,14 @@ impl Message {
         Self { header, payload }
     }
 
+    pub fn new_sd(session_id: u32, sd_header: sd::Header) -> Self {
+        let sd_header_size = sd_header.size();
+        Self::new(
+            Header::new_sd(session_id, sd_header_size),
+            MessagePayload::ServiceDiscovery(sd_header),
+        )
+    }
+
     pub fn header(&self) -> &Header {
         &self.header
     }

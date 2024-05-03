@@ -17,5 +17,9 @@ pub enum Error {
     #[error("Invalid value for Service Discovery Option Transport Protocol: {0:X}")]
     InvalidSDOptionTransportProtocol(u8),
     #[error("Incorrect options size, {0} bytes remaining")]
-    IncorrectOptionsSize(u32),
+    IncorrectOptionsSize(usize),
+    #[error("Unicast socket not connected")]
+    UnicastSocketNotConnected,
+    #[error("Timeout expired")]
+    Timeout,
 }
