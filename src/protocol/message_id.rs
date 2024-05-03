@@ -20,6 +20,9 @@ impl MessageId {
     pub fn new(message_id: u32) -> Self {
         MessageId(message_id)
     }
+    pub fn new_sd() -> Self {
+        MessageId(SD_MESSAGE_ID)
+    }
 
     /// Get the message ID
     #[inline]

@@ -9,7 +9,7 @@ pub struct Flags {
 }
 
 impl From<u8> for Flags {
-    /// Only the two least significant bits are used.
+    /// Only the two most significant bits are used.
     fn from(value: u8) -> Self {
         Self {
             reboot: value & REBOOT_FLAG != 0,
@@ -28,5 +28,17 @@ impl From<Flags> for u8 {
             value |= UNICAST_FLAG;
         }
         value
+    }
+}
+
+impl Flags {
+    pub fn new(reboot: bool, unicast: bool) -> Self {
+        Self { reboot, unicast }
+    }
+    pub fn new_sd(reboot: bool) -> Self {
+        Self {
+            reboot,
+            unicast: true,
+        }
     }
 }

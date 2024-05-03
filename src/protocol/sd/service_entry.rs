@@ -19,6 +19,18 @@ pub struct ServiceEntry {
 }
 
 impl ServiceEntry {
+    pub fn new_find(service_id: u16) -> Self {
+        Self {
+            index_first_options_run: 0,
+            index_second_options_run: 0,
+            options_count: OptionsCount::new(0, 0),
+            service_id,
+            instance_id: 0xFFFF,
+            major_version: 0xFF,
+            ttl: 0x00FFFFFF,
+            minor_version: 0xFFFFFFFF,
+        }
+    }
     pub fn write<T: Write>(&self, writer: &mut T) -> Result<usize, Error> {
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;

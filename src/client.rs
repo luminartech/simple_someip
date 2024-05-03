@@ -20,8 +20,9 @@ pub struct ClientConfig {
 
 #[derive(Debug)]
 pub struct SomeIPClient {
-    config: ClientConfig,
+    pub config: ClientConfig,
     discovery_socket: Option<UdpSocket>,
+    unicast_socket: Option<UdpSocket>,
     buffer: [u8; 1400],
 }
 
@@ -30,6 +31,7 @@ impl SomeIPClient {
         Self {
             config,
             discovery_socket: None,
+            unicast_socket: None,
             buffer: [0; 1400],
         }
     }
@@ -76,6 +78,42 @@ impl SomeIPClient {
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(Error::from(e)),
+        }
+    }
+
+    pub fn connect_unicast(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), Error> {
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 10, 87)), 0);
+        let target_addr = SocketAddr::new(IpAddr::V4(ip), port);
+        let unicast_socket = UdpSocket::bind(bind_addr)?;
+        unicast_socket.set_read_timeout(self.config.read_timeout)?;
+        unicast_socket.connect(target_addr)?;
+        self.unicast_socket = Some(unicast_socket);
+        Ok(())
+    }
+
+    pub fn send_message(&self, message: &Message) -> Result<(), Error> {
+        if self.unicast_socket.is_none() {
+            return Err(Error::UnicastSocketNotConnected);
+        }
+        let mut buffer = Vec::new();
+        message.write(&mut buffer)?;
+        self.unicast_socket.as_ref().unwrap().send(&buffer)?;
+        Ok(())
+    }
+
+    pub fn receive_message(&self) -> Result<Message, Error> {
+        if self.unicast_socket.is_none() {
+            return Err(Error::UnicastSocketNotConnected);
+        }
+        let mut buffer = [0; 1400];
+        match self.unicast_socket.as_ref().unwrap().recv(&mut buffer) {
+            Ok(packet_size) => {
+                let message = Message::read(&mut buffer.as_ref())?;
+                assert!(message.header().length as usize == packet_size - 8);
+                Ok(message)
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(Error::Timeout),
             Err(e) => Err(Error::from(e)),
         }
     }

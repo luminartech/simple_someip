@@ -19,6 +19,22 @@ pub struct Header {
 }
 
 impl Header {
+    pub fn new_sd(request_id: u32, sd_header_size: usize) -> Self {
+        Self {
+            message_id: MessageId::new_sd(),
+            length: 8 + sd_header_size as u32,
+            request_id,
+            protocol_version: 0x01,
+            interface_version: 0x01,
+            message_type: MessageTypeField::new_sd(),
+            return_code: ReturnCode::Ok,
+        }
+    }
+
+    pub fn is_sd(&self) -> bool {
+        self.message_id.is_sd()
+    }
+
     pub fn read<T: Read>(message_bytes: &mut T) -> Result<Self, Error> {
         let message_id = MessageId::from(message_bytes.read_u32::<BigEndian>()?);
         let length = message_bytes.read_u32::<BigEndian>()?;
