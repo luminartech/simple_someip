@@ -18,6 +18,8 @@ pub enum Error {
     InvalidSDOptionTransportProtocol(u8),
     #[error("Incorrect options size, {0} bytes remaining")]
     IncorrectOptionsSize(usize),
+    #[error("Multicast socket not connected")]
+    MulticastSocketNotConnected,
     #[error("Unicast socket not connected")]
     UnicastSocketNotConnected,
     #[error("Timeout expired")]

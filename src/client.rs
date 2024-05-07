@@ -15,7 +15,6 @@ pub trait SomeIpMessageHandler {
 #[derive(Debug)]
 pub struct ClientConfig {
     pub client_ip: Ipv4Addr,
-    pub read_timeout: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -38,12 +37,13 @@ impl SomeIPClient {
 
     pub fn bind_discovery(&mut self) -> Result<(), Error> {
         let discovery_address = Ipv4Addr::from_str(SD_MULTICAST_IP).unwrap();
-        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 30490);
+        let bind_addr = SocketAddr::new(IpAddr::V4(self.config.client_ip), 30490);
         let discovery_socket = UdpSocket::bind(bind_addr)?;
+
         discovery_socket
             .join_multicast_v4(&discovery_address, &self.config.client_ip)
             .unwrap();
-        discovery_socket.set_read_timeout(self.config.read_timeout)?;
+        discovery_socket.set_nonblocking(true)?;
         self.discovery_socket = Some(discovery_socket);
         Ok(())
     }
@@ -56,6 +56,39 @@ impl SomeIPClient {
             )?;
         }
         self.discovery_socket = None;
+        Ok(())
+    }
+
+    pub fn send_multicast_discovery_message(&self, message: &Message) -> Result<(), Error> {
+        if self.discovery_socket.is_none() {
+            return Err(Error::MulticastSocketNotConnected);
+        }
+        let mut buffer = Vec::new();
+        message.write(&mut buffer)?;
+        let discovery_socket_addr =
+            SocketAddr::new(IpAddr::from_str(SD_MULTICAST_IP).unwrap(), 30490);
+        self.discovery_socket
+            .as_ref()
+            .unwrap()
+            .send_to(&buffer, discovery_socket_addr)?;
+        Ok(())
+    }
+
+    pub fn send_unicast_discovery_message(
+        &self,
+        message: &Message,
+        ip: Ipv4Addr,
+    ) -> Result<(), Error> {
+        if self.discovery_socket.is_none() {
+            return Err(Error::MulticastSocketNotConnected);
+        }
+        let mut buffer = Vec::new();
+        message.write(&mut buffer)?;
+        let discovery_socket_addr = SocketAddr::new(IpAddr::V4(ip), 30490);
+        self.discovery_socket
+            .as_ref()
+            .unwrap()
+            .send_to(&buffer, discovery_socket_addr)?;
         Ok(())
     }
 
@@ -86,7 +119,7 @@ impl SomeIPClient {
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 10, 87)), 0);
         let target_addr = SocketAddr::new(IpAddr::V4(ip), port);
         let unicast_socket = UdpSocket::bind(bind_addr)?;
-        unicast_socket.set_read_timeout(self.config.read_timeout)?;
+        unicast_socket.set_nonblocking(true)?;
         unicast_socket.connect(target_addr)?;
         self.unicast_socket = Some(unicast_socket);
         Ok(())
