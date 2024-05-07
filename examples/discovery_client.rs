@@ -19,7 +19,6 @@ struct DiscoveredIpV4Endpoint {
 fn main() -> Result<(), Error> {
     let config = ClientConfig {
         client_ip: Ipv4Addr::new(0, 0, 0, 0),
-        read_timeout: Some(Duration::from_millis(5)),
     };
     let mut client = simple_someip::SomeIPClient::new(config);
     client.bind_discovery()?;

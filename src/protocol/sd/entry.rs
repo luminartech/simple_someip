@@ -156,7 +156,7 @@ impl Entry {
     pub fn read<T: Read>(message_bytes: &mut T) -> Result<Self, Error> {
         let entry_type = EntryType::try_from(message_bytes.read_u8()?)?;
         match entry_type {
-            EntryType::FindService | EntryType::OfferService | EntryType::StopOfferService => {
+            EntryType::FindService => {
                 let service_entry = ServiceEntry::read(message_bytes)?;
                 Ok(Entry::FindService(service_entry))
             }
@@ -168,7 +168,7 @@ impl Entry {
                 let service_entry = ServiceEntry::read(message_bytes)?;
                 Ok(Entry::StopOfferService(service_entry))
             }
-            EntryType::Subscribe | EntryType::SubscribeAck => {
+            EntryType::Subscribe => {
                 let event_group_entry = EventGroupEntry::read(message_bytes)?;
                 Ok(Entry::SubscribeEventGroup(event_group_entry))
             }
