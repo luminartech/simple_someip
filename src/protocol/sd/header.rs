@@ -111,14 +111,13 @@ impl Header {
         let mut options_count = 0;
         for i in 0..entries_count {
             entries.push(Entry::read(message_bytes)?);
-            options_count += entries[i as usize].first_options_count();
         }
 
         let mut remaining_options_size = message_bytes.read_u32::<BigEndian>()? as usize;
         let mut options = Vec::with_capacity(options_count as usize);
-        for i in 0..options_count as usize {
+        while remaining_options_size > 0 {
             options.push(Options::read(message_bytes)?);
-            remaining_options_size -= options[i].size();
+            remaining_options_size -= options.last().unwrap().size();
         }
         if remaining_options_size != 0 {
             return Err(Error::IncorrectOptionsSize(remaining_options_size));
