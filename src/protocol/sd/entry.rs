@@ -71,10 +71,6 @@ impl OptionsCount {
     pub fn new(first_options_count: u8, second_options_count: u8) -> Self {
         assert!(first_options_count < 16);
         assert!(second_options_count < 16);
-        println!(
-            "first_option_count: {:x}, second option count: {:x}",
-            first_options_count, second_options_count
-        );
         OptionsCount {
             first_options_count,
             second_options_count,
