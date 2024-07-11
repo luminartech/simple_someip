@@ -1,11 +1,10 @@
 use crate::{
     protocol::{sd, Error, Message, MessagePayload},
-    SD_MULTICAST_IP,
+    SD_MULTICAST_IP, SD_MULTICAST_PORT,
 };
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     str::FromStr,
-    time::Duration,
 };
 
 pub trait SomeIpMessageHandler {
@@ -37,7 +36,10 @@ impl SomeIPClient {
 
     pub fn bind_discovery(&mut self) -> Result<(), Error> {
         let discovery_address = Ipv4Addr::from_str(SD_MULTICAST_IP).unwrap();
-        let bind_addr = SocketAddr::new(IpAddr::V4(self.config.client_ip), 30490);
+        let bind_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::from_str("0.0.0.0").unwrap()),
+            SD_MULTICAST_PORT,
+        );
         let discovery_socket = UdpSocket::bind(bind_addr)?;
 
         discovery_socket
@@ -74,13 +76,19 @@ impl SomeIPClient {
         Ok(())
     }
 
+    pub fn get_unicast_port(&self) -> Option<u16> {
+        self.unicast_socket
+            .as_ref()
+            .map(|socket| socket.local_addr().unwrap().port())
+    }
+
     pub fn send_unicast_discovery_message(
         &self,
         message: &Message,
         ip: Ipv4Addr,
     ) -> Result<(), Error> {
-        if self.discovery_socket.is_none() {
-            return Err(Error::MulticastSocketNotConnected);
+        if self.unicast_socket.is_none() {
+            return Err(Error::UnicastSocketNotConnected);
         }
         let mut buffer = Vec::new();
         message.write(&mut buffer)?;
@@ -116,7 +124,10 @@ impl SomeIPClient {
     }
 
     pub fn connect_unicast(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), Error> {
-        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 10, 87)), 0);
+        if self.unicast_socket.is_some() {
+            return Ok(());
+        }
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
         let target_addr = SocketAddr::new(IpAddr::V4(ip), port);
         let unicast_socket = UdpSocket::bind(bind_addr)?;
         unicast_socket.set_nonblocking(true)?;

@@ -31,7 +31,7 @@ impl EventGroupEntry {
         Self {
             index_first_options_run: 0,
             index_second_options_run: 0,
-            options_count: OptionsCount::new(0, 0),
+            options_count: OptionsCount::new(1, 0),
             service_id,
             instance_id,
             major_version,

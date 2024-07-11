@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, time::Duration};
+use std::net::Ipv4Addr;
 
 use simple_someip::{
     protocol::{
