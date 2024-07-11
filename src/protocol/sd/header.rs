@@ -5,10 +5,7 @@ use std::{
     vec,
 };
 
-use crate::{
-    client,
-    protocol::{self, Error},
-};
+use crate::protocol::{self, Error};
 
 use super::{
     entry::ENTRY_SIZE, Entry, EventGroupEntry, Flags, Options, ServiceEntry, TransportProtocol,
@@ -108,8 +105,8 @@ impl Header {
         let entries_size = message_bytes.read_u32::<BigEndian>()?;
         let entries_count = entries_size / ENTRY_SIZE as u32;
         let mut entries = Vec::with_capacity(entries_count as usize);
-        let mut options_count = 0;
-        for i in 0..entries_count {
+        let options_count = 0;
+        for _i in 0..entries_count {
             entries.push(Entry::read(message_bytes)?);
         }
 

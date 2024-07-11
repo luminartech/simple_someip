@@ -43,7 +43,7 @@ impl From<EntryType> for u8 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct OptionsCount {
+pub struct OptionsCount {
     pub first_options_count: u8,
     pub second_options_count: u8,
 }
