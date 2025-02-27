@@ -1,7 +1,9 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{Read, Write};
 
-use super::{Error, MessageId, MessageTypeField, ReturnCode};
+use crate::{
+    protocol::{Error, MessageId, MessageTypeField, ReturnCode},
+    traits::WireFormat,
+};
 
 /// SOME/IP header
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,17 +37,23 @@ impl Header {
         self.message_id.is_sd()
     }
 
-    pub fn read<T: Read>(message_bytes: &mut T) -> Result<Self, Error> {
-        let message_id = MessageId::from(message_bytes.read_u32::<BigEndian>()?);
-        let length = message_bytes.read_u32::<BigEndian>()?;
-        let request_id = message_bytes.read_u32::<BigEndian>()?;
-        let protocol_version = message_bytes.read_u8()?;
+    pub fn payload_size(&self) -> usize {
+        self.length as usize - 8
+    }
+}
+
+impl WireFormat for Header {
+    fn from_reader<T: std::io::Read>(reader: &mut T) -> Result<Self, Error> {
+        let message_id = MessageId::from(reader.read_u32::<BigEndian>()?);
+        let length = reader.read_u32::<BigEndian>()?;
+        let request_id = reader.read_u32::<BigEndian>()?;
+        let protocol_version = reader.read_u8()?;
         if protocol_version != 0x01 {
             return Err(Error::InvalidProtocolVersion(protocol_version));
         }
-        let interface_version = message_bytes.read_u8()?;
-        let message_type = MessageTypeField::try_from(message_bytes.read_u8()?)?;
-        let return_code = ReturnCode::try_from(message_bytes.read_u8()?)?;
+        let interface_version = reader.read_u8()?;
+        let message_type = MessageTypeField::try_from(reader.read_u8()?)?;
+        let return_code = ReturnCode::try_from(reader.read_u8()?)?;
         Ok(Self {
             message_id,
             length,
@@ -57,7 +65,11 @@ impl Header {
         })
     }
 
-    pub fn write<T: Write>(&self, writer: &mut T) -> Result<usize, Error> {
+    fn required_size(&self) -> usize {
+        16
+    }
+
+    fn to_writer<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
         writer.write_u32::<BigEndian>(self.message_id.message_id())?;
         writer.write_u32::<BigEndian>(self.length)?;
         writer.write_u32::<BigEndian>(self.request_id)?;
@@ -66,9 +78,5 @@ impl Header {
         writer.write_u8(u8::from(self.message_type))?;
         writer.write_u8(u8::from(self.return_code))?;
         Ok(16)
-    }
-
-    pub fn payload_size(&self) -> usize {
-        self.length as usize - 8
     }
 }
