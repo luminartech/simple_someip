@@ -27,4 +27,11 @@ mod client;
 #[cfg(feature = "client")]
 pub use client::*;
 
+#[cfg(any(feature = "client", feature = "server"))]
+mod error;
+#[cfg(any(feature = "client", feature = "server"))]
+pub use error::Error;
+
+pub mod traits;
+
 pub mod protocol;
