@@ -1,30 +1,26 @@
 use std::io::{Read, Write};
 
-use super::sd;
-use crate::protocol::{Error, Header, MessageType, ReturnCode};
+use crate::{
+    protocol::{Error, Header, MessageType, ReturnCode, sd},
+    traits::{PayloadWireFormat, WireFormat},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MessagePayload {
-    ServiceDiscovery(sd::Header),
-    Custom(Vec<u8>),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Message {
+pub struct Message<PayloadDefinition> {
     header: Header,
-    payload: MessagePayload,
+    payload: PayloadDefinition,
 }
 
-impl Message {
-    pub fn new(header: Header, payload: MessagePayload) -> Self {
+impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
+    pub fn new(header: Header, payload: PayloadDefinition) -> Self {
         Self { header, payload }
     }
 
-    pub fn new_sd(session_id: u32, sd_header: sd::Header) -> Self {
+    pub fn new_sd(session_id: u32, sd_header: &sd::Header) -> Self {
         let sd_header_size = sd_header.size();
         Self::new(
             Header::new_sd(session_id, sd_header_size),
-            MessagePayload::ServiceDiscovery(sd_header),
+            PayloadDefinition::new_sd_payload(&sd_header),
         )
     }
 
@@ -32,30 +28,18 @@ impl Message {
         &self.header
     }
 
-    pub fn payload(&self) -> &MessagePayload {
+    pub fn payload(&self) -> &PayloadDefinition {
         &self.payload
     }
 
-    pub fn payload_mut(&mut self) -> &mut MessagePayload {
+    pub fn payload_mut(&mut self) -> &mut PayloadDefinition {
         &mut self.payload
     }
+}
 
-    pub fn write<T: Write>(&self, writer: &mut T) -> Result<usize, Error> {
-        let header_size = self.header.write(writer)?;
-        match &self.payload {
-            MessagePayload::ServiceDiscovery(sd_header) => {
-                let sd_header_size = sd_header.write(writer)?;
-                Ok(header_size + sd_header_size)
-            }
-            MessagePayload::Custom(payload) => {
-                writer.write_all(payload)?;
-                Ok(header_size + payload.len())
-            }
-        }
-    }
-
-    pub fn read<T: Read>(message_bytes: &mut T) -> Result<Self, Error> {
-        let header = Header::read(message_bytes)?;
+impl<PayloadDefinition: PayloadWireFormat> WireFormat for Message<PayloadDefinition> {
+    fn from_reader<R: Read>(reader: &mut R) -> Result<Self, Error> {
+        let header = Header::from_reader(reader)?;
         if header.message_id.is_sd() {
             assert!(header.payload_size() >= 12, "SD message too short");
             assert!(
@@ -74,16 +58,18 @@ impl Message {
                 header.return_code == ReturnCode::Ok,
                 "SD return code mismatch"
             );
-            let sd_header = sd::Header::read(message_bytes)?;
-
-            Ok(Self::new(
-                header,
-                MessagePayload::ServiceDiscovery(sd_header),
-            ))
-        } else {
-            let mut payload = vec![0; header.payload_size()];
-            message_bytes.read_exact(&mut payload)?;
-            Ok(Self::new(header, MessagePayload::Custom(payload)))
         }
+        let mut payload_reader = reader.take(header.payload_size() as u64);
+        let payload =
+            PayloadDefinition::from_reader_with_message_id(header.message_id, &mut payload_reader)?;
+        Ok(Self::new(header, payload))
+    }
+
+    fn required_size(&self) -> usize {
+        self.header.required_size() + self.payload.required_size()
+    }
+
+    fn to_writer<W: Write>(&self, writer: &mut W) -> Result<usize, Error> {
+        Ok(self.header.to_writer(writer)? + self.payload.to_writer(writer)?)
     }
 }
