@@ -2,10 +2,10 @@ use std::net::Ipv4Addr;
 
 use simple_someip::{
     protocol::{
-        sd::{Entry, Options, TransportProtocol},
         Error,
+        sd::{Entry, Options, TransportProtocol},
     },
-    ClientConfig,
+    traits::DiscoveryOnlyPayload,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,15 +16,18 @@ struct DiscoveredIpV4Endpoint {
     protocol: TransportProtocol,
     port: u16,
 }
-fn main() -> Result<(), Error> {
-    let config = ClientConfig {
-        client_ip: Ipv4Addr::new(0, 0, 0, 0),
-    };
-    let mut client = simple_someip::SomeIPClient::new(config);
-    client.bind_discovery()?;
-    let mut discovered_endpoints = Vec::new();
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let mut client = simple_someip::SomeIPClient::<DiscoveryOnlyPayload>::new();
+    client
+        .bind_discovery_to_interface(Ipv4Addr::new(192, 168, 10, 87))
+        .await
+        .unwrap();
 
     loop {
+        client.run().await;
+        /*
         if let Some(header) = client.attempt_discovery()? {
             for entry in header.entries {
                 if let Entry::OfferService(service_entry) = &entry {
@@ -69,6 +72,6 @@ fn main() -> Result<(), Error> {
                     }
                 }
             }
-        }
+        }*/
     }
 }
