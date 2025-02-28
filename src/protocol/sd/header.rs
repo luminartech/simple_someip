@@ -1,9 +1,5 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use std::{
-    io::{Read, Write},
-    net::Ipv4Addr,
-    vec,
-};
+use std::{net::Ipv4Addr, vec};
 
 use crate::{protocol::Error, traits::WireFormat};
 
@@ -70,15 +66,49 @@ impl Header {
             options: vec![endpoint],
         }
     }
+}
 
-    pub fn size(&self) -> usize {
+impl WireFormat for Header {
+    fn from_reader<T: std::io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
+        let flags = Flags::from(reader.read_u8()?);
+        let mut reserved: [u8; 3] = [0; 3];
+        reader.read_exact(&mut reserved)?;
+        let entries_size = reader.read_u32::<BigEndian>()?;
+        let entries_count = entries_size / ENTRY_SIZE as u32;
+        let mut entries = Vec::with_capacity(entries_count as usize);
+        let options_count = 0;
+        for _i in 0..entries_count {
+            entries.push(Entry::from_reader(reader)?);
+        }
+
+        let mut remaining_options_size = reader.read_u32::<BigEndian>()? as usize;
+        let mut options = Vec::with_capacity(options_count as usize);
+        while remaining_options_size > 0 {
+            options.push(Options::read(reader)?);
+            remaining_options_size -= options.last().unwrap().size();
+        }
+        if remaining_options_size != 0 {
+            return Err(Error::IncorrectOptionsSize(remaining_options_size));
+        }
+        Ok(Self {
+            flags,
+            entries,
+            options,
+        })
+    }
+
+    fn required_size(&self) -> usize {
         let mut size = 12 + self.entries.len() * ENTRY_SIZE;
         for option in &self.options {
             size += option.size();
         }
         size
     }
-    pub fn write<T: Write>(&self, writer: &mut T) -> Result<usize, Error> {
+
+    fn to_writer<T: std::io::Write>(
+        &self,
+        writer: &mut T,
+    ) -> Result<usize, crate::protocol::Error> {
         writer.write_u8(u8::from(self.flags))?;
         let reserved: [u8; 3] = [0; 3];
         writer.write_all(&reserved)?;
@@ -96,33 +126,5 @@ impl Header {
             option.write(writer)?;
         }
         Ok(12 + entries_size as usize + options_size as usize)
-    }
-
-    pub fn read<T: Read>(message_bytes: &mut T) -> Result<Self, Error> {
-        let flags = Flags::from(message_bytes.read_u8()?);
-        let mut reserved: [u8; 3] = [0; 3];
-        message_bytes.read_exact(&mut reserved)?;
-        let entries_size = message_bytes.read_u32::<BigEndian>()?;
-        let entries_count = entries_size / ENTRY_SIZE as u32;
-        let mut entries = Vec::with_capacity(entries_count as usize);
-        let options_count = 0;
-        for _i in 0..entries_count {
-            entries.push(Entry::from_reader(message_bytes)?);
-        }
-
-        let mut remaining_options_size = message_bytes.read_u32::<BigEndian>()? as usize;
-        let mut options = Vec::with_capacity(options_count as usize);
-        while remaining_options_size > 0 {
-            options.push(Options::read(message_bytes)?);
-            remaining_options_size -= options.last().unwrap().size();
-        }
-        if remaining_options_size != 0 {
-            return Err(Error::IncorrectOptionsSize(remaining_options_size));
-        }
-        Ok(Self {
-            flags,
-            entries,
-            options,
-        })
     }
 }
