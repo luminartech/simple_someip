@@ -2,7 +2,6 @@ use super::Error;
 
 ///Return code contained in a SOME/IP header.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-
 pub enum ReturnCode {
     Ok,
     NotOk,

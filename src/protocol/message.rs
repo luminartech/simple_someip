@@ -28,6 +28,10 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
         &self.header
     }
 
+    pub const fn is_sd(&self) -> bool {
+        self.header.is_sd()
+    }
+
     pub fn payload(&self) -> &PayloadDefinition {
         &self.payload
     }
