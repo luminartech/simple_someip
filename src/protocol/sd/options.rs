@@ -1,4 +1,7 @@
-use std::io::{Read, Write};
+use std::{
+    io::{Read, Write},
+    net::Ipv4Addr,
+};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
@@ -78,7 +81,7 @@ pub enum Options {
     Configuration,
     LoadBalancing,
     IpV4Endpoint {
-        ip: u32,
+        ip: Ipv4Addr,
         protocol: TransportProtocol,
         port: u16,
     },
@@ -111,7 +114,7 @@ impl Options {
             Options::IpV4Endpoint { ip, protocol, port } => {
                 writer.write_u8(u8::from(OptionType::IpV4Endpoint))?;
                 writer.write_u8(0)?;
-                writer.write_u32::<BigEndian>(*ip)?;
+                writer.write_u32::<BigEndian>(ip.to_bits())?;
                 writer.write_u8(0)?;
                 writer.write_u8(u8::from(*protocol))?;
                 writer.write_u16::<BigEndian>(*port)?;
@@ -140,7 +143,7 @@ impl Options {
             OptionType::IpV4Endpoint => {
                 assert!(length == 9, "Invalid length for IpV4Endpoint");
                 assert!(!discard_flag, "Discard flag not set");
-                let ip = message_bytes.read_u32::<BigEndian>()?;
+                let ip = Ipv4Addr::from_bits(message_bytes.read_u32::<BigEndian>()?);
                 let reserved = message_bytes.read_u8()?;
                 assert!(reserved == 0, "Reserved byte not zero");
                 let protocol = TransportProtocol::try_from(message_bytes.read_u8()?)?;
