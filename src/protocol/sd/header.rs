@@ -5,10 +5,10 @@ use std::{
     vec,
 };
 
-use crate::protocol::{self, Error};
+use crate::{protocol::Error, traits::WireFormat};
 
 use super::{
-    entry::ENTRY_SIZE, Entry, EventGroupEntry, Flags, Options, ServiceEntry, TransportProtocol,
+    Entry, EventGroupEntry, Flags, Options, ServiceEntry, TransportProtocol, entry::ENTRY_SIZE,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,7 +85,7 @@ impl Header {
         let entries_size = (self.entries.len() * 16) as u32;
         writer.write_u32::<BigEndian>(entries_size)?;
         for entry in &self.entries {
-            entry.write(writer)?;
+            entry.to_writer(writer)?;
         }
         let mut options_size = 0;
         for option in &self.options {
@@ -107,7 +107,7 @@ impl Header {
         let mut entries = Vec::with_capacity(entries_count as usize);
         let options_count = 0;
         for _i in 0..entries_count {
-            entries.push(Entry::read(message_bytes)?);
+            entries.push(Entry::from_reader(message_bytes)?);
         }
 
         let mut remaining_options_size = message_bytes.read_u32::<BigEndian>()? as usize;

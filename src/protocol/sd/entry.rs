@@ -1,7 +1,7 @@
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 
-use crate::protocol::Error;
+use crate::{protocol::Error, traits::WireFormat};
 
 use super::{EventGroupEntry, ServiceEntry};
 
@@ -123,54 +123,66 @@ impl Entry {
     pub fn total_options_count(&self) -> u8 {
         self.first_options_count() + self.second_options_count()
     }
+}
 
-    pub fn write<T: Write>(&self, writer: &mut T) -> Result<usize, Error> {
-        match self {
-            Entry::FindService(service_entry) => {
-                writer.write_u8(u8::from(EntryType::FindService))?;
-                service_entry.write(writer)
+impl WireFormat for Entry {
+    fn from_reader<R: Read>(reader: &mut R) -> Result<Self, Error> {
+        let entry_type = EntryType::try_from(reader.read_u8()?)?;
+        match entry_type {
+            EntryType::FindService => {
+                let service_entry = ServiceEntry::from_reader(reader)?;
+                Ok(Entry::FindService(service_entry))
             }
-            Entry::OfferService(service_entry) => {
-                writer.write_u8(u8::from(EntryType::OfferService))?;
-                service_entry.write(writer)
+            EntryType::OfferService => {
+                let service_entry = ServiceEntry::from_reader(reader)?;
+                Ok(Entry::OfferService(service_entry))
             }
-            Entry::StopOfferService(service_entry) => {
-                writer.write_u8(u8::from(EntryType::StopOfferService))?;
-                service_entry.write(writer)
+            EntryType::StopOfferService => {
+                let service_entry = ServiceEntry::from_reader(reader)?;
+                Ok(Entry::StopOfferService(service_entry))
             }
-            Entry::SubscribeEventGroup(event_group_entry) => {
-                writer.write_u8(u8::from(EntryType::Subscribe))?;
-                event_group_entry.write(writer)
+            EntryType::Subscribe => {
+                let event_group_entry = EventGroupEntry::from_reader(reader)?;
+                Ok(Entry::SubscribeEventGroup(event_group_entry))
             }
-            Entry::SubscribeAckEventGroup(event_group_entry) => {
-                writer.write_u8(u8::from(EntryType::SubscribeAck))?;
-                event_group_entry.write(writer)
+            EntryType::SubscribeAck => {
+                let event_group_entry = EventGroupEntry::from_reader(reader)?;
+                Ok(Entry::SubscribeAckEventGroup(event_group_entry))
             }
         }
     }
 
-    pub fn read<T: Read>(message_bytes: &mut T) -> Result<Self, Error> {
-        let entry_type = EntryType::try_from(message_bytes.read_u8()?)?;
-        match entry_type {
-            EntryType::FindService => {
-                let service_entry = ServiceEntry::read(message_bytes)?;
-                Ok(Entry::FindService(service_entry))
+    fn required_size(&self) -> usize {
+        1 + match self {
+            Entry::FindService(service_entry) => service_entry.required_size(),
+            Entry::OfferService(service_entry) => service_entry.required_size(),
+            Entry::StopOfferService(service_entry) => service_entry.required_size(),
+            Entry::SubscribeEventGroup(event_group_entry) => event_group_entry.required_size(),
+            Entry::SubscribeAckEventGroup(event_group_entry) => event_group_entry.required_size(),
+        }
+    }
+
+    fn to_writer<W: Write>(&self, writer: &mut W) -> Result<usize, Error> {
+        match self {
+            Entry::FindService(service_entry) => {
+                writer.write_u8(u8::from(EntryType::FindService))?;
+                service_entry.to_writer(writer)
             }
-            EntryType::OfferService => {
-                let service_entry = ServiceEntry::read(message_bytes)?;
-                Ok(Entry::OfferService(service_entry))
+            Entry::OfferService(service_entry) => {
+                writer.write_u8(u8::from(EntryType::OfferService))?;
+                service_entry.to_writer(writer)
             }
-            EntryType::StopOfferService => {
-                let service_entry = ServiceEntry::read(message_bytes)?;
-                Ok(Entry::StopOfferService(service_entry))
+            Entry::StopOfferService(service_entry) => {
+                writer.write_u8(u8::from(EntryType::StopOfferService))?;
+                service_entry.to_writer(writer)
             }
-            EntryType::Subscribe => {
-                let event_group_entry = EventGroupEntry::read(message_bytes)?;
-                Ok(Entry::SubscribeEventGroup(event_group_entry))
+            Entry::SubscribeEventGroup(event_group_entry) => {
+                writer.write_u8(u8::from(EntryType::Subscribe))?;
+                event_group_entry.to_writer(writer)
             }
-            EntryType::SubscribeAck => {
-                let event_group_entry = EventGroupEntry::read(message_bytes)?;
-                Ok(Entry::SubscribeAckEventGroup(event_group_entry))
+            Entry::SubscribeAckEventGroup(event_group_entry) => {
+                writer.write_u8(u8::from(EntryType::SubscribeAck))?;
+                event_group_entry.to_writer(writer)
             }
         }
     }
