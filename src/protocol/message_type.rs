@@ -4,7 +4,7 @@ use super::Error;
 pub const MESSAGE_TYPE_TP_FLAG: u8 = 0x20;
 
 ///Message types of a SOME/IP message.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MessageType {
     Request,
     RequestNoReturn,
@@ -13,9 +13,8 @@ pub enum MessageType {
     Error,
 }
 
-impl TryFrom<u8> for MessageType {
-    type Error = Error;
-    fn try_from(value: u8) -> Result<Self, Error> {
+impl MessageType {
+    const fn try_from(value: u8) -> Result<Self, Error> {
         match value & !MESSAGE_TYPE_TP_FLAG {
             0x00 => Ok(MessageType::Request),
             0x01 => Ok(MessageType::RequestNoReturn),
@@ -24,6 +23,13 @@ impl TryFrom<u8> for MessageType {
             0x81 => Ok(MessageType::Error),
             _ => Err(Error::InvalidMessageTypeField(value)),
         }
+    }
+}
+
+impl TryFrom<u8> for MessageType {
+    type Error = Error;
+    fn try_from(value: u8) -> Result<Self, Error> {
+        MessageType::try_from(value)
     }
 }
 
@@ -48,7 +54,7 @@ impl From<MessageTypeField> for u8 {
 }
 
 impl MessageTypeField {
-    pub fn new(msg_type: MessageType, tp: bool) -> Self {
+    pub const fn new(msg_type: MessageType, tp: bool) -> Self {
         let message_type_byte = if tp {
             msg_type as u8 | MESSAGE_TYPE_TP_FLAG
         } else {
@@ -57,7 +63,7 @@ impl MessageTypeField {
         MessageTypeField(message_type_byte)
     }
 
-    pub fn new_sd() -> Self {
+    pub const fn new_sd() -> Self {
         Self::new(MessageType::Notification, false)
     }
 
@@ -67,7 +73,7 @@ impl MessageTypeField {
         MessageType::try_from(self.0).unwrap()
     }
 
-    pub fn is_tp(&self) -> bool {
+    pub const fn is_tp(&self) -> bool {
         self.0 & MESSAGE_TYPE_TP_FLAG != 0
     }
 }
