@@ -10,6 +10,8 @@ pub enum Error {
     InvalidMessageTypeField(u8),
     #[error("Invalid value in ReturnCode field: {0:X}")]
     InvalidReturnCode(u8),
+    #[error("Unsupported MessageID  {0:X?}")]
+    UnsupportedMessageID(super::MessageId),
     #[error("Invalid value for Service Discovery entry type: {0:X}")]
     InvalidSDEntryType(u8),
     #[error("Invalid value for Service Discovery Option Type: {0:X}")]
