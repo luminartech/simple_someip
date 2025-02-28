@@ -1,7 +1,7 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 
-use crate::protocol::Error;
+use crate::{protocol::Error, traits::WireFormat};
 
 use super::entry::OptionsCount;
 
@@ -31,27 +31,18 @@ impl ServiceEntry {
             minor_version: 0xFFFFFFFF,
         }
     }
-    pub fn write<T: Write>(&self, writer: &mut T) -> Result<usize, Error> {
-        writer.write_u8(self.index_first_options_run)?;
-        writer.write_u8(self.index_second_options_run)?;
-        writer.write_u8(u8::from(self.options_count))?;
-        writer.write_u16::<BigEndian>(self.service_id)?;
-        writer.write_u16::<BigEndian>(self.instance_id)?;
-        writer.write_u8(self.major_version)?;
-        writer.write_u24::<BigEndian>(self.ttl)?;
-        writer.write_u32::<BigEndian>(self.minor_version)?;
-        Ok(16)
-    }
+}
 
-    pub fn read<T: Read>(message_bytes: &mut T) -> Result<Self, Error> {
-        let index_first_options_run = message_bytes.read_u8()?;
-        let index_second_options_run = message_bytes.read_u8()?;
-        let options_count = OptionsCount::from(message_bytes.read_u8()?);
-        let service_id = message_bytes.read_u16::<BigEndian>()?;
-        let instance_id = message_bytes.read_u16::<BigEndian>()?;
-        let major_version = message_bytes.read_u8()?;
-        let ttl = message_bytes.read_u24::<BigEndian>()?;
-        let minor_version = message_bytes.read_u32::<BigEndian>()?;
+impl WireFormat for ServiceEntry {
+    fn from_reader<R: Read>(reader: &mut R) -> Result<Self, Error> {
+        let index_first_options_run = reader.read_u8()?;
+        let index_second_options_run = reader.read_u8()?;
+        let options_count = OptionsCount::from(reader.read_u8()?);
+        let service_id = reader.read_u16::<BigEndian>()?;
+        let instance_id = reader.read_u16::<BigEndian>()?;
+        let major_version = reader.read_u8()?;
+        let ttl = reader.read_u24::<BigEndian>()?;
+        let minor_version = reader.read_u32::<BigEndian>()?;
         Ok(Self {
             index_first_options_run,
             index_second_options_run,
@@ -62,5 +53,21 @@ impl ServiceEntry {
             ttl,
             minor_version,
         })
+    }
+
+    fn required_size(&self) -> usize {
+        16
+    }
+
+    fn to_writer<W: Write>(&self, writer: &mut W) -> Result<usize, Error> {
+        writer.write_u8(self.index_first_options_run)?;
+        writer.write_u8(self.index_second_options_run)?;
+        writer.write_u8(u8::from(self.options_count))?;
+        writer.write_u16::<BigEndian>(self.service_id)?;
+        writer.write_u16::<BigEndian>(self.instance_id)?;
+        writer.write_u8(self.major_version)?;
+        writer.write_u24::<BigEndian>(self.ttl)?;
+        writer.write_u32::<BigEndian>(self.minor_version)?;
+        Ok(16)
     }
 }
