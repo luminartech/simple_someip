@@ -1,8 +1,5 @@
 mod entry;
-pub use entry::Entry;
-
-mod event_group_entry;
-pub use event_group_entry::EventGroupEntry;
+pub use entry::{Entry, EventGroupEntry, ServiceEntry};
 
 mod flags;
 pub use flags::Flags;
@@ -12,6 +9,3 @@ pub use header::Header;
 
 mod options;
 pub use options::{Options, TransportProtocol};
-
-mod service_entry;
-pub use service_entry::ServiceEntry;
