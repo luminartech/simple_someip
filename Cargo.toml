@@ -8,10 +8,20 @@ publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-byteorder = "1.5.0"
-thiserror = "1.0.59"
+byteorder = "1"
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "net",
+    "rt",
+    "sync",
+    "time",
+], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [features]
 default = ["client", "server"]
-client = []
+client = ["dep:tokio"]
 server = []
