@@ -1,7 +1,6 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{Read, Write};
 
-use crate::protocol::Error;
+use crate::traits::WireFormat;
 
 use super::entry::OptionsCount;
 
@@ -40,30 +39,19 @@ impl EventGroupEntry {
             event_group_id,
         }
     }
+}
 
-    pub fn write<T: Write>(&self, writer: &mut T) -> Result<usize, Error> {
-        writer.write_u8(self.index_first_options_run)?;
-        writer.write_u8(self.index_second_options_run)?;
-        writer.write_u8(u8::from(self.options_count))?;
-        writer.write_u16::<BigEndian>(self.service_id)?;
-        writer.write_u16::<BigEndian>(self.instance_id)?;
-        writer.write_u8(self.major_version)?;
-        writer.write_u24::<BigEndian>(self.ttl)?;
-        writer.write_u16::<BigEndian>(self.counter)?;
-        writer.write_u16::<BigEndian>(self.event_group_id)?;
-        Ok(16)
-    }
-
-    pub fn read<T: Read>(message_bytes: &mut T) -> Result<Self, Error> {
-        let index_first_options_run = message_bytes.read_u8()?;
-        let index_second_options_run = message_bytes.read_u8()?;
-        let options_count = OptionsCount::from(message_bytes.read_u8()?);
-        let service_id = message_bytes.read_u16::<BigEndian>()?;
-        let instance_id = message_bytes.read_u16::<BigEndian>()?;
-        let major_version = message_bytes.read_u8()?;
-        let ttl = message_bytes.read_u24::<BigEndian>()?;
-        let counter = message_bytes.read_u16::<BigEndian>()? & 0x000f;
-        let event_group_id = message_bytes.read_u16::<BigEndian>()?;
+impl WireFormat for EventGroupEntry {
+    fn from_reader<T: std::io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
+        let index_first_options_run = reader.read_u8()?;
+        let index_second_options_run = reader.read_u8()?;
+        let options_count = OptionsCount::from(reader.read_u8()?);
+        let service_id = reader.read_u16::<BigEndian>()?;
+        let instance_id = reader.read_u16::<BigEndian>()?;
+        let major_version = reader.read_u8()?;
+        let ttl = reader.read_u24::<BigEndian>()?;
+        let counter = reader.read_u16::<BigEndian>()? & 0x000f;
+        let event_group_id = reader.read_u16::<BigEndian>()?;
         Ok(Self {
             index_first_options_run,
             index_second_options_run,
@@ -75,5 +63,25 @@ impl EventGroupEntry {
             counter,
             event_group_id,
         })
+    }
+
+    fn required_size(&self) -> usize {
+        16
+    }
+
+    fn to_writer<T: std::io::Write>(
+        &self,
+        writer: &mut T,
+    ) -> Result<usize, crate::protocol::Error> {
+        writer.write_u8(self.index_first_options_run)?;
+        writer.write_u8(self.index_second_options_run)?;
+        writer.write_u8(u8::from(self.options_count))?;
+        writer.write_u16::<BigEndian>(self.service_id)?;
+        writer.write_u16::<BigEndian>(self.instance_id)?;
+        writer.write_u8(self.major_version)?;
+        writer.write_u24::<BigEndian>(self.ttl)?;
+        writer.write_u16::<BigEndian>(self.counter)?;
+        writer.write_u16::<BigEndian>(self.event_group_id)?;
+        Ok(16)
     }
 }
