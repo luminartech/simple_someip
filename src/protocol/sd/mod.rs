@@ -1,11 +1,11 @@
 mod entry;
-pub use entry::{Entry, EventGroupEntry, ServiceEntry};
-
 mod flags;
-pub use flags::Flags;
-
 mod header;
-pub use header::Header;
-
 mod options;
+
+// Export all definitions from the service discovery mod
+
+pub use entry::{Entry, EventGroupEntry, ServiceEntry};
+pub use flags::Flags;
+pub use header::Header;
 pub use options::{Options, TransportProtocol};
