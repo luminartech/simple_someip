@@ -6,7 +6,7 @@ use crate::protocol::{self, MessageId};
 ///
 /// `WireFormat` acts as the base trait for all types that can be serialized and deserialized
 /// as part of the Simple SOME/IP ecosystem.
-pub trait WireFormat: Sized {
+pub trait WireFormat: Send + Sized + Sync {
     /// Deserialize a value from a byte stream.
     /// Returns Ok(`Some(value)`) if the stream contains a complete value.
     /// Returns Ok(`None`) if the stream is empty.
@@ -29,13 +29,11 @@ pub trait WireFormat: Sized {
 /// [`Reader`](std::io::Read) and serialized to a [`Writer`](std::io::Write).
 /// Note that SOME/IP payloads are not self identifying, so the [Message ID](protocol::MessageId)
 /// must be provided by the caller after reading from the [SOME/IP header](protocol::Header).
-pub trait PayloadWireFormat: Sized {
+pub trait PayloadWireFormat: Send + Sized + Sync {
     /// Get the Message ID for te payload
-    fn message_id(&self) -> u32;
-    /// Get the service ID for the payload
-    fn service_id(&self) -> u16;
-    /// Get the method ID for the payload
-    fn method_id(&self) -> u16;
+    fn message_id(&self) -> MessageId;
+    /// Get the payload as a service discovery header
+    fn as_sd_header(&self) -> Option<&crate::protocol::sd::Header>;
     /// Deserialize a payload from a [Reader](std::io::Read) given the Message ID.
     fn from_reader_with_message_id<T: std::io::Read>(
         message_id: MessageId,
@@ -47,4 +45,45 @@ pub trait PayloadWireFormat: Sized {
     fn required_size(&self) -> usize;
     /// Serialize the payload to a [Writer](std::io::Write)
     fn to_writer<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
+}
+
+pub struct DiscoveryOnlyPayload {
+    header: crate::protocol::sd::Header,
+}
+
+impl PayloadWireFormat for DiscoveryOnlyPayload {
+    fn message_id(&self) -> MessageId {
+        protocol::SD_MESSAGE_ID
+    }
+
+    fn as_sd_header(&self) -> Option<&crate::protocol::sd::Header> {
+        Some(&self.header)
+    }
+
+    fn from_reader_with_message_id<T: std::io::Read>(
+        message_id: MessageId,
+        reader: &mut T,
+    ) -> Result<Self, protocol::Error> {
+        if message_id.is_sd() {
+            Ok(Self {
+                header: protocol::sd::Header::from_reader(reader)?,
+            })
+        } else {
+            Err(protocol::Error::UnsupportedMessageID(message_id))
+        }
+    }
+
+    fn new_sd_payload(header: &crate::protocol::sd::Header) -> Self {
+        Self {
+            header: header.clone(),
+        }
+    }
+
+    fn required_size(&self) -> usize {
+        self.header.required_size()
+    }
+
+    fn to_writer<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
+        self.header.to_writer(writer)
+    }
 }

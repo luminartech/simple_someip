@@ -1,6 +1,3 @@
-///Message id for SOME/IP service discovery messages
-pub const SD_MESSAGE_ID: u32 = 0xffff_8100;
-
 /// Newtype for a message ID.
 /// The Message ID is a 32-bit identifier that is unique for each message.
 /// It encodes both the service ID and the method ID.
@@ -21,7 +18,7 @@ impl MessageId {
         MessageId(message_id)
     }
     pub const fn new_sd() -> Self {
-        MessageId(SD_MESSAGE_ID)
+        super::SD_MESSAGE_ID
     }
 
     /// Get the message ID
@@ -69,6 +66,6 @@ impl MessageId {
     /// Message is SOME/IP Service Discovery
     #[inline]
     pub const fn is_sd(&self) -> bool {
-        self.0 == SD_MESSAGE_ID
+        self.0 == crate::SD_MESSAGE_ID_VALUE
     }
 }

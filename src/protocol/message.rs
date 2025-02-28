@@ -17,7 +17,7 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
     }
 
     pub fn new_sd(session_id: u32, sd_header: &sd::Header) -> Self {
-        let sd_header_size = sd_header.size();
+        let sd_header_size = sd_header.required_size();
         Self::new(
             Header::new_sd(session_id, sd_header_size),
             PayloadDefinition::new_sd_payload(&sd_header),
@@ -30,6 +30,12 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
 
     pub const fn is_sd(&self) -> bool {
         self.header.is_sd()
+    }
+
+    pub fn get_sd_header(&self) -> Option<&sd::Header> {
+        assert!(self.header().message_id.is_sd());
+        assert!(!self.header().message_type.is_tp());
+        self.payload.as_sd_header()
     }
 
     pub fn payload(&self) -> &PayloadDefinition {
