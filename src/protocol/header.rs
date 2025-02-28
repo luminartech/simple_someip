@@ -33,7 +33,7 @@ impl Header {
         }
     }
 
-    pub fn is_sd(&self) -> bool {
+    pub const fn is_sd(&self) -> bool {
         self.message_id.is_sd()
     }
 
