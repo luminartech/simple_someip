@@ -1,93 +1,71 @@
-use tokio::{net::UdpSocket, select, sync::mpsc};
+mod inner;
 
-use crate::{
-    Error, SD_MULTICAST_IP, SD_MULTICAST_PORT,
-    protocol::{Message, sd},
-    traits::{PayloadWireFormat, WireFormat},
-};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use inner::{Control, ControlMessage, Inner};
+use tokio::sync::mpsc;
 
-pub trait SomeIpMessageHandler {
-    fn handle_message<PayloadDefinition: PayloadWireFormat>(
-        &self,
-        message: &Message<PayloadDefinition>,
-    );
+use crate::{Error, protocol::sd, traits::PayloadWireFormat};
+use std::net::Ipv4Addr;
+
+#[derive(Debug)]
+pub enum ClientUpdate<MessageDefinitions> {
+    DiscoveryUpdated(sd::Header),
+    Unicast(MessageDefinitions),
+    Error(Error),
 }
 
 #[derive(Debug)]
-pub struct SomeIPClient<MessageDefinitions> {
-    discovery_receiver: Option<mpsc::Receiver<Option<sd::Header>>>,
-    unicast_socket: Option<UdpSocket>,
+pub struct Client<MessageDefinitions> {
+    interface: Ipv4Addr,
+    unicast_port: Option<u16>,
+    control_sender: mpsc::Sender<inner::ControlMessage>,
+    update_receiver: mpsc::Receiver<ClientUpdate<MessageDefinitions>>,
     phantom: std::marker::PhantomData<MessageDefinitions>,
 }
 
-impl<MessageDefinitions: PayloadWireFormat> SomeIPClient<MessageDefinitions> {
-    pub fn new() -> Self {
+impl<MessageDefinitions> Client<MessageDefinitions>
+where
+    MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
+{
+    pub fn new(interface: Ipv4Addr) -> Self {
+        let (control_sender, update_receiver) = Inner::new(interface);
+
         Self {
-            discovery_receiver: None,
-            unicast_socket: None,
+            interface,
+            unicast_port: None,
+            control_sender,
+            update_receiver,
             phantom: std::marker::PhantomData,
         }
     }
 
-    pub async fn bind_discovery_to_interface(&mut self, interface: Ipv4Addr) -> Result<(), Error> {
-        let (sender, receiver) = mpsc::channel(16);
-        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), SD_MULTICAST_PORT);
-        let discovery_socket = UdpSocket::bind(bind_addr).await?;
-        tokio::spawn(async move {
-            discovery_socket
-                .join_multicast_v4(SD_MULTICAST_IP, interface)
-                .unwrap();
-            let mut buf = vec![0; 1400];
-            loop {
-                select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                        println!("Timeout");
-                        if sender.send(None).await.is_err() {
-                            // The receiver has been dropped, so we should exit
-                            break;
-                        }
+    pub async fn run(&mut self) -> ClientUpdate<MessageDefinitions> {
+        self.update_receiver.recv().await.unwrap()
+    }
 
-                    }
-                    Ok((_, _)) = discovery_socket.recv_from(&mut buf) => {
-                        println!("Message received");
-                        match Message::<MessageDefinitions>::from_reader(&mut buf.as_slice()) {
-                            Ok(message) => {
-                                let sd_header = message.get_sd_header().unwrap();
-                                println!("Received SD message: {:?}", sd_header);
-                                if sender.send(Some(sd_header.clone())).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => {
-                                if sender.send(None).await.is_err() {
-                                    // The receiver has been dropped, so we should exit
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        self.discovery_receiver = Some(receiver);
+    pub fn interface(&self) -> Ipv4Addr {
+        self.interface
+    }
+
+    pub async fn set_interface(&mut self, interface: Ipv4Addr) -> Result<(), Error> {
+        self.send_control_message(Control::SetInterface(interface))
+            .await?;
+        self.interface = interface;
         Ok(())
     }
 
-    pub async fn run(&mut self) {
-        if self.discovery_receiver.is_none() {
-            panic!("Discovery receiver not bound");
-        } else {
-            let receiver = self.discovery_receiver.as_mut().unwrap();
+    pub async fn bind_discovery(&mut self) -> Result<(), Error> {
+        self.send_control_message(Control::BindDiscovery).await
+    }
 
-            match receiver.recv().await {
-                Some(Some(header)) => {}
-                Some(None) => {}
-                None => {
-                    panic!("Discovery sender dropped");
-                }
-            }
-        }
+    pub async fn unbind_discovery(&mut self) -> Result<(), Error> {
+        self.send_control_message(inner::Control::UnbindDiscovery)
+            .await
+    }
+
+    async fn send_control_message(&mut self, control: Control) -> Result<(), Error> {
+        let (control_message, response_sender) = ControlMessage::new(control);
+        self.control_sender.send(control_message).await.unwrap();
+        response_sender.await.unwrap()
     }
 }
 /*

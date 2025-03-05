@@ -47,6 +47,7 @@ pub trait PayloadWireFormat: Send + Sized + Sync {
     fn to_writer<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveryOnlyPayload {
     header: crate::protocol::sd::Header,
 }
