@@ -1,8 +1,10 @@
 use std::{
+    collections::HashMap,
     future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
+use chrono::{DateTime, Utc};
 use tokio::{
     net::UdpSocket,
     select,
@@ -18,7 +20,7 @@ use crate::{
     traits::{PayloadWireFormat, WireFormat},
 };
 
-use super::ClientUpdate;
+use super::{ClientUpdate, DiscoveredIpV4Endpoint, DiscoveryInfo};
 
 pub(super) enum Control {
     SetInterface(Ipv4Addr),
@@ -50,6 +52,7 @@ pub(super) struct Inner<MessageDefinitions> {
     update_sender: mpsc::Sender<ClientUpdate<MessageDefinitions>>,
     interface: Ipv4Addr,
     discovery_receiver: Option<mpsc::Receiver<Result<Message<MessageDefinitions>, Error>>>,
+    discovery_info: DiscoveryInfo,
     unicast_info: Option<UnicastInfo<MessageDefinitions>>,
     phantom: std::marker::PhantomData<MessageDefinitions>,
 }
@@ -71,6 +74,7 @@ where
             update_sender,
             interface,
             discovery_receiver: None,
+            discovery_info: DiscoveryInfo::new(),
             unicast_info: None,
             phantom: std::marker::PhantomData,
         };
@@ -189,6 +193,7 @@ where
                 let Self {
                     control_receiver,
                     discovery_receiver,
+                    discovery_info,
                     update_sender,
                     ..
                 } = &mut self;
@@ -217,7 +222,14 @@ where
                     discovery = Inner::receive_discovery(discovery_receiver) => {
                         match discovery {
                             Ok(header) => {
-                                update_sender.send(ClientUpdate::DiscoveryUpdated(header)).await.unwrap();
+                                match discovery_info.update(header) {
+                                    Ok(info) => {
+                                        update_sender.send(ClientUpdate::DiscoveryUpdated(info)).await.unwrap();
+                                    }
+                                    Err(err) => {
+                                        update_sender.send(ClientUpdate::Error(err)).await.unwrap();
+                                    }
+                                }
                             }
                             Err(err) => {
                                 update_sender.send(ClientUpdate::Error(err)).await.unwrap();
