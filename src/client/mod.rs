@@ -5,11 +5,7 @@ mod inner;
 use inner::{Control, ControlMessage, Inner};
 use tokio::sync::mpsc;
 
-use crate::{
-    Error,
-    protocol::sd::{self, TransportProtocol},
-    traits::PayloadWireFormat,
-};
+use crate::{ Error, traits::PayloadWireFormat};
 use std::net::Ipv4Addr;
 
 #[derive(Debug)]

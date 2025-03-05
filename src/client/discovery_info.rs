@@ -18,7 +18,7 @@ pub struct DiscoveredIpV4Endpoint {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EndpointInfo {
-    last_seen: DateTime<Utc>,
+    last_seen: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +27,10 @@ pub struct DiscoveryInfo(HashMap<DiscoveredIpV4Endpoint, EndpointInfo>);
 impl DiscoveryInfo {
     pub fn new() -> Self {
         Self(HashMap::new())
+    }
+
+    pub fn add_endpoint(&mut self, endpoint: DiscoveredIpV4Endpoint) {
+        self.0.insert(endpoint, EndpointInfo { last_seen: None });
     }
 
     pub fn update(&mut self, sd_header: sd::Header) -> Result<Self, Error> {
@@ -55,7 +59,7 @@ impl DiscoveryInfo {
                     self.0.insert(
                         discovered,
                         EndpointInfo {
-                            last_seen: Utc::now(),
+                            last_seen: Some(Utc::now()),
                         },
                     );
                 } else {
@@ -66,13 +70,14 @@ impl DiscoveryInfo {
         Ok(self.clone())
     }
 }
+
 impl std::fmt::Display for DiscoveryInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Discovered SOME/IP Endpoints:\n[")?;
         for endpoint in &self.0 {
             writeln!(
                 f,
-                "    Service ID: {}, Instance ID: {}, IP: {}, Transport: {:?}, Port: {} - Last Seen: {}",
+                "    Service ID: {}, Instance ID: {}, IP: {}, Transport: {:?}, Port: {} - Last Seen: {:?}",
                 endpoint.0.service_id,
                 endpoint.0.instance_id,
                 endpoint.0.ip,

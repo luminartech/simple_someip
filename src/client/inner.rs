@@ -1,10 +1,8 @@
 use std::{
-    collections::HashMap,
     future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
-use chrono::{DateTime, Utc};
 use tokio::{
     net::UdpSocket,
     select,
@@ -20,7 +18,7 @@ use crate::{
     traits::{PayloadWireFormat, WireFormat},
 };
 
-use super::{ClientUpdate, DiscoveredIpV4Endpoint, DiscoveryInfo};
+use super::{ClientUpdate, DiscoveryInfo};
 
 pub(super) enum Control {
     SetInterface(Ipv4Addr),
@@ -247,7 +245,7 @@ async fn receive<MessageDefinitions: PayloadWireFormat>(
     buf: &mut Vec<u8>,
 ) -> Result<Message<MessageDefinitions>, Error> {
     match socket.recv_from(buf).await {
-        Ok((received, origin)) => {
+        Ok((_received, _origin)) => {
             match Message::<MessageDefinitions>::from_reader(&mut buf.as_slice()) {
                 Ok(message) => Ok(message),
                 Err(err) => Err(Error::from(err)),
