@@ -6,4 +6,6 @@ pub enum Error {
     ProtocolError(#[from] crate::protocol::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error("Unexpected discovery message: {0:?}")]
+    UnexpectedDiscoveryMessage(crate::protocol::Header),
 }
