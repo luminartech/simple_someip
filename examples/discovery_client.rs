@@ -17,23 +17,30 @@ struct DiscoveredIpV4Endpoint {
     port: u16,
 }
 
+fn clear_console() {
+    print!("{}[2J", 27 as char);
+    print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let mut client =
-        simple_someip::Client::<DiscoveryOnlyPayload>::new(Ipv4Addr::new(192, 168, 10, 87));
+        simple_someip::Client::<DiscoveryOnlyPayload>::new(Ipv4Addr::new(192, 168, 10, 90));
     client.bind_discovery().await.unwrap();
+
+    client
+        .set_interface(Ipv4Addr::new(192, 168, 10, 87))
+        .await
+        .unwrap();
     loop {
         let update = client.run().await;
+        clear_console();
         match update {
             simple_someip::ClientUpdate::DiscoveryUpdated(header) => {
-                print!("{}[2J", 27 as char);
-                print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
                 println!("{header}")
             }
             simple_someip::ClientUpdate::Unicast(_) => todo!(),
             simple_someip::ClientUpdate::Error(error) => {
-                print!("{}[2J", 27 as char);
-                print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
                 println!("Error: {:?}", error);
             }
         }
