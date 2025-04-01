@@ -29,7 +29,7 @@ pub trait WireFormat: Send + Sized + Sync {
 /// [`Reader`](std::io::Read) and serialized to a [`Writer`](std::io::Write).
 /// Note that SOME/IP payloads are not self identifying, so the [Message ID](protocol::MessageId)
 /// must be provided by the caller after reading from the [SOME/IP header](protocol::Header).
-pub trait PayloadWireFormat: Send + Sized + Sync {
+pub trait PayloadWireFormat: std::fmt::Debug + Send + Sized + Sync {
     /// Get the Message ID for te payload
     fn message_id(&self) -> MessageId;
     /// Get the payload as a service discovery header
