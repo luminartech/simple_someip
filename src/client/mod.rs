@@ -36,8 +36,8 @@ where
         }
     }
 
-    pub async fn run(&mut self) -> ClientUpdate<PayloadDefinitions> {
-        self.update_receiver.recv().await.unwrap()
+    pub async fn run(&mut self) -> Option<ClientUpdate<PayloadDefinitions>> {
+        self.update_receiver.recv().await
     }
 
     pub fn interface(&self) -> Ipv4Addr {
