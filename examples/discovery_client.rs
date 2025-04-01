@@ -39,8 +39,7 @@ async fn main() -> Result<(), Error> {
         .await
         .unwrap();
 
-    loop {
-        let update = client.run().await;
+    while let Some(update) = client.run().await {
         clear_console();
         match update {
             simple_someip::ClientUpdate::DiscoveryUpdated(header) => {
@@ -52,4 +51,5 @@ async fn main() -> Result<(), Error> {
             }
         }
     }
+    Ok(())
 }
