@@ -5,7 +5,7 @@ mod inner;
 use inner::{Control, ControlMessage, Inner};
 use tokio::sync::mpsc;
 
-use crate::{ Error, traits::PayloadWireFormat};
+use crate::{Error, protocol, traits::PayloadWireFormat};
 use std::net::Ipv4Addr;
 
 #[derive(Debug)]
@@ -18,14 +18,13 @@ pub enum ClientUpdate<MessageDefinitions> {
 #[derive(Debug)]
 pub struct Client<MessageDefinitions> {
     interface: Ipv4Addr,
-    control_sender: mpsc::Sender<inner::ControlMessage>,
+    control_sender: mpsc::Sender<inner::ControlMessage<MessageDefinitions>>,
     update_receiver: mpsc::Receiver<ClientUpdate<MessageDefinitions>>,
-    phantom: std::marker::PhantomData<MessageDefinitions>,
 }
 
-impl<MessageDefinitions> Client<MessageDefinitions>
+impl<PayloadDefinitions> Client<PayloadDefinitions>
 where
-    MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
+    PayloadDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
 {
     pub fn new(interface: Ipv4Addr) -> Self {
         let (control_sender, update_receiver) = Inner::new(interface);
@@ -34,11 +33,10 @@ where
             interface,
             control_sender,
             update_receiver,
-            phantom: std::marker::PhantomData,
         }
     }
 
-    pub async fn run(&mut self) -> ClientUpdate<MessageDefinitions> {
+    pub async fn run(&mut self) -> ClientUpdate<PayloadDefinitions> {
         self.update_receiver.recv().await.unwrap()
     }
 
@@ -62,7 +60,17 @@ where
             .await
     }
 
-    async fn send_control_message(&mut self, control: Control) -> Result<(), Error> {
+    pub async fn send_sd_message(
+        &mut self,
+        sd_header: crate::protocol::sd::Header,
+    ) -> Result<(), Error> {
+        self.send_control_message(Control::SendSD(sd_header)).await
+    }
+
+    async fn send_control_message(
+        &mut self,
+        control: Control<PayloadDefinitions>,
+    ) -> Result<(), Error> {
         let (control_message, response_sender) = ControlMessage::new(control);
         self.control_sender.send(control_message).await.unwrap();
         response_sender.await.unwrap()

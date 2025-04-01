@@ -7,6 +7,7 @@ use simple_someip::{
     },
     traits::DiscoveryOnlyPayload,
 };
+use tracing::level_filters::LevelFilter;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DiscoveredIpV4Endpoint {
@@ -24,14 +25,20 @@ fn clear_console() {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    tracing_subscriber::fmt()
+        .with_max_level(LevelFilter::TRACE)
+        .init();
+    // Bind with an interface that *doesn't* work
     let mut client =
         simple_someip::Client::<DiscoveryOnlyPayload>::new(Ipv4Addr::new(192, 168, 10, 90));
     client.bind_discovery().await.unwrap();
 
+    // Change the interface to one that *does* work
     client
         .set_interface(Ipv4Addr::new(192, 168, 10, 87))
         .await
         .unwrap();
+
     loop {
         let update = client.run().await;
         clear_console();
