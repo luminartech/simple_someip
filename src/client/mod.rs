@@ -1,12 +1,14 @@
 mod discovery_info;
-pub use discovery_info::{DiscoveredIpV4Endpoint, DiscoveryInfo, EndpointInfo};
 mod inner;
+mod socket_manager;
 
+pub use discovery_info::{DiscoveredIpV4Endpoint, DiscoveryInfo};
 use inner::{Control, ControlMessage, Inner};
-use tokio::sync::mpsc;
+use socket_manager::SocketManager;
 
 use crate::{Error, protocol::Message, traits::PayloadWireFormat};
 use std::net::Ipv4Addr;
+use tokio::sync::mpsc;
 
 #[derive(Debug)]
 pub enum ClientUpdate<MessageDefinitions> {
