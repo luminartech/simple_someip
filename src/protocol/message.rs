@@ -28,14 +28,28 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
         &self.header
     }
 
+    pub fn header_mut(&mut self) -> &mut Header {
+        &mut self.header
+    }
+
     pub const fn is_sd(&self) -> bool {
         self.header.is_sd()
+    }
+
+    pub fn set_session_id(&mut self, session_id: u32) {
+        self.header.set_session_id(session_id);
     }
 
     pub fn get_sd_header(&self) -> Option<&sd::Header> {
         assert!(self.header().message_id.is_sd());
         assert!(!self.header().message_type.is_tp());
         self.payload.as_sd_header()
+    }
+
+    pub fn get_sd_header_mut(&mut self) -> Option<&mut sd::Header> {
+        assert!(self.header().message_id.is_sd());
+        assert!(!self.header().message_type.is_tp());
+        self.payload.as_sd_header_mut()
     }
 
     pub fn payload(&self) -> &PayloadDefinition {

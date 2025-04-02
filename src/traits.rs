@@ -34,6 +34,8 @@ pub trait PayloadWireFormat: std::fmt::Debug + Send + Sized + Sync {
     fn message_id(&self) -> MessageId;
     /// Get the payload as a service discovery header
     fn as_sd_header(&self) -> Option<&crate::protocol::sd::Header>;
+    /// Get the payload as a mutable service discovery header
+    fn as_sd_header_mut(&mut self) -> Option<&mut crate::protocol::sd::Header>;
     /// Deserialize a payload from a [Reader](std::io::Read) given the Message ID.
     fn from_reader_with_message_id<T: std::io::Read>(
         message_id: MessageId,
@@ -59,6 +61,10 @@ impl PayloadWireFormat for DiscoveryOnlyPayload {
 
     fn as_sd_header(&self) -> Option<&crate::protocol::sd::Header> {
         Some(&self.header)
+    }
+
+    fn as_sd_header_mut(&mut self) -> Option<&mut crate::protocol::sd::Header> {
+        Some(&mut self.header)
     }
 
     fn from_reader_with_message_id<T: std::io::Read>(

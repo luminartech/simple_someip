@@ -5,7 +5,7 @@ mod inner;
 use inner::{Control, ControlMessage, Inner};
 use tokio::sync::mpsc;
 
-use crate::{Error, protocol, traits::PayloadWireFormat};
+use crate::{Error, protocol::Message, traits::PayloadWireFormat};
 use std::net::Ipv4Addr;
 
 #[derive(Debug)]
@@ -60,11 +60,20 @@ where
             .await
     }
 
+    pub async fn bind_unicast(&mut self) -> Result<(), Error> {
+        self.send_control_message(Control::BindUnicast).await
+    }
+
+    pub async fn unbind_unicast(&mut self) -> Result<(), Error> {
+        self.send_control_message(Control::UnbindUnicast).await
+    }
+
     pub async fn send_sd_message(
         &mut self,
-        sd_header: crate::protocol::sd::Header,
+        sd_header: &crate::protocol::sd::Header,
     ) -> Result<(), Error> {
-        self.send_control_message(Control::SendSD(sd_header)).await
+        let message = Message::new_sd(0, sd_header);
+        self.send_control_message(Control::Send(message)).await
     }
 
     async fn send_control_message(

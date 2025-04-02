@@ -13,11 +13,11 @@ use tokio::{
         oneshot,
     },
 };
-use tracing::{debug, field::debug, info, trace};
+use tracing::{debug, error, field::debug, info, trace};
 
 use crate::{
     Error, SD_MULTICAST_IP, SD_MULTICAST_PORT,
-    protocol::{self, Message, sd},
+    protocol::{Message, sd},
     traits::{PayloadWireFormat, WireFormat},
 };
 
@@ -30,7 +30,6 @@ pub(super) enum Control<PayloadDefinition> {
     UnbindDiscovery,
     BindUnicast,
     UnbindUnicast,
-    SendSD(sd::Header),
     Send(Message<PayloadDefinition>),
 }
 
@@ -55,6 +54,7 @@ where
 #[derive(Debug)]
 struct UnicastInfo<PayloadDefinitions> {
     receiver: mpsc::Receiver<Option<Message<PayloadDefinitions>>>,
+    session_id: u16,
     port: u16,
 }
 
@@ -155,31 +155,37 @@ where
         let bind_addr = SocketAddr::new(IpAddr::V4(interface), 0);
         let unicast_socket = UdpSocket::bind(bind_addr).await?;
         // We've bound the socket successfully, so we can store the unicast info
+        let port = unicast_socket.local_addr().unwrap().port();
         self.unicast_info = Some(UnicastInfo {
             receiver,
-            port: unicast_socket.local_addr().unwrap().port(),
+            session_id: 0,
+            port,
         });
+        info!("Unicast socket succesffully bound on port {}", port);
         tokio::spawn(async move {
             let mut buf = vec![0; 1400];
+
             loop {
                 select! {
                     _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                         if sender.send(None).await.is_err() {
+                            info!("Client inner loop stopped, closing unicast socket.");
                             // The receiver has been dropped, so we should exit
                             break;
                         }
                     }
                     Ok((_, _)) = unicast_socket.recv_from(&mut buf) => {
-                        println!("Unicast message received");
                         match Message::<PayloadDefinitions>::from_reader(&mut buf.as_slice()) {
                             Ok(message) => {
-                                println!("Received unicast message: {:?}", message);
+                                debug!("Received unicast message: {:?}", message);
                                 if sender.send(Some(message)).await.is_err() {
                                     break;
                                 }
                             }
-                            Err(_) => {
+                            Err(e) => {
+                                error!("Error decoding unicast message: {:?}", e);
                                 if sender.send(None).await.is_err() {
+                                    info!("Client inner loop stopped, closing unicast socket.");
                                     // The receiver has been dropped, so we should exit
                                     break;
                                 }
@@ -194,7 +200,6 @@ where
 
     async fn unbind_unicast(&mut self) {
         self.unicast_info = None;
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 
     async fn receive_discovery(
@@ -284,8 +289,13 @@ where
                         return;
                     }
                 }
-                Control::SendSD(header) => todo!(),
-                Control::Send(message) => todo!(),
+                Control::Send(mut message) => {
+                    if message.is_sd() {
+                        let header = message.header_mut();
+                        let sd_header = message.get_sd_header_mut().unwrap();
+                    } else {
+                    }
+                }
             }
         }
     }

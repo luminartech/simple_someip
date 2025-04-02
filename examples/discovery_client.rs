@@ -1,22 +1,7 @@
 use std::net::Ipv4Addr;
 
-use simple_someip::{
-    protocol::{
-        Error,
-        sd::{Entry, Options, TransportProtocol},
-    },
-    traits::DiscoveryOnlyPayload,
-};
+use simple_someip::{protocol::Error, traits::DiscoveryOnlyPayload};
 use tracing::level_filters::LevelFilter;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DiscoveredIpV4Endpoint {
-    service_id: u16,
-    instance_id: u16,
-    ip: Ipv4Addr,
-    protocol: TransportProtocol,
-    port: u16,
-}
 
 fn clear_console() {
     print!("{}[2J", 27 as char);
