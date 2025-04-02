@@ -1,27 +1,22 @@
-use std::{
-    future,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    thread::sleep,
-    time::Duration,
-};
+use std::{future, net::Ipv4Addr, thread::sleep, time::Duration};
 
 use tokio::{
-    net::UdpSocket,
     select,
     sync::{
         mpsc::{self, Receiver, Sender},
         oneshot,
     },
 };
-use tracing::{debug, error, field::debug, info, trace};
+use tracing::{debug, field::debug, info, warn};
 
 use crate::{
-    Error, SD_MULTICAST_IP, SD_MULTICAST_PORT,
+    DiscoveryInfo, Error, SD_MULTICAST_IP, SD_MULTICAST_PORT,
+    client::ClientUpdate,
     protocol::{Message, sd},
-    traits::{PayloadWireFormat, WireFormat},
+    traits::PayloadWireFormat,
 };
 
-use super::{ClientUpdate, DiscoveryInfo};
+use super::socket_manager::SocketManager;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Control<PayloadDefinition> {
@@ -68,12 +63,12 @@ pub(super) struct Inner<PayloadDefinitions> {
     update_sender: mpsc::Sender<ClientUpdate<PayloadDefinitions>>,
     /// Target interface for sockets
     interface: Ipv4Addr,
-    /// MPSC Receiver used to receive discovery messages
-    discovery_receiver: Option<mpsc::Receiver<Result<Message<PayloadDefinitions>, Error>>>,
     /// Discovery information containing endpoint information
     discovery_info: DiscoveryInfo,
-    /// Unicast information containing the receiver and port if a unicase socket is bound
-    unicast_info: Option<UnicastInfo<PayloadDefinitions>>,
+    /// Socket manager for service discovery if bound
+    discovery_socket: Option<SocketManager<PayloadDefinitions>>,
+    /// Socket manager for unicast messages if bound
+    unicast_socket: Option<SocketManager<PayloadDefinitions>>,
     /// Phantom data to represent the generic message definitions
     phantom: std::marker::PhantomData<PayloadDefinitions>,
 }
@@ -96,9 +91,9 @@ where
             active_request: None,
             update_sender,
             interface,
-            discovery_receiver: None,
             discovery_info: DiscoveryInfo::new(),
-            unicast_info: None,
+            discovery_socket: None,
+            unicast_socket: None,
             phantom: std::marker::PhantomData,
         };
         inner.run();
@@ -106,107 +101,55 @@ where
     }
 
     async fn bind_discovery(&mut self) -> Result<(), Error> {
-        let (sender, receiver) = mpsc::channel(16);
-        let bind_addr =
-            std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), SD_MULTICAST_PORT);
-        let mut discovery_socket = UdpSocket::bind(bind_addr).await?;
-        info!(
-            "Bound Discovery socket to: {}",
-            discovery_socket.local_addr().unwrap()
-        );
-        discovery_socket.join_multicast_v4(SD_MULTICAST_IP, self.interface)?;
-        tokio::spawn(async move {
-            let mut buf = vec![0; 1400];
-            loop {
-                select! {
-                    message = receive::<PayloadDefinitions>(&mut discovery_socket, &mut buf) => {
-                        match sender.send(message).await {
-                            Ok(_) => {}
-                            Err(_) => {
-                                info!("Discovery Socket Dropping");
-                                // The receiver has been dropped, so we should exit
-                                break;
-                            }
-                        }
-                    },
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(125)) => {}
-                }
-                if sender.is_closed() {
-                    break;
-                }
-            }
-        });
-        self.discovery_receiver = Some(receiver);
-        Ok(())
+        if self.discovery_socket.is_some() {
+            warn!("Discovery socket already bound!");
+            Ok(())
+        } else {
+            self.discovery_socket = Some(
+                SocketManager::bind_multicast(self.interface, SD_MULTICAST_IP, SD_MULTICAST_PORT)
+                    .await?,
+            );
+            Ok(())
+        }
     }
 
     // Dropping the receiver kills the loop
     fn unbind_discovery(&mut self) {
         debug("Unbinding Discovery socket.");
-        self.discovery_receiver = None;
+        self.discovery_socket = None;
     }
 
     async fn set_interface(&mut self, interface: Ipv4Addr) {
         self.interface = interface;
     }
 
-    async fn bind_unicast(&mut self, interface: Ipv4Addr) -> Result<(), Error> {
-        let (sender, receiver) = mpsc::channel(16);
-        let bind_addr = SocketAddr::new(IpAddr::V4(interface), 0);
-        let unicast_socket = UdpSocket::bind(bind_addr).await?;
-        // We've bound the socket successfully, so we can store the unicast info
-        let port = unicast_socket.local_addr().unwrap().port();
-        self.unicast_info = Some(UnicastInfo {
-            receiver,
-            session_id: 0,
-            port,
-        });
-        info!("Unicast socket succesffully bound on port {}", port);
-        tokio::spawn(async move {
-            let mut buf = vec![0; 1400];
-
-            loop {
-                select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
-                        if sender.send(None).await.is_err() {
-                            info!("Client inner loop stopped, closing unicast socket.");
-                            // The receiver has been dropped, so we should exit
-                            break;
-                        }
-                    }
-                    Ok((_, _)) = unicast_socket.recv_from(&mut buf) => {
-                        match Message::<PayloadDefinitions>::from_reader(&mut buf.as_slice()) {
-                            Ok(message) => {
-                                debug!("Received unicast message: {:?}", message);
-                                if sender.send(Some(message)).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                error!("Error decoding unicast message: {:?}", e);
-                                if sender.send(None).await.is_err() {
-                                    info!("Client inner loop stopped, closing unicast socket.");
-                                    // The receiver has been dropped, so we should exit
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        Ok(())
+    async fn bind_unicast(&mut self) -> Result<(), Error> {
+        if self.unicast_socket.is_some() {
+            warn!("Unicast socket already bound!");
+            Ok(())
+        } else {
+            self.unicast_socket = Some(SocketManager::bind(0).await?);
+            Ok(())
+        }
     }
 
     async fn unbind_unicast(&mut self) {
-        self.unicast_info = None;
+        self.unicast_socket = None;
+    }
+
+    fn update_message(&self, message: &mut Message<PayloadDefinitions>) {
+        if message.is_sd() {
+            let header = message.header_mut();
+            let sd_header = message.get_sd_header_mut().unwrap();
+        } else {
+        }
     }
 
     async fn receive_discovery(
-        discovery_receiver: &mut Option<mpsc::Receiver<Result<Message<PayloadDefinitions>, Error>>>,
+        socket_manager: &mut Option<SocketManager<PayloadDefinitions>>,
     ) -> Result<sd::Header, Error> {
-        if let Some(receiver) = discovery_receiver {
-            match receiver.recv().await {
+        if let Some(receiver) = socket_manager {
+            match receiver.receive().await {
                 Some(message) => match message {
                     Ok(message) => {
                         if let Some(header) = message.get_sd_header() {
@@ -227,22 +170,12 @@ where
         }
     }
 
-    /*
-        async fn receive_unicast(&mut self) -> Result<MessageDefinitions, Error> {
-            if let Some(unicast_info) = self.unicast_info.as_ref() {
-                unicast_info.receiver.recv().await
-            } else {
-                None
-            }
-        }
-    */
-
     async fn handle_control_message(&mut self) {
         if let Some(active_request) = self.active_request.take() {
             match active_request.control {
                 Control::SetInterface(interface) => {
                     info!("Binding to interface: {}", interface);
-                    if self.discovery_receiver.is_some() {
+                    if self.discovery_socket.is_some() {
                         self.unbind_discovery();
                         sleep(Duration::from_millis(250));
                         self.active_request = Some(active_request);
@@ -275,7 +208,7 @@ where
                 Control::BindUnicast => {
                     if active_request
                         .response
-                        .send(self.bind_unicast(self.interface).await)
+                        .send(self.bind_unicast().await)
                         .is_err()
                     {
                         // The sender has been dropped, so we should exit
@@ -290,11 +223,8 @@ where
                     }
                 }
                 Control::Send(mut message) => {
-                    if message.is_sd() {
-                        let header = message.header_mut();
-                        let sd_header = message.get_sd_header_mut().unwrap();
-                    } else {
-                    }
+                    self.update_message(&mut message);
+                    if message.is_sd() {}
                 }
             }
         }
@@ -306,8 +236,9 @@ where
             loop {
                 let Self {
                     control_receiver,
-                    discovery_receiver,
                     discovery_info,
+                    discovery_socket,
+                    unicast_socket,
                     update_sender,
                     ..
                 } = &mut self;
@@ -324,7 +255,7 @@ where
                         }
                     }
                     // Receive a discovery message
-                    discovery = Inner::receive_discovery(discovery_receiver) => {
+                    discovery = Inner::receive_discovery(discovery_socket) => {
                         match discovery {
                             Ok(header) => {
                                 match discovery_info.update(header) {
@@ -354,23 +285,5 @@ where
                 self.handle_control_message().await;
             }
         });
-    }
-}
-
-async fn receive<MessageDefinitions: PayloadWireFormat>(
-    socket: &mut UdpSocket,
-    buf: &mut Vec<u8>,
-) -> Result<Message<MessageDefinitions>, Error> {
-    match socket.recv_from(buf).await {
-        Ok((_received, _origin)) => {
-            match Message::<MessageDefinitions>::from_reader(&mut buf.as_slice()) {
-                Ok(message) => {
-                    trace!("Received message: {:?}", message);
-                    Ok(message)
-                }
-                Err(err) => Err(Error::from(err)),
-            }
-        }
-        Err(err) => Err(Error::from(err)),
     }
 }
