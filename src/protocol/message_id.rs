@@ -13,11 +13,13 @@ impl From<u32> for MessageId {
 }
 
 impl MessageId {
+    pub const SD: Self = Self::sd();
     /// Create a new MessageId.
     pub const fn new(message_id: u32) -> Self {
         MessageId(message_id)
     }
-    pub const fn new_sd() -> Self {
+
+    pub const fn sd() -> Self {
         super::SD_MESSAGE_ID
     }
 

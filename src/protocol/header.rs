@@ -13,7 +13,7 @@ pub struct Header {
     /// Length of the message in bytes, starting at the request Id
     /// Total length of the message is therefore length + 8
     pub length: u32,
-    pub request_id: u32,
+    pub session_id: u32,
     pub protocol_version: u8,
     pub interface_version: u8,
     pub message_type: MessageTypeField,
@@ -21,11 +21,11 @@ pub struct Header {
 }
 
 impl Header {
-    pub fn new_sd(request_id: u32, sd_header_size: usize) -> Self {
+    pub fn new_sd(session_id: u32, sd_header_size: usize) -> Self {
         Self {
-            message_id: MessageId::new_sd(),
+            message_id: MessageId::SD,
             length: 8 + sd_header_size as u32,
-            request_id,
+            session_id,
             protocol_version: 0x01,
             interface_version: 0x01,
             message_type: MessageTypeField::new_sd(),
@@ -37,8 +37,12 @@ impl Header {
         self.message_id.is_sd()
     }
 
-    pub fn payload_size(&self) -> usize {
+    pub const fn payload_size(&self) -> usize {
         self.length as usize - 8
+    }
+
+    pub fn set_session_id(&mut self, session_id: u32) {
+        self.session_id = session_id;
     }
 }
 
@@ -57,7 +61,7 @@ impl WireFormat for Header {
         Ok(Self {
             message_id,
             length,
-            request_id,
+            session_id: request_id,
             protocol_version,
             interface_version,
             message_type,
@@ -72,7 +76,7 @@ impl WireFormat for Header {
     fn to_writer<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
         writer.write_u32::<BigEndian>(self.message_id.message_id())?;
         writer.write_u32::<BigEndian>(self.length)?;
-        writer.write_u32::<BigEndian>(self.request_id)?;
+        writer.write_u32::<BigEndian>(self.session_id)?;
         writer.write_u8(self.protocol_version)?;
         writer.write_u8(self.interface_version)?;
         writer.write_u8(u8::from(self.message_type))?;
