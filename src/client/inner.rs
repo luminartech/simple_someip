@@ -44,6 +44,13 @@ where
         let (response, receiver) = oneshot::channel();
         (Self { control, response }, receiver)
     }
+
+    pub fn with_response(
+        control: Control<PayloadDefinition>,
+        response: oneshot::Sender<Result<(), Error>>,
+    ) -> Self {
+        Self { control, response }
+    }
 }
 
 #[derive(Debug)]
@@ -119,8 +126,8 @@ where
         self.discovery_socket = None;
     }
 
-    async fn set_interface(&mut self, interface: Ipv4Addr) {
-        self.interface = interface;
+    async fn set_interface(&mut self, interface: &Ipv4Addr) {
+        self.interface = interface.clone();
     }
 
     async fn bind_unicast(&mut self) -> Result<(), Error> {
@@ -137,10 +144,10 @@ where
         self.unicast_socket = None;
     }
 
-    fn update_message(&self, message: &mut Message<PayloadDefinitions>) {
+    fn update_message(&self, message: &Message<PayloadDefinitions>) {
         if message.is_sd() {
-            let header = message.header_mut();
-            let sd_header = message.get_sd_header_mut().unwrap();
+            let mut header = message.header().clone();
+            let mut sd_header = message.get_sd_header().unwrap().clone();
         } else {
         }
     }
@@ -172,59 +179,71 @@ where
 
     async fn handle_control_message(&mut self) {
         if let Some(active_request) = self.active_request.take() {
-            match active_request.control {
+            let ControlMessage { control, response } = active_request;
+            match &control {
                 Control::SetInterface(interface) => {
                     info!("Binding to interface: {}", interface);
                     if self.discovery_socket.is_some() {
                         self.unbind_discovery();
-                        sleep(Duration::from_millis(250));
-                        self.active_request = Some(active_request);
+                        self.active_request = Some(ControlMessage::with_response(
+                            Control::SetInterface(interface.to_owned()),
+                            response,
+                        ));
+
                         return;
                     }
                     self.set_interface(interface).await;
-                    if active_request
-                        .response
-                        .send(self.bind_discovery().await)
-                        .is_err()
-                    {
+                    if response.send(self.bind_discovery().await).is_err() {
                         // The sender has been dropped, so we should exit
                         return;
                     }
                 }
                 Control::BindDiscovery => {
                     let result = self.bind_discovery().await;
-                    if active_request.response.send(result).is_err() {
+                    if response.send(result).is_err() {
                         // The sender has been dropped, so we should exit
                         return;
                     }
                 }
                 Control::UnbindDiscovery => {
                     self.unbind_discovery();
-                    if active_request.response.send(Ok(())).is_err() {
+                    if response.send(Ok(())).is_err() {
                         // The sender has been dropped, so we should exit
                         return;
                     }
                 }
                 Control::BindUnicast => {
-                    if active_request
-                        .response
-                        .send(self.bind_unicast().await)
-                        .is_err()
-                    {
+                    if response.send(self.bind_unicast().await).is_err() {
                         // The sender has been dropped, so we should exit
                         return;
                     }
                 }
                 Control::UnbindUnicast => {
                     self.unbind_unicast().await;
-                    if active_request.response.send(Ok(())).is_err() {
+                    if response.send(Ok(())).is_err() {
                         // The sender has been dropped, so we should exit
                         return;
                     }
                 }
-                Control::Send(mut message) => {
-                    self.update_message(&mut message);
-                    if message.is_sd() {}
+                Control::Send(message) => {
+                    // If the discovery socket is not bound, bind it
+                    if self.discovery_socket.is_none() {
+                        match self.bind_discovery().await {
+                            Ok(_) => {
+                                self.active_request = Some(ControlMessage::with_response(
+                                    Control::Send(message.to_owned()),
+                                    response,
+                                ));
+                            }
+                            Err(e) => {
+                                if response.send(Err(e)).is_err() {
+                                    // The sender has been dropped, so we should exit
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    let updated = self.update_message(&message);
                 }
             }
         }
@@ -247,6 +266,7 @@ where
                     // Receive a control message
                     ctrl = control_receiver.recv() => {
                         if let Some(ctrl) = ctrl {
+                            assert!(self.active_request.is_none());
                             debug!("Received control message: {:?}", ctrl.control);
                             self.active_request = Some(ctrl);
                         } else {
