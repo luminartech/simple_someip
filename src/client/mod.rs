@@ -3,11 +3,11 @@ mod inner;
 mod socket_manager;
 
 pub use discovery_info::{DiscoveredIpV4Endpoint, DiscoveryInfo};
-use inner::{Control, ControlMessage, Inner};
-use socket_manager::SocketManager;
+pub use inner::ControlResponse;
 
 use crate::{Error, protocol::Message, traits::PayloadWireFormat};
-use std::net::Ipv4Addr;
+use inner::{Control, ControlMessage, Inner};
+use std::net::{Ipv4Addr, SocketAddrV4};
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
@@ -53,35 +53,37 @@ where
         Ok(())
     }
 
-    pub async fn bind_discovery(&mut self) -> Result<(), Error> {
+    pub async fn bind_discovery(&mut self) -> Result<ControlResponse, Error> {
         self.send_control_message(Control::BindDiscovery).await
     }
 
-    pub async fn unbind_discovery(&mut self) -> Result<(), Error> {
+    pub async fn unbind_discovery(&mut self) -> Result<ControlResponse, Error> {
         self.send_control_message(inner::Control::UnbindDiscovery)
             .await
     }
 
-    pub async fn bind_unicast(&mut self) -> Result<(), Error> {
-        self.send_control_message(Control::BindUnicast).await
+    pub async fn bind_unicast(&mut self, target: SocketAddrV4) -> Result<ControlResponse, Error> {
+        self.send_control_message(Control::BindUnicast(target))
+            .await
     }
 
-    pub async fn unbind_unicast(&mut self) -> Result<(), Error> {
+    pub async fn unbind_unicast(&mut self) -> Result<ControlResponse, Error> {
         self.send_control_message(Control::UnbindUnicast).await
     }
 
     pub async fn send_sd_message(
         &mut self,
+        target: SocketAddrV4,
         sd_header: &crate::protocol::sd::Header,
-    ) -> Result<(), Error> {
-        let message = Message::new_sd(0, sd_header);
-        self.send_control_message(Control::Send(message)).await
+    ) -> Result<ControlResponse, Error> {
+        self.send_control_message(Control::SendSD(target, sd_header.to_owned()))
+            .await
     }
 
     async fn send_control_message(
         &mut self,
         control: Control<PayloadDefinitions>,
-    ) -> Result<(), Error> {
+    ) -> Result<ControlResponse, Error> {
         let (control_message, response_sender) = ControlMessage::new(control);
         self.control_sender.send(control_message).await.unwrap();
         response_sender.await.unwrap()

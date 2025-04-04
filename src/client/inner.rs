@@ -1,4 +1,7 @@
-use std::{future, net::Ipv4Addr, thread::sleep, time::Duration};
+use std::{
+    future,
+    net::{Ipv4Addr, SocketAddrV4},
+};
 
 use tokio::{
     select,
@@ -10,7 +13,7 @@ use tokio::{
 use tracing::{debug, field::debug, info, warn};
 
 use crate::{
-    DiscoveryInfo, Error, SD_MULTICAST_IP, SD_MULTICAST_PORT,
+    DiscoveryInfo, Error,
     client::ClientUpdate,
     protocol::{Message, sd},
     traits::PayloadWireFormat,
@@ -23,15 +26,16 @@ pub(super) enum Control<PayloadDefinition> {
     SetInterface(Ipv4Addr),
     BindDiscovery,
     UnbindDiscovery,
-    BindUnicast,
+    BindUnicast(SocketAddrV4),
     UnbindUnicast,
-    Send(Message<PayloadDefinition>),
+    SendSD(SocketAddrV4, sd::Header),
+    Send(SocketAddrV4, Message<PayloadDefinition>),
 }
 
 #[derive(Debug)]
 pub(super) struct ControlMessage<PayloadDefinition> {
     control: Control<PayloadDefinition>,
-    response: oneshot::Sender<Result<(), Error>>,
+    response: oneshot::Sender<Result<ControlResponse, Error>>,
 }
 
 impl<PayloadDefinition> ControlMessage<PayloadDefinition>
@@ -40,24 +44,23 @@ where
 {
     pub fn new(
         control: Control<PayloadDefinition>,
-    ) -> (Self, oneshot::Receiver<Result<(), Error>>) {
+    ) -> (Self, oneshot::Receiver<Result<ControlResponse, Error>>) {
         let (response, receiver) = oneshot::channel();
         (Self { control, response }, receiver)
     }
 
     pub fn with_response(
         control: Control<PayloadDefinition>,
-        response: oneshot::Sender<Result<(), Error>>,
+        response: oneshot::Sender<Result<ControlResponse, Error>>,
     ) -> Self {
         Self { control, response }
     }
 }
 
 #[derive(Debug)]
-struct UnicastInfo<PayloadDefinitions> {
-    receiver: mpsc::Receiver<Option<Message<PayloadDefinitions>>>,
-    session_id: u16,
-    port: u16,
+pub enum ControlResponse {
+    Success,
+    SocketBind(u16),
 }
 
 #[derive(Debug)]
@@ -107,16 +110,14 @@ where
         (control_sender, update_receiver)
     }
 
-    async fn bind_discovery(&mut self) -> Result<(), Error> {
+    async fn bind_discovery(&mut self) -> Result<ControlResponse, Error> {
         if self.discovery_socket.is_some() {
             warn!("Discovery socket already bound!");
-            Ok(())
+            Ok(ControlResponse::Success)
         } else {
-            self.discovery_socket = Some(
-                SocketManager::bind_multicast(self.interface, SD_MULTICAST_IP, SD_MULTICAST_PORT)
-                    .await?,
-            );
-            Ok(())
+            let socket = SocketManager::bind_discovery(self.interface).await?;
+            self.discovery_socket = Some(socket);
+            Ok(ControlResponse::Success)
         }
     }
 
@@ -130,13 +131,15 @@ where
         self.interface = interface.clone();
     }
 
-    async fn bind_unicast(&mut self) -> Result<(), Error> {
+    async fn bind_unicast(&mut self, target_addr: SocketAddrV4) -> Result<ControlResponse, Error> {
         if self.unicast_socket.is_some() {
             warn!("Unicast socket already bound!");
-            Ok(())
+            Ok(ControlResponse::Success)
         } else {
-            self.unicast_socket = Some(SocketManager::bind(0).await?);
-            Ok(())
+            let unicast_socket = SocketManager::bind(0).await?;
+            let port = unicast_socket.port();
+            self.unicast_socket = Some(unicast_socket);
+            Ok(ControlResponse::SocketBind(port))
         }
     }
 
@@ -146,8 +149,7 @@ where
 
     fn update_message(&self, message: &Message<PayloadDefinitions>) {
         if message.is_sd() {
-            let mut header = message.header().clone();
-            let mut sd_header = message.get_sd_header().unwrap().clone();
+            let header = message.header().clone();
         } else {
         }
     }
@@ -207,43 +209,65 @@ where
                 }
                 Control::UnbindDiscovery => {
                     self.unbind_discovery();
-                    if response.send(Ok(())).is_err() {
+                    if response.send(Ok(ControlResponse::Success)).is_err() {
                         // The sender has been dropped, so we should exit
                         return;
                     }
                 }
-                Control::BindUnicast => {
-                    if response.send(self.bind_unicast().await).is_err() {
+                Control::BindUnicast(target) => {
+                    if response
+                        .send(self.bind_unicast(target.to_owned()).await)
+                        .is_err()
+                    {
                         // The sender has been dropped, so we should exit
                         return;
                     }
                 }
                 Control::UnbindUnicast => {
                     self.unbind_unicast().await;
-                    if response.send(Ok(())).is_err() {
+                    if response.send(Ok(ControlResponse::Success)).is_err() {
                         // The sender has been dropped, so we should exit
                         return;
                     }
                 }
-                Control::Send(message) => {
-                    // If the discovery socket is not bound, bind it
+                Control::SendSD(target, header) => {
+                    // SD Message, If the discovery socket is not bound, bind it
                     if self.discovery_socket.is_none() {
                         match self.bind_discovery().await {
                             Ok(_) => {
                                 self.active_request = Some(ControlMessage::with_response(
-                                    Control::Send(message.to_owned()),
+                                    Control::SendSD(*target, header.to_owned()),
                                     response,
                                 ));
+                                return;
                             }
                             Err(e) => {
                                 if response.send(Err(e)).is_err() {
                                     // The sender has been dropped, so we should exit
-                                    return;
                                 }
+                                return;
                             }
                         }
                     }
-                    let updated = self.update_message(&message);
+                    let message = Message::<PayloadDefinitions>::new_sd(
+                        self.discovery_socket.as_ref().unwrap().session_id() as u32,
+                        header,
+                    );
+                    info!("Sending {:?} to {}", &message, target);
+                    let send_result = self
+                        .discovery_socket
+                        .as_mut()
+                        .unwrap()
+                        .send(*target, message)
+                        .await;
+                    if response.send(send_result).is_err() {
+                        return;
+                    }
+                }
+                Control::Send(target, message) => {
+                    if response.send(Err(Error::UnicastSocketNotBound)).is_err() {
+                        return;
+                    }
                 }
             }
         }
