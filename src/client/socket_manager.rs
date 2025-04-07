@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 
 use tokio::{net::UdpSocket, select, sync::mpsc};
-use tracing::{debug, error, info};
+use tracing::{error, info, trace};
 
 use crate::{
     Error, SD_MULTICAST_IP, SD_MULTICAST_PORT,
@@ -111,7 +111,7 @@ where
                     message = tx_rx.recv() => {
                         match message {
                             Some(message) => {
-                                debug!("Sending: {:?}", message);
+                                trace!("Sending: {:?}", message);
                                 let message_length = message.1.to_writer(&mut buf.as_mut_slice()).unwrap();
                                 socket.send_to(&buf[..message_length], message.0).await.unwrap();
                             }
