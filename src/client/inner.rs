@@ -9,7 +9,7 @@ use tokio::{
         oneshot,
     },
 };
-use tracing::{debug, field::debug, info, warn};
+use tracing::{debug, field::debug, info, trace, warn};
 
 use crate::{
     Error,
@@ -107,7 +107,6 @@ where
 
     async fn bind_discovery(&mut self) -> Result<ControlResponse, Error> {
         if self.discovery_socket.is_some() {
-            warn!("Discovery socket already bound!");
             Ok(ControlResponse::Success)
         } else {
             let socket = SocketManager::bind_discovery(self.interface).await?;
@@ -128,7 +127,6 @@ where
 
     async fn bind_unicast(&mut self) -> Result<ControlResponse, Error> {
         if let Some(socket) = &self.unicast_socket {
-            warn!("Unicast socket already bound!");
             Ok(ControlResponse::SocketBind(socket.port()))
         } else {
             let unicast_socket = SocketManager::bind(0).await?;
@@ -167,13 +165,30 @@ where
         }
     }
 
+    async fn receive_unicast(
+        socket_manager: &mut Option<SocketManager<PayloadDefinitions>>,
+    ) -> Result<Message<PayloadDefinitions>, Error> {
+        if let Some(receiver) = socket_manager {
+            match receiver.receive().await {
+                Some(message) => message,
+                None => Err(Error::SocketClosedUnexpectedly),
+            }
+        } else {
+            // If we don't have a receiver, we should return a future that never resolves
+            future::pending().await
+        }
+    }
+
     async fn handle_control_message(&mut self) {
         if let Some(active_request) = self.active_request.take() {
             let ControlMessage { control, response } = active_request;
             match &control {
                 Control::SetInterface(interface) => {
                     if self.discovery_socket.is_some() {
-                        info!("Discovery socket currently bound to interface: {}, unbinding.", self.interface);
+                        info!(
+                            "Discovery socket currently bound to interface: {}, unbinding.",
+                            self.interface
+                        );
                         self.unbind_discovery();
                         self.active_request = Some(ControlMessage::with_response(
                             Control::SetInterface(interface.to_owned()),
@@ -199,7 +214,6 @@ where
                         Err(e) => {
                             warn!("Failed to bind to interface: {}. Error: {:?}", interface, e);
                         }
-                        
                     }
                     if response.send(bind_result).is_err() {
                         // The sender has been dropped, so we should exit
@@ -256,7 +270,7 @@ where
                         self.discovery_socket.as_ref().unwrap().session_id() as u32,
                         header,
                     );
-                    info!("Sending {:?} to {}", &message, target);
+                    debug!("Sending {:?} to {}", &message, target);
                     let send_result = self
                         .discovery_socket
                         .as_mut()
@@ -283,6 +297,7 @@ where
                 let Self {
                     control_receiver,
                     discovery_socket,
+                    unicast_socket,
                     update_sender,
                     ..
                 } = &mut self;
@@ -301,7 +316,7 @@ where
                     }
                     // Receive a discovery message
                     discovery = Inner::receive_discovery(discovery_socket) => {
-                        debug!("Received discovery message");
+                        trace!("Received discovery message");
                         match discovery {
                             Ok(header) => {
                                 if update_sender.send(ClientUpdate::DiscoveryUpdated(header)).await.is_err() {
@@ -316,6 +331,9 @@ where
                                 }
                             }
                         }
+                     }
+                     unicast = Inner::receive_unicast(unicast_socket) => {
+                         info!("{:?}",unicast);
                      }
                 }
                 self.handle_control_message().await;
