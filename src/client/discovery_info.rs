@@ -29,6 +29,10 @@ impl DiscoveryInfo {
         Self(HashMap::new())
     }
 
+    pub fn endpoint_info(&self) -> Vec<&EndpointInfo> {
+        self.0.values().collect()
+    }
+
     pub fn add_endpoint(&mut self, endpoint: DiscoveredIpV4Endpoint) {
         self.0.insert(endpoint, EndpointInfo { last_seen: None });
     }

@@ -26,7 +26,7 @@ pub(super) enum Control<PayloadDefinition> {
     SetInterface(Ipv4Addr),
     BindDiscovery,
     UnbindDiscovery,
-    BindUnicast(SocketAddrV4),
+    BindUnicast,
     UnbindUnicast,
     SendSD(SocketAddrV4, sd::Header),
     Send(SocketAddrV4, Message<PayloadDefinition>),
@@ -131,7 +131,7 @@ where
         self.interface = interface.clone();
     }
 
-    async fn bind_unicast(&mut self, target_addr: SocketAddrV4) -> Result<ControlResponse, Error> {
+    async fn bind_unicast(&mut self) -> Result<ControlResponse, Error> {
         if self.unicast_socket.is_some() {
             warn!("Unicast socket already bound!");
             Ok(ControlResponse::Success)
@@ -145,13 +145,6 @@ where
 
     async fn unbind_unicast(&mut self) {
         self.unicast_socket = None;
-    }
-
-    fn update_message(&self, message: &Message<PayloadDefinitions>) {
-        if message.is_sd() {
-            let header = message.header().clone();
-        } else {
-        }
     }
 
     async fn receive_discovery(
@@ -214,11 +207,8 @@ where
                         return;
                     }
                 }
-                Control::BindUnicast(target) => {
-                    if response
-                        .send(self.bind_unicast(target.to_owned()).await)
-                        .is_err()
-                    {
+                Control::BindUnicast => {
+                    if response.send(self.bind_unicast().await).is_err() {
                         // The sender has been dropped, so we should exit
                         return;
                     }
@@ -264,7 +254,7 @@ where
                         return;
                     }
                 }
-                Control::Send(target, message) => {
+                Control::Send(_target, _message) => {
                     if response.send(Err(Error::UnicastSocketNotBound)).is_err() {
                         return;
                     }
@@ -302,19 +292,9 @@ where
                     discovery = Inner::receive_discovery(discovery_socket) => {
                         match discovery {
                             Ok(header) => {
-                                match discovery_info.update(header) {
-                                    Ok(info) => {
-                                        if update_sender.send(ClientUpdate::DiscoveryUpdated(info)).await.is_err() {
-                                            // The sender has been dropped, so we should exit
-                                            break;
-                                        }
-                                    }
-                                    Err(err) => {
-                                        if update_sender.send(ClientUpdate::Error(err)).await.is_err() {
-                                            // The sender has been dropped, so we should exit
-                                            break;
-                                        }
-                                    }
+                                if update_sender.send(ClientUpdate::DiscoveryUpdated(header)).await.is_err() {
+                                    // The sender has been dropped, so we should exit
+                                    break;
                                 }
                             }
                             Err(err) => {

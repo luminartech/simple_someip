@@ -28,7 +28,7 @@ async fn main() -> Result<(), Error> {
         clear_console();
         match update {
             simple_someip::ClientUpdate::DiscoveryUpdated(header) => {
-                println!("{header}")
+                println!("{header:?}")
             }
             simple_someip::ClientUpdate::Unicast(_) => todo!(),
             simple_someip::ClientUpdate::Error(error) => {
