@@ -86,6 +86,6 @@ where
     ) -> Result<ControlResponse, Error> {
         let (control_message, response_sender) = ControlMessage::new(control);
         self.control_sender.send(control_message).await.unwrap();
-        response_sender.await.unwrap()
+        response_sender.await.unwrap() // The inner client should always respond
     }
 }
