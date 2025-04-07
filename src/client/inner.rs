@@ -127,9 +127,9 @@ where
     }
 
     async fn bind_unicast(&mut self) -> Result<ControlResponse, Error> {
-        if self.unicast_socket.is_some() {
+        if let Some(socket) = &self.unicast_socket {
             warn!("Unicast socket already bound!");
-            Ok(ControlResponse::Success)
+            Ok(ControlResponse::SocketBind(socket.port()))
         } else {
             let unicast_socket = SocketManager::bind(0).await?;
             let port = unicast_socket.port();
@@ -172,8 +172,8 @@ where
             let ControlMessage { control, response } = active_request;
             match &control {
                 Control::SetInterface(interface) => {
-                    info!("Binding to interface: {}", interface);
                     if self.discovery_socket.is_some() {
+                        info!("Discovery socket currently bound to interface: {}, unbinding.", self.interface);
                         self.unbind_discovery();
                         self.active_request = Some(ControlMessage::with_response(
                             Control::SetInterface(interface.to_owned()),
@@ -182,8 +182,26 @@ where
 
                         return;
                     }
-                    self.set_interface(interface).await;
-                    if response.send(self.bind_discovery().await).is_err() {
+                    if self.interface != *interface {
+                        self.set_interface(interface).await;
+                        self.active_request = Some(ControlMessage::with_response(
+                            Control::SetInterface(interface.to_owned()),
+                            response,
+                        ));
+                        return;
+                    }
+                    info!("Binding to interface: {}", interface);
+                    let bind_result = self.bind_discovery().await;
+                    match &bind_result {
+                        Ok(_) => {
+                            info!("Successfully Bound to interface: {}", interface);
+                        }
+                        Err(e) => {
+                            warn!("Failed to bind to interface: {}. Error: {:?}", interface, e);
+                        }
+                        
+                    }
+                    if response.send(bind_result).is_err() {
                         // The sender has been dropped, so we should exit
                         return;
                     }
@@ -283,6 +301,7 @@ where
                     }
                     // Receive a discovery message
                     discovery = Inner::receive_discovery(discovery_socket) => {
+                        debug!("Received discovery message");
                         match discovery {
                             Ok(header) => {
                                 if update_sender.send(ClientUpdate::DiscoveryUpdated(header)).await.is_err() {

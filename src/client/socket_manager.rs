@@ -26,7 +26,8 @@ where
     pub async fn bind_discovery(interface: Ipv4Addr) -> Result<Self, Error> {
         let (rx_tx, rx_rx) = mpsc::channel(16);
         let (tx_tx, tx_rx) = mpsc::channel(16);
-        let bind_addr = std::net::SocketAddr::new(interface.into(), SD_MULTICAST_PORT);
+        let bind_addr =
+            std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), SD_MULTICAST_PORT);
         let socket = UdpSocket::bind(bind_addr).await?;
 
         socket.join_multicast_v4(SD_MULTICAST_IP, interface)?;
