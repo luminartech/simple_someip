@@ -78,20 +78,20 @@ impl OptionsCount {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventGroupEntry {
-    index_first_options_run: u8,
-    index_second_options_run: u8,
-    pub(crate) options_count: OptionsCount,
-    service_id: u16,
-    instance_id: u16,
-    major_version: u8,
+    pub index_first_options_run: u8,
+    pub index_second_options_run: u8,
+    pub options_count: OptionsCount,
+    pub service_id: u16,
+    pub instance_id: u16,
+    pub major_version: u8,
     /// ttl is a u24 value
-    ttl: u32,
-    counter: u16,
-    event_group_id: u16,
+    pub ttl: u32,
+    pub counter: u16,
+    pub event_group_id: u16,
 }
 
 impl EventGroupEntry {
-    pub fn new_subscription(
+    pub fn new(
         service_id: u16,
         instance_id: u16,
         major_version: u8,
@@ -172,7 +172,7 @@ pub struct ServiceEntry {
 }
 
 impl ServiceEntry {
-    pub fn new_find(service_id: u16) -> Self {
+    pub fn find(service_id: u16) -> Self {
         Self {
             index_first_options_run: 0,
             index_second_options_run: 0,

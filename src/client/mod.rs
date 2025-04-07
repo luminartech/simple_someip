@@ -5,15 +5,18 @@ mod socket_manager;
 pub use discovery_info::{DiscoveredIpV4Endpoint, DiscoveryInfo};
 pub use inner::ControlResponse;
 
-use crate::{Error, protocol::Message, traits::PayloadWireFormat};
+use crate::{Error, protocol::sd, traits::PayloadWireFormat};
 use inner::{Control, ControlMessage, Inner};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
 pub enum ClientUpdate<MessageDefinitions> {
-    DiscoveryUpdated(DiscoveryInfo),
+    /// Discovery message received
+    DiscoveryUpdated(sd::Header),
+    /// Unicast message received
     Unicast(MessageDefinitions),
+    /// Inner SOME/IP Client has encountered an error
     Error(Error),
 }
 
@@ -62,9 +65,8 @@ where
             .await
     }
 
-    pub async fn bind_unicast(&mut self, target: SocketAddrV4) -> Result<ControlResponse, Error> {
-        self.send_control_message(Control::BindUnicast(target))
-            .await
+    pub async fn bind_unicast(&mut self) -> Result<ControlResponse, Error> {
+        self.send_control_message(Control::BindUnicast).await
     }
 
     pub async fn unbind_unicast(&mut self) -> Result<ControlResponse, Error> {

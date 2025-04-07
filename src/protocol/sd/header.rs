@@ -4,7 +4,8 @@ use std::{net::Ipv4Addr, vec};
 use crate::{protocol::Error, traits::WireFormat};
 
 use super::{
-    Entry, EventGroupEntry, Flags, Options, ServiceEntry, TransportProtocol, entry::ENTRY_SIZE,
+    Entry, EventGroupEntry, Flags, Options, ServiceEntry, TransportProtocol,
+    entry::{ENTRY_SIZE, OptionsCount},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,10 +24,43 @@ impl Header {
         }
     }
 
+    pub fn new_service_offer(
+        reboot: bool,
+        service_id: u16,
+        instance_id: u16,
+        major_version: u8,
+        minor_version: u32,
+        ttl: u32,
+        client_ip: Ipv4Addr,
+        protocol: TransportProtocol,
+        client_port: u16,
+    ) -> Self {
+        let entry = Entry::OfferService(ServiceEntry {
+            service_id,
+            instance_id,
+            major_version,
+            ttl,
+            index_first_options_run: 0,
+            index_second_options_run: 0,
+            options_count: OptionsCount::new(1, 0),
+            minor_version,
+        });
+        let endpoint = Options::IpV4Endpoint {
+            ip: client_ip.into(),
+            protocol,
+            port: client_port,
+        };
+        Self {
+            flags: Flags::new_sd(reboot),
+            entries: vec![entry],
+            options: vec![endpoint],
+        }
+    }
+
     pub fn new_find_services(reboot: bool, service_ids: Vec<u16>) -> Self {
         let entries = service_ids
             .iter()
-            .map(|service_id| Entry::FindService(ServiceEntry::new_find(*service_id)))
+            .map(|service_id| Entry::FindService(ServiceEntry::find(*service_id)))
             .collect();
         Self {
             flags: Flags::new_sd(reboot),
@@ -47,7 +81,7 @@ impl Header {
         protocol: TransportProtocol,
         client_port: u16,
     ) -> Self {
-        let entry = Entry::SubscribeEventGroup(EventGroupEntry::new_subscription(
+        let entry = Entry::SubscribeEventGroup(EventGroupEntry::new(
             service_id,
             instance_id,
             major_version,
