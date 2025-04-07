@@ -2,7 +2,6 @@ use std::{
     future,
     net::{Ipv4Addr, SocketAddrV4},
 };
-
 use tokio::{
     select,
     sync::{
@@ -15,11 +14,10 @@ use tracing::{debug, field::debug, info, warn};
 use crate::{
     Error,
     client::ClientUpdate,
+    client::socket_manager::SocketManager,
     protocol::{Message, sd},
     traits::PayloadWireFormat,
 };
-
-use super::socket_manager::SocketManager;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Control<PayloadDefinition> {
@@ -267,7 +265,6 @@ where
                 let Self {
                     control_receiver,
                     discovery_socket,
-                    unicast_socket,
                     update_sender,
                     ..
                 } = &mut self;
