@@ -100,6 +100,29 @@ impl Header {
             options: vec![endpoint],
         }
     }
+
+    pub fn subscribe_ack(
+        service_id: u16,
+        instance_id: u16,
+        major_version: u8,
+        ttl: u32,
+        counter: u8,
+        event_group_id: u16,
+    ) -> Self {
+        let entry = Entry::SubscribeAckEventGroup(EventGroupEntry::new(
+            service_id,
+            instance_id,
+            major_version,
+            ttl,
+            counter,
+            event_group_id,
+        ));
+        Self {
+            flags: Flags::new_sd(true),
+            entries: vec![entry],
+            options: vec![],
+        }
+    }
 }
 
 impl WireFormat for Header {
