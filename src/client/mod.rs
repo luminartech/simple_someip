@@ -1,8 +1,6 @@
-mod discovery_info;
 mod inner;
 mod socket_manager;
 
-pub use discovery_info::{DiscoveredIpV4Endpoint, DiscoveryInfo};
 pub use inner::ControlResponse;
 
 use crate::{Error, protocol::sd, traits::PayloadWireFormat};

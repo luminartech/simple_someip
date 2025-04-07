@@ -13,7 +13,7 @@ use tokio::{
 use tracing::{debug, field::debug, info, warn};
 
 use crate::{
-    DiscoveryInfo, Error,
+    Error,
     client::ClientUpdate,
     protocol::{Message, sd},
     traits::PayloadWireFormat,
@@ -73,8 +73,6 @@ pub(super) struct Inner<PayloadDefinitions> {
     update_sender: mpsc::Sender<ClientUpdate<PayloadDefinitions>>,
     /// Target interface for sockets
     interface: Ipv4Addr,
-    /// Discovery information containing endpoint information
-    discovery_info: DiscoveryInfo,
     /// Socket manager for service discovery if bound
     discovery_socket: Option<SocketManager<PayloadDefinitions>>,
     /// Socket manager for unicast messages if bound
@@ -101,7 +99,6 @@ where
             active_request: None,
             update_sender,
             interface,
-            discovery_info: DiscoveryInfo::new(),
             discovery_socket: None,
             unicast_socket: None,
             phantom: std::marker::PhantomData,
@@ -269,7 +266,6 @@ where
             loop {
                 let Self {
                     control_receiver,
-                    discovery_info,
                     discovery_socket,
                     unicast_socket,
                     update_sender,
