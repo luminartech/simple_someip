@@ -56,7 +56,7 @@ pub struct DiscoveryOnlyPayload {
 
 impl PayloadWireFormat for DiscoveryOnlyPayload {
     fn message_id(&self) -> MessageId {
-        protocol::SD_MESSAGE_ID
+        MessageId::SD
     }
 
     fn as_sd_header(&self) -> Option<&crate::protocol::sd::Header> {
