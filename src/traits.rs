@@ -65,12 +65,11 @@ impl PayloadWireFormat for DiscoveryOnlyPayload {
         message_id: MessageId,
         reader: &mut T,
     ) -> Result<Self, protocol::Error> {
-        if message_id.is_sd() {
-            Ok(Self {
+        match message_id {
+            MessageId::SD => Ok(Self {
                 header: protocol::sd::Header::from_reader(reader)?,
-            })
-        } else {
-            Err(protocol::Error::UnsupportedMessageID(message_id))
+            }),
+            _ => Err(protocol::Error::UnsupportedMessageID(message_id)),
         }
     }
 

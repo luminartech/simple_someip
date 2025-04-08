@@ -26,4 +26,6 @@ pub enum Error {
     UnicastSocketNotConnected,
     #[error("Timeout expired")]
     Timeout,
+    #[error("Invalid value for user type: {0}, {1}")]
+    InvalidValueUserType(String, u8),
 }
