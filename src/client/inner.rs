@@ -316,7 +316,7 @@ where
                     }
                     // Receive a discovery message
                     discovery = Inner::receive_discovery(discovery_socket) => {
-                        trace!("Received discovery message");
+                        trace!("Received discovery message: {:?}", discovery);
                         match discovery {
                             Ok(header) => {
                                 if update_sender.send(ClientUpdate::DiscoveryUpdated(header)).await.is_err() {
@@ -333,7 +333,21 @@ where
                         }
                      }
                      unicast = Inner::receive_unicast(unicast_socket) => {
-                         info!("{:?}",unicast);
+                         trace!("Received unicast message: {:?}",unicast);
+                         match unicast {
+                             Ok(message) => {
+                                 if update_sender.send(ClientUpdate::Unicast(message)).await.is_err() {
+                                     // The sender has been dropped, so we should exit
+                                     break;
+                                 }
+                             }
+                             Err(err) => {
+                                 if update_sender.send(ClientUpdate::Error(err)).await.is_err() {
+                                     // The sender has been dropped, so we should exit
+                                     break;
+                                 }
+                             }
+                         }
                      }
                 }
                 self.handle_control_message().await;

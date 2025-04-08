@@ -3,7 +3,11 @@ mod socket_manager;
 
 pub use inner::ControlResponse;
 
-use crate::{Error, protocol::sd, traits::PayloadWireFormat};
+use crate::{
+    Error,
+    protocol::{Message, sd},
+    traits::PayloadWireFormat,
+};
 use inner::{Control, ControlMessage, Inner};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use tokio::sync::mpsc;
@@ -13,7 +17,7 @@ pub enum ClientUpdate<MessageDefinitions> {
     /// Discovery message received
     DiscoveryUpdated(sd::Header),
     /// Unicast message received
-    Unicast(MessageDefinitions),
+    Unicast(Message<MessageDefinitions>),
     /// Inner SOME/IP Client has encountered an error
     Error(Error),
 }

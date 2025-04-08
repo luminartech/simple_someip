@@ -69,6 +69,7 @@ impl PayloadWireFormat for DiscoveryOnlyPayload {
             MessageId::SD => Ok(Self {
                 header: protocol::sd::Header::from_reader(reader)?,
             }),
+
             _ => Err(protocol::Error::UnsupportedMessageID(message_id)),
         }
     }
