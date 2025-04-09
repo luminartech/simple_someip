@@ -116,9 +116,11 @@ where
     }
 
     // Dropping the receiver kills the loop
-    fn unbind_discovery(&mut self) {
+    async fn unbind_discovery(&mut self) {
         debug("Unbinding Discovery socket.");
-        self.discovery_socket = None;
+        if let Some(socket_manger) = self.discovery_socket.take() {
+            socket_manger.shut_down().await;
+        }
     }
 
     async fn set_interface(&mut self, interface: &Ipv4Addr) {
@@ -189,7 +191,7 @@ where
                             "Discovery socket currently bound to interface: {}, unbinding.",
                             self.interface
                         );
-                        self.unbind_discovery();
+                        self.unbind_discovery().await;
                         self.active_request = Some(ControlMessage::with_response(
                             Control::SetInterface(interface.to_owned()),
                             response,
@@ -228,7 +230,7 @@ where
                     }
                 }
                 Control::UnbindDiscovery => {
-                    self.unbind_discovery();
+                    self.unbind_discovery().await;
                     if response.send(Ok(ControlResponse::Success)).is_err() {
                         // The sender has been dropped, so we should exit
                         return;
@@ -305,7 +307,7 @@ where
 
     fn run(mut self) {
         tokio::spawn(async move {
-            debug!("SOME/IP Client processing loop started");
+            info!("SOME/IP Client processing loop started");
             loop {
                 let Self {
                     control_receiver,
@@ -315,7 +317,7 @@ where
                     ..
                 } = &mut self;
                 select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(125)) => {}
                     // Receive a control message
                     ctrl = control_receiver.recv() => {
                         if let Some(ctrl) = ctrl {

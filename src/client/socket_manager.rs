@@ -81,6 +81,16 @@ where
         self.local_port
     }
 
+    pub async fn shut_down(self) {
+        let Self {
+            sender,
+            mut receiver,
+            ..
+        } = self;
+        drop(sender);
+        _ = receiver.recv().await;
+    }
+
     fn spawn_socket_loop(
         socket: UdpSocket,
         rx_tx: mpsc::Sender<Result<Message<PayloadDefinitions>, Error>>,
