@@ -83,7 +83,7 @@ impl<PayloadDefinitions> Inner<PayloadDefinitions>
 where
     PayloadDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
 {
-    pub fn new(
+    pub fn spawn(
         interface: Ipv4Addr,
     ) -> (
         Sender<ControlMessage<PayloadDefinitions>>,
@@ -122,7 +122,7 @@ where
     }
 
     async fn set_interface(&mut self, interface: &Ipv4Addr) {
-        self.interface = interface.clone();
+        self.interface = *interface;
     }
 
     async fn bind_unicast(&mut self) -> Result<ControlResponse, Error> {
