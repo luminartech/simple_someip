@@ -7,7 +7,6 @@ use crate::SD_MESSAGE_ID_VALUE;
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct MessageId(u32);
 
-/// Implement From<u32> for MessageId
 impl From<u32> for MessageId {
     fn from(message_id: u32) -> Self {
         MessageId(message_id)
