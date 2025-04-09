@@ -2,6 +2,7 @@ mod inner;
 mod socket_manager;
 
 pub use inner::ControlResponse;
+use tracing::info;
 
 use crate::{
     Error,
@@ -91,6 +92,19 @@ where
     ) -> Result<ControlResponse, Error> {
         self.send_control_message(Control::Send(target, message))
             .await
+    }
+
+    pub async fn shut_down(self) {
+        let Self {
+            control_sender,
+            mut update_receiver,
+            ..
+        } = self;
+        drop(control_sender);
+        info!("Shutting Down SOME/IP client");
+        while update_receiver.recv().await.is_some() {
+            info!(".");
+        }
     }
 
     async fn send_control_message(
