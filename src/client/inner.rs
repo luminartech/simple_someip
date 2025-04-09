@@ -157,7 +157,7 @@ where
                     }
                     Err(err) => Err(err),
                 },
-                None => todo!(),
+                None => Err(Error::SocketClosedUnexpectedly),
             }
         } else {
             // If we don't have a receiver, we should return a future that never resolves
