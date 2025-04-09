@@ -84,6 +84,15 @@ where
             .await
     }
 
+    pub async fn send_message(
+        &mut self,
+        target: SocketAddrV4,
+        message: crate::protocol::Message<PayloadDefinitions>,
+    ) -> Result<ControlResponse, Error> {
+        self.send_control_message(Control::Send(target, message))
+            .await
+    }
+
     async fn send_control_message(
         &mut self,
         control: Control<PayloadDefinitions>,

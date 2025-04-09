@@ -281,9 +281,22 @@ where
                         return;
                     }
                 }
-                Control::Send(_target, _message) => {
-                    if response.send(Err(Error::UnicastSocketNotBound)).is_err() {
-                        return;
+                Control::Send(target, message) => {
+                    if self.unicast_socket.is_none() {
+                        if response.send(Err(Error::UnicastSocketNotBound)).is_err() {
+                            return;
+                        }
+                    } else {
+                        let send_result = self
+                            .unicast_socket
+                            .as_mut()
+                            .unwrap()
+                            .send(*target, message.clone())
+                            .await;
+                        if response.send(send_result).is_err() {
+                            // The sender has been dropped, so we should exit
+                            return;
+                        }
                     }
                 }
             }
