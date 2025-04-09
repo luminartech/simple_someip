@@ -4,7 +4,7 @@ use crate::SD_MESSAGE_ID_VALUE;
 /// The Message ID is a 32-bit identifier that is unique for each message.
 /// It encodes both the service ID and the method ID.
 /// Message IDs are assumed to be unique for an entire vehicle network.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct MessageId(u32);
 
 /// Implement From<u32> for MessageId
@@ -74,5 +74,16 @@ impl MessageId {
     #[inline]
     pub const fn is_sd(&self) -> bool {
         self.0 == crate::SD_MESSAGE_ID_VALUE
+    }
+}
+
+impl std::fmt::Debug for MessageId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Message Id: {{ service_id: {:#02X}, method_id: {:#02X} }}",
+            self.service_id(),
+            self.method_id(),
+        )
     }
 }
