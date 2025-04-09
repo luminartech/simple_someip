@@ -12,7 +12,7 @@ pub struct Message<PayloadDefinition> {
 }
 
 impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
-    pub fn new(header: Header, payload: PayloadDefinition) -> Self {
+    pub const fn new(header: Header, payload: PayloadDefinition) -> Self {
         Self { header, payload }
     }
 
@@ -20,7 +20,7 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
         let sd_header_size = sd_header.required_size();
         Self::new(
             Header::new_sd(session_id, sd_header_size),
-            PayloadDefinition::new_sd_payload(&sd_header),
+            PayloadDefinition::new_sd_payload(sd_header),
         )
     }
 

@@ -46,7 +46,7 @@ impl Header {
             minor_version,
         });
         let endpoint = Options::IpV4Endpoint {
-            ip: client_ip.into(),
+            ip: client_ip,
             protocol,
             port: client_port,
         };
@@ -90,7 +90,7 @@ impl Header {
             event_group_id,
         ));
         let endpoint = Options::IpV4Endpoint {
-            ip: client_ip.into(),
+            ip: client_ip,
             protocol,
             port: client_port,
         };
@@ -182,6 +182,6 @@ impl WireFormat for Header {
         for option in &self.options {
             option.write(writer)?;
         }
-        Ok(12 + entries_size as usize + options_size as usize)
+        Ok(12 + entries_size as usize + options_size)
     }
 }

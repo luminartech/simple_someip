@@ -35,7 +35,7 @@ where
     PayloadDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
 {
     pub fn new(interface: Ipv4Addr) -> Self {
-        let (control_sender, update_receiver) = Inner::new(interface);
+        let (control_sender, update_receiver) = Inner::spawn(interface);
 
         Self {
             interface,
