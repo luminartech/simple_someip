@@ -20,20 +20,20 @@ use crate::{
 };
 
 #[derive(Clone, Debug, PartialEq)]
-pub(super) enum Control<PayloadDefinition> {
+pub(super) enum Control<MessageDefinitions> {
     SetInterface(Ipv4Addr),
     BindDiscovery,
     UnbindDiscovery,
     BindUnicast,
     UnbindUnicast,
     SendSD(SocketAddrV4, sd::Header),
-    Send(SocketAddrV4, Message<PayloadDefinition>),
+    Send(SocketAddrV4, Message<MessageDefinitions>),
 }
 
 #[derive(Debug)]
 pub(super) struct ControlMessage<PayloadDefinition> {
     control: Control<PayloadDefinition>,
-    response: oneshot::Sender<Result<ControlResponse, Error>>,
+    response: oneshot::Sender<Result<ControlResponse<PayloadDefinition>, Error>>,
 }
 
 impl<PayloadDefinition> ControlMessage<PayloadDefinition>
@@ -42,23 +42,27 @@ where
 {
     pub fn new(
         control: Control<PayloadDefinition>,
-    ) -> (Self, oneshot::Receiver<Result<ControlResponse, Error>>) {
+    ) -> (
+        Self,
+        oneshot::Receiver<Result<ControlResponse<PayloadDefinition>, Error>>,
+    ) {
         let (response, receiver) = oneshot::channel();
         (Self { control, response }, receiver)
     }
 
     pub fn with_response(
         control: Control<PayloadDefinition>,
-        response: oneshot::Sender<Result<ControlResponse, Error>>,
+        response: oneshot::Sender<Result<ControlResponse<PayloadDefinition>, Error>>,
     ) -> Self {
         Self { control, response }
     }
 }
 
 #[derive(Debug)]
-pub enum ControlResponse {
+pub enum ControlResponse<PayloadDefinition> {
     Success,
     SocketBind(u16),
+    Send(PayloadDefinition),
 }
 
 #[derive(Debug)]
@@ -105,7 +109,7 @@ where
         (control_sender, update_receiver)
     }
 
-    async fn bind_discovery(&mut self) -> Result<ControlResponse, Error> {
+    async fn bind_discovery(&mut self) -> Result<ControlResponse<PayloadDefinitions>, Error> {
         if self.discovery_socket.is_some() {
             Ok(ControlResponse::Success)
         } else {
@@ -127,7 +131,7 @@ where
         self.interface = *interface;
     }
 
-    async fn bind_unicast(&mut self) -> Result<ControlResponse, Error> {
+    async fn bind_unicast(&mut self) -> Result<ControlResponse<PayloadDefinitions>, Error> {
         if let Some(socket) = &self.unicast_socket {
             Ok(ControlResponse::SocketBind(socket.port()))
         } else {
