@@ -19,9 +19,9 @@ pub struct SocketManager<PayloadDefinitions> {
     session_id: u16,
 }
 
-impl<PayloadDefinitions> SocketManager<PayloadDefinitions>
+impl<MessageDefinitions> SocketManager<MessageDefinitions>
 where
-    PayloadDefinitions: PayloadWireFormat + 'static,
+    MessageDefinitions: PayloadWireFormat + 'static,
 {
     pub async fn bind_discovery(interface: Ipv4Addr) -> Result<Self, Error> {
         let (rx_tx, rx_rx) = mpsc::channel(16);
@@ -59,8 +59,8 @@ where
     pub async fn send(
         &mut self,
         target_addr: SocketAddrV4,
-        message: Message<PayloadDefinitions>,
-    ) -> Result<ControlResponse, Error> {
+        message: Message<MessageDefinitions>,
+    ) -> Result<ControlResponse<MessageDefinitions>, Error> {
         self.sender
             .send((target_addr, message))
             .await
@@ -69,7 +69,7 @@ where
         Ok(ControlResponse::Success)
     }
 
-    pub async fn receive(&mut self) -> Option<Result<Message<PayloadDefinitions>, Error>> {
+    pub async fn receive(&mut self) -> Option<Result<Message<MessageDefinitions>, Error>> {
         self.receiver.recv().await
     }
 
@@ -93,8 +93,8 @@ where
 
     fn spawn_socket_loop(
         socket: UdpSocket,
-        rx_tx: mpsc::Sender<Result<Message<PayloadDefinitions>, Error>>,
-        mut tx_rx: mpsc::Receiver<(SocketAddrV4, Message<PayloadDefinitions>)>,
+        rx_tx: mpsc::Sender<Result<Message<MessageDefinitions>, Error>>,
+        mut tx_rx: mpsc::Receiver<(SocketAddrV4, Message<MessageDefinitions>)>,
     ) {
         tokio::spawn(async move {
             let mut buf = vec![0; 1400];
@@ -103,7 +103,7 @@ where
                     result = socket.recv_from(&mut buf) => {
                         match result {
                             Ok((_bytes_received, _source_address )) => {
-                                let parse_result = Message::<PayloadDefinitions>::from_reader(&mut buf.as_slice()).map_err(Error::from);
+                                let parse_result = Message::<MessageDefinitions>::from_reader(&mut buf.as_slice()).map_err(Error::from);
                                 match rx_tx.send( parse_result ).await {
                                     Ok(_) => {}
                                     Err(_) => {
@@ -114,6 +114,7 @@ where
                                 }
                             }
                             Err(e) => {
+
                                 error!("Error decoding message: {:?}", e)
                             }
                         }

@@ -14,11 +14,11 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
-pub enum ClientUpdate<MessageDefinitions> {
+pub enum ClientUpdate<PayloadDefinitions> {
     /// Discovery message received
     DiscoveryUpdated(sd::Header),
     /// Unicast message received
-    Unicast(Message<MessageDefinitions>),
+    Unicast(Message<PayloadDefinitions>),
     /// Inner SOME/IP Client has encountered an error
     Error(Error),
 }
@@ -30,9 +30,9 @@ pub struct Client<MessageDefinitions> {
     update_receiver: mpsc::Receiver<ClientUpdate<MessageDefinitions>>,
 }
 
-impl<PayloadDefinitions> Client<PayloadDefinitions>
+impl<MessageDefinitions> Client<MessageDefinitions>
 where
-    PayloadDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
+    MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
 {
     pub fn new(interface: Ipv4Addr) -> Self {
         let (control_sender, update_receiver) = Inner::spawn(interface);
@@ -44,7 +44,7 @@ where
         }
     }
 
-    pub async fn run(&mut self) -> Option<ClientUpdate<PayloadDefinitions>> {
+    pub async fn run(&mut self) -> Option<ClientUpdate<MessageDefinitions>> {
         self.update_receiver.recv().await
     }
 
@@ -59,20 +59,20 @@ where
         Ok(())
     }
 
-    pub async fn bind_discovery(&mut self) -> Result<ControlResponse, Error> {
+    pub async fn bind_discovery(&mut self) -> Result<ControlResponse<MessageDefinitions>, Error> {
         self.send_control_message(Control::BindDiscovery).await
     }
 
-    pub async fn unbind_discovery(&mut self) -> Result<ControlResponse, Error> {
+    pub async fn unbind_discovery(&mut self) -> Result<ControlResponse<MessageDefinitions>, Error> {
         self.send_control_message(inner::Control::UnbindDiscovery)
             .await
     }
 
-    pub async fn bind_unicast(&mut self) -> Result<ControlResponse, Error> {
+    pub async fn bind_unicast(&mut self) -> Result<ControlResponse<MessageDefinitions>, Error> {
         self.send_control_message(Control::BindUnicast).await
     }
 
-    pub async fn unbind_unicast(&mut self) -> Result<ControlResponse, Error> {
+    pub async fn unbind_unicast(&mut self) -> Result<ControlResponse<MessageDefinitions>, Error> {
         self.send_control_message(Control::UnbindUnicast).await
     }
 
@@ -80,7 +80,7 @@ where
         &mut self,
         target: SocketAddrV4,
         sd_header: &crate::protocol::sd::Header,
-    ) -> Result<ControlResponse, Error> {
+    ) -> Result<ControlResponse<MessageDefinitions>, Error> {
         self.send_control_message(Control::SendSD(target, sd_header.to_owned()))
             .await
     }
@@ -88,8 +88,8 @@ where
     pub async fn send_message(
         &mut self,
         target: SocketAddrV4,
-        message: crate::protocol::Message<PayloadDefinitions>,
-    ) -> Result<ControlResponse, Error> {
+        message: crate::protocol::Message<MessageDefinitions>,
+    ) -> Result<ControlResponse<MessageDefinitions>, Error> {
         self.send_control_message(Control::Send(target, message))
             .await
     }
@@ -109,8 +109,8 @@ where
 
     async fn send_control_message(
         &mut self,
-        control: Control<PayloadDefinitions>,
-    ) -> Result<ControlResponse, Error> {
+        control: Control<MessageDefinitions>,
+    ) -> Result<ControlResponse<MessageDefinitions>, Error> {
         let (control_message, response_sender) = ControlMessage::new(control);
         self.control_sender.send(control_message).await.unwrap();
         response_sender.await.unwrap() // The inner client should always respond
