@@ -9,8 +9,6 @@ use crate::{
     traits::{PayloadWireFormat, WireFormat},
 };
 
-use super::inner::ControlResponse;
-
 #[derive(Debug)]
 pub struct SocketManager<PayloadDefinitions> {
     receiver: mpsc::Receiver<Result<Message<PayloadDefinitions>, Error>>,
@@ -60,13 +58,13 @@ where
         &mut self,
         target_addr: SocketAddrV4,
         message: Message<MessageDefinitions>,
-    ) -> Result<ControlResponse<MessageDefinitions>, Error> {
+    ) -> Result<(), Error> {
         self.sender
             .send((target_addr, message))
             .await
             .map_err(|_| Error::SocketClosedUnexpectedly)?;
         self.session_id += 1;
-        Ok(ControlResponse::Success)
+        Ok(())
     }
 
     pub async fn receive(&mut self) -> Option<Result<Message<MessageDefinitions>, Error>> {

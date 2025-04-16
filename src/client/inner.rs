@@ -19,51 +19,61 @@ use crate::{
     traits::PayloadWireFormat,
 };
 
-#[derive(Clone, Debug, PartialEq)]
-pub(super) enum Control<MessageDefinitions> {
-    SetInterface(Ipv4Addr),
-    BindDiscovery,
-    UnbindDiscovery,
-    BindUnicast,
-    UnbindUnicast,
-    SendSD(SocketAddrV4, sd::Header),
-    Send(SocketAddrV4, Message<MessageDefinitions>),
-    AwaitResponse(Message<MessageDefinitions>),
-}
-
 #[derive(Debug)]
-pub(super) struct ControlMessage<PayloadDefinition> {
-    control: Control<PayloadDefinition>,
-    response: oneshot::Sender<Result<ControlResponse<PayloadDefinition>, Error>>,
+pub(super) enum ControlMessage<MessageDefinitions> {
+    SetInterface(Ipv4Addr, oneshot::Sender<Result<(), Error>>),
+    BindDiscovery(oneshot::Sender<Result<(), Error>>),
+    UnbindDiscovery(oneshot::Sender<Result<(), Error>>),
+    BindUnicast(oneshot::Sender<Result<u16, Error>>),
+    UnbindUnicast(oneshot::Sender<Result<(), Error>>),
+    SendSD(SocketAddrV4, sd::Header, oneshot::Sender<Result<(), Error>>),
+    Send(
+        SocketAddrV4,
+        Message<MessageDefinitions>,
+        oneshot::Sender<Result<MessageDefinitions, Error>>,
+    ),
+    AwaitResponse(
+        Message<MessageDefinitions>,
+        oneshot::Sender<Result<MessageDefinitions, Error>>,
+    ),
 }
 
-impl<PayloadDefinition> ControlMessage<PayloadDefinition>
-where
-    PayloadDefinition: PayloadWireFormat,
-{
-    pub fn new(
-        control: Control<PayloadDefinition>,
-    ) -> (
-        Self,
-        oneshot::Receiver<Result<ControlResponse<PayloadDefinition>, Error>>,
-    ) {
-        let (response, receiver) = oneshot::channel();
-        (Self { control, response }, receiver)
+impl<MessageDefinitions> ControlMessage<MessageDefinitions> {
+    pub fn set_interface(interface: Ipv4Addr) -> (oneshot::Receiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = oneshot::channel();
+        (receiver, Self::SetInterface(interface, sender))
+    }
+    pub fn bind_discovery() -> (oneshot::Receiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = oneshot::channel();
+        (receiver, Self::BindDiscovery(sender))
+    }
+    pub fn unbind_discovery() -> (oneshot::Receiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = oneshot::channel();
+        (receiver, Self::UnbindDiscovery(sender))
+    }
+    pub fn bind_unicast() -> (oneshot::Receiver<Result<u16, Error>>, Self) {
+        let (sender, receiver) = oneshot::channel();
+        (receiver, Self::BindUnicast(sender))
+    }
+    pub fn unbind_unicast() -> (oneshot::Receiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = oneshot::channel();
+        (receiver, Self::UnbindUnicast(sender))
     }
 
-    pub fn with_response(
-        control: Control<PayloadDefinition>,
-        response: oneshot::Sender<Result<ControlResponse<PayloadDefinition>, Error>>,
-    ) -> Self {
-        Self { control, response }
+    pub fn send_sd(
+        socket_addr: SocketAddrV4,
+        header: sd::Header,
+    ) -> (oneshot::Receiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = oneshot::channel();
+        (receiver, Self::SendSD(socket_addr, header, sender))
     }
-}
-
-#[derive(Debug)]
-pub enum ControlResponse<PayloadDefinition> {
-    Success,
-    SocketBind(u16),
-    Send(PayloadDefinition),
+    pub fn send_request(
+        socket_addr: SocketAddrV4,
+        message: Message<MessageDefinitions>,
+    ) -> (oneshot::Receiver<Result<MessageDefinitions, Error>>, Self) {
+        let (sender, receiver) = oneshot::channel();
+        (receiver, Self::Send(socket_addr, message, sender))
+    }
 }
 
 #[derive(Debug)]
@@ -113,13 +123,13 @@ where
         (control_sender, update_receiver)
     }
 
-    async fn bind_discovery(&mut self) -> Result<ControlResponse<PayloadDefinitions>, Error> {
+    async fn bind_discovery(&mut self) -> Result<(), Error> {
         if self.discovery_socket.is_some() {
-            Ok(ControlResponse::Success)
+            Ok(())
         } else {
             let socket = SocketManager::bind_discovery(self.interface).await?;
             self.discovery_socket = Some(socket);
-            Ok(ControlResponse::Success)
+            Ok(())
         }
     }
 
@@ -135,14 +145,14 @@ where
         self.interface = *interface;
     }
 
-    async fn bind_unicast(&mut self) -> Result<ControlResponse<PayloadDefinitions>, Error> {
+    async fn bind_unicast(&mut self) -> Result<u16, Error> {
         if let Some(socket) = &self.unicast_socket {
-            Ok(ControlResponse::SocketBind(socket.port()))
+            Ok(socket.port())
         } else {
             let unicast_socket = SocketManager::bind(0).await?;
             let port = unicast_socket.port();
             self.unicast_socket = Some(unicast_socket);
-            Ok(ControlResponse::SocketBind(port))
+            Ok(port)
         }
     }
 
@@ -191,27 +201,22 @@ where
 
     async fn handle_control_message(&mut self) {
         if let Some(active_request) = self.active_request.take() {
-            let ControlMessage { control, response } = active_request;
-            match &control {
-                Control::SetInterface(interface) => {
+            match active_request {
+                ControlMessage::SetInterface(interface, response) => {
                     if self.discovery_socket.is_some() {
                         info!(
                             "Discovery socket currently bound to interface: {}, unbinding.",
                             self.interface
                         );
                         self.unbind_discovery().await;
-                        self.active_request = Some(ControlMessage::with_response(
-                            Control::SetInterface(interface.to_owned()),
-                            response,
-                        ));
+                        self.active_request =
+                            Some(ControlMessage::SetInterface(interface, response));
                         return;
                     }
-                    if self.interface != *interface {
-                        self.set_interface(interface).await;
-                        self.active_request = Some(ControlMessage::with_response(
-                            Control::SetInterface(interface.to_owned()),
-                            response,
-                        ));
+                    if self.interface != interface {
+                        self.set_interface(&interface).await;
+                        self.active_request =
+                            Some(ControlMessage::SetInterface(interface, response));
                         return;
                     }
                     info!("Binding to interface: {}", interface);
@@ -230,7 +235,7 @@ where
                         return;
                     }
                 }
-                Control::BindDiscovery => {
+                ControlMessage::BindDiscovery(response) => {
                     let result = self.bind_discovery().await;
                     if response.send(result).is_err() {
                         // The sender has been dropped, so we should exit
@@ -238,38 +243,36 @@ where
                         return;
                     }
                 }
-                Control::UnbindDiscovery => {
+                ControlMessage::UnbindDiscovery(response) => {
                     self.unbind_discovery().await;
-                    if response.send(Ok(ControlResponse::Success)).is_err() {
+                    if response.send(Ok(())).is_err() {
                         // The sender has been dropped, so we should exit
                         self.run = false;
                         return;
                     }
                 }
-                Control::BindUnicast => {
+                ControlMessage::BindUnicast(response) => {
                     if response.send(self.bind_unicast().await).is_err() {
                         // The sender has been dropped, so we should exit
                         self.run = false;
                         return;
                     }
                 }
-                Control::UnbindUnicast => {
+                ControlMessage::UnbindUnicast(response) => {
                     self.unbind_unicast().await;
-                    if response.send(Ok(ControlResponse::Success)).is_err() {
+                    if response.send(Ok(())).is_err() {
                         // The sender has been dropped, so we should exit
                         self.run = false;
                         return;
                     }
                 }
-                Control::SendSD(target, header) => {
+                ControlMessage::SendSD(target, header, response) => {
                     // SD Message, If the discovery socket is not bound, bind it
                     if self.discovery_socket.is_none() {
                         match self.bind_discovery().await {
                             Ok(_) => {
-                                self.active_request = Some(ControlMessage::with_response(
-                                    Control::SendSD(*target, header.to_owned()),
-                                    response,
-                                ));
+                                self.active_request =
+                                    Some(ControlMessage::SendSD(target, header, response));
                                 return;
                             }
                             Err(e) => {
@@ -282,20 +285,20 @@ where
                     }
                     let message = Message::<PayloadDefinitions>::new_sd(
                         self.discovery_socket.as_ref().unwrap().session_id() as u32,
-                        header,
+                        &header,
                     );
                     debug!("Sending {:?} to {}", &message, target);
                     let send_result = self
                         .discovery_socket
                         .as_mut()
                         .unwrap()
-                        .send(*target, message)
+                        .send(target, message)
                         .await;
                     if response.send(send_result).is_err() {
                         return;
                     }
                 }
-                Control::Send(target, message) => {
+                ControlMessage::Send(target, message, response) => {
                     if self.unicast_socket.is_none() {
                         if response.send(Err(Error::UnicastSocketNotBound)).is_err() {
                             return;
@@ -305,12 +308,12 @@ where
                             .unicast_socket
                             .as_mut()
                             .unwrap()
-                            .send(*target, message.clone())
+                            .send(target, message.clone())
                             .await;
                         match send_result {
                             Ok(_) => {
-                                self.active_request = Some(ControlMessage::with_response(
-                                    Control::AwaitResponse(message.to_owned()),
+                                self.active_request = Some(ControlMessage::AwaitResponse(
+                                    message.to_owned(),
                                     response,
                                 ))
                             }
@@ -318,12 +321,9 @@ where
                         };
                     }
                 }
-                // TODO: figure out how to make a request timeout.
-                Control::AwaitResponse(message) => {
-                    self.active_request = Some(ControlMessage::with_response(
-                        Control::AwaitResponse(message.to_owned()),
-                        response,
-                    ))
+                // Nothing to do here, this is handled in the run loop when receiving messages
+                ControlMessage::AwaitResponse(message, response) => {
+                    self.active_request = Some(ControlMessage::AwaitResponse(message, response))
                 }
             }
         }
@@ -348,7 +348,7 @@ where
                     ctrl = control_receiver.recv() => {
                         if let Some(ctrl) = ctrl {
                             assert!(active_request.is_none());
-                            debug!("Received control message: {:?}", ctrl.control);
+                            debug!("Received control message: {:?}", ctrl);
                             *active_request = Some(ctrl);
                         } else {
                             // The sender has been dropped, so we should exit
@@ -378,11 +378,11 @@ where
                          match unicast {
                              Ok(received_message) => {
                                  if let Some(active) = active_request.take() {
-                                     if let Control::AwaitResponse(request_message) = active.control.clone() {
+                                     if let ControlMessage::AwaitResponse(request_message, response) = active {
                                          if request_message.header().message_id == received_message.header().message_id {
-                                            if active.response.send(Ok(ControlResponse::Send(
-                                                 received_message.payload().to_owned(),
-                                             ))).is_err() {
+                                            if response.send(Ok(
+                                                 received_message.payload().clone(),
+                                             )).is_err() {
                                                  // The sender has been dropped, so we should exit
                                                  *run = false;
                                              }
@@ -390,7 +390,7 @@ where
                                                  *active_request = None;
                                              }
                                          } else {
-                                             *active_request = Some(active);
+                                             *active_request = Some(ControlMessage::AwaitResponse(request_message, response));
                                              if update_sender.send(ClientUpdate::Unicast(received_message)).await.is_err(){
                                              }
                                          }
