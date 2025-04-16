@@ -1,17 +1,15 @@
 mod inner;
 mod socket_manager;
 
-pub use inner::ControlResponse;
-use tracing::info;
-
 use crate::{
     Error,
     protocol::{Message, sd},
     traits::PayloadWireFormat,
 };
-use inner::{Control, ControlMessage, Inner};
+use inner::{ControlMessage, Inner};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use tokio::sync::mpsc;
+use tracing::info;
 
 #[derive(Debug)]
 pub enum ClientUpdate<PayloadDefinitions> {
@@ -53,45 +51,55 @@ where
     }
 
     pub async fn set_interface(&mut self, interface: Ipv4Addr) -> Result<(), Error> {
-        self.send_control_message(Control::SetInterface(interface))
-            .await?;
+        let (response, message) = ControlMessage::set_interface(interface);
+        self.control_sender.send(message).await.unwrap();
+        response.await.unwrap()?;
         self.interface = interface;
         Ok(())
     }
 
-    pub async fn bind_discovery(&mut self) -> Result<ControlResponse<MessageDefinitions>, Error> {
-        self.send_control_message(Control::BindDiscovery).await
+    pub async fn bind_discovery(&mut self) -> Result<(), Error> {
+        let (response, message) = ControlMessage::bind_discovery();
+        self.control_sender.send(message).await.unwrap();
+        response.await.unwrap()
     }
 
-    pub async fn unbind_discovery(&mut self) -> Result<ControlResponse<MessageDefinitions>, Error> {
-        self.send_control_message(inner::Control::UnbindDiscovery)
-            .await
+    pub async fn unbind_discovery(&mut self) -> Result<(), Error> {
+        let (response, message) = ControlMessage::unbind_discovery();
+        self.control_sender.send(message).await.unwrap();
+        response.await.unwrap()
     }
 
-    pub async fn bind_unicast(&mut self) -> Result<ControlResponse<MessageDefinitions>, Error> {
-        self.send_control_message(Control::BindUnicast).await
+    pub async fn bind_unicast(&mut self) -> Result<u16, Error> {
+        let (response, message) = ControlMessage::bind_unicast();
+        self.control_sender.send(message).await.unwrap();
+        response.await.unwrap()
     }
 
-    pub async fn unbind_unicast(&mut self) -> Result<ControlResponse<MessageDefinitions>, Error> {
-        self.send_control_message(Control::UnbindUnicast).await
+    pub async fn unbind_unicast(&mut self) -> Result<(), Error> {
+        let (response, message) = ControlMessage::unbind_unicast();
+        self.control_sender.send(message).await.unwrap();
+        response.await.unwrap()
     }
 
     pub async fn send_sd_message(
         &mut self,
         target: SocketAddrV4,
-        sd_header: &crate::protocol::sd::Header,
-    ) -> Result<ControlResponse<MessageDefinitions>, Error> {
-        self.send_control_message(Control::SendSD(target, sd_header.to_owned()))
-            .await
+        sd_header: crate::protocol::sd::Header,
+    ) -> Result<(), Error> {
+        let (response, message) = ControlMessage::send_sd(target, sd_header);
+        self.control_sender.send(message).await.unwrap();
+        response.await.unwrap()
     }
 
     pub async fn send_message(
         &mut self,
         target: SocketAddrV4,
         message: crate::protocol::Message<MessageDefinitions>,
-    ) -> Result<ControlResponse<MessageDefinitions>, Error> {
-        self.send_control_message(Control::Send(target, message))
-            .await
+    ) -> Result<MessageDefinitions, Error> {
+        let (response, message) = ControlMessage::send_request(target, message);
+        self.control_sender.send(message).await.unwrap();
+        response.await.unwrap()
     }
 
     pub async fn shut_down(self) {
@@ -105,14 +113,5 @@ where
         while update_receiver.recv().await.is_some() {
             info!(".");
         }
-    }
-
-    async fn send_control_message(
-        &mut self,
-        control: Control<MessageDefinitions>,
-    ) -> Result<ControlResponse<MessageDefinitions>, Error> {
-        let (control_message, response_sender) = ControlMessage::new(control);
-        self.control_sender.send(control_message).await.unwrap();
-        response_sender.await.unwrap() // The inner client should always respond
     }
 }
