@@ -28,6 +28,7 @@ pub(super) enum Control<MessageDefinitions> {
     UnbindUnicast,
     SendSD(SocketAddrV4, sd::Header),
     Send(SocketAddrV4, Message<MessageDefinitions>),
+    AwaitResponse(Message<MessageDefinitions>),
 }
 
 #[derive(Debug)]
@@ -79,6 +80,8 @@ pub(super) struct Inner<PayloadDefinitions> {
     discovery_socket: Option<SocketManager<PayloadDefinitions>>,
     /// Socket manager for unicast messages if bound
     unicast_socket: Option<SocketManager<PayloadDefinitions>>,
+    /// Internal flag to continue run loop
+    run: bool,
     /// Phantom data to represent the generic message definitions
     phantom: std::marker::PhantomData<PayloadDefinitions>,
 }
@@ -103,6 +106,7 @@ where
             interface,
             discovery_socket: None,
             unicast_socket: None,
+            run: true,
             phantom: std::marker::PhantomData,
         };
         inner.run();
@@ -200,7 +204,6 @@ where
                             Control::SetInterface(interface.to_owned()),
                             response,
                         ));
-
                         return;
                     }
                     if self.interface != *interface {
@@ -223,6 +226,7 @@ where
                     }
                     if response.send(bind_result).is_err() {
                         // The sender has been dropped, so we should exit
+                        self.run = false;
                         return;
                     }
                 }
@@ -230,6 +234,7 @@ where
                     let result = self.bind_discovery().await;
                     if response.send(result).is_err() {
                         // The sender has been dropped, so we should exit
+                        self.run = false;
                         return;
                     }
                 }
@@ -237,12 +242,14 @@ where
                     self.unbind_discovery().await;
                     if response.send(Ok(ControlResponse::Success)).is_err() {
                         // The sender has been dropped, so we should exit
+                        self.run = false;
                         return;
                     }
                 }
                 Control::BindUnicast => {
                     if response.send(self.bind_unicast().await).is_err() {
                         // The sender has been dropped, so we should exit
+                        self.run = false;
                         return;
                     }
                 }
@@ -250,6 +257,7 @@ where
                     self.unbind_unicast().await;
                     if response.send(Ok(ControlResponse::Success)).is_err() {
                         // The sender has been dropped, so we should exit
+                        self.run = false;
                         return;
                     }
                 }
@@ -266,7 +274,7 @@ where
                             }
                             Err(e) => {
                                 if response.send(Err(e)).is_err() {
-                                    // The sender has been dropped, so we should exit
+                                    self.run = false;
                                 }
                                 return;
                             }
@@ -299,11 +307,23 @@ where
                             .unwrap()
                             .send(*target, message.clone())
                             .await;
-                        if response.send(send_result).is_err() {
-                            // The sender has been dropped, so we should exit
-                            return;
-                        }
+                        match send_result {
+                            Ok(_) => {
+                                self.active_request = Some(ControlMessage::with_response(
+                                    Control::AwaitResponse(message.to_owned()),
+                                    response,
+                                ))
+                            }
+                            Err(_) => todo!(),
+                        };
                     }
+                }
+                // TODO: figure out how to make a request timeout.
+                Control::AwaitResponse(message) => {
+                    self.active_request = Some(ControlMessage::with_response(
+                        Control::AwaitResponse(message.to_owned()),
+                        response,
+                    ))
                 }
             }
         }
@@ -318,6 +338,8 @@ where
                     discovery_socket,
                     unicast_socket,
                     update_sender,
+                    active_request,
+                    run,
                     ..
                 } = &mut self;
                 select! {
@@ -325,12 +347,12 @@ where
                     // Receive a control message
                     ctrl = control_receiver.recv() => {
                         if let Some(ctrl) = ctrl {
-                            assert!(self.active_request.is_none());
+                            assert!(active_request.is_none());
                             debug!("Received control message: {:?}", ctrl.control);
-                            self.active_request = Some(ctrl);
+                            *active_request = Some(ctrl);
                         } else {
                             // The sender has been dropped, so we should exit
-                            break;
+                            *run = false;
                         }
                     }
                     // Receive a discovery message
@@ -340,13 +362,13 @@ where
                             Ok(header) => {
                                 if update_sender.send(ClientUpdate::DiscoveryUpdated(header)).await.is_err() {
                                     // The sender has been dropped, so we should exit
-                                    break;
+                                    *run = false;
                                 }
                             }
                             Err(err) => {
                                 if update_sender.send(ClientUpdate::Error(err)).await.is_err() {
                                     // The sender has been dropped, so we should exit
-                                    break;
+                                    *run = false;
                                 }
                             }
                         }
@@ -354,20 +376,43 @@ where
                      unicast = Inner::receive_unicast(unicast_socket) => {
                          trace!("Received unicast message: {:?}",unicast);
                          match unicast {
-                             Ok(message) => {
-                                 if update_sender.send(ClientUpdate::Unicast(message)).await.is_err() {
-                                     // The sender has been dropped, so we should exit
-                                     break;
+                             Ok(received_message) => {
+                                 if let Some(active) = active_request.take() {
+                                     if let Control::AwaitResponse(request_message) = active.control.clone() {
+                                         if request_message.header().message_id == received_message.header().message_id {
+                                            if active.response.send(Ok(ControlResponse::Send(
+                                                 received_message.payload().to_owned(),
+                                             ))).is_err() {
+                                                 // The sender has been dropped, so we should exit
+                                                 *run = false;
+                                             }
+                                             else {
+                                                 *active_request = None;
+                                             }
+                                         } else {
+                                             *active_request = Some(active);
+                                             if update_sender.send(ClientUpdate::Unicast(received_message)).await.is_err(){
+                                             }
+                                         }
+                                     } else {*active_request = Some(active);}
+                                 } else {
+                                    if update_sender.send(ClientUpdate::Unicast(received_message)).await.is_err(){
+                                        *run = false;
+                                    }
                                  }
                              }
                              Err(err) => {
                                  if update_sender.send(ClientUpdate::Error(err)).await.is_err() {
                                      // The sender has been dropped, so we should exit
-                                     break;
+                                     *run = false;
                                  }
                              }
                          }
                      }
+                }
+                if !*run {
+                    info!("SOME/IP Client processing loop exiting");
+                    break;
                 }
                 self.handle_control_message().await;
             }
