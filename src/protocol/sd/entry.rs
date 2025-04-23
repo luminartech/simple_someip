@@ -96,7 +96,6 @@ impl EventGroupEntry {
         instance_id: u16,
         major_version: u8,
         ttl: u32,
-        counter: u8,
         event_group_id: u16,
     ) -> Self {
         Self {
@@ -107,7 +106,7 @@ impl EventGroupEntry {
             instance_id,
             major_version,
             ttl,
-            counter: (counter & 0x000f) as u16,
+            counter: 0,
             event_group_id,
         }
     }
