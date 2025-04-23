@@ -232,7 +232,6 @@ where
                     if response.send(bind_result).is_err() {
                         // The sender has been dropped, so we should exit
                         self.run = false;
-                        return;
                     }
                 }
                 ControlMessage::BindDiscovery(response) => {
@@ -240,7 +239,6 @@ where
                     if response.send(result).is_err() {
                         // The sender has been dropped, so we should exit
                         self.run = false;
-                        return;
                     }
                 }
                 ControlMessage::UnbindDiscovery(response) => {
@@ -248,14 +246,12 @@ where
                     if response.send(Ok(())).is_err() {
                         // The sender has been dropped, so we should exit
                         self.run = false;
-                        return;
                     }
                 }
                 ControlMessage::BindUnicast(response) => {
                     if response.send(self.bind_unicast().await).is_err() {
                         // The sender has been dropped, so we should exit
                         self.run = false;
-                        return;
                     }
                 }
                 ControlMessage::UnbindUnicast(response) => {
@@ -263,7 +259,6 @@ where
                     if response.send(Ok(())).is_err() {
                         // The sender has been dropped, so we should exit
                         self.run = false;
-                        return;
                     }
                 }
                 ControlMessage::SendSD(target, header, response) => {
@@ -295,7 +290,7 @@ where
                         .send(target, message)
                         .await;
                     if response.send(send_result).is_err() {
-                        return;
+                        self.run = false;
                     }
                 }
                 ControlMessage::Send(target, message, response) => {
@@ -386,10 +381,8 @@ where
                                              }
                                          }
                                      } else {*active_request = Some(active);}
-                                 } else {
-                                    if update_sender.send(ClientUpdate::Unicast(received_message)).await.is_err(){
+                                 } else if update_sender.send(ClientUpdate::Unicast(received_message)).await.is_err(){
                                         *run = false;
-                                    }
                                  }
                              }
                              Err(err) => {
