@@ -25,7 +25,6 @@ impl Header {
     }
 
     pub fn new_service_offer(
-        reboot: bool,
         service_id: u16,
         instance_id: u16,
         major_version: u8,
@@ -51,7 +50,7 @@ impl Header {
             port: client_port,
         };
         Self {
-            flags: Flags::new_sd(reboot),
+            flags: Flags::new_sd(false),
             entries: vec![entry],
             options: vec![endpoint],
         }
@@ -70,12 +69,10 @@ impl Header {
     }
 
     pub fn new_subscription(
-        reboot: bool,
         service_id: u16,
         instance_id: u16,
         major_version: u8,
         ttl: u32,
-        counter: u8,
         event_group_id: u16,
         client_ip: Ipv4Addr,
         protocol: TransportProtocol,
@@ -86,7 +83,6 @@ impl Header {
             instance_id,
             major_version,
             ttl,
-            counter,
             event_group_id,
         ));
         let endpoint = Options::IpV4Endpoint {
@@ -95,7 +91,7 @@ impl Header {
             port: client_port,
         };
         Self {
-            flags: Flags::new_sd(reboot),
+            flags: Flags::new_sd(false),
             entries: vec![entry],
             options: vec![endpoint],
         }
@@ -106,7 +102,6 @@ impl Header {
         instance_id: u16,
         major_version: u8,
         ttl: u32,
-        counter: u8,
         event_group_id: u16,
     ) -> Self {
         let entry = Entry::SubscribeAckEventGroup(EventGroupEntry::new(
@@ -114,7 +109,6 @@ impl Header {
             instance_id,
             major_version,
             ttl,
-            counter,
             event_group_id,
         ));
         Self {
