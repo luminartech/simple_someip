@@ -299,17 +299,8 @@ where
                     }
                 }
                 ControlMessage::Send(target, message, response) => {
-                    if self.unicast_socket.is_none() {
-                        if response.send(Err(Error::UnicastSocketNotBound)).is_err() {
-                            return;
-                        }
-                    } else {
-                        let send_result = self
-                            .unicast_socket
-                            .as_mut()
-                            .unwrap()
-                            .send(target, message.clone())
-                            .await;
+                    if let Some(socket) = &mut self.unicast_socket {
+                        let send_result = socket.send(target, message.clone()).await;
                         match send_result {
                             Ok(_) => {
                                 self.active_request = Some(ControlMessage::AwaitResponse(
