@@ -121,7 +121,7 @@ where
                         match message {
                             Some(message) => {
                                 trace!("Sending: {:?}", message);
-                                let message_length = message.1.to_writer(&mut buf.as_mut_slice()).unwrap();
+                                let message_length = message.1.encode(&mut buf.as_mut_slice()).unwrap();
                                 socket.send_to(&buf[..message_length], message.0).await.unwrap();
                             }
                             None => {

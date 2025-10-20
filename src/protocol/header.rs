@@ -73,7 +73,7 @@ impl WireFormat for Header {
         16
     }
 
-    fn to_writer<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
+    fn encode<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
         writer.write_u32::<BigEndian>(self.message_id.message_id())?;
         writer.write_u32::<BigEndian>(self.length)?;
         writer.write_u32::<BigEndian>(self.session_id)?;

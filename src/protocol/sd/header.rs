@@ -156,7 +156,7 @@ impl WireFormat for Header {
         size
     }
 
-    fn to_writer<T: std::io::Write>(
+    fn encode<T: std::io::Write>(
         &self,
         writer: &mut T,
     ) -> Result<usize, crate::protocol::Error> {
@@ -166,7 +166,7 @@ impl WireFormat for Header {
         let entries_size = (self.entries.len() * 16) as u32;
         writer.write_u32::<BigEndian>(entries_size)?;
         for entry in &self.entries {
-            entry.to_writer(writer)?;
+            entry.encode(writer)?;
         }
         let mut options_size = 0;
         for option in &self.options {
