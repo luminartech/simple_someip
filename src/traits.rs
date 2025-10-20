@@ -44,9 +44,10 @@ pub trait PayloadWireFormat: std::fmt::Debug + Send + Sized + Sync {
     /// Number of bytes required to write the payload
     fn required_size(&self) -> usize;
     /// Serialize the payload to a [Writer](std::io::Write)
-    fn to_writer<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
+    fn encode<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
 }
 
+/// A simple implementation of [PayloadWireFormat] that only supports SOME/IP-SD messages.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveryOnlyPayload {
     header: crate::protocol::sd::Header,
@@ -84,7 +85,7 @@ impl PayloadWireFormat for DiscoveryOnlyPayload {
         self.header.required_size()
     }
 
-    fn to_writer<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
+    fn encode<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
         self.header.encode(writer)
     }
 }
