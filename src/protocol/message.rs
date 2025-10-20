@@ -75,7 +75,7 @@ impl<PayloadDefinition: PayloadWireFormat> WireFormat for Message<PayloadDefinit
         }
         let mut payload_reader = reader.take(header.payload_size() as u64);
         let payload =
-            PayloadDefinition::from_reader_with_message_id(header.message_id, &mut payload_reader)?;
+            PayloadDefinition::decode_with_message_id(header.message_id, &mut payload_reader)?;
         Ok(Self::new(header, payload))
     }
 
