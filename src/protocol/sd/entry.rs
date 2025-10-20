@@ -140,7 +140,7 @@ impl WireFormat for EventGroupEntry {
         16
     }
 
-    fn to_writer<T: std::io::Write>(
+    fn encode<T: std::io::Write>(
         &self,
         writer: &mut T,
     ) -> Result<usize, crate::protocol::Error> {
@@ -211,7 +211,7 @@ impl WireFormat for ServiceEntry {
         16
     }
 
-    fn to_writer<W: Write>(&self, writer: &mut W) -> Result<usize, Error> {
+    fn encode<W: Write>(&self, writer: &mut W) -> Result<usize, Error> {
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;
         writer.write_u8(u8::from(self.options_count))?;
@@ -308,27 +308,27 @@ impl WireFormat for Entry {
         }
     }
 
-    fn to_writer<W: Write>(&self, writer: &mut W) -> Result<usize, Error> {
+    fn encode<W: Write>(&self, writer: &mut W) -> Result<usize, Error> {
         match self {
             Entry::FindService(service_entry) => {
                 writer.write_u8(u8::from(EntryType::FindService))?;
-                service_entry.to_writer(writer)
+                service_entry.encode(writer)
             }
             Entry::OfferService(service_entry) => {
                 writer.write_u8(u8::from(EntryType::OfferService))?;
-                service_entry.to_writer(writer)
+                service_entry.encode(writer)
             }
             Entry::StopOfferService(service_entry) => {
                 writer.write_u8(u8::from(EntryType::StopOfferService))?;
-                service_entry.to_writer(writer)
+                service_entry.encode(writer)
             }
             Entry::SubscribeEventGroup(event_group_entry) => {
                 writer.write_u8(u8::from(EntryType::Subscribe))?;
-                event_group_entry.to_writer(writer)
+                event_group_entry.encode(writer)
             }
             Entry::SubscribeAckEventGroup(event_group_entry) => {
                 writer.write_u8(u8::from(EntryType::SubscribeAck))?;
-                event_group_entry.to_writer(writer)
+                event_group_entry.encode(writer)
             }
         }
     }

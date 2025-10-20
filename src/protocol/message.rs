@@ -83,7 +83,7 @@ impl<PayloadDefinition: PayloadWireFormat> WireFormat for Message<PayloadDefinit
         self.header.required_size() + self.payload.required_size()
     }
 
-    fn to_writer<W: Write>(&self, writer: &mut W) -> Result<usize, Error> {
-        Ok(self.header.to_writer(writer)? + self.payload.to_writer(writer)?)
+    fn encode<W: Write>(&self, writer: &mut W) -> Result<usize, Error> {
+        Ok(self.header.encode(writer)? + self.payload.to_writer(writer)?)
     }
 }

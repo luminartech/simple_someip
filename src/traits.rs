@@ -22,7 +22,7 @@ pub trait WireFormat: Send + Sized + Sync {
     /// Returns the number of bytes written.
     /// # Errors
     /// - If the data cannot be written to the stream
-    fn to_writer<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
+    fn encode<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
 }
 
 /// A trait for SOME/IP Payload types that can be deserialized from a
@@ -85,6 +85,6 @@ impl PayloadWireFormat for DiscoveryOnlyPayload {
     }
 
     fn to_writer<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
-        self.header.to_writer(writer)
+        self.header.encode(writer)
     }
 }
