@@ -52,8 +52,8 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
 }
 
 impl<PayloadDefinition: PayloadWireFormat> WireFormat for Message<PayloadDefinition> {
-    fn from_reader<R: Read>(reader: &mut R) -> Result<Self, Error> {
-        let header = Header::from_reader(reader)?;
+    fn decode<R: Read>(reader: &mut R) -> Result<Self, Error> {
+        let header = Header::decode(reader)?;
         if header.message_id.is_sd() {
             assert!(header.payload_size() >= 12, "SD message too short");
             assert!(

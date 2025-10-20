@@ -101,7 +101,7 @@ where
                     result = socket.recv_from(&mut buf) => {
                         match result {
                             Ok((_bytes_received, _source_address )) => {
-                                let parse_result = Message::<MessageDefinitions>::from_reader(&mut buf.as_slice()).map_err(Error::from);
+                                let parse_result = Message::<MessageDefinitions>::decode(&mut buf.as_slice()).map_err(Error::from);
                                 match rx_tx.send( parse_result ).await {
                                     Ok(_) => {}
                                     Err(_) => {

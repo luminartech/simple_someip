@@ -47,7 +47,7 @@ impl Header {
 }
 
 impl WireFormat for Header {
-    fn from_reader<T: std::io::Read>(reader: &mut T) -> Result<Self, Error> {
+    fn decode<T: std::io::Read>(reader: &mut T) -> Result<Self, Error> {
         let message_id = MessageId::from(reader.read_u32::<BigEndian>()?);
         let length = reader.read_u32::<BigEndian>()?;
         let request_id = reader.read_u32::<BigEndian>()?;
