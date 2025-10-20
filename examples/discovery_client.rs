@@ -1,17 +1,12 @@
 use std::net::Ipv4Addr;
 
 use simple_someip::{protocol::Error, traits::DiscoveryOnlyPayload};
-use tracing::level_filters::LevelFilter;
-
-fn clear_console() {
-    print!("{}[2J", 27 as char);
-    print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
-}
+use tracing::{error, info, level_filters::LevelFilter};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt()
-        .with_max_level(LevelFilter::TRACE)
+        .with_max_level(LevelFilter::INFO)
         .init();
     // Bind with an interface that *doesn't* work
     let mut client =
@@ -25,14 +20,13 @@ async fn main() -> Result<(), Error> {
         .unwrap();
 
     while let Some(update) = client.run().await {
-        clear_console();
         match update {
             simple_someip::ClientUpdate::DiscoveryUpdated(header) => {
-                println!("{header:?}")
+                info!("{header:?}")
             }
             simple_someip::ClientUpdate::Unicast(_) => todo!(),
             simple_someip::ClientUpdate::Error(error) => {
-                println!("Error: {:?}", error);
+                error!("Error: {:?}", error);
             }
         }
     }
