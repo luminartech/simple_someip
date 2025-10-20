@@ -120,7 +120,7 @@ impl Header {
 }
 
 impl WireFormat for Header {
-    fn from_reader<T: std::io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
+    fn decode<T: std::io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
         let flags = Flags::from(reader.read_u8()?);
         let mut reserved: [u8; 3] = [0; 3];
         reader.read_exact(&mut reserved)?;
@@ -129,7 +129,7 @@ impl WireFormat for Header {
         let mut entries = Vec::with_capacity(entries_count as usize);
         let options_count = 0;
         for _i in 0..entries_count {
-            entries.push(Entry::from_reader(reader)?);
+            entries.push(Entry::decode(reader)?);
         }
 
         let mut remaining_options_size = reader.read_u32::<BigEndian>()? as usize;

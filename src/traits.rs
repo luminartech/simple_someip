@@ -13,7 +13,7 @@ pub trait WireFormat: Send + Sized + Sync {
     /// # Errors
     /// - if the stream is not in the expected format
     /// - if the stream contains partial data
-    fn from_reader<T: std::io::Read>(reader: &mut T) -> Result<Self, protocol::Error>;
+    fn decode<T: std::io::Read>(reader: &mut T) -> Result<Self, protocol::Error>;
 
     /// Returns the number of bytes required to serialize this value.
     fn required_size(&self) -> usize;
@@ -67,7 +67,7 @@ impl PayloadWireFormat for DiscoveryOnlyPayload {
     ) -> Result<Self, protocol::Error> {
         match message_id {
             MessageId::SD => Ok(Self {
-                header: protocol::sd::Header::from_reader(reader)?,
+                header: protocol::sd::Header::decode(reader)?,
             }),
 
             _ => Err(protocol::Error::UnsupportedMessageID(message_id)),

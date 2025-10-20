@@ -113,7 +113,7 @@ impl EventGroupEntry {
 }
 
 impl WireFormat for EventGroupEntry {
-    fn from_reader<T: std::io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
+    fn decode<T: std::io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
         let index_first_options_run = reader.read_u8()?;
         let index_second_options_run = reader.read_u8()?;
         let options_count = OptionsCount::from(reader.read_u8()?);
@@ -186,7 +186,7 @@ impl ServiceEntry {
 }
 
 impl WireFormat for ServiceEntry {
-    fn from_reader<R: Read>(reader: &mut R) -> Result<Self, Error> {
+    fn decode<R: Read>(reader: &mut R) -> Result<Self, Error> {
         let index_first_options_run = reader.read_u8()?;
         let index_second_options_run = reader.read_u8()?;
         let options_count = OptionsCount::from(reader.read_u8()?);
@@ -272,27 +272,27 @@ impl Entry {
 }
 
 impl WireFormat for Entry {
-    fn from_reader<R: Read>(reader: &mut R) -> Result<Self, Error> {
+    fn decode<R: Read>(reader: &mut R) -> Result<Self, Error> {
         let entry_type = EntryType::try_from(reader.read_u8()?)?;
         match entry_type {
             EntryType::FindService => {
-                let service_entry = ServiceEntry::from_reader(reader)?;
+                let service_entry = ServiceEntry::decode(reader)?;
                 Ok(Entry::FindService(service_entry))
             }
             EntryType::OfferService => {
-                let service_entry = ServiceEntry::from_reader(reader)?;
+                let service_entry = ServiceEntry::decode(reader)?;
                 Ok(Entry::OfferService(service_entry))
             }
             EntryType::StopOfferService => {
-                let service_entry = ServiceEntry::from_reader(reader)?;
+                let service_entry = ServiceEntry::decode(reader)?;
                 Ok(Entry::StopOfferService(service_entry))
             }
             EntryType::Subscribe => {
-                let event_group_entry = EventGroupEntry::from_reader(reader)?;
+                let event_group_entry = EventGroupEntry::decode(reader)?;
                 Ok(Entry::SubscribeEventGroup(event_group_entry))
             }
             EntryType::SubscribeAck => {
-                let event_group_entry = EventGroupEntry::from_reader(reader)?;
+                let event_group_entry = EventGroupEntry::decode(reader)?;
                 Ok(Entry::SubscribeAckEventGroup(event_group_entry))
             }
         }
