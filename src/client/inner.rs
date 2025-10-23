@@ -9,12 +9,11 @@ use tokio::{
         oneshot,
     },
 };
-use tracing::{debug, field::debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     Error,
-    client::ClientUpdate,
-    client::socket_manager::SocketManager,
+    client::{ClientUpdate, socket_manager::SocketManager},
     protocol::{Message, sd},
     traits::PayloadWireFormat,
 };
@@ -107,8 +106,8 @@ where
         Receiver<ClientUpdate<PayloadDefinitions>>,
     ) {
         info!("Initializing SOME/IP Client");
-        let (control_sender, control_receiver) = mpsc::channel(16);
-        let (update_sender, update_receiver) = mpsc::channel(16);
+        let (control_sender, control_receiver) = mpsc::channel(4);
+        let (update_sender, update_receiver) = mpsc::channel(4);
         let inner = Self {
             control_receiver,
             active_request: None,
@@ -135,7 +134,7 @@ where
 
     // Dropping the receiver kills the loop
     async fn unbind_discovery(&mut self) {
-        debug("Unbinding Discovery socket.");
+        debug!("Unbinding Discovery socket.");
         if let Some(socket_manger) = self.discovery_socket.take() {
             socket_manger.shut_down().await;
         }
@@ -249,9 +248,13 @@ where
                     }
                 }
                 ControlMessage::BindUnicast(response) => {
-                    if response.send(self.bind_unicast().await).is_err() {
-                        // The sender has been dropped, so we should exit
-                        self.run = false;
+                    let result = self.bind_unicast().await;
+                    match response.send(result) {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!("Failed to send bind unicast response: {:?}", e);
+                            self.run = false;
+                        }
                     }
                 }
                 ControlMessage::UnbindUnicast(response) => {
@@ -263,34 +266,43 @@ where
                 }
                 ControlMessage::SendSD(target, header, response) => {
                     // SD Message, If the discovery socket is not bound, bind it
-                    if self.discovery_socket.is_none() {
-                        match self.bind_discovery().await {
-                            Ok(_) => {
-                                self.active_request =
-                                    Some(ControlMessage::SendSD(target, header, response));
-                                return;
-                            }
-                            Err(e) => {
-                                if response.send(Err(e)).is_err() {
-                                    self.run = false;
+                    match &mut self.discovery_socket {
+                        None => {
+                            match self.bind_discovery().await {
+                                Ok(_) => {
+                                    // Discovery socket successfully bound, send the message on the next loop
+                                    self.active_request =
+                                        Some(ControlMessage::SendSD(target, header, response));
+                                    return;
                                 }
-                                return;
+                                Err(e) => {
+                                    error!(
+                                        "Failed to bind discovery socket for sending SD message: {:?}",
+                                        e
+                                    );
+                                    if response.send(Err(e)).is_err() {
+                                        self.run = false;
+                                    }
+                                    return;
+                                }
                             }
                         }
-                    }
-                    let message = Message::<PayloadDefinitions>::new_sd(
-                        self.discovery_socket.as_ref().unwrap().session_id() as u32,
-                        &header,
-                    );
-                    debug!("Sending {:?} to {}", &message, target);
-                    let send_result = self
-                        .discovery_socket
-                        .as_mut()
-                        .unwrap()
-                        .send(target, message)
-                        .await;
-                    if response.send(send_result).is_err() {
-                        self.run = false;
+                        Some(discovery_socket) => {
+                            let message = Message::<PayloadDefinitions>::new_sd(
+                                discovery_socket.session_id() as u32,
+                                &header,
+                            );
+                            debug!("Sending {:?} to {}", &message, target);
+                            let send_result = self
+                                .discovery_socket
+                                .as_mut()
+                                .unwrap()
+                                .send(target, message)
+                                .await;
+                            if response.send(send_result).is_err() {
+                                self.run = false;
+                            }
+                        }
                     }
                 }
                 ControlMessage::Send(target, message, response) => {
@@ -352,6 +364,7 @@ where
                                 }
                             }
                             Err(err) => {
+                                error!("Error receiving discovery message: {:?}", err);
                                 if update_sender.send(ClientUpdate::Error(err)).await.is_err() {
                                     // The sender has been dropped, so we should exit
                                     *run = false;
