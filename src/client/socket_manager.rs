@@ -1,18 +1,41 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
-
-use tokio::{net::UdpSocket, select, sync::mpsc};
-use tracing::{error, info, trace};
-
 use crate::{
     Error, SD_MULTICAST_IP, SD_MULTICAST_PORT,
     protocol::Message,
     traits::{PayloadWireFormat, WireFormat},
 };
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use tokio::{net::UdpSocket, select, sync::mpsc};
+use tracing::{error, info, trace};
+
+/// Structure representing a request to send a message
+#[derive(Debug)]
+pub struct SendMessage<PayloadDefinitions> {
+    pub target_addr: SocketAddrV4,
+    pub message: Message<PayloadDefinitions>,
+    response: tokio::sync::oneshot::Sender<Result<(), Error>>,
+}
+
+impl<PayloadDefinitions: PayloadWireFormat + 'static> SendMessage<PayloadDefinitions> {
+    pub fn new(
+        target_addr: SocketAddrV4,
+        message: Message<PayloadDefinitions>,
+    ) -> (tokio::sync::oneshot::Receiver<Result<(), Error>>, Self) {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        (
+            response_rx,
+            Self {
+                target_addr,
+                message,
+                response: response_tx,
+            },
+        )
+    }
+}
 
 #[derive(Debug)]
 pub struct SocketManager<PayloadDefinitions> {
     receiver: mpsc::Receiver<Result<Message<PayloadDefinitions>, Error>>,
-    sender: mpsc::Sender<(SocketAddrV4, Message<PayloadDefinitions>)>,
+    sender: mpsc::Sender<SendMessage<PayloadDefinitions>>,
     local_port: u16,
     session_id: u16,
 }
@@ -40,8 +63,8 @@ where
     }
 
     pub async fn bind(port: u16) -> Result<Self, Error> {
-        let (rx_tx, rx_rx) = mpsc::channel(16);
-        let (tx_tx, tx_rx) = mpsc::channel(16);
+        let (rx_tx, rx_rx) = mpsc::channel(4);
+        let (tx_tx, tx_rx) = mpsc::channel(4);
         let bind_addr = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
         let socket = UdpSocket::bind(bind_addr).await?;
         let port = socket.local_addr()?.port();
@@ -59,10 +82,14 @@ where
         target_addr: SocketAddrV4,
         message: Message<MessageDefinitions>,
     ) -> Result<(), Error> {
-        self.sender
-            .send((target_addr, message))
+        let (result_channel, message) = SendMessage::new(target_addr, message);
+        self.sender.send(message).await.map_err(|e| {
+            error!("Socket error: {e} when attempting to send message");
+            Error::SocketClosedUnexpectedly
+        })?;
+        result_channel
             .await
-            .map_err(|_| Error::SocketClosedUnexpectedly)?;
+            .expect("Socket manager must always return result of send before dropping channel")?;
         self.session_id += 1;
         Ok(())
     }
@@ -92,7 +119,7 @@ where
     fn spawn_socket_loop(
         socket: UdpSocket,
         rx_tx: mpsc::Sender<Result<Message<MessageDefinitions>, Error>>,
-        mut tx_rx: mpsc::Receiver<(SocketAddrV4, Message<MessageDefinitions>)>,
+        mut tx_rx: mpsc::Receiver<SendMessage<MessageDefinitions>>,
     ) {
         tokio::spawn(async move {
             let mut buf = vec![0; 1400];
@@ -119,13 +146,52 @@ where
                     },
                     message = tx_rx.recv() => {
                         match message {
-                            Some(message) => {
-                                trace!("Sending: {:?}", message);
-                                let message_length = message.1.encode(&mut buf.as_mut_slice()).unwrap();
-                                socket.send_to(&buf[..message_length], message.0).await.unwrap();
+                            Some(send_message) => {
+                                trace!("Sending: {:?}", &send_message);
+                                let message_length = match send_message.message.encode(&mut buf.as_mut_slice()) {
+                                    Ok(length) => length,
+                                    Err(e) => {
+                                        error!("Failed to encode message: {:?}", e);
+                                        // If the sender is already closed we can't send the error back, so we shut everything down
+                                        match send_message.response.send(Err(e.into())) {
+                                            Ok(_) => {
+                                                // Successfully sent error back to sender, carry on
+                                                continue;
+                                            }
+                                            Err(_) => {
+                                                error!("Socket owner closed channel unexpectedly, closing socket.");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                };
+                                match socket.send_to(&buf[..message_length], send_message.target_addr).await {
+                                    Ok(_bytes_sent) => {
+                                        trace!("Sent {} bytes to {}", message_length, send_message.target_addr);
+                                        match send_message.response.send(Ok(())) {
+                                            Ok(_) => {}
+                                            Err(_) => {
+                                                info!("Socket owner closed channel, closing socket.");
+                                                // The sender has been dropped, so we should exit
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to send message with error: {:?}", e);
+                                        match send_message.response.send(Err(Error::Io(e)))
+                                        {
+                                            Ok(())=> (),
+                                            Err(_)=> {
+                                                error!("Socket owner closed channel unexpectedly, closing socket.");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             None => {
-                                info!("Socket Dropping");
+                                info!("Send channel closed, closing socket.");
                                 // The sender has been dropped, so we should exit
                                 break;
                             }
