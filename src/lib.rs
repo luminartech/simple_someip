@@ -21,6 +21,7 @@
 
 #[cfg(feature = "client")]
 mod client;
+pub mod e2e;
 #[cfg(any(feature = "client", feature = "server"))]
 mod error;
 pub mod protocol;
