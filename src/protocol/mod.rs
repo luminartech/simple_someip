@@ -5,6 +5,12 @@ mod message_id;
 mod message_type;
 mod return_code;
 
+/// Service Discovery
+pub mod sd;
+
+/// SOME/IP-TP
+pub mod tp;
+
 pub use error::Error;
 pub use header::Header;
 pub use message::Message;

@@ -1,7 +1,11 @@
-use crate::{someip::Error, Message, SD_MULTICAST_IP};
+use crate::{
+    protocol::{Error, Message},
+    SD_MULTICAST_IP,
+};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     str::FromStr,
+    time::Duration,
 };
 
 pub trait SomeIpMessageHandler {
@@ -31,14 +35,24 @@ impl SomeIPClient {
         discover_socket
             .join_multicast_v4(&discovery_address, &self.config.client_ip)
             .unwrap();
+        discover_socket.set_read_timeout(Some(Duration::from_millis(1)))?;
         println!("Successfully bound Discovery Socket");
         let mut rx_buffer = vec![0; 1400];
         loop {
-            let bytes = discover_socket.recv(&mut rx_buffer)?;
-            let message = Message::read(&mut rx_buffer.as_slice())?;
-            assert!(message.header().message_id.is_sd());
-            assert!(!message.header().message_type.is_tp());
-            println!("Received SD message: {:?}", message);
+            match discover_socket.recv(&mut rx_buffer) {
+                Ok(_) => {
+                    let message = Message::read(&mut rx_buffer.as_slice())?;
+                    assert!(message.header().message_id.is_sd());
+                    assert!(!message.header().message_type.is_tp());
+                    println!("Received SD message: {:?}", message);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(Error::from(e));
+                }
+            }
         }
         Ok(())
     }
