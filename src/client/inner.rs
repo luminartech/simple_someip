@@ -23,7 +23,7 @@ pub(super) enum ControlMessage<MessageDefinitions> {
     SetInterface(Ipv4Addr, oneshot::Sender<Result<(), Error>>),
     BindDiscovery(oneshot::Sender<Result<(), Error>>),
     UnbindDiscovery(oneshot::Sender<Result<(), Error>>),
-    BindUnicast(oneshot::Sender<Result<u16, Error>>),
+    BindUnicast(oneshot::Sender<Result<u16, Error>>, Option<u16>),
     UnbindUnicast(oneshot::Sender<Result<(), Error>>),
     SendSD(SocketAddrV4, sd::Header, oneshot::Sender<Result<(), Error>>),
     Send(
@@ -50,9 +50,17 @@ impl<MessageDefinitions> ControlMessage<MessageDefinitions> {
         let (sender, receiver) = oneshot::channel();
         (receiver, Self::UnbindDiscovery(sender))
     }
+    #[allow(dead_code)]
     pub fn bind_unicast() -> (oneshot::Receiver<Result<u16, Error>>, Self) {
+        Self::bind_unicast_with_port(None)
+    }
+
+    #[allow(dead_code)]
+    pub fn bind_unicast_with_port(
+        port: Option<u16>,
+    ) -> (oneshot::Receiver<Result<u16, Error>>, Self) {
         let (sender, receiver) = oneshot::channel();
-        (receiver, Self::BindUnicast(sender))
+        (receiver, Self::BindUnicast(sender, port))
     }
     pub fn unbind_unicast() -> (oneshot::Receiver<Result<(), Error>>, Self) {
         let (sender, receiver) = oneshot::channel();
@@ -144,14 +152,25 @@ where
         self.interface = *interface;
     }
 
-    async fn bind_unicast(&mut self) -> Result<u16, Error> {
+    async fn bind_unicast(&mut self, port: u16) -> Result<u16, Error> {
         if let Some(socket) = &self.unicast_socket {
-            Ok(socket.port())
+            let current_port = socket.port();
+            // If requesting a different port, we need to rebind
+            if current_port != port && port != 0 {
+                // Unbind current socket and bind to new port
+                self.unicast_socket = None;
+                let unicast_socket = SocketManager::bind(port).await?;
+                let bound_port = unicast_socket.port();
+                self.unicast_socket = Some(unicast_socket);
+                Ok(bound_port)
+            } else {
+                Ok(current_port)
+            }
         } else {
-            let unicast_socket = SocketManager::bind(0).await?;
-            let port = unicast_socket.port();
+            let unicast_socket = SocketManager::bind(port).await?;
+            let bound_port = unicast_socket.port();
             self.unicast_socket = Some(unicast_socket);
-            Ok(port)
+            Ok(bound_port)
         }
     }
 
@@ -247,8 +266,8 @@ where
                         self.run = false;
                     }
                 }
-                ControlMessage::BindUnicast(response) => {
-                    let result = self.bind_unicast().await;
+                ControlMessage::BindUnicast(response, port) => {
+                    let result = self.bind_unicast(port.unwrap_or(0)).await;
                     match response.send(result) {
                         Ok(_) => (),
                         Err(e) => {
