@@ -49,7 +49,18 @@ where
         let (tx_tx, tx_rx) = mpsc::channel(16);
         let bind_addr =
             std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), SD_MULTICAST_PORT);
-        let socket = UdpSocket::bind(bind_addr).await?;
+        
+        // Create socket with SO_REUSEADDR and SO_REUSEPORT to allow quick restart
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&bind_addr.into())?;
+        socket.set_nonblocking(true)?;
+        let socket: std::net::UdpSocket = socket.into();
+        let socket = UdpSocket::from_std(socket)?;
 
         socket.join_multicast_v4(SD_MULTICAST_IP, interface)?;
 
@@ -66,7 +77,18 @@ where
         let (rx_tx, rx_rx) = mpsc::channel(4);
         let (tx_tx, tx_rx) = mpsc::channel(4);
         let bind_addr = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-        let socket = UdpSocket::bind(bind_addr).await?;
+        
+        // Create socket with SO_REUSEADDR and SO_REUSEPORT to allow quick restart
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&bind_addr.into())?;
+        socket.set_nonblocking(true)?;
+        let socket: std::net::UdpSocket = socket.into();
+        let socket = UdpSocket::from_std(socket)?;
         let port = socket.local_addr()?.port();
         Self::spawn_socket_loop(socket, rx_tx, tx_rx);
         Ok(Self {
