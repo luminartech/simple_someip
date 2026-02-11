@@ -34,22 +34,23 @@ pub fn compute_crc32_p4(length: u16, counter: u16, data_id: u32, payload: &[u8])
 
 /// Compute CRC-16-CCITT for Profile 5.
 ///
-/// The CRC is computed over: DataID (2) + Length (2) + Counter (1) + Payload
+/// Per AUTOSAR E2E Profile 5, the CRC is computed over all data bytes except the
+/// CRC field itself, plus the DataID. Specifically:
+/// - Counter (1 byte) + Payload (N bytes) + DataID (2 bytes, little-endian)
+///
 /// Note: CRC field itself is not included in the calculation.
-pub fn compute_crc16_p5(data_id: u16, data_length: u16, counter: u8, payload: &[u8]) -> u16 {
+/// Note: DataLength is NOT included in the CRC calculation.
+pub fn compute_crc16_p5(data_id: u16, counter: u8, payload: &[u8]) -> u16 {
     let mut digest = CRC16_CCITT.digest();
-
-    // DataID (big-endian)
-    digest.update(&data_id.to_be_bytes());
-
-    // Data length (big-endian)
-    digest.update(&data_length.to_be_bytes());
 
     // Counter (single byte)
     digest.update(&[counter]);
 
     // Payload
     digest.update(payload);
+
+    // DataID (little-endian)
+    digest.update(&data_id.to_le_bytes());
 
     digest.finalize()
 }
@@ -74,10 +75,10 @@ mod tests {
     #[test]
     fn test_crc16_p5_basic() {
         // Basic smoke test - verify CRC changes with different inputs
-        let crc1 = compute_crc16_p5(0x1234, 10, 0, b"test");
-        let crc2 = compute_crc16_p5(0x1234, 10, 1, b"test");
-        let crc3 = compute_crc16_p5(0x1235, 10, 0, b"test");
-        let crc4 = compute_crc16_p5(0x1234, 10, 0, b"Test");
+        let crc1 = compute_crc16_p5(0x1234, 0, b"test");
+        let crc2 = compute_crc16_p5(0x1234, 1, b"test");
+        let crc3 = compute_crc16_p5(0x1235, 0, b"test");
+        let crc4 = compute_crc16_p5(0x1234, 0, b"Test");
 
         assert_ne!(crc1, crc2, "Different counter should produce different CRC");
         assert_ne!(crc1, crc3, "Different data_id should produce different CRC");
@@ -95,8 +96,8 @@ mod tests {
     #[test]
     fn test_crc16_p5_deterministic() {
         // Same inputs should always produce same output
-        let crc1 = compute_crc16_p5(0xABCD, 20, 5, b"payload data");
-        let crc2 = compute_crc16_p5(0xABCD, 20, 5, b"payload data");
+        let crc1 = compute_crc16_p5(0xABCD, 5, b"payload data");
+        let crc2 = compute_crc16_p5(0xABCD, 5, b"payload data");
         assert_eq!(crc1, crc2);
     }
 
@@ -110,7 +111,7 @@ mod tests {
     #[test]
     fn test_crc16_p5_empty_payload() {
         // Should work with empty payload
-        let crc = compute_crc16_p5(0x1234, 3, 0, b"");
+        let crc = compute_crc16_p5(0x1234, 0, b"");
         assert_ne!(crc, 0); // CRC should be non-trivial even for empty payload
     }
 }

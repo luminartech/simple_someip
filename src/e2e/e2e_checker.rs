@@ -68,8 +68,8 @@ pub fn check_profile4(
 /// Check E2E Profile 5 protected data.
 ///
 /// Validates the 3-byte header:
+/// - CRC (2 bytes, little-endian): Verified against computed CRC-16-CCITT
 /// - Counter (1 byte): Checks sequence continuity
-/// - CRC (2 bytes): Verified against computed CRC-16-CCITT
 ///
 /// # Arguments
 /// * `config` - Profile 5 configuration
@@ -88,15 +88,15 @@ pub fn check_profile5(
         return E2ECheckResult::error(E2ECheckStatus::BadArgument);
     }
 
-    // Parse header
-    let counter = protected[0];
-    let received_crc = u16::from_be_bytes([protected[1], protected[2]]);
+    // Parse header: CRC (2, little-endian) + Counter (1)
+    let received_crc = u16::from_le_bytes([protected[0], protected[1]]);
+    let counter = protected[2];
 
     // Extract payload
     let payload = &protected[PROFILE5_HEADER_SIZE..];
 
     // Compute and verify CRC
-    let computed_crc = compute_crc16_p5(config.data_id, config.data_length, counter, payload);
+    let computed_crc = compute_crc16_p5(config.data_id, counter, payload);
     if computed_crc != received_crc {
         return E2ECheckResult::error(E2ECheckStatus::CrcError);
     }

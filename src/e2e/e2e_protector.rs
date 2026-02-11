@@ -61,8 +61,8 @@ pub fn protect_profile4(
 /// Add E2E Profile 5 protection to a payload.
 ///
 /// Creates a protected message with a 3-byte header prepended:
+/// - CRC (2 bytes, little-endian): CRC-16-CCITT over Counter + Payload + DataID(LE)
 /// - Counter (1 byte): Sequence counter from state
-/// - CRC (2 bytes): CRC-16-CCITT over DataID + DataLength + Counter + Payload
 ///
 /// The state counter is incremented after each call.
 ///
@@ -80,15 +80,15 @@ pub fn protect_profile5(
 ) -> Vec<u8> {
     let counter = state.protect_counter;
 
-    // Compute CRC over: DataID + DataLength + Counter + Payload
-    let crc = compute_crc16_p5(config.data_id, config.data_length, counter, payload);
+    // Compute CRC over: Counter + Payload + DataID (LE)
+    let crc = compute_crc16_p5(config.data_id, counter, payload);
 
     // Build the protected message
     let mut result = Vec::with_capacity(PROFILE5_HEADER_SIZE + payload.len());
 
-    // Header: Counter (1) + CRC (2)
+    // Header: CRC (2, little-endian) + Counter (1)
+    result.extend_from_slice(&crc.to_le_bytes());
     result.push(counter);
-    result.extend_from_slice(&crc.to_be_bytes());
 
     // Payload
     result.extend_from_slice(payload);
@@ -171,8 +171,9 @@ mod tests {
         // Check total length
         assert_eq!(protected.len(), 3 + 4); // header + payload
 
-        // Check counter field (first byte)
-        assert_eq!(protected[0], 0);
+        // Header layout: [CRC_lo, CRC_hi, Counter]
+        // Check counter field (third byte)
+        assert_eq!(protected[2], 0);
 
         // Check payload at end
         assert_eq!(&protected[3..], b"test");
@@ -187,7 +188,7 @@ mod tests {
 
         for i in 0..5u8 {
             let protected = protect_profile5(&config, &mut state, payload);
-            assert_eq!(protected[0], i);
+            assert_eq!(protected[2], i); // Counter is at byte 2
         }
     }
 
@@ -199,10 +200,10 @@ mod tests {
         let payload = b"test";
 
         let protected1 = protect_profile5(&config, &mut state, payload);
-        assert_eq!(protected1[0], u8::MAX);
+        assert_eq!(protected1[2], u8::MAX); // Counter is at byte 2
 
         let protected2 = protect_profile5(&config, &mut state, payload);
-        assert_eq!(protected2[0], 0); // Wrapped
+        assert_eq!(protected2[2], 0); // Wrapped
     }
 
     #[test]
