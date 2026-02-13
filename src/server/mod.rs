@@ -144,8 +144,13 @@ impl Server {
                 match Self::send_offer_service(&config, &sd_socket, &sd_session_id).await {
                     Ok(_) => {
                         announcement_count += 1;
-                        if announcement_count % 10 == 1 {
+                        if announcement_count == 1 {
                             tracing::info!(
+                                "Sent first SD announcement for service 0x{:04X}",
+                                config.service_id
+                            );
+                        } else {
+                            tracing::debug!(
                                 "Sent {} SD announcements for service 0x{:04X}",
                                 announcement_count,
                                 config.service_id
@@ -288,7 +293,7 @@ impl Server {
         buffer.extend_from_slice(&sd_data);
 
         self.sd_socket.send_to(&buffer, target).await?;
-        tracing::info!(
+        tracing::debug!(
             "Sent unicast OfferService to {} for service 0x{:04X}",
             target, self.config.service_id
         );
@@ -342,14 +347,14 @@ impl Server {
                 }
             }
 
-            tracing::debug!("Received {} bytes from {} on {} socket", len, addr, source);
+            tracing::trace!("Received {} bytes from {} on {} socket", len, addr, source);
             tracing::trace!("Raw data: {:02X?}", &data[..len.min(64)]);
 
             // Try to parse as SOME/IP message
             let mut cursor = Cursor::new(data);
             match SomeIpHeader::decode(&mut cursor) {
                 Ok(header) => {
-                    tracing::debug!("SOME/IP Header: service=0x{:04X}, method=0x{:04X}, type={:?}",
+                    tracing::trace!("SOME/IP Header: service=0x{:04X}, method=0x{:04X}, type={:?}",
                         header.message_id.service_id(),
                         header.message_id.method_id(),
                         header.message_type.message_type()
@@ -395,7 +400,7 @@ impl Server {
         for entry in &sd_msg.entries {
             match entry {
                 Entry::SubscribeEventGroup(sub) => {
-                    tracing::info!(
+                    tracing::debug!(
                         "Received Subscribe from {}: service=0x{:04X}, instance={}, eventgroup=0x{:04X}",
                         sender,
                         sub.service_id,
@@ -445,7 +450,7 @@ impl Server {
                 Entry::FindService(find) => {
                     // Check if this FindService is for our service (or wildcard 0xFFFF)
                     if find.service_id == self.config.service_id || find.service_id == 0xFFFF {
-                        tracing::info!(
+                        tracing::debug!(
                             "Received FindService from {} for service 0x{:04X} (ours: 0x{:04X}), sending unicast offer",
                             sender, find.service_id, self.config.service_id
                         );
@@ -472,7 +477,7 @@ impl Server {
         for option in options {
             tracing::trace!("Option: {:?}", option);
             if let sd::Options::IpV4Endpoint { ip, port, .. } = option {
-                tracing::debug!("Found IPv4 endpoint: {}:{}", ip, port);
+                tracing::trace!("Found IPv4 endpoint: {}:{}", ip, port);
                 return Some(SocketAddrV4::new(*ip, *port));
             }
         }
@@ -533,7 +538,7 @@ impl Server {
         // Send SubscribeAck to the subscriber
         self.unicast_socket.send_to(&buffer, subscriber).await?;
 
-        tracing::info!(
+        tracing::debug!(
             "Sent SubscribeAck to {} for service 0x{:04X}, eventgroup 0x{:04X}",
             subscriber,
             subscription.service_id,

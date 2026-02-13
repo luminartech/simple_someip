@@ -46,7 +46,7 @@ impl SubscriptionManager {
         subscribers.push(subscriber);
 
         tracing::info!(
-            "New subscriber {} for service 0x{:04X}, instance {}, event group 0x{:04X}",
+            "Subscriber {} added for service 0x{:04X}, instance {}, event group 0x{:04X}",
             subscriber_addr,
             service_id,
             instance_id,
