@@ -41,6 +41,14 @@ pub fn compute_crc32_p4(length: u16, counter: u16, data_id: u32, payload: &[u8])
 /// Note: CRC field itself is not included in the calculation.
 /// Note: DataLength is NOT included in the CRC calculation.
 pub fn compute_crc16_p5(data_id: u16, counter: u8, payload: &[u8]) -> u16 {
+    tracing::trace!(
+        "CRC-16 Profile5: data_id=0x{:04X}, counter={}, payload_len={}, payload={:02X?}",
+        data_id,
+        counter,
+        payload.len(),
+        payload
+    );
+
     let mut digest = CRC16_CCITT.digest();
 
     // Counter (single byte)
@@ -50,9 +58,13 @@ pub fn compute_crc16_p5(data_id: u16, counter: u8, payload: &[u8]) -> u16 {
     digest.update(payload);
 
     // DataID (little-endian)
-    digest.update(&data_id.to_le_bytes());
+    let data_id_bytes = data_id.to_le_bytes();
+    digest.update(&data_id_bytes);
 
-    digest.finalize()
+    let crc = digest.finalize();
+    tracing::trace!("CRC-16 Profile5: computed CRC = 0x{:04X} (bytes: {:02X?})", crc, crc.to_le_bytes());
+    
+    crc
 }
 
 #[cfg(test)]

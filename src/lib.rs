@@ -25,12 +25,16 @@ pub mod e2e;
 #[cfg(any(feature = "client", feature = "server"))]
 mod error;
 pub mod protocol;
+#[cfg(feature = "server")]
+pub mod server;
 pub mod traits;
 
 #[cfg(feature = "client")]
 pub use client::*;
 #[cfg(any(feature = "client", feature = "server"))]
 pub use error::Error;
+#[cfg(feature = "server")]
+pub use server::Server;
 
 use std::net::Ipv4Addr;
 

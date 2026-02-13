@@ -88,6 +88,18 @@ pub fn check_profile5(
         return E2ECheckResult::error(E2ECheckStatus::BadArgument);
     }
 
+    // Verify data length matches configuration (header + payload = config.data_length)
+    let expected_total_length = PROFILE5_HEADER_SIZE + config.data_length as usize;
+    if protected.len() != expected_total_length {
+        tracing::warn!(
+            "E2E Profile 5 length mismatch: expected {} bytes (3 header + {} payload), got {} bytes",
+            expected_total_length,
+            config.data_length,
+            protected.len()
+        );
+        return E2ECheckResult::error(E2ECheckStatus::BadArgument);
+    }
+
     // Parse header: CRC (2, little-endian) + Counter (1)
     let received_crc = u16::from_le_bytes([protected[0], protected[1]]);
     let counter = protected[2];
