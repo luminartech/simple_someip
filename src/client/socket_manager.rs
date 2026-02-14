@@ -50,7 +50,7 @@ where
         let bind_addr =
             std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), SD_MULTICAST_PORT);
         
-        // Create socket with SO_REUSEADDR and SO_REUSEPORT to allow quick restart
+        // Create socket with SO_REUSEADDR to allow quick restart
         let socket = socket2::Socket::new(
             socket2::Domain::IPV4,
             socket2::Type::DGRAM,
