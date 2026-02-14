@@ -32,10 +32,16 @@ pub fn protect_profile4(
     state: &mut Profile4State,
     payload: &[u8],
 ) -> Vec<u8> {
-    let counter = state.protect_counter;
+    let total_length = PROFILE4_HEADER_SIZE + payload.len();
+    assert!(
+        total_length <= u16::MAX as usize,
+        "E2E Profile 4 payload too large: total length {} exceeds u16::MAX ({})",
+        total_length,
+        u16::MAX,
+    );
 
-    // Total length includes 12-byte header + payload
-    let length = (PROFILE4_HEADER_SIZE + payload.len()) as u16;
+    let counter = state.protect_counter;
+    let length = total_length as u16;
 
     // Compute CRC over: Length + Counter + DataID + Payload
     let crc = compute_crc32_p4(length, counter, config.data_id, payload);

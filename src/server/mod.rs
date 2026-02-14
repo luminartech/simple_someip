@@ -22,6 +22,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use tokio::sync::RwLock;
 
+/// Compute the SOME/IP header `length` field (payload + 8 bytes of header overhead).
+///
+/// Panics if the total exceeds `u32::MAX`, which would cause silent truncation.
+pub(crate) fn someip_length(payload_len: usize) -> u32 {
+    const HEADER_OVERHEAD: usize = 8;
+    let total = payload_len + HEADER_OVERHEAD;
+    assert!(
+        total <= u32::MAX as usize,
+        "SOME/IP payload too large: length {} exceeds u32::MAX",
+        total,
+    );
+    total as u32
+}
+
 /// Configuration for a SOME/IP service provider
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -206,14 +220,19 @@ impl Server {
         sd_payload.encode(&mut sd_data)?;
 
         // Increment session ID (wrapping from 0xFFFF back to 0x0001, skipping 0)
-        let sid = session_id.fetch_add(1, Ordering::Relaxed);
-        let sid = if sid == 0 { session_id.fetch_add(1, Ordering::Relaxed) } else { sid };
-        let sid = sid as u32;
+        let prev = session_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                let next = v.wrapping_add(1);
+                Some(if next == 0 { 1 } else { next })
+            })
+            .unwrap();
+        let next = prev.wrapping_add(1);
+        let sid = (if next == 0 { 1 } else { next }) as u32;
 
         // Wrap in SOME/IP header for SD (service 0xFFFF, method 0x8100)
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
-            length: (sd_data.len() + 8) as u32, // SD payload + 8 bytes header overhead
+            length: someip_length(sd_data.len()),
             session_id: sid,
             protocol_version: 0x01,
             interface_version: 0x01,
@@ -280,7 +299,7 @@ impl Server {
         let sid = self.next_sd_session_id();
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
-            length: (sd_data.len() + 8) as u32,
+            length: someip_length(sd_data.len()),
             session_id: sid,
             protocol_version: 0x01,
             interface_version: 0x01,
@@ -303,9 +322,15 @@ impl Server {
 
     /// Get the next SD session ID (client_id=0, session_id incrementing), skipping 0
     fn next_sd_session_id(&self) -> u32 {
-        let sid = self.sd_session_id.fetch_add(1, Ordering::Relaxed);
-        let sid = if sid == 0 { self.sd_session_id.fetch_add(1, Ordering::Relaxed) } else { sid };
-        sid as u32 // client_id (upper 16) = 0, session_id (lower 16) = sid
+        let prev = self.sd_session_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                let next = v.wrapping_add(1);
+                Some(if next == 0 { 1 } else { next })
+            })
+            .unwrap();
+        // fetch_update returns the previous value; compute the same next value
+        let next = prev.wrapping_add(1);
+        (if next == 0 { 1 } else { next }) as u32
     }
 
     /// Get the event publisher for sending events
@@ -522,7 +547,7 @@ impl Server {
         let sid = self.next_sd_session_id();
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
-            length: (sd_data.len() + 8) as u32,
+            length: someip_length(sd_data.len()),
             session_id: sid,
             protocol_version: 0x01,
             interface_version: 0x01,
@@ -588,7 +613,7 @@ impl Server {
         let sid = self.next_sd_session_id();
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
-            length: (sd_data.len() + 8) as u32,
+            length: someip_length(sd_data.len()),
             session_id: sid,
             protocol_version: 0x01,
             interface_version: 0x01,
@@ -642,7 +667,7 @@ mod tests {
 
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
-            length: (sd_data.len() + 8) as u32,
+            length: someip_length(sd_data.len()),
             session_id: 0x0001,
             protocol_version: 0x01,
             interface_version: 0x01,

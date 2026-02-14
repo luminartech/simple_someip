@@ -27,7 +27,7 @@ The server implementation provides:
          │ SD Announcements      │ Events                │ Subscriptions
          ↓                       ↓                       ↑
 ┌────────────────┐      ┌────────────────┐      ┌────────────────┐
-│ 224.244.224.245│      │   Subscriber   │      │   Subscriber   │
+│  239.255.0.255 │      │   Subscriber   │      │   Subscriber   │
 │    :30490      │      │   (unicast)    │      │   (unicast)    │
 │  (multicast)   │      └────────────────┘      └────────────────┘
 └────────────────┘
@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Service Discovery (SD) Protocol
 
-The server periodically sends **OfferService** messages to the multicast group `224.244.224.245:30490`:
+The server periodically sends **OfferService** messages to the multicast group `239.255.0.255:30490`:
 
 ```
 SD Message Structure:

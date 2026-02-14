@@ -119,7 +119,7 @@ impl EventPublisher {
                 service_id,
                 event_id,
             ),
-            length: (8 + payload.len()) as u32, // Header overhead + payload
+            length: super::someip_length(payload.len()),
             session_id,
             protocol_version,
             interface_version,
