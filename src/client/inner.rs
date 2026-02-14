@@ -99,6 +99,10 @@ pub(super) struct Inner<PayloadDefinitions> {
     unicast_socket: Option<SocketManager<PayloadDefinitions>>,
     /// Internal flag to continue run loop
     run: bool,
+    /// Client ID for SOME/IP request headers (upper 16 bits of request ID)
+    client_id: u16,
+    /// Incrementing session counter for SOME/IP request headers (lower 16 bits of request ID)
+    session_counter: u16,
     /// Phantom data to represent the generic message definitions
     phantom: std::marker::PhantomData<PayloadDefinitions>,
 }
@@ -124,6 +128,8 @@ where
             discovery_socket: None,
             unicast_socket: None,
             run: true,
+            client_id: 0x1234,
+            session_counter: 1,
             phantom: std::marker::PhantomData,
         };
         inner.run();
@@ -324,8 +330,15 @@ where
                         }
                     }
                 }
-                ControlMessage::Send(target, message, response) => {
+                ControlMessage::Send(target, mut message, response) => {
                     if let Some(socket) = &mut self.unicast_socket {
+                        // Set client ID (upper 16) and session ID (lower 16)
+                        let request_id = ((self.client_id as u32) << 16) | (self.session_counter as u32);
+                        message.set_session_id(request_id);
+                        self.session_counter = self.session_counter.wrapping_add(1);
+                        if self.session_counter == 0 {
+                            self.session_counter = 1;
+                        }
                         let send_result = socket.send(target, message.clone()).await;
                         match send_result {
                             Ok(_) => {
