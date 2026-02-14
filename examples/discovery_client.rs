@@ -15,7 +15,7 @@ async fn main() -> Result<(), Error> {
 
     // Change the interface to one that *does* work
     client
-        .set_interface(Ipv4Addr::new(192, 168, 10, 87))
+        .set_interface(Ipv4Addr::new(192, 168, 11, 87))
         .await
         .unwrap();
 
