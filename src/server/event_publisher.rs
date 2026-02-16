@@ -92,6 +92,7 @@ impl EventPublisher {
     /// Publish raw event data (already serialized with E2E protection)
     ///
     /// This is useful when you've already applied E2E protection to the payload
+    #[allow(clippy::too_many_arguments)]
     pub async fn publish_raw_event(
         &self,
         service_id: u16,

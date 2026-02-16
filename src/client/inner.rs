@@ -163,10 +163,10 @@ where
     }
 
     async fn bind_unicast(&mut self, port: u16) -> Result<u16, Error> {
-        if port != 0 {
-            if let Some(socket) = self.unicast_sockets.get(&port) {
-                return Ok(socket.port());
-            }
+        if port != 0
+            && let Some(socket) = self.unicast_sockets.get(&port)
+        {
+            return Ok(socket.port());
         }
         let unicast_socket = SocketManager::bind(port).await?;
         let bound_port = unicast_socket.port();
@@ -303,7 +303,6 @@ where
                                     // Discovery socket successfully bound, send the message on the next loop
                                     self.active_request =
                                         Some(ControlMessage::SendSD(target, header, response));
-                                    return;
                                 }
                                 Err(e) => {
                                     error!(
@@ -313,7 +312,6 @@ where
                                     if response.send(Err(e)).is_err() {
                                         self.run = false;
                                     }
-                                    return;
                                 }
                             }
                         }

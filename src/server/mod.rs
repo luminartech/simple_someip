@@ -119,13 +119,13 @@ impl Server {
             "Server SD socket bound to {} (expected port {}), joined multicast {}",
             actual_sd_addr, expected_sd_port, crate::SD_MULTICAST_IP
         );
-        if let std::net::SocketAddr::V4(v4) = actual_sd_addr {
-            if v4.port() != expected_sd_port {
-                tracing::error!(
-                    "SD socket port mismatch! Expected {}, got {}. Offers will use wrong source port.",
-                    expected_sd_port, v4.port()
-                );
-            }
+        if let std::net::SocketAddr::V4(v4) = actual_sd_addr
+            && v4.port() != expected_sd_port
+        {
+            tracing::error!(
+                "SD socket port mismatch! Expected {}, got {}. Offers will use wrong source port.",
+                expected_sd_port, v4.port()
+            );
         }
 
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
@@ -365,11 +365,11 @@ impl Server {
             let data = &data[..len];
 
             // Skip our own multicast messages
-            if let std::net::SocketAddr::V4(v4) = addr {
-                if *v4.ip() == self.config.interface && source == "sd-multicast" {
-                    tracing::trace!("Ignoring our own SD multicast message");
-                    continue;
-                }
+            if let std::net::SocketAddr::V4(v4) = addr
+                && *v4.ip() == self.config.interface && source == "sd-multicast"
+            {
+                tracing::trace!("Ignoring our own SD multicast message");
+                continue;
             }
 
             tracing::trace!("Received {} bytes from {} on {} socket", len, addr, source);

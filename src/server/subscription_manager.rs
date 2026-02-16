@@ -28,7 +28,7 @@ impl SubscriptionManager {
         subscriber_addr: SocketAddrV4,
     ) {
         let key = (service_id, instance_id, event_group_id);
-        let subscribers = self.subscriptions.entry(key).or_insert_with(Vec::new);
+        let subscribers = self.subscriptions.entry(key).or_default();
 
         // Deduplicate: if this address is already subscribed, just refresh (don't add again)
         if subscribers.iter().any(|s| s.address == subscriber_addr) {
@@ -89,10 +89,7 @@ impl SubscriptionManager {
         event_group_id: u16,
     ) -> Vec<Subscriber> {
         let key = (service_id, instance_id, event_group_id);
-        self.subscriptions
-            .get(&key)
-            .map(|v| v.clone())
-            .unwrap_or_default()
+        self.subscriptions.get(&key).cloned().unwrap_or_default()
     }
 
     /// Get total number of active subscriptions
