@@ -1,6 +1,8 @@
 use std::{
+    collections::HashMap,
     future,
     net::{Ipv4Addr, SocketAddrV4},
+    task::Poll,
 };
 use tokio::{
     select,
@@ -29,6 +31,7 @@ pub(super) enum ControlMessage<MessageDefinitions> {
     Send(
         SocketAddrV4,
         Message<MessageDefinitions>,
+        u16, // source port — which unicast socket to send from
         oneshot::Sender<Result<MessageDefinitions, Error>>,
     ),
     AwaitResponse(
@@ -77,9 +80,10 @@ impl<MessageDefinitions> ControlMessage<MessageDefinitions> {
     pub fn send_request(
         socket_addr: SocketAddrV4,
         message: Message<MessageDefinitions>,
+        source_port: u16,
     ) -> (oneshot::Receiver<Result<MessageDefinitions, Error>>, Self) {
         let (sender, receiver) = oneshot::channel();
-        (receiver, Self::Send(socket_addr, message, sender))
+        (receiver, Self::Send(socket_addr, message, source_port, sender))
     }
 }
 
@@ -95,8 +99,8 @@ pub(super) struct Inner<PayloadDefinitions> {
     interface: Ipv4Addr,
     /// Socket manager for service discovery if bound
     discovery_socket: Option<SocketManager<PayloadDefinitions>>,
-    /// Socket manager for unicast messages if bound
-    unicast_socket: Option<SocketManager<PayloadDefinitions>>,
+    /// Socket managers for unicast messages, keyed by local port
+    unicast_sockets: HashMap<u16, SocketManager<PayloadDefinitions>>,
     /// Internal flag to continue run loop
     run: bool,
     /// Client ID for SOME/IP request headers (upper 16 bits of request ID)
@@ -126,7 +130,7 @@ where
             update_sender,
             interface,
             discovery_socket: None,
-            unicast_socket: None,
+            unicast_sockets: HashMap::new(),
             run: true,
             client_id: 0x1234,
             session_counter: 1,
@@ -159,29 +163,20 @@ where
     }
 
     async fn bind_unicast(&mut self, port: u16) -> Result<u16, Error> {
-        if let Some(socket) = &self.unicast_socket {
-            let current_port = socket.port();
-            // If requesting a different port, we need to rebind
-            if current_port != port && port != 0 {
-                // Unbind current socket and bind to new port
-                self.unicast_socket = None;
-                let unicast_socket = SocketManager::bind(port).await?;
-                let bound_port = unicast_socket.port();
-                self.unicast_socket = Some(unicast_socket);
-                Ok(bound_port)
-            } else {
-                Ok(current_port)
+        if port != 0 {
+            if let Some(socket) = self.unicast_sockets.get(&port) {
+                return Ok(socket.port());
             }
-        } else {
-            let unicast_socket = SocketManager::bind(port).await?;
-            let bound_port = unicast_socket.port();
-            self.unicast_socket = Some(unicast_socket);
-            Ok(bound_port)
         }
+        let unicast_socket = SocketManager::bind(port).await?;
+        let bound_port = unicast_socket.port();
+        self.unicast_sockets.insert(bound_port, unicast_socket);
+        debug!("Bound unicast socket on port {}", bound_port);
+        Ok(bound_port)
     }
 
     async fn unbind_unicast(&mut self) {
-        self.unicast_socket = None;
+        self.unicast_sockets.clear();
     }
 
     async fn receive_discovery(
@@ -209,18 +204,28 @@ where
         }
     }
 
-    async fn receive_unicast(
-        socket_manager: &mut Option<SocketManager<PayloadDefinitions>>,
+    /// Receive from any bound unicast socket. Returns the first message ready
+    /// from any socket. If no sockets are bound, returns a future that never resolves.
+    async fn receive_any_unicast(
+        unicast_sockets: &mut HashMap<u16, SocketManager<PayloadDefinitions>>,
     ) -> Result<Message<PayloadDefinitions>, Error> {
-        if let Some(receiver) = socket_manager {
-            match receiver.receive().await {
-                Some(message) => message,
-                None => Err(Error::SocketClosedUnexpectedly),
-            }
-        } else {
-            // If we don't have a receiver, we should return a future that never resolves
-            future::pending().await
+        if unicast_sockets.is_empty() {
+            return future::pending().await;
         }
+
+        // Use poll_fn to manually poll each socket's receiver
+        std::future::poll_fn(|cx| {
+            for socket in unicast_sockets.values_mut() {
+                if let Poll::Ready(result) = socket.poll_receive(cx) {
+                    return Poll::Ready(match result {
+                        Some(msg) => msg,
+                        None => Err(Error::SocketClosedUnexpectedly),
+                    });
+                }
+            }
+            Poll::Pending
+        })
+        .await
     }
 
     async fn handle_control_message(&mut self) {
@@ -330,8 +335,8 @@ where
                         }
                     }
                 }
-                ControlMessage::Send(target, mut message, response) => {
-                    if let Some(socket) = &mut self.unicast_socket {
+                ControlMessage::Send(target, mut message, source_port, response) => {
+                    if let Some(socket) = self.unicast_sockets.get_mut(&source_port) {
                         // Set client ID (upper 16) and session ID (lower 16)
                         let request_id = ((self.client_id as u32) << 16) | (self.session_counter as u32);
                         message.set_session_id(request_id);
@@ -349,6 +354,9 @@ where
                             }
                             Err(_) => todo!(),
                         };
+                    } else {
+                        error!("No unicast socket bound on port {}", source_port);
+                        let _ = response.send(Err(Error::UnicastSocketNotBound));
                     }
                 }
                 // Nothing to do here, this is handled in the run loop when receiving messages
@@ -366,7 +374,7 @@ where
                 let Self {
                     control_receiver,
                     discovery_socket,
-                    unicast_socket,
+                    unicast_sockets,
                     update_sender,
                     active_request,
                     run,
@@ -404,8 +412,8 @@ where
                             }
                         }
                      }
-                     unicast = Inner::receive_unicast(unicast_socket) => {
-                         trace!("Received unicast message: {:?}",unicast);
+                     unicast = Inner::receive_any_unicast(unicast_sockets) => {
+                         trace!("Received unicast message: {:?}", unicast);
                          match unicast {
                              Ok(received_message) => {
                                  if let Some(active) = active_request.take() {
@@ -422,7 +430,17 @@ where
                                              }
                                          } else {
                                              *active_request = Some(ControlMessage::AwaitResponse(request_message, response));
-                                             if update_sender.send(ClientUpdate::Unicast(received_message)).await.is_err(){
+                                             // Use try_send to avoid blocking the select loop
+                                             // while waiting for a response. If the channel is
+                                             // full, drop the event rather than deadlocking.
+                                             match update_sender.try_send(ClientUpdate::Unicast(received_message)) {
+                                                 Ok(_) => {}
+                                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                                     trace!("Update channel full, dropping event while awaiting response");
+                                                 }
+                                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                                     *run = false;
+                                                 }
                                              }
                                          }
                                      } else {*active_request = Some(active);}

@@ -285,8 +285,10 @@ mod tests {
         let mut protect_state = Profile5State::new();
         let mut check_state = Profile5State::new();
 
-        let payload = b"Hello, World!";
-        let protected = protect_profile5(&config, &mut protect_state, payload);
+        // Payload must be padded to data_length (20 bytes) for check_profile5
+        let mut payload = [0u8; 20];
+        payload[..13].copy_from_slice(b"Hello, World!");
+        let protected = protect_profile5(&config, &mut protect_state, &payload);
 
         let result = check_profile5(&config, &mut check_state, &protected);
         assert_eq!(result.status, E2ECheckStatus::Ok);
@@ -300,8 +302,9 @@ mod tests {
         let mut protect_state = Profile5State::new();
         let mut check_state = Profile5State::new();
 
-        let payload = b"test";
-        let mut protected = protect_profile5(&config, &mut protect_state, payload);
+        let mut payload = [0u8; 20];
+        payload[..4].copy_from_slice(b"test");
+        let mut protected = protect_profile5(&config, &mut protect_state, &payload);
 
         // Corrupt CRC (bytes 1-2)
         protected[1] ^= 0xFF;
@@ -423,11 +426,12 @@ mod tests {
         let mut protect_state = Profile5State::with_initial_counter(u8::MAX - 2);
         let mut check_state = Profile5State::new();
 
-        let payload = b"test";
+        let mut payload = [0u8; 20];
+        payload[..4].copy_from_slice(b"test");
 
         // Messages around counter wraparound
         for _ in 0..5 {
-            let protected = protect_profile5(&config, &mut protect_state, payload);
+            let protected = protect_profile5(&config, &mut protect_state, &payload);
             let result = check_profile5(&config, &mut check_state, &protected);
             assert_eq!(result.status, E2ECheckStatus::Ok);
         }

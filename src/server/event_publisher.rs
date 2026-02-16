@@ -188,8 +188,6 @@ impl EventPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
-
     #[tokio::test]
     async fn test_event_publisher_creation() {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));

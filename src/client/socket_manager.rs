@@ -3,7 +3,10 @@ use crate::{
     protocol::Message,
     traits::{PayloadWireFormat, WireFormat},
 };
-use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddrV4},
+    task::{Context, Poll},
+};
 use tokio::{net::UdpSocket, select, sync::mpsc};
 use tracing::{error, info, trace};
 
@@ -49,7 +52,7 @@ where
         let (tx_tx, tx_rx) = mpsc::channel(16);
         let bind_addr =
             std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), SD_MULTICAST_PORT);
-        
+
         // Create socket with SO_REUSEADDR to allow quick restart
         let socket = socket2::Socket::new(
             socket2::Domain::IPV4,
@@ -77,7 +80,7 @@ where
         let (rx_tx, rx_rx) = mpsc::channel(4);
         let (tx_tx, tx_rx) = mpsc::channel(4);
         let bind_addr = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-        
+
         // Create socket with SO_REUSEADDR and SO_REUSEPORT to allow quick restart
         let socket = socket2::Socket::new(
             socket2::Domain::IPV4,
@@ -118,6 +121,15 @@ where
 
     pub async fn receive(&mut self) -> Option<Result<Message<MessageDefinitions>, Error>> {
         self.receiver.recv().await
+    }
+
+    /// Poll the receiver for a message without blocking.
+    /// Used by `Inner::receive_any_unicast` to poll multiple sockets.
+    pub fn poll_receive(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Message<MessageDefinitions>, Error>>> {
+        self.receiver.poll_recv(cx)
     }
 
     pub fn session_id(&self) -> u16 {

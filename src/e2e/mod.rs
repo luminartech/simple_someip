@@ -135,8 +135,10 @@ mod tests {
         let mut protect_state = Profile5State::new();
         let mut check_state = Profile5State::new();
 
-        let payload = b"Test payload data";
-        let protected = protect_profile5(&config, &mut protect_state, payload);
+        // Payload must be padded to data_length (20 bytes) for check_profile5
+        let mut payload = [0u8; 20];
+        payload[..17].copy_from_slice(b"Test payload data");
+        let protected = protect_profile5(&config, &mut protect_state, &payload);
 
         assert_eq!(protected.len(), payload.len() + 3); // 3-byte header
 
@@ -241,8 +243,9 @@ mod tests {
         let mut protect_state = Profile5State::new();
         let mut check_state = Profile5State::new();
 
-        let payload = b"Test";
-        let mut protected = protect_profile5(&config, &mut protect_state, payload);
+        let mut payload = [0u8; 20];
+        payload[..4].copy_from_slice(b"Test");
+        let mut protected = protect_profile5(&config, &mut protect_state, &payload);
 
         // Corrupt the CRC (bytes 1-2 of header)
         protected[1] ^= 0xFF;

@@ -100,8 +100,9 @@ where
         &mut self,
         target: SocketAddrV4,
         message: crate::protocol::Message<MessageDefinitions>,
+        source_port: u16,
     ) -> Result<MessageDefinitions, Error> {
-        let (response, message) = ControlMessage::send_request(target, message);
+        let (response, message) = ControlMessage::send_request(target, message, source_port);
         self.control_sender.send(message).await.unwrap();
         response.await.unwrap()
     }
