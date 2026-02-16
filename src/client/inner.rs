@@ -53,12 +53,7 @@ impl<MessageDefinitions> ControlMessage<MessageDefinitions> {
         let (sender, receiver) = oneshot::channel();
         (receiver, Self::UnbindDiscovery(sender))
     }
-    #[allow(dead_code)]
-    pub fn bind_unicast() -> (oneshot::Receiver<Result<u16, Error>>, Self) {
-        Self::bind_unicast_with_port(None)
-    }
 
-    #[allow(dead_code)]
     pub fn bind_unicast_with_port(
         port: Option<u16>,
     ) -> (oneshot::Receiver<Result<u16, Error>>, Self) {
