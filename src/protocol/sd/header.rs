@@ -24,6 +24,7 @@ impl Header {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_service_offer(
         service_id: u16,
         instance_id: u16,
@@ -68,6 +69,7 @@ impl Header {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_subscription(
         service_id: u16,
         instance_id: u16,

@@ -71,7 +71,11 @@ where
     }
 
     pub async fn bind_unicast(&mut self) -> Result<u16, Error> {
-        let (response, message) = ControlMessage::bind_unicast();
+        self.bind_unicast_with_port(None).await
+    }
+
+    pub async fn bind_unicast_with_port(&mut self, port: Option<u16>) -> Result<u16, Error> {
+        let (response, message) = ControlMessage::bind_unicast_with_port(port);
         self.control_sender.send(message).await.unwrap();
         response.await.unwrap()
     }
@@ -96,8 +100,9 @@ where
         &mut self,
         target: SocketAddrV4,
         message: crate::protocol::Message<MessageDefinitions>,
+        source_port: u16,
     ) -> Result<MessageDefinitions, Error> {
-        let (response, message) = ControlMessage::send_request(target, message);
+        let (response, message) = ControlMessage::send_request(target, message, source_port);
         self.control_sender.send(message).await.unwrap();
         response.await.unwrap()
     }
