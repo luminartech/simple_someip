@@ -28,6 +28,7 @@ pub struct EventGroupInfo {
 
 impl EventGroupInfo {
     /// Create a new event group
+    #[must_use] 
     pub fn new(event_group_id: u16, event_ids: Vec<u16>) -> Self {
         Self {
             event_group_id,

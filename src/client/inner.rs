@@ -135,11 +135,11 @@ where
         (control_sender, update_receiver)
     }
 
-    async fn bind_discovery(&mut self) -> Result<(), Error> {
+    fn bind_discovery(&mut self) -> Result<(), Error> {
         if self.discovery_socket.is_some() {
             Ok(())
         } else {
-            let socket = SocketManager::bind_discovery(self.interface).await?;
+            let socket = SocketManager::bind_discovery(self.interface)?;
             self.discovery_socket = Some(socket);
             Ok(())
         }
@@ -153,24 +153,24 @@ where
         }
     }
 
-    async fn set_interface(&mut self, interface: &Ipv4Addr) {
-        self.interface = *interface;
+    fn set_interface(&mut self, interface: Ipv4Addr) {
+        self.interface = interface;
     }
 
-    async fn bind_unicast(&mut self, port: u16) -> Result<u16, Error> {
+    fn bind_unicast(&mut self, port: u16) -> Result<u16, Error> {
         if port != 0
             && let Some(socket) = self.unicast_sockets.get(&port)
         {
             return Ok(socket.port());
         }
-        let unicast_socket = SocketManager::bind(port).await?;
+        let unicast_socket = SocketManager::bind(port)?;
         let bound_port = unicast_socket.port();
         self.unicast_sockets.insert(bound_port, unicast_socket);
         debug!("Bound unicast socket on port {}", bound_port);
         Ok(bound_port)
     }
 
-    async fn unbind_unicast(&mut self) {
+    fn unbind_unicast(&mut self) {
         self.unicast_sockets.clear();
     }
 
@@ -223,6 +223,7 @@ where
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn handle_control_message(&mut self) {
         if let Some(active_request) = self.active_request.take() {
             match active_request {
@@ -238,15 +239,15 @@ where
                         return;
                     }
                     if self.interface != interface {
-                        self.set_interface(&interface).await;
+                        self.set_interface(interface);
                         self.active_request =
                             Some(ControlMessage::SetInterface(interface, response));
                         return;
                     }
                     info!("Binding to interface: {}", interface);
-                    let bind_result = self.bind_discovery().await;
+                    let bind_result = self.bind_discovery();
                     match &bind_result {
-                        Ok(_) => {
+                        Ok(()) => {
                             info!("Successfully Bound to interface: {}", interface);
                         }
                         Err(e) => {
@@ -259,7 +260,7 @@ where
                     }
                 }
                 ControlMessage::BindDiscovery(response) => {
-                    let result = self.bind_discovery().await;
+                    let result = self.bind_discovery();
                     if response.send(result).is_err() {
                         // The sender has been dropped, so we should exit
                         self.run = false;
@@ -273,9 +274,9 @@ where
                     }
                 }
                 ControlMessage::BindUnicast(response, port) => {
-                    let result = self.bind_unicast(port.unwrap_or(0)).await;
+                    let result = self.bind_unicast(port.unwrap_or(0));
                     match response.send(result) {
-                        Ok(_) => (),
+                        Ok(()) => (),
                         Err(e) => {
                             error!("Failed to send bind unicast response: {:?}", e);
                             self.run = false;
@@ -283,7 +284,7 @@ where
                     }
                 }
                 ControlMessage::UnbindUnicast(response) => {
-                    self.unbind_unicast().await;
+                    self.unbind_unicast();
                     if response.send(Ok(())).is_err() {
                         // The sender has been dropped, so we should exit
                         self.run = false;
@@ -293,8 +294,8 @@ where
                     // SD Message, If the discovery socket is not bound, bind it
                     match &mut self.discovery_socket {
                         None => {
-                            match self.bind_discovery().await {
-                                Ok(_) => {
+                            match self.bind_discovery() {
+                                Ok(()) => {
                                     // Discovery socket successfully bound, send the message on the next loop
                                     self.active_request =
                                         Some(ControlMessage::SendSD(target, header, response));
@@ -312,7 +313,7 @@ where
                         }
                         Some(discovery_socket) => {
                             let message = Message::<PayloadDefinitions>::new_sd(
-                                discovery_socket.session_id() as u32,
+                                u32::from(discovery_socket.session_id()),
                                 &header,
                             );
                             debug!("Sending {:?} to {}", &message, target);
@@ -331,7 +332,7 @@ where
                 ControlMessage::Send(target, mut message, source_port, response) => {
                     if let Some(socket) = self.unicast_sockets.get_mut(&source_port) {
                         // Set client ID (upper 16) and session ID (lower 16)
-                        let request_id = ((self.client_id as u32) << 16) | (self.session_counter as u32);
+                        let request_id = (u32::from(self.client_id) << 16) | u32::from(self.session_counter);
                         message.set_session_id(request_id);
                         self.session_counter = self.session_counter.wrapping_add(1);
                         if self.session_counter == 0 {
@@ -339,14 +340,14 @@ where
                         }
                         let send_result = socket.send(target, message.clone()).await;
                         match send_result {
-                            Ok(_) => {
+                            Ok(()) => {
                                 self.active_request = Some(ControlMessage::AwaitResponse(
-                                    message.to_owned(),
+                                    message.clone(),
                                     response,
-                                ))
+                                ));
                             }
                             Err(_) => todo!(),
-                        };
+                        }
                     } else {
                         error!("No unicast socket bound on port {}", source_port);
                         let _ = response.send(Err(Error::UnicastSocketNotBound));
@@ -354,7 +355,7 @@ where
                 }
                 // Nothing to do here, this is handled in the run loop when receiving messages
                 ControlMessage::AwaitResponse(message, response) => {
-                    self.active_request = Some(ControlMessage::AwaitResponse(message, response))
+                    self.active_request = Some(ControlMessage::AwaitResponse(message, response));
                 }
             }
         }
@@ -374,7 +375,7 @@ where
                     ..
                 } = &mut self;
                 select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(125)) => {}
+                    () = tokio::time::sleep(std::time::Duration::from_millis(125)) => {}
                     // Receive a control message
                     ctrl = control_receiver.recv() => {
                         if let Some(ctrl) = ctrl {
@@ -427,7 +428,7 @@ where
                                              // while waiting for a response. If the channel is
                                              // full, drop the event rather than deadlocking.
                                              match update_sender.try_send(ClientUpdate::Unicast(received_message)) {
-                                                 Ok(_) => {}
+                                                 Ok(()) => {}
                                                  Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                                      trace!("Update channel full, dropping event while awaiting response");
                                                  }

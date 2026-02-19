@@ -11,6 +11,7 @@ pub struct Profile4State {
 
 impl Profile4State {
     /// Create a new Profile 4 state with initial counter value of 0.
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             protect_counter: 0,
@@ -19,6 +20,7 @@ impl Profile4State {
     }
 
     /// Create a new Profile 4 state with a specific initial counter.
+    #[must_use] 
     pub fn with_initial_counter(counter: u16) -> Self {
         Self {
             protect_counter: counter,
@@ -50,6 +52,7 @@ pub struct Profile5State {
 
 impl Profile5State {
     /// Create a new Profile 5 state with initial counter value of 0.
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             protect_counter: 0,
@@ -58,6 +61,7 @@ impl Profile5State {
     }
 
     /// Create a new Profile 5 state with a specific initial counter.
+    #[must_use] 
     pub fn with_initial_counter(counter: u8) -> Self {
         Self {
             protect_counter: counter,

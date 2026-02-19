@@ -66,6 +66,7 @@ impl From<OptionsCount> for u8 {
 }
 
 impl OptionsCount {
+    #[must_use] 
     pub fn new(first_options_count: u8, second_options_count: u8) -> Self {
         assert!(first_options_count < 16);
         assert!(second_options_count < 16);
@@ -91,6 +92,7 @@ pub struct EventGroupEntry {
 }
 
 impl EventGroupEntry {
+    #[must_use] 
     pub fn new(
         service_id: u16,
         instance_id: u16,
@@ -171,6 +173,7 @@ pub struct ServiceEntry {
 }
 
 impl ServiceEntry {
+    #[must_use] 
     pub fn find(service_id: u16) -> Self {
         Self {
             index_first_options_run: 0,
@@ -179,8 +182,8 @@ impl ServiceEntry {
             service_id,
             instance_id: 0xFFFF,
             major_version: 0xFF,
-            ttl: 0x00FFFFFF,
-            minor_version: 0xFFFFFFFF,
+            ttl: 0x00FF_FFFF,
+            minor_version: 0xFFFF_FFFF,
         }
     }
 }
@@ -234,38 +237,37 @@ pub enum Entry {
 }
 
 impl Entry {
+    #[must_use] 
     pub fn first_options_count(&self) -> u8 {
         match self {
-            Entry::FindService(service_entry) => service_entry.options_count.first_options_count,
-            Entry::OfferService(service_entry) => service_entry.options_count.first_options_count,
-            Entry::StopOfferService(service_entry) => {
+            Entry::FindService(service_entry)
+            | Entry::OfferService(service_entry)
+            | Entry::StopOfferService(service_entry) => {
                 service_entry.options_count.first_options_count
             }
-            Entry::SubscribeEventGroup(event_group_entry) => {
-                event_group_entry.options_count.first_options_count
-            }
-            Entry::SubscribeAckEventGroup(event_group_entry) => {
+            Entry::SubscribeEventGroup(event_group_entry)
+            | Entry::SubscribeAckEventGroup(event_group_entry) => {
                 event_group_entry.options_count.first_options_count
             }
         }
     }
 
+    #[must_use] 
     pub fn second_options_count(&self) -> u8 {
         match self {
-            Entry::FindService(service_entry) => service_entry.options_count.second_options_count,
-            Entry::OfferService(service_entry) => service_entry.options_count.second_options_count,
-            Entry::StopOfferService(service_entry) => {
+            Entry::FindService(service_entry)
+            | Entry::OfferService(service_entry)
+            | Entry::StopOfferService(service_entry) => {
                 service_entry.options_count.second_options_count
             }
-            Entry::SubscribeEventGroup(event_group_entry) => {
-                event_group_entry.options_count.second_options_count
-            }
-            Entry::SubscribeAckEventGroup(event_group_entry) => {
+            Entry::SubscribeEventGroup(event_group_entry)
+            | Entry::SubscribeAckEventGroup(event_group_entry) => {
                 event_group_entry.options_count.second_options_count
             }
         }
     }
 
+    #[must_use] 
     pub fn total_options_count(&self) -> u8 {
         self.first_options_count() + self.second_options_count()
     }
@@ -300,11 +302,13 @@ impl WireFormat for Entry {
 
     fn required_size(&self) -> usize {
         1 + match self {
-            Entry::FindService(service_entry) => service_entry.required_size(),
-            Entry::OfferService(service_entry) => service_entry.required_size(),
-            Entry::StopOfferService(service_entry) => service_entry.required_size(),
-            Entry::SubscribeEventGroup(event_group_entry) => event_group_entry.required_size(),
-            Entry::SubscribeAckEventGroup(event_group_entry) => event_group_entry.required_size(),
+            Entry::FindService(service_entry)
+            | Entry::OfferService(service_entry)
+            | Entry::StopOfferService(service_entry) => service_entry.required_size(),
+            Entry::SubscribeEventGroup(event_group_entry)
+            | Entry::SubscribeAckEventGroup(event_group_entry) => {
+                event_group_entry.required_size()
+            }
         }
     }
 

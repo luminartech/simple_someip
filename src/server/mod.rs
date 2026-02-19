@@ -28,12 +28,7 @@ use tokio::sync::RwLock;
 pub(crate) fn someip_length(payload_len: usize) -> u32 {
     const HEADER_OVERHEAD: usize = 8;
     let total = payload_len + HEADER_OVERHEAD;
-    assert!(
-        total <= u32::MAX as usize,
-        "SOME/IP payload too large: length {} exceeds u32::MAX",
-        total,
-    );
-    total as u32
+    u32::try_from(total).expect("SOME/IP payload too large: length exceeds u32::MAX")
 }
 
 /// Configuration for a SOME/IP service provider
@@ -57,6 +52,7 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     /// Create a new server configuration
+    #[must_use] 
     pub fn new(
         interface: Ipv4Addr,
         local_port: u16,
@@ -146,8 +142,8 @@ impl Server {
 
     /// Start announcing the service via Service Discovery
     ///
-    /// This sends periodic OfferService messages to the SD multicast group
-    pub async fn start_announcing(&self) -> Result<(), Error> {
+    /// This sends periodic `OfferService` messages to the SD multicast group
+    pub fn start_announcing(&self) -> Result<(), Error> {
         let config = self.config.clone();
         let sd_socket = Arc::clone(&self.sd_socket);
         let sd_session_id = Arc::clone(&self.sd_session_id);
@@ -156,7 +152,7 @@ impl Server {
             let mut announcement_count = 0u32;
             loop {
                 match Self::send_offer_service(&config, &sd_socket, &sd_session_id).await {
-                    Ok(_) => {
+                    Ok(()) => {
                         announcement_count += 1;
                         if announcement_count == 1 {
                             tracing::info!(
@@ -184,7 +180,7 @@ impl Server {
         Ok(())
     }
 
-    /// Send an OfferService message via Service Discovery
+    /// Send an `OfferService` message via Service Discovery
     async fn send_offer_service(config: &ServerConfig, socket: &UdpSocket, session_id: &AtomicU16) -> Result<(), Error> {
         use crate::protocol::{Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode};
         use crate::traits::WireFormat;
@@ -227,7 +223,7 @@ impl Server {
             })
             .unwrap();
         let next = prev.wrapping_add(1);
-        let sid = (if next == 0 { 1 } else { next }) as u32;
+        let sid = u32::from(if next == 0 { 1 } else { next });
 
         // Wrap in SOME/IP header for SD (service 0xFFFF, method 0x8100)
         let someip_header = SomeIpHeader {
@@ -265,7 +261,7 @@ impl Server {
         Ok(())
     }
 
-    /// Send a unicast OfferService to a specific address (in response to FindService)
+    /// Send a unicast `OfferService` to a specific address (in response to `FindService`)
     async fn send_unicast_offer(&self, target: std::net::SocketAddr) -> Result<(), Error> {
         use crate::protocol::{Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode};
         use crate::traits::WireFormat;
@@ -320,7 +316,7 @@ impl Server {
         Ok(())
     }
 
-    /// Get the next SD session ID (client_id=0, session_id incrementing), skipping 0
+    /// Get the next SD session ID (`client_id=0`, `session_id` incrementing), skipping 0
     fn next_sd_session_id(&self) -> u32 {
         let prev = self.sd_session_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -330,10 +326,11 @@ impl Server {
             .unwrap();
         // fetch_update returns the previous value; compute the same next value
         let next = prev.wrapping_add(1);
-        (if next == 0 { 1 } else { next }) as u32
+        u32::from(if next == 0 { 1 } else { next })
     }
 
     /// Get the event publisher for sending events
+    #[must_use] 
     pub fn publisher(&self) -> Arc<EventPublisher> {
         Arc::clone(&self.publisher)
     }
@@ -342,7 +339,7 @@ impl Server {
     ///
     /// Handles incoming subscription requests and manages event groups.
     /// Listens on both the unicast socket (for direct requests) and the
-    /// SD multicast socket (for FindService and SubscribeEventGroup).
+    /// SD multicast socket (for `FindService` and `SubscribeEventGroup`).
     pub async fn run(&mut self) -> Result<(), Error> {
         use crate::protocol::Header as SomeIpHeader;
         use crate::traits::WireFormat;
@@ -450,25 +447,22 @@ impl Server {
                         self.send_subscribe_nack(sub, sender, "Wrong instance ID").await?;
                     } else {
                         // Extract subscriber endpoint from options
-                        match self.extract_endpoint(&sd_msg.options) {
-                            Some(endpoint_addr) => {
-                                // The endpoint in SubscribeEventGroup is the subscriber's
-                                // receive address — where they want events sent to.
-                                let mut subs = self.subscriptions.write().await;
-                                subs.subscribe(
-                                    sub.service_id,
-                                    sub.instance_id,
-                                    sub.event_group_id,
-                                    endpoint_addr,
-                                );
+                        if let Some(endpoint_addr) = Self::extract_endpoint(&sd_msg.options) {
+                            // The endpoint in SubscribeEventGroup is the subscriber's
+                            // receive address — where they want events sent to.
+                            let mut subs = self.subscriptions.write().await;
+                            subs.subscribe(
+                                sub.service_id,
+                                sub.instance_id,
+                                sub.event_group_id,
+                                endpoint_addr,
+                            );
 
-                                // Send SubscribeAck
-                                self.send_subscribe_ack(sub, sender).await?;
-                            }
-                            None => {
-                                tracing::warn!("No endpoint found in Subscribe message options");
-                                self.send_subscribe_nack(sub, sender, "No endpoint in options").await?;
-                            }
+                            // Send SubscribeAck
+                            self.send_subscribe_ack(sub, sender).await?;
+                        } else {
+                            tracing::warn!("No endpoint found in Subscribe message options");
+                            self.send_subscribe_nack(sub, sender, "No endpoint in options").await?;
                         }
                     }
                 }
@@ -497,7 +491,7 @@ impl Server {
     }
 
     /// Extract endpoint address from SD options
-    fn extract_endpoint(&self, options: &[sd::Options]) -> Option<SocketAddrV4> {
+    fn extract_endpoint(options: &[sd::Options]) -> Option<SocketAddrV4> {
         tracing::trace!("Extracting endpoint from {} options", options.len());
         for option in options {
             tracing::trace!("Option: {:?}", option);
@@ -510,7 +504,7 @@ impl Server {
         None
     }
 
-    /// Send SubscribeAck in response to a subscription request
+    /// Send `SubscribeAck` in response to a subscription request
     async fn send_subscribe_ack(
         &self,
         subscription: &sd::EventGroupEntry,
@@ -573,9 +567,9 @@ impl Server {
         Ok(())
     }
 
-    /// Send SubscribeNack (Negative Acknowledgement) for rejected subscription
+    /// Send `SubscribeNack` (Negative Acknowledgement) for rejected subscription
     ///
-    /// According to SOME/IP spec, SubscribeNack is indicated by TTL=0 in SubscribeAckEventGroup
+    /// According to SOME/IP spec, `SubscribeNack` is indicated by TTL=0 in `SubscribeAckEventGroup`
     async fn send_subscribe_nack(
         &self,
         subscription: &sd::EventGroupEntry,
