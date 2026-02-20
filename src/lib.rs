@@ -19,6 +19,11 @@
 //! - [SOME/IP Specification R23-11](https://www.autosar.org/fileadmin/standards/R23-11/FO/AUTOSAR_FO_PRS_SOMEIPProtocol.pdf)
 //! - [AUTOSAR Website](https://www.autosar.org/)
 
+#![warn(clippy::pedantic)]
+// TODO: Add `# Errors` and `# Panics` doc sections in a follow-up PR.
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+
 #[cfg(feature = "client")]
 mod client;
 pub mod e2e;

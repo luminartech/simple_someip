@@ -32,9 +32,11 @@ impl From<Flags> for u8 {
 }
 
 impl Flags {
+    #[must_use] 
     pub fn new(reboot: bool, unicast: bool) -> Self {
         Self { reboot, unicast }
     }
+    #[must_use] 
     pub fn new_sd(reboot: bool) -> Self {
         Self {
             reboot,

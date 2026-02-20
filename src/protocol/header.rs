@@ -21,10 +21,11 @@ pub struct Header {
 }
 
 impl Header {
+    #[must_use] 
     pub fn new_sd(session_id: u32, sd_header_size: usize) -> Self {
         Self {
             message_id: MessageId::SD,
-            length: 8 + sd_header_size as u32,
+            length: 8 + u32::try_from(sd_header_size).expect("SD header too large"),
             session_id,
             protocol_version: 0x01,
             interface_version: 0x01,
@@ -33,10 +34,12 @@ impl Header {
         }
     }
 
+    #[must_use] 
     pub const fn is_sd(&self) -> bool {
         self.message_id.is_sd()
     }
 
+    #[must_use] 
     pub const fn payload_size(&self) -> usize {
         self.length as usize - 8
     }

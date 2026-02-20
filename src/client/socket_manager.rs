@@ -47,7 +47,7 @@ impl<MessageDefinitions> SocketManager<MessageDefinitions>
 where
     MessageDefinitions: PayloadWireFormat + 'static,
 {
-    pub async fn bind_discovery(interface: Ipv4Addr) -> Result<Self, Error> {
+    pub fn bind_discovery(interface: Ipv4Addr) -> Result<Self, Error> {
         let (rx_tx, rx_rx) = mpsc::channel(16);
         let (tx_tx, tx_rx) = mpsc::channel(16);
         let bind_addr =
@@ -76,7 +76,7 @@ where
         })
     }
 
-    pub async fn bind(port: u16) -> Result<Self, Error> {
+    pub fn bind(port: u16) -> Result<Self, Error> {
         let (rx_tx, rx_rx) = mpsc::channel(4);
         let (tx_tx, tx_rx) = mpsc::channel(4);
         let bind_addr = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
@@ -163,72 +163,55 @@ where
                         match result {
                             Ok((_bytes_received, _source_address )) => {
                                 let parse_result = Message::<MessageDefinitions>::decode(&mut buf.as_slice()).map_err(Error::from);
-                                match rx_tx.send( parse_result ).await {
-                                    Ok(_) => {}
-                                    Err(_) => {
-                                        info!("Socket Dropping");
-                                        // The receiver has been dropped, so we should exit
-                                        break;
-                                    }
+                                if let Ok(()) = rx_tx.send( parse_result ).await {} else {
+                                    info!("Socket Dropping");
+                                    // The receiver has been dropped, so we should exit
+                                    break;
                                 }
                             }
                             Err(e) => {
 
-                                error!("Error decoding message: {:?}", e)
+                                error!("Error decoding message: {:?}", e);
                             }
                         }
                     },
                     message = tx_rx.recv() => {
-                        match message {
-                            Some(send_message) => {
-                                trace!("Sending: {:?}", &send_message);
-                                let message_length = match send_message.message.encode(&mut buf.as_mut_slice()) {
-                                    Ok(length) => length,
-                                    Err(e) => {
-                                        error!("Failed to encode message: {:?}", e);
-                                        // If the sender is already closed we can't send the error back, so we shut everything down
-                                        match send_message.response.send(Err(e.into())) {
-                                            Ok(_) => {
-                                                // Successfully sent error back to sender, carry on
-                                                continue;
-                                            }
-                                            Err(_) => {
-                                                error!("Socket owner closed channel unexpectedly, closing socket.");
-                                                break;
-                                            }
-                                        }
+                        if let Some(send_message) = message {
+                            trace!("Sending: {:?}", &send_message);
+                            let message_length = match send_message.message.encode(&mut buf.as_mut_slice()) {
+                                Ok(length) => length,
+                                Err(e) => {
+                                    error!("Failed to encode message: {:?}", e);
+                                    // If the sender is already closed we can't send the error back, so we shut everything down
+                                    if let Ok(()) = send_message.response.send(Err(e.into())) {
+                                        // Successfully sent error back to sender, carry on
+                                        continue;
                                     }
-                                };
-                                match socket.send_to(&buf[..message_length], send_message.target_addr).await {
-                                    Ok(_bytes_sent) => {
-                                        trace!("Sent {} bytes to {}", message_length, send_message.target_addr);
-                                        match send_message.response.send(Ok(())) {
-                                            Ok(_) => {}
-                                            Err(_) => {
-                                                info!("Socket owner closed channel, closing socket.");
-                                                // The sender has been dropped, so we should exit
-                                                break;
-                                            }
-                                        }
+                                    error!("Socket owner closed channel unexpectedly, closing socket.");
+                                    break;
+                                }
+                            };
+                            match socket.send_to(&buf[..message_length], send_message.target_addr).await {
+                                Ok(_bytes_sent) => {
+                                    trace!("Sent {} bytes to {}", message_length, send_message.target_addr);
+                                    if let Ok(()) = send_message.response.send(Ok(())) {} else {
+                                        info!("Socket owner closed channel, closing socket.");
+                                        // The sender has been dropped, so we should exit
+                                        break;
                                     }
-                                    Err(e) => {
-                                        error!("Failed to send message with error: {:?}", e);
-                                        match send_message.response.send(Err(Error::Io(e)))
-                                        {
-                                            Ok(())=> (),
-                                            Err(_)=> {
-                                                error!("Socket owner closed channel unexpectedly, closing socket.");
-                                                break;
-                                            }
-                                        }
+                                }
+                                Err(e) => {
+                                    error!("Failed to send message with error: {:?}", e);
+                                    if let Ok(()) = send_message.response.send(Err(Error::Io(e))) {  } else {
+                                        error!("Socket owner closed channel unexpectedly, closing socket.");
+                                        break;
                                     }
                                 }
                             }
-                            None => {
-                                info!("Send channel closed, closing socket.");
-                                // The sender has been dropped, so we should exit
-                                break;
-                            }
+                        } else {
+                            info!("Send channel closed, closing socket.");
+                            // The sender has been dropped, so we should exit
+                            break;
                         }
                     }
                 }

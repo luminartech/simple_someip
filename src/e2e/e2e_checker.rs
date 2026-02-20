@@ -11,7 +11,7 @@ use super::{E2ECheckResult, E2ECheckStatus};
 /// Validates the 12-byte header:
 /// - Length (2 bytes): Verifies against actual message length
 /// - Counter (2 bytes): Checks sequence continuity
-/// - DataID (4 bytes): Must match configuration
+/// - `DataID` (4 bytes): Must match configuration
 /// - CRC (4 bytes): Verified against computed CRC-32P4
 ///
 /// # Arguments
@@ -20,7 +20,7 @@ use super::{E2ECheckResult, E2ECheckStatus};
 /// * `protected` - The protected message (header + payload)
 ///
 /// # Returns
-/// An E2ECheckResult containing the status, counter, and extracted payload.
+/// An `E2ECheckResult` containing the status, counter, and extracted payload.
 pub fn check_profile4(
     config: &Profile4Config,
     state: &mut Profile4State,
@@ -62,7 +62,7 @@ pub fn check_profile4(
     // Update state
     state.last_counter = Some(counter);
 
-    E2ECheckResult::success(status, counter as u32, payload.to_vec())
+    E2ECheckResult::success(status, u32::from(counter), payload.to_vec())
 }
 
 /// Check E2E Profile 5 protected data.
@@ -77,7 +77,7 @@ pub fn check_profile4(
 /// * `protected` - The protected message (header + payload)
 ///
 /// # Returns
-/// An E2ECheckResult containing the status, counter, and extracted payload.
+/// An `E2ECheckResult` containing the status, counter, and extracted payload.
 pub fn check_profile5(
     config: &Profile5Config,
     state: &mut Profile5State,
@@ -119,7 +119,7 @@ pub fn check_profile5(
     // Update state
     state.last_counter = Some(counter);
 
-    E2ECheckResult::success(status, counter as u32, payload.to_vec())
+    E2ECheckResult::success(status, u32::from(counter), payload.to_vec())
 }
 
 /// Check sequence continuity for Profile 4 (16-bit counter).

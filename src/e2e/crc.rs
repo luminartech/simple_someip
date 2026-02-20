@@ -12,7 +12,7 @@ const CRC16_CCITT: Crc<u16> = Crc::<u16>::new(&CRC_16_IBM_3740);
 
 /// Compute CRC-32P4 for Profile 4.
 ///
-/// The CRC is computed over: Length (2) + Counter (2) + DataID (4) + Payload
+/// The CRC is computed over: Length (2) + Counter (2) + `DataID` (4) + Payload
 /// Note: CRC field itself is not included in the calculation.
 pub fn compute_crc32_p4(length: u16, counter: u16, data_id: u32, payload: &[u8]) -> u32 {
     let mut digest = CRC32_P4.digest();
@@ -35,11 +35,11 @@ pub fn compute_crc32_p4(length: u16, counter: u16, data_id: u32, payload: &[u8])
 /// Compute CRC-16-CCITT for Profile 5.
 ///
 /// Per AUTOSAR E2E Profile 5, the CRC is computed over all data bytes except the
-/// CRC field itself, plus the DataID. Specifically:
-/// - Counter (1 byte) + Payload (N bytes) + DataID (2 bytes, little-endian)
+/// CRC field itself, plus the `DataID`. Specifically:
+/// - Counter (1 byte) + Payload (N bytes) + `DataID` (2 bytes, little-endian)
 ///
 /// Note: CRC field itself is not included in the calculation.
-/// Note: DataLength is NOT included in the CRC calculation.
+/// Note: `DataLength` is NOT included in the CRC calculation.
 pub fn compute_crc16_p5(data_id: u16, counter: u8, payload: &[u8]) -> u16 {
     tracing::trace!(
         "CRC-16 Profile5: data_id=0x{:04X}, counter={}, payload_len={}, payload={:02X?}",
