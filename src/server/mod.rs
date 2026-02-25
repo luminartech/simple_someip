@@ -14,7 +14,7 @@ pub use service_info::{ServiceInfo, EventGroupInfo};
 pub use event_publisher::EventPublisher;
 pub use subscription_manager::SubscriptionManager;
 
-use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
+use crate::protocol::sd::{self, Entry, Flags, OptionsCount, SdEntries, SdOptions, ServiceEntry, TransportProtocol};
 use crate::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use tokio::net::UdpSocket;
@@ -205,10 +205,14 @@ impl Server {
         };
 
         // Create SD header with reboot flag set
+        let mut entries = SdEntries::new();
+        let mut options = SdOptions::new();
+        let _ = entries.push(entry);
+        let _ = options.push(option);
         let sd_payload = sd::Header {
             flags: Flags::new(true, true),
-            entries: vec![entry],
-            options: vec![option],
+            entries,
+            options,
         };
 
         // Encode SD payload
@@ -283,10 +287,14 @@ impl Server {
             protocol: TransportProtocol::Udp,
         };
 
+        let mut entries = SdEntries::new();
+        let mut options = SdOptions::new();
+        let _ = entries.push(entry);
+        let _ = options.push(option);
         let sd_payload = sd::Header {
             flags: Flags::new(true, true), // reboot + unicast flags set
-            entries: vec![entry],
-            options: vec![option],
+            entries,
+            options,
         };
 
         let mut sd_data = Vec::new();
@@ -526,10 +534,12 @@ impl Server {
         });
 
         // Create SD header
+        let mut entries = SdEntries::new();
+        let _ = entries.push(ack_entry);
         let sd_payload = sd::Header {
             flags: Flags::new(true, true), // reboot + unicast flags set
-            entries: vec![ack_entry],
-            options: vec![],
+            entries,
+            options: SdOptions::new(),
         };
 
         // Encode SD payload
@@ -592,10 +602,12 @@ impl Server {
         });
 
         // Create SD header
+        let mut entries = SdEntries::new();
+        let _ = entries.push(nack_entry);
         let sd_payload = sd::Header {
             flags: Flags::new(true, true), // reboot + unicast flags set
-            entries: vec![nack_entry],
-            options: vec![],
+            entries,
+            options: SdOptions::new(),
         };
 
         // Encode SD payload
