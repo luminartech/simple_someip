@@ -1,11 +1,10 @@
 use crate::protocol::Error;
+use embedded_io::Error as _;  // for .kind() method
 
 /// Extension trait for reading big-endian integers from a byte stream.
 ///
-/// This trait is intentionally decoupled from `std::io::Read` so it can
-/// later be backed by `embedded_io::Read` without changing call sites.
-/// The only required method is [`read_bytes`](ReadBytesExt::read_bytes),
-/// which is adapted to `std::io::Read` via a blanket impl.
+/// The only required method is [`read_bytes`](ReadBytesExt::read_bytes).
+/// Backed by `embedded_io::Read` via a blanket impl.
 pub(crate) trait ReadBytesExt {
     /// Read exactly `buf.len()` bytes into `buf`.
     fn read_bytes(&mut self, buf: &mut [u8]) -> Result<(), Error>;
@@ -35,19 +34,23 @@ pub(crate) trait ReadBytesExt {
     }
 }
 
-impl<T: std::io::Read> ReadBytesExt for T {
+impl<T: embedded_io::Read> ReadBytesExt for T {
     fn read_bytes(&mut self, buf: &mut [u8]) -> Result<(), Error> {
-        self.read_exact(buf)?;
-        Ok(())
+        self.read_exact(buf).map_err(|e| match e {
+            embedded_io::ReadExactError::UnexpectedEof => {
+                Error::Io(std::io::ErrorKind::UnexpectedEof.into())
+            }
+            embedded_io::ReadExactError::Other(e) => {
+                Error::Io(std::io::Error::other(format!("{:?}", e.kind())))
+            }
+        })
     }
 }
 
 /// Extension trait for writing big-endian integers to a byte stream.
 ///
-/// This trait is intentionally decoupled from `std::io::Write` so it can
-/// later be backed by `embedded_io::Write` without changing call sites.
-/// The only required method is [`write_bytes`](WriteBytesExt::write_bytes),
-/// which is adapted to `std::io::Write` via a blanket impl.
+/// The only required method is [`write_bytes`](WriteBytesExt::write_bytes).
+/// Backed by `embedded_io::Write` via a blanket impl.
 pub(crate) trait WriteBytesExt {
     /// Write all bytes from `buf` to the stream.
     fn write_bytes(&mut self, buf: &[u8]) -> Result<(), Error>;
@@ -69,9 +72,42 @@ pub(crate) trait WriteBytesExt {
     }
 }
 
-impl<T: std::io::Write> WriteBytesExt for T {
+impl<T: embedded_io::Write> WriteBytesExt for T {
     fn write_bytes(&mut self, buf: &[u8]) -> Result<(), Error> {
-        self.write_all(buf)?;
-        Ok(())
+        self.write_all(buf).map_err(|e| {
+            Error::Io(std::io::Error::other(format!("{:?}", e.kind())))
+        })
+    }
+}
+
+/// A reader wrapper that limits reads to a specified number of bytes.
+/// Equivalent to `std::io::Read::take()` but works with `embedded_io::Read`.
+pub(crate) struct Take<'a, R> {
+    inner: &'a mut R,
+    remaining: usize,
+}
+
+impl<'a, R> Take<'a, R> {
+    pub fn new(inner: &'a mut R, limit: usize) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+        }
+    }
+}
+
+impl<R: embedded_io::ErrorType> embedded_io::ErrorType for Take<'_, R> {
+    type Error = R::Error;
+}
+
+impl<R: embedded_io::Read> embedded_io::Read for Take<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let max = buf.len().min(self.remaining);
+        let n = self.inner.read(&mut buf[..max])?;
+        self.remaining -= n;
+        Ok(n)
     }
 }

@@ -343,7 +343,6 @@ impl Server {
     pub async fn run(&mut self) -> Result<(), Error> {
         use crate::protocol::Header as SomeIpHeader;
         use crate::traits::WireFormat;
-        use std::io::Cursor;
 
         let mut unicast_buf = vec![0u8; 65535];
         let mut sd_buf = vec![0u8; 65535];
@@ -373,8 +372,8 @@ impl Server {
             tracing::trace!("Raw data: {:02X?}", &data[..len.min(64)]);
 
             // Try to parse as SOME/IP message
-            let mut cursor = Cursor::new(data);
-            match SomeIpHeader::decode(&mut cursor) {
+            let mut reader = data;
+            match SomeIpHeader::decode(&mut reader) {
                 Ok(header) => {
                     tracing::trace!("SOME/IP Header: service=0x{:04X}, method=0x{:04X}, type={:?}",
                         header.message_id.service_id(),
@@ -387,7 +386,7 @@ impl Server {
                        header.message_id.method_id() == 0x8100 {
                         tracing::trace!("This is an SD message");
                         // Parse SD payload
-                        match sd::Header::decode(&mut cursor) {
+                        match sd::Header::decode(&mut reader) {
                             Ok(sd_msg) => {
                                 tracing::trace!("SD message has {} entries, {} options",
                                     sd_msg.entries.len(),
@@ -677,9 +676,9 @@ mod tests {
 
     /// Helper: parse a SubscribeAck/Nack from raw response bytes, returns the TTL
     fn parse_subscribe_ack_ttl(data: &[u8]) -> u32 {
-        let mut cursor = std::io::Cursor::new(data);
-        let _header = SomeIpHeader::decode(&mut cursor).expect("Failed to parse SOME/IP header");
-        let sd_msg = sd::Header::decode(&mut cursor).expect("Failed to parse SD header");
+        let mut reader = data;
+        let _header = SomeIpHeader::decode(&mut reader).expect("Failed to parse SOME/IP header");
+        let sd_msg = sd::Header::decode(&mut reader).expect("Failed to parse SD header");
         assert_eq!(sd_msg.entries.len(), 1, "Expected exactly 1 entry in response");
         match &sd_msg.entries[0] {
             sd::Entry::SubscribeAckEventGroup(entry) => entry.ttl,
@@ -740,10 +739,10 @@ mod tests {
             let mut buf = vec![0u8; 65535];
             let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
             let data = &buf[..len];
-            let mut cursor = std::io::Cursor::new(data);
-            let header = SomeIpHeader::decode(&mut cursor).unwrap();
+            let mut reader: &[u8] = data;
+            let header = SomeIpHeader::decode(&mut reader).unwrap();
             assert_eq!(header.message_id.service_id(), 0xFFFF);
-            let sd_msg = sd::Header::decode(&mut cursor).unwrap();
+            let sd_msg = sd::Header::decode(&mut reader).unwrap();
             server.handle_sd_message(sd_msg, addr).await.unwrap();
 
             // Check subscription was added
@@ -795,9 +794,9 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
-            let mut cursor = std::io::Cursor::new(&buf[..len]);
-            let _header = SomeIpHeader::decode(&mut cursor).unwrap();
-            let sd_msg = sd::Header::decode(&mut cursor).unwrap();
+            let mut reader: &[u8] = &buf[..len];
+            let _header = SomeIpHeader::decode(&mut reader).unwrap();
+            let sd_msg = sd::Header::decode(&mut reader).unwrap();
             server.handle_sd_message(sd_msg, addr).await.unwrap();
 
             // No subscription should have been added
@@ -846,9 +845,9 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
-            let mut cursor = std::io::Cursor::new(&buf[..len]);
-            let _header = SomeIpHeader::decode(&mut cursor).unwrap();
-            let sd_msg = sd::Header::decode(&mut cursor).unwrap();
+            let mut reader: &[u8] = &buf[..len];
+            let _header = SomeIpHeader::decode(&mut reader).unwrap();
+            let sd_msg = sd::Header::decode(&mut reader).unwrap();
             server.handle_sd_message(sd_msg, addr).await.unwrap();
 
             let subs = server.subscriptions.read().await;
@@ -896,9 +895,9 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
-            let mut cursor = std::io::Cursor::new(&buf[..len]);
-            let _header = SomeIpHeader::decode(&mut cursor).unwrap();
-            let sd_msg = sd::Header::decode(&mut cursor).unwrap();
+            let mut reader: &[u8] = &buf[..len];
+            let _header = SomeIpHeader::decode(&mut reader).unwrap();
+            let sd_msg = sd::Header::decode(&mut reader).unwrap();
             server.handle_sd_message(sd_msg, addr).await.unwrap();
 
             // Subscription should have been added

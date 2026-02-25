@@ -118,7 +118,7 @@ impl EventGroupEntry {
 }
 
 impl WireFormat for EventGroupEntry {
-    fn decode<T: std::io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
+    fn decode<T: embedded_io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
         let index_first_options_run = reader.read_u8()?;
         let index_second_options_run = reader.read_u8()?;
         let options_count = OptionsCount::from(reader.read_u8()?);
@@ -145,7 +145,7 @@ impl WireFormat for EventGroupEntry {
         16
     }
 
-    fn encode<T: std::io::Write>(
+    fn encode<T: embedded_io::Write>(
         &self,
         writer: &mut T,
     ) -> Result<usize, crate::protocol::Error> {
@@ -192,7 +192,7 @@ impl ServiceEntry {
 }
 
 impl WireFormat for ServiceEntry {
-    fn decode<R: std::io::Read>(reader: &mut R) -> Result<Self, Error> {
+    fn decode<R: embedded_io::Read>(reader: &mut R) -> Result<Self, Error> {
         let index_first_options_run = reader.read_u8()?;
         let index_second_options_run = reader.read_u8()?;
         let options_count = OptionsCount::from(reader.read_u8()?);
@@ -217,7 +217,7 @@ impl WireFormat for ServiceEntry {
         16
     }
 
-    fn encode<W: std::io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
+    fn encode<W: embedded_io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;
         writer.write_u8(u8::from(self.options_count))?;
@@ -277,7 +277,7 @@ impl Entry {
 }
 
 impl WireFormat for Entry {
-    fn decode<R: std::io::Read>(reader: &mut R) -> Result<Self, Error> {
+    fn decode<R: embedded_io::Read>(reader: &mut R) -> Result<Self, Error> {
         let entry_type = EntryType::try_from(reader.read_u8()?)?;
         match entry_type {
             EntryType::FindService => {
@@ -315,7 +315,7 @@ impl WireFormat for Entry {
         }
     }
 
-    fn encode<W: std::io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
+    fn encode<W: embedded_io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
         match self {
             Entry::FindService(service_entry) => {
                 writer.write_u8(u8::from(EntryType::FindService))?;
