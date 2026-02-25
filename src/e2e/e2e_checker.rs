@@ -125,8 +125,24 @@ pub fn check_profile5(
 
 /// Check E2E Profile 5 protected data with SOME/IP upper-header in the CRC.
 ///
-/// Identical to [`check_profile5`] but includes the 8-byte SOME/IP upper
-/// header (UPPER-HEADER-BITS-TO-SHIFT = 64 bits) in the CRC verification.
+/// Validates the 3-byte header:
+/// - CRC (2 bytes, little-endian): Verified against CRC-16-CCITT computed over
+///   `upper_header(8) + Counter(1) + Payload(N) + DataID(2 LE)`
+/// - Counter (1 byte): Checks sequence continuity
+///
+/// The 8-byte `upper_header` (UPPER-HEADER-BITS-TO-SHIFT = 64 bits) is the
+/// second half of the SOME/IP header: `[request_id:4 BE, proto_ver:1,
+/// iface_ver:1, msg_type:1, return_code:1]`. It must match exactly what the
+/// sender included in its CRC computation, otherwise a `CrcError` is returned.
+///
+/// # Arguments
+/// * `config` - Profile 5 configuration (data ID, data length, max delta counter)
+/// * `state` - Mutable state for counter tracking
+/// * `protected` - The protected message (3-byte E2E header + payload)
+/// * `upper_header` - 8-byte SOME/IP upper header included in the CRC
+///
+/// # Returns
+/// An [`E2ECheckResult`] containing the status, counter, and extracted payload.
 pub fn check_profile5_with_header(
     config: &Profile5Config,
     state: &mut Profile5State,

@@ -101,8 +101,24 @@ pub fn protect_profile5(
 
 /// Add E2E Profile 5 protection with SOME/IP upper-header in the CRC.
 ///
-/// Identical to [`protect_profile5`] but includes the 8-byte SOME/IP upper
-/// header (UPPER-HEADER-BITS-TO-SHIFT = 64 bits) in the CRC computation.
+/// Creates a protected message with a 3-byte header prepended:
+/// - CRC (2 bytes, little-endian): CRC-16-CCITT over
+///   `upper_header(8) + Counter(1) + Payload(N) + DataID(2 LE)`
+/// - Counter (1 byte): Sequence counter from state
+///
+/// The 8-byte `upper_header` (UPPER-HEADER-BITS-TO-SHIFT = 64 bits) is the
+/// second half of the SOME/IP header: `[request_id:4 BE, proto_ver:1,
+/// iface_ver:1, msg_type:1, return_code:1]`. The state counter is incremented
+/// after each call.
+///
+/// # Arguments
+/// * `config` - Profile 5 configuration (data ID, data length, max delta counter)
+/// * `state` - Mutable state for counter tracking
+/// * `payload` - The payload data to protect
+/// * `upper_header` - 8-byte SOME/IP upper header included in the CRC
+///
+/// # Returns
+/// A new `Vec` containing the 3-byte E2E header followed by the payload.
 pub fn protect_profile5_with_header(
     config: &Profile5Config,
     state: &mut Profile5State,
