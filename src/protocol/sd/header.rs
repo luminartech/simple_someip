@@ -1,5 +1,6 @@
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::{net::Ipv4Addr, vec};
+
+use crate::protocol::byte_order::{ReadBytesExt, WriteBytesExt};
 
 use crate::{protocol::Error, traits::WireFormat};
 
@@ -130,8 +131,8 @@ impl WireFormat for Header {
     fn decode<T: std::io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
         let flags = Flags::from(reader.read_u8()?);
         let mut reserved: [u8; 3] = [0; 3];
-        reader.read_exact(&mut reserved)?;
-        let entries_size = reader.read_u32::<BigEndian>()?;
+        reader.read_bytes(&mut reserved)?;
+        let entries_size = reader.read_u32_be()?;
         let entries_count = entries_size / u32::try_from(ENTRY_SIZE).expect("constant fits u32");
         let mut entries = Vec::with_capacity(entries_count as usize);
         let options_count: usize = 0;
@@ -139,7 +140,7 @@ impl WireFormat for Header {
             entries.push(Entry::decode(reader)?);
         }
 
-        let mut remaining_options_size = reader.read_u32::<BigEndian>()? as usize;
+        let mut remaining_options_size = reader.read_u32_be()? as usize;
         let mut options = Vec::with_capacity(options_count);
         while remaining_options_size > 0 {
             options.push(Options::read(reader)?);
@@ -169,9 +170,9 @@ impl WireFormat for Header {
     ) -> Result<usize, crate::protocol::Error> {
         writer.write_u8(u8::from(self.flags))?;
         let reserved: [u8; 3] = [0; 3];
-        writer.write_all(&reserved)?;
+        writer.write_bytes(&reserved)?;
         let entries_size = u32::try_from(self.entries.len() * 16).expect("entries size fits u32");
-        writer.write_u32::<BigEndian>(entries_size)?;
+        writer.write_u32_be(entries_size)?;
         for entry in &self.entries {
             entry.encode(writer)?;
         }
@@ -179,7 +180,7 @@ impl WireFormat for Header {
         for option in &self.options {
             options_size += option.size();
         }
-        writer.write_u32::<BigEndian>(u32::try_from(options_size).expect("options size fits u32"))?;
+        writer.write_u32_be(u32::try_from(options_size).expect("options size fits u32"))?;
         for option in &self.options {
             option.write(writer)?;
         }

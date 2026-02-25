@@ -1,7 +1,10 @@
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{Read, Write};
-
-use crate::{protocol::Error, traits::WireFormat};
+use crate::{
+    protocol::{
+        Error,
+        byte_order::{ReadBytesExt, WriteBytesExt},
+    },
+    traits::WireFormat,
+};
 
 pub const ENTRY_SIZE: usize = 16;
 
@@ -119,12 +122,12 @@ impl WireFormat for EventGroupEntry {
         let index_first_options_run = reader.read_u8()?;
         let index_second_options_run = reader.read_u8()?;
         let options_count = OptionsCount::from(reader.read_u8()?);
-        let service_id = reader.read_u16::<BigEndian>()?;
-        let instance_id = reader.read_u16::<BigEndian>()?;
+        let service_id = reader.read_u16_be()?;
+        let instance_id = reader.read_u16_be()?;
         let major_version = reader.read_u8()?;
-        let ttl = reader.read_u24::<BigEndian>()?;
-        let counter = reader.read_u16::<BigEndian>()? & 0x000f;
-        let event_group_id = reader.read_u16::<BigEndian>()?;
+        let ttl = reader.read_u24_be()?;
+        let counter = reader.read_u16_be()? & 0x000f;
+        let event_group_id = reader.read_u16_be()?;
         Ok(Self {
             index_first_options_run,
             index_second_options_run,
@@ -149,12 +152,12 @@ impl WireFormat for EventGroupEntry {
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;
         writer.write_u8(u8::from(self.options_count))?;
-        writer.write_u16::<BigEndian>(self.service_id)?;
-        writer.write_u16::<BigEndian>(self.instance_id)?;
+        writer.write_u16_be(self.service_id)?;
+        writer.write_u16_be(self.instance_id)?;
         writer.write_u8(self.major_version)?;
-        writer.write_u24::<BigEndian>(self.ttl)?;
-        writer.write_u16::<BigEndian>(self.counter)?;
-        writer.write_u16::<BigEndian>(self.event_group_id)?;
+        writer.write_u24_be(self.ttl)?;
+        writer.write_u16_be(self.counter)?;
+        writer.write_u16_be(self.event_group_id)?;
         Ok(16)
     }
 }
@@ -189,15 +192,15 @@ impl ServiceEntry {
 }
 
 impl WireFormat for ServiceEntry {
-    fn decode<R: Read>(reader: &mut R) -> Result<Self, Error> {
+    fn decode<R: std::io::Read>(reader: &mut R) -> Result<Self, Error> {
         let index_first_options_run = reader.read_u8()?;
         let index_second_options_run = reader.read_u8()?;
         let options_count = OptionsCount::from(reader.read_u8()?);
-        let service_id = reader.read_u16::<BigEndian>()?;
-        let instance_id = reader.read_u16::<BigEndian>()?;
+        let service_id = reader.read_u16_be()?;
+        let instance_id = reader.read_u16_be()?;
         let major_version = reader.read_u8()?;
-        let ttl = reader.read_u24::<BigEndian>()?;
-        let minor_version = reader.read_u32::<BigEndian>()?;
+        let ttl = reader.read_u24_be()?;
+        let minor_version = reader.read_u32_be()?;
         Ok(Self {
             index_first_options_run,
             index_second_options_run,
@@ -214,15 +217,15 @@ impl WireFormat for ServiceEntry {
         16
     }
 
-    fn encode<W: Write>(&self, writer: &mut W) -> Result<usize, Error> {
+    fn encode<W: std::io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;
         writer.write_u8(u8::from(self.options_count))?;
-        writer.write_u16::<BigEndian>(self.service_id)?;
-        writer.write_u16::<BigEndian>(self.instance_id)?;
+        writer.write_u16_be(self.service_id)?;
+        writer.write_u16_be(self.instance_id)?;
         writer.write_u8(self.major_version)?;
-        writer.write_u24::<BigEndian>(self.ttl)?;
-        writer.write_u32::<BigEndian>(self.minor_version)?;
+        writer.write_u24_be(self.ttl)?;
+        writer.write_u32_be(self.minor_version)?;
         Ok(16)
     }
 }
@@ -274,7 +277,7 @@ impl Entry {
 }
 
 impl WireFormat for Entry {
-    fn decode<R: Read>(reader: &mut R) -> Result<Self, Error> {
+    fn decode<R: std::io::Read>(reader: &mut R) -> Result<Self, Error> {
         let entry_type = EntryType::try_from(reader.read_u8()?)?;
         match entry_type {
             EntryType::FindService => {
@@ -312,7 +315,7 @@ impl WireFormat for Entry {
         }
     }
 
-    fn encode<W: Write>(&self, writer: &mut W) -> Result<usize, Error> {
+    fn encode<W: std::io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
         match self {
             Entry::FindService(service_entry) => {
                 writer.write_u8(u8::from(EntryType::FindService))?;

@@ -1,11 +1,9 @@
-use std::{
-    io::{Read, Write},
-    net::Ipv4Addr,
+use std::net::Ipv4Addr;
+
+use crate::protocol::{
+    Error,
+    byte_order::{ReadBytesExt, WriteBytesExt},
 };
-
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-
-use crate::protocol::Error;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TransportProtocol {
@@ -107,18 +105,18 @@ impl Options {
         }
     }
 
-    pub fn write<T: Write>(&self, writer: &mut T) -> Result<usize, Error> {
-        writer.write_u16::<BigEndian>(u16::try_from(self.size() - 3).expect("option size fits u16"))?;
+    pub fn write<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
+        writer.write_u16_be(u16::try_from(self.size() - 3).expect("option size fits u16"))?;
         match self {
             Options::Configuration => todo!("Options::Configuration not implemented"),
             Options::LoadBalancing => todo!("Options::Configuration not implemented"),
             Options::IpV4Endpoint { ip, protocol, port } => {
                 writer.write_u8(u8::from(OptionType::IpV4Endpoint))?;
                 writer.write_u8(0)?;
-                writer.write_u32::<BigEndian>(ip.to_bits())?;
+                writer.write_u32_be(ip.to_bits())?;
                 writer.write_u8(0)?;
                 writer.write_u8(u8::from(*protocol))?;
-                writer.write_u16::<BigEndian>(*port)?;
+                writer.write_u16_be(*port)?;
                 Ok(12)
             }
             Options::IpV6Endpoint => todo!("Options::Configuration not implemented"),
@@ -129,8 +127,8 @@ impl Options {
         }
     }
 
-    pub fn read<T: Read>(message_bytes: &mut T) -> Result<Self, Error> {
-        let length = message_bytes.read_u16::<BigEndian>()?;
+    pub fn read<T: std::io::Read>(message_bytes: &mut T) -> Result<Self, Error> {
+        let length = message_bytes.read_u16_be()?;
         let option_type = OptionType::try_from(message_bytes.read_u8()?)?;
         let discard_flag = message_bytes.read_u8()? & 0x80 != 0;
 
@@ -144,11 +142,11 @@ impl Options {
             OptionType::IpV4Endpoint => {
                 assert!(length == 9, "Invalid length for IpV4Endpoint");
                 assert!(!discard_flag, "Discard flag not set");
-                let ip = Ipv4Addr::from_bits(message_bytes.read_u32::<BigEndian>()?);
+                let ip = Ipv4Addr::from_bits(message_bytes.read_u32_be()?);
                 let reserved = message_bytes.read_u8()?;
                 assert!(reserved == 0, "Reserved byte not zero");
                 let protocol = TransportProtocol::try_from(message_bytes.read_u8()?)?;
-                let port = message_bytes.read_u16::<BigEndian>()?;
+                let port = message_bytes.read_u16_be()?;
                 Ok(Options::IpV4Endpoint { ip, protocol, port })
             }
             OptionType::IpV6Endpoint => {
