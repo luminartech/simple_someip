@@ -1,7 +1,8 @@
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-
 use crate::{
-    protocol::{Error, MessageId, MessageTypeField, ReturnCode},
+    protocol::{
+        Error, MessageId, MessageTypeField, ReturnCode,
+        byte_order::{ReadBytesExt, WriteBytesExt},
+    },
     traits::WireFormat,
 };
 
@@ -51,9 +52,9 @@ impl Header {
 
 impl WireFormat for Header {
     fn decode<T: std::io::Read>(reader: &mut T) -> Result<Self, Error> {
-        let message_id = MessageId::from(reader.read_u32::<BigEndian>()?);
-        let length = reader.read_u32::<BigEndian>()?;
-        let request_id = reader.read_u32::<BigEndian>()?;
+        let message_id = MessageId::from(reader.read_u32_be()?);
+        let length = reader.read_u32_be()?;
+        let request_id = reader.read_u32_be()?;
         let protocol_version = reader.read_u8()?;
         if protocol_version != 0x01 {
             return Err(Error::InvalidProtocolVersion(protocol_version));
@@ -77,9 +78,9 @@ impl WireFormat for Header {
     }
 
     fn encode<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
-        writer.write_u32::<BigEndian>(self.message_id.message_id())?;
-        writer.write_u32::<BigEndian>(self.length)?;
-        writer.write_u32::<BigEndian>(self.session_id)?;
+        writer.write_u32_be(self.message_id.message_id())?;
+        writer.write_u32_be(self.length)?;
+        writer.write_u32_be(self.session_id)?;
         writer.write_u8(self.protocol_version)?;
         writer.write_u8(self.interface_version)?;
         writer.write_u8(u8::from(self.message_type))?;
