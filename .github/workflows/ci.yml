@@ -16,7 +16,7 @@ jobs:
         with:
           components: clippy, rustfmt
       - run: cargo fmt --check
-      - run: cargo clippy --all-features -- -D warnings
+      - run: cargo clippy --all-features -- -D warnings -D clippy::pedantic
 
   linear-history:
     name: Linear PR History
