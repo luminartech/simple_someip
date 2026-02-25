@@ -168,7 +168,12 @@ impl<const E: usize, const O: usize> WireFormat for Header<E, O> {
 
         let mut remaining_options_size = reader.read_u32_be()? as usize;
         let mut options = SdOptions::new();
+        // Minimum SD option wire size: length(2) + type(1) + reserved(1) = 4 bytes
+        const MIN_OPTION_SIZE: usize = 4;
         while remaining_options_size > 0 {
+            if remaining_options_size < MIN_OPTION_SIZE {
+                return Err(Error::IncorrectOptionsSize(remaining_options_size));
+            }
             let option = Options::read(reader)?;
             let option_size = option.size();
             if option_size > remaining_options_size {

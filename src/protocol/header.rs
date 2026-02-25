@@ -32,12 +32,12 @@ impl Header {
     /// (Client ID [31:16] + Session ID [15:0]), not just the 2-byte Session ID.
     #[must_use]
     pub fn upper_header_bytes(&self) -> [u8; 8] {
-        let sid = self.request_id.to_be_bytes();
+        let rid = self.request_id.to_be_bytes();
         [
-            sid[0],
-            sid[1],
-            sid[2],
-            sid[3],
+            rid[0],
+            rid[1],
+            rid[2],
+            rid[3],
             self.protocol_version,
             self.interface_version,
             u8::from(self.message_type),
