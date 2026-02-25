@@ -160,7 +160,7 @@ pub fn check_profile5_with_header(
     let status = check_sequence_profile5(state, counter, config.max_delta_counter);
     state.last_counter = Some(counter);
 
-    E2ECheckResult::success(status, counter as u32, payload.to_vec())
+    E2ECheckResult::success(status, u32::from(counter), payload.to_vec())
 }
 
 /// Check sequence continuity for Profile 4 (16-bit counter).
