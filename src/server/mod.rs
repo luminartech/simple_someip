@@ -251,7 +251,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
             length: someip_length(sd_data.len()),
-            session_id: sid,
+            request_id: sid,
             protocol_version: 0x01,
             interface_version: 0x01,
             message_type: MessageTypeField::new(MessageType::Notification, false),
@@ -328,7 +328,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
             length: someip_length(sd_data.len()),
-            session_id: sid,
+            request_id: sid,
             protocol_version: 0x01,
             interface_version: 0x01,
             message_type: MessageTypeField::new(MessageType::Notification, false),
@@ -590,7 +590,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
             length: someip_length(sd_data.len()),
-            session_id: sid,
+            request_id: sid,
             protocol_version: 0x01,
             interface_version: 0x01,
             message_type: MessageTypeField::new(MessageType::Notification, false),
@@ -662,7 +662,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
             length: someip_length(sd_data.len()),
-            session_id: sid,
+            request_id: sid,
             protocol_version: 0x01,
             interface_version: 0x01,
             message_type: MessageTypeField::new(MessageType::Notification, false),
@@ -718,7 +718,7 @@ mod tests {
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
             length: someip_length(sd_data.len()),
-            session_id: 0x0001,
+            request_id: 0x0001,
             protocol_version: 0x01,
             interface_version: 0x01,
             message_type: MessageTypeField::new(MessageType::Notification, false),

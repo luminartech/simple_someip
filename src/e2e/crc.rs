@@ -165,11 +165,45 @@ mod tests {
     }
 
     #[test]
-    fn test_crc16_p5_with_header_differs_from_without() {
-        let header_a = [0u8; 8];
-        let header_b = [0xFF; 8];
+    fn test_crc16_p5_with_header_nonzero_header_changes_crc() {
+        // A non-zero upper header must produce a different CRC than the headerless variant
+        let header = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+        let crc_no_header = compute_crc16_p5(0x1234, 0, b"test");
+        let crc_with_header = compute_crc16_p5_with_header(0x1234, 0, b"test", &header);
+        assert_ne!(
+            crc_no_header, crc_with_header,
+            "Non-zero upper_header should change CRC vs headerless path"
+        );
+    }
+
+    #[test]
+    fn test_crc16_p5_with_header_different_headers_differ() {
+        let header_a = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+        let header_b = [0x00, 0x02, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00]; // single byte changed
         let crc_a = compute_crc16_p5_with_header(0x1234, 0, b"test", &header_a);
         let crc_b = compute_crc16_p5_with_header(0x1234, 0, b"test", &header_b);
         assert_ne!(crc_a, crc_b, "Different upper_header should produce different CRC");
+    }
+
+    #[test]
+    fn test_crc16_p5_with_header_deterministic() {
+        let header = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+        let crc1 = compute_crc16_p5_with_header(0x1234, 0, b"test", &header);
+        let crc2 = compute_crc16_p5_with_header(0x1234, 0, b"test", &header);
+        assert_eq!(crc1, crc2, "Same inputs should always produce same CRC");
+    }
+
+    #[test]
+    fn test_crc16_p5_with_header_each_field_matters() {
+        let header = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+        let baseline = compute_crc16_p5_with_header(0x1234, 0, b"test", &header);
+
+        let crc_diff_data_id = compute_crc16_p5_with_header(0x1235, 0, b"test", &header);
+        let crc_diff_counter = compute_crc16_p5_with_header(0x1234, 1, b"test", &header);
+        let crc_diff_payload = compute_crc16_p5_with_header(0x1234, 0, b"Test", &header);
+
+        assert_ne!(baseline, crc_diff_data_id, "Different data_id should change CRC");
+        assert_ne!(baseline, crc_diff_counter, "Different counter should change CRC");
+        assert_ne!(baseline, crc_diff_payload, "Different payload should change CRC");
     }
 }

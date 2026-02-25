@@ -66,9 +66,8 @@ impl<const E: usize, const O: usize> Header<E, O> {
         };
         let mut entries = SdEntries::new();
         let mut options = SdOptions::new();
-        // Single entry/option — capacity is always sufficient.
-        let _ = entries.push(entry);
-        let _ = options.push(endpoint);
+        entries.push(entry).expect("single SD entry exceeds capacity");
+        options.push(endpoint).expect("single SD option exceeds capacity");
         Self {
             flags: Flags::new_sd(false),
             entries,
@@ -119,8 +118,8 @@ impl<const E: usize, const O: usize> Header<E, O> {
         };
         let mut entries = SdEntries::new();
         let mut options = SdOptions::new();
-        let _ = entries.push(entry);
-        let _ = options.push(endpoint);
+        entries.push(entry).expect("single SD entry exceeds capacity");
+        options.push(endpoint).expect("single SD option exceeds capacity");
         Self {
             flags: Flags::new_sd(false),
             entries,
@@ -144,7 +143,7 @@ impl<const E: usize, const O: usize> Header<E, O> {
             event_group_id,
         ));
         let mut entries = SdEntries::new();
-        let _ = entries.push(entry);
+        entries.push(entry).expect("single SD entry exceeds capacity");
         Self {
             flags: Flags::new_sd(true),
             entries,
@@ -171,11 +170,12 @@ impl<const E: usize, const O: usize> WireFormat for Header<E, O> {
         let mut options = SdOptions::new();
         while remaining_options_size > 0 {
             let option = Options::read(reader)?;
-            remaining_options_size -= option.size();
+            let option_size = option.size();
+            if option_size > remaining_options_size {
+                return Err(Error::IncorrectOptionsSize(remaining_options_size));
+            }
+            remaining_options_size -= option_size;
             options.push(option).map_err(|_| Error::TooManyOptions)?;
-        }
-        if remaining_options_size != 0 {
-            return Err(Error::IncorrectOptionsSize(remaining_options_size));
         }
         Ok(Self {
             flags,

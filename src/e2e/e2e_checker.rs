@@ -230,7 +230,7 @@ fn check_sequence_profile5(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::e2e::{protect_profile4, protect_profile5};
+    use crate::e2e::{protect_profile4, protect_profile5, protect_profile5_with_header};
 
     #[test]
     fn test_check_profile4_valid() {
@@ -476,5 +476,46 @@ mod tests {
             let result = check_profile5(&config, &mut check_state, &protected);
             assert_eq!(result.status, E2ECheckStatus::Ok);
         }
+    }
+
+    #[test]
+    fn test_check_profile5_with_header_roundtrip() {
+        let config = Profile5Config::new(0x1234, 20, 15);
+        let mut protect_state = Profile5State::new();
+        let mut check_state = Profile5State::new();
+
+        let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+
+        let mut payload = [0u8; 20];
+        payload[..5].copy_from_slice(b"Hello");
+
+        let protected =
+            protect_profile5_with_header(&config, &mut protect_state, &payload, &upper_header);
+        let result =
+            check_profile5_with_header(&config, &mut check_state, &protected, &upper_header);
+
+        assert_eq!(result.status, E2ECheckStatus::Ok);
+        assert_eq!(result.counter, Some(0));
+        assert_eq!(result.payload.as_deref(), Some(payload.as_slice()));
+    }
+
+    #[test]
+    fn test_check_profile5_with_header_mismatch_is_crc_error() {
+        let config = Profile5Config::new(0x1234, 20, 15);
+        let mut protect_state = Profile5State::new();
+        let mut check_state = Profile5State::new();
+
+        let tx_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+        let rx_header: [u8; 8] = [0x00, 0x02, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+
+        let mut payload = [0u8; 20];
+        payload[..5].copy_from_slice(b"Hello");
+
+        let protected =
+            protect_profile5_with_header(&config, &mut protect_state, &payload, &tx_header);
+        let result =
+            check_profile5_with_header(&config, &mut check_state, &protected, &rx_header);
+
+        assert_eq!(result.status, E2ECheckStatus::CrcError);
     }
 }
