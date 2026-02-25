@@ -6,20 +6,22 @@
 //! - Event group management
 //! - Request/Response handling
 
-mod service_info;
 mod event_publisher;
+mod service_info;
 mod subscription_manager;
 
-pub use service_info::{ServiceInfo, EventGroupInfo};
 pub use event_publisher::EventPublisher;
+pub use service_info::{EventGroupInfo, ServiceInfo};
 pub use subscription_manager::SubscriptionManager;
 
-use crate::protocol::sd::{self, Entry, Flags, OptionsCount, SdEntries, SdOptions, ServiceEntry, TransportProtocol};
 use crate::Error;
+use crate::protocol::sd::{
+    self, Entry, Flags, OptionsCount, SdEntries, SdOptions, ServiceEntry, TransportProtocol,
+};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
-use tokio::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
+use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
 /// Compute the SOME/IP header `length` field (payload + 8 bytes of header overhead).
@@ -52,13 +54,8 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     /// Create a new server configuration
-    #[must_use] 
-    pub fn new(
-        interface: Ipv4Addr,
-        local_port: u16,
-        service_id: u16,
-        instance_id: u16,
-    ) -> Self {
+    #[must_use]
+    pub fn new(interface: Ipv4Addr, local_port: u16, service_id: u16, instance_id: u16) -> Self {
         Self {
             interface,
             local_port,
@@ -92,11 +89,16 @@ impl Server {
         // Bind unicast socket for receiving subscriptions
         let unicast_addr = SocketAddrV4::new(config.interface, config.local_port);
         let unicast_socket = Arc::new(UdpSocket::bind(unicast_addr).await?);
-        tracing::info!("Server bound to {} for service 0x{:04X}", unicast_addr, config.service_id);
+        tracing::info!(
+            "Server bound to {} for service 0x{:04X}",
+            unicast_addr,
+            config.service_id
+        );
 
         // Bind SD socket for sending/receiving SD messages (must use SD port 30490)
         let expected_sd_port = crate::SD_MULTICAST_PORT;
-        let sd_bind_addr = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), expected_sd_port);
+        let sd_bind_addr =
+            std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), expected_sd_port);
         let sd_raw_socket = socket2::Socket::new(
             socket2::Domain::IPV4,
             socket2::Type::DGRAM,
@@ -113,14 +115,17 @@ impl Server {
         let actual_sd_addr = sd_socket.local_addr()?;
         tracing::info!(
             "Server SD socket bound to {} (expected port {}), joined multicast {}",
-            actual_sd_addr, expected_sd_port, crate::SD_MULTICAST_IP
+            actual_sd_addr,
+            expected_sd_port,
+            crate::SD_MULTICAST_IP
         );
         if let std::net::SocketAddr::V4(v4) = actual_sd_addr
             && v4.port() != expected_sd_port
         {
             tracing::error!(
                 "SD socket port mismatch! Expected {}, got {}. Offers will use wrong source port.",
-                expected_sd_port, v4.port()
+                expected_sd_port,
+                v4.port()
             );
         }
 
@@ -181,8 +186,14 @@ impl Server {
     }
 
     /// Send an `OfferService` message via Service Discovery
-    async fn send_offer_service(config: &ServerConfig, socket: &UdpSocket, session_id: &AtomicU16) -> Result<(), Error> {
-        use crate::protocol::{Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode};
+    async fn send_offer_service(
+        config: &ServerConfig,
+        socket: &UdpSocket,
+        session_id: &AtomicU16,
+    ) -> Result<(), Error> {
+        use crate::protocol::{
+            Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode,
+        };
         use crate::traits::WireFormat;
 
         // Create OfferService entry
@@ -245,10 +256,7 @@ impl Server {
         someip_header.encode(&mut buffer)?;
         buffer.extend_from_slice(&sd_data);
 
-        let multicast_addr = SocketAddrV4::new(
-            crate::SD_MULTICAST_IP,
-            crate::SD_MULTICAST_PORT,
-        );
+        let multicast_addr = SocketAddrV4::new(crate::SD_MULTICAST_IP, crate::SD_MULTICAST_PORT);
 
         tracing::trace!(
             "Sending OfferService: service=0x{:04X}, instance={}, port={}, size={} bytes",
@@ -257,7 +265,10 @@ impl Server {
             config.local_port,
             buffer.len()
         );
-        tracing::trace!("OfferService data: {:02X?}", &buffer[..buffer.len().min(64)]);
+        tracing::trace!(
+            "OfferService data: {:02X?}",
+            &buffer[..buffer.len().min(64)]
+        );
 
         socket.send_to(&buffer, multicast_addr).await?;
         tracing::trace!("Sent to {}", multicast_addr);
@@ -267,7 +278,9 @@ impl Server {
 
     /// Send a unicast `OfferService` to a specific address (in response to `FindService`)
     async fn send_unicast_offer(&self, target: std::net::SocketAddr) -> Result<(), Error> {
-        use crate::protocol::{Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode};
+        use crate::protocol::{
+            Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode,
+        };
         use crate::traits::WireFormat;
 
         let entry = Entry::OfferService(ServiceEntry {
@@ -318,7 +331,8 @@ impl Server {
         self.sd_socket.send_to(&buffer, target).await?;
         tracing::debug!(
             "Sent unicast OfferService to {} for service 0x{:04X}",
-            target, self.config.service_id
+            target,
+            self.config.service_id
         );
 
         Ok(())
@@ -326,7 +340,8 @@ impl Server {
 
     /// Get the next SD session ID (`client_id=0`, `session_id` incrementing), skipping 0
     fn next_sd_session_id(&self) -> u32 {
-        let prev = self.sd_session_id
+        let prev = self
+            .sd_session_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 let next = v.wrapping_add(1);
                 Some(if next == 0 { 1 } else { next })
@@ -338,7 +353,7 @@ impl Server {
     }
 
     /// Get the event publisher for sending events
-    #[must_use] 
+    #[must_use]
     pub fn publisher(&self) -> Arc<EventPublisher> {
         Arc::clone(&self.publisher)
     }
@@ -370,7 +385,8 @@ impl Server {
 
             // Skip our own multicast messages
             if let std::net::SocketAddr::V4(v4) = addr
-                && *v4.ip() == self.config.interface && source == "sd-multicast"
+                && *v4.ip() == self.config.interface
+                && source == "sd-multicast"
             {
                 tracing::trace!("Ignoring our own SD multicast message");
                 continue;
@@ -383,20 +399,23 @@ impl Server {
             let mut reader = data;
             match SomeIpHeader::decode(&mut reader) {
                 Ok(header) => {
-                    tracing::trace!("SOME/IP Header: service=0x{:04X}, method=0x{:04X}, type={:?}",
+                    tracing::trace!(
+                        "SOME/IP Header: service=0x{:04X}, method=0x{:04X}, type={:?}",
                         header.message_id.service_id(),
                         header.message_id.method_id(),
                         header.message_type.message_type()
                     );
 
                     // Check if this is a Service Discovery message (0xFFFF8100)
-                    if header.message_id.service_id() == 0xFFFF &&
-                       header.message_id.method_id() == 0x8100 {
+                    if header.message_id.service_id() == 0xFFFF
+                        && header.message_id.method_id() == 0x8100
+                    {
                         tracing::trace!("This is an SD message");
                         // Parse SD payload
                         match sd::Header::decode(&mut reader) {
                             Ok(sd_msg) => {
-                                tracing::trace!("SD message has {} entries, {} options",
+                                tracing::trace!(
+                                    "SD message has {} entries, {} options",
                                     sd_msg.entries.len(),
                                     sd_msg.options.len()
                                 );
@@ -444,14 +463,16 @@ impl Server {
                             self.config.service_id,
                             sub.service_id
                         );
-                        self.send_subscribe_nack(sub, sender, "Wrong service ID").await?;
+                        self.send_subscribe_nack(sub, sender, "Wrong service ID")
+                            .await?;
                     } else if sub.instance_id != self.config.instance_id {
                         tracing::warn!(
                             "Subscribe for wrong instance: expected {}, got {}",
                             self.config.instance_id,
                             sub.instance_id
                         );
-                        self.send_subscribe_nack(sub, sender, "Wrong instance ID").await?;
+                        self.send_subscribe_nack(sub, sender, "Wrong instance ID")
+                            .await?;
                     } else {
                         // Extract subscriber endpoint from options
                         if let Some(endpoint_addr) = Self::extract_endpoint(&sd_msg.options) {
@@ -469,7 +490,8 @@ impl Server {
                             self.send_subscribe_ack(sub, sender).await?;
                         } else {
                             tracing::warn!("No endpoint found in Subscribe message options");
-                            self.send_subscribe_nack(sub, sender, "No endpoint in options").await?;
+                            self.send_subscribe_nack(sub, sender, "No endpoint in options")
+                                .await?;
                         }
                     }
                 }
@@ -478,7 +500,9 @@ impl Server {
                     if find.service_id == self.config.service_id || find.service_id == 0xFFFF {
                         tracing::debug!(
                             "Received FindService from {} for service 0x{:04X} (ours: 0x{:04X}), sending unicast offer",
-                            sender, find.service_id, self.config.service_id
+                            sender,
+                            find.service_id,
+                            self.config.service_id
                         );
                         self.send_unicast_offer(sender).await?;
                     } else {
@@ -517,7 +541,9 @@ impl Server {
         subscription: &sd::EventGroupEntry,
         subscriber: std::net::SocketAddr,
     ) -> Result<(), Error> {
-        use crate::protocol::{Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode};
+        use crate::protocol::{
+            Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode,
+        };
         use crate::traits::WireFormat;
 
         // Create SubscribeAck entry
@@ -585,7 +611,9 @@ impl Server {
         subscriber: std::net::SocketAddr,
         reason: &str,
     ) -> Result<(), Error> {
-        use crate::protocol::{Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode};
+        use crate::protocol::{
+            Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode,
+        };
         use crate::traits::WireFormat;
 
         // Create SubscribeNack entry (SubscribeAck with TTL=0 indicates rejection)
@@ -649,7 +677,9 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode};
+    use crate::protocol::{
+        Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode,
+    };
     use crate::traits::WireFormat;
 
     /// All server tests bind the SD multicast port (30490), so they must run
@@ -659,12 +689,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_creation() {
         let _lock = SD_PORT_LOCK.lock().await;
-        let config = ServerConfig::new(
-            Ipv4Addr::new(127, 0, 0, 1),
-            30682,
-            0x5B,
-            1,
-        );
+        let config = ServerConfig::new(Ipv4Addr::new(127, 0, 0, 1), 30682, 0x5B, 1);
 
         let server = Server::new(config).await;
         assert!(server.is_ok());
@@ -696,7 +721,11 @@ mod tests {
         let mut reader = data;
         let _header = SomeIpHeader::decode(&mut reader).expect("Failed to parse SOME/IP header");
         let sd_msg = sd::Header::decode(&mut reader).expect("Failed to parse SD header");
-        assert_eq!(sd_msg.entries.len(), 1, "Expected exactly 1 entry in response");
+        assert_eq!(
+            sd_msg.entries.len(),
+            1,
+            "Expected exactly 1 entry in response"
+        );
         match &sd_msg.entries[0] {
             sd::Entry::SubscribeAckEventGroup(entry) => entry.ttl,
             other => panic!("Expected SubscribeAckEventGroup, got {:?}", other),
@@ -706,12 +735,7 @@ mod tests {
     /// Helper: create a server on an ephemeral port and return (Server, port)
     async fn create_test_server(service_id: u16, instance_id: u16) -> (Server, u16) {
         // Use port 0 to get an ephemeral port
-        let config = ServerConfig::new(
-            Ipv4Addr::new(127, 0, 0, 1),
-            0,
-            service_id,
-            instance_id,
-        );
+        let config = ServerConfig::new(Ipv4Addr::new(127, 0, 0, 1), 0, service_id, instance_id);
         let mut server = Server::new(config).await.expect("Failed to create server");
         let local_addr = server.unicast_socket.local_addr().unwrap();
         let port = match local_addr {

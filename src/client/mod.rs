@@ -32,7 +32,7 @@ impl<MessageDefinitions> Client<MessageDefinitions>
 where
     MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
 {
-    #[must_use] 
+    #[must_use]
     pub fn new(interface: Ipv4Addr) -> Self {
         let (control_sender, update_receiver) = Inner::spawn(interface);
 
@@ -47,7 +47,7 @@ where
         self.update_receiver.recv().await
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn interface(&self) -> Ipv4Addr {
         self.interface
     }

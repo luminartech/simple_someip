@@ -16,7 +16,7 @@ impl Profile4Config {
     /// # Arguments
     /// * `data_id` - Unique identifier for this data element
     /// * `max_delta_counter` - Maximum allowed gap in counter sequence
-    #[must_use] 
+    #[must_use]
     pub fn new(data_id: u32, max_delta_counter: u16) -> Self {
         Self {
             data_id,
@@ -44,7 +44,7 @@ impl Profile5Config {
     /// * `data_id` - Unique identifier for this data element
     /// * `data_length` - Expected length of protected data
     /// * `max_delta_counter` - Maximum allowed gap in counter sequence
-    #[must_use] 
+    #[must_use]
     pub fn new(data_id: u16, data_length: u16, max_delta_counter: u8) -> Self {
         Self {
             data_id,

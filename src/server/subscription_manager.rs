@@ -13,7 +13,7 @@ pub struct SubscriptionManager {
 
 impl SubscriptionManager {
     /// Create a new subscription manager
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             subscriptions: HashMap::new(),
@@ -83,7 +83,7 @@ impl SubscriptionManager {
     }
 
     /// Get all subscribers for an event group
-    #[must_use] 
+    #[must_use]
     pub fn get_subscribers(
         &self,
         service_id: u16,
@@ -95,7 +95,7 @@ impl SubscriptionManager {
     }
 
     /// Get total number of active subscriptions
-    #[must_use] 
+    #[must_use]
     pub fn subscription_count(&self) -> usize {
         self.subscriptions.values().map(std::vec::Vec::len).sum()
     }

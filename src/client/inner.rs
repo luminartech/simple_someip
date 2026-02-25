@@ -78,7 +78,10 @@ impl<MessageDefinitions> ControlMessage<MessageDefinitions> {
         source_port: u16,
     ) -> (oneshot::Receiver<Result<MessageDefinitions, Error>>, Self) {
         let (sender, receiver) = oneshot::channel();
-        (receiver, Self::Send(socket_addr, message, source_port, sender))
+        (
+            receiver,
+            Self::Send(socket_addr, message, source_port, sender),
+        )
     }
 }
 
@@ -332,7 +335,8 @@ where
                 ControlMessage::Send(target, mut message, source_port, response) => {
                     if let Some(socket) = self.unicast_sockets.get_mut(&source_port) {
                         // Set client ID (upper 16) and session ID (lower 16)
-                        let request_id = (u32::from(self.client_id) << 16) | u32::from(self.session_counter);
+                        let request_id =
+                            (u32::from(self.client_id) << 16) | u32::from(self.session_counter);
                         message.set_session_id(request_id);
                         self.session_counter = self.session_counter.wrapping_add(1);
                         if self.session_counter == 0 {
@@ -341,10 +345,8 @@ where
                         let send_result = socket.send(target, message.clone()).await;
                         match send_result {
                             Ok(()) => {
-                                self.active_request = Some(ControlMessage::AwaitResponse(
-                                    message.clone(),
-                                    response,
-                                ));
+                                self.active_request =
+                                    Some(ControlMessage::AwaitResponse(message.clone(), response));
                             }
                             Err(_) => todo!(),
                         }

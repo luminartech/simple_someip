@@ -69,7 +69,7 @@ impl From<OptionsCount> for u8 {
 }
 
 impl OptionsCount {
-    #[must_use] 
+    #[must_use]
     pub fn new(first_options_count: u8, second_options_count: u8) -> Self {
         assert!(first_options_count < 16);
         assert!(second_options_count < 16);
@@ -95,7 +95,7 @@ pub struct EventGroupEntry {
 }
 
 impl EventGroupEntry {
-    #[must_use] 
+    #[must_use]
     pub fn new(
         service_id: u16,
         instance_id: u16,
@@ -176,7 +176,7 @@ pub struct ServiceEntry {
 }
 
 impl ServiceEntry {
-    #[must_use] 
+    #[must_use]
     pub fn find(service_id: u16) -> Self {
         Self {
             index_first_options_run: 0,
@@ -240,7 +240,7 @@ pub enum Entry {
 }
 
 impl Entry {
-    #[must_use] 
+    #[must_use]
     pub fn first_options_count(&self) -> u8 {
         match self {
             Entry::FindService(service_entry)
@@ -255,7 +255,7 @@ impl Entry {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn second_options_count(&self) -> u8 {
         match self {
             Entry::FindService(service_entry)
@@ -270,7 +270,7 @@ impl Entry {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn total_options_count(&self) -> u8 {
         self.first_options_count() + self.second_options_count()
     }
@@ -309,9 +309,7 @@ impl WireFormat for Entry {
             | Entry::OfferService(service_entry)
             | Entry::StopOfferService(service_entry) => service_entry.required_size(),
             Entry::SubscribeEventGroup(event_group_entry)
-            | Entry::SubscribeAckEventGroup(event_group_entry) => {
-                event_group_entry.required_size()
-            }
+            | Entry::SubscribeAckEventGroup(event_group_entry) => event_group_entry.required_size(),
         }
     }
 
