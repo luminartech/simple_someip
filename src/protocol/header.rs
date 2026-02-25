@@ -51,7 +51,7 @@ impl Header {
 }
 
 impl WireFormat for Header {
-    fn decode<T: std::io::Read>(reader: &mut T) -> Result<Self, Error> {
+    fn decode<T: embedded_io::Read>(reader: &mut T) -> Result<Self, Error> {
         let message_id = MessageId::from(reader.read_u32_be()?);
         let length = reader.read_u32_be()?;
         let request_id = reader.read_u32_be()?;
@@ -77,7 +77,7 @@ impl WireFormat for Header {
         16
     }
 
-    fn encode<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
+    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
         writer.write_u32_be(self.message_id.message_id())?;
         writer.write_u32_be(self.length)?;
         writer.write_u32_be(self.session_id)?;

@@ -1,8 +1,7 @@
 use crate::protocol::{self, MessageId};
 
 /// A trait for types that can be deserialized from a
-/// [`Reader`](https://doc.rust-lang.org/std/io/trait.Read.html) and serialized
-/// to a [`Writer`](https://doc.rust-lang.org/std/io/trait.Write.html).
+/// [`Reader`](embedded_io::Read) and serialized to a [`Writer`](embedded_io::Write).
 ///
 /// `WireFormat` acts as the base trait for all types that can be serialized and deserialized
 /// as part of the Simple SOME/IP ecosystem.
@@ -13,7 +12,7 @@ pub trait WireFormat: Send + Sized + Sync {
     /// # Errors
     /// - if the stream is not in the expected format
     /// - if the stream contains partial data
-    fn decode<T: std::io::Read>(reader: &mut T) -> Result<Self, protocol::Error>;
+    fn decode<T: embedded_io::Read>(reader: &mut T) -> Result<Self, protocol::Error>;
 
     /// Returns the number of bytes required to serialize this value.
     fn required_size(&self) -> usize;
@@ -22,11 +21,11 @@ pub trait WireFormat: Send + Sized + Sync {
     /// Returns the number of bytes written.
     /// # Errors
     /// - If the data cannot be written to the stream
-    fn encode<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
+    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
 }
 
 /// A trait for SOME/IP Payload types that can be deserialized from a
-/// [`Reader`](std::io::Read) and serialized to a [`Writer`](std::io::Write).
+/// [`Reader`](embedded_io::Read) and serialized to a [`Writer`](embedded_io::Write).
 /// Note that SOME/IP payloads are not self identifying, so the [Message ID](protocol::MessageId)
 /// must be provided by the caller after reading from the [SOME/IP header](protocol::Header).
 pub trait PayloadWireFormat: std::fmt::Debug + Send + Sized + Sync {
@@ -34,8 +33,8 @@ pub trait PayloadWireFormat: std::fmt::Debug + Send + Sized + Sync {
     fn message_id(&self) -> MessageId;
     /// Get the payload as a service discovery header
     fn as_sd_header(&self) -> Option<&crate::protocol::sd::Header>;
-    /// Deserialize a payload from a [Reader](std::io::Read) given the Message ID.
-    fn decode_with_message_id<T: std::io::Read>(
+    /// Deserialize a payload from a [Reader](embedded_io::Read) given the Message ID.
+    fn decode_with_message_id<T: embedded_io::Read>(
         message_id: MessageId,
         reader: &mut T,
     ) -> Result<Self, protocol::Error>;
@@ -43,8 +42,8 @@ pub trait PayloadWireFormat: std::fmt::Debug + Send + Sized + Sync {
     fn new_sd_payload(header: &crate::protocol::sd::Header) -> Self;
     /// Number of bytes required to write the payload
     fn required_size(&self) -> usize;
-    /// Serialize the payload to a [Writer](std::io::Write)
-    fn encode<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
+    /// Serialize the payload to a [Writer](embedded_io::Write)
+    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
 }
 
 /// A simple implementation of [`PayloadWireFormat`] that only supports SOME/IP-SD messages.
@@ -62,7 +61,7 @@ impl PayloadWireFormat for DiscoveryOnlyPayload {
         Some(&self.header)
     }
 
-    fn decode_with_message_id<T: std::io::Read>(
+    fn decode_with_message_id<T: embedded_io::Read>(
         message_id: MessageId,
         reader: &mut T,
     ) -> Result<Self, protocol::Error> {
@@ -85,7 +84,7 @@ impl PayloadWireFormat for DiscoveryOnlyPayload {
         self.header.required_size()
     }
 
-    fn encode<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
+    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
         self.header.encode(writer)
     }
 }

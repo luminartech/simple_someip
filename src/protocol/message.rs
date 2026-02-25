@@ -1,7 +1,5 @@
-use std::io::{Read, Write};
-
 use crate::{
-    protocol::{Error, Header, MessageType, ReturnCode, sd},
+    protocol::{Error, Header, MessageType, ReturnCode, byte_order::Take, sd},
     traits::{PayloadWireFormat, WireFormat},
 };
 
@@ -16,7 +14,7 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
         Self { header, payload }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn new_sd(session_id: u32, sd_header: &sd::Header) -> Self {
         let sd_header_size = sd_header.required_size();
         Self::new(
@@ -53,7 +51,7 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
 }
 
 impl<PayloadDefinition: PayloadWireFormat> WireFormat for Message<PayloadDefinition> {
-    fn decode<R: Read>(reader: &mut R) -> Result<Self, Error> {
+    fn decode<R: embedded_io::Read>(reader: &mut R) -> Result<Self, Error> {
         let header = Header::decode(reader)?;
         if header.message_id.is_sd() {
             assert!(header.payload_size() >= 12, "SD message too short");
@@ -74,7 +72,7 @@ impl<PayloadDefinition: PayloadWireFormat> WireFormat for Message<PayloadDefinit
                 "SD return code mismatch"
             );
         }
-        let mut payload_reader = reader.take(header.payload_size() as u64);
+        let mut payload_reader = Take::new(reader, header.payload_size());
         let payload =
             PayloadDefinition::decode_with_message_id(header.message_id, &mut payload_reader)?;
         Ok(Self::new(header, payload))
@@ -84,7 +82,7 @@ impl<PayloadDefinition: PayloadWireFormat> WireFormat for Message<PayloadDefinit
         self.header.required_size() + self.payload.required_size()
     }
 
-    fn encode<W: Write>(&self, writer: &mut W) -> Result<usize, Error> {
+    fn encode<W: embedded_io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
         Ok(self.header.encode(writer)? + self.payload.encode(writer)?)
     }
 }

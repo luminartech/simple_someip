@@ -128,7 +128,7 @@ impl Header {
 }
 
 impl WireFormat for Header {
-    fn decode<T: std::io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
+    fn decode<T: embedded_io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
         let flags = Flags::from(reader.read_u8()?);
         let mut reserved: [u8; 3] = [0; 3];
         reader.read_bytes(&mut reserved)?;
@@ -164,7 +164,7 @@ impl WireFormat for Header {
         size
     }
 
-    fn encode<T: std::io::Write>(
+    fn encode<T: embedded_io::Write>(
         &self,
         writer: &mut T,
     ) -> Result<usize, crate::protocol::Error> {

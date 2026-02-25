@@ -105,7 +105,7 @@ impl Options {
         }
     }
 
-    pub fn write<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
+    pub fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
         writer.write_u16_be(u16::try_from(self.size() - 3).expect("option size fits u16"))?;
         match self {
             Options::Configuration => todo!("Options::Configuration not implemented"),
@@ -127,7 +127,7 @@ impl Options {
         }
     }
 
-    pub fn read<T: std::io::Read>(message_bytes: &mut T) -> Result<Self, Error> {
+    pub fn read<T: embedded_io::Read>(message_bytes: &mut T) -> Result<Self, Error> {
         let length = message_bytes.read_u16_be()?;
         let option_type = OptionType::try_from(message_bytes.read_u8()?)?;
         let discard_flag = message_bytes.read_u8()? & 0x80 != 0;
