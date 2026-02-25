@@ -15,8 +15,8 @@ pub const PROFILE5_HEADER_SIZE: usize = 3;
 /// Creates a protected message with a 12-byte header prepended:
 /// - Length (2 bytes): Total length including header
 /// - Counter (2 bytes): Sequence counter from state
-/// - DataID (4 bytes): From configuration
-/// - CRC (4 bytes): CRC-32P4 over Length + Counter + DataID + Payload
+/// - `DataID` (4 bytes): From configuration
+/// - CRC (4 bytes): CRC-32P4 over Length + Counter + `DataID` + Payload
 ///
 /// The state counter is incremented after each call.
 ///
@@ -33,15 +33,9 @@ pub fn protect_profile4(
     payload: &[u8],
 ) -> Vec<u8> {
     let total_length = PROFILE4_HEADER_SIZE + payload.len();
-    assert!(
-        total_length <= u16::MAX as usize,
-        "E2E Profile 4 payload too large: total length {} exceeds u16::MAX ({})",
-        total_length,
-        u16::MAX,
-    );
+    let length = u16::try_from(total_length).expect("E2E Profile 4 payload too large");
 
     let counter = state.protect_counter;
-    let length = total_length as u16;
 
     // Compute CRC over: Length + Counter + DataID + Payload
     let crc = compute_crc32_p4(length, counter, config.data_id, payload);

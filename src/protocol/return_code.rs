@@ -69,8 +69,7 @@ impl From<ReturnCode> for u8 {
             ReturnCode::E2E => 0x0d,
             ReturnCode::E2ENotAvailable => 0x0e,
             ReturnCode::E2ENoNewData => 0x0f,
-            ReturnCode::GenericError(value) => value,
-            ReturnCode::InterfaceError(value) => value,
+            ReturnCode::GenericError(value) | ReturnCode::InterfaceError(value) => value,
         }
     }
 }

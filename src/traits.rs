@@ -39,7 +39,7 @@ pub trait PayloadWireFormat: std::fmt::Debug + Send + Sized + Sync {
         message_id: MessageId,
         reader: &mut T,
     ) -> Result<Self, protocol::Error>;
-    /// Create a PayloadWireFormat from a service discovery [Header](protocol::sd::Header)
+    /// Create a `PayloadWireFormat` from a service discovery [Header](protocol::sd::Header)
     fn new_sd_payload(header: &crate::protocol::sd::Header) -> Self;
     /// Number of bytes required to write the payload
     fn required_size(&self) -> usize;
@@ -47,7 +47,7 @@ pub trait PayloadWireFormat: std::fmt::Debug + Send + Sized + Sync {
     fn encode<T: std::io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
 }
 
-/// A simple implementation of [PayloadWireFormat] that only supports SOME/IP-SD messages.
+/// A simple implementation of [`PayloadWireFormat`] that only supports SOME/IP-SD messages.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveryOnlyPayload {
     header: crate::protocol::sd::Header,

@@ -16,6 +16,7 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
         Self { header, payload }
     }
 
+    #[must_use] 
     pub fn new_sd(session_id: u32, sd_header: &sd::Header) -> Self {
         let sd_header_size = sd_header.required_size();
         Self::new(

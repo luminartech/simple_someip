@@ -93,6 +93,7 @@ pub enum Options {
 }
 
 impl Options {
+    #[must_use] 
     pub fn size(&self) -> usize {
         match self {
             Options::Configuration => todo!("Options::Configuration not implemented"),
@@ -107,7 +108,7 @@ impl Options {
     }
 
     pub fn write<T: Write>(&self, writer: &mut T) -> Result<usize, Error> {
-        writer.write_u16::<BigEndian>((self.size() - 3) as u16)?;
+        writer.write_u16::<BigEndian>(u16::try_from(self.size() - 3).expect("option size fits u16"))?;
         match self {
             Options::Configuration => todo!("Options::Configuration not implemented"),
             Options::LoadBalancing => todo!("Options::Configuration not implemented"),

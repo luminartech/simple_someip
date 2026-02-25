@@ -16,6 +16,7 @@ pub struct Header {
 }
 
 impl Header {
+    #[must_use] 
     pub fn new(flags: Flags, entries: Vec<Entry>, options: Vec<Options>) -> Self {
         Self {
             flags,
@@ -25,6 +26,7 @@ impl Header {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[must_use] 
     pub fn new_service_offer(
         service_id: u16,
         instance_id: u16,
@@ -57,7 +59,8 @@ impl Header {
         }
     }
 
-    pub fn new_find_services(reboot: bool, service_ids: Vec<u16>) -> Self {
+    #[must_use] 
+    pub fn new_find_services(reboot: bool, service_ids: &[u16]) -> Self {
         let entries = service_ids
             .iter()
             .map(|service_id| Entry::FindService(ServiceEntry::find(*service_id)))
@@ -70,6 +73,7 @@ impl Header {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[must_use] 
     pub fn new_subscription(
         service_id: u16,
         instance_id: u16,
@@ -99,6 +103,7 @@ impl Header {
         }
     }
 
+    #[must_use] 
     pub fn subscribe_ack(
         service_id: u16,
         instance_id: u16,
@@ -127,15 +132,15 @@ impl WireFormat for Header {
         let mut reserved: [u8; 3] = [0; 3];
         reader.read_exact(&mut reserved)?;
         let entries_size = reader.read_u32::<BigEndian>()?;
-        let entries_count = entries_size / ENTRY_SIZE as u32;
+        let entries_count = entries_size / u32::try_from(ENTRY_SIZE).expect("constant fits u32");
         let mut entries = Vec::with_capacity(entries_count as usize);
-        let options_count = 0;
+        let options_count: usize = 0;
         for _i in 0..entries_count {
             entries.push(Entry::decode(reader)?);
         }
 
         let mut remaining_options_size = reader.read_u32::<BigEndian>()? as usize;
-        let mut options = Vec::with_capacity(options_count as usize);
+        let mut options = Vec::with_capacity(options_count);
         while remaining_options_size > 0 {
             options.push(Options::read(reader)?);
             remaining_options_size -= options.last().unwrap().size();
@@ -165,7 +170,7 @@ impl WireFormat for Header {
         writer.write_u8(u8::from(self.flags))?;
         let reserved: [u8; 3] = [0; 3];
         writer.write_all(&reserved)?;
-        let entries_size = (self.entries.len() * 16) as u32;
+        let entries_size = u32::try_from(self.entries.len() * 16).expect("entries size fits u32");
         writer.write_u32::<BigEndian>(entries_size)?;
         for entry in &self.entries {
             entry.encode(writer)?;
@@ -174,7 +179,7 @@ impl WireFormat for Header {
         for option in &self.options {
             options_size += option.size();
         }
-        writer.write_u32::<BigEndian>(options_size as u32)?;
+        writer.write_u32::<BigEndian>(u32::try_from(options_size).expect("options size fits u32"))?;
         for option in &self.options {
             option.write(writer)?;
         }
