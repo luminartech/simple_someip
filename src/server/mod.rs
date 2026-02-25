@@ -652,8 +652,13 @@ mod tests {
     use crate::protocol::{Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode};
     use crate::traits::WireFormat;
 
+    /// All server tests bind the SD multicast port (30490), so they must run
+    /// serially to avoid `AddrInUse` failures.
+    static SD_PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn test_server_creation() {
+        let _lock = SD_PORT_LOCK.lock().await;
         let config = ServerConfig::new(
             Ipv4Addr::new(127, 0, 0, 1),
             30682,
@@ -720,6 +725,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_ack_success() {
+        let _lock = SD_PORT_LOCK.lock().await;
         let (mut server, server_port) = create_test_server(0x5B, 1).await;
 
         // Create a client socket to send subscription and receive response
@@ -782,6 +788,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_nack_wrong_service() {
+        let _lock = SD_PORT_LOCK.lock().await;
         let (mut server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
@@ -834,6 +841,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_nack_wrong_instance() {
+        let _lock = SD_PORT_LOCK.lock().await;
         let (mut server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
@@ -883,6 +891,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_ack_different_endpoint_port() {
+        let _lock = SD_PORT_LOCK.lock().await;
         let (mut server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
