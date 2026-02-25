@@ -20,6 +20,10 @@ pub enum Error {
     InvalidSDOptionTransportProtocol(u8),
     #[error("Incorrect options size, {0} bytes remaining")]
     IncorrectOptionsSize(usize),
+    #[error("Too many SD entries for fixed-capacity buffer")]
+    TooManyEntries,
+    #[error("Too many SD options for fixed-capacity buffer")]
+    TooManyOptions,
     #[error("Multicast socket not connected")]
     MulticastSocketNotConnected,
     #[error("Unicast socket not connected")]

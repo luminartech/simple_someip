@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, vec};
+use std::net::Ipv4Addr;
 
 use crate::protocol::byte_order::{ReadBytesExt, WriteBytesExt};
 
@@ -9,16 +9,24 @@ use super::{
     entry::{ENTRY_SIZE, OptionsCount},
 };
 
+/// Maximum number of SD entries in a single header.
+pub const MAX_SD_ENTRIES: usize = 16;
+/// Maximum number of SD options in a single header.
+pub const MAX_SD_OPTIONS: usize = 16;
+
+pub type SdEntries = heapless::Vec<Entry, MAX_SD_ENTRIES>;
+pub type SdOptions = heapless::Vec<Options, MAX_SD_OPTIONS>;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Header {
     pub flags: Flags,
-    pub entries: Vec<Entry>,
-    pub options: Vec<Options>,
+    pub entries: SdEntries,
+    pub options: SdOptions,
 }
 
 impl Header {
-    #[must_use] 
-    pub fn new(flags: Flags, entries: Vec<Entry>, options: Vec<Options>) -> Self {
+    #[must_use]
+    pub fn new(flags: Flags, entries: SdEntries, options: SdOptions) -> Self {
         Self {
             flags,
             entries,
@@ -27,7 +35,7 @@ impl Header {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[must_use] 
+    #[must_use]
     pub fn new_service_offer(
         service_id: u16,
         instance_id: u16,
@@ -53,28 +61,37 @@ impl Header {
             protocol,
             port: client_port,
         };
+        let mut entries = SdEntries::new();
+        let mut options = SdOptions::new();
+        // Single entry/option — capacity is always sufficient.
+        let _ = entries.push(entry);
+        let _ = options.push(endpoint);
         Self {
             flags: Flags::new_sd(false),
-            entries: vec![entry],
-            options: vec![endpoint],
+            entries,
+            options,
         }
     }
 
-    #[must_use] 
+    /// # Panics
+    /// Panics if `service_ids` has more than [`MAX_SD_ENTRIES`] elements.
+    #[must_use]
     pub fn new_find_services(reboot: bool, service_ids: &[u16]) -> Self {
-        let entries = service_ids
-            .iter()
-            .map(|service_id| Entry::FindService(ServiceEntry::find(*service_id)))
-            .collect();
+        let mut entries = SdEntries::new();
+        for service_id in service_ids {
+            entries
+                .push(Entry::FindService(ServiceEntry::find(*service_id)))
+                .expect("too many service IDs for SD header");
+        }
         Self {
             flags: Flags::new_sd(reboot),
             entries,
-            options: vec![],
+            options: SdOptions::new(),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[must_use] 
+    #[must_use]
     pub fn new_subscription(
         service_id: u16,
         instance_id: u16,
@@ -97,14 +114,18 @@ impl Header {
             protocol,
             port: client_port,
         };
+        let mut entries = SdEntries::new();
+        let mut options = SdOptions::new();
+        let _ = entries.push(entry);
+        let _ = options.push(endpoint);
         Self {
             flags: Flags::new_sd(false),
-            entries: vec![entry],
-            options: vec![endpoint],
+            entries,
+            options,
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn subscribe_ack(
         service_id: u16,
         instance_id: u16,
@@ -119,10 +140,12 @@ impl Header {
             ttl,
             event_group_id,
         ));
+        let mut entries = SdEntries::new();
+        let _ = entries.push(entry);
         Self {
             flags: Flags::new_sd(true),
-            entries: vec![entry],
-            options: vec![],
+            entries,
+            options: SdOptions::new(),
         }
     }
 }
@@ -134,17 +157,19 @@ impl WireFormat for Header {
         reader.read_bytes(&mut reserved)?;
         let entries_size = reader.read_u32_be()?;
         let entries_count = entries_size / u32::try_from(ENTRY_SIZE).expect("constant fits u32");
-        let mut entries = Vec::with_capacity(entries_count as usize);
-        let options_count: usize = 0;
+        let mut entries = SdEntries::new();
         for _i in 0..entries_count {
-            entries.push(Entry::decode(reader)?);
+            entries
+                .push(Entry::decode(reader)?)
+                .map_err(|_| Error::TooManyEntries)?;
         }
 
         let mut remaining_options_size = reader.read_u32_be()? as usize;
-        let mut options = Vec::with_capacity(options_count);
+        let mut options = SdOptions::new();
         while remaining_options_size > 0 {
-            options.push(Options::read(reader)?);
-            remaining_options_size -= options.last().unwrap().size();
+            let option = Options::read(reader)?;
+            remaining_options_size -= option.size();
+            options.push(option).map_err(|_| Error::TooManyOptions)?;
         }
         if remaining_options_size != 0 {
             return Err(Error::IncorrectOptionsSize(remaining_options_size));
