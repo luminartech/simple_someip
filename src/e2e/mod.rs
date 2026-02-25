@@ -17,9 +17,10 @@
 //! let mut check_state = Profile4State::new();
 //!
 //! let payload = b"Hello, SOME/IP!";
-//! let protected = protect_profile4(&config, &mut protect_state, payload);
+//! let mut buf = [0u8; 128];
+//! let len = protect_profile4(&config, &mut protect_state, payload, &mut buf);
 //!
-//! let result = check_profile4(&config, &mut check_state, &protected);
+//! let result = check_profile4(&config, &mut check_state, &buf[..len]);
 //! assert!(matches!(result.status, E2ECheckStatus::Ok));
 //! ```
 
@@ -31,7 +32,10 @@ mod state;
 
 pub use config::{Profile4Config, Profile5Config};
 pub use e2e_checker::{check_profile4, check_profile5, check_profile5_with_header};
-pub use e2e_protector::{protect_profile4, protect_profile5, protect_profile5_with_header};
+pub use e2e_protector::{
+    PROFILE4_HEADER_SIZE, PROFILE5_HEADER_SIZE, protect_profile4, protect_profile5,
+    protect_profile5_with_header,
+};
 pub use state::{Profile4State, Profile5State};
 
 /// Status result from E2E check operations.
@@ -71,16 +75,16 @@ impl E2ECheckStatus {
 
 /// Result from an E2E check operation.
 #[derive(Debug, Clone)]
-pub struct E2ECheckResult {
+pub struct E2ECheckResult<'a> {
     /// Status of the E2E check.
     pub status: E2ECheckStatus,
     /// Counter value extracted from the header (if parsing succeeded).
     pub counter: Option<u32>,
     /// Extracted payload without E2E header (if check succeeded).
-    pub payload: Option<Vec<u8>>,
+    pub payload: Option<&'a [u8]>,
 }
 
-impl E2ECheckResult {
+impl<'a> E2ECheckResult<'a> {
     pub(crate) fn error(status: E2ECheckStatus) -> Self {
         Self {
             status,
@@ -89,7 +93,7 @@ impl E2ECheckResult {
         }
     }
 
-    pub(crate) fn success(status: E2ECheckStatus, counter: u32, payload: Vec<u8>) -> Self {
+    pub(crate) fn success(status: E2ECheckStatus, counter: u32, payload: &'a [u8]) -> Self {
         Self {
             status,
             counter: Some(counter),
@@ -120,14 +124,16 @@ mod tests {
         let mut check_state = Profile4State::new();
 
         let payload = b"Test payload data";
-        let protected = protect_profile4(&config, &mut protect_state, payload);
+        let mut buf = [0u8; 256];
+        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf);
+        let protected = &buf[..len];
 
-        assert_eq!(protected.len(), payload.len() + 12); // 12-byte header
+        assert_eq!(len, payload.len() + 12); // 12-byte header
 
-        let result = check_profile4(&config, &mut check_state, &protected);
+        let result = check_profile4(&config, &mut check_state, protected);
         assert_eq!(result.status, E2ECheckStatus::Ok);
         assert_eq!(result.counter, Some(0));
-        assert_eq!(result.payload.as_deref(), Some(payload.as_slice()));
+        assert_eq!(result.payload, Some(payload.as_slice()));
     }
 
     #[test]
@@ -139,14 +145,16 @@ mod tests {
         // Payload must be padded to data_length (20 bytes) for check_profile5
         let mut payload = [0u8; 20];
         payload[..17].copy_from_slice(b"Test payload data");
-        let protected = protect_profile5(&config, &mut protect_state, &payload);
+        let mut buf = [0u8; 256];
+        let len = protect_profile5(&config, &mut protect_state, &payload, &mut buf);
+        let protected = &buf[..len];
 
-        assert_eq!(protected.len(), payload.len() + 3); // 3-byte header
+        assert_eq!(len, payload.len() + 3); // 3-byte header
 
-        let result = check_profile5(&config, &mut check_state, &protected);
+        let result = check_profile5(&config, &mut check_state, protected);
         assert_eq!(result.status, E2ECheckStatus::Ok);
         assert_eq!(result.counter, Some(0));
-        assert_eq!(result.payload.as_deref(), Some(payload.as_slice()));
+        assert_eq!(result.payload, Some(payload.as_slice()));
     }
 
     #[test]
@@ -156,19 +164,21 @@ mod tests {
         let mut check_state = Profile4State::new();
 
         let payload = b"Test";
+        let mut buf1 = [0u8; 256];
+        let mut buf2 = [0u8; 256];
 
         // First message - should be Ok
-        let protected1 = protect_profile4(&config, &mut protect_state, payload);
-        let result1 = check_profile4(&config, &mut check_state, &protected1);
+        let len1 = protect_profile4(&config, &mut protect_state, payload, &mut buf1);
+        let result1 = check_profile4(&config, &mut check_state, &buf1[..len1]);
         assert_eq!(result1.status, E2ECheckStatus::Ok);
 
         // Second message - should be Ok
-        let protected2 = protect_profile4(&config, &mut protect_state, payload);
-        let result2 = check_profile4(&config, &mut check_state, &protected2);
+        let len2 = protect_profile4(&config, &mut protect_state, payload, &mut buf2);
+        let result2 = check_profile4(&config, &mut check_state, &buf2[..len2]);
         assert_eq!(result2.status, E2ECheckStatus::Ok);
 
         // Replay first message - should be Repeated or WrongSequence
-        let result3 = check_profile4(&config, &mut check_state, &protected1);
+        let result3 = check_profile4(&config, &mut check_state, &buf1[..len1]);
         assert!(matches!(
             result3.status,
             E2ECheckStatus::Repeated | E2ECheckStatus::WrongSequence
@@ -182,19 +192,20 @@ mod tests {
         let mut check_state = Profile4State::new();
 
         let payload = b"Test";
+        let mut buf = [0u8; 256];
 
         // First message
-        let protected1 = protect_profile4(&config, &mut protect_state, payload);
-        let result1 = check_profile4(&config, &mut check_state, &protected1);
+        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf);
+        let result1 = check_profile4(&config, &mut check_state, &buf[..len]);
         assert_eq!(result1.status, E2ECheckStatus::Ok);
 
         // Skip a few messages by advancing protector counter
-        let _ = protect_profile4(&config, &mut protect_state, payload);
-        let _ = protect_profile4(&config, &mut protect_state, payload);
-        let protected4 = protect_profile4(&config, &mut protect_state, payload);
+        let _ = protect_profile4(&config, &mut protect_state, payload, &mut buf);
+        let _ = protect_profile4(&config, &mut protect_state, payload, &mut buf);
+        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf);
 
         // Check skipped message - should be OkSomeLost (delta=3, within max_delta=5)
-        let result4 = check_profile4(&config, &mut check_state, &protected4);
+        let result4 = check_profile4(&config, &mut check_state, &buf[..len]);
         assert_eq!(result4.status, E2ECheckStatus::OkSomeLost);
     }
 
@@ -205,20 +216,21 @@ mod tests {
         let mut check_state = Profile4State::new();
 
         let payload = b"Test";
+        let mut buf = [0u8; 256];
 
         // First message
-        let protected1 = protect_profile4(&config, &mut protect_state, payload);
-        let result1 = check_profile4(&config, &mut check_state, &protected1);
+        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf);
+        let result1 = check_profile4(&config, &mut check_state, &buf[..len]);
         assert_eq!(result1.status, E2ECheckStatus::Ok);
 
         // Skip many messages (exceed max_delta)
         for _ in 0..5 {
-            let _ = protect_profile4(&config, &mut protect_state, payload);
+            let _ = protect_profile4(&config, &mut protect_state, payload, &mut buf);
         }
-        let protected_late = protect_profile4(&config, &mut protect_state, payload);
+        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf);
 
         // Check - should be WrongSequence (delta=6, exceeds max_delta=2)
-        let result = check_profile4(&config, &mut check_state, &protected_late);
+        let result = check_profile4(&config, &mut check_state, &buf[..len]);
         assert_eq!(result.status, E2ECheckStatus::WrongSequence);
     }
 
@@ -229,12 +241,13 @@ mod tests {
         let mut check_state = Profile4State::new();
 
         let payload = b"Test";
-        let mut protected = protect_profile4(&config, &mut protect_state, payload);
+        let mut buf = [0u8; 256];
+        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf);
 
         // Corrupt the CRC (last 4 bytes of header)
-        protected[8] ^= 0xFF;
+        buf[8] ^= 0xFF;
 
-        let result = check_profile4(&config, &mut check_state, &protected);
+        let result = check_profile4(&config, &mut check_state, &buf[..len]);
         assert_eq!(result.status, E2ECheckStatus::CrcError);
     }
 
@@ -246,12 +259,13 @@ mod tests {
 
         let mut payload = [0u8; 20];
         payload[..4].copy_from_slice(b"Test");
-        let mut protected = protect_profile5(&config, &mut protect_state, &payload);
+        let mut buf = [0u8; 256];
+        let len = protect_profile5(&config, &mut protect_state, &payload, &mut buf);
 
         // Corrupt the CRC (bytes 1-2 of header)
-        protected[1] ^= 0xFF;
+        buf[1] ^= 0xFF;
 
-        let result = check_profile5(&config, &mut check_state, &protected);
+        let result = check_profile5(&config, &mut check_state, &buf[..len]);
         assert_eq!(result.status, E2ECheckStatus::CrcError);
     }
 

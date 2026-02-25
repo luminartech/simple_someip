@@ -12,7 +12,7 @@ pub const PROFILE5_HEADER_SIZE: usize = 3;
 
 /// Add E2E Profile 4 protection to a payload.
 ///
-/// Creates a protected message with a 12-byte header prepended:
+/// Writes a protected message into `output` with a 12-byte header prepended:
 /// - Length (2 bytes): Total length including header
 /// - Counter (2 bytes): Sequence counter from state
 /// - `DataID` (4 bytes): From configuration
@@ -24,43 +24,52 @@ pub const PROFILE5_HEADER_SIZE: usize = 3;
 /// * `config` - Profile 4 configuration
 /// * `state` - Mutable state for counter tracking
 /// * `payload` - The payload data to protect
+/// * `output` - Buffer to write the protected message into; must be at least
+///   `PROFILE4_HEADER_SIZE + payload.len()` bytes
 ///
 /// # Returns
-/// A new Vec containing the E2E header followed by the payload.
+/// The number of bytes written to `output`.
+///
+/// # Panics
+/// Panics if `output` is too small to hold the protected message.
 pub fn protect_profile4(
     config: &Profile4Config,
     state: &mut Profile4State,
     payload: &[u8],
-) -> Vec<u8> {
+    output: &mut [u8],
+) -> usize {
     let total_length = PROFILE4_HEADER_SIZE + payload.len();
     let length = u16::try_from(total_length).expect("E2E Profile 4 payload too large");
+
+    assert!(
+        output.len() >= total_length,
+        "output buffer too small: need {total_length} bytes, got {}",
+        output.len()
+    );
 
     let counter = state.protect_counter;
 
     // Compute CRC over: Length + Counter + DataID + Payload
     let crc = compute_crc32_p4(length, counter, config.data_id, payload);
 
-    // Build the protected message
-    let mut result = Vec::with_capacity(PROFILE4_HEADER_SIZE + payload.len());
-
     // Header: Length (2) + Counter (2) + DataID (4) + CRC (4)
-    result.extend_from_slice(&length.to_be_bytes());
-    result.extend_from_slice(&counter.to_be_bytes());
-    result.extend_from_slice(&config.data_id.to_be_bytes());
-    result.extend_from_slice(&crc.to_be_bytes());
+    output[0..2].copy_from_slice(&length.to_be_bytes());
+    output[2..4].copy_from_slice(&counter.to_be_bytes());
+    output[4..8].copy_from_slice(&config.data_id.to_be_bytes());
+    output[8..12].copy_from_slice(&crc.to_be_bytes());
 
     // Payload
-    result.extend_from_slice(payload);
+    output[PROFILE4_HEADER_SIZE..total_length].copy_from_slice(payload);
 
     // Increment counter (wraps at u16::MAX)
     state.protect_counter = state.protect_counter.wrapping_add(1);
 
-    result
+    total_length
 }
 
 /// Add E2E Profile 5 protection to a payload.
 ///
-/// Creates a protected message with a 3-byte header prepended:
+/// Writes a protected message into `output` with a 3-byte header prepended:
 /// - CRC (2 bytes, little-endian): CRC-16-CCITT over Counter + Payload + DataID(LE)
 /// - Counter (1 byte): Sequence counter from state
 ///
@@ -70,33 +79,44 @@ pub fn protect_profile4(
 /// * `config` - Profile 5 configuration
 /// * `state` - Mutable state for counter tracking
 /// * `payload` - The payload data to protect
+/// * `output` - Buffer to write the protected message into; must be at least
+///   `PROFILE5_HEADER_SIZE + payload.len()` bytes
 ///
 /// # Returns
-/// A new Vec containing the E2E header followed by the payload.
+/// The number of bytes written to `output`.
+///
+/// # Panics
+/// Panics if `output` is too small to hold the protected message.
 pub fn protect_profile5(
     config: &Profile5Config,
     state: &mut Profile5State,
     payload: &[u8],
-) -> Vec<u8> {
+    output: &mut [u8],
+) -> usize {
+    let total_length = PROFILE5_HEADER_SIZE + payload.len();
+
+    assert!(
+        output.len() >= total_length,
+        "output buffer too small: need {total_length} bytes, got {}",
+        output.len()
+    );
+
     let counter = state.protect_counter;
 
     // Compute CRC over: Counter + Payload + DataID (LE)
     let crc = compute_crc16_p5(config.data_id, counter, payload);
 
-    // Build the protected message
-    let mut result = Vec::with_capacity(PROFILE5_HEADER_SIZE + payload.len());
-
     // Header: CRC (2, little-endian) + Counter (1)
-    result.extend_from_slice(&crc.to_le_bytes());
-    result.push(counter);
+    output[0..2].copy_from_slice(&crc.to_le_bytes());
+    output[2] = counter;
 
     // Payload
-    result.extend_from_slice(payload);
+    output[PROFILE5_HEADER_SIZE..total_length].copy_from_slice(payload);
 
     // Increment counter (wraps at u8::MAX)
     state.protect_counter = state.protect_counter.wrapping_add(1);
 
-    result
+    total_length
 }
 
 /// Add E2E Profile 5 protection with SOME/IP upper-header in the CRC.
@@ -147,10 +167,12 @@ mod tests {
         let mut state = Profile4State::new();
 
         let payload = b"test";
-        let protected = protect_profile4(&config, &mut state, payload);
+        let mut buf = [0u8; 256];
+        let len = protect_profile4(&config, &mut state, payload, &mut buf);
+        let protected = &buf[..len];
 
         // Check total length
-        assert_eq!(protected.len(), 12 + 4); // header + payload
+        assert_eq!(len, 12 + 4); // header + payload
 
         // Check length field (first 2 bytes)
         let length = u16::from_be_bytes([protected[0], protected[1]]);
@@ -174,11 +196,13 @@ mod tests {
         let mut state = Profile4State::new();
 
         let payload = b"test";
+        let mut buf = [0u8; 256];
 
         for i in 0..5 {
-            let protected = protect_profile4(&config, &mut state, payload);
-            let counter = u16::from_be_bytes([protected[2], protected[3]]);
+            let len = protect_profile4(&config, &mut state, payload, &mut buf);
+            let counter = u16::from_be_bytes([buf[2], buf[3]]);
             assert_eq!(counter, i);
+            assert_eq!(len, 16);
         }
     }
 
@@ -188,13 +212,14 @@ mod tests {
         let mut state = Profile4State::with_initial_counter(u16::MAX);
 
         let payload = b"test";
+        let mut buf = [0u8; 256];
 
-        let protected1 = protect_profile4(&config, &mut state, payload);
-        let counter1 = u16::from_be_bytes([protected1[2], protected1[3]]);
+        let _ = protect_profile4(&config, &mut state, payload, &mut buf);
+        let counter1 = u16::from_be_bytes([buf[2], buf[3]]);
         assert_eq!(counter1, u16::MAX);
 
-        let protected2 = protect_profile4(&config, &mut state, payload);
-        let counter2 = u16::from_be_bytes([protected2[2], protected2[3]]);
+        let _ = protect_profile4(&config, &mut state, payload, &mut buf);
+        let counter2 = u16::from_be_bytes([buf[2], buf[3]]);
         assert_eq!(counter2, 0); // Wrapped
     }
 
@@ -204,10 +229,12 @@ mod tests {
         let mut state = Profile5State::new();
 
         let payload = b"test";
-        let protected = protect_profile5(&config, &mut state, payload);
+        let mut buf = [0u8; 256];
+        let len = protect_profile5(&config, &mut state, payload, &mut buf);
+        let protected = &buf[..len];
 
         // Check total length
-        assert_eq!(protected.len(), 3 + 4); // header + payload
+        assert_eq!(len, 3 + 4); // header + payload
 
         // Header layout: [CRC_lo, CRC_hi, Counter]
         // Check counter field (third byte)
@@ -223,10 +250,11 @@ mod tests {
         let mut state = Profile5State::new();
 
         let payload = b"test";
+        let mut buf = [0u8; 256];
 
         for i in 0..5u8 {
-            let protected = protect_profile5(&config, &mut state, payload);
-            assert_eq!(protected[2], i); // Counter is at byte 2
+            let _ = protect_profile5(&config, &mut state, payload, &mut buf);
+            assert_eq!(buf[2], i); // Counter is at byte 2
         }
     }
 
@@ -236,12 +264,13 @@ mod tests {
         let mut state = Profile5State::with_initial_counter(u8::MAX);
 
         let payload = b"test";
+        let mut buf = [0u8; 256];
 
-        let protected1 = protect_profile5(&config, &mut state, payload);
-        assert_eq!(protected1[2], u8::MAX); // Counter is at byte 2
+        let _ = protect_profile5(&config, &mut state, payload, &mut buf);
+        assert_eq!(buf[2], u8::MAX); // Counter is at byte 2
 
-        let protected2 = protect_profile5(&config, &mut state, payload);
-        assert_eq!(protected2[2], 0); // Wrapped
+        let _ = protect_profile5(&config, &mut state, payload, &mut buf);
+        assert_eq!(buf[2], 0); // Wrapped
     }
 
     #[test]
@@ -249,8 +278,9 @@ mod tests {
         let config = Profile4Config::new(0x12345678, 15);
         let mut state = Profile4State::new();
 
-        let protected = protect_profile4(&config, &mut state, b"");
-        assert_eq!(protected.len(), 12); // Just header
+        let mut buf = [0u8; 256];
+        let len = protect_profile4(&config, &mut state, b"", &mut buf);
+        assert_eq!(len, 12); // Just header
     }
 
     #[test]
@@ -258,7 +288,8 @@ mod tests {
         let config = Profile5Config::new(0x1234, 3, 15);
         let mut state = Profile5State::new();
 
-        let protected = protect_profile5(&config, &mut state, b"");
-        assert_eq!(protected.len(), 3); // Just header
+        let mut buf = [0u8; 256];
+        let len = protect_profile5(&config, &mut state, b"", &mut buf);
+        assert_eq!(len, 3); // Just header
     }
 }
