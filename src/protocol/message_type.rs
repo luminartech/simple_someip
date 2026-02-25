@@ -54,7 +54,7 @@ impl From<MessageTypeField> for u8 {
 }
 
 impl MessageTypeField {
-    #[must_use] 
+    #[must_use]
     pub const fn new(msg_type: MessageType, tp: bool) -> Self {
         let message_type_byte = if tp {
             msg_type as u8 | MESSAGE_TYPE_TP_FLAG
@@ -64,19 +64,19 @@ impl MessageTypeField {
         MessageTypeField(message_type_byte)
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn new_sd() -> Self {
         Self::new(MessageType::Notification, false)
     }
 
     /// Returns the message type of the message
-    #[must_use] 
+    #[must_use]
     pub fn message_type(&self) -> MessageType {
         // This unwrap is safe because the private message_type_byte is always a valid MessageType
         MessageType::try_from(self.0).unwrap()
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn is_tp(&self) -> bool {
         self.0 & MESSAGE_TYPE_TP_FLAG != 0
     }

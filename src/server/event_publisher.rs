@@ -1,9 +1,9 @@
 //! Event publishing functionality
 
 use super::subscription_manager::SubscriptionManager;
+use crate::Error;
 use crate::protocol::{Header, Message, MessageType, MessageTypeField, ReturnCode};
 use crate::traits::{PayloadWireFormat, WireFormat};
-use crate::Error;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -117,8 +117,7 @@ impl EventPublisher {
         // Build SOME/IP header
         let header = Header {
             message_id: crate::protocol::MessageId::new_from_service_and_method(
-                service_id,
-                event_id,
+                service_id, event_id,
             ),
             length: super::someip_length(payload.len()),
             session_id,

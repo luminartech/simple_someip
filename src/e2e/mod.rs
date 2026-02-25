@@ -55,7 +55,7 @@ pub enum E2ECheckStatus {
 
 impl E2ECheckStatus {
     /// Convert to a numeric return code compatible with AUTOSAR E2E.
-    #[must_use] 
+    #[must_use]
     pub fn to_return_code(self) -> u8 {
         match self {
             E2ECheckStatus::Unchecked => 0,

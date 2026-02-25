@@ -1,6 +1,6 @@
 //! CRC computation helpers for E2E profiles.
 
-use crc::{Crc, CRC_16_IBM_3740, CRC_32_AUTOSAR};
+use crc::{CRC_16_IBM_3740, CRC_32_AUTOSAR, Crc};
 
 /// CRC-32P4 algorithm used by E2E Profile 4.
 /// Polynomial: 0xF4ACFB13 (AUTOSAR CRC-32)
@@ -62,8 +62,12 @@ pub fn compute_crc16_p5(data_id: u16, counter: u8, payload: &[u8]) -> u16 {
     digest.update(&data_id_bytes);
 
     let crc = digest.finalize();
-    tracing::trace!("CRC-16 Profile5: computed CRC = 0x{:04X} (bytes: {:02X?})", crc, crc.to_le_bytes());
-    
+    tracing::trace!(
+        "CRC-16 Profile5: computed CRC = 0x{:04X} (bytes: {:02X?})",
+        crc,
+        crc.to_le_bytes()
+    );
+
     crc
 }
 

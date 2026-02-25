@@ -35,7 +35,8 @@ pub fn check_profile4(
     let length = u16::from_be_bytes([protected[0], protected[1]]);
     let counter = u16::from_be_bytes([protected[2], protected[3]]);
     let data_id = u32::from_be_bytes([protected[4], protected[5], protected[6], protected[7]]);
-    let received_crc = u32::from_be_bytes([protected[8], protected[9], protected[10], protected[11]]);
+    let received_crc =
+        u32::from_be_bytes([protected[8], protected[9], protected[10], protected[11]]);
 
     // Verify length field matches actual message length
     if length as usize != protected.len() {

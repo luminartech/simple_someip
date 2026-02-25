@@ -91,7 +91,7 @@ pub enum Options {
 }
 
 impl Options {
-    #[must_use] 
+    #[must_use]
     pub fn size(&self) -> usize {
         match self {
             Options::Configuration => todo!("Options::Configuration not implemented"),

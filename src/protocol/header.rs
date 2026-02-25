@@ -22,7 +22,7 @@ pub struct Header {
 }
 
 impl Header {
-    #[must_use] 
+    #[must_use]
     pub fn new_sd(session_id: u32, sd_header_size: usize) -> Self {
         Self {
             message_id: MessageId::SD,
@@ -35,12 +35,12 @@ impl Header {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn is_sd(&self) -> bool {
         self.message_id.is_sd()
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn payload_size(&self) -> usize {
         self.length as usize - 8
     }
