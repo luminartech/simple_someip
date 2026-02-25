@@ -73,15 +73,15 @@ pub fn compute_crc16_p5(data_id: u16, counter: u8, payload: &[u8]) -> u16 {
 
 /// Compute CRC-16-CCITT for Profile 5 with SOME/IP upper-header prefix.
 ///
-/// When UPPER-HEADER-BITS-TO-SHIFT is non-zero (typically 64 bits = 8 bytes),
-/// those bytes are prepended to the CRC input before Counter + Payload + DataID.
+/// The 8-byte upper header (UPPER-HEADER-BITS-TO-SHIFT = 64 bits) is prepended
+/// to the CRC input before Counter + Payload + DataID.
 ///
-/// CRC input order: upper_header + Counter(1) + Payload(N) + DataID(2 LE)
+/// CRC input order: upper_header(8) + Counter(1) + Payload(N) + DataID(2 LE)
 pub fn compute_crc16_p5_with_header(
     data_id: u16,
     counter: u8,
     payload: &[u8],
-    upper_header: &[u8],
+    upper_header: &[u8; 8],
 ) -> u16 {
     let mut digest = CRC16_CCITT.digest();
     digest.update(upper_header);

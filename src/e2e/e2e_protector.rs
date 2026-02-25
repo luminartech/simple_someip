@@ -101,14 +101,13 @@ pub fn protect_profile5(
 
 /// Add E2E Profile 5 protection with SOME/IP upper-header in the CRC.
 ///
-/// Identical to [`protect_profile5`] but includes the `upper_header` bytes
-/// (typically the 8-byte SOME/IP upper header from UPPER-HEADER-BITS-TO-SHIFT)
-/// in the CRC computation.
+/// Identical to [`protect_profile5`] but includes the 8-byte SOME/IP upper
+/// header (UPPER-HEADER-BITS-TO-SHIFT = 64 bits) in the CRC computation.
 pub fn protect_profile5_with_header(
     config: &Profile5Config,
     state: &mut Profile5State,
     payload: &[u8],
-    upper_header: &[u8],
+    upper_header: &[u8; 8],
 ) -> Vec<u8> {
     let counter = state.protect_counter;
     let crc = compute_crc16_p5_with_header(config.data_id, counter, payload, upper_header);

@@ -125,13 +125,13 @@ pub fn check_profile5(
 
 /// Check E2E Profile 5 protected data with SOME/IP upper-header in the CRC.
 ///
-/// Identical to [`check_profile5`] but includes the `upper_header` bytes
-/// in the CRC verification.
+/// Identical to [`check_profile5`] but includes the 8-byte SOME/IP upper
+/// header (UPPER-HEADER-BITS-TO-SHIFT = 64 bits) in the CRC verification.
 pub fn check_profile5_with_header(
     config: &Profile5Config,
     state: &mut Profile5State,
     protected: &[u8],
-    upper_header: &[u8],
+    upper_header: &[u8; 8],
 ) -> E2ECheckResult {
     if protected.len() < PROFILE5_HEADER_SIZE {
         return E2ECheckResult::error(E2ECheckStatus::BadArgument);
