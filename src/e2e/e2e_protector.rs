@@ -1,7 +1,7 @@
 //! E2E protection functions for adding E2E headers to payloads.
 
 use super::config::{Profile4Config, Profile5Config};
-use super::crc::{compute_crc16_p5, compute_crc32_p4};
+use super::crc::{compute_crc16_p5, compute_crc16_p5_with_header, compute_crc32_p4};
 use super::state::{Profile4State, Profile5State};
 
 /// Profile 4 header size in bytes.
@@ -96,6 +96,29 @@ pub fn protect_profile5(
     // Increment counter (wraps at u8::MAX)
     state.protect_counter = state.protect_counter.wrapping_add(1);
 
+    result
+}
+
+/// Add E2E Profile 5 protection with SOME/IP upper-header in the CRC.
+///
+/// Identical to [`protect_profile5`] but includes the `upper_header` bytes
+/// (typically the 8-byte SOME/IP upper header from UPPER-HEADER-BITS-TO-SHIFT)
+/// in the CRC computation.
+pub fn protect_profile5_with_header(
+    config: &Profile5Config,
+    state: &mut Profile5State,
+    payload: &[u8],
+    upper_header: &[u8],
+) -> Vec<u8> {
+    let counter = state.protect_counter;
+    let crc = compute_crc16_p5_with_header(config.data_id, counter, payload, upper_header);
+
+    let mut result = Vec::with_capacity(PROFILE5_HEADER_SIZE + payload.len());
+    result.extend_from_slice(&crc.to_le_bytes());
+    result.push(counter);
+    result.extend_from_slice(payload);
+
+    state.protect_counter = state.protect_counter.wrapping_add(1);
     result
 }
 

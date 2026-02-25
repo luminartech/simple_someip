@@ -1,7 +1,7 @@
 //! E2E checking functions for validating E2E-protected payloads.
 
 use super::config::{Profile4Config, Profile5Config};
-use super::crc::{compute_crc16_p5, compute_crc32_p4};
+use super::crc::{compute_crc16_p5, compute_crc16_p5_with_header, compute_crc32_p4};
 use super::e2e_protector::{PROFILE4_HEADER_SIZE, PROFILE5_HEADER_SIZE};
 use super::state::{Profile4State, Profile5State};
 use super::{E2ECheckResult, E2ECheckStatus};
@@ -121,6 +121,46 @@ pub fn check_profile5(
     state.last_counter = Some(counter);
 
     E2ECheckResult::success(status, u32::from(counter), payload.to_vec())
+}
+
+/// Check E2E Profile 5 protected data with SOME/IP upper-header in the CRC.
+///
+/// Identical to [`check_profile5`] but includes the `upper_header` bytes
+/// in the CRC verification.
+pub fn check_profile5_with_header(
+    config: &Profile5Config,
+    state: &mut Profile5State,
+    protected: &[u8],
+    upper_header: &[u8],
+) -> E2ECheckResult {
+    if protected.len() < PROFILE5_HEADER_SIZE {
+        return E2ECheckResult::error(E2ECheckStatus::BadArgument);
+    }
+
+    let expected_total_length = PROFILE5_HEADER_SIZE + config.data_length as usize;
+    if protected.len() != expected_total_length {
+        tracing::warn!(
+            "E2E Profile 5 length mismatch: expected {} bytes (3 header + {} payload), got {} bytes",
+            expected_total_length,
+            config.data_length,
+            protected.len()
+        );
+        return E2ECheckResult::error(E2ECheckStatus::BadArgument);
+    }
+
+    let received_crc = u16::from_le_bytes([protected[0], protected[1]]);
+    let counter = protected[2];
+    let payload = &protected[PROFILE5_HEADER_SIZE..];
+
+    let computed_crc = compute_crc16_p5_with_header(config.data_id, counter, payload, upper_header);
+    if computed_crc != received_crc {
+        return E2ECheckResult::error(E2ECheckStatus::CrcError);
+    }
+
+    let status = check_sequence_profile5(state, counter, config.max_delta_counter);
+    state.last_counter = Some(counter);
+
+    E2ECheckResult::success(status, counter as u32, payload.to_vec())
 }
 
 /// Check sequence continuity for Profile 4 (16-bit counter).
