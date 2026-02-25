@@ -66,6 +66,24 @@ impl Header {
     pub fn set_session_id(&mut self, session_id: u32) {
         self.session_id = session_id;
     }
+
+    /// Return the 8-byte "upper header" used by E2E UPPER-HEADER-BITS-TO-SHIFT.
+    ///
+    /// Layout (big-endian): session_id(4) + protocol_version(1) + interface_version(1)
+    ///                      + message_type(1) + return_code(1)
+    pub fn upper_header_bytes(&self) -> [u8; 8] {
+        let sid = self.session_id.to_be_bytes();
+        [
+            sid[0],
+            sid[1],
+            sid[2],
+            sid[3],
+            self.protocol_version,
+            self.interface_version,
+            u8::from(self.message_type),
+            u8::from(self.return_code),
+        ]
+    }
 }
 
 impl WireFormat for Header {
