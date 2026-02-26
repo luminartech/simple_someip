@@ -9,24 +9,27 @@ use super::{
     entry::{ENTRY_SIZE, OptionsCount},
 };
 
-/// Maximum number of SD entries in a single header.
-pub const MAX_SD_ENTRIES: usize = 16;
-/// Maximum number of SD options in a single header.
-pub const MAX_SD_OPTIONS: usize = 16;
+/// Default maximum number of SD entries in a single header.
+pub const MAX_SD_ENTRIES: usize = 1;
+/// Default maximum number of SD options in a single header.
+pub const MAX_SD_OPTIONS: usize = 1;
 
-pub type SdEntries = heapless::Vec<Entry, MAX_SD_ENTRIES>;
-pub type SdOptions = heapless::Vec<Options, MAX_SD_OPTIONS>;
+pub type SdEntries<const N: usize = MAX_SD_ENTRIES> = heapless::Vec<Entry, N>;
+pub type SdOptions<const N: usize = MAX_SD_OPTIONS> = heapless::Vec<Options, N>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Header {
+pub struct Header<
+    const MAX_ENTRIES: usize = MAX_SD_ENTRIES,
+    const MAX_OPTIONS: usize = MAX_SD_OPTIONS,
+> {
     pub flags: Flags,
-    pub entries: SdEntries,
-    pub options: SdOptions,
+    pub entries: SdEntries<MAX_ENTRIES>,
+    pub options: SdOptions<MAX_OPTIONS>,
 }
 
-impl Header {
+impl<const E: usize, const O: usize> Header<E, O> {
     #[must_use]
-    pub fn new(flags: Flags, entries: SdEntries, options: SdOptions) -> Self {
+    pub fn new(flags: Flags, entries: SdEntries<E>, options: SdOptions<O>) -> Self {
         Self {
             flags,
             entries,
@@ -74,7 +77,7 @@ impl Header {
     }
 
     /// # Panics
-    /// Panics if `service_ids` has more than [`MAX_SD_ENTRIES`] elements.
+    /// Panics if `service_ids` has more than `E` elements.
     #[must_use]
     pub fn new_find_services(reboot: bool, service_ids: &[u16]) -> Self {
         let mut entries = SdEntries::new();
@@ -150,7 +153,7 @@ impl Header {
     }
 }
 
-impl WireFormat for Header {
+impl<const E: usize, const O: usize> WireFormat for Header<E, O> {
     fn decode<T: embedded_io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
         let flags = Flags::from(reader.read_u8()?);
         let mut reserved: [u8; 3] = [0; 3];

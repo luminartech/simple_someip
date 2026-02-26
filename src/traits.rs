@@ -1,4 +1,4 @@
-use crate::protocol::{self, MessageId};
+use crate::protocol::{self, MessageId, sd};
 
 /// A trait for types that can be deserialized from a
 /// [`Reader`](embedded_io::Read) and serialized to a [`Writer`](embedded_io::Write).
@@ -29,17 +29,20 @@ pub trait WireFormat: Send + Sized + Sync {
 /// Note that SOME/IP payloads are not self identifying, so the [Message ID](protocol::MessageId)
 /// must be provided by the caller after reading from the [SOME/IP header](protocol::Header).
 pub trait PayloadWireFormat: std::fmt::Debug + Send + Sized + Sync {
+    /// The SD header type used by this payload implementation.
+    type SdHeader: WireFormat + Clone + std::fmt::Debug + Eq;
+
     /// Get the Message ID for te payload
     fn message_id(&self) -> MessageId;
     /// Get the payload as a service discovery header
-    fn as_sd_header(&self) -> Option<&crate::protocol::sd::Header>;
+    fn as_sd_header(&self) -> Option<&Self::SdHeader>;
     /// Deserialize a payload from a [Reader](embedded_io::Read) given the Message ID.
     fn decode_with_message_id<T: embedded_io::Read>(
         message_id: MessageId,
         reader: &mut T,
     ) -> Result<Self, protocol::Error>;
     /// Create a `PayloadWireFormat` from a service discovery [Header](protocol::sd::Header)
-    fn new_sd_payload(header: &crate::protocol::sd::Header) -> Self;
+    fn new_sd_payload(header: &Self::SdHeader) -> Self;
     /// Number of bytes required to write the payload
     fn required_size(&self) -> usize;
     /// Serialize the payload to a [Writer](embedded_io::Write)
@@ -48,16 +51,21 @@ pub trait PayloadWireFormat: std::fmt::Debug + Send + Sized + Sync {
 
 /// A simple implementation of [`PayloadWireFormat`] that only supports SOME/IP-SD messages.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DiscoveryOnlyPayload {
-    header: crate::protocol::sd::Header,
+pub struct DiscoveryOnlyPayload<
+    const E: usize = { sd::MAX_SD_ENTRIES },
+    const O: usize = { sd::MAX_SD_OPTIONS },
+> {
+    header: sd::Header<E, O>,
 }
 
-impl PayloadWireFormat for DiscoveryOnlyPayload {
+impl<const E: usize, const O: usize> PayloadWireFormat for DiscoveryOnlyPayload<E, O> {
+    type SdHeader = sd::Header<E, O>;
+
     fn message_id(&self) -> MessageId {
         MessageId::SD
     }
 
-    fn as_sd_header(&self) -> Option<&crate::protocol::sd::Header> {
+    fn as_sd_header(&self) -> Option<&sd::Header<E, O>> {
         Some(&self.header)
     }
 
@@ -67,14 +75,14 @@ impl PayloadWireFormat for DiscoveryOnlyPayload {
     ) -> Result<Self, protocol::Error> {
         match message_id {
             MessageId::SD => Ok(Self {
-                header: protocol::sd::Header::decode(reader)?,
+                header: sd::Header::decode(reader)?,
             }),
 
             _ => Err(protocol::Error::UnsupportedMessageID(message_id)),
         }
     }
 
-    fn new_sd_payload(header: &crate::protocol::sd::Header) -> Self {
+    fn new_sd_payload(header: &sd::Header<E, O>) -> Self {
         Self {
             header: header.clone(),
         }
