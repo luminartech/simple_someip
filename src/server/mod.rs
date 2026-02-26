@@ -221,8 +221,12 @@ impl<const E: usize, const O: usize> Server<E, O> {
         // Create SD header with reboot flag set
         let mut entries = SdEntries::<E>::new();
         let mut options = SdOptions::<O>::new();
-        let _ = entries.push(entry);
-        let _ = options.push(option);
+        entries
+            .push(entry)
+            .expect("SdEntries capacity E must be at least 1 to send OfferService");
+        options
+            .push(option)
+            .expect("SdOptions capacity O must be at least 1 to send OfferService");
         let sd_payload = sd::Header::<E, O> {
             flags: Flags::new(true, true),
             entries,
@@ -305,8 +309,12 @@ impl<const E: usize, const O: usize> Server<E, O> {
 
         let mut entries = SdEntries::<E>::new();
         let mut options = SdOptions::<O>::new();
-        let _ = entries.push(entry);
-        let _ = options.push(option);
+        entries
+            .push(entry)
+            .expect("SdEntries capacity E must be at least 1 for unicast offers");
+        options
+            .push(option)
+            .expect("SdOptions capacity O must be at least 1 for unicast offers");
         let sd_payload = sd::Header::<E, O> {
             flags: Flags::new(true, true), // reboot + unicast flags set
             entries,
@@ -564,7 +572,9 @@ impl<const E: usize, const O: usize> Server<E, O> {
 
         // Create SD header
         let mut entries = SdEntries::<E>::new();
-        let _ = entries.push(ack_entry);
+        entries
+            .push(ack_entry)
+            .expect("SdEntries capacity E must allow at least one entry for SubscribeAck");
         let sd_payload = sd::Header::<E, O> {
             flags: Flags::new(true, true), // reboot + unicast flags set
             entries,
@@ -634,7 +644,9 @@ impl<const E: usize, const O: usize> Server<E, O> {
 
         // Create SD header
         let mut entries = SdEntries::<E>::new();
-        let _ = entries.push(nack_entry);
+        entries
+            .push(nack_entry)
+            .expect("SdEntries<E> must have capacity for at least one entry when sending SubscribeNack");
         let sd_payload = sd::Header::<E, O> {
             flags: Flags::new(true, true), // reboot + unicast flags set
             entries,

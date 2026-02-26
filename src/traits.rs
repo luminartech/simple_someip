@@ -32,7 +32,7 @@ pub trait PayloadWireFormat: std::fmt::Debug + Send + Sized + Sync {
     /// The SD header type used by this payload implementation.
     type SdHeader: WireFormat + Clone + std::fmt::Debug + Eq;
 
-    /// Get the Message ID for te payload
+    /// Get the Message ID for the payload
     fn message_id(&self) -> MessageId;
     /// Get the payload as a service discovery header
     fn as_sd_header(&self) -> Option<&Self::SdHeader>;
