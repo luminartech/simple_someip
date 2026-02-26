@@ -519,10 +519,17 @@ mod tests {
         let mut payload = [0u8; 20];
         payload[..5].copy_from_slice(b"Hello");
 
-        let protected =
-            protect_profile5_with_header(&config, &mut protect_state, &payload, upper_header);
+        let mut buf = [0u8; 256];
+        let len = protect_profile5_with_header(
+            &config,
+            &mut protect_state,
+            &payload,
+            upper_header,
+            &mut buf,
+        )
+        .unwrap();
         let result =
-            check_profile5_with_header(&config, &mut check_state, &protected, upper_header);
+            check_profile5_with_header(&config, &mut check_state, &buf[..len], upper_header);
 
         assert_eq!(result.status, E2ECheckStatus::Ok);
         assert_eq!(result.counter, Some(0));
@@ -541,9 +548,17 @@ mod tests {
         let mut payload = [0u8; 20];
         payload[..5].copy_from_slice(b"Hello");
 
-        let protected =
-            protect_profile5_with_header(&config, &mut protect_state, &payload, tx_header);
-        let result = check_profile5_with_header(&config, &mut check_state, &protected, rx_header);
+        let mut buf = [0u8; 256];
+        let len = protect_profile5_with_header(
+            &config,
+            &mut protect_state,
+            &payload,
+            tx_header,
+            &mut buf,
+        )
+        .unwrap();
+        let result =
+            check_profile5_with_header(&config, &mut check_state, &buf[..len], rx_header);
 
         assert_eq!(result.status, E2ECheckStatus::CrcError);
     }

@@ -153,23 +153,41 @@ pub fn protect_profile5(
 /// * `upper_header` - 8-byte SOME/IP upper header included in the CRC
 ///
 /// # Returns
-/// A new `Vec` containing the 3-byte E2E header followed by the payload.
+/// The number of bytes written to `output`, or an error if the buffer is too
+/// small.
+///
+/// # Errors
+/// Returns [`Error::BufferTooSmall`] if `output` is too small to hold the
+/// protected message.
 pub fn protect_profile5_with_header(
     config: &Profile5Config,
     state: &mut Profile5State,
     payload: &[u8],
     upper_header: [u8; 8],
-) -> Vec<u8> {
+    output: &mut [u8],
+) -> Result<usize, Error> {
+    let total_length = PROFILE5_HEADER_SIZE + payload.len();
+
+    if output.len() < total_length {
+        return Err(Error::BufferTooSmall {
+            needed: total_length,
+            actual: output.len(),
+        });
+    }
+
     let counter = state.protect_counter;
     let crc = compute_crc16_p5_with_header(config.data_id, counter, payload, upper_header);
 
-    let mut result = Vec::with_capacity(PROFILE5_HEADER_SIZE + payload.len());
-    result.extend_from_slice(&crc.to_le_bytes());
-    result.push(counter);
-    result.extend_from_slice(payload);
+    // Header: CRC (2, little-endian) + Counter (1)
+    output[0..2].copy_from_slice(&crc.to_le_bytes());
+    output[2] = counter;
+
+    // Payload
+    output[PROFILE5_HEADER_SIZE..total_length].copy_from_slice(payload);
 
     state.protect_counter = state.protect_counter.wrapping_add(1);
-    result
+
+    Ok(total_length)
 }
 
 #[cfg(test)]
@@ -295,10 +313,14 @@ mod tests {
 
         let payload = b"test";
         let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
-        let protected = protect_profile5_with_header(&config, &mut state, payload, upper_header);
+        let mut buf = [0u8; 256];
+        let len =
+            protect_profile5_with_header(&config, &mut state, payload, upper_header, &mut buf)
+                .unwrap();
+        let protected = &buf[..len];
 
         // Check total length
-        assert_eq!(protected.len(), 3 + 4); // header + payload
+        assert_eq!(len, 3 + 4); // header + payload
 
         // Check counter field (third byte)
         assert_eq!(protected[2], 0);
@@ -314,11 +336,12 @@ mod tests {
 
         let payload = b"test";
         let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+        let mut buf = [0u8; 256];
 
         for i in 0..5u8 {
-            let protected =
-                protect_profile5_with_header(&config, &mut state, payload, upper_header);
-            assert_eq!(protected[2], i);
+            protect_profile5_with_header(&config, &mut state, payload, upper_header, &mut buf)
+                .unwrap();
+            assert_eq!(buf[2], i);
         }
     }
 
@@ -329,12 +352,15 @@ mod tests {
 
         let payload = b"test";
         let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+        let mut buf = [0u8; 256];
 
-        let protected = protect_profile5_with_header(&config, &mut state, payload, upper_header);
-        assert_eq!(protected[2], u8::MAX);
+        protect_profile5_with_header(&config, &mut state, payload, upper_header, &mut buf)
+            .unwrap();
+        assert_eq!(buf[2], u8::MAX);
 
-        let protected = protect_profile5_with_header(&config, &mut state, payload, upper_header);
-        assert_eq!(protected[2], 0); // Wrapped
+        protect_profile5_with_header(&config, &mut state, payload, upper_header, &mut buf)
+            .unwrap();
+        assert_eq!(buf[2], 0); // Wrapped
     }
 
     #[test]
@@ -343,8 +369,11 @@ mod tests {
         let mut state = Profile5State::new();
 
         let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
-        let protected = protect_profile5_with_header(&config, &mut state, b"", upper_header);
-        assert_eq!(protected.len(), 3); // Just header
+        let mut buf = [0u8; 256];
+        let len =
+            protect_profile5_with_header(&config, &mut state, b"", upper_header, &mut buf)
+                .unwrap();
+        assert_eq!(len, 3); // Just header
     }
 
     #[test]
@@ -356,17 +385,19 @@ mod tests {
         let payload = b"test";
         let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
 
-        let mut buf = [0u8; 256];
-        let len = protect_profile5(&config, &mut state_a, payload, &mut buf).unwrap();
-        let without_header_crc = u16::from_le_bytes([buf[0], buf[1]]);
+        let mut buf_a = [0u8; 256];
+        let len_a = protect_profile5(&config, &mut state_a, payload, &mut buf_a).unwrap();
+        let without_header_crc = u16::from_le_bytes([buf_a[0], buf_a[1]]);
 
-        let with_header =
-            protect_profile5_with_header(&config, &mut state_b, payload, upper_header);
-        let with_header_crc = u16::from_le_bytes([with_header[0], with_header[1]]);
+        let mut buf_b = [0u8; 256];
+        let len_b =
+            protect_profile5_with_header(&config, &mut state_b, payload, upper_header, &mut buf_b)
+                .unwrap();
+        let with_header_crc = u16::from_le_bytes([buf_b[0], buf_b[1]]);
 
         // Same counter and payload but different CRC due to upper_header
-        assert_eq!(buf[2], with_header[2]); // same counter
-        assert_eq!(&buf[3..len], &with_header[3..]); // same payload
+        assert_eq!(buf_a[2], buf_b[2]); // same counter
+        assert_eq!(&buf_a[3..len_a], &buf_b[3..len_b]); // same payload
         assert_ne!(without_header_crc, with_header_crc); // different CRC
     }
 
