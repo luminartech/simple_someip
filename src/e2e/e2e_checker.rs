@@ -506,7 +506,7 @@ mod tests {
         payload[..5].copy_from_slice(b"Hello");
 
         let protected =
-            protect_profile5_with_header(&config, &mut protect_state, &payload, &upper_header);
+            protect_profile5_with_header(&config, &mut protect_state, &payload, upper_header);
         let result =
             check_profile5_with_header(&config, &mut check_state, &protected, &upper_header);
 
@@ -528,9 +528,8 @@ mod tests {
         payload[..5].copy_from_slice(b"Hello");
 
         let protected =
-            protect_profile5_with_header(&config, &mut protect_state, &payload, &tx_header);
-        let result =
-            check_profile5_with_header(&config, &mut check_state, &protected, &rx_header);
+            protect_profile5_with_header(&config, &mut protect_state, &payload, tx_header);
+        let result = check_profile5_with_header(&config, &mut check_state, &protected, &rx_header);
 
         assert_eq!(result.status, E2ECheckStatus::CrcError);
     }
