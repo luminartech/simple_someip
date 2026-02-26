@@ -31,7 +31,8 @@ pub const PROFILE5_HEADER_SIZE: usize = 3;
 /// The number of bytes written to `output`.
 ///
 /// # Panics
-/// Panics if `output` is too small to hold the protected message.
+/// Panics if `output` is too small to hold the protected message, or if the
+/// total message length (header + payload) exceeds 65535 bytes.
 pub fn protect_profile4(
     config: &Profile4Config,
     state: &mut Profile4State,
