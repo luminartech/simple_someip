@@ -25,8 +25,8 @@ pub struct Header {
 impl Header {
     /// Return the 8-byte "upper header" used by E2E UPPER-HEADER-BITS-TO-SHIFT.
     ///
-    /// Layout (big-endian): request_id(4) + protocol_version(1) + interface_version(1)
-    ///                      + message_type(1) + return_code(1)
+    /// Layout (big-endian): `request_id(4)` + `protocol_version(1)` + `interface_version(1)`
+    ///                      + `message_type(1)` + `return_code(1)`
     ///
     /// Note: `request_id` is the full 4-byte SOME/IP Request ID field
     /// (Client ID [31:16] + Session ID [15:0]), not just the 2-byte Session ID.

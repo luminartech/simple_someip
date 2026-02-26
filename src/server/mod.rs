@@ -644,9 +644,9 @@ impl<const E: usize, const O: usize> Server<E, O> {
 
         // Create SD header
         let mut entries = SdEntries::<E>::new();
-        entries
-            .push(nack_entry)
-            .expect("SdEntries<E> must have capacity for at least one entry when sending SubscribeNack");
+        entries.push(nack_entry).expect(
+            "SdEntries<E> must have capacity for at least one entry when sending SubscribeNack",
+        );
         let sd_payload = sd::Header::<E, O> {
             flags: Flags::new(true, true), // reboot + unicast flags set
             entries,

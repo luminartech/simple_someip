@@ -147,7 +147,7 @@ pub fn check_profile5_with_header(
     config: &Profile5Config,
     state: &mut Profile5State,
     protected: &[u8],
-    upper_header: &[u8; 8],
+    upper_header: [u8; 8],
 ) -> E2ECheckResult {
     if protected.len() < PROFILE5_HEADER_SIZE {
         return E2ECheckResult::error(E2ECheckStatus::BadArgument);
@@ -508,7 +508,7 @@ mod tests {
         let protected =
             protect_profile5_with_header(&config, &mut protect_state, &payload, upper_header);
         let result =
-            check_profile5_with_header(&config, &mut check_state, &protected, &upper_header);
+            check_profile5_with_header(&config, &mut check_state, &protected, upper_header);
 
         assert_eq!(result.status, E2ECheckStatus::Ok);
         assert_eq!(result.counter, Some(0));
@@ -529,7 +529,7 @@ mod tests {
 
         let protected =
             protect_profile5_with_header(&config, &mut protect_state, &payload, tx_header);
-        let result = check_profile5_with_header(&config, &mut check_state, &protected, &rx_header);
+        let result = check_profile5_with_header(&config, &mut check_state, &protected, rx_header);
 
         assert_eq!(result.status, E2ECheckStatus::CrcError);
     }

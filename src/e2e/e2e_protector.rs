@@ -126,7 +126,7 @@ pub fn protect_profile5_with_header(
     upper_header: [u8; 8],
 ) -> Vec<u8> {
     let counter = state.protect_counter;
-    let crc = compute_crc16_p5_with_header(config.data_id, counter, payload, &upper_header);
+    let crc = compute_crc16_p5_with_header(config.data_id, counter, payload, upper_header);
 
     let mut result = Vec::with_capacity(PROFILE5_HEADER_SIZE + payload.len());
     result.extend_from_slice(&crc.to_le_bytes());

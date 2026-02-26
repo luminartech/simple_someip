@@ -66,8 +66,12 @@ impl<const E: usize, const O: usize> Header<E, O> {
         };
         let mut entries = SdEntries::new();
         let mut options = SdOptions::new();
-        entries.push(entry).expect("single SD entry exceeds capacity");
-        options.push(endpoint).expect("single SD option exceeds capacity");
+        entries
+            .push(entry)
+            .expect("single SD entry exceeds capacity");
+        options
+            .push(endpoint)
+            .expect("single SD option exceeds capacity");
         Self {
             flags: Flags::new_sd(false),
             entries,
@@ -118,8 +122,12 @@ impl<const E: usize, const O: usize> Header<E, O> {
         };
         let mut entries = SdEntries::new();
         let mut options = SdOptions::new();
-        entries.push(entry).expect("single SD entry exceeds capacity");
-        options.push(endpoint).expect("single SD option exceeds capacity");
+        entries
+            .push(entry)
+            .expect("single SD entry exceeds capacity");
+        options
+            .push(endpoint)
+            .expect("single SD option exceeds capacity");
         Self {
             flags: Flags::new_sd(false),
             entries,
@@ -143,7 +151,9 @@ impl<const E: usize, const O: usize> Header<E, O> {
             event_group_id,
         ));
         let mut entries = SdEntries::new();
-        entries.push(entry).expect("single SD entry exceeds capacity");
+        entries
+            .push(entry)
+            .expect("single SD entry exceeds capacity");
         Self {
             flags: Flags::new_sd(true),
             entries,
@@ -154,6 +164,7 @@ impl<const E: usize, const O: usize> Header<E, O> {
 
 impl<const E: usize, const O: usize> WireFormat for Header<E, O> {
     fn decode<T: embedded_io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
+        const MIN_OPTION_SIZE: usize = 4;
         let flags = Flags::from(reader.read_u8()?);
         let mut reserved: [u8; 3] = [0; 3];
         reader.read_bytes(&mut reserved)?;
@@ -169,7 +180,6 @@ impl<const E: usize, const O: usize> WireFormat for Header<E, O> {
         let mut remaining_options_size = reader.read_u32_be()? as usize;
         let mut options = SdOptions::new();
         // Minimum SD option wire size: length(2) + type(1) + reserved(1) = 4 bytes
-        const MIN_OPTION_SIZE: usize = 4;
         while remaining_options_size > 0 {
             if remaining_options_size < MIN_OPTION_SIZE {
                 return Err(Error::IncorrectOptionsSize(remaining_options_size));
