@@ -18,7 +18,7 @@
 //!
 //! let payload = b"Hello, SOME/IP!";
 //! let mut buf = [0u8; 128];
-//! let len = protect_profile4(&config, &mut protect_state, payload, &mut buf);
+//! let len = protect_profile4(&config, &mut protect_state, payload, &mut buf).unwrap();
 //!
 //! let result = check_profile4(&config, &mut check_state, &buf[..len]);
 //! assert!(matches!(result.status, E2ECheckStatus::Ok));
@@ -128,7 +128,7 @@ mod tests {
 
         let payload = b"Test payload data";
         let mut buf = [0u8; 256];
-        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf);
+        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf).unwrap();
         let protected = &buf[..len];
 
         assert_eq!(len, payload.len() + 12); // 12-byte header
@@ -149,7 +149,7 @@ mod tests {
         let mut payload = [0u8; 20];
         payload[..17].copy_from_slice(b"Test payload data");
         let mut buf = [0u8; 256];
-        let len = protect_profile5(&config, &mut protect_state, &payload, &mut buf);
+        let len = protect_profile5(&config, &mut protect_state, &payload, &mut buf).unwrap();
         let protected = &buf[..len];
 
         assert_eq!(len, payload.len() + 3); // 3-byte header
@@ -171,12 +171,12 @@ mod tests {
         let mut buf2 = [0u8; 256];
 
         // First message - should be Ok
-        let len1 = protect_profile4(&config, &mut protect_state, payload, &mut buf1);
+        let len1 = protect_profile4(&config, &mut protect_state, payload, &mut buf1).unwrap();
         let result1 = check_profile4(&config, &mut check_state, &buf1[..len1]);
         assert_eq!(result1.status, E2ECheckStatus::Ok);
 
         // Second message - should be Ok
-        let len2 = protect_profile4(&config, &mut protect_state, payload, &mut buf2);
+        let len2 = protect_profile4(&config, &mut protect_state, payload, &mut buf2).unwrap();
         let result2 = check_profile4(&config, &mut check_state, &buf2[..len2]);
         assert_eq!(result2.status, E2ECheckStatus::Ok);
 
@@ -198,14 +198,14 @@ mod tests {
         let mut buf = [0u8; 256];
 
         // First message
-        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf);
+        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf).unwrap();
         let result1 = check_profile4(&config, &mut check_state, &buf[..len]);
         assert_eq!(result1.status, E2ECheckStatus::Ok);
 
         // Skip a few messages by advancing protector counter
-        let _ = protect_profile4(&config, &mut protect_state, payload, &mut buf);
-        let _ = protect_profile4(&config, &mut protect_state, payload, &mut buf);
-        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf);
+        protect_profile4(&config, &mut protect_state, payload, &mut buf).unwrap();
+        protect_profile4(&config, &mut protect_state, payload, &mut buf).unwrap();
+        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf).unwrap();
 
         // Check skipped message - should be OkSomeLost (delta=3, within max_delta=5)
         let result4 = check_profile4(&config, &mut check_state, &buf[..len]);
@@ -222,15 +222,15 @@ mod tests {
         let mut buf = [0u8; 256];
 
         // First message
-        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf);
+        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf).unwrap();
         let result1 = check_profile4(&config, &mut check_state, &buf[..len]);
         assert_eq!(result1.status, E2ECheckStatus::Ok);
 
         // Skip many messages (exceed max_delta)
         for _ in 0..5 {
-            let _ = protect_profile4(&config, &mut protect_state, payload, &mut buf);
+            protect_profile4(&config, &mut protect_state, payload, &mut buf).unwrap();
         }
-        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf);
+        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf).unwrap();
 
         // Check - should be WrongSequence (delta=6, exceeds max_delta=2)
         let result = check_profile4(&config, &mut check_state, &buf[..len]);
@@ -245,7 +245,7 @@ mod tests {
 
         let payload = b"Test";
         let mut buf = [0u8; 256];
-        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf);
+        let len = protect_profile4(&config, &mut protect_state, payload, &mut buf).unwrap();
 
         // Corrupt the CRC (last 4 bytes of header)
         buf[8] ^= 0xFF;
@@ -263,7 +263,7 @@ mod tests {
         let mut payload = [0u8; 20];
         payload[..4].copy_from_slice(b"Test");
         let mut buf = [0u8; 256];
-        let len = protect_profile5(&config, &mut protect_state, &payload, &mut buf);
+        let len = protect_profile5(&config, &mut protect_state, &payload, &mut buf).unwrap();
 
         // Corrupt the CRC (bytes 1-2 of header)
         buf[1] ^= 0xFF;

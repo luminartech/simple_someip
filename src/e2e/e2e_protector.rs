@@ -3,6 +3,7 @@
 use super::config::{Profile4Config, Profile5Config};
 use super::crc::{compute_crc16_p5, compute_crc16_p5_with_header, compute_crc32_p4};
 use super::state::{Profile4State, Profile5State};
+use crate::Error;
 
 /// Profile 4 header size in bytes.
 pub const PROFILE4_HEADER_SIZE: usize = 12;
@@ -28,25 +29,35 @@ pub const PROFILE5_HEADER_SIZE: usize = 3;
 ///   `PROFILE4_HEADER_SIZE + payload.len()` bytes
 ///
 /// # Returns
-/// The number of bytes written to `output`.
+/// The number of bytes written to `output`, or an error if the buffer is too
+/// small.
 ///
-/// # Panics
-/// Panics if `output` is too small to hold the protected message, or if the
-/// total message length (header + payload) exceeds 65535 bytes.
+/// # Errors
+/// Returns [`Error::BufferTooSmall`] if `output` is too small to hold the
+/// protected message, or if the total message length (header + payload)
+/// exceeds 65 535 bytes (the Profile 4 length field is `u16`).
 pub fn protect_profile4(
     config: &Profile4Config,
     state: &mut Profile4State,
     payload: &[u8],
     output: &mut [u8],
-) -> usize {
+) -> Result<usize, Error> {
     let total_length = PROFILE4_HEADER_SIZE + payload.len();
-    let length = u16::try_from(total_length).expect("E2E Profile 4 payload too large");
 
-    assert!(
-        output.len() >= total_length,
-        "output buffer too small: need {total_length} bytes, got {}",
-        output.len()
-    );
+    if output.len() < total_length {
+        return Err(Error::BufferTooSmall {
+            needed: total_length,
+            actual: output.len(),
+        });
+    }
+
+    // Profile 4 length field is u16; if total_length > u16::MAX the buffer
+    // requirement already exceeds what the protocol can encode, so report it
+    // as a buffer-too-small error (needed would be > 65535).
+    let length = u16::try_from(total_length).map_err(|_| Error::BufferTooSmall {
+        needed: total_length,
+        actual: output.len(),
+    })?;
 
     let counter = state.protect_counter;
 
@@ -65,7 +76,7 @@ pub fn protect_profile4(
     // Increment counter (wraps at u16::MAX)
     state.protect_counter = state.protect_counter.wrapping_add(1);
 
-    total_length
+    Ok(total_length)
 }
 
 /// Add E2E Profile 5 protection to a payload.
@@ -84,23 +95,26 @@ pub fn protect_profile4(
 ///   `PROFILE5_HEADER_SIZE + payload.len()` bytes
 ///
 /// # Returns
-/// The number of bytes written to `output`.
+/// The number of bytes written to `output`, or an error if the buffer is too
+/// small.
 ///
-/// # Panics
-/// Panics if `output` is too small to hold the protected message.
+/// # Errors
+/// Returns [`Error::BufferTooSmall`] if `output` is too small to hold the
+/// protected message.
 pub fn protect_profile5(
     config: &Profile5Config,
     state: &mut Profile5State,
     payload: &[u8],
     output: &mut [u8],
-) -> usize {
+) -> Result<usize, Error> {
     let total_length = PROFILE5_HEADER_SIZE + payload.len();
 
-    assert!(
-        output.len() >= total_length,
-        "output buffer too small: need {total_length} bytes, got {}",
-        output.len()
-    );
+    if output.len() < total_length {
+        return Err(Error::BufferTooSmall {
+            needed: total_length,
+            actual: output.len(),
+        });
+    }
 
     let counter = state.protect_counter;
 
@@ -117,7 +131,7 @@ pub fn protect_profile5(
     // Increment counter (wraps at u8::MAX)
     state.protect_counter = state.protect_counter.wrapping_add(1);
 
-    total_length
+    Ok(total_length)
 }
 
 /// Add E2E Profile 5 protection with SOME/IP upper-header in the CRC.
@@ -169,7 +183,7 @@ mod tests {
 
         let payload = b"test";
         let mut buf = [0u8; 256];
-        let len = protect_profile4(&config, &mut state, payload, &mut buf);
+        let len = protect_profile4(&config, &mut state, payload, &mut buf).unwrap();
         let protected = &buf[..len];
 
         // Check total length
@@ -200,7 +214,7 @@ mod tests {
         let mut buf = [0u8; 256];
 
         for i in 0..5 {
-            let len = protect_profile4(&config, &mut state, payload, &mut buf);
+            let len = protect_profile4(&config, &mut state, payload, &mut buf).unwrap();
             let counter = u16::from_be_bytes([buf[2], buf[3]]);
             assert_eq!(counter, i);
             assert_eq!(len, 16);
@@ -215,11 +229,11 @@ mod tests {
         let payload = b"test";
         let mut buf = [0u8; 256];
 
-        let _ = protect_profile4(&config, &mut state, payload, &mut buf);
+        protect_profile4(&config, &mut state, payload, &mut buf).unwrap();
         let counter1 = u16::from_be_bytes([buf[2], buf[3]]);
         assert_eq!(counter1, u16::MAX);
 
-        let _ = protect_profile4(&config, &mut state, payload, &mut buf);
+        protect_profile4(&config, &mut state, payload, &mut buf).unwrap();
         let counter2 = u16::from_be_bytes([buf[2], buf[3]]);
         assert_eq!(counter2, 0); // Wrapped
     }
@@ -231,7 +245,7 @@ mod tests {
 
         let payload = b"test";
         let mut buf = [0u8; 256];
-        let len = protect_profile5(&config, &mut state, payload, &mut buf);
+        let len = protect_profile5(&config, &mut state, payload, &mut buf).unwrap();
         let protected = &buf[..len];
 
         // Check total length
@@ -254,7 +268,7 @@ mod tests {
         let mut buf = [0u8; 256];
 
         for i in 0..5u8 {
-            let _ = protect_profile5(&config, &mut state, payload, &mut buf);
+            protect_profile5(&config, &mut state, payload, &mut buf).unwrap();
             assert_eq!(buf[2], i); // Counter is at byte 2
         }
     }
@@ -267,10 +281,10 @@ mod tests {
         let payload = b"test";
         let mut buf = [0u8; 256];
 
-        let _ = protect_profile5(&config, &mut state, payload, &mut buf);
+        protect_profile5(&config, &mut state, payload, &mut buf).unwrap();
         assert_eq!(buf[2], u8::MAX); // Counter is at byte 2
 
-        let _ = protect_profile5(&config, &mut state, payload, &mut buf);
+        protect_profile5(&config, &mut state, payload, &mut buf).unwrap();
         assert_eq!(buf[2], 0); // Wrapped
     }
 
@@ -343,7 +357,7 @@ mod tests {
         let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
 
         let mut buf = [0u8; 256];
-        let len = protect_profile5(&config, &mut state_a, payload, &mut buf);
+        let len = protect_profile5(&config, &mut state_a, payload, &mut buf).unwrap();
         let without_header_crc = u16::from_le_bytes([buf[0], buf[1]]);
 
         let with_header =
@@ -362,7 +376,7 @@ mod tests {
         let mut state = Profile4State::new();
 
         let mut buf = [0u8; 256];
-        let len = protect_profile4(&config, &mut state, b"", &mut buf);
+        let len = protect_profile4(&config, &mut state, b"", &mut buf).unwrap();
         assert_eq!(len, 12); // Just header
     }
 
@@ -372,7 +386,7 @@ mod tests {
         let mut state = Profile5State::new();
 
         let mut buf = [0u8; 256];
-        let len = protect_profile5(&config, &mut state, b"", &mut buf);
+        let len = protect_profile5(&config, &mut state, b"", &mut buf).unwrap();
         assert_eq!(len, 3); // Just header
     }
 }
