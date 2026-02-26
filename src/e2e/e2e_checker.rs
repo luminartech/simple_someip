@@ -557,8 +557,7 @@ mod tests {
             &mut buf,
         )
         .unwrap();
-        let result =
-            check_profile5_with_header(&config, &mut check_state, &buf[..len], rx_header);
+        let result = check_profile5_with_header(&config, &mut check_state, &buf[..len], rx_header);
 
         assert_eq!(result.status, E2ECheckStatus::CrcError);
     }

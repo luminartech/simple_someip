@@ -354,12 +354,10 @@ mod tests {
         let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
         let mut buf = [0u8; 256];
 
-        protect_profile5_with_header(&config, &mut state, payload, upper_header, &mut buf)
-            .unwrap();
+        protect_profile5_with_header(&config, &mut state, payload, upper_header, &mut buf).unwrap();
         assert_eq!(buf[2], u8::MAX);
 
-        protect_profile5_with_header(&config, &mut state, payload, upper_header, &mut buf)
-            .unwrap();
+        protect_profile5_with_header(&config, &mut state, payload, upper_header, &mut buf).unwrap();
         assert_eq!(buf[2], 0); // Wrapped
     }
 
@@ -371,8 +369,7 @@ mod tests {
         let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
         let mut buf = [0u8; 256];
         let len =
-            protect_profile5_with_header(&config, &mut state, b"", upper_header, &mut buf)
-                .unwrap();
+            protect_profile5_with_header(&config, &mut state, b"", upper_header, &mut buf).unwrap();
         assert_eq!(len, 3); // Just header
     }
 
