@@ -247,7 +247,7 @@ fn check_sequence_profile5(
 mod tests {
     use super::*;
     use crate::e2e::{
-        e2e_protector::protect_profile5_with_header, protect_profile4, protect_profile5,
+        protect_profile4, protect_profile5, protect_profile5_with_header,
     };
 
     #[test]

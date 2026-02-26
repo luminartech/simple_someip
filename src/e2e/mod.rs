@@ -81,6 +81,9 @@ pub struct E2ECheckResult<'a> {
     /// Counter value extracted from the header (if parsing succeeded).
     pub counter: Option<u32>,
     /// Extracted payload without E2E header (if check succeeded).
+    ///
+    /// This is a borrowed subslice of the input `protected` buffer and is only
+    /// valid as long as that buffer is kept alive.
     pub payload: Option<&'a [u8]>,
 }
 
