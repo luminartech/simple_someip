@@ -399,6 +399,63 @@ mod tests {
     }
 
     #[test]
+    fn test_protect_profile4_buffer_too_small() {
+        let config = Profile4Config::new(0x12345678, 15);
+        let mut state = Profile4State::new();
+
+        let payload = b"test";
+        // Need 12 (header) + 4 (payload) = 16 bytes, provide only 10
+        let mut buf = [0u8; 10];
+        let err = protect_profile4(&config, &mut state, payload, &mut buf).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::BufferTooSmall {
+                needed: 16,
+                actual: 10,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_protect_profile5_buffer_too_small() {
+        let config = Profile5Config::new(0x1234, 20, 15);
+        let mut state = Profile5State::new();
+
+        let payload = b"test";
+        // Need 3 (header) + 4 (payload) = 7 bytes, provide only 5
+        let mut buf = [0u8; 5];
+        let err = protect_profile5(&config, &mut state, payload, &mut buf).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::BufferTooSmall {
+                needed: 7,
+                actual: 5,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_protect_profile5_with_header_buffer_too_small() {
+        let config = Profile5Config::new(0x1234, 20, 15);
+        let mut state = Profile5State::new();
+
+        let payload = b"test";
+        let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+        // Need 3 (header) + 4 (payload) = 7 bytes, provide only 5
+        let mut buf = [0u8; 5];
+        let err =
+            protect_profile5_with_header(&config, &mut state, payload, upper_header, &mut buf)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::BufferTooSmall {
+                needed: 7,
+                actual: 5,
+            }
+        ));
+    }
+
+    #[test]
     fn test_protect_profile4_empty_payload() {
         let config = Profile4Config::new(0x12345678, 15);
         let mut state = Profile4State::new();
