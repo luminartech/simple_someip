@@ -9,24 +9,27 @@ use super::{
     entry::{ENTRY_SIZE, OptionsCount},
 };
 
-/// Maximum number of SD entries in a single header.
-pub const MAX_SD_ENTRIES: usize = 16;
-/// Maximum number of SD options in a single header.
-pub const MAX_SD_OPTIONS: usize = 16;
+/// Default maximum number of SD entries in a single header.
+pub const MAX_SD_ENTRIES: usize = 1;
+/// Default maximum number of SD options in a single header.
+pub const MAX_SD_OPTIONS: usize = 1;
 
-pub type SdEntries = heapless::Vec<Entry, MAX_SD_ENTRIES>;
-pub type SdOptions = heapless::Vec<Options, MAX_SD_OPTIONS>;
+pub type SdEntries<const N: usize = MAX_SD_ENTRIES> = heapless::Vec<Entry, N>;
+pub type SdOptions<const N: usize = MAX_SD_OPTIONS> = heapless::Vec<Options, N>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Header {
+pub struct Header<
+    const MAX_ENTRIES: usize = MAX_SD_ENTRIES,
+    const MAX_OPTIONS: usize = MAX_SD_OPTIONS,
+> {
     pub flags: Flags,
-    pub entries: SdEntries,
-    pub options: SdOptions,
+    pub entries: SdEntries<MAX_ENTRIES>,
+    pub options: SdOptions<MAX_OPTIONS>,
 }
 
-impl Header {
+impl<const E: usize, const O: usize> Header<E, O> {
     #[must_use]
-    pub fn new(flags: Flags, entries: SdEntries, options: SdOptions) -> Self {
+    pub fn new(flags: Flags, entries: SdEntries<E>, options: SdOptions<O>) -> Self {
         Self {
             flags,
             entries,
@@ -63,9 +66,12 @@ impl Header {
         };
         let mut entries = SdEntries::new();
         let mut options = SdOptions::new();
-        // Single entry/option — capacity is always sufficient.
-        let _ = entries.push(entry);
-        let _ = options.push(endpoint);
+        entries
+            .push(entry)
+            .expect("single SD entry exceeds capacity");
+        options
+            .push(endpoint)
+            .expect("single SD option exceeds capacity");
         Self {
             flags: Flags::new_sd(false),
             entries,
@@ -74,7 +80,7 @@ impl Header {
     }
 
     /// # Panics
-    /// Panics if `service_ids` has more than [`MAX_SD_ENTRIES`] elements.
+    /// Panics if `service_ids` has more than `E` elements.
     #[must_use]
     pub fn new_find_services(reboot: bool, service_ids: &[u16]) -> Self {
         let mut entries = SdEntries::new();
@@ -116,8 +122,12 @@ impl Header {
         };
         let mut entries = SdEntries::new();
         let mut options = SdOptions::new();
-        let _ = entries.push(entry);
-        let _ = options.push(endpoint);
+        entries
+            .push(entry)
+            .expect("single SD entry exceeds capacity");
+        options
+            .push(endpoint)
+            .expect("single SD option exceeds capacity");
         Self {
             flags: Flags::new_sd(false),
             entries,
@@ -141,7 +151,9 @@ impl Header {
             event_group_id,
         ));
         let mut entries = SdEntries::new();
-        let _ = entries.push(entry);
+        entries
+            .push(entry)
+            .expect("single SD entry exceeds capacity");
         Self {
             flags: Flags::new_sd(true),
             entries,
@@ -150,8 +162,9 @@ impl Header {
     }
 }
 
-impl WireFormat for Header {
+impl<const E: usize, const O: usize> WireFormat for Header<E, O> {
     fn decode<T: embedded_io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
+        const MIN_OPTION_SIZE: usize = 4;
         let flags = Flags::from(reader.read_u8()?);
         let mut reserved: [u8; 3] = [0; 3];
         reader.read_bytes(&mut reserved)?;
@@ -166,13 +179,18 @@ impl WireFormat for Header {
 
         let mut remaining_options_size = reader.read_u32_be()? as usize;
         let mut options = SdOptions::new();
+        // Minimum SD option wire size: length(2) + type(1) + reserved(1) = 4 bytes
         while remaining_options_size > 0 {
+            if remaining_options_size < MIN_OPTION_SIZE {
+                return Err(Error::IncorrectOptionsSize(remaining_options_size));
+            }
             let option = Options::read(reader)?;
-            remaining_options_size -= option.size();
+            let option_size = option.size();
+            if option_size > remaining_options_size {
+                return Err(Error::IncorrectOptionsSize(remaining_options_size));
+            }
+            remaining_options_size -= option_size;
             options.push(option).map_err(|_| Error::TooManyOptions)?;
-        }
-        if remaining_options_size != 0 {
-            return Err(Error::IncorrectOptionsSize(remaining_options_size));
         }
         Ok(Self {
             flags,

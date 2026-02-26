@@ -69,7 +69,10 @@ impl ServerConfig {
 }
 
 /// SOME/IP Server that can offer services and publish events
-pub struct Server {
+pub struct Server<
+    const MAX_ENTRIES: usize = { sd::MAX_SD_ENTRIES },
+    const MAX_OPTIONS: usize = { sd::MAX_SD_OPTIONS },
+> {
     config: ServerConfig,
     /// Socket for receiving subscription requests
     unicast_socket: Arc<UdpSocket>,
@@ -83,7 +86,7 @@ pub struct Server {
     sd_session_id: Arc<AtomicU16>,
 }
 
-impl Server {
+impl<const E: usize, const O: usize> Server<E, O> {
     /// Create a new SOME/IP server
     pub async fn new(config: ServerConfig) -> Result<Self, Error> {
         // Bind unicast socket for receiving subscriptions
@@ -216,11 +219,15 @@ impl Server {
         };
 
         // Create SD header with reboot flag set
-        let mut entries = SdEntries::new();
-        let mut options = SdOptions::new();
-        let _ = entries.push(entry);
-        let _ = options.push(option);
-        let sd_payload = sd::Header {
+        let mut entries = SdEntries::<E>::new();
+        let mut options = SdOptions::<O>::new();
+        entries
+            .push(entry)
+            .expect("SdEntries capacity E must be at least 1 to send OfferService");
+        options
+            .push(option)
+            .expect("SdOptions capacity O must be at least 1 to send OfferService");
+        let sd_payload = sd::Header::<E, O> {
             flags: Flags::new(true, true),
             entries,
             options,
@@ -244,7 +251,7 @@ impl Server {
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
             length: someip_length(sd_data.len()),
-            session_id: sid,
+            request_id: sid,
             protocol_version: 0x01,
             interface_version: 0x01,
             message_type: MessageTypeField::new(MessageType::Notification, false),
@@ -300,11 +307,15 @@ impl Server {
             protocol: TransportProtocol::Udp,
         };
 
-        let mut entries = SdEntries::new();
-        let mut options = SdOptions::new();
-        let _ = entries.push(entry);
-        let _ = options.push(option);
-        let sd_payload = sd::Header {
+        let mut entries = SdEntries::<E>::new();
+        let mut options = SdOptions::<O>::new();
+        entries
+            .push(entry)
+            .expect("SdEntries capacity E must be at least 1 for unicast offers");
+        options
+            .push(option)
+            .expect("SdOptions capacity O must be at least 1 for unicast offers");
+        let sd_payload = sd::Header::<E, O> {
             flags: Flags::new(true, true), // reboot + unicast flags set
             entries,
             options,
@@ -317,7 +328,7 @@ impl Server {
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
             length: someip_length(sd_data.len()),
-            session_id: sid,
+            request_id: sid,
             protocol_version: 0x01,
             interface_version: 0x01,
             message_type: MessageTypeField::new(MessageType::Notification, false),
@@ -412,7 +423,7 @@ impl Server {
                     {
                         tracing::trace!("This is an SD message");
                         // Parse SD payload
-                        match sd::Header::decode(&mut reader) {
+                        match sd::Header::<E, O>::decode(&mut reader) {
                             Ok(sd_msg) => {
                                 tracing::trace!(
                                     "SD message has {} entries, {} options",
@@ -440,7 +451,7 @@ impl Server {
     /// Handle a Service Discovery message
     async fn handle_sd_message(
         &mut self,
-        sd_msg: sd::Header,
+        sd_msg: sd::Header<E, O>,
         sender: std::net::SocketAddr,
     ) -> Result<(), Error> {
         tracing::trace!("Handling SD message from {}", sender);
@@ -560,12 +571,14 @@ impl Server {
         });
 
         // Create SD header
-        let mut entries = SdEntries::new();
-        let _ = entries.push(ack_entry);
-        let sd_payload = sd::Header {
+        let mut entries = SdEntries::<E>::new();
+        entries
+            .push(ack_entry)
+            .expect("SdEntries capacity E must allow at least one entry for SubscribeAck");
+        let sd_payload = sd::Header::<E, O> {
             flags: Flags::new(true, true), // reboot + unicast flags set
             entries,
-            options: SdOptions::new(),
+            options: SdOptions::<O>::new(),
         };
 
         // Encode SD payload
@@ -577,7 +590,7 @@ impl Server {
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
             length: someip_length(sd_data.len()),
-            session_id: sid,
+            request_id: sid,
             protocol_version: 0x01,
             interface_version: 0x01,
             message_type: MessageTypeField::new(MessageType::Notification, false),
@@ -630,12 +643,14 @@ impl Server {
         });
 
         // Create SD header
-        let mut entries = SdEntries::new();
-        let _ = entries.push(nack_entry);
-        let sd_payload = sd::Header {
+        let mut entries = SdEntries::<E>::new();
+        entries.push(nack_entry).expect(
+            "SdEntries<E> must have capacity for at least one entry when sending SubscribeNack",
+        );
+        let sd_payload = sd::Header::<E, O> {
             flags: Flags::new(true, true), // reboot + unicast flags set
             entries,
-            options: SdOptions::new(),
+            options: SdOptions::<O>::new(),
         };
 
         // Encode SD payload
@@ -647,7 +662,7 @@ impl Server {
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
             length: someip_length(sd_data.len()),
-            session_id: sid,
+            request_id: sid,
             protocol_version: 0x01,
             interface_version: 0x01,
             message_type: MessageTypeField::new(MessageType::Notification, false),
@@ -691,7 +706,7 @@ mod tests {
         let _lock = SD_PORT_LOCK.lock().await;
         let config = ServerConfig::new(Ipv4Addr::new(127, 0, 0, 1), 30682, 0x5B, 1);
 
-        let server = Server::new(config).await;
+        let server: Result<Server, _> = Server::new(config).await;
         assert!(server.is_ok());
     }
 
@@ -703,7 +718,7 @@ mod tests {
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
             length: someip_length(sd_data.len()),
-            session_id: 0x0001,
+            request_id: 0x0001,
             protocol_version: 0x01,
             interface_version: 0x01,
             message_type: MessageTypeField::new(MessageType::Notification, false),
@@ -720,7 +735,8 @@ mod tests {
     fn parse_subscribe_ack_ttl(data: &[u8]) -> u32 {
         let mut reader = data;
         let _header = SomeIpHeader::decode(&mut reader).expect("Failed to parse SOME/IP header");
-        let sd_msg = sd::Header::decode(&mut reader).expect("Failed to parse SD header");
+        let sd_msg: sd::Header =
+            sd::Header::decode(&mut reader).expect("Failed to parse SD header");
         assert_eq!(
             sd_msg.entries.len(),
             1,
@@ -736,7 +752,7 @@ mod tests {
     async fn create_test_server(service_id: u16, instance_id: u16) -> (Server, u16) {
         // Use port 0 to get an ephemeral port
         let config = ServerConfig::new(Ipv4Addr::new(127, 0, 0, 1), 0, service_id, instance_id);
-        let mut server = Server::new(config).await.expect("Failed to create server");
+        let mut server: Server = Server::new(config).await.expect("Failed to create server");
         let local_addr = server.unicast_socket.local_addr().unwrap();
         let port = match local_addr {
             std::net::SocketAddr::V4(addr) => addr.port(),
@@ -784,7 +800,7 @@ mod tests {
             let mut reader: &[u8] = data;
             let header = SomeIpHeader::decode(&mut reader).unwrap();
             assert_eq!(header.message_id.service_id(), 0xFFFF);
-            let sd_msg = sd::Header::decode(&mut reader).unwrap();
+            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
             server.handle_sd_message(sd_msg, addr).await.unwrap();
 
             // Check subscription was added
@@ -839,7 +855,7 @@ mod tests {
             let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
             let mut reader: &[u8] = &buf[..len];
             let _header = SomeIpHeader::decode(&mut reader).unwrap();
-            let sd_msg = sd::Header::decode(&mut reader).unwrap();
+            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
             server.handle_sd_message(sd_msg, addr).await.unwrap();
 
             // No subscription should have been added
@@ -891,7 +907,7 @@ mod tests {
             let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
             let mut reader: &[u8] = &buf[..len];
             let _header = SomeIpHeader::decode(&mut reader).unwrap();
-            let sd_msg = sd::Header::decode(&mut reader).unwrap();
+            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
             server.handle_sd_message(sd_msg, addr).await.unwrap();
 
             let subs = server.subscriptions.read().await;
@@ -942,7 +958,7 @@ mod tests {
             let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
             let mut reader: &[u8] = &buf[..len];
             let _header = SomeIpHeader::decode(&mut reader).unwrap();
-            let sd_msg = sd::Header::decode(&mut reader).unwrap();
+            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
             server.handle_sd_message(sd_msg, addr).await.unwrap();
 
             // Subscription should have been added

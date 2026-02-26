@@ -1,31 +1,45 @@
 mod inner;
 mod socket_manager;
 
-use crate::{
-    Error,
-    protocol::{Message, sd},
-    traits::PayloadWireFormat,
-};
+use crate::{Error, protocol::Message, traits::PayloadWireFormat};
 use inner::{ControlMessage, Inner};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use tokio::sync::mpsc;
 use tracing::info;
 
-#[derive(Debug)]
-pub enum ClientUpdate<PayloadDefinitions> {
+pub enum ClientUpdate<P: PayloadWireFormat> {
     /// Discovery message received
-    DiscoveryUpdated(sd::Header),
+    DiscoveryUpdated(P::SdHeader),
     /// Unicast message received
-    Unicast(Message<PayloadDefinitions>),
+    Unicast(Message<P>),
     /// Inner SOME/IP Client has encountered an error
     Error(Error),
 }
 
-#[derive(Debug)]
-pub struct Client<MessageDefinitions> {
+impl<P: PayloadWireFormat> std::fmt::Debug for ClientUpdate<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DiscoveryUpdated(header) => {
+                f.debug_tuple("DiscoveryUpdated").field(header).finish()
+            }
+            Self::Unicast(msg) => f.debug_tuple("Unicast").field(msg).finish(),
+            Self::Error(err) => f.debug_tuple("Error").field(err).finish(),
+        }
+    }
+}
+
+pub struct Client<MessageDefinitions: PayloadWireFormat> {
     interface: Ipv4Addr,
     control_sender: mpsc::Sender<inner::ControlMessage<MessageDefinitions>>,
     update_receiver: mpsc::Receiver<ClientUpdate<MessageDefinitions>>,
+}
+
+impl<MessageDefinitions: PayloadWireFormat> std::fmt::Debug for Client<MessageDefinitions> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("interface", &self.interface)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<MessageDefinitions> Client<MessageDefinitions>
@@ -91,7 +105,7 @@ where
     pub async fn send_sd_message(
         &mut self,
         target: SocketAddrV4,
-        sd_header: crate::protocol::sd::Header,
+        sd_header: <MessageDefinitions as PayloadWireFormat>::SdHeader,
     ) -> Result<(), Error> {
         let (response, message) = ControlMessage::send_sd(target, sd_header);
         self.control_sender.send(message).await.unwrap();

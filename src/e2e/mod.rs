@@ -30,8 +30,8 @@ mod e2e_protector;
 mod state;
 
 pub use config::{Profile4Config, Profile5Config};
-pub use e2e_checker::{check_profile4, check_profile5};
-pub use e2e_protector::{protect_profile4, protect_profile5};
+pub use e2e_checker::{check_profile4, check_profile5, check_profile5_with_header};
+pub use e2e_protector::{protect_profile4, protect_profile5, protect_profile5_with_header};
 pub use state::{Profile4State, Profile5State};
 
 /// Status result from E2E check operations.

@@ -16,31 +16,53 @@ use tracing::{debug, error, info, trace, warn};
 use crate::{
     Error,
     client::{ClientUpdate, socket_manager::SocketManager},
-    protocol::{Message, sd},
+    protocol::Message,
     traits::PayloadWireFormat,
 };
 
-#[derive(Debug)]
-pub(super) enum ControlMessage<MessageDefinitions> {
+pub(super) enum ControlMessage<P: PayloadWireFormat> {
     SetInterface(Ipv4Addr, oneshot::Sender<Result<(), Error>>),
     BindDiscovery(oneshot::Sender<Result<(), Error>>),
     UnbindDiscovery(oneshot::Sender<Result<(), Error>>),
     BindUnicast(oneshot::Sender<Result<u16, Error>>, Option<u16>),
     UnbindUnicast(oneshot::Sender<Result<(), Error>>),
-    SendSD(SocketAddrV4, sd::Header, oneshot::Sender<Result<(), Error>>),
+    SendSD(
+        SocketAddrV4,
+        P::SdHeader,
+        oneshot::Sender<Result<(), Error>>,
+    ),
     Send(
         SocketAddrV4,
-        Message<MessageDefinitions>,
+        Message<P>,
         u16, // source port — which unicast socket to send from
-        oneshot::Sender<Result<MessageDefinitions, Error>>,
+        oneshot::Sender<Result<P, Error>>,
     ),
-    AwaitResponse(
-        Message<MessageDefinitions>,
-        oneshot::Sender<Result<MessageDefinitions, Error>>,
-    ),
+    AwaitResponse(Message<P>, oneshot::Sender<Result<P, Error>>),
 }
 
-impl<MessageDefinitions> ControlMessage<MessageDefinitions> {
+impl<P: PayloadWireFormat> std::fmt::Debug for ControlMessage<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SetInterface(addr, _) => f.debug_tuple("SetInterface").field(addr).finish(),
+            Self::BindDiscovery(_) => f.write_str("BindDiscovery"),
+            Self::UnbindDiscovery(_) => f.write_str("UnbindDiscovery"),
+            Self::BindUnicast(_, port) => f.debug_tuple("BindUnicast").field(port).finish(),
+            Self::UnbindUnicast(_) => f.write_str("UnbindUnicast"),
+            Self::SendSD(addr, header, _) => {
+                f.debug_tuple("SendSD").field(addr).field(header).finish()
+            }
+            Self::Send(addr, msg, port, _) => f
+                .debug_tuple("Send")
+                .field(addr)
+                .field(msg)
+                .field(port)
+                .finish(),
+            Self::AwaitResponse(msg, _) => f.debug_tuple("AwaitResponse").field(msg).finish(),
+        }
+    }
+}
+
+impl<P: PayloadWireFormat> ControlMessage<P> {
     pub fn set_interface(interface: Ipv4Addr) -> (oneshot::Receiver<Result<(), Error>>, Self) {
         let (sender, receiver) = oneshot::channel();
         (receiver, Self::SetInterface(interface, sender))
@@ -67,16 +89,16 @@ impl<MessageDefinitions> ControlMessage<MessageDefinitions> {
 
     pub fn send_sd(
         socket_addr: SocketAddrV4,
-        header: sd::Header,
+        header: P::SdHeader,
     ) -> (oneshot::Receiver<Result<(), Error>>, Self) {
         let (sender, receiver) = oneshot::channel();
         (receiver, Self::SendSD(socket_addr, header, sender))
     }
     pub fn send_request(
         socket_addr: SocketAddrV4,
-        message: Message<MessageDefinitions>,
+        message: Message<P>,
         source_port: u16,
-    ) -> (oneshot::Receiver<Result<MessageDefinitions, Error>>, Self) {
+    ) -> (oneshot::Receiver<Result<P, Error>>, Self) {
         let (sender, receiver) = oneshot::channel();
         (
             receiver,
@@ -85,8 +107,7 @@ impl<MessageDefinitions> ControlMessage<MessageDefinitions> {
     }
 }
 
-#[derive(Debug)]
-pub(super) struct Inner<PayloadDefinitions> {
+pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     /// MPSC Receiver used to receive control messages from outer client
     control_receiver: Receiver<ControlMessage<PayloadDefinitions>>,
     /// The active request, if one is being served
@@ -107,6 +128,17 @@ pub(super) struct Inner<PayloadDefinitions> {
     session_counter: u16,
     /// Phantom data to represent the generic message definitions
     phantom: std::marker::PhantomData<PayloadDefinitions>,
+}
+
+impl<PayloadDefinitions: PayloadWireFormat> std::fmt::Debug for Inner<PayloadDefinitions> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("interface", &self.interface)
+            .field("run", &self.run)
+            .field("client_id", &self.client_id)
+            .field("session_counter", &self.session_counter)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<PayloadDefinitions> Inner<PayloadDefinitions>
@@ -179,7 +211,7 @@ where
 
     async fn receive_discovery(
         socket_manager: &mut Option<SocketManager<PayloadDefinitions>>,
-    ) -> Result<sd::Header, Error> {
+    ) -> Result<<PayloadDefinitions as PayloadWireFormat>::SdHeader, Error> {
         if let Some(receiver) = socket_manager {
             match receiver.receive().await {
                 Some(message) => match message {
@@ -337,7 +369,7 @@ where
                         // Set client ID (upper 16) and session ID (lower 16)
                         let request_id =
                             (u32::from(self.client_id) << 16) | u32::from(self.session_counter);
-                        message.set_session_id(request_id);
+                        message.set_request_id(request_id);
                         self.session_counter = self.session_counter.wrapping_add(1);
                         if self.session_counter == 0 {
                             self.session_counter = 1;

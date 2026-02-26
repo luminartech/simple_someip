@@ -71,6 +71,43 @@ pub fn compute_crc16_p5(data_id: u16, counter: u8, payload: &[u8]) -> u16 {
     crc
 }
 
+/// Compute CRC-16-CCITT for Profile 5 with SOME/IP upper-header prefix.
+///
+/// The 8-byte upper header (UPPER-HEADER-BITS-TO-SHIFT = 64 bits) is prepended
+/// to the CRC input before Counter + Payload + `DataID`.
+///
+/// CRC input order: `upper_header(8)` + Counter(1) + Payload(N) + DataID(2 LE)
+pub fn compute_crc16_p5_with_header(
+    data_id: u16,
+    counter: u8,
+    payload: &[u8],
+    upper_header: [u8; 8],
+) -> u16 {
+    tracing::trace!(
+        "CRC-16 Profile5 (with header): data_id=0x{:04X}, counter={}, payload_len={}, upper_header={:02X?}, payload={:02X?}",
+        data_id,
+        counter,
+        payload.len(),
+        upper_header,
+        payload
+    );
+
+    let mut digest = CRC16_CCITT.digest();
+    digest.update(&upper_header);
+    digest.update(&[counter]);
+    digest.update(payload);
+    digest.update(&data_id.to_le_bytes());
+
+    let crc = digest.finalize();
+    tracing::trace!(
+        "CRC-16 Profile5 (with header): computed CRC = 0x{:04X} (bytes: {:02X?})",
+        crc,
+        crc.to_le_bytes()
+    );
+
+    crc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +166,60 @@ mod tests {
         // Should work with empty payload
         let crc = compute_crc16_p5(0x1234, 0, b"");
         assert_ne!(crc, 0); // CRC should be non-trivial even for empty payload
+    }
+
+    #[test]
+    fn test_crc16_p5_with_header_nonzero_header_changes_crc() {
+        // A non-zero upper header must produce a different CRC than the headerless variant
+        let header = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+        let crc_no_header = compute_crc16_p5(0x1234, 0, b"test");
+        let crc_with_header = compute_crc16_p5_with_header(0x1234, 0, b"test", header);
+        assert_ne!(
+            crc_no_header, crc_with_header,
+            "Non-zero upper_header should change CRC vs headerless path"
+        );
+    }
+
+    #[test]
+    fn test_crc16_p5_with_header_different_headers_differ() {
+        let header_a = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+        let header_b = [0x00, 0x02, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00]; // single byte changed
+        let crc_a = compute_crc16_p5_with_header(0x1234, 0, b"test", header_a);
+        let crc_b = compute_crc16_p5_with_header(0x1234, 0, b"test", header_b);
+        assert_ne!(
+            crc_a, crc_b,
+            "Different upper_header should produce different CRC"
+        );
+    }
+
+    #[test]
+    fn test_crc16_p5_with_header_deterministic() {
+        let header = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+        let crc1 = compute_crc16_p5_with_header(0x1234, 0, b"test", header);
+        let crc2 = compute_crc16_p5_with_header(0x1234, 0, b"test", header);
+        assert_eq!(crc1, crc2, "Same inputs should always produce same CRC");
+    }
+
+    #[test]
+    fn test_crc16_p5_with_header_each_field_matters() {
+        let header = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+        let baseline = compute_crc16_p5_with_header(0x1234, 0, b"test", header);
+
+        let crc_diff_data_id = compute_crc16_p5_with_header(0x1235, 0, b"test", header);
+        let crc_diff_counter = compute_crc16_p5_with_header(0x1234, 1, b"test", header);
+        let crc_diff_payload = compute_crc16_p5_with_header(0x1234, 0, b"Test", header);
+
+        assert_ne!(
+            baseline, crc_diff_data_id,
+            "Different data_id should change CRC"
+        );
+        assert_ne!(
+            baseline, crc_diff_counter,
+            "Different counter should change CRC"
+        );
+        assert_ne!(
+            baseline, crc_diff_payload,
+            "Different payload should change CRC"
+        );
     }
 }

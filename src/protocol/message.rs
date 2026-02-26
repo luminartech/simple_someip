@@ -1,5 +1,5 @@
 use crate::{
-    protocol::{Error, Header, MessageType, ReturnCode, byte_order::Take, sd},
+    protocol::{Error, Header, MessageType, ReturnCode, byte_order::Take},
     traits::{PayloadWireFormat, WireFormat},
 };
 
@@ -15,10 +15,13 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
     }
 
     #[must_use]
-    pub fn new_sd(session_id: u32, sd_header: &sd::Header) -> Self {
+    pub fn new_sd(
+        request_id: u32,
+        sd_header: &<PayloadDefinition as PayloadWireFormat>::SdHeader,
+    ) -> Self {
         let sd_header_size = sd_header.required_size();
         Self::new(
-            Header::new_sd(session_id, sd_header_size),
+            Header::new_sd(request_id, sd_header_size),
             PayloadDefinition::new_sd_payload(sd_header),
         )
     }
@@ -31,11 +34,11 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
         self.header.is_sd()
     }
 
-    pub fn set_session_id(&mut self, session_id: u32) {
-        self.header.set_session_id(session_id);
+    pub fn set_request_id(&mut self, request_id: u32) {
+        self.header.set_request_id(request_id);
     }
 
-    pub fn get_sd_header(&self) -> Option<&sd::Header> {
+    pub fn get_sd_header(&self) -> Option<&<PayloadDefinition as PayloadWireFormat>::SdHeader> {
         assert!(self.header().message_id.is_sd());
         assert!(!self.header().message_type.is_tp());
         self.payload.as_sd_header()

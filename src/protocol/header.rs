@@ -14,7 +14,8 @@ pub struct Header {
     /// Length of the message in bytes, starting at the request Id
     /// Total length of the message is therefore length + 8
     pub length: u32,
-    pub session_id: u32,
+    /// SOME/IP Request ID (4 bytes): Client ID [31:16] + Session ID [15:0].
+    pub request_id: u32,
     pub protocol_version: u8,
     pub interface_version: u8,
     pub message_type: MessageTypeField,
@@ -22,12 +23,34 @@ pub struct Header {
 }
 
 impl Header {
+    /// Return the 8-byte "upper header" used by E2E UPPER-HEADER-BITS-TO-SHIFT.
+    ///
+    /// Layout (big-endian): `request_id(4)` + `protocol_version(1)` + `interface_version(1)`
+    ///                      + `message_type(1)` + `return_code(1)`
+    ///
+    /// Note: `request_id` is the full 4-byte SOME/IP Request ID field
+    /// (Client ID [31:16] + Session ID [15:0]), not just the 2-byte Session ID.
     #[must_use]
-    pub fn new_sd(session_id: u32, sd_header_size: usize) -> Self {
+    pub fn upper_header_bytes(&self) -> [u8; 8] {
+        let rid = self.request_id.to_be_bytes();
+        [
+            rid[0],
+            rid[1],
+            rid[2],
+            rid[3],
+            self.protocol_version,
+            self.interface_version,
+            u8::from(self.message_type),
+            u8::from(self.return_code),
+        ]
+    }
+
+    #[must_use]
+    pub fn new_sd(request_id: u32, sd_header_size: usize) -> Self {
         Self {
             message_id: MessageId::SD,
             length: 8 + u32::try_from(sd_header_size).expect("SD header too large"),
-            session_id,
+            request_id,
             protocol_version: 0x01,
             interface_version: 0x01,
             message_type: MessageTypeField::new_sd(),
@@ -45,8 +68,8 @@ impl Header {
         self.length as usize - 8
     }
 
-    pub fn set_session_id(&mut self, session_id: u32) {
-        self.session_id = session_id;
+    pub fn set_request_id(&mut self, request_id: u32) {
+        self.request_id = request_id;
     }
 }
 
@@ -65,7 +88,7 @@ impl WireFormat for Header {
         Ok(Self {
             message_id,
             length,
-            session_id: request_id,
+            request_id,
             protocol_version,
             interface_version,
             message_type,
@@ -80,7 +103,7 @@ impl WireFormat for Header {
     fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
         writer.write_u32_be(self.message_id.message_id())?;
         writer.write_u32_be(self.length)?;
-        writer.write_u32_be(self.session_id)?;
+        writer.write_u32_be(self.request_id)?;
         writer.write_u8(self.protocol_version)?;
         writer.write_u8(self.interface_version)?;
         writer.write_u8(u8::from(self.message_type))?;

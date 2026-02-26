@@ -1,7 +1,7 @@
 //! E2E protection functions for adding E2E headers to payloads.
 
 use super::config::{Profile4Config, Profile5Config};
-use super::crc::{compute_crc16_p5, compute_crc32_p4};
+use super::crc::{compute_crc16_p5, compute_crc16_p5_with_header, compute_crc32_p4};
 use super::state::{Profile4State, Profile5State};
 
 /// Profile 4 header size in bytes.
@@ -96,6 +96,44 @@ pub fn protect_profile5(
     // Increment counter (wraps at u8::MAX)
     state.protect_counter = state.protect_counter.wrapping_add(1);
 
+    result
+}
+
+/// Add E2E Profile 5 protection with SOME/IP upper-header in the CRC.
+///
+/// Creates a protected message with a 3-byte header prepended:
+/// - CRC (2 bytes, little-endian): CRC-16-CCITT over
+///   `upper_header(8) + Counter(1) + Payload(N) + DataID(2 LE)`
+/// - Counter (1 byte): Sequence counter from state
+///
+/// The 8-byte `upper_header` (UPPER-HEADER-BITS-TO-SHIFT = 64 bits) is the
+/// second half of the SOME/IP header: `[request_id:4 BE, proto_ver:1,
+/// iface_ver:1, msg_type:1, return_code:1]`. The state counter is incremented
+/// after each call.
+///
+/// # Arguments
+/// * `config` - Profile 5 configuration (data ID, data length, max delta counter)
+/// * `state` - Mutable state for counter tracking
+/// * `payload` - The payload data to protect
+/// * `upper_header` - 8-byte SOME/IP upper header included in the CRC
+///
+/// # Returns
+/// A new `Vec` containing the 3-byte E2E header followed by the payload.
+pub fn protect_profile5_with_header(
+    config: &Profile5Config,
+    state: &mut Profile5State,
+    payload: &[u8],
+    upper_header: [u8; 8],
+) -> Vec<u8> {
+    let counter = state.protect_counter;
+    let crc = compute_crc16_p5_with_header(config.data_id, counter, payload, upper_header);
+
+    let mut result = Vec::with_capacity(PROFILE5_HEADER_SIZE + payload.len());
+    result.extend_from_slice(&crc.to_le_bytes());
+    result.push(counter);
+    result.extend_from_slice(payload);
+
+    state.protect_counter = state.protect_counter.wrapping_add(1);
     result
 }
 

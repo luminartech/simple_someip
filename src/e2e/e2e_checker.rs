@@ -1,7 +1,7 @@
 //! E2E checking functions for validating E2E-protected payloads.
 
 use super::config::{Profile4Config, Profile5Config};
-use super::crc::{compute_crc16_p5, compute_crc32_p4};
+use super::crc::{compute_crc16_p5, compute_crc16_p5_with_header, compute_crc32_p4};
 use super::e2e_protector::{PROFILE4_HEADER_SIZE, PROFILE5_HEADER_SIZE};
 use super::state::{Profile4State, Profile5State};
 use super::{E2ECheckResult, E2ECheckStatus};
@@ -123,6 +123,62 @@ pub fn check_profile5(
     E2ECheckResult::success(status, u32::from(counter), payload.to_vec())
 }
 
+/// Check E2E Profile 5 protected data with SOME/IP upper-header in the CRC.
+///
+/// Validates the 3-byte header:
+/// - CRC (2 bytes, little-endian): Verified against CRC-16-CCITT computed over
+///   `upper_header(8) + Counter(1) + Payload(N) + DataID(2 LE)`
+/// - Counter (1 byte): Checks sequence continuity
+///
+/// The 8-byte `upper_header` (UPPER-HEADER-BITS-TO-SHIFT = 64 bits) is the
+/// second half of the SOME/IP header: `[request_id:4 BE, proto_ver:1,
+/// iface_ver:1, msg_type:1, return_code:1]`. It must match exactly what the
+/// sender included in its CRC computation, otherwise a `CrcError` is returned.
+///
+/// # Arguments
+/// * `config` - Profile 5 configuration (data ID, data length, max delta counter)
+/// * `state` - Mutable state for counter tracking
+/// * `protected` - The protected message (3-byte E2E header + payload)
+/// * `upper_header` - 8-byte SOME/IP upper header included in the CRC
+///
+/// # Returns
+/// An [`E2ECheckResult`] containing the status, counter, and extracted payload.
+pub fn check_profile5_with_header(
+    config: &Profile5Config,
+    state: &mut Profile5State,
+    protected: &[u8],
+    upper_header: [u8; 8],
+) -> E2ECheckResult {
+    if protected.len() < PROFILE5_HEADER_SIZE {
+        return E2ECheckResult::error(E2ECheckStatus::BadArgument);
+    }
+
+    let expected_total_length = PROFILE5_HEADER_SIZE + config.data_length as usize;
+    if protected.len() != expected_total_length {
+        tracing::warn!(
+            "E2E Profile 5 length mismatch: expected {} bytes (3 header + {} payload), got {} bytes",
+            expected_total_length,
+            config.data_length,
+            protected.len()
+        );
+        return E2ECheckResult::error(E2ECheckStatus::BadArgument);
+    }
+
+    let received_crc = u16::from_le_bytes([protected[0], protected[1]]);
+    let counter = protected[2];
+    let payload = &protected[PROFILE5_HEADER_SIZE..];
+
+    let computed_crc = compute_crc16_p5_with_header(config.data_id, counter, payload, upper_header);
+    if computed_crc != received_crc {
+        return E2ECheckResult::error(E2ECheckStatus::CrcError);
+    }
+
+    let status = check_sequence_profile5(state, counter, config.max_delta_counter);
+    state.last_counter = Some(counter);
+
+    E2ECheckResult::success(status, u32::from(counter), payload.to_vec())
+}
+
 /// Check sequence continuity for Profile 4 (16-bit counter).
 fn check_sequence_profile4(
     state: &Profile4State,
@@ -190,7 +246,7 @@ fn check_sequence_profile5(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::e2e::{protect_profile4, protect_profile5};
+    use crate::e2e::{protect_profile4, protect_profile5, protect_profile5_with_header};
 
     #[test]
     fn test_check_profile4_valid() {
@@ -436,5 +492,45 @@ mod tests {
             let result = check_profile5(&config, &mut check_state, &protected);
             assert_eq!(result.status, E2ECheckStatus::Ok);
         }
+    }
+
+    #[test]
+    fn test_check_profile5_with_header_roundtrip() {
+        let config = Profile5Config::new(0x1234, 20, 15);
+        let mut protect_state = Profile5State::new();
+        let mut check_state = Profile5State::new();
+
+        let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+
+        let mut payload = [0u8; 20];
+        payload[..5].copy_from_slice(b"Hello");
+
+        let protected =
+            protect_profile5_with_header(&config, &mut protect_state, &payload, upper_header);
+        let result =
+            check_profile5_with_header(&config, &mut check_state, &protected, upper_header);
+
+        assert_eq!(result.status, E2ECheckStatus::Ok);
+        assert_eq!(result.counter, Some(0));
+        assert_eq!(result.payload.as_deref(), Some(payload.as_slice()));
+    }
+
+    #[test]
+    fn test_check_profile5_with_header_mismatch_is_crc_error() {
+        let config = Profile5Config::new(0x1234, 20, 15);
+        let mut protect_state = Profile5State::new();
+        let mut check_state = Profile5State::new();
+
+        let tx_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+        let rx_header: [u8; 8] = [0x00, 0x02, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+
+        let mut payload = [0u8; 20];
+        payload[..5].copy_from_slice(b"Hello");
+
+        let protected =
+            protect_profile5_with_header(&config, &mut protect_state, &payload, tx_header);
+        let result = check_profile5_with_header(&config, &mut check_state, &protected, rx_header);
+
+        assert_eq!(result.status, E2ECheckStatus::CrcError);
     }
 }
