@@ -274,6 +274,88 @@ mod tests {
     }
 
     #[test]
+    fn test_protect_profile5_with_header_format() {
+        let config = Profile5Config::new(0x1234, 20, 15);
+        let mut state = Profile5State::new();
+
+        let payload = b"test";
+        let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+        let protected = protect_profile5_with_header(&config, &mut state, payload, upper_header);
+
+        // Check total length
+        assert_eq!(protected.len(), 3 + 4); // header + payload
+
+        // Check counter field (third byte)
+        assert_eq!(protected[2], 0);
+
+        // Check payload at end
+        assert_eq!(&protected[3..], b"test");
+    }
+
+    #[test]
+    fn test_protect_profile5_with_header_counter_increment() {
+        let config = Profile5Config::new(0x1234, 20, 15);
+        let mut state = Profile5State::new();
+
+        let payload = b"test";
+        let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+
+        for i in 0..5u8 {
+            let protected =
+                protect_profile5_with_header(&config, &mut state, payload, upper_header);
+            assert_eq!(protected[2], i);
+        }
+    }
+
+    #[test]
+    fn test_protect_profile5_with_header_counter_wraps() {
+        let config = Profile5Config::new(0x1234, 20, 15);
+        let mut state = Profile5State::with_initial_counter(u8::MAX);
+
+        let payload = b"test";
+        let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+
+        let protected = protect_profile5_with_header(&config, &mut state, payload, upper_header);
+        assert_eq!(protected[2], u8::MAX);
+
+        let protected = protect_profile5_with_header(&config, &mut state, payload, upper_header);
+        assert_eq!(protected[2], 0); // Wrapped
+    }
+
+    #[test]
+    fn test_protect_profile5_with_header_empty_payload() {
+        let config = Profile5Config::new(0x1234, 3, 15);
+        let mut state = Profile5State::new();
+
+        let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+        let protected = protect_profile5_with_header(&config, &mut state, b"", upper_header);
+        assert_eq!(protected.len(), 3); // Just header
+    }
+
+    #[test]
+    fn test_protect_profile5_with_header_differs_from_no_header() {
+        let config = Profile5Config::new(0x1234, 20, 15);
+        let mut state_a = Profile5State::new();
+        let mut state_b = Profile5State::new();
+
+        let payload = b"test";
+        let upper_header: [u8; 8] = [0x00, 0x01, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00];
+
+        let mut buf = [0u8; 256];
+        let len = protect_profile5(&config, &mut state_a, payload, &mut buf);
+        let without_header_crc = u16::from_le_bytes([buf[0], buf[1]]);
+
+        let with_header =
+            protect_profile5_with_header(&config, &mut state_b, payload, upper_header);
+        let with_header_crc = u16::from_le_bytes([with_header[0], with_header[1]]);
+
+        // Same counter and payload but different CRC due to upper_header
+        assert_eq!(buf[2], with_header[2]); // same counter
+        assert_eq!(&buf[3..len], &with_header[3..]); // same payload
+        assert_ne!(without_header_crc, with_header_crc); // different CRC
+    }
+
+    #[test]
     fn test_protect_profile4_empty_payload() {
         let config = Profile4Config::new(0x12345678, 15);
         let mut state = Profile4State::new();
