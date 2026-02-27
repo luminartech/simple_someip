@@ -3,7 +3,7 @@
 use crc::{CRC_16_IBM_3740, CRC_32_AUTOSAR, Crc};
 
 /// CRC-32P4 algorithm used by E2E Profile 4.
-/// Polynomial: 0xF4ACFB13 (AUTOSAR CRC-32)
+/// Polynomial: 0xF4ACFB13
 const CRC32_P4: Crc<u32> = Crc::<u32>::new(&CRC_32_AUTOSAR);
 
 /// CRC-16-CCITT algorithm used by E2E Profile 5.
@@ -34,7 +34,7 @@ pub fn compute_crc32_p4(length: u16, counter: u16, data_id: u32, payload: &[u8])
 
 /// Compute CRC-16-CCITT for Profile 5.
 ///
-/// Per AUTOSAR E2E Profile 5, the CRC is computed over all data bytes except the
+/// Per E2E Profile 5, the CRC is computed over all data bytes except the
 /// CRC field itself, plus the `DataID`. Specifically:
 /// - Counter (1 byte) + Payload (N bytes) + `DataID` (2 bytes, little-endian)
 ///
