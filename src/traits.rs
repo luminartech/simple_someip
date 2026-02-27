@@ -28,9 +28,9 @@ pub trait WireFormat: Send + Sized + Sync {
 /// [`Reader`](embedded_io::Read) and serialized to a [`Writer`](embedded_io::Write).
 /// Note that SOME/IP payloads are not self identifying, so the [Message ID](protocol::MessageId)
 /// must be provided by the caller after reading from the [SOME/IP header](protocol::Header).
-pub trait PayloadWireFormat: std::fmt::Debug + Send + Sized + Sync {
+pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
     /// The SD header type used by this payload implementation.
-    type SdHeader: WireFormat + Clone + std::fmt::Debug + Eq;
+    type SdHeader: WireFormat + Clone + core::fmt::Debug + Eq;
 
     /// Get the Message ID for the payload
     fn message_id(&self) -> MessageId;
