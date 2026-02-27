@@ -4,12 +4,16 @@ use thiserror::Error;
 pub enum Error {
     #[error(transparent)]
     ProtocolError(#[from] crate::protocol::Error),
+    #[cfg(feature = "std")]
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[cfg(feature = "std")]
     #[error("Unexpected discovery message: {0:?}")]
     UnexpectedDiscoveryMessage(crate::protocol::Header),
+    #[cfg(feature = "std")]
     #[error("Socket Closed Unexpectedly")]
     SocketClosedUnexpectedly,
+    #[cfg(feature = "std")]
     #[error("Unicast Socket not bound")]
     UnicastSocketNotBound,
     #[error("output buffer too small: need {needed} bytes, got {actual}")]

@@ -27,5 +27,6 @@ tracing-subscriber = "0.3"
 
 [features]
 default = ["client", "server"]
-client = ["dep:tokio", "dep:socket2"]
-server = ["dep:socket2"]
+std = []
+client = ["std", "dep:tokio", "dep:socket2"]
+server = ["std", "dep:socket2"]
