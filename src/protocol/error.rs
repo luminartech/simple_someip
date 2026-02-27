@@ -2,8 +2,8 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
+    #[error("I/O error: {0:?}")]
+    Io(embedded_io::ErrorKind),
     #[error("Invalid protocol version: {0:X}")]
     InvalidProtocolVersion(u8),
     #[error("Invalid value in MessageType field: {0:X}")]
@@ -24,12 +24,4 @@ pub enum Error {
     TooManyEntries,
     #[error("Too many SD options for fixed-capacity buffer")]
     TooManyOptions,
-    #[error("Multicast socket not connected")]
-    MulticastSocketNotConnected,
-    #[error("Unicast socket not connected")]
-    UnicastSocketNotConnected,
-    #[error("Timeout expired")]
-    Timeout,
-    #[error("Invalid value for user type: {0}, {1}")]
-    InvalidValueUserType(String, u8),
 }
