@@ -2,9 +2,9 @@
 name = "simple-someip"
 version = "0.2.0"
 edition = "2024"
-publish = false
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+license = "MIT OR Apache-2.0"
+description = "A lightweight SOME/IP serialization and communication library"
+repository = "https://github.com/luminartech/simple_someip"
 
 [dependencies]
 crc = "3.4"
