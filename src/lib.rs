@@ -35,7 +35,7 @@ pub use error::Error;
 #[cfg(feature = "server")]
 pub use server::Server;
 
-use std::net::Ipv4Addr;
+use core::net::Ipv4Addr;
 
 pub const SD_MULTICAST_IP: Ipv4Addr = Ipv4Addr::new(239, 255, 0, 255);
 pub const SD_MULTICAST_PORT: u16 = 30490;
