@@ -1,5 +1,5 @@
 use crate::protocol::Error;
-use embedded_io::Error as _; // for .kind() method
+use embedded_io::Error as _;
 
 /// Extension trait for reading big-endian integers from a byte stream.
 ///
@@ -38,11 +38,9 @@ impl<T: embedded_io::Read> ReadBytesExt for T {
     fn read_bytes(&mut self, buf: &mut [u8]) -> Result<(), Error> {
         self.read_exact(buf).map_err(|e| match e {
             embedded_io::ReadExactError::UnexpectedEof => {
-                Error::Io(std::io::ErrorKind::UnexpectedEof.into())
+                Error::Io(embedded_io::ErrorKind::Other)
             }
-            embedded_io::ReadExactError::Other(e) => {
-                Error::Io(std::io::Error::other(format!("{:?}", e.kind())))
-            }
+            embedded_io::ReadExactError::Other(e) => Error::Io(e.kind()),
         })
     }
 }
@@ -74,8 +72,7 @@ pub(crate) trait WriteBytesExt {
 
 impl<T: embedded_io::Write> WriteBytesExt for T {
     fn write_bytes(&mut self, buf: &[u8]) -> Result<(), Error> {
-        self.write_all(buf)
-            .map_err(|e| Error::Io(std::io::Error::other(format!("{:?}", e.kind()))))
+        self.write_all(buf).map_err(|e| Error::Io(e.kind()))
     }
 }
 
