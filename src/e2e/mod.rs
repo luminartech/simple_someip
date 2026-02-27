@@ -1,7 +1,7 @@
-//! AUTOSAR E2E (End-to-End) protection for SOME/IP payloads.
+//! E2E (End-to-End) protection for SOME/IP payloads.
 //!
 //! This module implements E2E Profile 4 and Profile 5 protection as specified
-//! in the AUTOSAR E2E Protocol Specification.
+//! in the [Open SOME/IP Specification](https://github.com/some-ip-com/open-someip-spec).
 //!
 //! # Example
 //!
@@ -58,7 +58,7 @@ pub enum E2ECheckStatus {
 }
 
 impl E2ECheckStatus {
-    /// Convert to a numeric return code compatible with AUTOSAR E2E.
+    /// Convert to a numeric return code compatible with E2E.
     #[must_use]
     pub fn to_return_code(self) -> u8 {
         match self {
