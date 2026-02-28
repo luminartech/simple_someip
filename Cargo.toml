@@ -30,3 +30,7 @@ default = ["client", "server"]
 std = []
 client = ["std", "dep:tokio", "dep:socket2"]
 server = ["std", "dep:socket2"]
+
+[[example]]
+name = "discovery_client"
+required-features = ["client"]
