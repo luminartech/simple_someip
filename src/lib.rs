@@ -15,10 +15,14 @@
 //!
 //! - [Open SOME/IP Specification](https://github.com/some-ip-com/open-someip-spec)
 
+#![no_std]
 #![warn(clippy::pedantic)]
 // TODO: Add `# Errors` and `# Panics` doc sections in a follow-up PR.
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
+
+#[cfg(feature = "std")]
+extern crate std;
 
 #[cfg(feature = "client")]
 mod client;

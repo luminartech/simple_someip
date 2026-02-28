@@ -5,7 +5,9 @@ use crate::{
 };
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
+    prelude::rust_2024::*,
     task::{Context, Poll},
+    vec,
 };
 use tokio::{net::UdpSocket, select, sync::mpsc};
 use tracing::{error, info, trace};
