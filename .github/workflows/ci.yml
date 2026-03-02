@@ -62,10 +62,21 @@ jobs:
           components: llvm-tools
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall cargo-nextest
       - run: cargo test --no-default-features
-      - run: cargo llvm-cov --all-features --lcov --output-path lcov.info
-      - uses: codecov/codecov-action@v5
+      - run: cargo llvm-cov nextest --all-features --lcov --output-path ./target/lcov.info
+      - name: Upload Coverage report
+        uses: codecov/codecov-action@v5
         with:
-          files: lcov.info
+          report_type: coverage
+          files: ./target/lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
+      - name: Upload test results to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          report_type: test_results
+          files: ./target/nextest/default/junit.xml
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true

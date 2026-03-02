@@ -1,0 +1,12 @@
+[profile.default]
+
+# Server tests all bind the SD multicast port (30490) and must run serially.
+[[profile.default.overrides]]
+filter = 'test(server::tests::)'
+test-group = 'serial-sd-port'
+
+[test-groups]
+serial-sd-port = { max-threads = 1 }
+
+[profile.default.junit]  # Output the junit coverage for tools
+path = "junit.xml"
