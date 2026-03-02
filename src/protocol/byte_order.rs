@@ -109,9 +109,6 @@ impl<R: embedded_io::Read> embedded_io::Read for Take<'_, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "std")]
-    use std::vec::Vec;
-
     // Minimal reader/writer stubs that always return an I/O error.
     struct FailingReader;
 
@@ -220,36 +217,32 @@ mod tests {
 
     // --- WriteBytesExt happy path ---
 
-    #[cfg(feature = "std")]
     #[test]
     fn write_u8_encodes_correctly() {
-        let mut out = Vec::new();
-        out.write_u8(0xAB).unwrap();
-        assert_eq!(out, [0xAB]);
+        let mut buf = [0u8; 1];
+        buf.as_mut_slice().write_u8(0xAB).unwrap();
+        assert_eq!(buf, [0xAB]);
     }
 
-    #[cfg(feature = "std")]
     #[test]
     fn write_u16_be_encodes_correctly() {
-        let mut out = Vec::new();
-        out.write_u16_be(0x0102).unwrap();
-        assert_eq!(out, [0x01, 0x02]);
+        let mut buf = [0u8; 2];
+        buf.as_mut_slice().write_u16_be(0x0102).unwrap();
+        assert_eq!(buf, [0x01, 0x02]);
     }
 
-    #[cfg(feature = "std")]
     #[test]
     fn write_u24_be_encodes_correctly() {
-        let mut out = Vec::new();
-        out.write_u24_be(0x0001_0203).unwrap();
-        assert_eq!(out, [0x01, 0x02, 0x03]);
+        let mut buf = [0u8; 3];
+        buf.as_mut_slice().write_u24_be(0x0001_0203).unwrap();
+        assert_eq!(buf, [0x01, 0x02, 0x03]);
     }
 
-    #[cfg(feature = "std")]
     #[test]
     fn write_u32_be_encodes_correctly() {
-        let mut out = Vec::new();
-        out.write_u32_be(0x0102_0304).unwrap();
-        assert_eq!(out, [0x01, 0x02, 0x03, 0x04]);
+        let mut buf = [0u8; 4];
+        buf.as_mut_slice().write_u32_be(0x0102_0304).unwrap();
+        assert_eq!(buf, [0x01, 0x02, 0x03, 0x04]);
     }
 
     // --- Take ---
