@@ -167,3 +167,175 @@ impl Options {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use core::net::Ipv4Addr;
+
+    use super::*;
+    use crate::protocol::Error;
+
+    // --- TransportProtocol ---
+
+    #[test]
+    fn transport_protocol_tcp_round_trip() {
+        assert_eq!(
+            TransportProtocol::try_from(0x06).unwrap(),
+            TransportProtocol::Tcp
+        );
+        assert_eq!(u8::from(TransportProtocol::Tcp), 0x06);
+    }
+
+    #[test]
+    fn transport_protocol_invalid_returns_error() {
+        assert!(matches!(
+            TransportProtocol::try_from(0xFF),
+            Err(Error::InvalidSDOptionTransportProtocol(0xFF))
+        ));
+    }
+
+    // --- Options::read: success paths ---
+
+    #[test]
+    fn options_read_ipv4_endpoint_tcp() {
+        let buf: [u8; 12] = [
+            0x00, 0x09, // length = 9
+            0x04, // type = IpV4Endpoint
+            0x00, // discard flag
+            192, 168, 0, 1,    // ip
+            0x00, // reserved
+            0x06, // protocol = TCP
+            0x04, 0xD2, // port = 1234
+        ];
+        let opt = Options::read(&mut &buf[..]).unwrap();
+        assert_eq!(
+            opt,
+            Options::IpV4Endpoint {
+                ip: Ipv4Addr::new(192, 168, 0, 1),
+                protocol: TransportProtocol::Tcp,
+                port: 1234,
+            }
+        );
+    }
+
+    #[test]
+    fn options_read_invalid_option_type_returns_error() {
+        let buf: [u8; 4] = [0x00, 0x00, 0xFF, 0x00]; // type = 0xFF (invalid)
+        assert!(matches!(
+            Options::read(&mut &buf[..]),
+            Err(Error::InvalidSDOptionType(0xFF))
+        ));
+    }
+
+    #[test]
+    fn options_read_invalid_protocol_returns_error() {
+        let buf: [u8; 12] = [
+            0x00, 0x09, // length = 9
+            0x04, // type = IpV4Endpoint
+            0x00, // discard flag
+            127, 0, 0, 1,    // ip
+            0x00, // reserved
+            0xAB, // invalid protocol
+            0x00, 0x50, // port = 80
+        ];
+        assert!(matches!(
+            Options::read(&mut &buf[..]),
+            Err(Error::InvalidSDOptionTransportProtocol(0xAB))
+        ));
+    }
+
+    // --- Options::size: todo! branches (std only — requires catch_unwind) ---
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn options_size_configuration_panics() {
+        let _ = Options::Configuration.size();
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn options_size_load_balancing_panics() {
+        let _ = Options::LoadBalancing.size();
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn options_size_ipv6_endpoint_panics() {
+        let _ = Options::IpV6Endpoint.size();
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn options_size_ipv4_multicast_panics() {
+        let _ = Options::IpV4Multicast.size();
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn options_size_ipv6_multicast_panics() {
+        let _ = Options::IpV6Multicast.size();
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn options_size_ipv4_sd_panics() {
+        let _ = Options::IpV4SD.size();
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn options_size_ipv6_sd_panics() {
+        let _ = Options::IpV6SD.size();
+    }
+
+    // --- Options::read: todo! branches (std only — requires catch_unwind) ---
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn options_read_configuration_panics() {
+        let buf: [u8; 4] = [0x00, 0x00, 0x01, 0x00];
+        let _ = Options::read(&mut &buf[..]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn options_read_load_balancing_panics() {
+        let buf: [u8; 4] = [0x00, 0x00, 0x02, 0x00];
+        let _ = Options::read(&mut &buf[..]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn options_read_ipv6_endpoint_panics() {
+        let buf: [u8; 4] = [0x00, 0x00, 0x06, 0x00];
+        let _ = Options::read(&mut &buf[..]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn options_read_ipv4_multicast_panics() {
+        let buf: [u8; 4] = [0x00, 0x00, 0x14, 0x00];
+        let _ = Options::read(&mut &buf[..]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn options_read_ipv6_multicast_panics() {
+        let buf: [u8; 4] = [0x00, 0x00, 0x16, 0x00];
+        let _ = Options::read(&mut &buf[..]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn options_read_ipv4_sd_panics() {
+        let buf: [u8; 4] = [0x00, 0x00, 0x24, 0x00];
+        let _ = Options::read(&mut &buf[..]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet implemented")]
+    fn options_read_ipv6_sd_panics() {
+        let buf: [u8; 4] = [0x00, 0x00, 0x26, 0x00];
+        let _ = Options::read(&mut &buf[..]);
+    }
+}
