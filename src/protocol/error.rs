@@ -4,6 +4,8 @@ use thiserror::Error;
 pub enum Error {
     #[error("I/O error: {0:?}")]
     Io(embedded_io::ErrorKind),
+    #[error("Unexpected end of input")]
+    UnexpectedEof,
     #[error("Invalid protocol version: {0:X}")]
     InvalidProtocolVersion(u8),
     #[error("Invalid value in MessageType field: {0:X}")]

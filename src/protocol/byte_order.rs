@@ -37,7 +37,7 @@ pub(crate) trait ReadBytesExt {
 impl<T: embedded_io::Read> ReadBytesExt for T {
     fn read_bytes(&mut self, buf: &mut [u8]) -> Result<(), Error> {
         self.read_exact(buf).map_err(|e| match e {
-            embedded_io::ReadExactError::UnexpectedEof => Error::Io(embedded_io::ErrorKind::Other),
+            embedded_io::ReadExactError::UnexpectedEof => Error::UnexpectedEof,
             embedded_io::ReadExactError::Other(e) => Error::Io(e.kind()),
         })
     }
