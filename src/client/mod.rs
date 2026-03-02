@@ -136,3 +136,98 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::DiscoveryOnlyPayload;
+    use std::format;
+
+    type TestClient = Client<DiscoveryOnlyPayload>;
+
+    #[tokio::test]
+    async fn test_client_new_and_interface() {
+        let client = TestClient::new(Ipv4Addr::LOCALHOST);
+        assert_eq!(client.interface(), Ipv4Addr::LOCALHOST);
+        client.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn test_client_debug() {
+        let client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let debug_str = format!("{client:?}");
+        assert!(debug_str.contains("Client"));
+        assert!(debug_str.contains("127.0.0.1"));
+        client.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn test_client_update_debug() {
+        use crate::protocol::sd;
+
+        // DiscoveryUpdated
+        let sd_header = sd::Header::new_find_services(false, &[]);
+        let update: ClientUpdate<DiscoveryOnlyPayload> = ClientUpdate::DiscoveryUpdated(sd_header);
+        let debug_str = format!("{update:?}");
+        assert!(debug_str.contains("DiscoveryUpdated"));
+
+        // Unicast
+        let msg = crate::protocol::Message::new_sd(1, &sd::Header::new_find_services(false, &[]));
+        let update: ClientUpdate<DiscoveryOnlyPayload> = ClientUpdate::Unicast(msg);
+        let debug_str = format!("{update:?}");
+        assert!(debug_str.contains("Unicast"));
+
+        // Error
+        let update: ClientUpdate<DiscoveryOnlyPayload> =
+            ClientUpdate::Error(Error::UnicastSocketNotBound);
+        let debug_str = format!("{update:?}");
+        assert!(debug_str.contains("Error"));
+    }
+
+    #[tokio::test]
+    async fn test_bind_unbind_unicast() {
+        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let port = client.bind_unicast().await.unwrap();
+        assert!(port > 0);
+        client.unbind_unicast().await.unwrap();
+        client.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn test_bind_unicast_with_port_none() {
+        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let port = client.bind_unicast_with_port(None).await.unwrap();
+        assert!(port > 0);
+        client.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn test_bind_discovery_and_unbind() {
+        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        client.bind_discovery().await.unwrap();
+        client.unbind_discovery().await.unwrap();
+        client.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn test_set_interface() {
+        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let new_addr = Ipv4Addr::LOCALHOST;
+        client.set_interface(new_addr).await.unwrap();
+        assert_eq!(client.interface(), new_addr);
+        client.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn test_send_message_no_unicast_bound() {
+        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345);
+        let msg = crate::protocol::Message::new_sd(
+            1,
+            &crate::protocol::sd::Header::new_find_services(false, &[]),
+        );
+        let result = client.send_message(target, msg, 9999).await;
+        assert!(result.is_err());
+        client.shut_down().await;
+    }
+}
