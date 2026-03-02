@@ -152,17 +152,15 @@ mod tests {
         assert!(matches!(err, protocol::Error::UnsupportedMessageID(_)));
     }
 
-    #[cfg(feature = "std")]
     #[test]
     fn encode_decode_round_trip() {
         let header: sd::Header<1, 0> = sd::Header::new_find_services(true, &[0x5B]);
         let payload = DiscoveryOnlyPayload::new_sd_payload(&header);
-        let mut buf = std::vec::Vec::new();
-        let n = payload.encode(&mut buf).unwrap();
+        let mut buf = [0u8; 28]; // required_size: 12 overhead + 16 entry = 28
+        let n = payload.encode(&mut buf.as_mut_slice()).unwrap();
         assert_eq!(n, payload.required_size());
         let decoded =
-            DiscoveryOnlyPayload::decode_with_message_id(MessageId::SD, &mut buf.as_slice())
-                .unwrap();
+            DiscoveryOnlyPayload::decode_with_message_id(MessageId::SD, &mut &buf[..]).unwrap();
         assert_eq!(decoded, payload);
     }
 }
