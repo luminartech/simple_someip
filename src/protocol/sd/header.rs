@@ -162,6 +162,130 @@ impl<const E: usize, const O: usize> Header<E, O> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use core::net::Ipv4Addr;
+
+    use super::*;
+    use crate::{protocol::Error, traits::WireFormat};
+
+    fn ipv4_endpoint_bytes(ip: [u8; 4], protocol: u8, port: u16) -> [u8; 12] {
+        let mut b = [0u8; 12];
+        b[0] = 0x00;
+        b[1] = 0x09; // length = 9 (size - 3)
+        b[2] = 0x04; // type = IpV4Endpoint
+        b[3] = 0x00; // discard flag = 0
+        b[4..8].copy_from_slice(&ip);
+        b[8] = 0x00; // reserved
+        b[9] = protocol;
+        b[10] = (port >> 8) as u8;
+        b[11] = (port & 0xFF) as u8;
+        b
+    }
+
+    fn raw_header(entries_size: u32, options_size: u32) -> [u8; 12] {
+        let mut b = [0u8; 12];
+        // flags = 0, reserved = 0
+        b[4..8].copy_from_slice(&entries_size.to_be_bytes());
+        b[8..12].copy_from_slice(&options_size.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn header_new_stores_fields() {
+        let flags = Flags::new_sd(true);
+        let entries: SdEntries<1> = SdEntries::new();
+        let options: SdOptions<1> = SdOptions::new();
+        let h = Header::new(flags, entries.clone(), options.clone());
+        assert_eq!(h.flags, flags);
+        assert_eq!(h.entries, entries);
+        assert_eq!(h.options, options);
+    }
+
+    #[test]
+    fn new_service_offer_round_trips() {
+        let ip = Ipv4Addr::new(192, 168, 1, 10);
+        let h: Header<1, 1> = Header::new_service_offer(
+            0x1234,
+            0x0001,
+            1,
+            0,
+            0xFFFFFF,
+            ip,
+            TransportProtocol::Udp,
+            30509,
+        );
+        // required_size: 12 (overhead) + 16 (entry) + 12 (IpV4Endpoint option) = 40
+        assert_eq!(h.required_size(), 40);
+        let mut buf = [0u8; 64];
+        h.encode(&mut buf.as_mut_slice()).unwrap();
+        let decoded = Header::<1, 1>::decode(&mut &buf[..h.required_size()]).unwrap();
+        assert_eq!(decoded, h);
+    }
+
+    #[test]
+    fn subscribe_ack_round_trips() {
+        let h: Header<1, 0> = Header::subscribe_ack(0xAAAA, 0x0001, 1, 0xFFFFFF, 0x0010);
+        // required_size: 12 (overhead) + 16 (entry) = 28
+        assert_eq!(h.required_size(), 28);
+        let mut buf = [0u8; 32];
+        h.encode(&mut buf.as_mut_slice()).unwrap();
+        let decoded = Header::<1, 0>::decode(&mut &buf[..h.required_size()]).unwrap();
+        assert_eq!(decoded, h);
+    }
+
+    #[test]
+    fn decode_options_size_below_minimum_returns_error() {
+        // options_size = 2 < MIN_OPTION_SIZE (4): error triggered before any option read
+        let prefix = raw_header(0, 2);
+        assert!(matches!(
+            Header::<1, 1>::decode(&mut &prefix[..]),
+            Err(Error::IncorrectOptionsSize(2))
+        ));
+    }
+
+    #[test]
+    fn decode_option_size_exceeds_declared_remaining_returns_error() {
+        // options_size = 5 but IpV4Endpoint occupies 12 bytes → 12 > 5
+        let prefix = raw_header(0, 5);
+        let option = ipv4_endpoint_bytes([127, 0, 0, 1], 0x11, 1234);
+        let mut buf = [0u8; 24];
+        buf[..12].copy_from_slice(&prefix);
+        buf[12..24].copy_from_slice(&option);
+        assert!(matches!(
+            Header::<1, 1>::decode(&mut &buf[..]),
+            Err(Error::IncorrectOptionsSize(5))
+        ));
+    }
+
+    #[test]
+    fn decode_too_many_entries_returns_error() {
+        // Encode with capacity 2, then decode with capacity 1
+        let h: Header<2, 0> = Header::new_find_services(false, &[0x0001, 0x0002]);
+        let mut buf = [0u8; 64];
+        h.encode(&mut buf.as_mut_slice()).unwrap();
+        assert!(matches!(
+            Header::<1, 0>::decode(&mut &buf[..h.required_size()]),
+            Err(Error::TooManyEntries)
+        ));
+    }
+
+    #[test]
+    fn decode_too_many_options_returns_error() {
+        // Two IpV4Endpoint options (24 bytes total); decode with capacity 1 → TooManyOptions
+        let prefix = raw_header(0, 24);
+        let option = ipv4_endpoint_bytes([192, 168, 0, 1], 0x11, 8080);
+        let mut buf = [0u8; 36];
+        buf[..12].copy_from_slice(&prefix);
+        buf[12..24].copy_from_slice(&option);
+        buf[24..36].copy_from_slice(&option);
+        assert!(matches!(
+            Header::<0, 1>::decode(&mut &buf[..]),
+            Err(Error::TooManyOptions)
+        ));
+    }
+}
+
 impl<const E: usize, const O: usize> WireFormat for Header<E, O> {
     fn decode<T: embedded_io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
         const MIN_OPTION_SIZE: usize = 4;
