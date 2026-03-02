@@ -155,7 +155,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn encode_decode_round_trip() {
-        let header = sd::Header::new_find_services(true, &[0x5B]);
+        let header: sd::Header<1, 0> = sd::Header::new_find_services(true, &[0x5B]);
         let payload = DiscoveryOnlyPayload::new_sd_payload(&header);
         let mut buf = std::vec::Vec::new();
         let n = payload.encode(&mut buf).unwrap();
