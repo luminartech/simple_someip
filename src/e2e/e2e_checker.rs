@@ -537,6 +537,112 @@ mod tests {
     }
 
     #[test]
+    fn test_check_profile5_length_mismatch() {
+        // Config expects data_length=20, so total = 3 + 20 = 23 bytes.
+        // Pass a buffer that's >= 3 bytes but != 23 to hit the length mismatch path.
+        let config = Profile5Config::new(0x1234, 20, 15);
+        let mut check_state = Profile5State::new();
+
+        let buf = [0u8; 10]; // 10 != 23
+        let result = check_profile5(&config, &mut check_state, &buf);
+        assert_eq!(result.status, E2ECheckStatus::BadArgument);
+    }
+
+    #[test]
+    fn test_check_profile5_with_header_too_short() {
+        let config = Profile5Config::new(0x1234, 20, 15);
+        let mut check_state = Profile5State::new();
+        let upper_header: [u8; 8] = [0; 8];
+
+        let buf = [0u8; 2]; // Less than 3-byte header
+        let result = check_profile5_with_header(&config, &mut check_state, &buf, upper_header);
+        assert_eq!(result.status, E2ECheckStatus::BadArgument);
+    }
+
+    #[test]
+    fn test_check_profile5_with_header_length_mismatch() {
+        let config = Profile5Config::new(0x1234, 20, 15);
+        let mut check_state = Profile5State::new();
+        let upper_header: [u8; 8] = [0; 8];
+
+        let buf = [0u8; 10]; // >= 3 but != 23
+        let result = check_profile5_with_header(&config, &mut check_state, &buf, upper_header);
+        assert_eq!(result.status, E2ECheckStatus::BadArgument);
+    }
+
+    #[test]
+    fn test_profile5_sequence_some_lost() {
+        let config = Profile5Config::new(0x1234, 20, 10);
+        let mut protect_state = Profile5State::new();
+        let mut check_state = Profile5State::new();
+
+        let mut payload = [0u8; 20];
+        payload[..4].copy_from_slice(b"test");
+        let mut buf = [0u8; 256];
+
+        // First message
+        let len = protect_profile5(&config, &mut protect_state, &payload, &mut buf).unwrap();
+        let result = check_profile5(&config, &mut check_state, &buf[..len]);
+        assert_eq!(result.status, E2ECheckStatus::Ok);
+
+        // Skip 5 messages
+        for _ in 0..5 {
+            protect_profile5(&config, &mut protect_state, &payload, &mut buf).unwrap();
+        }
+
+        // Check with gap of 6 (within max_delta of 10)
+        let len = protect_profile5(&config, &mut protect_state, &payload, &mut buf).unwrap();
+        let result = check_profile5(&config, &mut check_state, &buf[..len]);
+        assert_eq!(result.status, E2ECheckStatus::OkSomeLost);
+    }
+
+    #[test]
+    fn test_profile5_sequence_wrong_sequence() {
+        let config = Profile5Config::new(0x1234, 20, 3);
+        let mut protect_state = Profile5State::new();
+        let mut check_state = Profile5State::new();
+
+        let mut payload = [0u8; 20];
+        payload[..4].copy_from_slice(b"test");
+        let mut buf = [0u8; 256];
+
+        // First message
+        let len = protect_profile5(&config, &mut protect_state, &payload, &mut buf).unwrap();
+        let result = check_profile5(&config, &mut check_state, &buf[..len]);
+        assert_eq!(result.status, E2ECheckStatus::Ok);
+
+        // Skip 10 messages (exceeds max_delta of 3)
+        for _ in 0..10 {
+            protect_profile5(&config, &mut protect_state, &payload, &mut buf).unwrap();
+        }
+
+        let len = protect_profile5(&config, &mut protect_state, &payload, &mut buf).unwrap();
+        let result = check_profile5(&config, &mut check_state, &buf[..len]);
+        assert_eq!(result.status, E2ECheckStatus::WrongSequence);
+    }
+
+    #[test]
+    fn test_profile5_sequence_repeated() {
+        let config = Profile5Config::new(0x1234, 20, 15);
+        let mut protect_state = Profile5State::new();
+        let mut check_state = Profile5State::new();
+
+        let mut payload = [0u8; 20];
+        payload[..4].copy_from_slice(b"test");
+        let mut buf = [0u8; 256];
+
+        let len = protect_profile5(&config, &mut protect_state, &payload, &mut buf).unwrap();
+
+        // First check
+        let result = check_profile5(&config, &mut check_state, &buf[..len]);
+        assert_eq!(result.status, E2ECheckStatus::Ok);
+
+        // Replay same message
+        let result = check_profile5(&config, &mut check_state, &buf[..len]);
+        assert_eq!(result.status, E2ECheckStatus::Repeated);
+    }
+
+    #[test]
     fn test_check_profile5_with_header_mismatch_is_crc_error() {
         let config = Profile5Config::new(0x1234, 20, 15);
         let mut protect_state = Profile5State::new();
