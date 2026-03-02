@@ -456,6 +456,19 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
+    fn test_protect_profile4_length_overflow() {
+        let config = Profile4Config::new(0x12345678, 15);
+        let mut state = Profile4State::new();
+
+        // payload of 65536 bytes => total = 12 + 65536 = 65548 > u16::MAX
+        let payload = std::vec![0u8; 65536];
+        let mut buf = std::vec![0u8; 65536 + 12];
+        let err = protect_profile4(&config, &mut state, &payload, &mut buf).unwrap_err();
+        assert!(matches!(err, crate::Error::BufferTooSmall { .. }));
+    }
+
+    #[test]
     fn test_protect_profile4_empty_payload() {
         let config = Profile4Config::new(0x12345678, 15);
         let mut state = Profile4State::new();
