@@ -62,6 +62,8 @@ where
             Some(socket2::Protocol::UDP),
         )?;
         socket.set_reuse_address(true)?;
+        #[cfg(unix)]
+        socket.set_reuse_port(true)?;
         socket.bind(&bind_addr.into())?;
         socket.set_nonblocking(true)?;
         let socket: std::net::UdpSocket = socket.into();

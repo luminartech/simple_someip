@@ -1,8 +1,9 @@
 [profile.default]
 
-# Server tests all bind the SD multicast port (30490) and must run serially.
+# Server tests and client-server integration tests all bind the SD multicast
+# port (30490) and must run serially.
 [[profile.default.overrides]]
-filter = 'test(server::tests::)'
+filter = 'test(server::tests::) | binary(client_server)'
 test-group = 'serial-sd-port'
 
 [test-groups]

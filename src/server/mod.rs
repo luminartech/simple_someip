@@ -113,6 +113,8 @@ impl<const E: usize, const O: usize> Server<E, O> {
             Some(socket2::Protocol::UDP),
         )?;
         sd_raw_socket.set_reuse_address(true)?;
+        #[cfg(unix)]
+        sd_raw_socket.set_reuse_port(true)?;
         sd_raw_socket.bind(&sd_bind_addr.into())?;
         sd_raw_socket.set_nonblocking(true)?;
         let sd_std_socket: std::net::UdpSocket = sd_raw_socket.into();
@@ -372,6 +374,16 @@ impl<const E: usize, const O: usize> Server<E, O> {
     #[must_use]
     pub fn publisher(&self) -> Arc<EventPublisher> {
         Arc::clone(&self.publisher)
+    }
+
+    /// Get the local address of the unicast socket.
+    pub fn unicast_local_addr(&self) -> Result<std::net::SocketAddr, std::io::Error> {
+        self.unicast_socket.local_addr()
+    }
+
+    /// Update the configured local port (useful after binding to ephemeral port 0).
+    pub fn set_local_port(&mut self, port: u16) {
+        self.config.local_port = port;
     }
 
     /// Run the server event loop
@@ -754,13 +766,12 @@ mod tests {
         // Use port 0 to get an ephemeral port
         let config = ServerConfig::new(Ipv4Addr::new(127, 0, 0, 1), 0, service_id, instance_id);
         let mut server: Server = Server::new(config).await.expect("Failed to create server");
-        let local_addr = server.unicast_socket.local_addr().unwrap();
-        let port = match local_addr {
+        let port = match server.unicast_local_addr().unwrap() {
             std::net::SocketAddr::V4(addr) => addr.port(),
             _ => panic!("Expected IPv4 address"),
         };
         // Update config to reflect actual bound port
-        server.config.local_port = port;
+        server.set_local_port(port);
         (server, port)
     }
 
