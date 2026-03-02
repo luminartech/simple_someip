@@ -1,8 +1,7 @@
 //! Manages event group subscriptions
 
 use super::service_info::Subscriber;
-use std::collections::HashMap;
-use std::net::SocketAddrV4;
+use std::{collections::HashMap, net::SocketAddrV4, prelude::rust_2024::*};
 
 /// Manages subscriptions to event groups
 #[derive(Debug)]

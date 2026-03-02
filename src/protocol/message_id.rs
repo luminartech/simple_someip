@@ -83,8 +83,8 @@ impl MessageId {
     }
 }
 
-impl std::fmt::Debug for MessageId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for MessageId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
             "Message Id: {{ service_id: {:#02X}, method_id: {:#02X} }}",

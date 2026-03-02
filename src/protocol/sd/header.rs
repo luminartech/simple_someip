@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use core::net::Ipv4Addr;
 
 use crate::protocol::byte_order::{ReadBytesExt, WriteBytesExt};
 

@@ -15,10 +15,14 @@
 //!
 //! - [Open SOME/IP Specification](https://github.com/some-ip-com/open-someip-spec)
 
+#![no_std]
 #![warn(clippy::pedantic)]
 // TODO: Add `# Errors` and `# Panics` doc sections in a follow-up PR.
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
+
+#[cfg(feature = "std")]
+extern crate std;
 
 #[cfg(feature = "client")]
 mod client;
@@ -35,7 +39,7 @@ pub use error::Error;
 #[cfg(feature = "server")]
 pub use server::Server;
 
-use std::net::Ipv4Addr;
+use core::net::Ipv4Addr;
 
 pub const SD_MULTICAST_IP: Ipv4Addr = Ipv4Addr::new(239, 255, 0, 255);
 pub const SD_MULTICAST_PORT: u16 = 30490;

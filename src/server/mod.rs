@@ -14,15 +14,20 @@ pub use event_publisher::EventPublisher;
 pub use service_info::{EventGroupInfo, ServiceInfo};
 pub use subscription_manager::SubscriptionManager;
 
-use crate::Error;
-use crate::protocol::sd::{
-    self, Entry, Flags, OptionsCount, SdEntries, SdOptions, ServiceEntry, TransportProtocol,
+use crate::{
+    Error,
+    protocol::sd::{
+        self, Entry, Flags, OptionsCount, SdEntries, SdOptions, ServiceEntry, TransportProtocol,
+    },
 };
-use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
-use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
+use core::sync::atomic::Ordering;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddrV4},
+    prelude::rust_2024::*,
+    sync::{Arc, atomic::AtomicU16},
+    vec,
+};
+use tokio::{net::UdpSocket, sync::RwLock};
 
 /// Compute the SOME/IP header `length` field (payload + 8 bytes of header overhead).
 ///
@@ -404,7 +409,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
             }
 
             tracing::trace!("Received {} bytes from {} on {} socket", len, addr, source);
-            tracing::trace!("Raw data: {:02X?}", &data[..len.min(64)]);
+            tracing::trace!("Raw data: {:02X?}", &data[..len.min(64_usize)]);
 
             // Try to parse as SOME/IP message
             let mut reader = data;
@@ -696,6 +701,7 @@ mod tests {
         Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode,
     };
     use crate::traits::WireFormat;
+    use std::format;
 
     /// All server tests bind the SD multicast port (30490), so they must run
     /// serially to avoid `AddrInUse` failures.
