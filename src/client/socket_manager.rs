@@ -221,3 +221,98 @@ where
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::DiscoveryOnlyPayload;
+
+    type TestSocketManager = SocketManager<DiscoveryOnlyPayload>;
+
+    #[tokio::test]
+    async fn test_bind_ephemeral_port() {
+        let sm = TestSocketManager::bind(0).unwrap();
+        assert!(sm.port() > 0);
+        assert_eq!(sm.session_id(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_new() {
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
+        let msg = Message::new_sd(
+            1,
+            &crate::protocol::sd::Header::new_find_services(false, &[]),
+        );
+        let (rx, send_msg) = SendMessage::<DiscoveryOnlyPayload>::new(target, msg);
+        assert_eq!(send_msg.target_addr, target);
+        // Verify the oneshot channel works
+        send_msg.response.send(Ok(())).unwrap();
+        assert!(rx.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_socket_manager_shut_down() {
+        let sm = TestSocketManager::bind(0).unwrap();
+        sm.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn test_socket_manager_send_and_receive() {
+        let mut sm = TestSocketManager::bind(0).unwrap();
+        let sm_port = sm.port();
+
+        // Create a raw UDP socket to send data to the SocketManager
+        let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Build and encode an SD message
+        let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
+        let msg = Message::<DiscoveryOnlyPayload>::new_sd(1, &sd_header);
+        let mut buf = vec![0u8; 128];
+        let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
+
+        // Send raw bytes to the SocketManager's port
+        raw_socket
+            .send_to(&buf[..n], SocketAddrV4::new(Ipv4Addr::LOCALHOST, sm_port))
+            .await
+            .unwrap();
+
+        // Receive the decoded message from the SocketManager
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), sm.receive())
+            .await
+            .expect("Timed out waiting for message");
+
+        let received = result.unwrap().unwrap();
+        assert_eq!(received.header().message_id, msg.header().message_id);
+        assert!(received.is_sd());
+    }
+
+    #[tokio::test]
+    async fn test_socket_manager_send_to_target() {
+        let mut sm = TestSocketManager::bind(0).unwrap();
+
+        // Create a raw socket to receive
+        let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let raw_port = raw_socket.local_addr().unwrap().port();
+
+        let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
+        let msg = Message::<DiscoveryOnlyPayload>::new_sd(1, &sd_header);
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_port);
+
+        sm.send(target, msg.clone()).await.unwrap();
+        assert_eq!(sm.session_id(), 1);
+
+        // Verify the raw socket received data
+        let mut recv_buf = vec![0u8; 1400];
+        let (len, _addr) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            raw_socket.recv_from(&mut recv_buf),
+        )
+        .await
+        .expect("Timed out waiting for sent data")
+        .unwrap();
+
+        // Decode and verify
+        let decoded = Message::<DiscoveryOnlyPayload>::decode(&mut &recv_buf[..len]).unwrap();
+        assert_eq!(decoded.header().message_id, msg.header().message_id);
+    }
+}
