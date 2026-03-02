@@ -109,6 +109,7 @@ impl<R: embedded_io::Read> embedded_io::Read for Take<'_, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "std")]
     use std::vec::Vec;
 
     // Minimal reader/writer stubs that always return an I/O error.
@@ -219,6 +220,7 @@ mod tests {
 
     // --- WriteBytesExt happy path ---
 
+    #[cfg(feature = "std")]
     #[test]
     fn write_u8_encodes_correctly() {
         let mut out = Vec::new();
@@ -226,6 +228,7 @@ mod tests {
         assert_eq!(out, [0xAB]);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn write_u16_be_encodes_correctly() {
         let mut out = Vec::new();
@@ -233,6 +236,7 @@ mod tests {
         assert_eq!(out, [0x01, 0x02]);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn write_u24_be_encodes_correctly() {
         let mut out = Vec::new();
@@ -240,6 +244,7 @@ mod tests {
         assert_eq!(out, [0x01, 0x02, 0x03]);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn write_u32_be_encodes_correctly() {
         let mut out = Vec::new();
