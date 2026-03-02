@@ -495,3 +495,102 @@ where
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::DiscoveryOnlyPayload;
+    use std::format;
+
+    type TestControl = ControlMessage<DiscoveryOnlyPayload>;
+
+    #[test]
+    fn test_control_message_constructors() {
+        // Each constructor returns (oneshot::Receiver, ControlMessage)
+        let (_rx, msg) = TestControl::set_interface(Ipv4Addr::LOCALHOST);
+        assert!(matches!(msg, ControlMessage::SetInterface(..)));
+
+        let (_rx, msg) = TestControl::bind_discovery();
+        assert!(matches!(msg, ControlMessage::BindDiscovery(..)));
+
+        let (_rx, msg) = TestControl::unbind_discovery();
+        assert!(matches!(msg, ControlMessage::UnbindDiscovery(..)));
+
+        let (_rx, msg) = TestControl::bind_unicast_with_port(Some(0));
+        assert!(matches!(msg, ControlMessage::BindUnicast(..)));
+
+        let (_rx, msg) = TestControl::unbind_unicast();
+        assert!(matches!(msg, ControlMessage::UnbindUnicast(..)));
+
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
+        let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
+        let (_rx, msg) = TestControl::send_sd(target, sd_header);
+        assert!(matches!(msg, ControlMessage::SendSD(..)));
+
+        let message = Message::new_sd(
+            1,
+            &crate::protocol::sd::Header::new_find_services(false, &[]),
+        );
+        let (_rx, msg) = TestControl::send_request(target, message, 5000);
+        assert!(matches!(msg, ControlMessage::Send(..)));
+    }
+
+    #[test]
+    fn test_control_message_debug() {
+        let (_rx, msg) = TestControl::set_interface(Ipv4Addr::LOCALHOST);
+        let s = format!("{msg:?}");
+        assert!(s.contains("SetInterface"));
+
+        let (_rx, msg) = TestControl::bind_discovery();
+        assert!(!format!("{msg:?}").is_empty());
+
+        let (_rx, msg) = TestControl::unbind_discovery();
+        assert!(format!("{msg:?}").contains("UnbindDiscovery"));
+
+        let (_rx, msg) = TestControl::bind_unicast_with_port(Some(8080));
+        assert!(format!("{msg:?}").contains("BindUnicast"));
+
+        let (_rx, msg) = TestControl::unbind_unicast();
+        assert!(format!("{msg:?}").contains("UnbindUnicast"));
+
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
+        let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
+        let (_rx, msg) = TestControl::send_sd(target, sd_header);
+        assert!(format!("{msg:?}").contains("SendSD"));
+
+        let message = Message::new_sd(
+            1,
+            &crate::protocol::sd::Header::new_find_services(false, &[]),
+        );
+        let (_rx, msg) = TestControl::send_request(target, message, 5000);
+        assert!(format!("{msg:?}").contains("Send"));
+    }
+
+    #[tokio::test]
+    async fn test_inner_spawn_and_shutdown() {
+        let (control_sender, mut update_receiver) =
+            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+        // Drop control sender to trigger loop exit
+        drop(control_sender);
+        // The update receiver should eventually return None when the inner loop exits
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), update_receiver.recv()).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_inner_bind_unicast_via_channel() {
+        let (control_sender, _update_receiver) =
+            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        let (rx, msg) = TestControl::bind_unicast_with_port(None);
+        control_sender.send(msg).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("Timed out waiting for bind response")
+            .expect("Oneshot channel closed");
+        let port = result.unwrap();
+        assert!(port > 0);
+    }
+}
