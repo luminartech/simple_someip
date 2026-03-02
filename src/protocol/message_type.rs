@@ -86,6 +86,45 @@ impl MessageTypeField {
 mod tests {
 
     use super::*;
+
+    // --- MessageType TryFrom<u8> ---
+
+    #[test]
+    fn message_type_trait_try_from() {
+        // Exercise the TryFrom<u8> trait impl (not the inherent const fn)
+        let mt: Result<MessageType, _> = 0x00u8.try_into();
+        assert_eq!(mt.unwrap(), MessageType::Request);
+    }
+
+    // --- MessageTypeField::new ---
+
+    #[test]
+    fn new_with_tp_true() {
+        let field = MessageTypeField::new(MessageType::Request, true);
+        assert_eq!(field.message_type(), MessageType::Request);
+        assert!(field.is_tp());
+        assert_eq!(u8::from(field), 0x20);
+    }
+
+    #[test]
+    fn new_with_tp_false() {
+        let field = MessageTypeField::new(MessageType::Request, false);
+        assert_eq!(field.message_type(), MessageType::Request);
+        assert!(!field.is_tp());
+        assert_eq!(u8::from(field), 0x00);
+    }
+
+    // --- MessageTypeField::new_sd ---
+
+    #[test]
+    fn new_sd_is_notification_no_tp() {
+        let field = MessageTypeField::new_sd();
+        assert_eq!(field.message_type(), MessageType::Notification);
+        assert!(!field.is_tp());
+    }
+
+    // --- exhaustive u8 ---
+
     /// Check that we properly decode and encode hex bytes
     #[test]
     fn test_all_u8_values() {

@@ -83,6 +83,104 @@ impl MessageId {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- constructors ---
+
+    #[test]
+    fn from_u32() {
+        let mid = MessageId::from(0x1234_5678);
+        assert_eq!(mid.message_id(), 0x1234_5678);
+    }
+
+    #[test]
+    fn new() {
+        let mid = MessageId::new(0xABCD_EF01);
+        assert_eq!(mid.message_id(), 0xABCD_EF01);
+    }
+
+    #[test]
+    fn new_from_service_and_method() {
+        let mid = MessageId::new_from_service_and_method(0x1234, 0x5678);
+        assert_eq!(mid.message_id(), 0x1234_5678);
+        assert_eq!(mid.service_id(), 0x1234);
+        assert_eq!(mid.method_id(), 0x5678);
+    }
+
+    // --- getters / setters ---
+
+    #[test]
+    fn set_message_id() {
+        let mut mid = MessageId::new(0);
+        mid.set_message_id(0xDEAD_BEEF);
+        assert_eq!(mid.message_id(), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn set_service_id_preserves_method() {
+        let mut mid = MessageId::new_from_service_and_method(0x0001, 0x00FF);
+        mid.set_service_id(0xAAAA);
+        assert_eq!(mid.service_id(), 0xAAAA);
+        assert_eq!(mid.method_id(), 0x00FF);
+    }
+
+    #[test]
+    fn set_method_id_preserves_service() {
+        let mut mid = MessageId::new_from_service_and_method(0x00FF, 0x0001);
+        mid.set_method_id(0xBBBB);
+        assert_eq!(mid.service_id(), 0x00FF);
+        assert_eq!(mid.method_id(), 0xBBBB);
+    }
+
+    // --- is_event ---
+
+    #[test]
+    fn is_event_true_when_method_high_bit_set() {
+        let mid = MessageId::new_from_service_and_method(0x0001, 0x8001);
+        assert!(mid.is_event());
+    }
+
+    #[test]
+    fn is_event_false_when_method_high_bit_clear() {
+        let mid = MessageId::new_from_service_and_method(0x0001, 0x0001);
+        assert!(!mid.is_event());
+    }
+
+    // --- is_sd ---
+
+    #[test]
+    fn is_sd_true_for_sd_constant() {
+        assert!(MessageId::SD.is_sd());
+    }
+
+    #[test]
+    fn is_sd_false_for_other() {
+        let mid = MessageId::new(0x0001_0001);
+        assert!(!mid.is_sd());
+    }
+
+    // --- SD constant ---
+
+    #[test]
+    fn sd_constant_value() {
+        assert_eq!(MessageId::SD.message_id(), 0xFFFF_8100);
+    }
+
+    // --- Debug ---
+
+    #[test]
+    fn debug_format() {
+        use core::fmt::Write;
+        let mid = MessageId::new_from_service_and_method(0x1234, 0x0001);
+        let mut buf = heapless::String::<128>::new();
+        write!(buf, "{mid:?}").unwrap();
+        assert!(buf.contains("service_id"));
+        assert!(buf.contains("method_id"));
+    }
+}
+
 impl core::fmt::Debug for MessageId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
