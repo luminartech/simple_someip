@@ -144,10 +144,7 @@ mod tests {
 
     #[test]
     fn read_truncated_input_returns_unexpected_eof() {
-        assert!(matches!(
-            (&[][..]).read_u8(),
-            Err(Error::UnexpectedEof)
-        ));
+        assert!(matches!((&[][..]).read_u8(), Err(Error::UnexpectedEof)));
     }
 
     #[test]
