@@ -61,9 +61,9 @@ jobs:
         with:
           components: llvm-tools
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: cargo-bins/cargo-binstall@main
-      - run: cargo binstall cargo-nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov, cargo-nextest
       - run: cargo test --no-default-features
       - run: cargo llvm-cov nextest --all-features --lcov --output-path ./target/lcov.info
       - name: Upload Coverage report

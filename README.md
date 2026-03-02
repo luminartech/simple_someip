@@ -30,27 +30,33 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-# Default: includes async client and server (requires std + tokio)
+# Protocol/E2E only (default) — no_std compatible, no tokio dependency
 simple-someip = "0.3"
 
-# Protocol/E2E only — no_std compatible, no tokio dependency
-simple-someip = { version = "0.3", default-features = false }
+# Client only
+simple-someip = { version = "0.3", features = ["client"] }
+
+# Server only
+simple-someip = { version = "0.3", features = ["server"] }
+
+# Both client and server
+simple-someip = { version = "0.3", features = ["client", "server"] }
 ```
 
 ### Feature flags
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `client` | yes | Async tokio client; implies `std` |
-| `server` | yes | Async tokio server; implies `std` |
-| `std` | no (implied) | Enables std-dependent code |
+| `client` | no | Async tokio client; implies `std` + tokio + socket2 |
+| `server` | no | Async tokio server; implies `std` + tokio + socket2 |
+| `std` | no | Enables std-dependent code |
 
-With `default-features = false` only the `protocol`, `traits`, and `e2e` modules are available, and the crate compiles in `no_std` mode.
+By default only the `protocol`, `traits`, and `e2e` modules are available, and the crate compiles in `no_std` mode. Most applications only need one of `client` or `server`.
 
 ## Examples
 
 Examples are provided in the `examples/` directory. To run the discovery client example:
 
 ```bash
-cargo run --example discovery_client
+cargo run --features client --example discovery_client
 ```

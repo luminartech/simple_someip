@@ -26,10 +26,10 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 tracing-subscriber = "0.3"
 
 [features]
-default = ["client", "server"]
+default = []
 std = []
 client = ["std", "dep:tokio", "dep:socket2"]
-server = ["std", "dep:socket2"]
+server = ["std", "dep:tokio", "dep:socket2"]
 
 [[test]]
 name = "client_server"
