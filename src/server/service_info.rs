@@ -66,3 +66,27 @@ impl Subscriber {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use std::vec;
+
+    #[test]
+    fn test_event_group_info_new() {
+        let info = EventGroupInfo::new(0x01, vec![0x8001, 0x8002]);
+        assert_eq!(info.event_group_id, 0x01);
+        assert_eq!(info.event_ids, vec![0x8001, 0x8002]);
+    }
+
+    #[test]
+    fn test_subscriber_new() {
+        let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 30500);
+        let subscriber = Subscriber::new(addr, 0x5B, 1, 0x01);
+        assert_eq!(subscriber.address, addr);
+        assert_eq!(subscriber.service_id, 0x5B);
+        assert_eq!(subscriber.instance_id, 1);
+        assert_eq!(subscriber.event_group_id, 0x01);
+    }
+}

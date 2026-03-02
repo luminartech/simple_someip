@@ -129,4 +129,39 @@ mod tests {
         manager.unsubscribe(0x5B, 1, 0x01, addr);
         assert_eq!(manager.subscription_count(), 0);
     }
+
+    #[test]
+    fn test_duplicate_subscriber_refresh() {
+        let mut manager = SubscriptionManager::new();
+        let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 8080);
+
+        manager.subscribe(0x5B, 1, 0x01, addr);
+        assert_eq!(manager.subscription_count(), 1);
+
+        // Subscribe same address again — should deduplicate
+        manager.subscribe(0x5B, 1, 0x01, addr);
+        assert_eq!(manager.subscription_count(), 1);
+    }
+
+    #[test]
+    fn test_unsubscribe_nonexistent_key() {
+        let mut manager = SubscriptionManager::new();
+        let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9000);
+
+        // Unsubscribe from empty manager — should not panic
+        manager.unsubscribe(0x99, 1, 0x01, addr);
+        assert_eq!(manager.subscription_count(), 0);
+    }
+
+    #[test]
+    fn test_get_subscribers_empty() {
+        let manager = SubscriptionManager::new();
+        assert!(manager.get_subscribers(0x99, 1, 0x01).is_empty());
+    }
+
+    #[test]
+    fn test_default_impl() {
+        let manager = SubscriptionManager::default();
+        assert_eq!(manager.subscription_count(), 0);
+    }
 }

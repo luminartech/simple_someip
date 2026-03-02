@@ -939,6 +939,408 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_find_service_sends_unicast_offer() {
+        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Send a FindService for 0x5B
+        let sd_header = sd::Header::new_find_services(false, &[0x5B]);
+        let message = build_sd_message(&sd_header);
+        client_socket
+            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .await
+            .unwrap();
+
+        // Process the message on the unicast socket
+        let server_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let mut reader: &[u8] = &buf[..len];
+            let _header = SomeIpHeader::decode(&mut reader).unwrap();
+            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
+            server.handle_sd_message(sd_msg, addr).await.unwrap();
+        });
+
+        // Receive the unicast OfferService response
+        let mut resp_buf = vec![0u8; 65535];
+        let (resp_len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_socket.recv_from(&mut resp_buf),
+        )
+        .await
+        .expect("Timeout waiting for unicast OfferService")
+        .unwrap();
+
+        // Parse the response and verify it's an OfferService for 0x5B
+        let mut reader: &[u8] = &resp_buf[..resp_len];
+        let header = SomeIpHeader::decode(&mut reader).unwrap();
+        assert_eq!(header.message_id.service_id(), 0xFFFF);
+        let sd_resp: sd::Header = sd::Header::decode(&mut reader).unwrap();
+        assert_eq!(sd_resp.entries.len(), 1);
+        match &sd_resp.entries[0] {
+            sd::Entry::OfferService(entry) => {
+                assert_eq!(entry.service_id, 0x5B);
+            }
+            other => panic!("Expected OfferService, got {:?}", other),
+        }
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_find_service_wildcard() {
+        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Send wildcard FindService (0xFFFF)
+        let sd_header = sd::Header::new_find_services(false, &[0xFFFF]);
+        let message = build_sd_message(&sd_header);
+        client_socket
+            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .await
+            .unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let mut reader: &[u8] = &buf[..len];
+            let _header = SomeIpHeader::decode(&mut reader).unwrap();
+            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
+            server.handle_sd_message(sd_msg, addr).await.unwrap();
+        });
+
+        let mut resp_buf = vec![0u8; 65535];
+        let (resp_len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_socket.recv_from(&mut resp_buf),
+        )
+        .await
+        .expect("Timeout waiting for unicast OfferService")
+        .unwrap();
+
+        let mut reader: &[u8] = &resp_buf[..resp_len];
+        let _header = SomeIpHeader::decode(&mut reader).unwrap();
+        let sd_resp: sd::Header = sd::Header::decode(&mut reader).unwrap();
+        assert_eq!(sd_resp.entries.len(), 1);
+        match &sd_resp.entries[0] {
+            sd::Entry::OfferService(entry) => {
+                assert_eq!(entry.service_id, 0x5B);
+            }
+            other => panic!("Expected OfferService, got {:?}", other),
+        }
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_find_service_wrong_service_ignored() {
+        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Send FindService for 0x99 (not our service)
+        let sd_header = sd::Header::new_find_services(false, &[0x99]);
+        let message = build_sd_message(&sd_header);
+        client_socket
+            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .await
+            .unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let mut reader: &[u8] = &buf[..len];
+            let _header = SomeIpHeader::decode(&mut reader).unwrap();
+            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
+            server.handle_sd_message(sd_msg, addr).await.unwrap();
+        });
+
+        // Should NOT receive any response (short timeout)
+        let mut resp_buf = vec![0u8; 65535];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            client_socket.recv_from(&mut resp_buf),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "Expected timeout (no response for wrong service)"
+        );
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_nack_no_endpoint() {
+        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Build a SubscribeEventGroup with NO endpoint option
+        let entry = sd::Entry::SubscribeEventGroup(sd::EventGroupEntry::new(0x5B, 1, 1, 3, 0x01));
+        let mut entries = sd::SdEntries::new();
+        entries.push(entry).unwrap();
+        let sd_header = sd::Header {
+            flags: sd::Flags::new(true, true),
+            entries,
+            options: sd::SdOptions::new(), // empty — no endpoint
+        };
+        let message = build_sd_message(&sd_header);
+
+        client_socket
+            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .await
+            .unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let mut reader: &[u8] = &buf[..len];
+            let _header = SomeIpHeader::decode(&mut reader).unwrap();
+            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
+            server.handle_sd_message(sd_msg, addr).await.unwrap();
+
+            // No subscription should have been added
+            let subs = server.subscriptions.read().await;
+            assert_eq!(subs.subscription_count(), 0);
+        });
+
+        // Should receive a NACK (TTL=0)
+        let mut resp_buf = vec![0u8; 65535];
+        let (resp_len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_socket.recv_from(&mut resp_buf),
+        )
+        .await
+        .expect("Timeout waiting for SubscribeNack")
+        .unwrap();
+
+        let ttl = parse_subscribe_ack_ttl(&resp_buf[..resp_len]);
+        assert_eq!(ttl, 0, "Expected NACK (TTL=0), got TTL={}", ttl);
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_send_offer_service() {
+        // Test send_unicast_offer directly (sends to a specific target).
+        // send_offer_service sends to multicast which is unreliable on loopback.
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = receiver.local_addr().unwrap();
+
+        let (server, _) = create_test_server(0x5B, 1).await;
+        server
+            .send_unicast_offer(recv_addr)
+            .await
+            .expect("send_unicast_offer failed");
+
+        // Receive and parse the offer
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            receiver.recv_from(&mut buf),
+        )
+        .await
+        .expect("Timeout waiting for OfferService")
+        .unwrap();
+
+        let mut reader: &[u8] = &buf[..len];
+        let header = SomeIpHeader::decode(&mut reader).unwrap();
+        assert_eq!(header.message_id, crate::protocol::MessageId::SD);
+        let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
+        assert_eq!(sd_msg.entries.len(), 1);
+        match &sd_msg.entries[0] {
+            sd::Entry::OfferService(entry) => {
+                assert_eq!(entry.service_id, 0x5B);
+                assert_eq!(entry.instance_id, 1);
+            }
+            other => panic!("Expected OfferService, got {:?}", other),
+        }
+
+        // Also test that start_announcing doesn't error
+        let (server2, _) = create_test_server(0x5B, 1).await;
+        assert!(server2.start_announcing().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_run_non_sd_message() {
+        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_port = match client_socket.local_addr().unwrap() {
+            std::net::SocketAddr::V4(a) => a.port(),
+            _ => panic!("expected v4"),
+        };
+
+        let subscriptions = Arc::clone(&server.subscriptions);
+
+        let server_handle = tokio::spawn(async move {
+            server.run().await.ok();
+        });
+
+        // Send a non-SD SOME/IP message (service 0x1234, method 0x0001)
+        let non_sd_header = SomeIpHeader {
+            message_id: crate::protocol::MessageId::new_from_service_and_method(0x1234, 0x0001),
+            length: someip_length(0),
+            request_id: 0x0001,
+            protocol_version: 0x01,
+            interface_version: 0x01,
+            message_type: MessageTypeField::new(MessageType::Request, false),
+            return_code: ReturnCode::Ok,
+        };
+        let mut non_sd_buf = Vec::new();
+        non_sd_header.encode(&mut non_sd_buf).unwrap();
+        client_socket
+            .send_to(&non_sd_buf, format!("127.0.0.1:{}", server_port))
+            .await
+            .unwrap();
+
+        // Small delay, then send valid subscribe
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let sd_header = sd::Header::new_subscription(
+            0x5B,
+            1,
+            1,
+            3,
+            0x01,
+            Ipv4Addr::new(127, 0, 0, 1),
+            sd::TransportProtocol::Udp,
+            client_port,
+        );
+        let message = build_sd_message(&sd_header);
+        client_socket
+            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .await
+            .unwrap();
+
+        // Wait for ACK
+        let mut resp_buf = vec![0u8; 65535];
+        let (resp_len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_socket.recv_from(&mut resp_buf),
+        )
+        .await
+        .expect("Timeout waiting for SubscribeAck")
+        .unwrap();
+
+        let ttl = parse_subscribe_ack_ttl(&resp_buf[..resp_len]);
+        assert!(ttl > 0, "Expected ACK (TTL > 0), got TTL={}", ttl);
+
+        // Verify subscription was added (non-SD message was ignored)
+        let subs = subscriptions.read().await;
+        assert_eq!(subs.subscription_count(), 1);
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_run_malformed_data() {
+        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_port = match client_socket.local_addr().unwrap() {
+            std::net::SocketAddr::V4(a) => a.port(),
+            _ => panic!("expected v4"),
+        };
+
+        let subscriptions = Arc::clone(&server.subscriptions);
+
+        let server_handle = tokio::spawn(async move {
+            server.run().await.ok();
+        });
+
+        // Send garbage bytes
+        client_socket
+            .send_to(&[0xFF, 0xFE, 0xFD], format!("127.0.0.1:{}", server_port))
+            .await
+            .unwrap();
+
+        // Small delay, then send valid subscribe
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let sd_header = sd::Header::new_subscription(
+            0x5B,
+            1,
+            1,
+            3,
+            0x01,
+            Ipv4Addr::new(127, 0, 0, 1),
+            sd::TransportProtocol::Udp,
+            client_port,
+        );
+        let message = build_sd_message(&sd_header);
+        client_socket
+            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .await
+            .unwrap();
+
+        // Wait for ACK
+        let mut resp_buf = vec![0u8; 65535];
+        let (resp_len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_socket.recv_from(&mut resp_buf),
+        )
+        .await
+        .expect("Timeout waiting for SubscribeAck")
+        .unwrap();
+
+        let ttl = parse_subscribe_ack_ttl(&resp_buf[..resp_len]);
+        assert!(ttl > 0, "Expected ACK (TTL > 0), got TTL={}", ttl);
+
+        let subs = subscriptions.read().await;
+        assert_eq!(subs.subscription_count(), 1);
+
+        server_handle.abort();
+    }
+
+    #[test]
+    fn test_someip_length() {
+        assert_eq!(someip_length(0), 8);
+        assert_eq!(someip_length(100), 108);
+    }
+
+    #[tokio::test]
+    async fn test_next_sd_session_id_wraps() {
+        let (server, _) = create_test_server(0x5B, 1).await;
+
+        // Set session ID to 0xFFFE
+        server.sd_session_id.store(0xFFFE, Ordering::Relaxed);
+
+        // First call: 0xFFFE -> 0xFFFF, returns 0xFFFF
+        let sid1 = server.next_sd_session_id();
+        assert_eq!(sid1, 0xFFFF);
+
+        // Second call: 0xFFFF -> wraps to 0x0001 (skipping 0), returns 0x0001
+        let sid2 = server.next_sd_session_id();
+        assert_eq!(sid2, 0x0001);
+    }
+
+    #[tokio::test]
+    async fn test_handle_sd_other_entry_type() {
+        let (mut server, _) = create_test_server(0x5B, 1).await;
+
+        // Build SD message with a StopOfferService entry (not handled by server)
+        let entry = sd::Entry::StopOfferService(sd::ServiceEntry {
+            index_first_options_run: 0,
+            index_second_options_run: 0,
+            options_count: sd::OptionsCount::new(0, 0),
+            service_id: 0x5B,
+            instance_id: 1,
+            major_version: 1,
+            ttl: 0,
+            minor_version: 0,
+        });
+        let mut entries = sd::SdEntries::new();
+        entries.push(entry).unwrap();
+        let sd_msg = sd::Header {
+            flags: sd::Flags::new(true, true),
+            entries,
+            options: sd::SdOptions::new(),
+        };
+
+        // Should not panic or error
+        let result = server
+            .handle_sd_message(sd_msg, "127.0.0.1:12345".parse().unwrap())
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
     async fn test_subscribe_ack_different_endpoint_port() {
         let (mut server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
