@@ -1,26 +1,56 @@
 # Simple SOME/IP
 
-Simple SOME/IP intends to make working with basic, IpV4 SOME/IP entities as easy as possible.
-It supports basic Service Discovery, events, anad methods with mininimal integration.
-The crate is focused on usability and ergonomics for tooling and scripting uses rather than use in an embedded context.
-The library is based on Tokio and utilizes std::io traits for serialization and deserialization.
+[![CI](https://img.shields.io/github/actions/workflow/status/luminartech/simple_someip/ci.yml?style=for-the-badge&label=CI)](https://github.com/luminartech/simple_someip/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/codecov/c/github/luminartech/simple_someip?style=for-the-badge)](https://app.codecov.io/gh/luminartech/simple_someip)
+[![Crates.io](https://img.shields.io/crates/v/simple-someip?style=for-the-badge)](https://crates.io/crates/simple-someip)
 
-## Organization
+Simple SOME/IP is a Rust library implementing the SOME/IP automotive communication protocol — remote procedure calls, event notifications, and wire format serialization. Based on the [Open SOME/IP Specification](https://github.com/some-ip-com/open-someip-spec).
 
-The crate is organized into several modules:
-- `client`: Provides a high-level client for interacting with SOME/IP services.
-- `protocol`: Contains definitions for sending and parsing SOME/IP protocol messages.
-- `error`: Defines error types used throughout the crate.
-- `traits`: Contains traits for defining SOME/IP services, methods, allowing the library automatically handle serialization and deserialization of custom types.
+The library supports both `std` and `no_std` environments, making it suitable for embedded targets as well as host-side tooling and scripting.
 
+## Features
+
+- **`no_std` compatible** — the `protocol`, `traits`, and `e2e` modules work without the standard library
+- **Service Discovery** — SD entry/option encoding and decoding via fixed-capacity `heapless` collections (no heap allocation)
+- **End-to-End protection** — Profile 4 (CRC-32) and Profile 5 (CRC-16) with zero-allocation APIs
+- **Async client and server** — tokio-based, gated behind optional feature flags
+- **`embedded-io`** traits for serialization — abstracts over `std::io::Read`/`Write`
+
+## Modules
+
+- `protocol` — Wire format layer: SOME/IP header, `MessageId`, `MessageType`, `ReturnCode`, SD entries/options
+- `traits` — `WireFormat` and `PayloadWireFormat` traits for custom message types
+- `e2e` — End-to-End protection profiles (always available, no heap allocation)
+- `client` — High-level async tokio client (requires `feature = "client"`)
+- `server` — Async tokio server with SD announcements and event publishing (requires `feature = "server"`)
 
 ## Usage
 
-To use Simple SOME/IP in your project, add the following to your `Cargo.toml`:
+Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-simple_someip = "0.2"
+# Default: includes async client and server (requires std + tokio)
+simple-someip = "0.3"
+
+# Protocol/E2E only — no_std compatible, no tokio dependency
+simple-someip = { version = "0.3", default-features = false }
 ```
 
-Then, you can create a client and interact with SOME/IP services as demonstrated in the examples provided in the repository.
+### Feature flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `client` | yes | Async tokio client; implies `std` |
+| `server` | yes | Async tokio server; implies `std` |
+| `std` | no (implied) | Enables std-dependent code |
+
+With `default-features = false` only the `protocol`, `traits`, and `e2e` modules are available, and the crate compiles in `no_std` mode.
+
+## Examples
+
+Examples are provided in the `examples/` directory. To run the discovery client example:
+
+```bash
+cargo run --example discovery_client
+```
