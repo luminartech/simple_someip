@@ -105,3 +105,159 @@ impl<R: embedded_io::Read> embedded_io::Read for Take<'_, R> {
         Ok(n)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::vec::Vec;
+
+    // Minimal reader/writer stubs that always return an I/O error.
+    struct FailingReader;
+
+    impl embedded_io::ErrorType for FailingReader {
+        type Error = embedded_io::ErrorKind;
+    }
+
+    impl embedded_io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> Result<usize, Self::Error> {
+            Err(embedded_io::ErrorKind::BrokenPipe)
+        }
+    }
+
+    struct FailingWriter;
+
+    impl embedded_io::ErrorType for FailingWriter {
+        type Error = embedded_io::ErrorKind;
+    }
+
+    impl embedded_io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> Result<usize, Self::Error> {
+            Err(embedded_io::ErrorKind::BrokenPipe)
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    // --- ReadBytesExt error mapping ---
+
+    #[test]
+    fn read_truncated_input_returns_unexpected_eof() {
+        assert!(matches!(
+            (&[][..]).read_u8(),
+            Err(Error::UnexpectedEof)
+        ));
+    }
+
+    #[test]
+    fn read_io_error_maps_to_error_io() {
+        assert!(matches!(
+            FailingReader.read_u8(),
+            Err(Error::Io(embedded_io::ErrorKind::BrokenPipe))
+        ));
+    }
+
+    // --- ReadBytesExt happy path ---
+
+    #[test]
+    fn read_u8_decodes_correctly() {
+        assert_eq!((&[0xAB][..]).read_u8().unwrap(), 0xAB);
+    }
+
+    #[test]
+    fn read_u16_be_decodes_correctly() {
+        assert_eq!((&[0x01, 0x02][..]).read_u16_be().unwrap(), 0x0102);
+    }
+
+    #[test]
+    fn read_u16_be_truncated_returns_unexpected_eof() {
+        assert!(matches!(
+            (&[0x01][..]).read_u16_be(),
+            Err(Error::UnexpectedEof)
+        ));
+    }
+
+    #[test]
+    fn read_u24_be_decodes_correctly() {
+        assert_eq!(
+            (&[0x01, 0x02, 0x03][..]).read_u24_be().unwrap(),
+            0x0001_0203
+        );
+    }
+
+    #[test]
+    fn read_u24_be_truncated_returns_unexpected_eof() {
+        assert!(matches!(
+            (&[0x01, 0x02][..]).read_u24_be(),
+            Err(Error::UnexpectedEof)
+        ));
+    }
+
+    #[test]
+    fn read_u32_be_decodes_correctly() {
+        assert_eq!(
+            (&[0x01, 0x02, 0x03, 0x04][..]).read_u32_be().unwrap(),
+            0x0102_0304
+        );
+    }
+
+    #[test]
+    fn read_u32_be_truncated_returns_unexpected_eof() {
+        assert!(matches!(
+            (&[0x01, 0x02, 0x03][..]).read_u32_be(),
+            Err(Error::UnexpectedEof)
+        ));
+    }
+
+    // --- WriteBytesExt error mapping ---
+
+    #[test]
+    fn write_io_error_maps_to_error_io() {
+        assert!(matches!(
+            FailingWriter.write_u8(0),
+            Err(Error::Io(embedded_io::ErrorKind::BrokenPipe))
+        ));
+    }
+
+    // --- WriteBytesExt happy path ---
+
+    #[test]
+    fn write_u8_encodes_correctly() {
+        let mut out = Vec::new();
+        out.write_u8(0xAB).unwrap();
+        assert_eq!(out, [0xAB]);
+    }
+
+    #[test]
+    fn write_u16_be_encodes_correctly() {
+        let mut out = Vec::new();
+        out.write_u16_be(0x0102).unwrap();
+        assert_eq!(out, [0x01, 0x02]);
+    }
+
+    #[test]
+    fn write_u24_be_encodes_correctly() {
+        let mut out = Vec::new();
+        out.write_u24_be(0x0001_0203).unwrap();
+        assert_eq!(out, [0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn write_u32_be_encodes_correctly() {
+        let mut out = Vec::new();
+        out.write_u32_be(0x0102_0304).unwrap();
+        assert_eq!(out, [0x01, 0x02, 0x03, 0x04]);
+    }
+
+    // --- Take ---
+
+    #[test]
+    fn take_limits_reads_and_signals_eof_at_limit() {
+        let data: &[u8] = &[0x01, 0x02, 0x03, 0x04];
+        let mut reader = data;
+        let mut taken = Take::new(&mut reader, 2);
+        assert_eq!(taken.read_u16_be().unwrap(), 0x0102);
+        assert!(matches!(taken.read_u8(), Err(Error::UnexpectedEof)));
+    }
+}
