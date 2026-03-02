@@ -62,8 +62,10 @@ jobs:
           components: llvm-tools
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: cargo-bins/cargo-binstall@1
+      - run: cargo binstall cargo-nextest
       - run: cargo test --no-default-features
-      - run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+      - run: cargo llvm-cov nextest --all-features --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5
         with:
           files: lcov.info
