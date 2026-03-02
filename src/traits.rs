@@ -96,3 +96,73 @@ impl<const E: usize, const O: usize> PayloadWireFormat for DiscoveryOnlyPayload<
         self.header.encode(writer)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{MessageId, sd};
+
+    fn minimal_sd_header() -> sd::Header {
+        sd::Header::new_find_services(false, &[])
+    }
+
+    #[test]
+    fn message_id_is_always_sd() {
+        let payload = DiscoveryOnlyPayload::new_sd_payload(&minimal_sd_header());
+        assert_eq!(payload.message_id(), MessageId::SD);
+    }
+
+    #[test]
+    fn as_sd_header_returns_some() {
+        let header = minimal_sd_header();
+        let payload = DiscoveryOnlyPayload::new_sd_payload(&header);
+        assert_eq!(payload.as_sd_header(), Some(&header));
+    }
+
+    #[test]
+    fn new_sd_payload_round_trips_header() {
+        let header = minimal_sd_header();
+        let payload = DiscoveryOnlyPayload::new_sd_payload(&header);
+        assert_eq!(payload.as_sd_header().unwrap(), &header);
+    }
+
+    #[test]
+    fn required_size_matches_header() {
+        let header = minimal_sd_header();
+        let payload = DiscoveryOnlyPayload::new_sd_payload(&header);
+        assert_eq!(payload.required_size(), header.required_size());
+    }
+
+    #[test]
+    fn decode_with_sd_message_id_succeeds() {
+        let header = minimal_sd_header();
+        let mut buf = [0u8; 64];
+        let n = header.encode(&mut buf.as_mut_slice()).unwrap();
+        let decoded =
+            DiscoveryOnlyPayload::decode_with_message_id(MessageId::SD, &mut &buf[..n]).unwrap();
+        assert_eq!(decoded.as_sd_header().unwrap(), &header);
+    }
+
+    #[test]
+    fn decode_with_non_sd_message_id_returns_error() {
+        let non_sd_id = MessageId::new_from_service_and_method(0x1234, 0x0001);
+        let mut empty: &[u8] = &[];
+        let err = DiscoveryOnlyPayload::<1, 1>::decode_with_message_id(non_sd_id, &mut empty)
+            .unwrap_err();
+        assert!(matches!(err, protocol::Error::UnsupportedMessageID(_)));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn encode_decode_round_trip() {
+        let header = sd::Header::new_find_services(true, &[0x5B]);
+        let payload = DiscoveryOnlyPayload::new_sd_payload(&header);
+        let mut buf = std::vec::Vec::new();
+        let n = payload.encode(&mut buf).unwrap();
+        assert_eq!(n, payload.required_size());
+        let decoded =
+            DiscoveryOnlyPayload::decode_with_message_id(MessageId::SD, &mut buf.as_slice())
+                .unwrap();
+        assert_eq!(decoded, payload);
+    }
+}
