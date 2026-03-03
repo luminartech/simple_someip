@@ -4,13 +4,20 @@ use crate::{
     traits::{PayloadWireFormat, WireFormat},
 };
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     prelude::rust_2024::*,
     task::{Context, Poll},
     vec,
 };
 use tokio::{net::UdpSocket, select, sync::mpsc};
 use tracing::{error, info, trace};
+
+/// A received message together with the source address it came from.
+#[derive(Clone, Debug)]
+pub struct ReceivedMessage<P> {
+    pub message: Message<P>,
+    pub source: SocketAddr,
+}
 
 /// Structure representing a request to send a message
 #[derive(Debug)]
@@ -39,7 +46,7 @@ impl<PayloadDefinitions: PayloadWireFormat + 'static> SendMessage<PayloadDefinit
 
 #[derive(Debug)]
 pub struct SocketManager<PayloadDefinitions> {
-    receiver: mpsc::Receiver<Result<Message<PayloadDefinitions>, Error>>,
+    receiver: mpsc::Receiver<Result<ReceivedMessage<PayloadDefinitions>, Error>>,
     sender: mpsc::Sender<SendMessage<PayloadDefinitions>>,
     local_port: u16,
     session_id: u16,
@@ -123,7 +130,7 @@ where
         Ok(())
     }
 
-    pub async fn receive(&mut self) -> Option<Result<Message<MessageDefinitions>, Error>> {
+    pub async fn receive(&mut self) -> Option<Result<ReceivedMessage<MessageDefinitions>, Error>> {
         self.receiver.recv().await
     }
 
@@ -132,7 +139,7 @@ where
     pub fn poll_receive(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Message<MessageDefinitions>, Error>>> {
+    ) -> Poll<Option<Result<ReceivedMessage<MessageDefinitions>, Error>>> {
         self.receiver.poll_recv(cx)
     }
 
@@ -156,7 +163,7 @@ where
 
     fn spawn_socket_loop(
         socket: UdpSocket,
-        rx_tx: mpsc::Sender<Result<Message<MessageDefinitions>, Error>>,
+        rx_tx: mpsc::Sender<Result<ReceivedMessage<MessageDefinitions>, Error>>,
         mut tx_rx: mpsc::Receiver<SendMessage<MessageDefinitions>>,
     ) {
         tokio::spawn(async move {
@@ -165,12 +172,15 @@ where
                 select! {
                     result = socket.recv_from(&mut buf) => {
                         match result {
-                            Ok((bytes_received, _source_address )) => {
+                            Ok((bytes_received, source_address)) => {
                                 let parse_result = MessageView::parse(&buf[..bytes_received])
                                     .and_then(|view| {
                                         let header = view.header().to_owned();
                                         let payload = MessageDefinitions::from_payload_bytes(header.message_id, view.payload_bytes())?;
-                                        Ok(Message::new(header, payload))
+                                        Ok(ReceivedMessage {
+                                            message: Message::new(header, payload),
+                                            source: source_address,
+                                        })
                                     })
                                     .map_err(Error::from);
                                 if let Ok(()) = rx_tx.send( parse_result ).await {} else {
@@ -290,8 +300,11 @@ mod tests {
             .expect("Timed out waiting for message");
 
         let received = result.unwrap().unwrap();
-        assert_eq!(received.header().message_id, msg.header().message_id);
-        assert!(received.is_sd());
+        assert_eq!(
+            received.message.header().message_id,
+            msg.header().message_id
+        );
+        assert!(received.message.is_sd());
     }
 
     #[tokio::test]
