@@ -154,7 +154,7 @@ where
     ) {
         info!("Initializing SOME/IP Client");
         let (control_sender, control_receiver) = mpsc::channel(4);
-        let (update_sender, update_receiver) = mpsc::channel(4);
+        let (update_sender, update_receiver) = mpsc::channel(64);
         let inner = Self {
             control_receiver,
             active_request: None,
@@ -291,39 +291,31 @@ where
                         }
                     }
                     if response.send(bind_result).is_err() {
-                        // The sender has been dropped, so we should exit
-                        self.run = false;
+                        warn!("SetInterface response receiver dropped (caller canceled)");
                     }
                 }
                 ControlMessage::BindDiscovery(response) => {
                     let result = self.bind_discovery();
                     if response.send(result).is_err() {
-                        // The sender has been dropped, so we should exit
-                        self.run = false;
+                        warn!("BindDiscovery response receiver dropped (caller canceled)");
                     }
                 }
                 ControlMessage::UnbindDiscovery(response) => {
                     self.unbind_discovery().await;
                     if response.send(Ok(())).is_err() {
-                        // The sender has been dropped, so we should exit
-                        self.run = false;
+                        warn!("UnbindDiscovery response receiver dropped (caller canceled)");
                     }
                 }
                 ControlMessage::BindUnicast(response, port) => {
                     let result = self.bind_unicast(port.unwrap_or(0));
-                    match response.send(result) {
-                        Ok(()) => (),
-                        Err(e) => {
-                            error!("Failed to send bind unicast response: {:?}", e);
-                            self.run = false;
-                        }
+                    if response.send(result).is_err() {
+                        warn!("BindUnicast response receiver dropped (caller canceled)");
                     }
                 }
                 ControlMessage::UnbindUnicast(response) => {
                     self.unbind_unicast();
                     if response.send(Ok(())).is_err() {
-                        // The sender has been dropped, so we should exit
-                        self.run = false;
+                        warn!("UnbindUnicast response receiver dropped (caller canceled)");
                     }
                 }
                 ControlMessage::SendSD(target, header, response) => {
@@ -342,7 +334,7 @@ where
                                         e
                                     );
                                     if response.send(Err(e)).is_err() {
-                                        self.run = false;
+                                        warn!("SendSD error response receiver dropped (caller canceled)");
                                     }
                                 }
                             }
@@ -360,7 +352,7 @@ where
                                 .send(target, message)
                                 .await;
                             if response.send(send_result).is_err() {
-                                self.run = false;
+                                warn!("SendSD response receiver dropped (caller canceled)");
                             }
                         }
                     }
@@ -414,7 +406,13 @@ where
                     // Receive a control message
                     ctrl = control_receiver.recv() => {
                         if let Some(ctrl) = ctrl {
-                            assert!(active_request.is_none());
+                            if active_request.is_some() {
+                                // The previous caller's oneshot receiver was dropped
+                                // (e.g. timed out or canceled). Clear the stale request
+                                // so we can process the new control message.
+                                warn!("Clearing stale active_request (caller abandoned)");
+                                *active_request = None;
+                            }
                             debug!("Received control message: {:?}", ctrl);
                             *active_request = Some(ctrl);
                         } else {
@@ -451,11 +449,9 @@ where
                                             if response.send(Ok(
                                                  received_message.payload().clone(),
                                              )).is_err() {
-                                                 // The sender has been dropped, so we should exit
-                                                 *run = false;
-                                             }
-                                             else {
-                                                 *active_request = None;
+                                                 // Receiver was dropped (caller timed out or canceled).
+                                                 // active_request is already None from .take() above.
+                                                 warn!("AwaitResponse receiver dropped (caller canceled)");
                                              }
                                          } else {
                                              *active_request = Some(ControlMessage::AwaitResponse(request_message, response));
