@@ -37,12 +37,6 @@ pub(super) enum ControlMessage<P: PayloadWireFormat> {
         P::SdHeader,
         oneshot::Sender<Result<(), Error>>,
     ),
-    Send(
-        SocketAddrV4,
-        Message<P>,
-        u16, // source port — which unicast socket to send from
-        oneshot::Sender<Result<P, Error>>,
-    ),
     AwaitResponse(Message<P>, oneshot::Sender<Result<P, Error>>),
     AddEndpoint(u16, u16, SocketAddrV4, oneshot::Sender<Result<(), Error>>),
     RemoveEndpoint(u16, u16, oneshot::Sender<Result<(), Error>>),
@@ -60,12 +54,6 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ControlMessage<P> {
             Self::SendSD(addr, header, _) => {
                 f.debug_tuple("SendSD").field(addr).field(header).finish()
             }
-            Self::Send(addr, msg, port, _) => f
-                .debug_tuple("Send")
-                .field(addr)
-                .field(msg)
-                .field(port)
-                .finish(),
             Self::AwaitResponse(msg, _) => f.debug_tuple("AwaitResponse").field(msg).finish(),
             Self::AddEndpoint(sid, iid, addr, _) => f
                 .debug_tuple("AddEndpoint")
@@ -120,18 +108,6 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
         let (sender, receiver) = oneshot::channel();
         (receiver, Self::SendSD(socket_addr, header, sender))
     }
-    pub fn send_request(
-        socket_addr: SocketAddrV4,
-        message: Message<P>,
-        source_port: u16,
-    ) -> (oneshot::Receiver<Result<P, Error>>, Self) {
-        let (sender, receiver) = oneshot::channel();
-        (
-            receiver,
-            Self::Send(socket_addr, message, source_port, sender),
-        )
-    }
-
     pub fn add_endpoint(
         service_id: u16,
         instance_id: u16,
@@ -432,31 +408,6 @@ where
                         }
                     }
                 }
-                ControlMessage::Send(target, mut message, source_port, response) => {
-                    if let Some(socket) = self.unicast_sockets.get_mut(&source_port) {
-                        // Set client ID (upper 16) and session ID (lower 16)
-                        let request_id =
-                            (u32::from(self.client_id) << 16) | u32::from(self.session_counter);
-                        message.set_request_id(request_id);
-                        self.session_counter = self.session_counter.wrapping_add(1);
-                        if self.session_counter == 0 {
-                            self.session_counter = 1;
-                        }
-                        let send_result = socket.send(target, message.clone()).await;
-                        match send_result {
-                            Ok(()) => {
-                                self.active_request =
-                                    Some(ControlMessage::AwaitResponse(message.clone(), response));
-                            }
-                            Err(e) => {
-                                let _ = response.send(Err(e));
-                            }
-                        }
-                    } else {
-                        error!("No unicast socket bound on port {}", source_port);
-                        let _ = response.send(Err(Error::UnicastSocketNotBound));
-                    }
-                }
                 // Nothing to do here, this is handled in the run loop when receiving messages
                 ControlMessage::AwaitResponse(message, response) => {
                     self.active_request = Some(ControlMessage::AwaitResponse(message, response));
@@ -751,13 +702,6 @@ mod tests {
         let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
         let (_rx, msg) = TestControl::send_sd(target, sd_header);
         assert!(matches!(msg, ControlMessage::SendSD(..)));
-
-        let message = Message::new_sd(
-            1,
-            &crate::protocol::sd::Header::new_find_services(false, &[]),
-        );
-        let (_rx, msg) = TestControl::send_request(target, message, 5000);
-        assert!(matches!(msg, ControlMessage::Send(..)));
     }
 
     #[test]
@@ -782,13 +726,6 @@ mod tests {
         let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
         let (_rx, msg) = TestControl::send_sd(target, sd_header);
         assert!(format!("{msg:?}").contains("SendSD"));
-
-        let message = Message::new_sd(
-            1,
-            &crate::protocol::sd::Header::new_find_services(false, &[]),
-        );
-        let (_rx, msg) = TestControl::send_request(target, message, 5000);
-        assert!(format!("{msg:?}").contains("Send"));
     }
 
     #[tokio::test]
@@ -934,18 +871,17 @@ mod tests {
         let (control_sender, _update_receiver) =
             Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
 
-        // Bind unicast to get a valid source port
-        let (rx, msg) = TestControl::bind_unicast_with_port(None);
-        control_sender.send(msg).await.unwrap();
-        let port = rx.await.unwrap().unwrap();
-
-        // Send a request to a port nobody is listening on — the UDP send
-        // succeeds but no reply will ever come, leaving the inner loop in
-        // AwaitResponse state.
+        // Register an endpoint pointing to a port nobody is listening on
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 55555);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, target);
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // Send a request via SendToService — the UDP send succeeds but no
+        // reply will ever come, leaving the inner loop in AwaitResponse state.
         let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
         let message = Message::<DiscoveryOnlyPayload>::new_sd(1, &sd_header);
-        let (_rx_send, msg_send) = TestControl::send_request(target, message, port);
+        let (_rx_send, msg_send) = TestControl::send_to_service(0x1234, 0x0001, message);
         control_sender.send(msg_send).await.unwrap();
 
         // Wait for inner to enter AwaitResponse state
@@ -973,21 +909,21 @@ mod tests {
         let (control_sender, _update_receiver) =
             Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
 
-        // Bind unicast
-        let (rx, msg) = TestControl::bind_unicast_with_port(None);
-        control_sender.send(msg).await.unwrap();
-        let port = rx.await.unwrap().unwrap();
-
         // Create a raw socket to receive the request and echo it back
         let raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let raw_port = raw.local_addr().unwrap().port();
 
+        // Register the raw socket as an endpoint
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_port);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, target);
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
         let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
         let message = Message::<DiscoveryOnlyPayload>::new_sd(1, &sd_header);
 
         // Send request through inner — it will be forwarded to raw_port
-        let (rx_send, msg_send) = TestControl::send_request(target, message, port);
+        let (rx_send, msg_send) = TestControl::send_to_service(0x1234, 0x0001, message);
         control_sender.send(msg_send).await.unwrap();
 
         // Receive the request on the raw socket

@@ -135,17 +135,6 @@ where
         response.await.unwrap()
     }
 
-    pub async fn send_message(
-        &mut self,
-        target: SocketAddrV4,
-        message: crate::protocol::Message<MessageDefinitions>,
-        source_port: u16,
-    ) -> Result<MessageDefinitions, Error> {
-        let (response, message) = ControlMessage::send_request(target, message, source_port);
-        self.control_sender.send(message).await.unwrap();
-        response.await.unwrap()
-    }
-
     pub async fn add_endpoint(
         &mut self,
         service_id: u16,
@@ -284,19 +273,6 @@ mod tests {
         let new_addr = Ipv4Addr::LOCALHOST;
         client.set_interface(new_addr).await.unwrap();
         assert_eq!(client.interface(), new_addr);
-        client.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn test_send_message_no_unicast_bound() {
-        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
-        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345);
-        let msg = crate::protocol::Message::new_sd(
-            1,
-            &crate::protocol::sd::Header::new_find_services(false, &[]),
-        );
-        let result = client.send_message(target, msg, 9999).await;
-        assert!(result.is_err());
         client.shut_down().await;
     }
 
