@@ -292,7 +292,7 @@ where
                 Some(result) => match result {
                     Ok(received) => {
                         let someip_header = received.message.header().clone();
-                        if let Some(sd_header) = received.message.get_sd_header() {
+                        if let Some(sd_header) = received.message.sd_header() {
                             Ok((received.source, someip_header, sd_header.to_owned()))
                         } else {
                             Err(Error::UnexpectedDiscoveryMessage(someip_header))

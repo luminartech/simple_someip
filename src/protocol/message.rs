@@ -38,7 +38,7 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
         self.header.set_request_id(request_id);
     }
 
-    pub fn get_sd_header(&self) -> Option<&<PayloadDefinition as PayloadWireFormat>::SdHeader> {
+    pub fn sd_header(&self) -> Option<&<PayloadDefinition as PayloadWireFormat>::SdHeader> {
         if !self.header().message_id.is_sd() || self.header().message_type.is_tp() {
             return None;
         }
@@ -211,7 +211,7 @@ mod tests {
     fn get_sd_header_returns_some_for_sd() {
         let sd_hdr = minimal_sd_header();
         let msg = make_sd_message();
-        assert_eq!(msg.get_sd_header().unwrap(), &sd_hdr);
+        assert_eq!(msg.sd_header().unwrap(), &sd_hdr);
     }
 
     // --- WireFormat: required_size ---
