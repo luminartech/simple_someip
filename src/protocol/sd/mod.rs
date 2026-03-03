@@ -8,4 +8,4 @@ mod options;
 pub use entry::{Entry, EventGroupEntry, OptionsCount, ServiceEntry};
 pub use flags::Flags;
 pub use header::{Header, MAX_SD_ENTRIES, MAX_SD_OPTIONS, SdEntries, SdOptions};
-pub use options::{Options, TransportProtocol};
+pub use options::{MAX_CONFIGURATION_STRING_LENGTH, Options, TransportProtocol};
