@@ -34,7 +34,7 @@ pub mod server;
 pub mod traits;
 
 #[cfg(feature = "client")]
-pub use client::*;
+pub use client::{Client, ClientUpdate};
 pub use error::Error;
 #[cfg(feature = "server")]
 pub use server::Server;
