@@ -36,4 +36,6 @@ pub enum Error {
     },
     #[error("Configuration string too long: {0} bytes")]
     ConfigurationStringTooLong(usize),
+    #[error("Invalid SD message: {0}")]
+    InvalidSDMessage(&'static str),
 }
