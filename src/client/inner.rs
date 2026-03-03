@@ -798,4 +798,53 @@ mod tests {
         // Verify inner loop is still alive
         assert_inner_alive(&control_sender).await;
     }
+
+    // -- Non-preemptible active_request test --
+    // Verifies that when a new control message arrives while a multi-step
+    // operation (SetInterface) is mid-way through processing, the new message
+    // is rejected and the in-progress operation completes successfully.
+
+    #[tokio::test]
+    async fn test_non_preemptible_active_request_rejects_new_message() {
+        let (control_sender, _update_receiver) =
+            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        // Bind discovery so SetInterface will take the multi-step path:
+        // iteration 1: unbind discovery, re-queue SetInterface
+        // iteration 2: interface matches, bind discovery, send response
+        let (rx, msg) = TestControl::bind_discovery();
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // Queue both messages into the channel buffer before the inner loop
+        // processes either. mpsc sends on a non-full buffer complete without
+        // yielding, so both land before the spawned task runs.
+        //
+        // 1) SetInterface(LOCALHOST) — will unbind discovery, re-queue itself
+        // 2) BindUnicast — should be rejected while SetInterface is in-flight
+        let (rx_set, msg_set) = TestControl::set_interface(Ipv4Addr::LOCALHOST);
+        let (rx_bind, msg_bind) = TestControl::bind_unicast_with_port(None);
+        control_sender.send(msg_set).await.unwrap();
+        control_sender.send(msg_bind).await.unwrap();
+
+        // SetInterface should complete successfully despite the intervening message
+        let set_result = tokio::time::timeout(std::time::Duration::from_secs(3), rx_set)
+            .await
+            .expect("Timed out waiting for SetInterface")
+            .expect("SetInterface oneshot closed");
+        assert!(set_result.is_ok());
+
+        // BindUnicast's oneshot sender was dropped when the non-preemptible
+        // arm rejected the message, so the receiver gets RecvError.
+        let bind_result = tokio::time::timeout(std::time::Duration::from_secs(1), rx_bind)
+            .await
+            .expect("Timed out waiting for BindUnicast rejection");
+        assert!(
+            bind_result.is_err(),
+            "BindUnicast should have been rejected (oneshot sender dropped)"
+        );
+
+        // Verify inner loop is still alive
+        assert_inner_alive(&control_sender).await;
+    }
 }
