@@ -1,4 +1,5 @@
 mod inner;
+mod service_registry;
 mod session;
 mod socket_manager;
 
@@ -145,6 +146,38 @@ where
         response.await.unwrap()
     }
 
+    pub async fn add_endpoint(
+        &mut self,
+        service_id: u16,
+        instance_id: u16,
+        addr: SocketAddrV4,
+    ) -> Result<(), Error> {
+        let (response, message) = ControlMessage::add_endpoint(service_id, instance_id, addr);
+        self.control_sender.send(message).await.unwrap();
+        response.await.unwrap()
+    }
+
+    pub async fn remove_endpoint(
+        &mut self,
+        service_id: u16,
+        instance_id: u16,
+    ) -> Result<(), Error> {
+        let (response, message) = ControlMessage::remove_endpoint(service_id, instance_id);
+        self.control_sender.send(message).await.unwrap();
+        response.await.unwrap()
+    }
+
+    pub async fn send_to_service(
+        &mut self,
+        service_id: u16,
+        instance_id: u16,
+        message: crate::protocol::Message<MessageDefinitions>,
+    ) -> Result<MessageDefinitions, Error> {
+        let (response, message) = ControlMessage::send_to_service(service_id, instance_id, message);
+        self.control_sender.send(message).await.unwrap();
+        response.await.unwrap()
+    }
+
     pub async fn shut_down(self) {
         let Self {
             control_sender,
@@ -264,6 +297,38 @@ mod tests {
         );
         let result = client.send_message(target, msg, 9999).await;
         assert!(result.is_err());
+        client.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn test_add_endpoint_succeeds() {
+        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 30000);
+        client.add_endpoint(0x1234, 0x0001, addr).await.unwrap();
+        client.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn test_send_to_service_unknown_returns_error() {
+        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let msg = crate::protocol::Message::new_sd(
+            1,
+            &crate::protocol::sd::Header::new_find_services(false, &[]),
+        );
+        let result = client.send_to_service(0xFFFF, 0xFFFF, msg).await;
+        assert!(
+            matches!(result, Err(Error::ServiceNotFound)),
+            "expected ServiceNotFound, got {result:?}"
+        );
+        client.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn test_remove_endpoint_succeeds() {
+        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 30000);
+        client.add_endpoint(0x1234, 0x0001, addr).await.unwrap();
+        client.remove_endpoint(0x1234, 0x0001).await.unwrap();
         client.shut_down().await;
     }
 }

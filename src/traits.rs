@@ -1,5 +1,17 @@
 use crate::protocol::{self, MessageId, sd, sd::Flags};
 
+/// Information about a service endpoint extracted from an SD message.
+#[cfg(feature = "std")]
+pub struct OfferedEndpoint {
+    pub service_id: u16,
+    pub instance_id: u16,
+    pub major_version: u8,
+    pub minor_version: u32,
+    pub addr: Option<std::net::SocketAddrV4>,
+    /// `true` for `OfferService`, `false` for `StopOfferService`.
+    pub is_offer: bool,
+}
+
 /// A trait for types that can be serialized to a [`Writer`](embedded_io::Write).
 ///
 /// `WireFormat` acts as the base trait for all types that can be serialized
@@ -42,6 +54,15 @@ pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
     fn required_size(&self) -> usize;
     /// Serialize the payload to a [Writer](embedded_io::Write)
     fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
+
+    /// Extract offered/stopped service endpoints from this SD payload.
+    ///
+    /// Default implementation returns an empty vec. Concrete implementations
+    /// that have access to SD entries and options should override this.
+    #[cfg(feature = "std")]
+    fn offered_endpoints(&self) -> std::vec::Vec<OfferedEndpoint> {
+        std::vec::Vec::new()
+    }
 }
 
 /// A simple implementation of [`PayloadWireFormat`] that only supports SOME/IP-SD messages.
@@ -92,6 +113,29 @@ impl<const E: usize, const O: usize> PayloadWireFormat for DiscoveryOnlyPayload<
 
     fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
         self.header.encode(writer)
+    }
+
+    #[cfg(feature = "std")]
+    fn offered_endpoints(&self) -> std::vec::Vec<OfferedEndpoint> {
+        self.header
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                sd::Entry::OfferService(svc) | sd::Entry::StopOfferService(svc) => {
+                    let is_offer = matches!(entry, sd::Entry::OfferService(_));
+                    let addr = sd::extract_ipv4_endpoint(&self.header.options);
+                    Some(OfferedEndpoint {
+                        service_id: svc.service_id,
+                        instance_id: svc.instance_id,
+                        major_version: svc.major_version,
+                        minor_version: svc.minor_version,
+                        addr,
+                        is_offer,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -156,5 +200,44 @@ mod tests {
         assert_eq!(n, payload.required_size());
         let decoded = DiscoveryOnlyPayload::from_payload_bytes(MessageId::SD, &buf[..]).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[cfg(feature = "std")]
+    mod offered_endpoints_tests {
+        use super::*;
+        use core::net::Ipv4Addr;
+
+        #[test]
+        fn offer_service_extracts_endpoint() {
+            let header: sd::Header<1, 1> = sd::Header::new_service_offer(
+                0x1234,
+                0x0001,
+                1,
+                0,
+                3,
+                Ipv4Addr::new(192, 168, 1, 1),
+                sd::TransportProtocol::Udp,
+                30000,
+            );
+            let payload = DiscoveryOnlyPayload::new_sd_payload(&header);
+            let endpoints = payload.offered_endpoints();
+            assert_eq!(endpoints.len(), 1);
+            assert!(endpoints[0].is_offer);
+            assert_eq!(endpoints[0].service_id, 0x1234);
+            assert_eq!(endpoints[0].instance_id, 0x0001);
+            assert_eq!(endpoints[0].major_version, 1);
+            assert_eq!(endpoints[0].minor_version, 0);
+            let addr = endpoints[0].addr.unwrap();
+            assert_eq!(addr.ip(), &Ipv4Addr::new(192, 168, 1, 1));
+            assert_eq!(addr.port(), 30000);
+        }
+
+        #[test]
+        fn find_service_returns_no_endpoints() {
+            let header: sd::Header<1, 0> = sd::Header::new_find_services(false, &[0x1234]);
+            let payload = DiscoveryOnlyPayload::new_sd_payload(&header);
+            let endpoints = payload.offered_endpoints();
+            assert!(endpoints.is_empty());
+        }
     }
 }
