@@ -1,11 +1,11 @@
 use std::{collections::HashMap, fmt, net::Ipv4Addr};
 
 use simple_someip::{
+    DiscoveryOnlyPayload,
     protocol::{
         Error,
         sd::{Entry, Options, TransportProtocol},
     },
-    traits::DiscoveryOnlyPayload,
 };
 use tracing::{error, info, level_filters::LevelFilter, warn};
 

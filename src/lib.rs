@@ -31,7 +31,8 @@ mod error;
 pub mod protocol;
 #[cfg(feature = "server")]
 pub mod server;
-pub mod traits;
+mod traits;
+pub use traits::{DiscoveryOnlyPayload, PayloadWireFormat, WireFormat};
 
 #[cfg(feature = "client")]
 pub use client::{Client, ClientUpdate};
