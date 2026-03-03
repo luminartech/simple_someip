@@ -39,10 +39,3 @@ pub use client::{Client, ClientUpdate};
 pub use error::Error;
 #[cfg(feature = "server")]
 pub use server::Server;
-
-use core::net::Ipv4Addr;
-
-pub const SD_MULTICAST_IP: Ipv4Addr = Ipv4Addr::new(239, 255, 0, 255);
-pub const SD_MULTICAST_PORT: u16 = 30490;
-///Message id for SOME/IP service discovery messages
-pub const SD_MESSAGE_ID_VALUE: u32 = 0xffff_8100;

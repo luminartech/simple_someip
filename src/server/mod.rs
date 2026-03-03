@@ -95,7 +95,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
         );
 
         // Bind SD socket for sending/receiving SD messages (must use SD port 30490)
-        let expected_sd_port = crate::SD_MULTICAST_PORT;
+        let expected_sd_port = sd::MULTICAST_PORT;
         let sd_bind_addr =
             std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), expected_sd_port);
         let sd_raw_socket = socket2::Socket::new(
@@ -112,13 +112,13 @@ impl<const E: usize, const O: usize> Server<E, O> {
         let sd_socket = UdpSocket::from_std(sd_std_socket)?;
 
         // Join SD multicast group to receive FindService and SubscribeEventGroup
-        sd_socket.join_multicast_v4(crate::SD_MULTICAST_IP, config.interface)?;
+        sd_socket.join_multicast_v4(sd::MULTICAST_IP, config.interface)?;
         let actual_sd_addr = sd_socket.local_addr()?;
         tracing::info!(
             "Server SD socket bound to {} (expected port {}), joined multicast {}",
             actual_sd_addr,
             expected_sd_port,
-            crate::SD_MULTICAST_IP
+            sd::MULTICAST_IP
         );
         if let std::net::SocketAddr::V4(v4) = actual_sd_addr
             && v4.port() != expected_sd_port
@@ -251,7 +251,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
         someip_header.encode(&mut buffer)?;
         buffer.extend_from_slice(&sd_data);
 
-        let multicast_addr = SocketAddrV4::new(crate::SD_MULTICAST_IP, crate::SD_MULTICAST_PORT);
+        let multicast_addr = SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT);
 
         tracing::trace!(
             "Sending OfferService: service=0x{:04X}, instance={}, port={}, size={} bytes",

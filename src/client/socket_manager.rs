@@ -1,6 +1,6 @@
 use crate::{
-    Error, SD_MULTICAST_IP, SD_MULTICAST_PORT,
-    protocol::{Message, MessageView},
+    Error,
+    protocol::{Message, MessageView, sd},
     traits::{PayloadWireFormat, WireFormat},
 };
 use std::{
@@ -60,7 +60,7 @@ where
         let (rx_tx, rx_rx) = mpsc::channel(16);
         let (tx_tx, tx_rx) = mpsc::channel(16);
         let bind_addr =
-            std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), SD_MULTICAST_PORT);
+            std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), sd::MULTICAST_PORT);
 
         // Create socket with SO_REUSEADDR to allow quick restart
         let socket = socket2::Socket::new(
@@ -76,13 +76,13 @@ where
         let socket: std::net::UdpSocket = socket.into();
         let socket = UdpSocket::from_std(socket)?;
 
-        socket.join_multicast_v4(SD_MULTICAST_IP, interface)?;
+        socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
 
         Self::spawn_socket_loop(socket, rx_tx, tx_rx);
         Ok(Self {
             receiver: rx_rx,
             sender: tx_tx,
-            local_port: SD_MULTICAST_PORT,
+            local_port: sd::MULTICAST_PORT,
             session_id: 0,
         })
     }

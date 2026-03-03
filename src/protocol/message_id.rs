@@ -1,4 +1,4 @@
-use crate::SD_MESSAGE_ID_VALUE;
+use super::sd;
 
 /// Newtype for a message ID.
 /// The Message ID is a 32-bit identifier that is unique for each message.
@@ -15,7 +15,7 @@ impl From<u32> for MessageId {
 
 impl MessageId {
     /// Message ID for Service Discovery
-    pub const SD: Self = Self::new(SD_MESSAGE_ID_VALUE);
+    pub const SD: Self = Self::new(sd::MESSAGE_ID_VALUE);
 
     /// Create a new `MessageId` directly.
     #[must_use]
@@ -79,7 +79,7 @@ impl MessageId {
     #[inline]
     #[must_use]
     pub const fn is_sd(&self) -> bool {
-        self.0 == crate::SD_MESSAGE_ID_VALUE
+        self.0 == sd::MESSAGE_ID_VALUE
     }
 }
 
