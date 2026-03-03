@@ -198,15 +198,16 @@ async fn main() -> Result<(), Error> {
 
     while let Some(update) = client.run().await {
         match update {
-            simple_someip::ClientUpdate::DiscoveryUpdated(header) => {
+            simple_someip::ClientUpdate::DiscoveryUpdated(msg) => {
                 state.total_messages += 1;
 
-                // The reboot flag is set on all SD messages until the session ID
-                // wraps around (65,535 messages). A true reboot is detected by
-                // tracking transitions: flag 0→1, or session ID decrease while
-                // flag stays 1. This requires the SOME/IP header's request_id
-                // which isn't currently exposed through DiscoveryUpdated.
+                info!(
+                    "SD from {} (session_id=0x{:04X})",
+                    msg.source,
+                    msg.someip_header.request_id & 0xFFFF,
+                );
 
+                let header = &msg.sd_header;
                 let options: Vec<_> = header.options.iter().cloned().collect();
 
                 for entry in &header.entries {
@@ -313,6 +314,11 @@ async fn main() -> Result<(), Error> {
                 }
 
                 state.print_summary();
+            }
+            simple_someip::ClientUpdate::SenderRebooted(addr) => {
+                warn!("Sender {addr} rebooted — clearing cached state");
+                state.services.clear();
+                state.event_groups.clear();
             }
             simple_someip::ClientUpdate::Unicast(message) => {
                 info!("Unicast message: {:?}", message.header());
