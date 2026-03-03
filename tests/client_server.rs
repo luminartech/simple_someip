@@ -198,7 +198,7 @@ async fn test_add_endpoint_and_send_to_service() {
         Message::<DiscoveryOnlyPayload>::new_sd(0x0001, &sd::Header::new_find_services(false, &[]));
     let result = client.send_to_service(0x5B, 1, msg).await;
     assert!(
-        matches!(result, Err(simple_someip::Error::ServiceNotFound)),
+        matches!(result, Err(simple_someip::client::Error::ServiceNotFound)),
         "expected ServiceNotFound after remove, got {result:?}"
     );
 

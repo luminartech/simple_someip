@@ -1,8 +1,9 @@
 use crate::{
-    Error,
     protocol::{Message, MessageView, sd},
     traits::{PayloadWireFormat, WireFormat},
 };
+
+use super::error::Error;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     prelude::rust_2024::*,

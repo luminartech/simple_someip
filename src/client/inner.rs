@@ -15,7 +15,6 @@ use tokio::{
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    Error,
     client::{
         ClientUpdate, DiscoveryMessage,
         service_registry::{ServiceEndpointInfo, ServiceInstanceId, ServiceRegistry},
@@ -25,6 +24,8 @@ use crate::{
     protocol::{self, Message},
     traits::PayloadWireFormat,
 };
+
+use super::error::Error;
 
 pub(super) enum ControlMessage<P: PayloadWireFormat> {
     SetInterface(Ipv4Addr, oneshot::Sender<Result<(), Error>>),

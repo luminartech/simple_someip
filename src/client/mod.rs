@@ -1,9 +1,12 @@
+mod error;
 mod inner;
 mod service_registry;
 mod session;
 mod socket_manager;
 
-use crate::{Error, protocol, protocol::Message, traits::PayloadWireFormat};
+pub use error::Error;
+
+use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
 use inner::{ControlMessage, Inner};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use tokio::sync::mpsc;

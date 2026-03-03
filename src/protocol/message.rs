@@ -77,16 +77,25 @@ impl<'a> MessageView<'a> {
         // SD-specific validation
         if header.is_sd() {
             if payload_size < 12 {
-                return Err(Error::InvalidSDMessage("SD message too short"));
+                return Err(
+                    crate::protocol::sd::Error::InvalidMessage("SD message too short").into(),
+                );
             }
             if header.interface_version() != 0x01 {
-                return Err(Error::InvalidSDMessage("SD interface version mismatch"));
+                return Err(crate::protocol::sd::Error::InvalidMessage(
+                    "SD interface version mismatch",
+                )
+                .into());
             }
             if header.message_type().message_type() != MessageType::Notification {
-                return Err(Error::InvalidSDMessage("SD message type mismatch"));
+                return Err(
+                    crate::protocol::sd::Error::InvalidMessage("SD message type mismatch").into(),
+                );
             }
             if header.return_code() != ReturnCode::Ok {
-                return Err(Error::InvalidSDMessage("SD return code mismatch"));
+                return Err(
+                    crate::protocol::sd::Error::InvalidMessage("SD return code mismatch").into(),
+                );
             }
         }
 
@@ -115,7 +124,7 @@ impl<'a> MessageView<'a> {
     /// have already passed).
     pub fn sd_header(&self) -> Result<SdHeaderView<'a>, Error> {
         if !self.is_sd() {
-            return Err(Error::InvalidSDMessage("Not an SD message"));
+            return Err(crate::protocol::sd::Error::InvalidMessage("Not an SD message").into());
         }
         SdHeaderView::parse(self.payload)
     }
@@ -285,7 +294,9 @@ mod tests {
         buf[4..8].copy_from_slice(&bad_len.to_be_bytes());
         assert!(matches!(
             MessageView::parse(&buf[..]),
-            Err(Error::InvalidSDMessage("SD message too short"))
+            Err(Error::Sd(crate::protocol::sd::Error::InvalidMessage(
+                "SD message too short"
+            )))
         ));
     }
 
@@ -297,7 +308,9 @@ mod tests {
         buf[13] = 0x02; // interface_version at byte 13
         assert!(matches!(
             MessageView::parse(&buf[..n]),
-            Err(Error::InvalidSDMessage("SD interface version mismatch"))
+            Err(Error::Sd(crate::protocol::sd::Error::InvalidMessage(
+                "SD interface version mismatch"
+            )))
         ));
     }
 
@@ -309,7 +322,9 @@ mod tests {
         buf[14] = 0x00; // Request instead of Notification
         assert!(matches!(
             MessageView::parse(&buf[..n]),
-            Err(Error::InvalidSDMessage("SD message type mismatch"))
+            Err(Error::Sd(crate::protocol::sd::Error::InvalidMessage(
+                "SD message type mismatch"
+            )))
         ));
     }
 
@@ -321,7 +336,9 @@ mod tests {
         buf[15] = 0x01; // NotOk instead of Ok
         assert!(matches!(
             MessageView::parse(&buf[..n]),
-            Err(Error::InvalidSDMessage("SD return code mismatch"))
+            Err(Error::Sd(crate::protocol::sd::Error::InvalidMessage(
+                "SD return code mismatch"
+            )))
         ));
     }
 
@@ -353,7 +370,9 @@ mod tests {
         let view = MessageView::parse(&buf).unwrap();
         assert!(matches!(
             view.sd_header(),
-            Err(Error::InvalidSDMessage("Not an SD message"))
+            Err(Error::Sd(crate::protocol::sd::Error::InvalidMessage(
+                "Not an SD message"
+            )))
         ));
     }
 }

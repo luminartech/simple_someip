@@ -25,9 +25,8 @@
 extern crate std;
 
 #[cfg(feature = "client")]
-mod client;
+pub mod client;
 pub mod e2e;
-mod error;
 pub mod protocol;
 #[cfg(feature = "server")]
 pub mod server;
@@ -35,7 +34,6 @@ mod traits;
 pub use traits::{DiscoveryOnlyPayload, PayloadWireFormat, WireFormat};
 
 #[cfg(feature = "client")]
-pub use client::{Client, ClientUpdate};
-pub use error::Error;
+pub use client::{Client, ClientUpdate, DiscoveryMessage};
 #[cfg(feature = "server")]
 pub use server::Server;

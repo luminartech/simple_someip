@@ -1,7 +1,7 @@
 //! Event publishing functionality
 
+use super::Error;
 use super::subscription_manager::SubscriptionManager;
-use crate::Error;
 use crate::protocol::{Header, Message};
 use crate::traits::{PayloadWireFormat, WireFormat};
 use std::{prelude::rust_2024::*, sync::Arc};

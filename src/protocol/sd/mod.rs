@@ -1,4 +1,5 @@
 mod entry;
+mod error;
 mod flags;
 mod header;
 mod options;
@@ -17,6 +18,7 @@ pub const MESSAGE_ID_VALUE: u32 = 0xffff_8100;
 pub use entry::{
     Entry, EntryIter, EntryType, EntryView, EventGroupEntry, OptionsCount, ServiceEntry,
 };
+pub use error::Error;
 pub use flags::Flags;
 pub use header::{Header, MAX_SD_ENTRIES, MAX_SD_OPTIONS, SdEntries, SdHeaderView, SdOptions};
 pub use options::{

@@ -1,6 +1,7 @@
 use core::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::protocol::{Error, byte_order::WriteBytesExt};
+use super::Error;
+use crate::protocol::byte_order::WriteBytesExt;
 
 pub const MAX_CONFIGURATION_STRING_LENGTH: usize = 256;
 
@@ -16,7 +17,7 @@ impl TryFrom<u8> for TransportProtocol {
         match value {
             0x11 => Ok(TransportProtocol::Udp),
             0x06 => Ok(TransportProtocol::Tcp),
-            _ => Err(Error::InvalidSDOptionTransportProtocol(value)),
+            _ => Err(Error::InvalidOptionTransportProtocol(value)),
         }
     }
 }
@@ -54,7 +55,7 @@ impl TryFrom<u8> for OptionType {
             0x16 => Ok(OptionType::IpV6Multicast),
             0x24 => Ok(OptionType::IpV4SD),
             0x26 => Ok(OptionType::IpV6SD),
-            _ => Err(Error::InvalidSDOptionType(value)),
+            _ => Err(Error::InvalidOptionType(value)),
         }
     }
 }
@@ -134,7 +135,10 @@ impl Options {
         }
     }
 
-    pub fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
+    pub fn write<T: embedded_io::Write>(
+        &self,
+        writer: &mut T,
+    ) -> Result<usize, crate::protocol::Error> {
         writer.write_u16_be(u16::try_from(self.size() - 3).expect("option size fits u16"))?;
         match self {
             Options::Configuration {
@@ -180,7 +184,7 @@ fn write_ipv4_option<T: embedded_io::Write>(
     ip: Ipv4Addr,
     protocol: TransportProtocol,
     port: u16,
-) -> Result<usize, Error> {
+) -> Result<usize, crate::protocol::Error> {
     writer.write_u8(u8::from(option_type))?;
     writer.write_u8(0)?;
     writer.write_u32_be(ip.to_bits())?;
@@ -196,7 +200,7 @@ fn write_ipv6_option<T: embedded_io::Write>(
     ip: Ipv6Addr,
     protocol: TransportProtocol,
     port: u16,
-) -> Result<usize, Error> {
+) -> Result<usize, crate::protocol::Error> {
     writer.write_u8(u8::from(option_type))?;
     writer.write_u8(0)?;
     writer.write_bytes(&ip.octets())?;
@@ -375,7 +379,7 @@ pub(crate) fn validate_option(buf: &[u8]) -> Result<usize, Error> {
     match option_type {
         OptionType::IpV4Endpoint | OptionType::IpV4Multicast | OptionType::IpV4SD => {
             if length != 9 {
-                return Err(Error::InvalidSDOptionLength {
+                return Err(Error::InvalidOptionLength {
                     option_type: buf[2],
                     expected: 9,
                     actual: length,
@@ -384,7 +388,7 @@ pub(crate) fn validate_option(buf: &[u8]) -> Result<usize, Error> {
         }
         OptionType::IpV6Endpoint | OptionType::IpV6Multicast | OptionType::IpV6SD => {
             if length != 21 {
-                return Err(Error::InvalidSDOptionLength {
+                return Err(Error::InvalidOptionLength {
                     option_type: buf[2],
                     expected: 21,
                     actual: length,
@@ -393,7 +397,7 @@ pub(crate) fn validate_option(buf: &[u8]) -> Result<usize, Error> {
         }
         OptionType::LoadBalancing => {
             if length != 5 {
-                return Err(Error::InvalidSDOptionLength {
+                return Err(Error::InvalidOptionLength {
                     option_type: buf[2],
                     expected: 5,
                     actual: length,
@@ -416,7 +420,6 @@ mod tests {
     use core::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
-    use crate::protocol::Error;
 
     // --- TransportProtocol ---
 
@@ -433,7 +436,7 @@ mod tests {
     fn transport_protocol_invalid_returns_error() {
         assert!(matches!(
             TransportProtocol::try_from(0xFF),
-            Err(Error::InvalidSDOptionTransportProtocol(0xFF))
+            Err(Error::InvalidOptionTransportProtocol(0xFF))
         ));
     }
 
@@ -465,7 +468,7 @@ mod tests {
         let view = OptionView(&buf);
         assert!(matches!(
             view.to_owned(),
-            Err(Error::InvalidSDOptionType(0xFF))
+            Err(Error::InvalidOptionType(0xFF))
         ));
     }
 
@@ -580,7 +583,7 @@ mod tests {
         buf[3] = 0x00; // discard flag
         assert!(matches!(
             validate_option(&buf),
-            Err(Error::InvalidSDOptionLength {
+            Err(Error::InvalidOptionLength {
                 option_type: 0x02,
                 expected: 5,
                 actual: 3,
@@ -598,7 +601,7 @@ mod tests {
         buf[3] = 0x00;
         assert!(matches!(
             validate_option(&buf),
-            Err(Error::InvalidSDOptionLength {
+            Err(Error::InvalidOptionLength {
                 option_type: 0x04,
                 expected: 9,
                 actual: 5,
@@ -616,7 +619,7 @@ mod tests {
         buf[3] = 0x00;
         assert!(matches!(
             validate_option(&buf),
-            Err(Error::InvalidSDOptionLength {
+            Err(Error::InvalidOptionLength {
                 option_type: 0x06,
                 expected: 21,
                 actual: 9,
@@ -634,7 +637,7 @@ mod tests {
         buf[3] = 0x00;
         assert!(matches!(
             validate_option(&buf),
-            Err(Error::InvalidSDOptionLength {
+            Err(Error::InvalidOptionLength {
                 option_type: 0x14,
                 expected: 9,
                 actual: 5,
@@ -652,7 +655,7 @@ mod tests {
         buf[3] = 0x00;
         assert!(matches!(
             validate_option(&buf),
-            Err(Error::InvalidSDOptionLength {
+            Err(Error::InvalidOptionLength {
                 option_type: 0x16,
                 expected: 21,
                 actual: 9,
@@ -670,7 +673,7 @@ mod tests {
         buf[3] = 0x00;
         assert!(matches!(
             validate_option(&buf),
-            Err(Error::InvalidSDOptionLength {
+            Err(Error::InvalidOptionLength {
                 option_type: 0x24,
                 expected: 9,
                 actual: 5,
@@ -688,7 +691,7 @@ mod tests {
         buf[3] = 0x00;
         assert!(matches!(
             validate_option(&buf),
-            Err(Error::InvalidSDOptionLength {
+            Err(Error::InvalidOptionLength {
                 option_type: 0x26,
                 expected: 21,
                 actual: 9,

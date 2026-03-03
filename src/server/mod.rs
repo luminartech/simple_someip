@@ -6,19 +6,18 @@
 //! - Event group management
 //! - Request/Response handling
 
+mod error;
 mod event_publisher;
 mod service_info;
 mod subscription_manager;
 
+pub use error::Error;
 pub use event_publisher::EventPublisher;
 pub use service_info::{EventGroupInfo, ServiceInfo};
 pub use subscription_manager::SubscriptionManager;
 
-use crate::{
-    Error,
-    protocol::sd::{
-        self, Entry, Flags, OptionsCount, SdEntries, SdOptions, ServiceEntry, TransportProtocol,
-    },
+use crate::protocol::sd::{
+    self, Entry, Flags, OptionsCount, SdEntries, SdOptions, ServiceEntry, TransportProtocol,
 };
 use core::sync::atomic::Ordering;
 use std::{

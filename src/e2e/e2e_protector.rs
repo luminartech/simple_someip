@@ -1,9 +1,9 @@
 //! E2E protection functions for adding E2E headers to payloads.
 
+use super::Error;
 use super::config::{Profile4Config, Profile5Config};
 use super::crc::{compute_crc16_p5, compute_crc16_p5_with_header, compute_crc32_p4};
 use super::state::{Profile4State, Profile5State};
-use crate::Error;
 
 /// Profile 4 header size in bytes.
 pub const PROFILE4_HEADER_SIZE: usize = 12;
@@ -409,7 +409,7 @@ mod tests {
         let err = protect_profile4(&config, &mut state, payload, &mut buf).unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::BufferTooSmall {
+            crate::e2e::Error::BufferTooSmall {
                 needed: 16,
                 actual: 10,
             }
@@ -427,7 +427,7 @@ mod tests {
         let err = protect_profile5(&config, &mut state, payload, &mut buf).unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::BufferTooSmall {
+            crate::e2e::Error::BufferTooSmall {
                 needed: 7,
                 actual: 5,
             }
@@ -448,7 +448,7 @@ mod tests {
                 .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::BufferTooSmall {
+            crate::e2e::Error::BufferTooSmall {
                 needed: 7,
                 actual: 5,
             }
@@ -465,7 +465,7 @@ mod tests {
         let payload = std::vec![0u8; 65536];
         let mut buf = std::vec![0u8; 65536 + 12];
         let err = protect_profile4(&config, &mut state, &payload, &mut buf).unwrap_err();
-        assert!(matches!(err, crate::Error::BufferTooSmall { .. }));
+        assert!(matches!(err, crate::e2e::Error::BufferTooSmall { .. }));
     }
 
     #[test]
