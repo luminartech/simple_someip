@@ -1,5 +1,5 @@
 use crate::{
-    protocol::{Error, Header, MessageType, ReturnCode, byte_order::Take},
+    protocol::{Error, Header, MessageType, ReturnCode, header::HeaderView, sd::SdHeaderView},
     traits::{PayloadWireFormat, WireFormat},
 };
 
@@ -51,6 +51,83 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
 
     pub fn payload_mut(&mut self) -> &mut PayloadDefinition {
         &mut self.payload
+    }
+}
+
+/// Zero-copy view into a complete SOME/IP message (header + payload).
+#[derive(Clone, Copy, Debug)]
+pub struct MessageView<'a> {
+    header: HeaderView<'a>,
+    payload: &'a [u8],
+}
+
+impl<'a> MessageView<'a> {
+    /// Parse a complete SOME/IP message from `buf`.
+    ///
+    /// Validates the header, checks that the buffer contains enough data for
+    /// the declared payload, and for SD messages validates SD-specific constraints.
+    pub fn parse(buf: &'a [u8]) -> Result<Self, Error> {
+        let (header, remaining) = HeaderView::parse(buf)?;
+        let payload_size = header.payload_size();
+
+        if remaining.len() < payload_size {
+            return Err(Error::UnexpectedEof);
+        }
+
+        // SD-specific validation
+        if header.is_sd() {
+            if payload_size < 12 {
+                return Err(Error::InvalidSDMessage("SD message too short"));
+            }
+            if header.interface_version() != 0x01 {
+                return Err(Error::InvalidSDMessage("SD interface version mismatch"));
+            }
+            if header.message_type().message_type() != MessageType::Notification {
+                return Err(Error::InvalidSDMessage("SD message type mismatch"));
+            }
+            if header.return_code() != ReturnCode::Ok {
+                return Err(Error::InvalidSDMessage("SD return code mismatch"));
+            }
+        }
+
+        let payload = &remaining[..payload_size];
+        Ok(Self { header, payload })
+    }
+
+    #[must_use]
+    pub fn header(&self) -> HeaderView<'a> {
+        self.header
+    }
+
+    #[must_use]
+    pub fn payload_bytes(&self) -> &'a [u8] {
+        self.payload
+    }
+
+    #[must_use]
+    pub fn is_sd(&self) -> bool {
+        self.header.is_sd()
+    }
+
+    /// Parse the payload as an SD header.
+    /// The caller should check `is_sd()` first; this method returns an error
+    /// if the message is not an SD message (the SD validation in `parse` must
+    /// have already passed).
+    pub fn sd_header(&self) -> Result<SdHeaderView<'a>, Error> {
+        if !self.is_sd() {
+            return Err(Error::InvalidSDMessage("Not an SD message"));
+        }
+        SdHeaderView::parse(self.payload)
+    }
+}
+
+impl<PayloadDefinition: PayloadWireFormat> WireFormat for Message<PayloadDefinition> {
+    fn required_size(&self) -> usize {
+        self.header.required_size() + self.payload.required_size()
+    }
+
+    fn encode<W: embedded_io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
+        Ok(self.header.encode(writer)? + self.payload.encode(writer)?)
     }
 }
 
@@ -146,43 +223,59 @@ mod tests {
         assert_eq!(msg.required_size(), expected);
     }
 
-    // --- WireFormat: encode / decode round-trip ---
+    // --- WireFormat: encode / MessageView::parse round-trip ---
 
     #[test]
-    fn encode_decode_round_trip() {
+    fn encode_parse_round_trip() {
         let msg = make_sd_message();
         let mut buf = [0u8; 64];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
         assert_eq!(n, msg.required_size());
-        let decoded = Msg::decode(&mut &buf[..n]).unwrap();
-        assert_eq!(decoded, msg);
+        let view = MessageView::parse(&buf[..n]).unwrap();
+        assert!(view.is_sd());
+        assert_eq!(view.header().to_owned(), *msg.header());
     }
 
     #[test]
-    fn encode_decode_with_entries() {
+    fn encode_parse_with_entries() {
         let sd_hdr: sd::Header<1, 0> = sd::Header::new_find_services(true, &[0xABCD]);
         let msg = Message::<DiscoveryOnlyPayload<1, 0>>::new_sd(0x42, &sd_hdr);
         let mut buf = [0u8; 64];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
-        let decoded = Message::<DiscoveryOnlyPayload<1, 0>>::decode(&mut &buf[..n]).unwrap();
-        assert_eq!(decoded, msg);
+        let view = MessageView::parse(&buf[..n]).unwrap();
+        let sd_view = view.sd_header().unwrap();
+        let decoded: sd::Header<1, 0> = sd_view.to_owned().unwrap();
+        assert_eq!(decoded, sd_hdr);
     }
 
-    // --- decode error paths ---
+    // --- parse with exactly-sized slice ---
 
     #[test]
-    fn decode_truncated_returns_eof() {
+    fn parse_exact_size_slice_succeeds() {
+        let msg = make_sd_message();
+        let mut buf = [0u8; 64];
+        let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
+        // Pass exactly n bytes — no extra data beyond the message
+        let view = MessageView::parse(&buf[..n]).unwrap();
+        assert!(view.is_sd());
+        assert_eq!(view.header().to_owned(), *msg.header());
+    }
+
+    // --- parse error paths ---
+
+    #[test]
+    fn parse_truncated_returns_eof() {
         let buf: [u8; 4] = [0; 4];
         assert!(matches!(
-            Msg::decode(&mut &buf[..]),
+            MessageView::parse(&buf[..]),
             Err(Error::UnexpectedEof)
         ));
     }
 
-    // --- decode SD validation errors ---
+    // --- parse SD validation errors ---
 
     #[test]
-    fn decode_sd_payload_too_short_returns_error() {
+    fn parse_sd_payload_too_short_returns_error() {
         let msg = make_sd_message();
         let mut buf = [0u8; 64];
         msg.encode(&mut buf.as_mut_slice()).unwrap();
@@ -191,76 +284,76 @@ mod tests {
         let bad_len: u32 = 19;
         buf[4..8].copy_from_slice(&bad_len.to_be_bytes());
         assert!(matches!(
-            Msg::decode(&mut &buf[..]),
+            MessageView::parse(&buf[..]),
             Err(Error::InvalidSDMessage("SD message too short"))
         ));
     }
 
     #[test]
-    fn decode_sd_wrong_interface_version_returns_error() {
+    fn parse_sd_wrong_interface_version_returns_error() {
         let msg = make_sd_message();
         let mut buf = [0u8; 64];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
         buf[13] = 0x02; // interface_version at byte 13
         assert!(matches!(
-            Msg::decode(&mut &buf[..n]),
+            MessageView::parse(&buf[..n]),
             Err(Error::InvalidSDMessage("SD interface version mismatch"))
         ));
     }
 
     #[test]
-    fn decode_sd_wrong_message_type_returns_error() {
+    fn parse_sd_wrong_message_type_returns_error() {
         let msg = make_sd_message();
         let mut buf = [0u8; 64];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
         buf[14] = 0x00; // Request instead of Notification
         assert!(matches!(
-            Msg::decode(&mut &buf[..n]),
+            MessageView::parse(&buf[..n]),
             Err(Error::InvalidSDMessage("SD message type mismatch"))
         ));
     }
 
     #[test]
-    fn decode_sd_wrong_return_code_returns_error() {
+    fn parse_sd_wrong_return_code_returns_error() {
         let msg = make_sd_message();
         let mut buf = [0u8; 64];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
         buf[15] = 0x01; // NotOk instead of Ok
         assert!(matches!(
-            Msg::decode(&mut &buf[..n]),
+            MessageView::parse(&buf[..n]),
             Err(Error::InvalidSDMessage("SD return code mismatch"))
         ));
     }
-}
 
-impl<PayloadDefinition: PayloadWireFormat> WireFormat for Message<PayloadDefinition> {
-    fn decode<R: embedded_io::Read>(reader: &mut R) -> Result<Self, Error> {
-        let header = Header::decode(reader)?;
-        if header.message_id.is_sd() {
-            if header.payload_size() < 12 {
-                return Err(Error::InvalidSDMessage("SD message too short"));
-            }
-            if header.interface_version != 0x01 {
-                return Err(Error::InvalidSDMessage("SD interface version mismatch"));
-            }
-            if header.message_type.message_type() != MessageType::Notification {
-                return Err(Error::InvalidSDMessage("SD message type mismatch"));
-            }
-            if header.return_code != ReturnCode::Ok {
-                return Err(Error::InvalidSDMessage("SD return code mismatch"));
-            }
-        }
-        let mut payload_reader = Take::new(reader, header.payload_size());
-        let payload =
-            PayloadDefinition::decode_with_message_id(header.message_id, &mut payload_reader)?;
-        Ok(Self::new(header, payload))
+    // --- MessageView accessors ---
+
+    #[test]
+    fn message_view_payload_bytes() {
+        let msg = make_sd_message();
+        let mut buf = [0u8; 64];
+        let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
+        let view = MessageView::parse(&buf[..n]).unwrap();
+        assert_eq!(view.payload_bytes().len(), msg.header().payload_size());
     }
 
-    fn required_size(&self) -> usize {
-        self.header.required_size() + self.payload.required_size()
-    }
-
-    fn encode<W: embedded_io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
-        Ok(self.header.encode(writer)? + self.payload.encode(writer)?)
+    #[test]
+    fn message_view_sd_header_on_non_sd_returns_error() {
+        // Build a non-SD message
+        let header = Header {
+            message_id: MessageId::new_from_service_and_method(0x1234, 0x0001),
+            length: 8, // payload_size = 0
+            request_id: 0x0001,
+            protocol_version: 0x01,
+            interface_version: 0x01,
+            message_type: crate::protocol::MessageTypeField::try_from(0x00).unwrap(),
+            return_code: ReturnCode::Ok,
+        };
+        let mut buf = [0u8; 16];
+        header.encode(&mut buf.as_mut_slice()).unwrap();
+        let view = MessageView::parse(&buf).unwrap();
+        assert!(matches!(
+            view.sd_header(),
+            Err(Error::InvalidSDMessage("Not an SD message"))
+        ));
     }
 }

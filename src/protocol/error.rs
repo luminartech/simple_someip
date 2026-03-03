@@ -38,4 +38,6 @@ pub enum Error {
     ConfigurationStringTooLong(usize),
     #[error("Invalid SD message: {0}")]
     InvalidSDMessage(&'static str),
+    #[error("Entries array length {0} is not a multiple of entry size (16)")]
+    IncorrectEntriesSize(usize),
 }

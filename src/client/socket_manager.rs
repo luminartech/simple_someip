@@ -1,6 +1,6 @@
 use crate::{
     Error, SD_MULTICAST_IP, SD_MULTICAST_PORT,
-    protocol::Message,
+    protocol::{Message, MessageView},
     traits::{PayloadWireFormat, WireFormat},
 };
 use std::{
@@ -165,8 +165,14 @@ where
                 select! {
                     result = socket.recv_from(&mut buf) => {
                         match result {
-                            Ok((_bytes_received, _source_address )) => {
-                                let parse_result = Message::<MessageDefinitions>::decode(&mut buf.as_slice()).map_err(Error::from);
+                            Ok((bytes_received, _source_address )) => {
+                                let parse_result = MessageView::parse(&buf[..bytes_received])
+                                    .and_then(|view| {
+                                        let header = view.header().to_owned();
+                                        let payload = MessageDefinitions::from_payload_bytes(header.message_id, view.payload_bytes())?;
+                                        Ok(Message::new(header, payload))
+                                    })
+                                    .map_err(Error::from);
                                 if let Ok(()) = rx_tx.send( parse_result ).await {} else {
                                     info!("Socket Dropping");
                                     // The receiver has been dropped, so we should exit
@@ -314,7 +320,7 @@ mod tests {
         .unwrap();
 
         // Decode and verify
-        let decoded = Message::<DiscoveryOnlyPayload>::decode(&mut &recv_buf[..len]).unwrap();
-        assert_eq!(decoded.header().message_id, msg.header().message_id);
+        let view = MessageView::parse(&recv_buf[..len]).unwrap();
+        assert_eq!(view.header().to_owned().message_id, msg.header().message_id);
     }
 }

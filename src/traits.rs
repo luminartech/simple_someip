@@ -1,19 +1,11 @@
 use crate::protocol::{self, MessageId, sd};
 
-/// A trait for types that can be deserialized from a
-/// [`Reader`](embedded_io::Read) and serialized to a [`Writer`](embedded_io::Write).
+/// A trait for types that can be serialized to a [`Writer`](embedded_io::Write).
 ///
-/// `WireFormat` acts as the base trait for all types that can be serialized and deserialized
-/// as part of the Simple SOME/IP ecosystem.
+/// `WireFormat` acts as the base trait for all types that can be serialized
+/// as part of the Simple SOME/IP ecosystem. Decoding is handled by zero-copy
+/// view types (`HeaderView`, `MessageView`, etc.) instead of this trait.
 pub trait WireFormat: Send + Sized + Sync {
-    /// Deserialize a value from a byte stream.
-    /// Returns Ok(`Some(value)`) if the stream contains a complete value.
-    /// Returns Ok(`None`) if the stream is empty.
-    /// # Errors
-    /// - if the stream is not in the expected format
-    /// - if the stream contains partial data
-    fn decode<T: embedded_io::Read>(reader: &mut T) -> Result<Self, protocol::Error>;
-
     /// Returns the number of bytes required to serialize this value.
     fn required_size(&self) -> usize;
 
@@ -24,10 +16,11 @@ pub trait WireFormat: Send + Sized + Sync {
     fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
 }
 
-/// A trait for SOME/IP Payload types that can be deserialized from a
-/// [`Reader`](embedded_io::Read) and serialized to a [`Writer`](embedded_io::Write).
+/// A trait for SOME/IP Payload types that can be serialized to a
+/// [`Writer`](embedded_io::Write) and constructed from raw payload bytes.
+///
 /// Note that SOME/IP payloads are not self identifying, so the [Message ID](protocol::MessageId)
-/// must be provided by the caller after reading from the [SOME/IP header](protocol::Header).
+/// must be provided by the caller.
 pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
     /// The SD header type used by this payload implementation.
     type SdHeader: WireFormat + Clone + core::fmt::Debug + Eq;
@@ -36,11 +29,11 @@ pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
     fn message_id(&self) -> MessageId;
     /// Get the payload as a service discovery header
     fn as_sd_header(&self) -> Option<&Self::SdHeader>;
-    /// Deserialize a payload from a [Reader](embedded_io::Read) given the Message ID.
-    fn decode_with_message_id<T: embedded_io::Read>(
-        message_id: MessageId,
-        reader: &mut T,
-    ) -> Result<Self, protocol::Error>;
+    /// Construct a payload from raw bytes and a message ID.
+    /// # Errors
+    /// - If the message ID is not supported
+    /// - If the payload bytes cannot be parsed
+    fn from_payload_bytes(message_id: MessageId, payload: &[u8]) -> Result<Self, protocol::Error>;
     /// Create a `PayloadWireFormat` from a service discovery [Header](protocol::sd::Header)
     fn new_sd_payload(header: &Self::SdHeader) -> Self;
     /// Number of bytes required to write the payload
@@ -69,15 +62,14 @@ impl<const E: usize, const O: usize> PayloadWireFormat for DiscoveryOnlyPayload<
         Some(&self.header)
     }
 
-    fn decode_with_message_id<T: embedded_io::Read>(
-        message_id: MessageId,
-        reader: &mut T,
-    ) -> Result<Self, protocol::Error> {
+    fn from_payload_bytes(message_id: MessageId, payload: &[u8]) -> Result<Self, protocol::Error> {
         match message_id {
-            MessageId::SD => Ok(Self {
-                header: sd::Header::decode(reader)?,
-            }),
-
+            MessageId::SD => {
+                let sd_view = protocol::sd::SdHeaderView::parse(payload)?;
+                Ok(Self {
+                    header: sd_view.to_owned()?,
+                })
+            }
             _ => Err(protocol::Error::UnsupportedMessageID(message_id)),
         }
     }
@@ -134,33 +126,29 @@ mod tests {
     }
 
     #[test]
-    fn decode_with_sd_message_id_succeeds() {
+    fn from_payload_bytes_with_sd_message_id_succeeds() {
         let header = minimal_sd_header();
         let mut buf = [0u8; 64];
         let n = header.encode(&mut buf.as_mut_slice()).unwrap();
-        let decoded =
-            DiscoveryOnlyPayload::decode_with_message_id(MessageId::SD, &mut &buf[..n]).unwrap();
+        let decoded = DiscoveryOnlyPayload::from_payload_bytes(MessageId::SD, &buf[..n]).unwrap();
         assert_eq!(decoded.as_sd_header().unwrap(), &header);
     }
 
     #[test]
-    fn decode_with_non_sd_message_id_returns_error() {
+    fn from_payload_bytes_with_non_sd_message_id_returns_error() {
         let non_sd_id = MessageId::new_from_service_and_method(0x1234, 0x0001);
-        let mut empty: &[u8] = &[];
-        let err = DiscoveryOnlyPayload::<1, 1>::decode_with_message_id(non_sd_id, &mut empty)
-            .unwrap_err();
+        let err = DiscoveryOnlyPayload::<1, 1>::from_payload_bytes(non_sd_id, &[]).unwrap_err();
         assert!(matches!(err, protocol::Error::UnsupportedMessageID(_)));
     }
 
     #[test]
-    fn encode_decode_round_trip() {
+    fn encode_from_payload_bytes_round_trip() {
         let header: sd::Header<1, 0> = sd::Header::new_find_services(true, &[0x5B]);
         let payload = DiscoveryOnlyPayload::new_sd_payload(&header);
         let mut buf = [0u8; 28]; // required_size: 12 overhead + 16 entry = 28
         let n = payload.encode(&mut buf.as_mut_slice()).unwrap();
         assert_eq!(n, payload.required_size());
-        let decoded =
-            DiscoveryOnlyPayload::decode_with_message_id(MessageId::SD, &mut &buf[..]).unwrap();
+        let decoded = DiscoveryOnlyPayload::from_payload_bytes(MessageId::SD, &buf[..]).unwrap();
         assert_eq!(decoded, payload);
     }
 }

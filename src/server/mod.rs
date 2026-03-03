@@ -392,8 +392,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
     /// Listens on both the unicast socket (for direct requests) and the
     /// SD multicast socket (for `FindService` and `SubscribeEventGroup`).
     pub async fn run(&mut self) -> Result<(), Error> {
-        use crate::protocol::Header as SomeIpHeader;
-        use crate::traits::WireFormat;
+        use crate::protocol::MessageView;
 
         let mut unicast_buf = vec![0u8; 65535];
         let mut sd_buf = vec![0u8; 65535];
@@ -423,31 +422,24 @@ impl<const E: usize, const O: usize> Server<E, O> {
             tracing::trace!("Received {} bytes from {} on {} socket", len, addr, source);
             tracing::trace!("Raw data: {:02X?}", &data[..len.min(64_usize)]);
 
-            // Try to parse as SOME/IP message
-            let mut reader = data;
-            match SomeIpHeader::decode(&mut reader) {
-                Ok(header) => {
+            // Try to parse as SOME/IP message using zero-copy view
+            match MessageView::parse(data) {
+                Ok(view) => {
                     tracing::trace!(
                         "SOME/IP Header: service=0x{:04X}, method=0x{:04X}, type={:?}",
-                        header.message_id.service_id(),
-                        header.message_id.method_id(),
-                        header.message_type.message_type()
+                        view.header().message_id().service_id(),
+                        view.header().message_id().method_id(),
+                        view.header().message_type().message_type()
                     );
 
                     // Check if this is a Service Discovery message (0xFFFF8100)
-                    if header.message_id.service_id() == 0xFFFF
-                        && header.message_id.method_id() == 0x8100
-                    {
+                    if view.is_sd() {
                         tracing::trace!("This is an SD message");
                         // Parse SD payload
-                        match sd::Header::<E, O>::decode(&mut reader) {
-                            Ok(sd_msg) => {
-                                tracing::trace!(
-                                    "SD message has {} entries, {} options",
-                                    sd_msg.entries.len(),
-                                    sd_msg.options.len()
-                                );
-                                self.handle_sd_message(sd_msg, addr).await?;
+                        match view.sd_header() {
+                            Ok(sd_view) => {
+                                tracing::trace!("SD message has {} entries", sd_view.entry_count(),);
+                                self.handle_sd_message(&sd_view, addr).await?;
                             }
                             Err(e) => {
                                 tracing::warn!("Failed to parse SD message: {:?}", e);
@@ -468,80 +460,91 @@ impl<const E: usize, const O: usize> Server<E, O> {
     /// Handle a Service Discovery message
     async fn handle_sd_message(
         &mut self,
-        sd_msg: sd::Header<E, O>,
+        sd_view: &sd::SdHeaderView<'_>,
         sender: std::net::SocketAddr,
     ) -> Result<(), Error> {
         tracing::trace!("Handling SD message from {}", sender);
 
-        for entry in &sd_msg.entries {
-            match entry {
-                Entry::SubscribeEventGroup(sub) => {
+        for entry_view in sd_view.entries() {
+            let entry_type = entry_view.entry_type()?;
+            match entry_type {
+                sd::EntryType::Subscribe => {
                     tracing::debug!(
                         "Received Subscribe from {}: service=0x{:04X}, instance={}, eventgroup=0x{:04X}",
                         sender,
-                        sub.service_id,
-                        sub.instance_id,
-                        sub.event_group_id
+                        entry_view.service_id(),
+                        entry_view.instance_id(),
+                        entry_view.event_group_id()
                     );
 
                     // Check if this is for our service
-                    if sub.service_id != self.config.service_id {
+                    if entry_view.service_id() != self.config.service_id {
                         tracing::warn!(
                             "Subscribe for wrong service: expected 0x{:04X}, got 0x{:04X}",
                             self.config.service_id,
-                            sub.service_id
+                            entry_view.service_id()
                         );
-                        self.send_subscribe_nack(sub, sender, "Wrong service ID")
+                        self.send_subscribe_nack_from_view(&entry_view, sender, "Wrong service ID")
                             .await?;
-                    } else if sub.instance_id != self.config.instance_id {
+                    } else if entry_view.instance_id() != self.config.instance_id {
                         tracing::warn!(
                             "Subscribe for wrong instance: expected {}, got {}",
                             self.config.instance_id,
-                            sub.instance_id
+                            entry_view.instance_id()
                         );
-                        self.send_subscribe_nack(sub, sender, "Wrong instance ID")
-                            .await?;
+                        self.send_subscribe_nack_from_view(
+                            &entry_view,
+                            sender,
+                            "Wrong instance ID",
+                        )
+                        .await?;
                     } else {
                         // Extract subscriber endpoint from options
-                        if let Some(endpoint_addr) = Self::extract_endpoint(&sd_msg.options) {
-                            // The endpoint in SubscribeEventGroup is the subscriber's
-                            // receive address — where they want events sent to.
+                        if let Some(endpoint_addr) =
+                            Self::extract_endpoint_from_views(sd_view.options())
+                        {
                             let mut subs = self.subscriptions.write().await;
                             subs.subscribe(
-                                sub.service_id,
-                                sub.instance_id,
-                                sub.event_group_id,
+                                entry_view.service_id(),
+                                entry_view.instance_id(),
+                                entry_view.event_group_id(),
                                 endpoint_addr,
                             );
 
                             // Send SubscribeAck
-                            self.send_subscribe_ack(sub, sender).await?;
+                            self.send_subscribe_ack_from_view(&entry_view, sender)
+                                .await?;
                         } else {
                             tracing::warn!("No endpoint found in Subscribe message options");
-                            self.send_subscribe_nack(sub, sender, "No endpoint in options")
-                                .await?;
+                            self.send_subscribe_nack_from_view(
+                                &entry_view,
+                                sender,
+                                "No endpoint in options",
+                            )
+                            .await?;
                         }
                     }
                 }
-                Entry::FindService(find) => {
+                sd::EntryType::FindService => {
+                    let find_service_id = entry_view.service_id();
                     // Check if this FindService is for our service (or wildcard 0xFFFF)
-                    if find.service_id == self.config.service_id || find.service_id == 0xFFFF {
+                    if find_service_id == self.config.service_id || find_service_id == 0xFFFF {
                         tracing::debug!(
                             "Received FindService from {} for service 0x{:04X} (ours: 0x{:04X}), sending unicast offer",
                             sender,
-                            find.service_id,
+                            find_service_id,
                             self.config.service_id
                         );
                         self.send_unicast_offer(sender).await?;
                     } else {
                         tracing::trace!(
                             "Ignoring FindService for service 0x{:04X} (not ours)",
-                            find.service_id
+                            find_service_id
                         );
                     }
                 }
                 _ => {
-                    tracing::trace!("Ignoring SD entry: {:?}", entry);
+                    tracing::trace!("Ignoring SD entry type: {:?}", entry_type);
                 }
             }
         }
@@ -549,24 +552,24 @@ impl<const E: usize, const O: usize> Server<E, O> {
         Ok(())
     }
 
-    /// Extract endpoint address from SD options
-    fn extract_endpoint(options: &[sd::Options]) -> Option<SocketAddrV4> {
-        tracing::trace!("Extracting endpoint from {} options", options.len());
-        for option in options {
-            tracing::trace!("Option: {:?}", option);
-            if let sd::Options::IpV4Endpoint { ip, port, .. } = option {
+    /// Extract endpoint address from SD option views
+    fn extract_endpoint_from_views(options: sd::OptionIter<'_>) -> Option<SocketAddrV4> {
+        for option_view in options {
+            if let Ok(sd::OptionType::IpV4Endpoint) = option_view.option_type()
+                && let Ok((ip, _, port)) = option_view.as_ipv4()
+            {
                 tracing::trace!("Found IPv4 endpoint: {}:{}", ip, port);
-                return Some(SocketAddrV4::new(*ip, *port));
+                return Some(SocketAddrV4::new(ip, port));
             }
         }
         tracing::warn!("No IPv4 endpoint found in options");
         None
     }
 
-    /// Send `SubscribeAck` in response to a subscription request
-    async fn send_subscribe_ack(
+    /// Send `SubscribeAck` from an entry view
+    async fn send_subscribe_ack_from_view(
         &self,
-        subscription: &sd::EventGroupEntry,
+        entry_view: &sd::EntryView<'_>,
         subscriber: std::net::SocketAddr,
     ) -> Result<(), Error> {
         use crate::protocol::{
@@ -574,35 +577,31 @@ impl<const E: usize, const O: usize> Server<E, O> {
         };
         use crate::traits::WireFormat;
 
-        // Create SubscribeAck entry
         let ack_entry = Entry::SubscribeAckEventGroup(sd::EventGroupEntry {
             index_first_options_run: 0,
             index_second_options_run: 0,
             options_count: OptionsCount::new(0, 0),
-            service_id: subscription.service_id,
-            instance_id: subscription.instance_id,
-            major_version: subscription.major_version,
+            service_id: entry_view.service_id(),
+            instance_id: entry_view.instance_id(),
+            major_version: entry_view.major_version(),
             ttl: self.config.ttl,
-            counter: subscription.counter,
-            event_group_id: subscription.event_group_id,
+            counter: entry_view.counter(),
+            event_group_id: entry_view.event_group_id(),
         });
 
-        // Create SD header
         let mut entries = SdEntries::<E>::new();
         entries
             .push(ack_entry)
             .expect("SdEntries capacity E must allow at least one entry for SubscribeAck");
         let sd_payload = sd::Header::<E, O> {
-            flags: Flags::new(true, true), // reboot + unicast flags set
+            flags: Flags::new(true, true),
             entries,
             options: SdOptions::<O>::new(),
         };
 
-        // Encode SD payload
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
 
-        // Wrap in SOME/IP header
         let sid = self.next_sd_session_id();
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
@@ -614,30 +613,26 @@ impl<const E: usize, const O: usize> Server<E, O> {
             return_code: ReturnCode::Ok,
         };
 
-        // Encode complete message
         let mut buffer = Vec::new();
         someip_header.encode(&mut buffer)?;
         buffer.extend_from_slice(&sd_data);
 
-        // Send SubscribeAck to the subscriber
         self.unicast_socket.send_to(&buffer, subscriber).await?;
 
         tracing::debug!(
             "Sent SubscribeAck to {} for service 0x{:04X}, eventgroup 0x{:04X}",
             subscriber,
-            subscription.service_id,
-            subscription.event_group_id
+            entry_view.service_id(),
+            entry_view.event_group_id()
         );
 
         Ok(())
     }
 
-    /// Send `SubscribeNack` (Negative Acknowledgement) for rejected subscription
-    ///
-    /// According to SOME/IP spec, `SubscribeNack` is indicated by TTL=0 in `SubscribeAckEventGroup`
-    async fn send_subscribe_nack(
+    /// Send `SubscribeNack` from an entry view
+    async fn send_subscribe_nack_from_view(
         &self,
-        subscription: &sd::EventGroupEntry,
+        entry_view: &sd::EntryView<'_>,
         subscriber: std::net::SocketAddr,
         reason: &str,
     ) -> Result<(), Error> {
@@ -646,35 +641,31 @@ impl<const E: usize, const O: usize> Server<E, O> {
         };
         use crate::traits::WireFormat;
 
-        // Create SubscribeNack entry (SubscribeAck with TTL=0 indicates rejection)
         let nack_entry = Entry::SubscribeAckEventGroup(sd::EventGroupEntry {
             index_first_options_run: 0,
             index_second_options_run: 0,
             options_count: OptionsCount::new(0, 0),
-            service_id: subscription.service_id,
-            instance_id: subscription.instance_id,
-            major_version: subscription.major_version,
+            service_id: entry_view.service_id(),
+            instance_id: entry_view.instance_id(),
+            major_version: entry_view.major_version(),
             ttl: 0, // TTL=0 indicates NACK
-            counter: subscription.counter,
-            event_group_id: subscription.event_group_id,
+            counter: entry_view.counter(),
+            event_group_id: entry_view.event_group_id(),
         });
 
-        // Create SD header
         let mut entries = SdEntries::<E>::new();
         entries.push(nack_entry).expect(
             "SdEntries<E> must have capacity for at least one entry when sending SubscribeNack",
         );
         let sd_payload = sd::Header::<E, O> {
-            flags: Flags::new(true, true), // reboot + unicast flags set
+            flags: Flags::new(true, true),
             entries,
             options: SdOptions::<O>::new(),
         };
 
-        // Encode SD payload
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
 
-        // Wrap in SOME/IP header
         let sid = self.next_sd_session_id();
         let someip_header = SomeIpHeader {
             message_id: MessageId::SD,
@@ -686,19 +677,17 @@ impl<const E: usize, const O: usize> Server<E, O> {
             return_code: ReturnCode::Ok,
         };
 
-        // Encode complete message
         let mut buffer = Vec::new();
         someip_header.encode(&mut buffer)?;
         buffer.extend_from_slice(&sd_data);
 
-        // Send SubscribeNack to the subscriber
         self.unicast_socket.send_to(&buffer, subscriber).await?;
 
         tracing::warn!(
             "Sent SubscribeNack to {} for service 0x{:04X}, eventgroup 0x{:04X} (reason: {})",
             subscriber,
-            subscription.service_id,
-            subscription.event_group_id,
+            entry_view.service_id(),
+            entry_view.event_group_id(),
             reason
         );
 
@@ -710,7 +699,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
 mod tests {
     use super::*;
     use crate::protocol::{
-        Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode,
+        Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, MessageView, ReturnCode,
     };
     use crate::traits::WireFormat;
     use std::format;
@@ -746,19 +735,16 @@ mod tests {
 
     /// Helper: parse a SubscribeAck/Nack from raw response bytes, returns the TTL
     fn parse_subscribe_ack_ttl(data: &[u8]) -> u32 {
-        let mut reader = data;
-        let _header = SomeIpHeader::decode(&mut reader).expect("Failed to parse SOME/IP header");
-        let sd_msg: sd::Header =
-            sd::Header::decode(&mut reader).expect("Failed to parse SD header");
+        let view = MessageView::parse(data).expect("Failed to parse SOME/IP message");
+        let sd_view = view.sd_header().expect("Failed to parse SD header");
+        let mut entries = sd_view.entries();
+        let entry = entries.next().expect("Expected at least 1 entry");
         assert_eq!(
-            sd_msg.entries.len(),
-            1,
-            "Expected exactly 1 entry in response"
+            entry.entry_type().unwrap(),
+            sd::EntryType::SubscribeAck,
+            "Expected SubscribeAckEventGroup entry"
         );
-        match &sd_msg.entries[0] {
-            sd::Entry::SubscribeAckEventGroup(entry) => entry.ttl,
-            other => panic!("Expected SubscribeAckEventGroup, got {:?}", other),
-        }
+        entry.ttl()
     }
 
     /// Helper: create a server on an ephemeral port and return (Server, port)
@@ -804,15 +790,12 @@ mod tests {
 
         // Run server to process one message (with a timeout)
         let server_handle = tokio::spawn(async move {
-            // We'll manually process one iteration instead of calling run() which loops forever
             let mut buf = vec![0u8; 65535];
             let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
             let data = &buf[..len];
-            let mut reader: &[u8] = data;
-            let header = SomeIpHeader::decode(&mut reader).unwrap();
-            assert_eq!(header.message_id.service_id(), 0xFFFF);
-            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
-            server.handle_sd_message(sd_msg, addr).await.unwrap();
+            let view = MessageView::parse(data).unwrap();
+            let sd_view = view.sd_header().unwrap();
+            server.handle_sd_message(&sd_view, addr).await.unwrap();
 
             // Check subscription was added
             let subs = server.subscriptions.read().await;
@@ -863,10 +846,10 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
-            let mut reader: &[u8] = &buf[..len];
-            let _header = SomeIpHeader::decode(&mut reader).unwrap();
-            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
-            server.handle_sd_message(sd_msg, addr).await.unwrap();
+            let data = &buf[..len];
+            let view = MessageView::parse(data).unwrap();
+            let sd_view = view.sd_header().unwrap();
+            server.handle_sd_message(&sd_view, addr).await.unwrap();
 
             // No subscription should have been added
             let subs = server.subscriptions.read().await;
@@ -914,10 +897,10 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
-            let mut reader: &[u8] = &buf[..len];
-            let _header = SomeIpHeader::decode(&mut reader).unwrap();
-            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
-            server.handle_sd_message(sd_msg, addr).await.unwrap();
+            let data = &buf[..len];
+            let view = MessageView::parse(data).unwrap();
+            let sd_view = view.sd_header().unwrap();
+            server.handle_sd_message(&sd_view, addr).await.unwrap();
 
             let subs = server.subscriptions.read().await;
             assert_eq!(subs.subscription_count(), 0);
@@ -955,10 +938,10 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
-            let mut reader: &[u8] = &buf[..len];
-            let _header = SomeIpHeader::decode(&mut reader).unwrap();
-            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
-            server.handle_sd_message(sd_msg, addr).await.unwrap();
+            let data = &buf[..len];
+            let view = MessageView::parse(data).unwrap();
+            let sd_view = view.sd_header().unwrap();
+            server.handle_sd_message(&sd_view, addr).await.unwrap();
         });
 
         // Receive the unicast OfferService response
@@ -972,17 +955,13 @@ mod tests {
         .unwrap();
 
         // Parse the response and verify it's an OfferService for 0x5B
-        let mut reader: &[u8] = &resp_buf[..resp_len];
-        let header = SomeIpHeader::decode(&mut reader).unwrap();
-        assert_eq!(header.message_id.service_id(), 0xFFFF);
-        let sd_resp: sd::Header = sd::Header::decode(&mut reader).unwrap();
-        assert_eq!(sd_resp.entries.len(), 1);
-        match &sd_resp.entries[0] {
-            sd::Entry::OfferService(entry) => {
-                assert_eq!(entry.service_id, 0x5B);
-            }
-            other => panic!("Expected OfferService, got {:?}", other),
-        }
+        let view = MessageView::parse(&resp_buf[..resp_len]).unwrap();
+        assert_eq!(view.header().message_id().service_id(), 0xFFFF);
+        let sd_view = view.sd_header().unwrap();
+        let mut entries = sd_view.entries();
+        let entry = entries.next().unwrap();
+        assert_eq!(entry.entry_type().unwrap(), sd::EntryType::OfferService);
+        assert_eq!(entry.service_id(), 0x5B);
 
         server_handle.await.unwrap();
     }
@@ -1003,10 +982,10 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
-            let mut reader: &[u8] = &buf[..len];
-            let _header = SomeIpHeader::decode(&mut reader).unwrap();
-            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
-            server.handle_sd_message(sd_msg, addr).await.unwrap();
+            let data = &buf[..len];
+            let view = MessageView::parse(data).unwrap();
+            let sd_view = view.sd_header().unwrap();
+            server.handle_sd_message(&sd_view, addr).await.unwrap();
         });
 
         let mut resp_buf = vec![0u8; 65535];
@@ -1018,16 +997,12 @@ mod tests {
         .expect("Timeout waiting for unicast OfferService")
         .unwrap();
 
-        let mut reader: &[u8] = &resp_buf[..resp_len];
-        let _header = SomeIpHeader::decode(&mut reader).unwrap();
-        let sd_resp: sd::Header = sd::Header::decode(&mut reader).unwrap();
-        assert_eq!(sd_resp.entries.len(), 1);
-        match &sd_resp.entries[0] {
-            sd::Entry::OfferService(entry) => {
-                assert_eq!(entry.service_id, 0x5B);
-            }
-            other => panic!("Expected OfferService, got {:?}", other),
-        }
+        let view = MessageView::parse(&resp_buf[..resp_len]).unwrap();
+        let sd_view = view.sd_header().unwrap();
+        let mut entries = sd_view.entries();
+        let entry = entries.next().unwrap();
+        assert_eq!(entry.entry_type().unwrap(), sd::EntryType::OfferService);
+        assert_eq!(entry.service_id(), 0x5B);
 
         server_handle.await.unwrap();
     }
@@ -1048,10 +1023,10 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
-            let mut reader: &[u8] = &buf[..len];
-            let _header = SomeIpHeader::decode(&mut reader).unwrap();
-            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
-            server.handle_sd_message(sd_msg, addr).await.unwrap();
+            let data = &buf[..len];
+            let view = MessageView::parse(data).unwrap();
+            let sd_view = view.sd_header().unwrap();
+            server.handle_sd_message(&sd_view, addr).await.unwrap();
         });
 
         // Should NOT receive any response (short timeout)
@@ -1093,10 +1068,10 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
-            let mut reader: &[u8] = &buf[..len];
-            let _header = SomeIpHeader::decode(&mut reader).unwrap();
-            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
-            server.handle_sd_message(sd_msg, addr).await.unwrap();
+            let data = &buf[..len];
+            let view = MessageView::parse(data).unwrap();
+            let sd_view = view.sd_header().unwrap();
+            server.handle_sd_message(&sd_view, addr).await.unwrap();
 
             // No subscription should have been added
             let subs = server.subscriptions.read().await;
@@ -1142,18 +1117,14 @@ mod tests {
         .expect("Timeout waiting for OfferService")
         .unwrap();
 
-        let mut reader: &[u8] = &buf[..len];
-        let header = SomeIpHeader::decode(&mut reader).unwrap();
-        assert_eq!(header.message_id, crate::protocol::MessageId::SD);
-        let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
-        assert_eq!(sd_msg.entries.len(), 1);
-        match &sd_msg.entries[0] {
-            sd::Entry::OfferService(entry) => {
-                assert_eq!(entry.service_id, 0x5B);
-                assert_eq!(entry.instance_id, 1);
-            }
-            other => panic!("Expected OfferService, got {:?}", other),
-        }
+        let view = MessageView::parse(&buf[..len]).unwrap();
+        assert_eq!(view.header().message_id(), crate::protocol::MessageId::SD);
+        let sd_view = view.sd_header().unwrap();
+        let mut entries = sd_view.entries();
+        let entry = entries.next().unwrap();
+        assert_eq!(entry.entry_type().unwrap(), sd::EntryType::OfferService);
+        assert_eq!(entry.service_id(), 0x5B);
+        assert_eq!(entry.instance_id(), 1);
 
         // Also test that start_announcing doesn't error
         let (server2, _) = create_test_server(0x5B, 1).await;
@@ -1327,15 +1298,20 @@ mod tests {
         });
         let mut entries = sd::SdEntries::new();
         entries.push(entry).unwrap();
-        let sd_msg = sd::Header {
+        let sd_msg: sd::Header<1, 0> = sd::Header {
             flags: sd::Flags::new(true, true),
             entries,
             options: sd::SdOptions::new(),
         };
 
+        // Encode and parse through view types
+        let mut buf = [0u8; 64];
+        let n = sd_msg.encode(&mut buf.as_mut_slice()).unwrap();
+        let sd_view = sd::SdHeaderView::parse(&buf[..n]).unwrap();
+
         // Should not panic or error
         let result = server
-            .handle_sd_message(sd_msg, "127.0.0.1:12345".parse().unwrap())
+            .handle_sd_message(&sd_view, "127.0.0.1:12345".parse().unwrap())
             .await;
         assert!(result.is_ok());
     }
@@ -1346,7 +1322,6 @@ mod tests {
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // Subscribe with a different endpoint port (subscriber's own receive port)
-        // This should succeed — the endpoint port is where the subscriber wants events sent
         let sd_header = sd::Header::new_subscription(
             0x5B,
             1,
@@ -1366,10 +1341,10 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
-            let mut reader: &[u8] = &buf[..len];
-            let _header = SomeIpHeader::decode(&mut reader).unwrap();
-            let sd_msg: sd::Header = sd::Header::decode(&mut reader).unwrap();
-            server.handle_sd_message(sd_msg, addr).await.unwrap();
+            let data = &buf[..len];
+            let view = MessageView::parse(data).unwrap();
+            let sd_view = view.sd_header().unwrap();
+            server.handle_sd_message(&sd_view, addr).await.unwrap();
 
             // Subscription should have been added
             let subs = server.subscriptions.read().await;
