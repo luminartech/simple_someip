@@ -1,4 +1,4 @@
-use crate::protocol::{self, MessageId, sd};
+use crate::protocol::{self, MessageId, sd, sd::Flags};
 
 /// A trait for types that can be serialized to a [`Writer`](embedded_io::Write).
 ///
@@ -36,6 +36,8 @@ pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
     fn from_payload_bytes(message_id: MessageId, payload: &[u8]) -> Result<Self, protocol::Error>;
     /// Create a `PayloadWireFormat` from a service discovery [Header](protocol::sd::Header)
     fn new_sd_payload(header: &Self::SdHeader) -> Self;
+    /// Return the SD flags if this payload is a service discovery message.
+    fn sd_flags(&self) -> Option<Flags>;
     /// Number of bytes required to write the payload
     fn required_size(&self) -> usize;
     /// Serialize the payload to a [Writer](embedded_io::Write)
@@ -78,6 +80,10 @@ impl<const E: usize, const O: usize> PayloadWireFormat for DiscoveryOnlyPayload<
         Self {
             header: header.clone(),
         }
+    }
+
+    fn sd_flags(&self) -> Option<Flags> {
+        Some(self.header.flags)
     }
 
     fn required_size(&self) -> usize {

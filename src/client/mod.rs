@@ -1,15 +1,38 @@
 mod inner;
+mod session;
 mod socket_manager;
 
-use crate::{Error, protocol::Message, traits::PayloadWireFormat};
+use crate::{Error, protocol, protocol::Message, traits::PayloadWireFormat};
 use inner::{ControlMessage, Inner};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use tokio::sync::mpsc;
 use tracing::info;
 
+/// A discovery message together with its source address and SOME/IP header.
+pub struct DiscoveryMessage<P: PayloadWireFormat> {
+    /// The network address this discovery message was received from.
+    pub source: SocketAddr,
+    /// The SOME/IP header (contains `request_id` = `client_id` + `session_id`).
+    pub someip_header: protocol::Header,
+    /// The parsed SD header payload.
+    pub sd_header: P::SdHeader,
+}
+
+impl<P: PayloadWireFormat> std::fmt::Debug for DiscoveryMessage<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscoveryMessage")
+            .field("source", &self.source)
+            .field("someip_header", &self.someip_header)
+            .field("sd_header", &self.sd_header)
+            .finish()
+    }
+}
+
 pub enum ClientUpdate<P: PayloadWireFormat> {
     /// Discovery message received
-    DiscoveryUpdated(P::SdHeader),
+    DiscoveryUpdated(DiscoveryMessage<P>),
+    /// A remote sender has rebooted (detected via SD session tracking).
+    SenderRebooted(SocketAddr),
     /// Unicast message received
     Unicast(Message<P>),
     /// Inner SOME/IP Client has encountered an error
@@ -19,9 +42,8 @@ pub enum ClientUpdate<P: PayloadWireFormat> {
 impl<P: PayloadWireFormat> std::fmt::Debug for ClientUpdate<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DiscoveryUpdated(header) => {
-                f.debug_tuple("DiscoveryUpdated").field(header).finish()
-            }
+            Self::DiscoveryUpdated(msg) => f.debug_tuple("DiscoveryUpdated").field(msg).finish(),
+            Self::SenderRebooted(addr) => f.debug_tuple("SenderRebooted").field(addr).finish(),
             Self::Unicast(msg) => f.debug_tuple("Unicast").field(msg).finish(),
             Self::Error(err) => f.debug_tuple("Error").field(err).finish(),
         }
@@ -140,7 +162,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::DiscoveryOnlyPayload;
+    use crate::traits::{DiscoveryOnlyPayload, WireFormat};
     use std::format;
 
     type TestClient = Client<DiscoveryOnlyPayload>;
@@ -164,12 +186,26 @@ mod tests {
     #[tokio::test]
     async fn test_client_update_debug() {
         use crate::protocol::sd;
+        use std::net::SocketAddr;
 
         // DiscoveryUpdated
         let sd_header = sd::Header::new_find_services(false, &[]);
-        let update: ClientUpdate<DiscoveryOnlyPayload> = ClientUpdate::DiscoveryUpdated(sd_header);
+        let someip_header = crate::protocol::Header::new_sd(1, sd_header.required_size());
+        let discovery_msg = DiscoveryMessage {
+            source: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 30490),
+            someip_header,
+            sd_header,
+        };
+        let update: ClientUpdate<DiscoveryOnlyPayload> =
+            ClientUpdate::DiscoveryUpdated(discovery_msg);
         let debug_str = format!("{update:?}");
         assert!(debug_str.contains("DiscoveryUpdated"));
+
+        // SenderRebooted
+        let update: ClientUpdate<DiscoveryOnlyPayload> =
+            ClientUpdate::SenderRebooted(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 30490));
+        let debug_str = format!("{update:?}");
+        assert!(debug_str.contains("SenderRebooted"));
 
         // Unicast
         let msg = crate::protocol::Message::new_sd(1, &sd::Header::new_find_services(false, &[]));

@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     future,
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     prelude::rust_2024::*,
     task::Poll,
 };
@@ -16,8 +16,12 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     Error,
-    client::{ClientUpdate, socket_manager::SocketManager},
-    protocol::Message,
+    client::{
+        ClientUpdate, DiscoveryMessage,
+        session::{SessionTracker, SessionVerdict, TransportKind},
+        socket_manager::{ReceivedMessage, SocketManager},
+    },
+    protocol::{self, Message},
     traits::PayloadWireFormat,
 };
 
@@ -121,6 +125,8 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     discovery_socket: Option<SocketManager<PayloadDefinitions>>,
     /// Socket managers for unicast messages, keyed by local port
     unicast_sockets: HashMap<u16, SocketManager<PayloadDefinitions>>,
+    /// Per-sender SD session state for reboot detection
+    session_tracker: SessionTracker,
     /// Internal flag to continue run loop
     run: bool,
     /// Client ID for SOME/IP request headers (upper 16 bits of request ID)
@@ -135,6 +141,7 @@ impl<PayloadDefinitions: PayloadWireFormat> std::fmt::Debug for Inner<PayloadDef
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inner")
             .field("interface", &self.interface)
+            .field("session_tracker", &self.session_tracker)
             .field("run", &self.run)
             .field("client_id", &self.client_id)
             .field("session_counter", &self.session_counter)
@@ -162,6 +169,7 @@ where
             interface,
             discovery_socket: None,
             unicast_sockets: HashMap::new(),
+            session_tracker: SessionTracker::default(),
             run: true,
             client_id: 0x1234,
             session_counter: 1,
@@ -212,17 +220,23 @@ where
 
     async fn receive_discovery(
         socket_manager: &mut Option<SocketManager<PayloadDefinitions>>,
-    ) -> Result<<PayloadDefinitions as PayloadWireFormat>::SdHeader, Error> {
+    ) -> Result<
+        (
+            SocketAddr,
+            protocol::Header,
+            <PayloadDefinitions as PayloadWireFormat>::SdHeader,
+        ),
+        Error,
+    > {
         if let Some(receiver) = socket_manager {
             match receiver.receive().await {
-                Some(message) => match message {
-                    Ok(message) => {
-                        if let Some(header) = message.get_sd_header() {
-                            Ok(header.to_owned())
+                Some(result) => match result {
+                    Ok(received) => {
+                        let someip_header = received.message.header().clone();
+                        if let Some(sd_header) = received.message.get_sd_header() {
+                            Ok((received.source, someip_header, sd_header.to_owned()))
                         } else {
-                            Err(Error::UnexpectedDiscoveryMessage(
-                                message.header().to_owned(),
-                            ))
+                            Err(Error::UnexpectedDiscoveryMessage(someip_header))
                         }
                     }
                     Err(err) => Err(err),
@@ -239,7 +253,7 @@ where
     /// from any socket. If no sockets are bound, returns a future that never resolves.
     async fn receive_any_unicast(
         unicast_sockets: &mut HashMap<u16, SocketManager<PayloadDefinitions>>,
-    ) -> Result<Message<PayloadDefinitions>, Error> {
+    ) -> Result<ReceivedMessage<PayloadDefinitions>, Error> {
         if unicast_sockets.is_empty() {
             return future::pending().await;
         }
@@ -392,6 +406,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run(mut self) {
         tokio::spawn(async move {
             info!("SOME/IP Client processing loop started");
@@ -402,6 +417,7 @@ where
                     unicast_sockets,
                     update_sender,
                     active_request,
+                    session_tracker,
                     run,
                     ..
                 } = &mut self;
@@ -441,9 +457,31 @@ where
                     discovery = Inner::receive_discovery(discovery_socket) => {
                         trace!("Received discovery message: {:?}", discovery);
                         match discovery {
-                            Ok(header) => {
-                                if update_sender.send(ClientUpdate::DiscoveryUpdated(header)).await.is_err() {
-                                    // The sender has been dropped, so we should exit
+                            Ok((source, someip_header, sd_header)) => {
+                                // Extract session ID from SOME/IP request_id (lower 16 bits)
+                                let session_id = (someip_header.request_id & 0xFFFF) as u16;
+                                // Extract reboot flag from the SD payload flags
+                                let reboot_flag = PayloadDefinitions::new_sd_payload(&sd_header)
+                                    .sd_flags()
+                                    .is_some_and(crate::protocol::sd::Flags::reboot);
+                                let verdict = session_tracker.check(
+                                    source,
+                                    TransportKind::Multicast,
+                                    session_id,
+                                    reboot_flag,
+                                );
+                                if verdict == SessionVerdict::Reboot
+                                    && update_sender.send(ClientUpdate::SenderRebooted(source)).await.is_err()
+                                {
+                                    *run = false;
+                                    continue;
+                                }
+                                let discovery_msg = DiscoveryMessage {
+                                    source,
+                                    someip_header,
+                                    sd_header,
+                                };
+                                if update_sender.send(ClientUpdate::DiscoveryUpdated(discovery_msg)).await.is_err() {
                                     *run = false;
                                 }
                             }
@@ -459,7 +497,8 @@ where
                      unicast = Inner::receive_any_unicast(unicast_sockets) => {
                          trace!("Received unicast message: {:?}", unicast);
                          match unicast {
-                             Ok(received_message) => {
+                             Ok(received) => {
+                                 let received_message = received.message;
                                  if let Some(active) = active_request.take() {
                                      if let ControlMessage::AwaitResponse(request_message, response) = active {
                                          if request_message.header().message_id == received_message.header().message_id {
