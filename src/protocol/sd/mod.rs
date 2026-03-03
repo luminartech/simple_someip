@@ -11,5 +11,6 @@ pub use entry::{
 pub use flags::Flags;
 pub use header::{Header, MAX_SD_ENTRIES, MAX_SD_OPTIONS, SdEntries, SdHeaderView, SdOptions};
 pub use options::{
-    MAX_CONFIGURATION_STRING_LENGTH, OptionIter, OptionType, OptionView, Options, TransportProtocol,
+    MAX_CONFIGURATION_STRING_LENGTH, OptionIter, OptionType, OptionView, Options,
+    TransportProtocol, extract_ipv4_endpoint,
 };

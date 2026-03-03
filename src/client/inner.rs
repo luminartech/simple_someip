@@ -18,6 +18,7 @@ use crate::{
     Error,
     client::{
         ClientUpdate, DiscoveryMessage,
+        service_registry::{ServiceEndpointInfo, ServiceInstanceId, ServiceRegistry},
         session::{SessionTracker, SessionVerdict, TransportKind},
         socket_manager::{ReceivedMessage, SocketManager},
     },
@@ -43,6 +44,9 @@ pub(super) enum ControlMessage<P: PayloadWireFormat> {
         oneshot::Sender<Result<P, Error>>,
     ),
     AwaitResponse(Message<P>, oneshot::Sender<Result<P, Error>>),
+    AddEndpoint(u16, u16, SocketAddrV4, oneshot::Sender<Result<(), Error>>),
+    RemoveEndpoint(u16, u16, oneshot::Sender<Result<(), Error>>),
+    SendToService(u16, u16, Message<P>, oneshot::Sender<Result<P, Error>>),
 }
 
 impl<P: PayloadWireFormat> std::fmt::Debug for ControlMessage<P> {
@@ -63,6 +67,23 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ControlMessage<P> {
                 .field(port)
                 .finish(),
             Self::AwaitResponse(msg, _) => f.debug_tuple("AwaitResponse").field(msg).finish(),
+            Self::AddEndpoint(sid, iid, addr, _) => f
+                .debug_tuple("AddEndpoint")
+                .field(sid)
+                .field(iid)
+                .field(addr)
+                .finish(),
+            Self::RemoveEndpoint(sid, iid, _) => f
+                .debug_tuple("RemoveEndpoint")
+                .field(sid)
+                .field(iid)
+                .finish(),
+            Self::SendToService(sid, iid, msg, _) => f
+                .debug_tuple("SendToService")
+                .field(sid)
+                .field(iid)
+                .field(msg)
+                .finish(),
         }
     }
 }
@@ -110,6 +131,41 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
             Self::Send(socket_addr, message, source_port, sender),
         )
     }
+
+    pub fn add_endpoint(
+        service_id: u16,
+        instance_id: u16,
+        addr: SocketAddrV4,
+    ) -> (oneshot::Receiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            receiver,
+            Self::AddEndpoint(service_id, instance_id, addr, sender),
+        )
+    }
+
+    pub fn remove_endpoint(
+        service_id: u16,
+        instance_id: u16,
+    ) -> (oneshot::Receiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            receiver,
+            Self::RemoveEndpoint(service_id, instance_id, sender),
+        )
+    }
+
+    pub fn send_to_service(
+        service_id: u16,
+        instance_id: u16,
+        message: Message<P>,
+    ) -> (oneshot::Receiver<Result<P, Error>>, Self) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            receiver,
+            Self::SendToService(service_id, instance_id, message, sender),
+        )
+    }
 }
 
 pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
@@ -127,6 +183,8 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     unicast_sockets: HashMap<u16, SocketManager<PayloadDefinitions>>,
     /// Per-sender SD session state for reboot detection
     session_tracker: SessionTracker,
+    /// Registry of known service endpoints (auto-populated from SD + manual)
+    service_registry: ServiceRegistry,
     /// Internal flag to continue run loop
     run: bool,
     /// Client ID for SOME/IP request headers (upper 16 bits of request ID)
@@ -170,6 +228,7 @@ where
             discovery_socket: None,
             unicast_sockets: HashMap::new(),
             session_tracker: SessionTracker::default(),
+            service_registry: ServiceRegistry::default(),
             run: true,
             client_id: 0x1234,
             session_counter: 1,
@@ -402,6 +461,87 @@ where
                 ControlMessage::AwaitResponse(message, response) => {
                     self.active_request = Some(ControlMessage::AwaitResponse(message, response));
                 }
+                ControlMessage::AddEndpoint(service_id, instance_id, addr, response) => {
+                    self.service_registry.insert(
+                        ServiceInstanceId {
+                            service_id,
+                            instance_id,
+                        },
+                        ServiceEndpointInfo {
+                            addr,
+                            major_version: 0xFF,
+                            minor_version: 0xFFFF_FFFF,
+                        },
+                    );
+                    debug!(
+                        "Added endpoint for service 0x{:04X}.0x{:04X} -> {}",
+                        service_id, instance_id, addr,
+                    );
+                    if response.send(Ok(())).is_err() {
+                        warn!("AddEndpoint response receiver dropped (caller canceled)");
+                    }
+                }
+                ControlMessage::RemoveEndpoint(service_id, instance_id, response) => {
+                    self.service_registry.remove(ServiceInstanceId {
+                        service_id,
+                        instance_id,
+                    });
+                    debug!(
+                        "Removed endpoint for service 0x{:04X}.0x{:04X}",
+                        service_id, instance_id,
+                    );
+                    if response.send(Ok(())).is_err() {
+                        warn!("RemoveEndpoint response receiver dropped (caller canceled)");
+                    }
+                }
+                ControlMessage::SendToService(service_id, instance_id, mut message, response) => {
+                    let id = ServiceInstanceId {
+                        service_id,
+                        instance_id,
+                    };
+                    let Some(endpoint) = self.service_registry.get(id) else {
+                        let _ = response.send(Err(Error::ServiceNotFound));
+                        return;
+                    };
+                    let target = endpoint.addr;
+
+                    // Auto-bind unicast if no sockets exist
+                    if self.unicast_sockets.is_empty() {
+                        match self.bind_unicast(0) {
+                            Ok(port) => {
+                                debug!("Auto-bound unicast on port {} for SendToService", port);
+                            }
+                            Err(e) => {
+                                let _ = response.send(Err(e));
+                                return;
+                            }
+                        }
+                    }
+
+                    // Use the first available unicast socket
+                    let source_port = *self.unicast_sockets.keys().next().unwrap();
+                    let socket = self.unicast_sockets.get_mut(&source_port).unwrap();
+
+                    // Stamp request ID
+                    let request_id =
+                        (u32::from(self.client_id) << 16) | u32::from(self.session_counter);
+                    message.set_request_id(request_id);
+                    self.session_counter = self.session_counter.wrapping_add(1);
+                    if self.session_counter == 0 {
+                        self.session_counter = 1;
+                    }
+
+                    let send_result = socket.send(target, message.clone()).await;
+                    match send_result {
+                        Ok(()) => {
+                            self.active_request =
+                                Some(ControlMessage::AwaitResponse(message.clone(), response));
+                        }
+                        Err(e) => {
+                            let _ = response.send(Err(e));
+                        }
+                    }
+                }
             }
         }
     }
@@ -418,6 +558,7 @@ where
                     update_sender,
                     active_request,
                     session_tracker,
+                    service_registry,
                     run,
                     ..
                 } = &mut self;
@@ -476,6 +617,38 @@ where
                                     *run = false;
                                     continue;
                                 }
+
+                                // Auto-populate service registry from SD entries
+                                let sd_payload = PayloadDefinitions::new_sd_payload(&sd_header);
+                                for ep in sd_payload.offered_endpoints() {
+                                    let id = ServiceInstanceId {
+                                        service_id: ep.service_id,
+                                        instance_id: ep.instance_id,
+                                    };
+                                    if ep.is_offer {
+                                        if let Some(addr) = ep.addr {
+                                            service_registry.insert(
+                                                id,
+                                                ServiceEndpointInfo {
+                                                    addr,
+                                                    major_version: ep.major_version,
+                                                    minor_version: ep.minor_version,
+                                                },
+                                            );
+                                            trace!(
+                                                "Registry: added 0x{:04X}.0x{:04X} -> {}",
+                                                ep.service_id, ep.instance_id, addr,
+                                            );
+                                        }
+                                    } else {
+                                        service_registry.remove(id);
+                                        trace!(
+                                            "Registry: removed 0x{:04X}.0x{:04X}",
+                                            ep.service_id, ep.instance_id,
+                                        );
+                                    }
+                                }
+
                                 let discovery_msg = DiscoveryMessage {
                                     source,
                                     someip_header,

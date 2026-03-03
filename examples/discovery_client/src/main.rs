@@ -194,6 +194,10 @@ async fn main() -> Result<(), Error> {
     let mut client = simple_someip::Client::<Payload>::new(interface);
     client.bind_discovery().await.unwrap();
 
+    // For non-broadcasting services, you can manually register an endpoint:
+    // client.add_endpoint(0x1234, 0x0001, SocketAddrV4::new(ip, port)).await.unwrap();
+    // Then use client.send_to_service(0x1234, 0x0001, message).await to send requests.
+
     let mut state = DiscoveryState::new();
 
     while let Some(update) = client.run().await {

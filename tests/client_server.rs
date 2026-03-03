@@ -181,3 +181,78 @@ async fn test_client_bind_unbind_lifecycle_with_server() {
     client.shut_down().await;
     server_handle.abort();
 }
+
+/// Verify that add_endpoint + send_to_service resolves the endpoint from the
+/// registry, auto-binds unicast, sends the request, and receives a response.
+#[tokio::test]
+async fn test_add_endpoint_and_send_to_service() {
+    let (mut server, server_port) = create_server(0x5B, 1).await;
+    let publisher = server.publisher();
+    let server_handle = tokio::spawn(async move { server.run().await });
+
+    let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+    client.bind_discovery().await.unwrap();
+
+    // Register the server's endpoint manually (simulating non-broadcasting service)
+    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    client.add_endpoint(0x5B, 1, server_addr).await.unwrap();
+
+    // Bind unicast so we can receive events
+    let client_port = client.bind_unicast().await.unwrap();
+
+    // Subscribe to server's event group via SD
+    let sd_header = sd::Header::new_subscription(
+        0x5B,
+        1,
+        1,
+        3,
+        0x01,
+        Ipv4Addr::LOCALHOST,
+        sd::TransportProtocol::Udp,
+        client_port,
+    );
+    client
+        .send_sd_message(server_addr, sd_header)
+        .await
+        .unwrap();
+
+    // Wait for the server to process the subscription
+    assert!(
+        wait_for_subscribers(&publisher, 0x5B, 1, 0x01).await,
+        "server should have registered the subscriber"
+    );
+
+    // Drain any pending discovery update
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(250), client.run()).await;
+
+    // Publish an event from the server
+    let event_msg =
+        Message::<DiscoveryOnlyPayload>::new_sd(0x0001, &sd::Header::new_find_services(false, &[]));
+    let sent = publisher
+        .publish_event(0x5B, 1, 0x01, &event_msg)
+        .await
+        .expect("publish_event failed");
+    assert_eq!(sent, 1);
+
+    // Client receives the unicast event
+    let update = tokio::time::timeout(std::time::Duration::from_secs(2), client.run())
+        .await
+        .expect("timeout waiting for Unicast");
+    assert!(
+        matches!(update, Some(ClientUpdate::Unicast(..))),
+        "expected Unicast, got {update:?}"
+    );
+
+    // Remove the endpoint and verify send_to_service returns ServiceNotFound
+    client.remove_endpoint(0x5B, 1).await.unwrap();
+    let msg =
+        Message::<DiscoveryOnlyPayload>::new_sd(0x0001, &sd::Header::new_find_services(false, &[]));
+    let result = client.send_to_service(0x5B, 1, msg).await;
+    assert!(
+        matches!(result, Err(simple_someip::Error::ServiceNotFound)),
+        "expected ServiceNotFound after remove, got {result:?}"
+    );
+
+    client.shut_down().await;
+    server_handle.abort();
+}
