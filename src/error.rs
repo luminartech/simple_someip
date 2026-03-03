@@ -14,9 +14,6 @@ pub enum Error {
     #[error("Socket Closed Unexpectedly")]
     SocketClosedUnexpectedly,
     #[cfg(feature = "std")]
-    #[error("Unicast Socket not bound")]
-    UnicastSocketNotBound,
-    #[cfg(feature = "std")]
     #[error("Service not found in endpoint registry")]
     ServiceNotFound,
     #[error("output buffer too small: need {needed} bytes, got {actual}")]

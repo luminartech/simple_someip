@@ -55,6 +55,20 @@ pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
     /// Serialize the payload to a [Writer](embedded_io::Write)
     fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
 
+    /// Construct an SD header for subscribing to an event group.
+    #[cfg(feature = "std")]
+    #[allow(clippy::too_many_arguments)]
+    fn new_subscription_sd_header(
+        service_id: u16,
+        instance_id: u16,
+        major_version: u8,
+        ttl: u32,
+        event_group_id: u16,
+        client_ip: std::net::Ipv4Addr,
+        protocol: sd::TransportProtocol,
+        client_port: u16,
+    ) -> Self::SdHeader;
+
     /// Extract offered/stopped service endpoints from this SD payload.
     ///
     /// Default implementation returns an empty vec. Concrete implementations
@@ -113,6 +127,29 @@ impl<const E: usize, const O: usize> PayloadWireFormat for DiscoveryOnlyPayload<
 
     fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
         self.header.encode(writer)
+    }
+
+    #[cfg(feature = "std")]
+    fn new_subscription_sd_header(
+        service_id: u16,
+        instance_id: u16,
+        major_version: u8,
+        ttl: u32,
+        event_group_id: u16,
+        client_ip: std::net::Ipv4Addr,
+        protocol: sd::TransportProtocol,
+        client_port: u16,
+    ) -> sd::Header<E, O> {
+        sd::Header::new_subscription(
+            service_id,
+            instance_id,
+            major_version,
+            ttl,
+            event_group_id,
+            client_ip,
+            protocol,
+            client_port,
+        )
     }
 
     #[cfg(feature = "std")]
