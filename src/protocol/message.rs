@@ -39,8 +39,9 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
     }
 
     pub fn get_sd_header(&self) -> Option<&<PayloadDefinition as PayloadWireFormat>::SdHeader> {
-        assert!(self.header().message_id.is_sd());
-        assert!(!self.header().message_type.is_tp());
+        if !self.header().message_id.is_sd() || self.header().message_type.is_tp() {
+            return None;
+        }
         self.payload.as_sd_header()
     }
 
@@ -178,12 +179,10 @@ mod tests {
         ));
     }
 
-    // --- decode SD validation asserts ---
+    // --- decode SD validation errors ---
 
     #[test]
-    #[should_panic(expected = "SD message too short")]
-    fn decode_sd_payload_too_short_panics() {
-        // Craft an SD header with payload_size < 12
+    fn decode_sd_payload_too_short_returns_error() {
         let msg = make_sd_message();
         let mut buf = [0u8; 64];
         msg.encode(&mut buf.as_mut_slice()).unwrap();
@@ -191,37 +190,46 @@ mod tests {
         // length = 8 + payload_size, so length=19 → payload_size=11
         let bad_len: u32 = 19;
         buf[4..8].copy_from_slice(&bad_len.to_be_bytes());
-        let _ = Msg::decode(&mut &buf[..]);
+        assert!(matches!(
+            Msg::decode(&mut &buf[..]),
+            Err(Error::InvalidSDMessage("SD message too short"))
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "SD interface version mismatch")]
-    fn decode_sd_wrong_interface_version_panics() {
+    fn decode_sd_wrong_interface_version_returns_error() {
         let msg = make_sd_message();
         let mut buf = [0u8; 64];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
         buf[13] = 0x02; // interface_version at byte 13
-        let _ = Msg::decode(&mut &buf[..n]);
+        assert!(matches!(
+            Msg::decode(&mut &buf[..n]),
+            Err(Error::InvalidSDMessage("SD interface version mismatch"))
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "SD message type mismatch")]
-    fn decode_sd_wrong_message_type_panics() {
+    fn decode_sd_wrong_message_type_returns_error() {
         let msg = make_sd_message();
         let mut buf = [0u8; 64];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
         buf[14] = 0x00; // Request instead of Notification
-        let _ = Msg::decode(&mut &buf[..n]);
+        assert!(matches!(
+            Msg::decode(&mut &buf[..n]),
+            Err(Error::InvalidSDMessage("SD message type mismatch"))
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "SD return code mismatch")]
-    fn decode_sd_wrong_return_code_panics() {
+    fn decode_sd_wrong_return_code_returns_error() {
         let msg = make_sd_message();
         let mut buf = [0u8; 64];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
         buf[15] = 0x01; // NotOk instead of Ok
-        let _ = Msg::decode(&mut &buf[..n]);
+        assert!(matches!(
+            Msg::decode(&mut &buf[..n]),
+            Err(Error::InvalidSDMessage("SD return code mismatch"))
+        ));
     }
 }
 
@@ -229,19 +237,18 @@ impl<PayloadDefinition: PayloadWireFormat> WireFormat for Message<PayloadDefinit
     fn decode<R: embedded_io::Read>(reader: &mut R) -> Result<Self, Error> {
         let header = Header::decode(reader)?;
         if header.message_id.is_sd() {
-            assert!(header.payload_size() >= 12, "SD message too short");
-            assert!(
-                header.interface_version == 0x01,
-                "SD interface version mismatch"
-            );
-            assert!(
-                header.message_type.message_type() == MessageType::Notification,
-                "SD message type mismatch"
-            );
-            assert!(
-                header.return_code == ReturnCode::Ok,
-                "SD return code mismatch"
-            );
+            if header.payload_size() < 12 {
+                return Err(Error::InvalidSDMessage("SD message too short"));
+            }
+            if header.interface_version != 0x01 {
+                return Err(Error::InvalidSDMessage("SD interface version mismatch"));
+            }
+            if header.message_type.message_type() != MessageType::Notification {
+                return Err(Error::InvalidSDMessage("SD message type mismatch"));
+            }
+            if header.return_code != ReturnCode::Ok {
+                return Err(Error::InvalidSDMessage("SD return code mismatch"));
+            }
         }
         let mut payload_reader = Take::new(reader, header.payload_size());
         let payload =

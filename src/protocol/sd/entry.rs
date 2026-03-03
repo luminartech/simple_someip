@@ -69,6 +69,8 @@ impl From<OptionsCount> for u8 {
 }
 
 impl OptionsCount {
+    /// # Panics
+    /// Panics if either count is >= 16 (each count must fit in a 4-bit nibble).
     #[must_use]
     pub fn new(first_options_count: u8, second_options_count: u8) -> Self {
         assert!(first_options_count < 16);
