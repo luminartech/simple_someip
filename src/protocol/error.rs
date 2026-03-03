@@ -26,4 +26,14 @@ pub enum Error {
     TooManyEntries,
     #[error("Too many SD options for fixed-capacity buffer")]
     TooManyOptions,
+    #[error(
+        "Invalid SD option length for type 0x{option_type:02X}: expected {expected}, got {actual}"
+    )]
+    InvalidSDOptionLength {
+        option_type: u8,
+        expected: u16,
+        actual: u16,
+    },
+    #[error("Configuration string too long: {0} bytes")]
+    ConfigurationStringTooLong(usize),
 }
