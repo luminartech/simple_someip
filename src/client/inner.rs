@@ -334,7 +334,9 @@ where
                                         e
                                     );
                                     if response.send(Err(e)).is_err() {
-                                        warn!("SendSD error response receiver dropped (caller canceled)");
+                                        warn!(
+                                            "SendSD error response receiver dropped (caller canceled)"
+                                        );
                                     }
                                 }
                             }
@@ -373,7 +375,9 @@ where
                                 self.active_request =
                                     Some(ControlMessage::AwaitResponse(message.clone(), response));
                             }
-                            Err(_) => todo!(),
+                            Err(e) => {
+                                let _ = response.send(Err(e));
+                            }
                         }
                     } else {
                         error!("No unicast socket bound on port {}", source_port);
@@ -406,12 +410,25 @@ where
                     // Receive a control message
                     ctrl = control_receiver.recv() => {
                         if let Some(ctrl) = ctrl {
-                            if active_request.is_some() {
-                                // The previous caller's oneshot receiver was dropped
-                                // (e.g. timed out or canceled). Clear the stale request
-                                // so we can process the new control message.
-                                warn!("Clearing stale active_request (caller abandoned)");
-                                *active_request = None;
+                            match active_request {
+                                // Only AwaitResponse is safe to preempt — it represents
+                                // waiting for an external UDP reply, and the caller may
+                                // have already abandoned the oneshot.
+                                Some(ControlMessage::AwaitResponse(..)) => {
+                                    warn!("Clearing stale active_request (caller abandoned AwaitResponse)");
+                                    *active_request = None;
+                                }
+                                // For multi-step operations (e.g. SetInterface, SendSD)
+                                // that re-queue themselves across loop iterations, do not
+                                // discard mid-operation. Let the existing request finish.
+                                Some(_) => {
+                                    error!(
+                                        "Received new control message while non-preemptible \
+                                         active_request is in progress; ignoring new message"
+                                    );
+                                    continue;
+                                }
+                                None => {}
                             }
                             debug!("Received control message: {:?}", ctrl);
                             *active_request = Some(ctrl);
@@ -763,13 +780,11 @@ mod tests {
 
         // Receive the request on the raw socket
         let mut buf = vec![0u8; 1400];
-        let (len, source_addr) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            raw.recv_from(&mut buf),
-        )
-        .await
-        .expect("Timed out waiting for request on raw socket")
-        .unwrap();
+        let (len, source_addr) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), raw.recv_from(&mut buf))
+                .await
+                .expect("Timed out waiting for request on raw socket")
+                .unwrap();
 
         // Drop the response receiver — inner still holds the sender in AwaitResponse
         drop(rx_send);
