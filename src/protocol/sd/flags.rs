@@ -43,4 +43,12 @@ impl Flags {
             unicast: true,
         }
     }
+    #[must_use]
+    pub fn reboot(self) -> bool {
+        self.reboot
+    }
+    #[must_use]
+    pub fn unicast(self) -> bool {
+        self.unicast
+    }
 }
