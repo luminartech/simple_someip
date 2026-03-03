@@ -7,19 +7,54 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Header {
     /// Message ID, encoding service ID and method ID
-    pub message_id: MessageId,
+    message_id: MessageId,
     /// Length of the message in bytes, starting at the request Id
     /// Total length of the message is therefore length + 8
-    pub length: u32,
+    length: u32,
     /// SOME/IP Request ID (4 bytes): Client ID [31:16] + Session ID [15:0].
-    pub request_id: u32,
-    pub protocol_version: u8,
-    pub interface_version: u8,
-    pub message_type: MessageTypeField,
-    pub return_code: ReturnCode,
+    request_id: u32,
+    protocol_version: u8,
+    interface_version: u8,
+    message_type: MessageTypeField,
+    return_code: ReturnCode,
 }
 
 impl Header {
+    #[must_use]
+    pub fn message_id(&self) -> MessageId {
+        self.message_id
+    }
+
+    #[must_use]
+    pub fn length(&self) -> u32 {
+        self.length
+    }
+
+    #[must_use]
+    pub fn request_id(&self) -> u32 {
+        self.request_id
+    }
+
+    #[must_use]
+    pub fn protocol_version(&self) -> u8 {
+        self.protocol_version
+    }
+
+    #[must_use]
+    pub fn interface_version(&self) -> u8 {
+        self.interface_version
+    }
+
+    #[must_use]
+    pub fn message_type(&self) -> MessageTypeField {
+        self.message_type
+    }
+
+    #[must_use]
+    pub fn return_code(&self) -> ReturnCode {
+        self.return_code
+    }
+
     /// Return the 8-byte "upper header" used by E2E UPPER-HEADER-BITS-TO-SHIFT.
     ///
     /// Layout (big-endian): `request_id(4)` + `protocol_version(1)` + `interface_version(1)`
@@ -43,6 +78,27 @@ impl Header {
     }
 
     #[must_use]
+    pub fn new(
+        message_id: MessageId,
+        request_id: u32,
+        protocol_version: u8,
+        interface_version: u8,
+        message_type: MessageTypeField,
+        return_code: ReturnCode,
+        payload_len: usize,
+    ) -> Self {
+        Self {
+            message_id,
+            length: 8 + u32::try_from(payload_len).expect("payload too large"),
+            request_id,
+            protocol_version,
+            interface_version,
+            message_type,
+            return_code,
+        }
+    }
+
+    #[must_use]
     pub fn new_sd(request_id: u32, sd_header_size: usize) -> Self {
         Self {
             message_id: MessageId::SD,
@@ -51,6 +107,26 @@ impl Header {
             protocol_version: 0x01,
             interface_version: 0x01,
             message_type: MessageTypeField::new_sd(),
+            return_code: ReturnCode::Ok,
+        }
+    }
+
+    #[must_use]
+    pub fn new_event(
+        service_id: u16,
+        event_id: u16,
+        request_id: u32,
+        protocol_version: u8,
+        interface_version: u8,
+        payload_len: usize,
+    ) -> Self {
+        Self {
+            message_id: MessageId::new_from_service_and_method(service_id, event_id),
+            length: 8 + u32::try_from(payload_len).expect("payload too large"),
+            request_id,
+            protocol_version,
+            interface_version,
+            message_type: MessageTypeField::new(crate::protocol::MessageType::Notification, false),
             return_code: ReturnCode::Ok,
         }
     }
@@ -189,12 +265,12 @@ mod tests {
     fn upper_header_bytes_layout() {
         let h = make_header();
         let ub = h.upper_header_bytes();
-        let rid = h.request_id.to_be_bytes();
+        let rid = h.request_id().to_be_bytes();
         assert_eq!(ub[0..4], rid);
-        assert_eq!(ub[4], h.protocol_version);
-        assert_eq!(ub[5], h.interface_version);
-        assert_eq!(ub[6], u8::from(h.message_type));
-        assert_eq!(ub[7], u8::from(h.return_code));
+        assert_eq!(ub[4], h.protocol_version());
+        assert_eq!(ub[5], h.interface_version());
+        assert_eq!(ub[6], u8::from(h.message_type()));
+        assert_eq!(ub[7], u8::from(h.return_code()));
     }
 
     // --- new_sd ---
@@ -202,12 +278,12 @@ mod tests {
     #[test]
     fn new_sd_fields() {
         let h = Header::new_sd(0x0000_0001, 28);
-        assert_eq!(h.message_id, MessageId::SD);
-        assert_eq!(h.length, 8 + 28);
-        assert_eq!(h.request_id, 0x0000_0001);
-        assert_eq!(h.protocol_version, 0x01);
-        assert_eq!(h.interface_version, 0x01);
-        assert_eq!(h.return_code, ReturnCode::Ok);
+        assert_eq!(h.message_id(), MessageId::SD);
+        assert_eq!(h.length(), 8 + 28);
+        assert_eq!(h.request_id(), 0x0000_0001);
+        assert_eq!(h.protocol_version(), 0x01);
+        assert_eq!(h.interface_version(), 0x01);
+        assert_eq!(h.return_code(), ReturnCode::Ok);
     }
 
     // --- is_sd ---
@@ -241,7 +317,7 @@ mod tests {
     fn set_request_id_updates_value() {
         let mut h = make_header();
         h.set_request_id(0xDEAD_BEEF);
-        assert_eq!(h.request_id, 0xDEAD_BEEF);
+        assert_eq!(h.request_id(), 0xDEAD_BEEF);
     }
 
     // --- required_size ---
@@ -349,14 +425,14 @@ mod tests {
         let h = make_header();
         let buf = encode_header(&h);
         let (view, _) = HeaderView::parse(&buf[..]).unwrap();
-        assert_eq!(view.message_id(), h.message_id);
-        assert_eq!(view.length(), h.length);
-        assert_eq!(view.request_id(), h.request_id);
+        assert_eq!(view.message_id(), h.message_id());
+        assert_eq!(view.length(), h.length());
+        assert_eq!(view.request_id(), h.request_id());
         assert_eq!(view.payload_size(), h.payload_size());
-        assert_eq!(view.protocol_version(), h.protocol_version);
-        assert_eq!(view.interface_version(), h.interface_version);
-        assert_eq!(view.message_type(), h.message_type);
-        assert_eq!(view.return_code(), h.return_code);
+        assert_eq!(view.protocol_version(), h.protocol_version());
+        assert_eq!(view.interface_version(), h.interface_version());
+        assert_eq!(view.message_type(), h.message_type());
+        assert_eq!(view.return_code(), h.return_code());
         assert_eq!(view.is_sd(), h.is_sd());
     }
 }

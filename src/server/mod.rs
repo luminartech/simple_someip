@@ -29,15 +29,6 @@ use std::{
 };
 use tokio::{net::UdpSocket, sync::RwLock};
 
-/// Compute the SOME/IP header `length` field (payload + 8 bytes of header overhead).
-///
-/// Panics if the total exceeds `u32::MAX`, which would cause silent truncation.
-pub(crate) fn someip_length(payload_len: usize) -> u32 {
-    const HEADER_OVERHEAD: usize = 8;
-    let total = payload_len + HEADER_OVERHEAD;
-    u32::try_from(total).expect("SOME/IP payload too large: length exceeds u32::MAX")
-}
-
 /// Configuration for a SOME/IP service provider
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -201,9 +192,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
         socket: &UdpSocket,
         session_id: &AtomicU16,
     ) -> Result<(), Error> {
-        use crate::protocol::{
-            Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode,
-        };
+        use crate::protocol::Header as SomeIpHeader;
         use crate::traits::WireFormat;
 
         // Create OfferService entry
@@ -255,15 +244,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
         let sid = u32::from(if next == 0 { 1 } else { next });
 
         // Wrap in SOME/IP header for SD (service 0xFFFF, method 0x8100)
-        let someip_header = SomeIpHeader {
-            message_id: MessageId::SD,
-            length: someip_length(sd_data.len()),
-            request_id: sid,
-            protocol_version: 0x01,
-            interface_version: 0x01,
-            message_type: MessageTypeField::new(MessageType::Notification, false),
-            return_code: ReturnCode::Ok,
-        };
+        let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
 
         // Encode complete SOME/IP-SD message
         let mut buffer = Vec::new();
@@ -292,9 +273,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
 
     /// Send a unicast `OfferService` to a specific address (in response to `FindService`)
     async fn send_unicast_offer(&self, target: std::net::SocketAddr) -> Result<(), Error> {
-        use crate::protocol::{
-            Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode,
-        };
+        use crate::protocol::Header as SomeIpHeader;
         use crate::traits::WireFormat;
 
         let entry = Entry::OfferService(ServiceEntry {
@@ -332,15 +311,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
         sd_payload.encode(&mut sd_data)?;
 
         let sid = self.next_sd_session_id();
-        let someip_header = SomeIpHeader {
-            message_id: MessageId::SD,
-            length: someip_length(sd_data.len()),
-            request_id: sid,
-            protocol_version: 0x01,
-            interface_version: 0x01,
-            message_type: MessageTypeField::new(MessageType::Notification, false),
-            return_code: ReturnCode::Ok,
-        };
+        let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
 
         let mut buffer = Vec::new();
         someip_header.encode(&mut buffer)?;
@@ -572,9 +543,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
         entry_view: &sd::EntryView<'_>,
         subscriber: std::net::SocketAddr,
     ) -> Result<(), Error> {
-        use crate::protocol::{
-            Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode,
-        };
+        use crate::protocol::Header as SomeIpHeader;
         use crate::traits::WireFormat;
 
         let ack_entry = Entry::SubscribeAckEventGroup(sd::EventGroupEntry {
@@ -603,15 +572,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
         sd_payload.encode(&mut sd_data)?;
 
         let sid = self.next_sd_session_id();
-        let someip_header = SomeIpHeader {
-            message_id: MessageId::SD,
-            length: someip_length(sd_data.len()),
-            request_id: sid,
-            protocol_version: 0x01,
-            interface_version: 0x01,
-            message_type: MessageTypeField::new(MessageType::Notification, false),
-            return_code: ReturnCode::Ok,
-        };
+        let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
 
         let mut buffer = Vec::new();
         someip_header.encode(&mut buffer)?;
@@ -636,9 +597,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
         subscriber: std::net::SocketAddr,
         reason: &str,
     ) -> Result<(), Error> {
-        use crate::protocol::{
-            Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, ReturnCode,
-        };
+        use crate::protocol::Header as SomeIpHeader;
         use crate::traits::WireFormat;
 
         let nack_entry = Entry::SubscribeAckEventGroup(sd::EventGroupEntry {
@@ -667,15 +626,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
         sd_payload.encode(&mut sd_data)?;
 
         let sid = self.next_sd_session_id();
-        let someip_header = SomeIpHeader {
-            message_id: MessageId::SD,
-            length: someip_length(sd_data.len()),
-            request_id: sid,
-            protocol_version: 0x01,
-            interface_version: 0x01,
-            message_type: MessageTypeField::new(MessageType::Notification, false),
-            return_code: ReturnCode::Ok,
-        };
+        let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
 
         let mut buffer = Vec::new();
         someip_header.encode(&mut buffer)?;
@@ -699,7 +650,7 @@ impl<const E: usize, const O: usize> Server<E, O> {
 mod tests {
     use super::*;
     use crate::protocol::{
-        Header as SomeIpHeader, MessageId, MessageType, MessageTypeField, MessageView, ReturnCode,
+        Header as SomeIpHeader, MessageType, MessageTypeField, MessageView, ReturnCode,
     };
     use crate::traits::WireFormat;
     use std::format;
@@ -717,15 +668,7 @@ mod tests {
         let mut sd_data = Vec::new();
         sd_header.encode(&mut sd_data).unwrap();
 
-        let someip_header = SomeIpHeader {
-            message_id: MessageId::SD,
-            length: someip_length(sd_data.len()),
-            request_id: 0x0001,
-            protocol_version: 0x01,
-            interface_version: 0x01,
-            message_type: MessageTypeField::new(MessageType::Notification, false),
-            return_code: ReturnCode::Ok,
-        };
+        let someip_header = SomeIpHeader::new_sd(0x0001, sd_data.len());
 
         let mut buffer = Vec::new();
         someip_header.encode(&mut buffer).unwrap();
@@ -1147,15 +1090,15 @@ mod tests {
         });
 
         // Send a non-SD SOME/IP message (service 0x1234, method 0x0001)
-        let non_sd_header = SomeIpHeader {
-            message_id: crate::protocol::MessageId::new_from_service_and_method(0x1234, 0x0001),
-            length: someip_length(0),
-            request_id: 0x0001,
-            protocol_version: 0x01,
-            interface_version: 0x01,
-            message_type: MessageTypeField::new(MessageType::Request, false),
-            return_code: ReturnCode::Ok,
-        };
+        let non_sd_header = SomeIpHeader::new(
+            crate::protocol::MessageId::new_from_service_and_method(0x1234, 0x0001),
+            0x0001,
+            0x01,
+            0x01,
+            MessageTypeField::new(MessageType::Request, false),
+            ReturnCode::Ok,
+            0,
+        );
         let mut non_sd_buf = Vec::new();
         non_sd_header.encode(&mut non_sd_buf).unwrap();
         client_socket
@@ -1257,12 +1200,6 @@ mod tests {
         assert_eq!(subs.subscription_count(), 1);
 
         server_handle.abort();
-    }
-
-    #[test]
-    fn test_someip_length() {
-        assert_eq!(someip_length(0), 8);
-        assert_eq!(someip_length(100), 108);
     }
 
     #[tokio::test]

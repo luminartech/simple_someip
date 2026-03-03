@@ -600,7 +600,7 @@ where
                         match discovery {
                             Ok((source, someip_header, sd_header)) => {
                                 // Extract session ID from SOME/IP request_id (lower 16 bits)
-                                let session_id = (someip_header.request_id & 0xFFFF) as u16;
+                                let session_id = (someip_header.request_id() & 0xFFFF) as u16;
                                 // Extract reboot flag from the SD payload flags
                                 let reboot_flag = PayloadDefinitions::new_sd_payload(&sd_header)
                                     .sd_flags()
@@ -674,7 +674,7 @@ where
                                  let received_message = received.message;
                                  if let Some(active) = active_request.take() {
                                      if let ControlMessage::AwaitResponse(request_message, response) = active {
-                                         if request_message.header().message_id == received_message.header().message_id {
+                                         if request_message.header().message_id() == received_message.header().message_id() {
                                             if response.send(Ok(
                                                  received_message.payload().clone(),
                                              )).is_err() {

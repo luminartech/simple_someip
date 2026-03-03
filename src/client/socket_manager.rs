@@ -176,7 +176,7 @@ where
                                 let parse_result = MessageView::parse(&buf[..bytes_received])
                                     .and_then(|view| {
                                         let header = view.header().to_owned();
-                                        let payload = MessageDefinitions::from_payload_bytes(header.message_id, view.payload_bytes())?;
+                                        let payload = MessageDefinitions::from_payload_bytes(header.message_id(), view.payload_bytes())?;
                                         Ok(ReceivedMessage {
                                             message: Message::new(header, payload),
                                             source: source_address,
@@ -301,8 +301,8 @@ mod tests {
 
         let received = result.unwrap().unwrap();
         assert_eq!(
-            received.message.header().message_id,
-            msg.header().message_id
+            received.message.header().message_id(),
+            msg.header().message_id()
         );
         assert!(received.message.is_sd());
     }
@@ -334,6 +334,9 @@ mod tests {
 
         // Decode and verify
         let view = MessageView::parse(&recv_buf[..len]).unwrap();
-        assert_eq!(view.header().to_owned().message_id, msg.header().message_id);
+        assert_eq!(
+            view.header().to_owned().message_id(),
+            msg.header().message_id()
+        );
     }
 }

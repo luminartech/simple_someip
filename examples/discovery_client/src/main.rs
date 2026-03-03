@@ -208,7 +208,7 @@ async fn main() -> Result<(), Error> {
                 info!(
                     "SD from {} (session_id=0x{:04X})",
                     msg.source,
-                    msg.someip_header.request_id & 0xFFFF,
+                    msg.someip_header.request_id() & 0xFFFF,
                 );
 
                 let header = &msg.sd_header;

@@ -39,7 +39,7 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
     }
 
     pub fn sd_header(&self) -> Option<&<PayloadDefinition as PayloadWireFormat>::SdHeader> {
-        if !self.header().message_id.is_sd() || self.header().message_type.is_tp() {
+        if !self.header().message_id().is_sd() || self.header().message_type().is_tp() {
             return None;
         }
         self.payload.as_sd_header()
@@ -164,7 +164,7 @@ mod tests {
     fn new_sd_creates_valid_message() {
         let msg = make_sd_message();
         assert!(msg.is_sd());
-        assert_eq!(msg.header().message_id, MessageId::SD);
+        assert_eq!(msg.header().message_id(), MessageId::SD);
     }
 
     // --- header / payload / payload_mut ---
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn header_returns_reference() {
         let msg = make_sd_message();
-        assert_eq!(msg.header().protocol_version, 0x01);
+        assert_eq!(msg.header().protocol_version(), 0x01);
     }
 
     #[test]
@@ -202,7 +202,7 @@ mod tests {
     fn set_request_id_updates_header() {
         let mut msg = make_sd_message();
         msg.set_request_id(0xDEAD_BEEF);
-        assert_eq!(msg.header().request_id, 0xDEAD_BEEF);
+        assert_eq!(msg.header().request_id(), 0xDEAD_BEEF);
     }
 
     // --- get_sd_header ---
@@ -339,15 +339,15 @@ mod tests {
     #[test]
     fn message_view_sd_header_on_non_sd_returns_error() {
         // Build a non-SD message
-        let header = Header {
-            message_id: MessageId::new_from_service_and_method(0x1234, 0x0001),
-            length: 8, // payload_size = 0
-            request_id: 0x0001,
-            protocol_version: 0x01,
-            interface_version: 0x01,
-            message_type: crate::protocol::MessageTypeField::try_from(0x00).unwrap(),
-            return_code: ReturnCode::Ok,
-        };
+        let header = Header::new(
+            MessageId::new_from_service_and_method(0x1234, 0x0001),
+            0x0001,
+            0x01,
+            0x01,
+            crate::protocol::MessageTypeField::try_from(0x00).unwrap(),
+            ReturnCode::Ok,
+            0,
+        );
         let mut buf = [0u8; 16];
         header.encode(&mut buf.as_mut_slice()).unwrap();
         let view = MessageView::parse(&buf).unwrap();
