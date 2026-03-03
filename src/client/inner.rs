@@ -154,7 +154,7 @@ where
     ) {
         info!("Initializing SOME/IP Client");
         let (control_sender, control_receiver) = mpsc::channel(4);
-        let (update_sender, update_receiver) = mpsc::channel(64);
+        let (update_sender, update_receiver) = mpsc::channel(4);
         let inner = Self {
             control_receiver,
             active_request: None,

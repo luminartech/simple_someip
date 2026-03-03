@@ -81,7 +81,7 @@ where
     }
 
     pub fn bind(port: u16) -> Result<Self, Error> {
-        let (rx_tx, rx_rx) = mpsc::channel(16);
+        let (rx_tx, rx_rx) = mpsc::channel(4);
         let (tx_tx, tx_rx) = mpsc::channel(4);
         let bind_addr = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
 
