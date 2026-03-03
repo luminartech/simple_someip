@@ -1,0 +1,11 @@
+[package]
+name = "discovery_client"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+simple-someip = { path = "../..", features = ["client"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
