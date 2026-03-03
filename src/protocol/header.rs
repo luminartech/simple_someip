@@ -1,8 +1,5 @@
 use crate::{
-    protocol::{
-        Error, MessageId, MessageTypeField, ReturnCode,
-        byte_order::{ReadBytesExt, WriteBytesExt},
-    },
+    protocol::{Error, MessageId, MessageTypeField, ReturnCode, byte_order::WriteBytesExt},
     traits::WireFormat,
 };
 
@@ -70,6 +67,96 @@ impl Header {
 
     pub fn set_request_id(&mut self, request_id: u32) {
         self.request_id = request_id;
+    }
+}
+
+/// Zero-copy view into a 16-byte SOME/IP header in a buffer.
+#[derive(Clone, Copy, Debug)]
+pub struct HeaderView<'a>(&'a [u8; 16]);
+
+impl<'a> HeaderView<'a> {
+    /// Parse and validate a SOME/IP header from the beginning of `buf`.
+    /// Returns `(view, remaining_bytes)` on success.
+    pub fn parse(buf: &'a [u8]) -> Result<(Self, &'a [u8]), Error> {
+        if buf.len() < 16 {
+            return Err(Error::UnexpectedEof);
+        }
+        let header_bytes: &[u8; 16] = buf[..16].try_into().expect("length checked above");
+        let view = Self(header_bytes);
+
+        // Validate protocol version
+        let pv = view.protocol_version();
+        if pv != 0x01 {
+            return Err(Error::InvalidProtocolVersion(pv));
+        }
+        // Validate message type
+        MessageTypeField::try_from(header_bytes[14])?;
+        // Validate return code
+        ReturnCode::try_from(header_bytes[15])?;
+
+        Ok((view, &buf[16..]))
+    }
+
+    #[must_use]
+    pub fn message_id(&self) -> MessageId {
+        MessageId::from(u32::from_be_bytes([
+            self.0[0], self.0[1], self.0[2], self.0[3],
+        ]))
+    }
+
+    #[must_use]
+    pub fn length(&self) -> u32 {
+        u32::from_be_bytes([self.0[4], self.0[5], self.0[6], self.0[7]])
+    }
+
+    #[must_use]
+    pub fn request_id(&self) -> u32 {
+        u32::from_be_bytes([self.0[8], self.0[9], self.0[10], self.0[11]])
+    }
+
+    #[must_use]
+    pub fn payload_size(&self) -> usize {
+        self.length() as usize - 8
+    }
+
+    #[must_use]
+    pub fn protocol_version(&self) -> u8 {
+        self.0[12]
+    }
+
+    #[must_use]
+    pub fn interface_version(&self) -> u8 {
+        self.0[13]
+    }
+
+    #[must_use]
+    pub fn message_type(&self) -> MessageTypeField {
+        // Safe: validated in parse()
+        MessageTypeField::try_from(self.0[14]).expect("validated in parse")
+    }
+
+    #[must_use]
+    pub fn return_code(&self) -> ReturnCode {
+        // Safe: validated in parse()
+        ReturnCode::try_from(self.0[15]).expect("validated in parse")
+    }
+
+    #[must_use]
+    pub fn is_sd(&self) -> bool {
+        self.message_id().is_sd()
+    }
+
+    #[must_use]
+    pub fn to_owned(&self) -> Header {
+        Header {
+            message_id: self.message_id(),
+            length: self.length(),
+            request_id: self.request_id(),
+            protocol_version: self.protocol_version(),
+            interface_version: self.interface_version(),
+            message_type: self.message_type(),
+            return_code: self.return_code(),
+        }
     }
 }
 
@@ -164,14 +251,15 @@ mod tests {
         assert_eq!(make_header().required_size(), 16);
     }
 
-    // --- encode / decode round-trip ---
+    // --- encode / parse round-trip ---
 
     #[test]
-    fn encode_decode_round_trip() {
+    fn encode_parse_round_trip() {
         let h = make_header();
         let buf = encode_header(&h);
-        let decoded = Header::decode(&mut &buf[..]).unwrap();
-        assert_eq!(decoded, h);
+        let (view, remaining) = HeaderView::parse(&buf[..]).unwrap();
+        assert_eq!(view.to_owned(), h);
+        assert!(remaining.is_empty());
     }
 
     #[test]
@@ -186,14 +274,26 @@ mod tests {
     fn sd_header_round_trips() {
         let h = Header::new_sd(0x0000_0042, 28);
         let buf = encode_header(&h);
-        let decoded = Header::decode(&mut &buf[..]).unwrap();
-        assert_eq!(decoded, h);
+        let (view, _) = HeaderView::parse(&buf[..]).unwrap();
+        assert_eq!(view.to_owned(), h);
     }
 
-    // --- decode error paths ---
+    // --- parse with exactly-sized slice ---
 
     #[test]
-    fn decode_invalid_protocol_version_returns_error() {
+    fn parse_exact_size_slice_returns_empty_remainder() {
+        let h = make_header();
+        let buf = encode_header(&h);
+        // buf is exactly 16 bytes — no extra data
+        let (view, remaining) = HeaderView::parse(&buf).unwrap();
+        assert_eq!(view.to_owned(), h);
+        assert!(remaining.is_empty());
+    }
+
+    // --- parse error paths ---
+
+    #[test]
+    fn parse_invalid_protocol_version_returns_error() {
         let mut h = make_header();
         h.protocol_version = 0x02;
         // Manually encode with wrong protocol version
@@ -206,66 +306,62 @@ mod tests {
             0x03, 0x00, 0x00,
         ];
         assert!(matches!(
-            Header::decode(&mut &buf[..]),
+            HeaderView::parse(&buf[..]),
             Err(Error::InvalidProtocolVersion(0x02))
         ));
     }
 
     #[test]
-    fn decode_invalid_message_type_returns_error() {
+    fn parse_invalid_message_type_returns_error() {
         let h = make_header();
         let mut buf = encode_header(&h);
         buf[14] = 0xFF; // invalid message type
         assert!(matches!(
-            Header::decode(&mut &buf[..]),
+            HeaderView::parse(&buf[..]),
             Err(Error::InvalidMessageTypeField(0xFF))
         ));
     }
 
     #[test]
-    fn decode_invalid_return_code_returns_error() {
+    fn parse_invalid_return_code_returns_error() {
         let h = make_header();
         let mut buf = encode_header(&h);
         buf[15] = 0x5F; // invalid return code
         assert!(matches!(
-            Header::decode(&mut &buf[..]),
+            HeaderView::parse(&buf[..]),
             Err(Error::InvalidReturnCode(0x5F))
         ));
     }
 
     #[test]
-    fn decode_truncated_input_returns_eof() {
+    fn parse_truncated_input_returns_eof() {
         let buf: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
         assert!(matches!(
-            Header::decode(&mut &buf[..]),
+            HeaderView::parse(&buf[..]),
             Err(Error::UnexpectedEof)
         ));
+    }
+
+    // --- HeaderView accessors ---
+
+    #[test]
+    fn header_view_accessors() {
+        let h = make_header();
+        let buf = encode_header(&h);
+        let (view, _) = HeaderView::parse(&buf[..]).unwrap();
+        assert_eq!(view.message_id(), h.message_id);
+        assert_eq!(view.length(), h.length);
+        assert_eq!(view.request_id(), h.request_id);
+        assert_eq!(view.payload_size(), h.payload_size());
+        assert_eq!(view.protocol_version(), h.protocol_version);
+        assert_eq!(view.interface_version(), h.interface_version);
+        assert_eq!(view.message_type(), h.message_type);
+        assert_eq!(view.return_code(), h.return_code);
+        assert_eq!(view.is_sd(), h.is_sd());
     }
 }
 
 impl WireFormat for Header {
-    fn decode<T: embedded_io::Read>(reader: &mut T) -> Result<Self, Error> {
-        let message_id = MessageId::from(reader.read_u32_be()?);
-        let length = reader.read_u32_be()?;
-        let request_id = reader.read_u32_be()?;
-        let protocol_version = reader.read_u8()?;
-        if protocol_version != 0x01 {
-            return Err(Error::InvalidProtocolVersion(protocol_version));
-        }
-        let interface_version = reader.read_u8()?;
-        let message_type = MessageTypeField::try_from(reader.read_u8()?)?;
-        let return_code = ReturnCode::try_from(reader.read_u8()?)?;
-        Ok(Self {
-            message_id,
-            length,
-            request_id,
-            protocol_version,
-            interface_version,
-            message_type,
-            return_code,
-        })
-    }
-
     fn required_size(&self) -> usize {
         16
     }

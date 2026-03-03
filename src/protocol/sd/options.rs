@@ -1,9 +1,6 @@
 use core::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::protocol::{
-    Error,
-    byte_order::{ReadBytesExt, WriteBytesExt},
-};
+use crate::protocol::{Error, byte_order::WriteBytesExt};
 
 pub const MAX_CONFIGURATION_STRING_LENGTH: usize = 256;
 
@@ -33,7 +30,8 @@ impl From<TransportProtocol> for u8 {
     }
 }
 
-enum OptionType {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptionType {
     Configuration,
     LoadBalancing,
     IpV4Endpoint,
@@ -174,58 +172,6 @@ impl Options {
             }
         }
     }
-
-    pub fn read<T: embedded_io::Read>(message_bytes: &mut T) -> Result<Self, Error> {
-        let length = message_bytes.read_u16_be()?;
-        let option_type = OptionType::try_from(message_bytes.read_u8()?)?;
-        let _discard_flag = message_bytes.read_u8()? & 0x80 != 0;
-
-        match option_type {
-            OptionType::Configuration => read_configuration(message_bytes, length),
-            OptionType::LoadBalancing => read_load_balancing(message_bytes, length),
-            OptionType::IpV4Endpoint => {
-                validate_length(OptionType::IpV4Endpoint, 9, length)?;
-                let (ip, protocol, port) = read_ipv4_fields(message_bytes)?;
-                Ok(Options::IpV4Endpoint { ip, protocol, port })
-            }
-            OptionType::IpV6Endpoint => {
-                validate_length(OptionType::IpV6Endpoint, 21, length)?;
-                let (ip, protocol, port) = read_ipv6_fields(message_bytes)?;
-                Ok(Options::IpV6Endpoint { ip, protocol, port })
-            }
-            OptionType::IpV4Multicast => {
-                validate_length(OptionType::IpV4Multicast, 9, length)?;
-                let (ip, protocol, port) = read_ipv4_fields(message_bytes)?;
-                Ok(Options::IpV4Multicast { ip, protocol, port })
-            }
-            OptionType::IpV6Multicast => {
-                validate_length(OptionType::IpV6Multicast, 21, length)?;
-                let (ip, protocol, port) = read_ipv6_fields(message_bytes)?;
-                Ok(Options::IpV6Multicast { ip, protocol, port })
-            }
-            OptionType::IpV4SD => {
-                validate_length(OptionType::IpV4SD, 9, length)?;
-                let (ip, protocol, port) = read_ipv4_fields(message_bytes)?;
-                Ok(Options::IpV4SD { ip, protocol, port })
-            }
-            OptionType::IpV6SD => {
-                validate_length(OptionType::IpV6SD, 21, length)?;
-                let (ip, protocol, port) = read_ipv6_fields(message_bytes)?;
-                Ok(Options::IpV6SD { ip, protocol, port })
-            }
-        }
-    }
-}
-
-fn validate_length(option_type: OptionType, expected: u16, actual: u16) -> Result<(), Error> {
-    if actual != expected {
-        return Err(Error::InvalidSDOptionLength {
-            option_type: u8::from(option_type),
-            expected,
-            actual,
-        });
-    }
-    Ok(())
 }
 
 fn write_ipv4_option<T: embedded_io::Write>(
@@ -260,54 +206,198 @@ fn write_ipv6_option<T: embedded_io::Write>(
     Ok(24)
 }
 
-fn read_ipv4_fields<T: embedded_io::Read>(
-    reader: &mut T,
-) -> Result<(Ipv4Addr, TransportProtocol, u16), Error> {
-    let ip = Ipv4Addr::from_bits(reader.read_u32_be()?);
-    let _reserved = reader.read_u8()?;
-    let protocol = TransportProtocol::try_from(reader.read_u8()?)?;
-    let port = reader.read_u16_be()?;
-    Ok((ip, protocol, port))
-}
+// --- Zero-copy view types ---
 
-fn read_ipv6_fields<T: embedded_io::Read>(
-    reader: &mut T,
-) -> Result<(Ipv6Addr, TransportProtocol, u16), Error> {
-    let mut octets = [0u8; 16];
-    reader.read_bytes(&mut octets)?;
-    let ip = Ipv6Addr::from(octets);
-    let _reserved = reader.read_u8()?;
-    let protocol = TransportProtocol::try_from(reader.read_u8()?)?;
-    let port = reader.read_u16_be()?;
-    Ok((ip, protocol, port))
-}
+/// Zero-copy view into a variable-length SD option in a buffer.
+///
+/// Wire layout:
+/// - `[0..2]`: length (u16 BE) = `total_size` - 3
+/// - `[2]`: option type (u8)
+/// - `[3]`: reserved/discard flag (u8)
+/// - `[4..]`: type-specific data
+#[derive(Clone, Copy, Debug)]
+pub struct OptionView<'a>(&'a [u8]);
 
-fn read_configuration<T: embedded_io::Read>(reader: &mut T, length: u16) -> Result<Options, Error> {
-    let string_len = length.saturating_sub(1);
-    if usize::from(string_len) > MAX_CONFIGURATION_STRING_LENGTH {
-        return Err(Error::ConfigurationStringTooLong(string_len.into()));
+impl<'a> OptionView<'a> {
+    pub fn option_type(&self) -> Result<OptionType, Error> {
+        OptionType::try_from(self.0[2])
     }
-    let mut buf = [0u8; MAX_CONFIGURATION_STRING_LENGTH];
-    let slice = &mut buf[..usize::from(string_len)];
-    reader.read_bytes(slice)?;
-    let mut configuration_string = heapless::Vec::<u8, MAX_CONFIGURATION_STRING_LENGTH>::new();
-    // Length already validated to fit within MAX_CONFIGURATION_STRING_LENGTH
-    configuration_string
-        .extend_from_slice(slice)
-        .expect("length validated above");
-    Ok(Options::Configuration {
-        configuration_string,
-    })
+
+    /// Total wire size of this option (length field value + 3).
+    #[must_use]
+    pub fn wire_size(&self) -> usize {
+        let length = u16::from_be_bytes([self.0[0], self.0[1]]);
+        usize::from(length) + 3
+    }
+
+    /// Parse as IPv4 endpoint/multicast/SD option.
+    /// Returns `(ip, protocol, port)`.
+    pub fn as_ipv4(&self) -> Result<(Ipv4Addr, TransportProtocol, u16), Error> {
+        let ip = Ipv4Addr::from_bits(u32::from_be_bytes([
+            self.0[4], self.0[5], self.0[6], self.0[7],
+        ]));
+        // [8] is reserved
+        let protocol = TransportProtocol::try_from(self.0[9])?;
+        let port = u16::from_be_bytes([self.0[10], self.0[11]]);
+        Ok((ip, protocol, port))
+    }
+
+    /// Parse as IPv6 endpoint/multicast/SD option.
+    /// Returns `(ip, protocol, port)`.
+    pub fn as_ipv6(&self) -> Result<(Ipv6Addr, TransportProtocol, u16), Error> {
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&self.0[4..20]);
+        let ip = Ipv6Addr::from(octets);
+        // [20] is reserved
+        let protocol = TransportProtocol::try_from(self.0[21])?;
+        let port = u16::from_be_bytes([self.0[22], self.0[23]]);
+        Ok((ip, protocol, port))
+    }
+
+    /// Raw configuration bytes (for Configuration options).
+    #[must_use]
+    pub fn configuration_bytes(&self) -> &'a [u8] {
+        let length = u16::from_be_bytes([self.0[0], self.0[1]]);
+        let string_len = length.saturating_sub(1);
+        &self.0[4..4 + usize::from(string_len)]
+    }
+
+    /// Parse as load-balancing option. Returns `(priority, weight)`.
+    pub fn as_load_balancing(&self) -> Result<(u16, u16), Error> {
+        let priority = u16::from_be_bytes([self.0[4], self.0[5]]);
+        let weight = u16::from_be_bytes([self.0[6], self.0[7]]);
+        Ok((priority, weight))
+    }
+
+    pub fn to_owned(&self) -> Result<Options, Error> {
+        let option_type = self.option_type()?;
+        match option_type {
+            OptionType::Configuration => {
+                let config_bytes = self.configuration_bytes();
+                if config_bytes.len() > MAX_CONFIGURATION_STRING_LENGTH {
+                    return Err(Error::ConfigurationStringTooLong(config_bytes.len()));
+                }
+                let mut configuration_string =
+                    heapless::Vec::<u8, MAX_CONFIGURATION_STRING_LENGTH>::new();
+                configuration_string
+                    .extend_from_slice(config_bytes)
+                    .expect("length validated above");
+                Ok(Options::Configuration {
+                    configuration_string,
+                })
+            }
+            OptionType::LoadBalancing => {
+                let (priority, weight) = self.as_load_balancing()?;
+                Ok(Options::LoadBalancing { priority, weight })
+            }
+            OptionType::IpV4Endpoint => {
+                let (ip, protocol, port) = self.as_ipv4()?;
+                Ok(Options::IpV4Endpoint { ip, protocol, port })
+            }
+            OptionType::IpV6Endpoint => {
+                let (ip, protocol, port) = self.as_ipv6()?;
+                Ok(Options::IpV6Endpoint { ip, protocol, port })
+            }
+            OptionType::IpV4Multicast => {
+                let (ip, protocol, port) = self.as_ipv4()?;
+                Ok(Options::IpV4Multicast { ip, protocol, port })
+            }
+            OptionType::IpV6Multicast => {
+                let (ip, protocol, port) = self.as_ipv6()?;
+                Ok(Options::IpV6Multicast { ip, protocol, port })
+            }
+            OptionType::IpV4SD => {
+                let (ip, protocol, port) = self.as_ipv4()?;
+                Ok(Options::IpV4SD { ip, protocol, port })
+            }
+            OptionType::IpV6SD => {
+                let (ip, protocol, port) = self.as_ipv6()?;
+                Ok(Options::IpV6SD { ip, protocol, port })
+            }
+        }
+    }
 }
 
-fn read_load_balancing<T: embedded_io::Read>(
-    reader: &mut T,
-    length: u16,
-) -> Result<Options, Error> {
-    validate_length(OptionType::LoadBalancing, 5, length)?;
-    let priority = reader.read_u16_be()?;
-    let weight = reader.read_u16_be()?;
-    Ok(Options::LoadBalancing { priority, weight })
+/// Iterator over variable-length SD options in a validated buffer.
+/// Options are guaranteed valid (validated upfront in `SdHeaderView::parse`).
+pub struct OptionIter<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> OptionIter<'a> {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
+        Self { remaining: buf }
+    }
+}
+
+impl<'a> Iterator for OptionIter<'a> {
+    type Item = OptionView<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining.len() < 4 {
+            return None;
+        }
+        let length = u16::from_be_bytes([self.remaining[0], self.remaining[1]]);
+        let wire_size = usize::from(length) + 3;
+        if wire_size > self.remaining.len() {
+            return None;
+        }
+        let view = OptionView(&self.remaining[..wire_size]);
+        self.remaining = &self.remaining[wire_size..];
+        Some(view)
+    }
+}
+
+/// Validate a single option's wire format and return its wire size.
+/// Used during `SdHeaderView::parse` for upfront validation.
+pub(crate) fn validate_option(buf: &[u8]) -> Result<usize, Error> {
+    if buf.len() < 4 {
+        return Err(Error::IncorrectOptionsSize(buf.len()));
+    }
+    let length = u16::from_be_bytes([buf[0], buf[1]]);
+    let wire_size = usize::from(length) + 3;
+    if wire_size > buf.len() {
+        return Err(Error::IncorrectOptionsSize(buf.len()));
+    }
+    let option_type = OptionType::try_from(buf[2])?;
+    // Validate expected lengths for fixed-size options
+    match option_type {
+        OptionType::IpV4Endpoint | OptionType::IpV4Multicast | OptionType::IpV4SD => {
+            if length != 9 {
+                return Err(Error::InvalidSDOptionLength {
+                    option_type: buf[2],
+                    expected: 9,
+                    actual: length,
+                });
+            }
+        }
+        OptionType::IpV6Endpoint | OptionType::IpV6Multicast | OptionType::IpV6SD => {
+            if length != 21 {
+                return Err(Error::InvalidSDOptionLength {
+                    option_type: buf[2],
+                    expected: 21,
+                    actual: length,
+                });
+            }
+        }
+        OptionType::LoadBalancing => {
+            if length != 5 {
+                return Err(Error::InvalidSDOptionLength {
+                    option_type: buf[2],
+                    expected: 5,
+                    actual: length,
+                });
+            }
+        }
+        OptionType::Configuration => {
+            // Configuration strings are variable length; just check it doesn't exceed max
+            let string_len = length.saturating_sub(1);
+            if usize::from(string_len) > MAX_CONFIGURATION_STRING_LENGTH {
+                return Err(Error::ConfigurationStringTooLong(string_len.into()));
+            }
+        }
+    }
+    Ok(wire_size)
 }
 
 #[cfg(test)]
@@ -336,10 +426,10 @@ mod tests {
         ));
     }
 
-    // --- Options::read: success paths ---
+    // --- OptionView: parse from encoded bytes ---
 
     #[test]
-    fn options_read_ipv4_endpoint_tcp() {
+    fn option_view_ipv4_endpoint_tcp() {
         let buf: [u8; 12] = [
             0x00, 0x09, // length = 9
             0x04, // type = IpV4Endpoint
@@ -349,40 +439,22 @@ mod tests {
             0x06, // protocol = TCP
             0x04, 0xD2, // port = 1234
         ];
-        let opt = Options::read(&mut &buf[..]).unwrap();
-        assert_eq!(
-            opt,
-            Options::IpV4Endpoint {
-                ip: Ipv4Addr::new(192, 168, 0, 1),
-                protocol: TransportProtocol::Tcp,
-                port: 1234,
-            }
-        );
+        let view = OptionView(&buf);
+        assert_eq!(view.option_type().unwrap(), OptionType::IpV4Endpoint);
+        assert_eq!(view.wire_size(), 12);
+        let (ip, protocol, port) = view.as_ipv4().unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 0, 1));
+        assert_eq!(protocol, TransportProtocol::Tcp);
+        assert_eq!(port, 1234);
     }
 
     #[test]
-    fn options_read_invalid_option_type_returns_error() {
+    fn option_view_to_owned_invalid_type() {
         let buf: [u8; 4] = [0x00, 0x00, 0xFF, 0x00]; // type = 0xFF (invalid)
+        let view = OptionView(&buf);
         assert!(matches!(
-            Options::read(&mut &buf[..]),
+            view.to_owned(),
             Err(Error::InvalidSDOptionType(0xFF))
-        ));
-    }
-
-    #[test]
-    fn options_read_invalid_protocol_returns_error() {
-        let buf: [u8; 12] = [
-            0x00, 0x09, // length = 9
-            0x04, // type = IpV4Endpoint
-            0x00, // discard flag
-            127, 0, 0, 1,    // ip
-            0x00, // reserved
-            0xAB, // invalid protocol
-            0x00, 0x50, // port = 80
-        ];
-        assert!(matches!(
-            Options::read(&mut &buf[..]),
-            Err(Error::InvalidSDOptionTransportProtocol(0xAB))
         ));
     }
 
@@ -393,7 +465,8 @@ mod tests {
         let mut buf = [0u8; 4 + MAX_CONFIGURATION_STRING_LENGTH];
         let written = option.write(&mut &mut buf[..size]).unwrap();
         assert_eq!(written, size);
-        let parsed = Options::read(&mut &buf[..size]).unwrap();
+        let view = OptionView(&buf[..size]);
+        let parsed = view.to_owned().unwrap();
         assert_eq!(*option, parsed);
     }
 
@@ -488,13 +561,14 @@ mod tests {
 
     #[test]
     fn load_balancing_invalid_length_returns_error() {
-        let buf: [u8; 4] = [
-            0x00, 0x03, // length = 3 (wrong, should be 5)
-            0x02, // type = LoadBalancing
-            0x00, // discard flag
-        ];
+        // length = 3 (wrong, should be 5), wire_size = 6
+        let mut buf = [0u8; 6];
+        buf[0] = 0x00;
+        buf[1] = 0x03; // length = 3
+        buf[2] = 0x02; // type = LoadBalancing
+        buf[3] = 0x00; // discard flag
         assert!(matches!(
-            Options::read(&mut &buf[..]),
+            validate_option(&buf),
             Err(Error::InvalidSDOptionLength {
                 option_type: 0x02,
                 expected: 5,
@@ -505,13 +579,14 @@ mod tests {
 
     #[test]
     fn ipv4_endpoint_invalid_length_returns_error() {
-        let buf: [u8; 4] = [
-            0x00, 0x05, // length = 5 (wrong, should be 9)
-            0x04, // type = IpV4Endpoint
-            0x00,
-        ];
+        // length = 5 (wrong, should be 9), wire_size = 8
+        let mut buf = [0u8; 8];
+        buf[0] = 0x00;
+        buf[1] = 0x05; // length = 5
+        buf[2] = 0x04; // type = IpV4Endpoint
+        buf[3] = 0x00;
         assert!(matches!(
-            Options::read(&mut &buf[..]),
+            validate_option(&buf),
             Err(Error::InvalidSDOptionLength {
                 option_type: 0x04,
                 expected: 9,
@@ -522,13 +597,14 @@ mod tests {
 
     #[test]
     fn ipv6_endpoint_invalid_length_returns_error() {
-        let buf: [u8; 4] = [
-            0x00, 0x09, // length = 9 (wrong, should be 21)
-            0x06, // type = IpV6Endpoint
-            0x00,
-        ];
+        // length = 9 (wrong, should be 21), wire_size = 12
+        let mut buf = [0u8; 12];
+        buf[0] = 0x00;
+        buf[1] = 0x09; // length = 9
+        buf[2] = 0x06; // type = IpV6Endpoint
+        buf[3] = 0x00;
         assert!(matches!(
-            Options::read(&mut &buf[..]),
+            validate_option(&buf),
             Err(Error::InvalidSDOptionLength {
                 option_type: 0x06,
                 expected: 21,
@@ -539,13 +615,14 @@ mod tests {
 
     #[test]
     fn ipv4_multicast_invalid_length_returns_error() {
-        let buf: [u8; 4] = [
-            0x00, 0x05, // wrong length
-            0x14, // type = IpV4Multicast
-            0x00,
-        ];
+        // length = 5 (wrong, should be 9), wire_size = 8
+        let mut buf = [0u8; 8];
+        buf[0] = 0x00;
+        buf[1] = 0x05;
+        buf[2] = 0x14; // type = IpV4Multicast
+        buf[3] = 0x00;
         assert!(matches!(
-            Options::read(&mut &buf[..]),
+            validate_option(&buf),
             Err(Error::InvalidSDOptionLength {
                 option_type: 0x14,
                 expected: 9,
@@ -556,13 +633,14 @@ mod tests {
 
     #[test]
     fn ipv6_multicast_invalid_length_returns_error() {
-        let buf: [u8; 4] = [
-            0x00, 0x09, // wrong length
-            0x16, // type = IpV6Multicast
-            0x00,
-        ];
+        // length = 9 (wrong, should be 21), wire_size = 12
+        let mut buf = [0u8; 12];
+        buf[0] = 0x00;
+        buf[1] = 0x09;
+        buf[2] = 0x16; // type = IpV6Multicast
+        buf[3] = 0x00;
         assert!(matches!(
-            Options::read(&mut &buf[..]),
+            validate_option(&buf),
             Err(Error::InvalidSDOptionLength {
                 option_type: 0x16,
                 expected: 21,
@@ -573,13 +651,14 @@ mod tests {
 
     #[test]
     fn ipv4_sd_invalid_length_returns_error() {
-        let buf: [u8; 4] = [
-            0x00, 0x05, // wrong length
-            0x24, // type = IpV4SD
-            0x00,
-        ];
+        // length = 5 (wrong, should be 9), wire_size = 8
+        let mut buf = [0u8; 8];
+        buf[0] = 0x00;
+        buf[1] = 0x05;
+        buf[2] = 0x24; // type = IpV4SD
+        buf[3] = 0x00;
         assert!(matches!(
-            Options::read(&mut &buf[..]),
+            validate_option(&buf),
             Err(Error::InvalidSDOptionLength {
                 option_type: 0x24,
                 expected: 9,
@@ -590,18 +669,51 @@ mod tests {
 
     #[test]
     fn ipv6_sd_invalid_length_returns_error() {
-        let buf: [u8; 4] = [
-            0x00, 0x09, // wrong length
-            0x26, // type = IpV6SD
-            0x00,
-        ];
+        // length = 9 (wrong, should be 21), wire_size = 12
+        let mut buf = [0u8; 12];
+        buf[0] = 0x00;
+        buf[1] = 0x09;
+        buf[2] = 0x26; // type = IpV6SD
+        buf[3] = 0x00;
         assert!(matches!(
-            Options::read(&mut &buf[..]),
+            validate_option(&buf),
             Err(Error::InvalidSDOptionLength {
                 option_type: 0x26,
                 expected: 21,
                 actual: 9,
             })
         ));
+    }
+
+    // --- OptionIter ---
+
+    #[test]
+    fn option_iter_empty() {
+        let iter = OptionIter::new(&[]);
+        assert_eq!(iter.count(), 0);
+    }
+
+    #[test]
+    fn option_iter_two_options() {
+        let opt1 = Options::IpV4Endpoint {
+            ip: Ipv4Addr::new(10, 0, 0, 1),
+            protocol: TransportProtocol::Udp,
+            port: 30490,
+        };
+        let opt2 = Options::LoadBalancing {
+            priority: 100,
+            weight: 200,
+        };
+        let mut buf = [0u8; 24]; // 12 + 8 = 20
+        let n1 = opt1.write(&mut &mut buf[..12]).unwrap();
+        let n2 = opt2.write(&mut &mut buf[12..20]).unwrap();
+        let total = n1 + n2;
+
+        let mut iter = OptionIter::new(&buf[..total]);
+        let v1 = iter.next().unwrap();
+        assert_eq!(v1.to_owned().unwrap(), opt1);
+        let v2 = iter.next().unwrap();
+        assert_eq!(v2.to_owned().unwrap(), opt2);
+        assert!(iter.next().is_none());
     }
 }

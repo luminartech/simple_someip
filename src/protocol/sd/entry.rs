@@ -1,15 +1,12 @@
 use crate::{
-    protocol::{
-        Error,
-        byte_order::{ReadBytesExt, WriteBytesExt},
-    },
+    protocol::{Error, byte_order::WriteBytesExt},
     traits::WireFormat,
 };
 
 pub const ENTRY_SIZE: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EntryType {
+pub enum EntryType {
     FindService,
     OfferService,
     StopOfferService,
@@ -120,29 +117,6 @@ impl EventGroupEntry {
 }
 
 impl WireFormat for EventGroupEntry {
-    fn decode<T: embedded_io::Read>(reader: &mut T) -> Result<Self, crate::protocol::Error> {
-        let index_first_options_run = reader.read_u8()?;
-        let index_second_options_run = reader.read_u8()?;
-        let options_count = OptionsCount::from(reader.read_u8()?);
-        let service_id = reader.read_u16_be()?;
-        let instance_id = reader.read_u16_be()?;
-        let major_version = reader.read_u8()?;
-        let ttl = reader.read_u24_be()?;
-        let counter = reader.read_u16_be()? & 0x000f;
-        let event_group_id = reader.read_u16_be()?;
-        Ok(Self {
-            index_first_options_run,
-            index_second_options_run,
-            options_count,
-            service_id,
-            instance_id,
-            major_version,
-            ttl,
-            counter,
-            event_group_id,
-        })
-    }
-
     fn required_size(&self) -> usize {
         16
     }
@@ -194,27 +168,6 @@ impl ServiceEntry {
 }
 
 impl WireFormat for ServiceEntry {
-    fn decode<R: embedded_io::Read>(reader: &mut R) -> Result<Self, Error> {
-        let index_first_options_run = reader.read_u8()?;
-        let index_second_options_run = reader.read_u8()?;
-        let options_count = OptionsCount::from(reader.read_u8()?);
-        let service_id = reader.read_u16_be()?;
-        let instance_id = reader.read_u16_be()?;
-        let major_version = reader.read_u8()?;
-        let ttl = reader.read_u24_be()?;
-        let minor_version = reader.read_u32_be()?;
-        Ok(Self {
-            index_first_options_run,
-            index_second_options_run,
-            options_count,
-            service_id,
-            instance_id,
-            major_version,
-            ttl,
-            minor_version,
-        })
-    }
-
     fn required_size(&self) -> usize {
         16
     }
@@ -277,6 +230,194 @@ impl Entry {
         self.first_options_count() + self.second_options_count()
     }
 }
+
+impl WireFormat for Entry {
+    fn required_size(&self) -> usize {
+        1 + match self {
+            Entry::FindService(service_entry)
+            | Entry::OfferService(service_entry)
+            | Entry::StopOfferService(service_entry) => service_entry.required_size(),
+            Entry::SubscribeEventGroup(event_group_entry)
+            | Entry::SubscribeAckEventGroup(event_group_entry) => event_group_entry.required_size(),
+        }
+    }
+
+    fn encode<W: embedded_io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
+        match self {
+            Entry::FindService(service_entry) => {
+                writer.write_u8(u8::from(EntryType::FindService))?;
+                service_entry.encode(writer)
+            }
+            Entry::OfferService(service_entry) => {
+                writer.write_u8(u8::from(EntryType::OfferService))?;
+                service_entry.encode(writer)
+            }
+            Entry::StopOfferService(service_entry) => {
+                writer.write_u8(u8::from(EntryType::StopOfferService))?;
+                service_entry.encode(writer)
+            }
+            Entry::SubscribeEventGroup(event_group_entry) => {
+                writer.write_u8(u8::from(EntryType::Subscribe))?;
+                event_group_entry.encode(writer)
+            }
+            Entry::SubscribeAckEventGroup(event_group_entry) => {
+                writer.write_u8(u8::from(EntryType::SubscribeAck))?;
+                event_group_entry.encode(writer)
+            }
+        }
+    }
+}
+
+// --- Zero-copy view types ---
+
+/// Zero-copy view into a 16-byte SD entry in a buffer.
+///
+/// Wire layout (16 bytes total):
+/// - `[0]`: entry type
+/// - `[1]`: `index_first_options_run`
+/// - `[2]`: `index_second_options_run`
+/// - `[3]`: `options_count` (packed nibbles)
+/// - `[4..6]`: `service_id` (BE)
+/// - `[6..8]`: `instance_id` (BE)
+/// - `[8]`: `major_version`
+/// - `[9..12]`: ttl (24-bit BE)
+/// - `[12..16]`: `minor_version` (BE) for service entries,
+///   OR `[12..14]` counter + `[14..16]` `event_group_id` for eventgroup entries
+#[derive(Clone, Copy, Debug)]
+pub struct EntryView<'a>(&'a [u8; ENTRY_SIZE]);
+
+impl EntryView<'_> {
+    pub fn entry_type(&self) -> Result<EntryType, Error> {
+        EntryType::try_from(self.0[0])
+    }
+
+    #[must_use]
+    pub fn index_first_options_run(&self) -> u8 {
+        self.0[1]
+    }
+
+    #[must_use]
+    pub fn index_second_options_run(&self) -> u8 {
+        self.0[2]
+    }
+
+    #[must_use]
+    pub fn options_count(&self) -> OptionsCount {
+        OptionsCount::from(self.0[3])
+    }
+
+    #[must_use]
+    pub fn service_id(&self) -> u16 {
+        u16::from_be_bytes([self.0[4], self.0[5]])
+    }
+
+    #[must_use]
+    pub fn instance_id(&self) -> u16 {
+        u16::from_be_bytes([self.0[6], self.0[7]])
+    }
+
+    #[must_use]
+    pub fn major_version(&self) -> u8 {
+        self.0[8]
+    }
+
+    #[must_use]
+    pub fn ttl(&self) -> u32 {
+        u32::from_be_bytes([0, self.0[9], self.0[10], self.0[11]])
+    }
+
+    /// Minor version (only valid for service entries).
+    #[must_use]
+    pub fn minor_version(&self) -> u32 {
+        u32::from_be_bytes([self.0[12], self.0[13], self.0[14], self.0[15]])
+    }
+
+    /// Counter field (only valid for eventgroup entries). Masked to lower 4 bits.
+    #[must_use]
+    pub fn counter(&self) -> u16 {
+        u16::from_be_bytes([self.0[12], self.0[13]]) & 0x000f
+    }
+
+    /// Event group ID (only valid for eventgroup entries).
+    #[must_use]
+    pub fn event_group_id(&self) -> u16 {
+        u16::from_be_bytes([self.0[14], self.0[15]])
+    }
+
+    pub fn to_owned(&self) -> Result<Entry, Error> {
+        let entry_type = self.entry_type()?;
+        match entry_type {
+            EntryType::FindService => Ok(Entry::FindService(self.to_service_entry())),
+            EntryType::OfferService => Ok(Entry::OfferService(self.to_service_entry())),
+            EntryType::StopOfferService => Ok(Entry::StopOfferService(self.to_service_entry())),
+            EntryType::Subscribe => Ok(Entry::SubscribeEventGroup(self.to_event_group_entry())),
+            EntryType::SubscribeAck => {
+                Ok(Entry::SubscribeAckEventGroup(self.to_event_group_entry()))
+            }
+        }
+    }
+
+    fn to_service_entry(self) -> ServiceEntry {
+        ServiceEntry {
+            index_first_options_run: self.index_first_options_run(),
+            index_second_options_run: self.index_second_options_run(),
+            options_count: self.options_count(),
+            service_id: self.service_id(),
+            instance_id: self.instance_id(),
+            major_version: self.major_version(),
+            ttl: self.ttl(),
+            minor_version: self.minor_version(),
+        }
+    }
+
+    fn to_event_group_entry(self) -> EventGroupEntry {
+        EventGroupEntry {
+            index_first_options_run: self.index_first_options_run(),
+            index_second_options_run: self.index_second_options_run(),
+            options_count: self.options_count(),
+            service_id: self.service_id(),
+            instance_id: self.instance_id(),
+            major_version: self.major_version(),
+            ttl: self.ttl(),
+            counter: self.counter(),
+            event_group_id: self.event_group_id(),
+        }
+    }
+}
+
+/// Iterator over 16-byte SD entries in a validated buffer.
+/// Entries are guaranteed valid (validated upfront in `SdHeaderView::parse`).
+pub struct EntryIter<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> EntryIter<'a> {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
+        Self { remaining: buf }
+    }
+}
+
+impl<'a> Iterator for EntryIter<'a> {
+    type Item = EntryView<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining.len() < ENTRY_SIZE {
+            return None;
+        }
+        let entry_bytes: &[u8; ENTRY_SIZE] = self.remaining[..ENTRY_SIZE]
+            .try_into()
+            .expect("length checked above");
+        self.remaining = &self.remaining[ENTRY_SIZE..];
+        Some(EntryView(entry_bytes))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.remaining.len() / ENTRY_SIZE;
+        (n, Some(n))
+    }
+}
+
+impl ExactSizeIterator for EntryIter<'_> {}
 
 #[cfg(test)]
 mod tests {
@@ -419,112 +560,88 @@ mod tests {
         }
     }
 
-    // --- Entry encode/decode round-trips ---
+    // --- Entry encode / EntryView round-trips ---
 
     #[test]
     fn find_service_entry_round_trips() {
         let entry = Entry::FindService(make_service_entry());
         let buf = encode_entry(&entry);
-        assert_eq!(Entry::decode(&mut &buf[..]).unwrap(), entry);
+        // EntryView works on 16 bytes (type byte is first byte of the 16-byte entry)
+        // But Entry::encode writes type(1) + data(15) = 16 bytes out of the 17-byte buffer
+        let entry_bytes: &[u8; ENTRY_SIZE] = buf[..ENTRY_SIZE].try_into().unwrap();
+        let view = EntryView(entry_bytes);
+        assert_eq!(view.to_owned().unwrap(), entry);
     }
 
     #[test]
     fn offer_service_entry_round_trips() {
         let entry = Entry::OfferService(make_service_entry());
         let buf = encode_entry(&entry);
-        assert_eq!(Entry::decode(&mut &buf[..]).unwrap(), entry);
+        let entry_bytes: &[u8; ENTRY_SIZE] = buf[..ENTRY_SIZE].try_into().unwrap();
+        let view = EntryView(entry_bytes);
+        assert_eq!(view.to_owned().unwrap(), entry);
     }
 
     #[test]
     fn stop_offer_service_entry_round_trips() {
         let entry = Entry::StopOfferService(make_service_entry());
         let buf = encode_entry(&entry);
-        assert_eq!(Entry::decode(&mut &buf[..]).unwrap(), entry);
+        let entry_bytes: &[u8; ENTRY_SIZE] = buf[..ENTRY_SIZE].try_into().unwrap();
+        let view = EntryView(entry_bytes);
+        assert_eq!(view.to_owned().unwrap(), entry);
     }
 
     #[test]
     fn subscribe_event_group_entry_round_trips() {
         let entry = Entry::SubscribeEventGroup(make_event_group_entry());
         let buf = encode_entry(&entry);
-        assert_eq!(Entry::decode(&mut &buf[..]).unwrap(), entry);
+        let entry_bytes: &[u8; ENTRY_SIZE] = buf[..ENTRY_SIZE].try_into().unwrap();
+        let view = EntryView(entry_bytes);
+        assert_eq!(view.to_owned().unwrap(), entry);
     }
 
     #[test]
     fn subscribe_ack_event_group_entry_round_trips() {
         let entry = Entry::SubscribeAckEventGroup(make_event_group_entry());
         let buf = encode_entry(&entry);
-        assert_eq!(Entry::decode(&mut &buf[..]).unwrap(), entry);
+        let entry_bytes: &[u8; ENTRY_SIZE] = buf[..ENTRY_SIZE].try_into().unwrap();
+        let view = EntryView(entry_bytes);
+        assert_eq!(view.to_owned().unwrap(), entry);
     }
 
     #[test]
-    fn entry_decode_invalid_type_returns_error() {
-        let buf = [0x03u8; 17]; // 0x03 is not a valid EntryType
+    fn entry_view_invalid_type_returns_error() {
+        let buf: [u8; ENTRY_SIZE] = [0x03; ENTRY_SIZE]; // 0x03 is not a valid EntryType
+        let view = EntryView(&buf);
         assert!(matches!(
-            Entry::decode(&mut &buf[..]),
+            view.to_owned(),
             Err(Error::InvalidSDEntryType(0x03))
         ));
     }
-}
 
-impl WireFormat for Entry {
-    fn decode<R: embedded_io::Read>(reader: &mut R) -> Result<Self, Error> {
-        let entry_type = EntryType::try_from(reader.read_u8()?)?;
-        match entry_type {
-            EntryType::FindService => {
-                let service_entry = ServiceEntry::decode(reader)?;
-                Ok(Entry::FindService(service_entry))
-            }
-            EntryType::OfferService => {
-                let service_entry = ServiceEntry::decode(reader)?;
-                Ok(Entry::OfferService(service_entry))
-            }
-            EntryType::StopOfferService => {
-                let service_entry = ServiceEntry::decode(reader)?;
-                Ok(Entry::StopOfferService(service_entry))
-            }
-            EntryType::Subscribe => {
-                let event_group_entry = EventGroupEntry::decode(reader)?;
-                Ok(Entry::SubscribeEventGroup(event_group_entry))
-            }
-            EntryType::SubscribeAck => {
-                let event_group_entry = EventGroupEntry::decode(reader)?;
-                Ok(Entry::SubscribeAckEventGroup(event_group_entry))
-            }
-        }
+    // --- EntryIter ---
+
+    #[test]
+    fn entry_iter_empty() {
+        let iter = EntryIter::new(&[]);
+        assert_eq!(iter.len(), 0);
     }
 
-    fn required_size(&self) -> usize {
-        1 + match self {
-            Entry::FindService(service_entry)
-            | Entry::OfferService(service_entry)
-            | Entry::StopOfferService(service_entry) => service_entry.required_size(),
-            Entry::SubscribeEventGroup(event_group_entry)
-            | Entry::SubscribeAckEventGroup(event_group_entry) => event_group_entry.required_size(),
-        }
-    }
+    #[test]
+    fn entry_iter_two_entries() {
+        let e1 = Entry::FindService(make_service_entry());
+        let e2 = Entry::SubscribeEventGroup(make_event_group_entry());
+        let buf1 = encode_entry(&e1);
+        let buf2 = encode_entry(&e2);
+        // Concatenate the 16-byte entries (first 16 bytes of each 17-byte encode)
+        let mut combined = [0u8; 32];
+        combined[..16].copy_from_slice(&buf1[..16]);
+        combined[16..32].copy_from_slice(&buf2[..16]);
 
-    fn encode<W: embedded_io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
-        match self {
-            Entry::FindService(service_entry) => {
-                writer.write_u8(u8::from(EntryType::FindService))?;
-                service_entry.encode(writer)
-            }
-            Entry::OfferService(service_entry) => {
-                writer.write_u8(u8::from(EntryType::OfferService))?;
-                service_entry.encode(writer)
-            }
-            Entry::StopOfferService(service_entry) => {
-                writer.write_u8(u8::from(EntryType::StopOfferService))?;
-                service_entry.encode(writer)
-            }
-            Entry::SubscribeEventGroup(event_group_entry) => {
-                writer.write_u8(u8::from(EntryType::Subscribe))?;
-                event_group_entry.encode(writer)
-            }
-            Entry::SubscribeAckEventGroup(event_group_entry) => {
-                writer.write_u8(u8::from(EntryType::SubscribeAck))?;
-                event_group_entry.encode(writer)
-            }
-        }
+        let mut iter = EntryIter::new(&combined);
+        assert_eq!(iter.len(), 2);
+        assert_eq!(iter.next().unwrap().to_owned().unwrap(), e1);
+        assert_eq!(iter.next().unwrap().to_owned().unwrap(), e2);
+        assert!(iter.next().is_none());
     }
 }
