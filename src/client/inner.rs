@@ -496,7 +496,7 @@ where
 mod tests {
     use super::*;
     use crate::traits::DiscoveryOnlyPayload;
-    use std::format;
+    use std::{format, vec};
 
     type TestControl = ControlMessage<DiscoveryOnlyPayload>;
 
@@ -588,5 +588,199 @@ mod tests {
             .expect("Oneshot channel closed");
         let port = result.unwrap();
         assert!(port > 0);
+    }
+
+    /// Helper: verify inner loop is still alive by sending a BindUnicast and
+    /// checking that a response arrives within 2 seconds.
+    async fn assert_inner_alive(control_sender: &Sender<ControlMessage<DiscoveryOnlyPayload>>) {
+        let (rx, msg) = TestControl::bind_unicast_with_port(None);
+        control_sender.send(msg).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("Timed out — inner loop appears dead")
+            .expect("Oneshot closed — inner loop appears dead");
+        assert!(result.is_ok());
+    }
+
+    // -- Dropped-receiver robustness tests --
+    // These verify that dropping the oneshot receiver before the inner loop
+    // sends its response does NOT kill the processing loop (the `warn!`
+    // paths that replaced `self.run = false`).
+
+    #[tokio::test]
+    async fn test_dropped_receiver_bind_unicast_continues() {
+        let (control_sender, _update_receiver) =
+            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        let (rx, msg) = TestControl::bind_unicast_with_port(None);
+        drop(rx); // drop before inner can respond
+        control_sender.send(msg).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert_inner_alive(&control_sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_dropped_receiver_unbind_unicast_continues() {
+        let (control_sender, _update_receiver) =
+            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        let (rx, msg) = TestControl::unbind_unicast();
+        drop(rx);
+        control_sender.send(msg).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert_inner_alive(&control_sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_dropped_receiver_bind_discovery_continues() {
+        let (control_sender, _update_receiver) =
+            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        let (rx, msg) = TestControl::bind_discovery();
+        drop(rx);
+        control_sender.send(msg).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert_inner_alive(&control_sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_dropped_receiver_unbind_discovery_continues() {
+        let (control_sender, _update_receiver) =
+            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        let (rx, msg) = TestControl::unbind_discovery();
+        drop(rx);
+        control_sender.send(msg).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert_inner_alive(&control_sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_dropped_receiver_set_interface_continues() {
+        let (control_sender, _update_receiver) =
+            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        // SetInterface(LOCALHOST) on a fresh inner goes straight to
+        // bind_discovery + send response (interface already matches).
+        let (rx, msg) = TestControl::set_interface(Ipv4Addr::LOCALHOST);
+        drop(rx);
+        control_sender.send(msg).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert_inner_alive(&control_sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_dropped_receiver_send_sd_continues() {
+        let (control_sender, _update_receiver) =
+            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        // Bind discovery first so the SendSD path has a socket to use
+        let (rx, msg) = TestControl::bind_discovery();
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // Send SD with a dropped receiver
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30490);
+        let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
+        let (rx, msg) = TestControl::send_sd(target, sd_header);
+        drop(rx);
+        control_sender.send(msg).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert_inner_alive(&control_sender).await;
+    }
+
+    // -- Stale active_request test --
+    // Verifies that when a new control message arrives while the inner loop
+    // already has an outstanding AwaitResponse, the stale request is cleared
+    // and the new message is processed (rather than panicking via assert!).
+
+    #[tokio::test]
+    async fn test_stale_active_request_cleared_on_new_message() {
+        let (control_sender, _update_receiver) =
+            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        // Bind unicast to get a valid source port
+        let (rx, msg) = TestControl::bind_unicast_with_port(None);
+        control_sender.send(msg).await.unwrap();
+        let port = rx.await.unwrap().unwrap();
+
+        // Send a request to a port nobody is listening on — the UDP send
+        // succeeds but no reply will ever come, leaving the inner loop in
+        // AwaitResponse state.
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 55555);
+        let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
+        let message = Message::<DiscoveryOnlyPayload>::new_sd(1, &sd_header);
+        let (_rx_send, msg_send) = TestControl::send_request(target, message, port);
+        control_sender.send(msg_send).await.unwrap();
+
+        // Wait for inner to enter AwaitResponse state
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Send a new control message — this should clear the stale
+        // AwaitResponse and process normally.
+        let (rx_unbind, msg_unbind) = TestControl::unbind_unicast();
+        control_sender.send(msg_unbind).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx_unbind)
+            .await
+            .expect("Timed out — stale active_request was not cleared")
+            .expect("Oneshot closed");
+        assert!(result.is_ok());
+    }
+
+    // -- AwaitResponse dropped receiver test --
+    // Verifies that when a matching unicast response arrives but the caller
+    // already dropped their oneshot receiver, the inner loop continues.
+
+    #[tokio::test]
+    async fn test_dropped_receiver_await_response_continues() {
+        use tokio::net::UdpSocket;
+
+        let (control_sender, _update_receiver) =
+            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        // Bind unicast
+        let (rx, msg) = TestControl::bind_unicast_with_port(None);
+        control_sender.send(msg).await.unwrap();
+        let port = rx.await.unwrap().unwrap();
+
+        // Create a raw socket to receive the request and echo it back
+        let raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let raw_port = raw.local_addr().unwrap().port();
+
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_port);
+        let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
+        let message = Message::<DiscoveryOnlyPayload>::new_sd(1, &sd_header);
+
+        // Send request through inner — it will be forwarded to raw_port
+        let (rx_send, msg_send) = TestControl::send_request(target, message, port);
+        control_sender.send(msg_send).await.unwrap();
+
+        // Receive the request on the raw socket
+        let mut buf = vec![0u8; 1400];
+        let (len, source_addr) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            raw.recv_from(&mut buf),
+        )
+        .await
+        .expect("Timed out waiting for request on raw socket")
+        .unwrap();
+
+        // Drop the response receiver — inner still holds the sender in AwaitResponse
+        drop(rx_send);
+
+        // Echo the request back (same message_id, so it matches AwaitResponse)
+        raw.send_to(&buf[..len], source_addr).await.unwrap();
+
+        // Give inner time to receive the echo and hit the dropped-receiver warn path
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Verify inner loop is still alive
+        assert_inner_alive(&control_sender).await;
     }
 }
