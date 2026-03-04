@@ -3,11 +3,15 @@ use core::net::{Ipv4Addr, Ipv6Addr};
 use super::Error;
 use crate::protocol::byte_order::WriteBytesExt;
 
+/// Maximum length of an SD configuration option string in bytes.
 pub const MAX_CONFIGURATION_STRING_LENGTH: usize = 256;
 
+/// Transport protocol used in SD endpoint options.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TransportProtocol {
+    /// UDP (0x11).
     Udp,
+    /// TCP (0x06).
     Tcp,
 }
 
@@ -31,15 +35,24 @@ impl From<TransportProtocol> for u8 {
     }
 }
 
+/// The type of an SD option.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OptionType {
+    /// Configuration option (0x01).
     Configuration,
+    /// Load balancing option (0x02).
     LoadBalancing,
+    /// IPv4 endpoint option (0x04).
     IpV4Endpoint,
+    /// IPv6 endpoint option (0x06).
     IpV6Endpoint,
+    /// IPv4 multicast option (0x14).
     IpV4Multicast,
+    /// IPv6 multicast option (0x16).
     IpV6Multicast,
+    /// IPv4 SD option (0x24).
     IpV4SD,
+    /// IPv6 SD option (0x26).
     IpV6SD,
 }
 
@@ -77,48 +90,79 @@ impl From<OptionType> for u8 {
 
 // Boxing is not available in no_std, so allow the large variant.
 #[allow(clippy::large_enum_variant)]
+/// A decoded SD option.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Options {
+    /// A configuration key-value string.
     Configuration {
+        /// The raw configuration string bytes.
         configuration_string: heapless::Vec<u8, MAX_CONFIGURATION_STRING_LENGTH>,
     },
+    /// Load balancing parameters.
     LoadBalancing {
+        /// The priority value.
         priority: u16,
+        /// The weight value.
         weight: u16,
     },
+    /// An IPv4 endpoint.
     IpV4Endpoint {
+        /// The IPv4 address.
         ip: Ipv4Addr,
+        /// The transport protocol (UDP or TCP).
         protocol: TransportProtocol,
+        /// The port number.
         port: u16,
     },
+    /// An IPv6 endpoint.
     IpV6Endpoint {
+        /// The IPv6 address.
         ip: Ipv6Addr,
+        /// The transport protocol (UDP or TCP).
         protocol: TransportProtocol,
+        /// The port number.
         port: u16,
     },
+    /// An IPv4 multicast address.
     IpV4Multicast {
+        /// The IPv4 multicast address.
         ip: Ipv4Addr,
+        /// The transport protocol (UDP or TCP).
         protocol: TransportProtocol,
+        /// The port number.
         port: u16,
     },
+    /// An IPv6 multicast address.
     IpV6Multicast {
+        /// The IPv6 multicast address.
         ip: Ipv6Addr,
+        /// The transport protocol (UDP or TCP).
         protocol: TransportProtocol,
+        /// The port number.
         port: u16,
     },
+    /// An IPv4 SD endpoint.
     IpV4SD {
+        /// The IPv4 address.
         ip: Ipv4Addr,
+        /// The transport protocol (UDP or TCP).
         protocol: TransportProtocol,
+        /// The port number.
         port: u16,
     },
+    /// An IPv6 SD endpoint.
     IpV6SD {
+        /// The IPv6 address.
         ip: Ipv6Addr,
+        /// The transport protocol (UDP or TCP).
         protocol: TransportProtocol,
+        /// The port number.
         port: u16,
     },
 }
 
 impl Options {
+    /// Returns the total wire size of this option in bytes.
     #[must_use]
     pub fn size(&self) -> usize {
         match self {
@@ -135,6 +179,15 @@ impl Options {
         }
     }
 
+    /// Serializes this option to a writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing to the writer fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the option size minus 3 exceeds `u16::MAX` (unreachable in practice).
     pub fn write<T: embedded_io::Write>(
         &self,
         writer: &mut T,
@@ -234,6 +287,11 @@ pub fn extract_ipv4_endpoint(options: &[Options]) -> Option<core::net::SocketAdd
 pub struct OptionView<'a>(&'a [u8]);
 
 impl<'a> OptionView<'a> {
+    /// Returns the option type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidOptionType`] if the type byte is unrecognized.
     pub fn option_type(&self) -> Result<OptionType, Error> {
         OptionType::try_from(self.0[2])
     }
@@ -247,6 +305,10 @@ impl<'a> OptionView<'a> {
 
     /// Parse as IPv4 endpoint/multicast/SD option.
     /// Returns `(ip, protocol, port)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidOptionTransportProtocol`] if the protocol byte is unrecognized.
     pub fn as_ipv4(&self) -> Result<(Ipv4Addr, TransportProtocol, u16), Error> {
         let ip = Ipv4Addr::from_bits(u32::from_be_bytes([
             self.0[4], self.0[5], self.0[6], self.0[7],
@@ -259,6 +321,10 @@ impl<'a> OptionView<'a> {
 
     /// Parse as IPv6 endpoint/multicast/SD option.
     /// Returns `(ip, protocol, port)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidOptionTransportProtocol`] if the protocol byte is unrecognized.
     pub fn as_ipv6(&self) -> Result<(Ipv6Addr, TransportProtocol, u16), Error> {
         let mut octets = [0u8; 16];
         octets.copy_from_slice(&self.0[4..20]);
@@ -278,12 +344,27 @@ impl<'a> OptionView<'a> {
     }
 
     /// Parse as load-balancing option. Returns `(priority, weight)`.
+    ///
+    /// # Errors
+    ///
+    /// Currently always succeeds; the `Result` return type is reserved for future validation.
     pub fn as_load_balancing(&self) -> Result<(u16, u16), Error> {
         let priority = u16::from_be_bytes([self.0[4], self.0[5]]);
         let weight = u16::from_be_bytes([self.0[6], self.0[7]]);
         Ok((priority, weight))
     }
 
+    /// Converts this view into an owned [`Options`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the option type is unrecognized, the transport protocol byte
+    /// is invalid, or the configuration string exceeds [`MAX_CONFIGURATION_STRING_LENGTH`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a configuration string passes the length check but fails to fit into the
+    /// heapless buffer (unreachable in practice).
     pub fn to_owned(&self) -> Result<Options, Error> {
         let option_type = self.option_type()?;
         match option_type {

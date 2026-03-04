@@ -3,12 +3,18 @@ use crate::{protocol::byte_order::WriteBytesExt, traits::WireFormat};
 
 pub const ENTRY_SIZE: usize = 16;
 
+/// The type of an SD entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryType {
+    /// Find a service (0x00).
     FindService,
+    /// Offer a service (0x01).
     OfferService,
+    /// Stop offering a service (0x02).
     StopOfferService,
+    /// Subscribe to an event group (0x06).
     Subscribe,
+    /// Acknowledge an event group subscription (0x07).
     SubscribeAck,
 }
 
@@ -38,9 +44,12 @@ impl From<EntryType> for u8 {
     }
 }
 
+/// Packed pair of 4-bit option run counts (first and second options run).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OptionsCount {
+    /// Number of options in the first options run.
     pub first_options_count: u8,
+    /// Number of options in the second options run.
     pub second_options_count: u8,
 }
 
@@ -77,21 +86,31 @@ impl OptionsCount {
     }
 }
 
+/// An SD entry for event group operations (subscribe / subscribe-ack).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventGroupEntry {
+    /// Index into the options array for the first options run.
     pub index_first_options_run: u8,
+    /// Index into the options array for the second options run.
     pub index_second_options_run: u8,
+    /// Number of options in each run.
     pub options_count: OptionsCount,
+    /// The SOME/IP service ID.
     pub service_id: u16,
+    /// The SOME/IP instance ID.
     pub instance_id: u16,
+    /// The major version of the service interface.
     pub major_version: u8,
-    /// ttl is a u24 value
+    /// Time-to-live in seconds (24-bit value).
     pub ttl: u32,
+    /// Event group counter.
     pub counter: u16,
+    /// The event group ID.
     pub event_group_id: u16,
 }
 
 impl EventGroupEntry {
+    /// Creates a new event group entry with default option indices.
     #[must_use]
     pub fn new(
         service_id: u16,
@@ -136,20 +155,29 @@ impl WireFormat for EventGroupEntry {
     }
 }
 
+/// An SD entry for service operations (find / offer / stop-offer).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceEntry {
+    /// Index into the options array for the first options run.
     pub index_first_options_run: u8,
+    /// Index into the options array for the second options run.
     pub index_second_options_run: u8,
+    /// Number of options in each run.
     pub options_count: OptionsCount,
+    /// The SOME/IP service ID.
     pub service_id: u16,
+    /// The SOME/IP instance ID.
     pub instance_id: u16,
+    /// The major version of the service interface.
     pub major_version: u8,
-    /// ttl is a u24 value
+    /// Time-to-live in seconds (24-bit value).
     pub ttl: u32,
+    /// The minor version of the service interface.
     pub minor_version: u32,
 }
 
 impl ServiceEntry {
+    /// Creates a `FindService` entry with wildcard instance/version fields.
     #[must_use]
     pub fn find(service_id: u16) -> Self {
         Self {
@@ -186,16 +214,23 @@ impl WireFormat for ServiceEntry {
     }
 }
 
+/// A decoded SD entry, wrapping a [`ServiceEntry`] or [`EventGroupEntry`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Entry {
+    /// Find a service.
     FindService(ServiceEntry),
+    /// Offer a service.
     OfferService(ServiceEntry),
+    /// Stop offering a service.
     StopOfferService(ServiceEntry),
+    /// Subscribe to an event group.
     SubscribeEventGroup(EventGroupEntry),
+    /// Acknowledge an event group subscription.
     SubscribeAckEventGroup(EventGroupEntry),
 }
 
 impl Entry {
+    /// Returns the number of options in the first options run.
     #[must_use]
     pub fn first_options_count(&self) -> u8 {
         match self {
@@ -211,6 +246,7 @@ impl Entry {
         }
     }
 
+    /// Returns the number of options in the second options run.
     #[must_use]
     pub fn second_options_count(&self) -> u8 {
         match self {
@@ -226,6 +262,7 @@ impl Entry {
         }
     }
 
+    /// Returns the total number of options across both runs.
     #[must_use]
     pub fn total_options_count(&self) -> u8 {
         self.first_options_count() + self.second_options_count()
@@ -291,40 +328,52 @@ impl WireFormat for Entry {
 pub struct EntryView<'a>(&'a [u8; ENTRY_SIZE]);
 
 impl EntryView<'_> {
+    /// Returns the entry type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidEntryType`] if the type byte is not recognized.
     pub fn entry_type(&self) -> Result<EntryType, Error> {
         EntryType::try_from(self.0[0])
     }
 
+    /// Returns the index of the first options run.
     #[must_use]
     pub fn index_first_options_run(&self) -> u8 {
         self.0[1]
     }
 
+    /// Returns the index of the second options run.
     #[must_use]
     pub fn index_second_options_run(&self) -> u8 {
         self.0[2]
     }
 
+    /// Returns the packed options count.
     #[must_use]
     pub fn options_count(&self) -> OptionsCount {
         OptionsCount::from(self.0[3])
     }
 
+    /// Returns the service ID.
     #[must_use]
     pub fn service_id(&self) -> u16 {
         u16::from_be_bytes([self.0[4], self.0[5]])
     }
 
+    /// Returns the instance ID.
     #[must_use]
     pub fn instance_id(&self) -> u16 {
         u16::from_be_bytes([self.0[6], self.0[7]])
     }
 
+    /// Returns the major version.
     #[must_use]
     pub fn major_version(&self) -> u8 {
         self.0[8]
     }
 
+    /// Returns the TTL (24-bit value).
     #[must_use]
     pub fn ttl(&self) -> u32 {
         u32::from_be_bytes([0, self.0[9], self.0[10], self.0[11]])
@@ -348,6 +397,11 @@ impl EntryView<'_> {
         u16::from_be_bytes([self.0[14], self.0[15]])
     }
 
+    /// Converts this view into an owned [`Entry`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidEntryType`] if the entry type byte is not recognized.
     pub fn to_owned(&self) -> Result<Entry, Error> {
         let entry_type = self.entry_type()?;
         match entry_type {
