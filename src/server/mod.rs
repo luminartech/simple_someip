@@ -83,6 +83,11 @@ pub struct Server<
 
 impl<const E: usize, const O: usize> Server<E, O> {
     /// Create a new SOME/IP server
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding the unicast or SD socket fails, or if joining the
+    /// SD multicast group fails.
     pub async fn new(config: ServerConfig) -> Result<Self, Error> {
         // Bind unicast socket for receiving subscriptions
         let unicast_addr = SocketAddrV4::new(config.interface, config.local_port);
@@ -148,6 +153,10 @@ impl<const E: usize, const O: usize> Server<E, O> {
     /// Start announcing the service via Service Discovery
     ///
     /// This sends periodic `OfferService` messages to the SD multicast group
+    ///
+    /// # Errors
+    ///
+    /// Currently always returns `Ok(())`; SD send failures are logged internally.
     pub fn start_announcing(&self) -> Result<(), Error> {
         let config = self.config.clone();
         let sd_socket = Arc::clone(&self.sd_socket);
@@ -347,6 +356,10 @@ impl<const E: usize, const O: usize> Server<E, O> {
     }
 
     /// Get the local address of the unicast socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket's local address cannot be retrieved.
     pub fn unicast_local_addr(&self) -> Result<std::net::SocketAddr, std::io::Error> {
         self.unicast_socket.local_addr()
     }
@@ -361,6 +374,10 @@ impl<const E: usize, const O: usize> Server<E, O> {
     /// Handles incoming subscription requests and manages event groups.
     /// Listens on both the unicast socket (for direct requests) and the
     /// SD multicast socket (for `FindService` and `SubscribeEventGroup`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if receiving from a socket fails or handling an SD message fails.
     pub async fn run(&mut self) -> Result<(), Error> {
         use crate::protocol::MessageView;
 

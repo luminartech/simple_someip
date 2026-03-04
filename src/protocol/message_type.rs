@@ -6,10 +6,15 @@ pub const MESSAGE_TYPE_TP_FLAG: u8 = 0x20;
 ///Message types of a SOME/IP message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MessageType {
+    /// A request expecting a response.
     Request,
+    /// A fire-and-forget request.
     RequestNoReturn,
+    /// An event notification.
     Notification,
+    /// A response to a request.
     Response,
+    /// An error response.
     Error,
 }
 
@@ -54,6 +59,7 @@ impl From<MessageTypeField> for u8 {
 }
 
 impl MessageTypeField {
+    /// Creates a new message type field from a [`MessageType`] and TP flag.
     #[must_use]
     pub const fn new(msg_type: MessageType, tp: bool) -> Self {
         let message_type_byte = if tp {
@@ -64,18 +70,24 @@ impl MessageTypeField {
         MessageTypeField(message_type_byte)
     }
 
+    /// Creates a message type field for SOME/IP-SD (Notification, no TP).
     #[must_use]
     pub const fn new_sd() -> Self {
         Self::new(MessageType::Notification, false)
     }
 
     /// Returns the message type of the message
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic — the inner byte is always a valid `MessageType`.
     #[must_use]
     pub fn message_type(&self) -> MessageType {
         // This unwrap is safe because the private message_type_byte is always a valid MessageType
         MessageType::try_from(self.0).unwrap()
     }
 
+    /// Returns `true` if the TP (Transport Protocol) flag is set.
     #[must_use]
     pub const fn is_tp(&self) -> bool {
         self.0 & MESSAGE_TYPE_TP_FLAG != 0

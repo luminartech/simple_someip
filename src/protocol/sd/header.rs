@@ -15,20 +15,27 @@ pub const MAX_SD_ENTRIES: usize = 1;
 /// Default maximum number of SD options in a single header.
 pub const MAX_SD_OPTIONS: usize = 1;
 
+/// Fixed-capacity vector of SD entries.
 pub type SdEntries<const N: usize = MAX_SD_ENTRIES> = heapless::Vec<Entry, N>;
+/// Fixed-capacity vector of SD options.
 pub type SdOptions<const N: usize = MAX_SD_OPTIONS> = heapless::Vec<Options, N>;
 
+/// An owned SOME/IP-SD header containing flags, entries, and options.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Header<
     const MAX_ENTRIES: usize = MAX_SD_ENTRIES,
     const MAX_OPTIONS: usize = MAX_SD_OPTIONS,
 > {
+    /// The SD flags byte (reboot + unicast).
     pub flags: Flags,
+    /// The SD entries.
     pub entries: SdEntries<MAX_ENTRIES>,
+    /// The SD options.
     pub options: SdOptions<MAX_OPTIONS>,
 }
 
 impl<const E: usize, const O: usize> Header<E, O> {
+    /// Creates a new SD header from the given flags, entries, and options.
     #[must_use]
     pub fn new(flags: Flags, entries: SdEntries<E>, options: SdOptions<O>) -> Self {
         Self {
@@ -38,6 +45,11 @@ impl<const E: usize, const O: usize> Header<E, O> {
         }
     }
 
+    /// Creates an SD header for offering a service with an IPv4 endpoint option.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the const generic `E` or `O` is zero (cannot hold a single entry/option).
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new_service_offer(
@@ -97,6 +109,11 @@ impl<const E: usize, const O: usize> Header<E, O> {
         }
     }
 
+    /// Creates an SD header for subscribing to an event group with an IPv4 endpoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the const generic `E` or `O` is zero (cannot hold a single entry/option).
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new_subscription(
@@ -136,6 +153,11 @@ impl<const E: usize, const O: usize> Header<E, O> {
         }
     }
 
+    /// Creates an SD header acknowledging an event group subscription.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the const generic `E` is zero (cannot hold a single entry).
     #[must_use]
     pub fn subscribe_ack(
         service_id: u16,
@@ -183,6 +205,11 @@ impl<'a> SdHeaderView<'a> {
     /// - `entries_size` is a multiple of `ENTRY_SIZE` (16)
     /// - All entry type bytes are valid
     /// - All options have valid types and lengths
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the buffer is too short, `entries_size` is not a multiple of 16,
+    /// any entry type byte is invalid, or any option has an invalid type or length.
     pub fn parse(buf: &'a [u8]) -> Result<Self, crate::protocol::Error> {
         // Minimum: 4 (flags+reserved) + 4 (entries_size) + 4 (options_size) = 12
         if buf.len() < 12 {
@@ -242,27 +269,36 @@ impl<'a> SdHeaderView<'a> {
         })
     }
 
+    /// Returns the SD flags.
     #[must_use]
     pub fn flags(&self) -> Flags {
         self.flags
     }
 
+    /// Returns an iterator over the SD entries.
     #[must_use]
     pub fn entries(&self) -> EntryIter<'a> {
         EntryIter::new(self.entries_buf)
     }
 
+    /// Returns an iterator over the SD options.
     #[must_use]
     pub fn options(&self) -> OptionIter<'a> {
         OptionIter::new(self.options_buf)
     }
 
+    /// Returns the number of entries in this SD header.
     #[must_use]
     pub fn entry_count(&self) -> usize {
         self.entries_buf.len() / ENTRY_SIZE
     }
 
     /// Convert to an owned `sd::Header<E, O>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are more entries than `E` or more options than `O`,
+    /// or if any entry or option cannot be decoded.
     pub fn to_owned<const E: usize, const O: usize>(
         &self,
     ) -> Result<Header<E, O>, crate::protocol::Error> {

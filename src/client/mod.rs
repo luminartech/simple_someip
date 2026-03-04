@@ -32,14 +32,15 @@ impl<P: PayloadWireFormat> std::fmt::Debug for DiscoveryMessage<P> {
     }
 }
 
+/// An update received from the SOME/IP client event loop.
 pub enum ClientUpdate<P: PayloadWireFormat> {
-    /// Discovery message received
+    /// Discovery message received.
     DiscoveryUpdated(DiscoveryMessage<P>),
     /// A remote sender has rebooted (detected via SD session tracking).
     SenderRebooted(SocketAddr),
-    /// Unicast message received
+    /// Unicast message received.
     Unicast(Message<P>),
-    /// Inner SOME/IP Client has encountered an error
+    /// The client encountered an error.
     Error(Error),
 }
 
@@ -54,6 +55,7 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ClientUpdate<P> {
     }
 }
 
+/// A SOME/IP client that handles service discovery and message exchange.
 pub struct Client<MessageDefinitions: PayloadWireFormat> {
     interface: Ipv4Addr,
     control_sender: mpsc::Sender<inner::ControlMessage<MessageDefinitions>>,
@@ -72,6 +74,7 @@ impl<MessageDefinitions> Client<MessageDefinitions>
 where
     MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
 {
+    /// Creates a new client bound to the given network interface and spawns its event loop.
     #[must_use]
     pub fn new(interface: Ipv4Addr) -> Self {
         let (control_sender, update_receiver) = Inner::spawn(interface);
@@ -83,15 +86,26 @@ where
         }
     }
 
+    /// Waits for the next update from the client event loop.
     pub async fn run(&mut self) -> Option<ClientUpdate<MessageDefinitions>> {
         self.update_receiver.recv().await
     }
 
+    /// Returns the current network interface address.
     #[must_use]
     pub fn interface(&self) -> Ipv4Addr {
         self.interface
     }
 
+    /// Changes the network interface and rebinds sockets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if rebinding sockets on the new interface fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal control channel is closed.
     pub async fn set_interface(&mut self, interface: Ipv4Addr) -> Result<(), Error> {
         let (response, message) = ControlMessage::set_interface(interface);
         self.control_sender.send(message).await.unwrap();
@@ -100,18 +114,45 @@ where
         Ok(())
     }
 
+    /// Binds the SD multicast discovery socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding the multicast socket fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal control channel is closed.
     pub async fn bind_discovery(&mut self) -> Result<(), Error> {
         let (response, message) = ControlMessage::bind_discovery();
         self.control_sender.send(message).await.unwrap();
         response.await.unwrap()
     }
 
+    /// Unbinds the SD multicast discovery socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if unbinding the multicast socket fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal control channel is closed.
     pub async fn unbind_discovery(&mut self) -> Result<(), Error> {
         let (response, message) = ControlMessage::unbind_discovery();
         self.control_sender.send(message).await.unwrap();
         response.await.unwrap()
     }
 
+    /// Subscribes to an event group on a known service.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service is not found or subscription fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal control channel is closed.
     pub async fn subscribe(
         &mut self,
         service_id: u16,
@@ -126,6 +167,15 @@ where
         response.await.unwrap()
     }
 
+    /// Sends an SD message to a specific target address.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if sending the SD message fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal control channel is closed.
     pub async fn send_sd_message(
         &mut self,
         target: SocketAddrV4,
@@ -136,6 +186,15 @@ where
         response.await.unwrap()
     }
 
+    /// Registers a service endpoint in the client's endpoint registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if registering the endpoint fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal control channel is closed.
     pub async fn add_endpoint(
         &mut self,
         service_id: u16,
@@ -147,6 +206,15 @@ where
         response.await.unwrap()
     }
 
+    /// Removes a service endpoint from the client's endpoint registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if removing the endpoint fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal control channel is closed.
     pub async fn remove_endpoint(
         &mut self,
         service_id: u16,
@@ -157,6 +225,15 @@ where
         response.await.unwrap()
     }
 
+    /// Sends a message to a service and awaits the response payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service is not found or sending fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal control channel is closed.
     pub async fn send_to_service(
         &mut self,
         service_id: u16,
@@ -168,6 +245,7 @@ where
         response.await.unwrap()
     }
 
+    /// Shuts down the client, dropping the control channel and draining remaining updates.
     pub async fn shut_down(self) {
         let Self {
             control_sender,

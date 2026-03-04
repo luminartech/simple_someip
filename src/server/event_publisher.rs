@@ -30,6 +30,10 @@ impl EventPublisher {
     /// * `instance_id` - Instance ID
     /// * `event_group_id` - Event group ID
     /// * `message` - The SOME/IP message to send (must be a notification/event)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the message fails to serialize.
     pub async fn publish_event<P: PayloadWireFormat>(
         &self,
         service_id: u16,
@@ -92,6 +96,10 @@ impl EventPublisher {
     /// Publish raw event data (already serialized with E2E protection)
     ///
     /// This is useful when you've already applied E2E protection to the payload
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SOME/IP header fails to serialize.
     #[allow(clippy::too_many_arguments)]
     pub async fn publish_raw_event(
         &self,

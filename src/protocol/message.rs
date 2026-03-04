@@ -3,6 +3,7 @@ use crate::{
     traits::{PayloadWireFormat, WireFormat},
 };
 
+/// A SOME/IP message consisting of a [`Header`] and a payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Message<PayloadDefinition> {
     header: Header,
@@ -10,10 +11,12 @@ pub struct Message<PayloadDefinition> {
 }
 
 impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
+    /// Creates a new message from a header and payload.
     pub const fn new(header: Header, payload: PayloadDefinition) -> Self {
         Self { header, payload }
     }
 
+    /// Creates a new SOME/IP-SD message from a request ID and SD header.
     #[must_use]
     pub fn new_sd(
         request_id: u32,
@@ -26,18 +29,22 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
         )
     }
 
+    /// Returns a reference to the message header.
     pub fn header(&self) -> &Header {
         &self.header
     }
 
+    /// Returns `true` if this is a SOME/IP-SD message.
     pub const fn is_sd(&self) -> bool {
         self.header.is_sd()
     }
 
+    /// Sets the request ID in the header.
     pub fn set_request_id(&mut self, request_id: u32) {
         self.header.set_request_id(request_id);
     }
 
+    /// Returns the SD header if this is an SD message, or `None` otherwise.
     pub fn sd_header(&self) -> Option<&<PayloadDefinition as PayloadWireFormat>::SdHeader> {
         if !self.header().message_id().is_sd() || self.header().message_type().is_tp() {
             return None;
@@ -45,10 +52,12 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
         self.payload.as_sd_header()
     }
 
+    /// Returns a reference to the payload.
     pub fn payload(&self) -> &PayloadDefinition {
         &self.payload
     }
 
+    /// Returns a mutable reference to the payload.
     pub fn payload_mut(&mut self) -> &mut PayloadDefinition {
         &mut self.payload
     }
@@ -66,6 +75,11 @@ impl<'a> MessageView<'a> {
     ///
     /// Validates the header, checks that the buffer contains enough data for
     /// the declared payload, and for SD messages validates SD-specific constraints.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the header is invalid, the buffer is too short for the
+    /// declared payload, or SD-specific validation fails.
     pub fn parse(buf: &'a [u8]) -> Result<Self, Error> {
         let (header, remaining) = HeaderView::parse(buf)?;
         let payload_size = header.payload_size();
@@ -103,16 +117,19 @@ impl<'a> MessageView<'a> {
         Ok(Self { header, payload })
     }
 
+    /// Returns the header view.
     #[must_use]
     pub fn header(&self) -> HeaderView<'a> {
         self.header
     }
 
+    /// Returns the raw payload bytes.
     #[must_use]
     pub fn payload_bytes(&self) -> &'a [u8] {
         self.payload
     }
 
+    /// Returns `true` if this is a SOME/IP-SD message.
     #[must_use]
     pub fn is_sd(&self) -> bool {
         self.header.is_sd()
@@ -122,6 +139,10 @@ impl<'a> MessageView<'a> {
     /// The caller should check `is_sd()` first; this method returns an error
     /// if the message is not an SD message (the SD validation in `parse` must
     /// have already passed).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this is not an SD message or the SD payload is malformed.
     pub fn sd_header(&self) -> Result<SdHeaderView<'a>, Error> {
         if !self.is_sd() {
             return Err(crate::protocol::sd::Error::InvalidMessage("Not an SD message").into());
