@@ -105,6 +105,7 @@ impl Server {
         sd_raw_socket.set_reuse_address(true)?;
         #[cfg(unix)]
         sd_raw_socket.set_reuse_port(true)?;
+        sd_raw_socket.set_multicast_if_v4(&config.interface)?;
         sd_raw_socket.bind(&sd_bind_addr.into())?;
         sd_raw_socket.set_nonblocking(true)?;
         let sd_std_socket: std::net::UdpSocket = sd_raw_socket.into();
