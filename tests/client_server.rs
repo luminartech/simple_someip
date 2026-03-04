@@ -2,8 +2,7 @@
 
 use simple_someip::protocol::{Message, sd};
 use simple_someip::server::{EventPublisher, ServerConfig};
-use simple_someip::traits::DiscoveryOnlyPayload;
-use simple_someip::{Client, ClientUpdate, Server};
+use simple_someip::{Client, ClientUpdate, DiscoveryOnlyPayload, Server};
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 type TestClient = Client<DiscoveryOnlyPayload>;
@@ -47,27 +46,11 @@ async fn test_client_server_subscribe_and_receive_event() {
     let publisher = server.publisher();
     let server_handle = tokio::spawn(async move { server.run().await });
 
-    // Create client, bind discovery + unicast
+    // Create client and subscribe to the server's event group
     let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
-    client.bind_discovery().await.unwrap();
-    let client_port = client.bind_unicast().await.unwrap();
-
-    // Send SubscribeEventGroup to the server
-    let sd_header = sd::Header::new_subscription(
-        0x5B,
-        1,
-        1,
-        3,
-        0x01,
-        Ipv4Addr::LOCALHOST,
-        sd::TransportProtocol::Udp,
-        client_port,
-    );
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
-    client
-        .send_sd_message(server_addr, sd_header)
-        .await
-        .unwrap();
+    client.add_endpoint(0x5B, 1, server_addr).await.unwrap();
+    client.subscribe(0x5B, 1, 1, 3, 0x01).await.unwrap();
 
     // Wait for the server to process the subscription.
     // The SubscribeAck is a unicast to port 30490 which may arrive at either
@@ -113,9 +96,8 @@ async fn test_client_send_sd_auto_binds_discovery() {
     let (mut server, server_port) = create_server(0x5B, 1).await;
     let server_handle = tokio::spawn(async move { server.run().await });
 
-    // Create client with unicast only — NO bind_discovery
+    // Create client — NO bind_discovery
     let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
-    client.bind_unicast().await.unwrap();
 
     // send_sd_message should auto-bind discovery and succeed
     let sd_header = sd::Header::new_subscription(
@@ -147,32 +129,15 @@ async fn test_client_bind_unbind_lifecycle_with_server() {
 
     let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
 
-    // Bind discovery, send an SD message, then unbind and rebind
+    // Bind discovery, subscribe, then unbind and rebind
     client.bind_discovery().await.unwrap();
-    let client_port = client.bind_unicast().await.unwrap();
-
-    let sd_header = sd::Header::new_subscription(
-        0x5B,
-        1,
-        1,
-        3,
-        0x01,
-        Ipv4Addr::LOCALHOST,
-        sd::TransportProtocol::Udp,
-        client_port,
-    );
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
-    client
-        .send_sd_message(server_addr, sd_header)
-        .await
-        .unwrap();
+    client.add_endpoint(0x5B, 1, server_addr).await.unwrap();
+    client.subscribe(0x5B, 1, 1, 3, 0x01).await.unwrap();
 
     // Unbind and rebind discovery — covers unbind_discovery + re-bind path
     client.unbind_discovery().await.unwrap();
     client.bind_discovery().await.unwrap();
-
-    // Unbind unicast
-    client.unbind_unicast().await.unwrap();
 
     // set_interface while discovery is bound — covers the SetInterface arm
     // that unbinds discovery, changes interface, and rebinds
@@ -197,24 +162,8 @@ async fn test_add_endpoint_and_send_to_service() {
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr).await.unwrap();
 
-    // Bind unicast so we can receive events
-    let client_port = client.bind_unicast().await.unwrap();
-
-    // Subscribe to server's event group via SD
-    let sd_header = sd::Header::new_subscription(
-        0x5B,
-        1,
-        1,
-        3,
-        0x01,
-        Ipv4Addr::LOCALHOST,
-        sd::TransportProtocol::Udp,
-        client_port,
-    );
-    client
-        .send_sd_message(server_addr, sd_header)
-        .await
-        .unwrap();
+    // Subscribe to server's event group (auto-binds unicast internally)
+    client.subscribe(0x5B, 1, 1, 3, 0x01).await.unwrap();
 
     // Wait for the server to process the subscription
     assert!(
@@ -249,7 +198,7 @@ async fn test_add_endpoint_and_send_to_service() {
         Message::<DiscoveryOnlyPayload>::new_sd(0x0001, &sd::Header::new_find_services(false, &[]));
     let result = client.send_to_service(0x5B, 1, msg).await;
     assert!(
-        matches!(result, Err(simple_someip::Error::ServiceNotFound)),
+        matches!(result, Err(simple_someip::client::Error::ServiceNotFound)),
         "expected ServiceNotFound after remove, got {result:?}"
     );
 

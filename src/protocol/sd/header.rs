@@ -2,7 +2,7 @@ use core::net::Ipv4Addr;
 
 use crate::protocol::byte_order::WriteBytesExt;
 
-use crate::{protocol::Error, traits::WireFormat};
+use crate::traits::WireFormat;
 
 use super::{
     Entry, EventGroupEntry, Flags, Options, ServiceEntry, TransportProtocol,
@@ -183,10 +183,10 @@ impl<'a> SdHeaderView<'a> {
     /// - `entries_size` is a multiple of `ENTRY_SIZE` (16)
     /// - All entry type bytes are valid
     /// - All options have valid types and lengths
-    pub fn parse(buf: &'a [u8]) -> Result<Self, Error> {
+    pub fn parse(buf: &'a [u8]) -> Result<Self, crate::protocol::Error> {
         // Minimum: 4 (flags+reserved) + 4 (entries_size) + 4 (options_size) = 12
         if buf.len() < 12 {
-            return Err(Error::UnexpectedEof);
+            return Err(crate::protocol::Error::UnexpectedEof);
         }
 
         let flags = Flags::from(buf[0]);
@@ -195,12 +195,12 @@ impl<'a> SdHeaderView<'a> {
         let entries_size = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
 
         if !entries_size.is_multiple_of(ENTRY_SIZE) {
-            return Err(Error::IncorrectEntriesSize(entries_size));
+            return Err(super::Error::IncorrectEntriesSize(entries_size).into());
         }
 
         // Need entries data + 4 bytes for options_size field
         if buf.len() < 8 + entries_size + 4 {
-            return Err(Error::UnexpectedEof);
+            return Err(crate::protocol::Error::UnexpectedEof);
         }
 
         let entries_buf = &buf[8..8 + entries_size];
@@ -222,7 +222,7 @@ impl<'a> SdHeaderView<'a> {
 
         let options_start = options_size_offset + 4;
         if buf.len() < options_start + options_size {
-            return Err(Error::UnexpectedEof);
+            return Err(crate::protocol::Error::UnexpectedEof);
         }
 
         let options_buf = &buf[options_start..options_start + options_size];
@@ -263,18 +263,20 @@ impl<'a> SdHeaderView<'a> {
     }
 
     /// Convert to an owned `sd::Header<E, O>`.
-    pub fn to_owned<const E: usize, const O: usize>(&self) -> Result<Header<E, O>, Error> {
+    pub fn to_owned<const E: usize, const O: usize>(
+        &self,
+    ) -> Result<Header<E, O>, crate::protocol::Error> {
         let mut entries = SdEntries::<E>::new();
         for entry_view in self.entries() {
             entries
                 .push(entry_view.to_owned()?)
-                .map_err(|_| Error::TooManyEntries)?;
+                .map_err(|_| super::Error::TooManyEntries)?;
         }
         let mut options = SdOptions::<O>::new();
         for option_view in self.options() {
             options
                 .push(option_view.to_owned()?)
-                .map_err(|_| Error::TooManyOptions)?;
+                .map_err(|_| super::Error::TooManyOptions)?;
         }
         Ok(Header {
             flags: self.flags,
@@ -322,7 +324,7 @@ mod tests {
     use core::net::Ipv4Addr;
 
     use super::*;
-    use crate::{protocol::Error, traits::WireFormat};
+    use crate::{protocol::sd::Error as SdError, traits::WireFormat};
 
     fn ipv4_endpoint_bytes(ip: [u8; 4], protocol: u8, port: u16) -> [u8; 12] {
         let mut b = [0u8; 12];
@@ -420,7 +422,7 @@ mod tests {
         buf[..12].copy_from_slice(&prefix);
         assert!(matches!(
             SdHeaderView::parse(&buf),
-            Err(Error::IncorrectOptionsSize(2))
+            Err(crate::protocol::Error::Sd(SdError::IncorrectOptionsSize(2)))
         ));
     }
 
@@ -434,7 +436,7 @@ mod tests {
         buf[12..24].copy_from_slice(&option);
         assert!(matches!(
             SdHeaderView::parse(&buf),
-            Err(Error::IncorrectOptionsSize(5))
+            Err(crate::protocol::Error::Sd(SdError::IncorrectOptionsSize(5)))
         ));
     }
 
@@ -447,7 +449,7 @@ mod tests {
         let view = SdHeaderView::parse(&buf[..h.required_size()]).unwrap();
         assert!(matches!(
             view.to_owned::<1, 0>(),
-            Err(Error::TooManyEntries)
+            Err(crate::protocol::Error::Sd(SdError::TooManyEntries))
         ));
     }
 
@@ -463,7 +465,7 @@ mod tests {
         let view = SdHeaderView::parse(&buf).unwrap();
         assert!(matches!(
             view.to_owned::<0, 1>(),
-            Err(Error::TooManyOptions)
+            Err(crate::protocol::Error::Sd(SdError::TooManyOptions))
         ));
     }
 
@@ -494,7 +496,7 @@ mod tests {
         buf[4..8].copy_from_slice(&5u32.to_be_bytes());
         assert!(matches!(
             SdHeaderView::parse(&buf),
-            Err(Error::IncorrectEntriesSize(5))
+            Err(crate::protocol::Error::Sd(SdError::IncorrectEntriesSize(5)))
         ));
     }
 }

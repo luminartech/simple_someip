@@ -1,8 +1,8 @@
 //! Event publishing functionality
 
+use super::Error;
 use super::subscription_manager::SubscriptionManager;
-use crate::Error;
-use crate::protocol::{Header, Message, MessageType, MessageTypeField, ReturnCode};
+use crate::protocol::{Header, Message};
 use crate::traits::{PayloadWireFormat, WireFormat};
 use std::{prelude::rust_2024::*, sync::Arc};
 use tokio::net::UdpSocket;
@@ -115,17 +115,14 @@ impl EventPublisher {
         }
 
         // Build SOME/IP header
-        let header = Header {
-            message_id: crate::protocol::MessageId::new_from_service_and_method(
-                service_id, event_id,
-            ),
-            length: super::someip_length(payload.len()),
+        let header = Header::new_event(
+            service_id,
+            event_id,
             request_id,
             protocol_version,
             interface_version,
-            message_type: MessageTypeField::new(MessageType::Notification, false),
-            return_code: ReturnCode::Ok,
-        };
+            payload.len(),
+        );
 
         // Serialize header + payload
         let mut buffer = Vec::new();

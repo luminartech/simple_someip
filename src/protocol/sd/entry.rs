@@ -1,7 +1,5 @@
-use crate::{
-    protocol::{Error, byte_order::WriteBytesExt},
-    traits::WireFormat,
-};
+use super::Error;
+use crate::{protocol::byte_order::WriteBytesExt, traits::WireFormat};
 
 pub const ENTRY_SIZE: usize = 16;
 
@@ -23,7 +21,7 @@ impl TryFrom<u8> for EntryType {
             0x02 => Ok(EntryType::StopOfferService),
             0x06 => Ok(EntryType::Subscribe),
             0x07 => Ok(EntryType::SubscribeAck),
-            _ => Err(Error::InvalidSDEntryType(value)),
+            _ => Err(Error::InvalidEntryType(value)),
         }
     }
 }
@@ -172,7 +170,10 @@ impl WireFormat for ServiceEntry {
         16
     }
 
-    fn encode<W: embedded_io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
+    fn encode<W: embedded_io::Write>(
+        &self,
+        writer: &mut W,
+    ) -> Result<usize, crate::protocol::Error> {
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;
         writer.write_u8(u8::from(self.options_count))?;
@@ -242,7 +243,10 @@ impl WireFormat for Entry {
         }
     }
 
-    fn encode<W: embedded_io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
+    fn encode<W: embedded_io::Write>(
+        &self,
+        writer: &mut W,
+    ) -> Result<usize, crate::protocol::Error> {
         match self {
             Entry::FindService(service_entry) => {
                 writer.write_u8(u8::from(EntryType::FindService))?;
@@ -474,7 +478,7 @@ mod tests {
     fn entry_type_try_from_invalid_returns_error() {
         assert!(matches!(
             EntryType::try_from(0x03),
-            Err(Error::InvalidSDEntryType(0x03))
+            Err(Error::InvalidEntryType(0x03))
         ));
     }
 
@@ -615,7 +619,7 @@ mod tests {
         let view = EntryView(&buf);
         assert!(matches!(
             view.to_owned(),
-            Err(Error::InvalidSDEntryType(0x03))
+            Err(Error::InvalidEntryType(0x03))
         ));
     }
 

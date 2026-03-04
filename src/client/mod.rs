@@ -1,9 +1,12 @@
+mod error;
 mod inner;
 mod service_registry;
 mod session;
 mod socket_manager;
 
-use crate::{Error, protocol, protocol::Message, traits::PayloadWireFormat};
+pub use error::Error;
+
+use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
 use inner::{ControlMessage, Inner};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use tokio::sync::mpsc;
@@ -109,18 +112,16 @@ where
         response.await.unwrap()
     }
 
-    pub async fn bind_unicast(&mut self) -> Result<u16, Error> {
-        self.bind_unicast_with_port(None).await
-    }
-
-    pub async fn bind_unicast_with_port(&mut self, port: Option<u16>) -> Result<u16, Error> {
-        let (response, message) = ControlMessage::bind_unicast_with_port(port);
-        self.control_sender.send(message).await.unwrap();
-        response.await.unwrap()
-    }
-
-    pub async fn unbind_unicast(&mut self) -> Result<(), Error> {
-        let (response, message) = ControlMessage::unbind_unicast();
+    pub async fn subscribe(
+        &mut self,
+        service_id: u16,
+        instance_id: u16,
+        major_version: u8,
+        ttl: u32,
+        event_group_id: u16,
+    ) -> Result<(), Error> {
+        let (response, message) =
+            ControlMessage::subscribe(service_id, instance_id, major_version, ttl, event_group_id);
         self.control_sender.send(message).await.unwrap();
         response.await.unwrap()
     }
@@ -131,17 +132,6 @@ where
         sd_header: <MessageDefinitions as PayloadWireFormat>::SdHeader,
     ) -> Result<(), Error> {
         let (response, message) = ControlMessage::send_sd(target, sd_header);
-        self.control_sender.send(message).await.unwrap();
-        response.await.unwrap()
-    }
-
-    pub async fn send_message(
-        &mut self,
-        target: SocketAddrV4,
-        message: crate::protocol::Message<MessageDefinitions>,
-        source_port: u16,
-    ) -> Result<MessageDefinitions, Error> {
-        let (response, message) = ControlMessage::send_request(target, message, source_port);
         self.control_sender.send(message).await.unwrap();
         response.await.unwrap()
     }
@@ -248,25 +238,19 @@ mod tests {
 
         // Error
         let update: ClientUpdate<DiscoveryOnlyPayload> =
-            ClientUpdate::Error(Error::UnicastSocketNotBound);
+            ClientUpdate::Error(Error::ServiceNotFound);
         let debug_str = format!("{update:?}");
         assert!(debug_str.contains("Error"));
     }
 
     #[tokio::test]
-    async fn test_bind_unbind_unicast() {
+    async fn test_subscribe_unknown_service_returns_error() {
         let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
-        let port = client.bind_unicast().await.unwrap();
-        assert!(port > 0);
-        client.unbind_unicast().await.unwrap();
-        client.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn test_bind_unicast_with_port_none() {
-        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
-        let port = client.bind_unicast_with_port(None).await.unwrap();
-        assert!(port > 0);
+        let result = client.subscribe(0xFFFF, 0xFFFF, 1, 3, 0x01).await;
+        assert!(
+            matches!(result, Err(Error::ServiceNotFound)),
+            "expected ServiceNotFound, got {result:?}"
+        );
         client.shut_down().await;
     }
 
@@ -284,19 +268,6 @@ mod tests {
         let new_addr = Ipv4Addr::LOCALHOST;
         client.set_interface(new_addr).await.unwrap();
         assert_eq!(client.interface(), new_addr);
-        client.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn test_send_message_no_unicast_bound() {
-        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
-        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345);
-        let msg = crate::protocol::Message::new_sd(
-            1,
-            &crate::protocol::sd::Header::new_find_services(false, &[]),
-        );
-        let result = client.send_message(target, msg, 9999).await;
-        assert!(result.is_err());
         client.shut_down().await;
     }
 

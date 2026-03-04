@@ -1,8 +1,9 @@
 use crate::{
-    Error, SD_MULTICAST_IP, SD_MULTICAST_PORT,
-    protocol::{Message, MessageView},
+    protocol::{Message, MessageView, sd},
     traits::{PayloadWireFormat, WireFormat},
 };
+
+use super::error::Error;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     prelude::rust_2024::*,
@@ -60,7 +61,7 @@ where
         let (rx_tx, rx_rx) = mpsc::channel(16);
         let (tx_tx, tx_rx) = mpsc::channel(16);
         let bind_addr =
-            std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), SD_MULTICAST_PORT);
+            std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), sd::MULTICAST_PORT);
 
         // Create socket with SO_REUSEADDR to allow quick restart
         let socket = socket2::Socket::new(
@@ -76,13 +77,13 @@ where
         let socket: std::net::UdpSocket = socket.into();
         let socket = UdpSocket::from_std(socket)?;
 
-        socket.join_multicast_v4(SD_MULTICAST_IP, interface)?;
+        socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
 
         Self::spawn_socket_loop(socket, rx_tx, tx_rx);
         Ok(Self {
             receiver: rx_rx,
             sender: tx_tx,
-            local_port: SD_MULTICAST_PORT,
+            local_port: sd::MULTICAST_PORT,
             session_id: 0,
         })
     }
@@ -176,7 +177,7 @@ where
                                 let parse_result = MessageView::parse(&buf[..bytes_received])
                                     .and_then(|view| {
                                         let header = view.header().to_owned();
-                                        let payload = MessageDefinitions::from_payload_bytes(header.message_id, view.payload_bytes())?;
+                                        let payload = MessageDefinitions::from_payload_bytes(header.message_id(), view.payload_bytes())?;
                                         Ok(ReceivedMessage {
                                             message: Message::new(header, payload),
                                             source: source_address,
@@ -301,8 +302,8 @@ mod tests {
 
         let received = result.unwrap().unwrap();
         assert_eq!(
-            received.message.header().message_id,
-            msg.header().message_id
+            received.message.header().message_id(),
+            msg.header().message_id()
         );
         assert!(received.message.is_sd());
     }
@@ -334,6 +335,9 @@ mod tests {
 
         // Decode and verify
         let view = MessageView::parse(&recv_buf[..len]).unwrap();
-        assert_eq!(view.header().to_owned().message_id, msg.header().message_id);
+        assert_eq!(
+            view.header().to_owned().message_id(),
+            msg.header().message_id()
+        );
     }
 }

@@ -28,6 +28,7 @@ mod config;
 mod crc;
 mod e2e_checker;
 mod e2e_protector;
+mod error;
 mod state;
 
 pub use config::{Profile4Config, Profile5Config};
@@ -36,6 +37,7 @@ pub use e2e_protector::{
     PROFILE4_HEADER_SIZE, PROFILE5_HEADER_SIZE, protect_profile4, protect_profile5,
     protect_profile5_with_header,
 };
+pub use error::Error;
 pub use state::{Profile4State, Profile5State};
 
 /// Status result from E2E check operations.
