@@ -31,16 +31,16 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 # Protocol/E2E only (default) — no_std compatible, no tokio dependency
-simple-someip = "0.3"
+simple-someip = "0.4"
 
 # Client only
-simple-someip = { version = "0.3", features = ["client"] }
+simple-someip = { version = "0.4", features = ["client"] }
 
 # Server only
-simple-someip = { version = "0.3", features = ["server"] }
+simple-someip = { version = "0.4", features = ["server"] }
 
 # Both client and server
-simple-someip = { version = "0.3", features = ["client", "server"] }
+simple-someip = { version = "0.4", features = ["client", "server"] }
 ```
 
 ### Feature flags
