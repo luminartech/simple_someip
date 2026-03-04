@@ -763,10 +763,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::DiscoveryOnlyPayload;
+    use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
     use std::{format, vec};
 
-    type TestControl = ControlMessage<DiscoveryOnlyPayload>;
+    type TestControl = ControlMessage<TestPayload>;
 
     #[test]
     fn test_control_message_constructors() {
@@ -781,7 +781,7 @@ mod tests {
         assert!(matches!(msg, ControlMessage::UnbindDiscovery(..)));
 
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
-        let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
+        let sd_header = empty_sd_header();
         let (_rx, msg) = TestControl::send_sd(target, sd_header);
         assert!(matches!(msg, ControlMessage::SendSD(..)));
     }
@@ -799,7 +799,7 @@ mod tests {
         assert!(format!("{msg:?}").contains("UnbindDiscovery"));
 
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
-        let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
+        let sd_header = empty_sd_header();
         let (_rx, msg) = TestControl::send_sd(target, sd_header);
         assert!(format!("{msg:?}").contains("SendSD"));
     }
@@ -807,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn test_inner_spawn_and_shutdown() {
         let (control_sender, mut update_receiver) =
-            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+            Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
         // Drop control sender to trigger loop exit
         drop(control_sender);
         // The update receiver should eventually return None when the inner loop exits
@@ -819,7 +819,7 @@ mod tests {
 
     /// Helper: verify inner loop is still alive by sending an `AddEndpoint` and
     /// checking that a response arrives within 2 seconds.
-    async fn assert_inner_alive(control_sender: &Sender<ControlMessage<DiscoveryOnlyPayload>>) {
+    async fn assert_inner_alive(control_sender: &Sender<ControlMessage<TestPayload>>) {
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
         let (rx, msg) = TestControl::add_endpoint(0xFFFE, 0xFFFE, addr);
         control_sender.send(msg).await.unwrap();
@@ -837,8 +837,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_bind_discovery_continues() {
-        let (control_sender, _update_receiver) =
-            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
 
         let (rx, msg) = TestControl::bind_discovery();
         drop(rx);
@@ -850,8 +849,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_unbind_discovery_continues() {
-        let (control_sender, _update_receiver) =
-            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
 
         let (rx, msg) = TestControl::unbind_discovery();
         drop(rx);
@@ -863,8 +861,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_set_interface_continues() {
-        let (control_sender, _update_receiver) =
-            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
 
         // SetInterface(LOCALHOST) on a fresh inner goes straight to
         // bind_discovery + send response (interface already matches).
@@ -878,8 +875,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_send_sd_continues() {
-        let (control_sender, _update_receiver) =
-            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
 
         // Bind discovery first so the SendSD path has a socket to use
         let (rx, msg) = TestControl::bind_discovery();
@@ -888,7 +884,7 @@ mod tests {
 
         // Send SD with a dropped receiver
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30490);
-        let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
+        let sd_header = empty_sd_header();
         let (rx, msg) = TestControl::send_sd(target, sd_header);
         drop(rx);
         control_sender.send(msg).await.unwrap();
@@ -904,8 +900,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stale_active_request_cleared_on_new_message() {
-        let (control_sender, _update_receiver) =
-            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
 
         // Register an endpoint pointing to a port nobody is listening on
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 55555);
@@ -915,8 +910,7 @@ mod tests {
 
         // Send a request via SendToService — the UDP send succeeds but no
         // reply will ever come, leaving the inner loop in AwaitResponse state.
-        let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
-        let message = Message::<DiscoveryOnlyPayload>::new_sd(1, &sd_header);
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
         let (_rx_send, msg_send) = TestControl::send_to_service(0x1234, 0x0001, message);
         control_sender.send(msg_send).await.unwrap();
 
@@ -942,8 +936,7 @@ mod tests {
     async fn test_dropped_receiver_await_response_continues() {
         use tokio::net::UdpSocket;
 
-        let (control_sender, _update_receiver) =
-            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
 
         // Create a raw socket to receive the request and echo it back
         let raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -955,8 +948,7 @@ mod tests {
         control_sender.send(msg).await.unwrap();
         rx.await.unwrap().unwrap();
 
-        let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
-        let message = Message::<DiscoveryOnlyPayload>::new_sd(1, &sd_header);
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
 
         // Send request through inner — it will be forwarded to raw_port
         let (rx_send, msg_send) = TestControl::send_to_service(0x1234, 0x0001, message);
@@ -990,8 +982,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_preemptible_active_request_rejects_new_message() {
-        let (control_sender, _update_receiver) =
-            Inner::<DiscoveryOnlyPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
 
         // Bind discovery so SetInterface will take the multi-step path:
         // iteration 1: unbind discovery, re-queue SetInterface
