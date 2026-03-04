@@ -3,23 +3,41 @@ use super::Error;
 ///Return code contained in a SOME/IP header.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum ReturnCode {
+    /// No error (0x00).
     Ok,
+    /// An unspecified error occurred (0x01).
     NotOk,
+    /// The requested service is unknown (0x02).
     UnknownService,
+    /// The requested method is unknown (0x03).
     UnknownMethod,
+    /// The service is not ready (0x04).
     NotReady,
+    /// The service is not reachable (0x05).
     NotReachable,
+    /// A timeout occurred (0x06).
     Timeout,
+    /// The protocol version is not supported (0x07).
     WrongProtocolVersion,
+    /// The interface version is not supported (0x08).
     WrongInterfaceVersion,
+    /// The message is malformed (0x09).
     MalformedMessage,
+    /// The message type is wrong for the context (0x0A).
     WrongMessageType,
+    /// E2E: repeated message detected (0x0B).
     E2ERepeated,
+    /// E2E: wrong sequence counter (0x0C).
     E2EWrongSequence,
+    /// E2E: unspecified E2E error (0x0D).
     E2E,
+    /// E2E: protection not available (0x0E).
     E2ENotAvailable,
+    /// E2E: no new data (0x0F).
     E2ENoNewData,
+    /// A generic error in the range 0x10..=0x1F.
     GenericError(u8),
+    /// An interface-specific error in the range 0x20..=0x5E.
     InterfaceError(u8),
 }
 

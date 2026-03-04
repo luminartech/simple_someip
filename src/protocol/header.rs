@@ -20,36 +20,43 @@ pub struct Header {
 }
 
 impl Header {
+    /// Returns the message ID (service ID + method ID).
     #[must_use]
     pub fn message_id(&self) -> MessageId {
         self.message_id
     }
 
+    /// Returns the length field (payload size + 8).
     #[must_use]
     pub fn length(&self) -> u32 {
         self.length
     }
 
+    /// Returns the request ID (client ID + session ID).
     #[must_use]
     pub fn request_id(&self) -> u32 {
         self.request_id
     }
 
+    /// Returns the protocol version.
     #[must_use]
     pub fn protocol_version(&self) -> u8 {
         self.protocol_version
     }
 
+    /// Returns the interface version.
     #[must_use]
     pub fn interface_version(&self) -> u8 {
         self.interface_version
     }
 
+    /// Returns the message type field.
     #[must_use]
     pub fn message_type(&self) -> MessageTypeField {
         self.message_type
     }
 
+    /// Returns the return code.
     #[must_use]
     pub fn return_code(&self) -> ReturnCode {
         self.return_code
@@ -61,7 +68,7 @@ impl Header {
     ///                      + `message_type(1)` + `return_code(1)`
     ///
     /// Note: `request_id` is the full 4-byte SOME/IP Request ID field
-    /// (Client ID [31:16] + Session ID [15:0]), not just the 2-byte Session ID.
+    /// (Client ID \[31:16\] + Session ID \[15:0\]), not just the 2-byte Session ID.
     #[must_use]
     pub fn upper_header_bytes(&self) -> [u8; 8] {
         let rid = self.request_id.to_be_bytes();
@@ -77,6 +84,11 @@ impl Header {
         ]
     }
 
+    /// Creates a new header with the given fields.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `payload_len` exceeds `u32::MAX - 8`.
     #[must_use]
     pub fn new(
         message_id: MessageId,
@@ -98,6 +110,11 @@ impl Header {
         }
     }
 
+    /// Creates a new SOME/IP-SD header with standard SD field values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `sd_header_size` exceeds `u32::MAX - 8`.
     #[must_use]
     pub fn new_sd(request_id: u32, sd_header_size: usize) -> Self {
         Self {
@@ -111,6 +128,11 @@ impl Header {
         }
     }
 
+    /// Creates a new header for a SOME/IP event notification.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `payload_len` exceeds `u32::MAX - 8`.
     #[must_use]
     pub fn new_event(
         service_id: u16,
@@ -131,16 +153,19 @@ impl Header {
         }
     }
 
+    /// Returns `true` if this is a SOME/IP-SD message.
     #[must_use]
     pub const fn is_sd(&self) -> bool {
         self.message_id.is_sd()
     }
 
+    /// Returns the payload size in bytes (`length - 8`).
     #[must_use]
     pub const fn payload_size(&self) -> usize {
         self.length as usize - 8
     }
 
+    /// Sets the request ID field.
     pub fn set_request_id(&mut self, request_id: u32) {
         self.request_id = request_id;
     }
@@ -153,6 +178,15 @@ pub struct HeaderView<'a>(&'a [u8; 16]);
 impl<'a> HeaderView<'a> {
     /// Parse and validate a SOME/IP header from the beginning of `buf`.
     /// Returns `(view, remaining_bytes)` on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `buf` is shorter than 16 bytes, the protocol version is
+    /// not `0x01`, the message type byte is unrecognized, or the return code is invalid.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic — the `expect` is guarded by a length check above it.
     pub fn parse(buf: &'a [u8]) -> Result<(Self, &'a [u8]), Error> {
         if buf.len() < 16 {
             return Err(Error::UnexpectedEof);
@@ -173,6 +207,7 @@ impl<'a> HeaderView<'a> {
         Ok((view, &buf[16..]))
     }
 
+    /// Returns the message ID (service ID + method ID).
     #[must_use]
     pub fn message_id(&self) -> MessageId {
         MessageId::from(u32::from_be_bytes([
@@ -180,48 +215,65 @@ impl<'a> HeaderView<'a> {
         ]))
     }
 
+    /// Returns the length field (payload size + 8).
     #[must_use]
     pub fn length(&self) -> u32 {
         u32::from_be_bytes([self.0[4], self.0[5], self.0[6], self.0[7]])
     }
 
+    /// Returns the request ID (client ID + session ID).
     #[must_use]
     pub fn request_id(&self) -> u32 {
         u32::from_be_bytes([self.0[8], self.0[9], self.0[10], self.0[11]])
     }
 
+    /// Returns the payload size in bytes (`length - 8`).
     #[must_use]
     pub fn payload_size(&self) -> usize {
         self.length() as usize - 8
     }
 
+    /// Returns the protocol version.
     #[must_use]
     pub fn protocol_version(&self) -> u8 {
         self.0[12]
     }
 
+    /// Returns the interface version.
     #[must_use]
     pub fn interface_version(&self) -> u8 {
         self.0[13]
     }
 
+    /// Returns the message type field.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic — the value is validated during [`Self::parse`].
     #[must_use]
     pub fn message_type(&self) -> MessageTypeField {
         // Safe: validated in parse()
         MessageTypeField::try_from(self.0[14]).expect("validated in parse")
     }
 
+    /// Returns the return code.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic — the value is validated during [`Self::parse`].
     #[must_use]
     pub fn return_code(&self) -> ReturnCode {
         // Safe: validated in parse()
         ReturnCode::try_from(self.0[15]).expect("validated in parse")
     }
 
+    /// Returns `true` if this is a SOME/IP-SD message.
     #[must_use]
     pub fn is_sd(&self) -> bool {
         self.message_id().is_sd()
     }
 
+    /// Copies the view into an owned [`Header`].
     #[must_use]
     pub fn to_owned(&self) -> Header {
         Header {
