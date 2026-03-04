@@ -24,10 +24,14 @@
 #[cfg(feature = "std")]
 extern crate std;
 
+/// SOME/IP client for discovering services and exchanging messages.
 #[cfg(feature = "client")]
 pub mod client;
+/// End-to-end (E2E) protection utilities for SOME/IP payloads.
 pub mod e2e;
+/// SOME/IP protocol primitives: headers, messages, return codes, and service discovery.
 pub mod protocol;
+/// SOME/IP server for offering services and handling incoming requests.
 #[cfg(feature = "server")]
 pub mod server;
 mod traits;

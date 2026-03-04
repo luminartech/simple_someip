@@ -3,10 +3,15 @@ use crate::protocol::{self, MessageId, sd, sd::Flags};
 /// Information about a service endpoint extracted from an SD message.
 #[cfg(feature = "std")]
 pub struct OfferedEndpoint {
+    /// The SOME/IP service ID.
     pub service_id: u16,
+    /// The SOME/IP instance ID.
     pub instance_id: u16,
+    /// The major version of the offered service interface.
     pub major_version: u8,
+    /// The minor version of the offered service interface.
     pub minor_version: u32,
+    /// The IPv4 socket address extracted from the SD options, if present.
     pub addr: Option<std::net::SocketAddrV4>,
     /// `true` for `OfferService`, `false` for `StopOfferService`.
     pub is_offer: bool,
@@ -53,6 +58,10 @@ pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
     /// Number of bytes required to write the payload
     fn required_size(&self) -> usize;
     /// Serialize the payload to a [Writer](embedded_io::Write)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload cannot be written to the writer.
     fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
 
     /// Construct an SD header for subscribing to an event group.
