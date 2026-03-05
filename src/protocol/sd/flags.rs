@@ -34,12 +34,12 @@ impl From<Flags> for u8 {
 impl Flags {
     /// Creates flags with the given reboot and unicast values.
     #[must_use]
-    pub fn new(reboot: bool, unicast: bool) -> Self {
+    pub const fn new(reboot: bool, unicast: bool) -> Self {
         Self { reboot, unicast }
     }
     /// Creates SD flags with unicast always set to `true`.
     #[must_use]
-    pub fn new_sd(reboot: bool) -> Self {
+    pub const fn new_sd(reboot: bool) -> Self {
         Self {
             reboot,
             unicast: true,
@@ -47,12 +47,12 @@ impl Flags {
     }
     /// Returns `true` if the reboot flag is set.
     #[must_use]
-    pub fn reboot(self) -> bool {
+    pub const fn reboot(self) -> bool {
         self.reboot
     }
     /// Returns `true` if the unicast flag is set.
     #[must_use]
-    pub fn unicast(self) -> bool {
+    pub const fn unicast(self) -> bool {
         self.unicast
     }
 }

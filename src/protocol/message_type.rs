@@ -82,9 +82,22 @@ impl MessageTypeField {
     ///
     /// Cannot panic — the inner byte is always a valid `MessageType`.
     #[must_use]
-    pub fn message_type(&self) -> MessageType {
-        // This unwrap is safe because the private message_type_byte is always a valid MessageType
-        MessageType::try_from(self.0).unwrap()
+    pub const fn message_type(&self) -> MessageType {
+        // The inner byte is always valid because it is validated on construction.
+        match self.0 & !MESSAGE_TYPE_TP_FLAG {
+            0x00 => MessageType::Request,
+            0x01 => MessageType::RequestNoReturn,
+            0x02 => MessageType::Notification,
+            0x80 => MessageType::Response,
+            0x81 => MessageType::Error,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Returns the raw byte value of the message type field.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self.0
     }
 
     /// Returns `true` if the TP (Transport Protocol) flag is set.
