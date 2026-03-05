@@ -12,8 +12,8 @@
   accessors instead.
 - **Removed `send_message` / binding API** — the client now manages socket binding internally;
   `Client::add_endpoint` / `Client::remove_endpoint` replace the old approach.
-- **Re-exported traits at crate root** — `WireFormat`, `PayloadWireFormat`, and
-  `DiscoveryOnlyPayload` are now available directly from `simple_someip::*`.
+- **Re-exported traits at crate root** — `WireFormat` and `PayloadWireFormat`
+  are now available directly from `simple_someip::*`.
 
 ### Added
 

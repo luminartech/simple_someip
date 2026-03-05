@@ -6,7 +6,7 @@ use simple_someip::{Client, ClientUpdate, OfferedEndpoint, PayloadWireFormat, Se
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 // ---------------------------------------------------------------------------
-// Test-local DiscoveryOnlyPayload (Vec-based, std only)
+// Test-local payload implementation (Vec-based, std only)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Eq, PartialEq)]

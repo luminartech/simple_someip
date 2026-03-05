@@ -13,7 +13,7 @@ use simple_someip::{
 use tracing::{error, info, level_filters::LevelFilter, warn};
 
 // ---------------------------------------------------------------------------
-// DiscoveryOnlyPayload — a simple PayloadWireFormat for SD-only usage
+// Payload — a simple PayloadWireFormat for SD-only usage
 // ---------------------------------------------------------------------------
 
 /// Owned SD header using heap-allocated vectors (std-only).
