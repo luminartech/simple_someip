@@ -105,6 +105,15 @@ impl<'a> E2ECheckResult<'a> {
             payload: Some(payload),
         }
     }
+
+    /// Copy the extracted payload into an owned `Vec<u8>`.
+    ///
+    /// Returns `None` if the check did not produce a payload (e.g. on error).
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn to_owned_payload(&self) -> Option<std::vec::Vec<u8>> {
+        self.payload.map(<[u8]>::to_vec)
+    }
 }
 
 #[cfg(test)]
