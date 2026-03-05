@@ -42,8 +42,8 @@
 //! use simple_someip::protocol::sd::{self, Entry, ServiceEntry};
 //!
 //! // Build an SD header with a FindService entry
-//! let entry = Entry::FindService(ServiceEntry::find(0x1234));
-//! let sd_header = sd::Header::new(sd::Flags::new_sd(false), &[entry], &[]);
+//! let entries = [Entry::FindService(ServiceEntry::find(0x1234))];
+//! let sd_header = sd::Header::new(sd::Flags::new_sd(false), &entries, &[]);
 //!
 //! // Encode to bytes
 //! let mut buf = [0u8; 64];
