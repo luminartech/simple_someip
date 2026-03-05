@@ -33,6 +33,26 @@ pub trait WireFormat: Send + Sized + Sync {
     /// # Errors
     /// - If the data cannot be written to the stream
     fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
+
+    /// Encode into a byte slice, returning the number of bytes written.
+    ///
+    /// # Errors
+    /// Returns an error if `buf` is too small (requires at least
+    /// [`required_size()`](Self::required_size) bytes).
+    fn encode_to_slice(&self, buf: &mut [u8]) -> Result<usize, protocol::Error> {
+        self.encode(&mut &mut *buf)
+    }
+
+    /// Encode into a newly allocated `Vec<u8>`.
+    ///
+    /// # Errors
+    /// Returns an error if encoding fails.
+    #[cfg(feature = "std")]
+    fn encode_to_vec(&self) -> Result<std::vec::Vec<u8>, protocol::Error> {
+        let mut buf = std::vec![0u8; self.required_size()];
+        self.encode_to_slice(&mut buf)?;
+        Ok(buf)
+    }
 }
 
 /// A trait for SOME/IP Payload types that can be serialized to a
