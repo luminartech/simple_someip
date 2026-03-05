@@ -84,6 +84,33 @@ impl Header {
         ]
     }
 
+    /// Creates a header from raw field values.
+    ///
+    /// Unlike [`new`](Self::new), the `length` field is taken directly rather
+    /// than being computed from a payload size.  This is the inverse of the
+    /// accessor methods and is useful for FFI or any context where the caller
+    /// already has the raw on-wire field values.
+    #[must_use]
+    pub const fn from_fields(
+        message_id: MessageId,
+        length: u32,
+        request_id: u32,
+        protocol_version: u8,
+        interface_version: u8,
+        message_type: MessageTypeField,
+        return_code: ReturnCode,
+    ) -> Self {
+        Self {
+            message_id,
+            length,
+            request_id,
+            protocol_version,
+            interface_version,
+            message_type,
+            return_code,
+        }
+    }
+
     /// Creates a new header with the given fields.
     ///
     /// # Panics
