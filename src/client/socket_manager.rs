@@ -71,6 +71,7 @@ where
         socket.set_reuse_address(true)?;
         #[cfg(unix)]
         socket.set_reuse_port(true)?;
+        socket.set_multicast_if_v4(&interface)?;
         socket.bind(&bind_addr.into())?;
         socket.set_nonblocking(true)?;
         let socket: std::net::UdpSocket = socket.into();
