@@ -22,43 +22,43 @@ pub struct Header {
 impl Header {
     /// Returns the message ID (service ID + method ID).
     #[must_use]
-    pub fn message_id(&self) -> MessageId {
+    pub const fn message_id(&self) -> MessageId {
         self.message_id
     }
 
     /// Returns the length field (payload size + 8).
     #[must_use]
-    pub fn length(&self) -> u32 {
+    pub const fn length(&self) -> u32 {
         self.length
     }
 
     /// Returns the request ID (client ID + session ID).
     #[must_use]
-    pub fn request_id(&self) -> u32 {
+    pub const fn request_id(&self) -> u32 {
         self.request_id
     }
 
     /// Returns the protocol version.
     #[must_use]
-    pub fn protocol_version(&self) -> u8 {
+    pub const fn protocol_version(&self) -> u8 {
         self.protocol_version
     }
 
     /// Returns the interface version.
     #[must_use]
-    pub fn interface_version(&self) -> u8 {
+    pub const fn interface_version(&self) -> u8 {
         self.interface_version
     }
 
     /// Returns the message type field.
     #[must_use]
-    pub fn message_type(&self) -> MessageTypeField {
+    pub const fn message_type(&self) -> MessageTypeField {
         self.message_type
     }
 
     /// Returns the return code.
     #[must_use]
-    pub fn return_code(&self) -> ReturnCode {
+    pub const fn return_code(&self) -> ReturnCode {
         self.return_code
     }
 
@@ -70,7 +70,7 @@ impl Header {
     /// Note: `request_id` is the full 4-byte SOME/IP Request ID field
     /// (Client ID \[31:16\] + Session ID \[15:0\]), not just the 2-byte Session ID.
     #[must_use]
-    pub fn upper_header_bytes(&self) -> [u8; 8] {
+    pub const fn upper_header_bytes(&self) -> [u8; 8] {
         let rid = self.request_id.to_be_bytes();
         [
             rid[0],
@@ -79,8 +79,8 @@ impl Header {
             rid[3],
             self.protocol_version,
             self.interface_version,
-            u8::from(self.message_type),
-            u8::from(self.return_code),
+            self.message_type.as_u8(),
+            self.return_code.as_u8(),
         ]
     }
 
@@ -90,7 +90,8 @@ impl Header {
     ///
     /// Panics if `payload_len` exceeds `u32::MAX - 8`.
     #[must_use]
-    pub fn new(
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn new(
         message_id: MessageId,
         request_id: u32,
         protocol_version: u8,
@@ -99,9 +100,10 @@ impl Header {
         return_code: ReturnCode,
         payload_len: usize,
     ) -> Self {
+        assert!(payload_len <= u32::MAX as usize - 8);
         Self {
             message_id,
-            length: 8 + u32::try_from(payload_len).expect("payload too large"),
+            length: 8 + payload_len as u32,
             request_id,
             protocol_version,
             interface_version,
@@ -116,10 +118,12 @@ impl Header {
     ///
     /// Panics if `sd_header_size` exceeds `u32::MAX - 8`.
     #[must_use]
-    pub fn new_sd(request_id: u32, sd_header_size: usize) -> Self {
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn new_sd(request_id: u32, sd_header_size: usize) -> Self {
+        assert!(sd_header_size <= u32::MAX as usize - 8);
         Self {
             message_id: MessageId::SD,
-            length: 8 + u32::try_from(sd_header_size).expect("SD header too large"),
+            length: 8 + sd_header_size as u32,
             request_id,
             protocol_version: 0x01,
             interface_version: 0x01,
@@ -134,7 +138,8 @@ impl Header {
     ///
     /// Panics if `payload_len` exceeds `u32::MAX - 8`.
     #[must_use]
-    pub fn new_event(
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn new_event(
         service_id: u16,
         event_id: u16,
         request_id: u32,
@@ -142,9 +147,10 @@ impl Header {
         interface_version: u8,
         payload_len: usize,
     ) -> Self {
+        assert!(payload_len <= u32::MAX as usize - 8);
         Self {
             message_id: MessageId::new_from_service_and_method(service_id, event_id),
-            length: 8 + u32::try_from(payload_len).expect("payload too large"),
+            length: 8 + payload_len as u32,
             request_id,
             protocol_version,
             interface_version,
@@ -166,7 +172,7 @@ impl Header {
     }
 
     /// Sets the request ID field.
-    pub fn set_request_id(&mut self, request_id: u32) {
+    pub const fn set_request_id(&mut self, request_id: u32) {
         self.request_id = request_id;
     }
 }

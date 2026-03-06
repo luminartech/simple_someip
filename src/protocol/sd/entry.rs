@@ -76,7 +76,7 @@ impl OptionsCount {
     /// # Panics
     /// Panics if either count is >= 16 (each count must fit in a 4-bit nibble).
     #[must_use]
-    pub fn new(first_options_count: u8, second_options_count: u8) -> Self {
+    pub const fn new(first_options_count: u8, second_options_count: u8) -> Self {
         assert!(first_options_count < 16);
         assert!(second_options_count < 16);
         OptionsCount {
@@ -112,7 +112,7 @@ pub struct EventGroupEntry {
 impl EventGroupEntry {
     /// Creates a new event group entry with default option indices.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         service_id: u16,
         instance_id: u16,
         major_version: u8,
@@ -179,7 +179,7 @@ pub struct ServiceEntry {
 impl ServiceEntry {
     /// Creates a `FindService` entry with wildcard instance/version fields.
     #[must_use]
-    pub fn find(service_id: u16) -> Self {
+    pub const fn find(service_id: u16) -> Self {
         Self {
             index_first_options_run: 0,
             index_second_options_run: 0,

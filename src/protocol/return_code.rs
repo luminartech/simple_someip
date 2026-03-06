@@ -41,6 +41,32 @@ pub enum ReturnCode {
     InterfaceError(u8),
 }
 
+impl ReturnCode {
+    /// Returns the raw byte value of the return code.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            ReturnCode::Ok => 0x00,
+            ReturnCode::NotOk => 0x01,
+            ReturnCode::UnknownService => 0x02,
+            ReturnCode::UnknownMethod => 0x03,
+            ReturnCode::NotReady => 0x04,
+            ReturnCode::NotReachable => 0x05,
+            ReturnCode::Timeout => 0x06,
+            ReturnCode::WrongProtocolVersion => 0x07,
+            ReturnCode::WrongInterfaceVersion => 0x08,
+            ReturnCode::MalformedMessage => 0x09,
+            ReturnCode::WrongMessageType => 0x0a,
+            ReturnCode::E2ERepeated => 0x0b,
+            ReturnCode::E2EWrongSequence => 0x0c,
+            ReturnCode::E2E => 0x0d,
+            ReturnCode::E2ENotAvailable => 0x0e,
+            ReturnCode::E2ENoNewData => 0x0f,
+            ReturnCode::GenericError(value) | ReturnCode::InterfaceError(value) => value,
+        }
+    }
+}
+
 impl TryFrom<u8> for ReturnCode {
     type Error = Error;
     fn try_from(value: u8) -> Result<Self, Error> {

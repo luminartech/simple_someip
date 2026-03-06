@@ -25,7 +25,7 @@ pub struct Header<'a> {
 impl<'a> Header<'a> {
     /// Creates a new SD header from the given flags, entries, and options.
     #[must_use]
-    pub fn new(flags: Flags, entries: &'a [Entry], options: &'a [Options]) -> Self {
+    pub const fn new(flags: Flags, entries: &'a [Entry], options: &'a [Options]) -> Self {
         Self {
             flags,
             entries,

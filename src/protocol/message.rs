@@ -30,7 +30,7 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
     }
 
     /// Returns a reference to the message header.
-    pub fn header(&self) -> &Header {
+    pub const fn header(&self) -> &Header {
         &self.header
     }
 
@@ -40,7 +40,7 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
     }
 
     /// Sets the request ID in the header.
-    pub fn set_request_id(&mut self, request_id: u32) {
+    pub const fn set_request_id(&mut self, request_id: u32) {
         self.header.set_request_id(request_id);
     }
 
@@ -53,12 +53,12 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
     }
 
     /// Returns a reference to the payload.
-    pub fn payload(&self) -> &PayloadDefinition {
+    pub const fn payload(&self) -> &PayloadDefinition {
         &self.payload
     }
 
     /// Returns a mutable reference to the payload.
-    pub fn payload_mut(&mut self) -> &mut PayloadDefinition {
+    pub const fn payload_mut(&mut self) -> &mut PayloadDefinition {
         &mut self.payload
     }
 }
