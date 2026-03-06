@@ -164,13 +164,13 @@ impl<PayloadDefinition: PayloadWireFormat> WireFormat for Message<PayloadDefinit
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::sd::test_support::{TestPayload, TestSdHeader, empty_sd_header};
     use crate::protocol::{MessageId, sd};
-    use crate::traits::DiscoveryOnlyPayload;
 
-    type Msg = Message<DiscoveryOnlyPayload>;
+    type Msg = Message<TestPayload>;
 
-    fn minimal_sd_header() -> sd::Header {
-        sd::Header::new_find_services(false, &[])
+    fn minimal_sd_header() -> TestSdHeader {
+        empty_sd_header()
     }
 
     fn make_sd_message() -> Msg {
@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn new_stores_header_and_payload() {
         let header = Header::new_sd(0x42, 12);
-        let payload = DiscoveryOnlyPayload::new_sd_payload(&minimal_sd_header());
+        let payload = TestPayload::new_sd_payload(&minimal_sd_header());
         let msg = Msg::new(header.clone(), payload.clone());
         assert_eq!(*msg.header(), header);
         assert_eq!(*msg.payload(), payload);
@@ -268,14 +268,23 @@ mod tests {
 
     #[test]
     fn encode_parse_with_entries() {
-        let sd_hdr: sd::Header<1, 0> = sd::Header::new_find_services(true, &[0xABCD]);
-        let msg = Message::<DiscoveryOnlyPayload<1, 0>>::new_sd(0x42, &sd_hdr);
+        let mut entries = heapless::Vec::<sd::Entry, 4>::new();
+        entries
+            .push(sd::Entry::FindService(sd::ServiceEntry::find(0xABCD)))
+            .unwrap();
+        let sd_hdr = TestSdHeader {
+            flags: sd::Flags::new_sd(true),
+            entries,
+            options: heapless::Vec::new(),
+        };
+        let msg = Msg::new_sd(0x42, &sd_hdr);
         let mut buf = [0u8; 64];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
         let view = MessageView::parse(&buf[..n]).unwrap();
         let sd_view = view.sd_header().unwrap();
-        let decoded: sd::Header<1, 0> = sd_view.to_owned().unwrap();
-        assert_eq!(decoded, sd_hdr);
+        assert_eq!(sd_view.entry_count(), 1);
+        let entry = sd_view.entries().next().unwrap();
+        assert_eq!(entry.service_id(), 0xABCD);
     }
 
     // --- parse with exactly-sized slice ---

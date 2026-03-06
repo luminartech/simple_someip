@@ -58,5 +58,5 @@ By default only the `protocol`, `traits`, and `e2e` modules are available, and t
 Examples are provided in the `examples/` directory. To run the discovery client example:
 
 ```bash
-cargo run --features client --example discovery_client
+cargo run -p discovery_client
 ```

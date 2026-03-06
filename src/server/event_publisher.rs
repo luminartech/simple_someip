@@ -4,7 +4,7 @@ use super::Error;
 use super::subscription_manager::SubscriptionManager;
 use crate::protocol::{Header, Message};
 use crate::traits::{PayloadWireFormat, WireFormat};
-use std::{prelude::rust_2024::*, sync::Arc};
+use std::{sync::Arc, vec::Vec};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
@@ -193,8 +193,7 @@ impl EventPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::sd;
-    use crate::traits::DiscoveryOnlyPayload;
+    use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     async fn make_publisher(
@@ -205,9 +204,8 @@ mod tests {
         (publisher, socket)
     }
 
-    fn make_test_message() -> Message<DiscoveryOnlyPayload> {
-        let sd_hdr = sd::Header::new_find_services(false, &[]);
-        Message::new_sd(0x0001, &sd_hdr)
+    fn make_test_message() -> Message<TestPayload> {
+        Message::new_sd(0x0001, &empty_sd_header())
     }
 
     #[tokio::test]

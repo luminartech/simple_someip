@@ -15,12 +15,6 @@ pub enum Error {
     /// The declared options size does not match the actual data.
     #[error("Incorrect options size, {0} bytes remaining")]
     IncorrectOptionsSize(usize),
-    /// The number of entries exceeds the fixed-capacity buffer.
-    #[error("Too many SD entries for fixed-capacity buffer")]
-    TooManyEntries,
-    /// The number of options exceeds the fixed-capacity buffer.
-    #[error("Too many SD options for fixed-capacity buffer")]
-    TooManyOptions,
     /// An option's length field does not match the expected size for its type.
     #[error(
         "Invalid SD option length for type 0x{option_type:02X}: expected {expected}, got {actual}"

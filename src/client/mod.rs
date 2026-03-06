@@ -263,10 +263,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::{DiscoveryOnlyPayload, WireFormat};
+    use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
+    use crate::traits::WireFormat;
     use std::format;
 
-    type TestClient = Client<DiscoveryOnlyPayload>;
+    type TestClient = Client<TestPayload>;
 
     #[tokio::test]
     async fn test_client_new_and_interface() {
@@ -286,37 +287,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_update_debug() {
-        use crate::protocol::sd;
         use std::net::SocketAddr;
 
         // DiscoveryUpdated
-        let sd_header = sd::Header::new_find_services(false, &[]);
+        let sd_header = empty_sd_header();
         let someip_header = crate::protocol::Header::new_sd(1, sd_header.required_size());
         let discovery_msg = DiscoveryMessage {
             source: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 30490),
             someip_header,
             sd_header,
         };
-        let update: ClientUpdate<DiscoveryOnlyPayload> =
-            ClientUpdate::DiscoveryUpdated(discovery_msg);
+        let update: ClientUpdate<TestPayload> = ClientUpdate::DiscoveryUpdated(discovery_msg);
         let debug_str = format!("{update:?}");
         assert!(debug_str.contains("DiscoveryUpdated"));
 
         // SenderRebooted
-        let update: ClientUpdate<DiscoveryOnlyPayload> =
+        let update: ClientUpdate<TestPayload> =
             ClientUpdate::SenderRebooted(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 30490));
         let debug_str = format!("{update:?}");
         assert!(debug_str.contains("SenderRebooted"));
 
         // Unicast
-        let msg = crate::protocol::Message::new_sd(1, &sd::Header::new_find_services(false, &[]));
-        let update: ClientUpdate<DiscoveryOnlyPayload> = ClientUpdate::Unicast(msg);
+        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
+        let update: ClientUpdate<TestPayload> = ClientUpdate::Unicast(msg);
         let debug_str = format!("{update:?}");
         assert!(debug_str.contains("Unicast"));
 
         // Error
-        let update: ClientUpdate<DiscoveryOnlyPayload> =
-            ClientUpdate::Error(Error::ServiceNotFound);
+        let update: ClientUpdate<TestPayload> = ClientUpdate::Error(Error::ServiceNotFound);
         let debug_str = format!("{update:?}");
         assert!(debug_str.contains("Error"));
     }
@@ -360,10 +358,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_to_service_unknown_returns_error() {
         let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
-        let msg = crate::protocol::Message::new_sd(
-            1,
-            &crate::protocol::sd::Header::new_find_services(false, &[]),
-        );
+        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         let result = client.send_to_service(0xFFFF, 0xFFFF, msg).await;
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),

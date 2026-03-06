@@ -6,7 +6,6 @@ use crate::{
 use super::error::Error;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
-    prelude::rust_2024::*,
     task::{Context, Poll},
     vec,
 };
@@ -244,9 +243,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::DiscoveryOnlyPayload;
+    use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
 
-    type TestSocketManager = SocketManager<DiscoveryOnlyPayload>;
+    type TestSocketManager = SocketManager<TestPayload>;
 
     #[tokio::test]
     async fn test_bind_ephemeral_port() {
@@ -258,11 +257,8 @@ mod tests {
     #[tokio::test]
     async fn test_send_message_new() {
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
-        let msg = Message::new_sd(
-            1,
-            &crate::protocol::sd::Header::new_find_services(false, &[]),
-        );
-        let (rx, send_msg) = SendMessage::<DiscoveryOnlyPayload>::new(target, msg);
+        let msg = Message::new_sd(1, &empty_sd_header());
+        let (rx, send_msg) = SendMessage::<TestPayload>::new(target, msg);
         assert_eq!(send_msg.target_addr, target);
         // Verify the oneshot channel works
         send_msg.response.send(Ok(())).unwrap();
@@ -284,8 +280,7 @@ mod tests {
         let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // Build and encode an SD message
-        let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
-        let msg = Message::<DiscoveryOnlyPayload>::new_sd(1, &sd_header);
+        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
         let mut buf = vec![0u8; 128];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
 
@@ -316,8 +311,7 @@ mod tests {
         let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let raw_port = raw_socket.local_addr().unwrap().port();
 
-        let sd_header = crate::protocol::sd::Header::new_find_services(false, &[]);
-        let msg = Message::<DiscoveryOnlyPayload>::new_sd(1, &sd_header);
+        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_port);
 
         sm.send(target, msg.clone()).await.unwrap();

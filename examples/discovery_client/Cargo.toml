@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+embedded-io = "0.7"
 simple-someip = { path = "../..", features = ["client"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"

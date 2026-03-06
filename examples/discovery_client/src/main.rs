@@ -1,19 +1,149 @@
 use std::{collections::HashMap, fmt, net::Ipv4Addr};
 
 use simple_someip::{
-    DiscoveryOnlyPayload,
+    PayloadWireFormat, WireFormat,
     protocol::{
-        Error,
-        sd::{Entry, Options, TransportProtocol},
+        Error, MessageId,
+        sd::{self, Entry, EventGroupEntry, Flags, Options, SdHeaderView, TransportProtocol},
     },
 };
 use tracing::{error, info, level_filters::LevelFilter, warn};
 
-/// Maximum number of SD entries and options per message.
-const MAX_ENTRIES: usize = 32;
-const MAX_OPTIONS: usize = 32;
+// ---------------------------------------------------------------------------
+// Payload — a simple PayloadWireFormat for SD-only usage
+// ---------------------------------------------------------------------------
 
-type Payload = DiscoveryOnlyPayload<MAX_ENTRIES, MAX_OPTIONS>;
+/// Owned SD header using heap-allocated vectors (std-only).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OwnedSdHeader {
+    flags: Flags,
+    entries: Vec<Entry>,
+    options: Vec<Options>,
+}
+
+impl WireFormat for OwnedSdHeader {
+    fn required_size(&self) -> usize {
+        let header = sd::Header::new(self.flags, &self.entries, &self.options);
+        header.required_size()
+    }
+
+    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
+        let header = sd::Header::new(self.flags, &self.entries, &self.options);
+        header.encode(writer)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DiscoveryOnlyPayload {
+    header: OwnedSdHeader,
+}
+
+impl PayloadWireFormat for DiscoveryOnlyPayload {
+    type SdHeader = OwnedSdHeader;
+
+    fn message_id(&self) -> MessageId {
+        MessageId::SD
+    }
+
+    fn as_sd_header(&self) -> Option<&OwnedSdHeader> {
+        Some(&self.header)
+    }
+
+    fn from_payload_bytes(message_id: MessageId, payload: &[u8]) -> Result<Self, Error> {
+        match message_id {
+            MessageId::SD => {
+                let view = SdHeaderView::parse(payload)?;
+                let mut entries = Vec::new();
+                for entry_view in view.entries() {
+                    entries.push(entry_view.to_owned()?);
+                }
+                let mut options = Vec::new();
+                for option_view in view.options() {
+                    options.push(option_view.to_owned()?);
+                }
+                Ok(Self {
+                    header: OwnedSdHeader {
+                        flags: view.flags(),
+                        entries,
+                        options,
+                    },
+                })
+            }
+            _ => Err(Error::UnsupportedMessageID(message_id)),
+        }
+    }
+
+    fn new_sd_payload(header: &OwnedSdHeader) -> Self {
+        Self {
+            header: header.clone(),
+        }
+    }
+
+    fn sd_flags(&self) -> Option<Flags> {
+        Some(self.header.flags)
+    }
+
+    fn required_size(&self) -> usize {
+        self.header.required_size()
+    }
+
+    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
+        self.header.encode(writer)
+    }
+
+    fn new_subscription_sd_header(
+        service_id: u16,
+        instance_id: u16,
+        major_version: u8,
+        ttl: u32,
+        event_group_id: u16,
+        client_ip: Ipv4Addr,
+        protocol: TransportProtocol,
+        client_port: u16,
+    ) -> OwnedSdHeader {
+        let entry = Entry::SubscribeEventGroup(EventGroupEntry::new(
+            service_id,
+            instance_id,
+            major_version,
+            ttl,
+            event_group_id,
+        ));
+        let endpoint = Options::IpV4Endpoint {
+            ip: client_ip,
+            protocol,
+            port: client_port,
+        };
+        OwnedSdHeader {
+            flags: Flags::new_sd(false),
+            entries: vec![entry],
+            options: vec![endpoint],
+        }
+    }
+
+    fn offered_endpoints(&self) -> Vec<simple_someip::OfferedEndpoint> {
+        self.header
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::OfferService(svc) | Entry::StopOfferService(svc) => {
+                    let is_offer = matches!(entry, Entry::OfferService(_));
+                    let addr = sd::extract_ipv4_endpoint(&self.header.options);
+                    Some(simple_someip::OfferedEndpoint {
+                        service_id: svc.service_id,
+                        instance_id: svc.instance_id,
+                        major_version: svc.major_version,
+                        minor_version: svc.minor_version,
+                        addr,
+                        is_offer,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+type Payload = DiscoveryOnlyPayload;
 
 /// Endpoint information extracted from SD options.
 #[derive(Clone)]
@@ -101,10 +231,10 @@ impl fmt::Display for EventGroupInfo {
     }
 }
 
-/// Key for identifying a service: (service_id, instance_id).
+/// Key for identifying a service: (`service_id`, `instance_id`).
 type ServiceKey = (u16, u16);
 
-/// Key for identifying an event group: (service_id, instance_id, event_group_id).
+/// Key for identifying an event group: (`service_id`, `instance_id`, `event_group_id`).
 type EventGroupKey = (u16, u16, u16);
 
 struct DiscoveryState {
@@ -121,6 +251,106 @@ impl DiscoveryState {
             event_groups: HashMap::new(),
             total_messages: 0,
             find_service_count: 0,
+        }
+    }
+
+    fn process_entry(&mut self, entry: &Entry, options: &[Options]) {
+        match entry {
+            Entry::OfferService(svc) => {
+                let key = (svc.service_id, svc.instance_id);
+                let endpoints = extract_endpoints(
+                    svc.index_first_options_run,
+                    svc.options_count.first_options_count,
+                    options,
+                );
+                let is_new = !self.services.contains_key(&key);
+                let info = self.services.entry(key).or_insert(ServiceInfo {
+                    major_version: svc.major_version,
+                    minor_version: svc.minor_version,
+                    ttl: svc.ttl,
+                    endpoints: Vec::new(),
+                    offer_count: 0,
+                });
+                info.major_version = svc.major_version;
+                info.minor_version = svc.minor_version;
+                info.ttl = svc.ttl;
+                info.endpoints = endpoints;
+                info.offer_count += 1;
+
+                if is_new {
+                    info!(
+                        "NEW service 0x{:04X}.0x{:04X} v{}.{}",
+                        svc.service_id, svc.instance_id, svc.major_version, svc.minor_version,
+                    );
+                }
+            }
+            Entry::StopOfferService(svc) => {
+                let key = (svc.service_id, svc.instance_id);
+                if self.services.remove(&key).is_some() {
+                    warn!(
+                        "REMOVED service 0x{:04X}.0x{:04X}",
+                        svc.service_id, svc.instance_id,
+                    );
+                }
+            }
+            Entry::FindService(svc) => {
+                self.find_service_count += 1;
+                info!(
+                    "FindService 0x{:04X}.0x{:04X}",
+                    svc.service_id, svc.instance_id,
+                );
+            }
+            Entry::SubscribeEventGroup(eg) => {
+                let key = (eg.service_id, eg.instance_id, eg.event_group_id);
+                let is_new = !self.event_groups.contains_key(&key);
+                let info = self.event_groups.entry(key).or_insert(EventGroupInfo {
+                    major_version: eg.major_version,
+                    ttl: eg.ttl,
+                    counter: eg.counter,
+                    subscribe_count: 0,
+                    ack_count: 0,
+                    nack_count: 0,
+                });
+                info.major_version = eg.major_version;
+                info.ttl = eg.ttl;
+                info.counter = eg.counter;
+                info.subscribe_count += 1;
+
+                if is_new {
+                    info!(
+                        "NEW subscription 0x{:04X}.0x{:04X} group=0x{:04X}",
+                        eg.service_id, eg.instance_id, eg.event_group_id,
+                    );
+                }
+            }
+            Entry::SubscribeAckEventGroup(eg) => {
+                let key = (eg.service_id, eg.instance_id, eg.event_group_id);
+                let info = self.event_groups.entry(key).or_insert(EventGroupInfo {
+                    major_version: eg.major_version,
+                    ttl: eg.ttl,
+                    counter: eg.counter,
+                    subscribe_count: 0,
+                    ack_count: 0,
+                    nack_count: 0,
+                });
+                info.major_version = eg.major_version;
+                info.counter = eg.counter;
+
+                if eg.ttl == 0 {
+                    info.nack_count += 1;
+                    warn!(
+                        "Subscribe NACK 0x{:04X}.0x{:04X} group=0x{:04X}",
+                        eg.service_id, eg.instance_id, eg.event_group_id,
+                    );
+                } else {
+                    info.ttl = eg.ttl;
+                    info.ack_count += 1;
+                    info!(
+                        "Subscribe ACK 0x{:04X}.0x{:04X} group=0x{:04X}",
+                        eg.service_id, eg.instance_id, eg.event_group_id,
+                    );
+                }
+            }
         }
     }
 
@@ -194,10 +424,6 @@ async fn main() -> Result<(), Error> {
     let mut client = simple_someip::Client::<Payload>::new(interface);
     client.bind_discovery().await.unwrap();
 
-    // For non-broadcasting services, you can manually register an endpoint:
-    // client.add_endpoint(0x1234, 0x0001, SocketAddrV4::new(ip, port)).await.unwrap();
-    // Then use client.send_to_service(0x1234, 0x0001, message).await to send requests.
-
     let mut state = DiscoveryState::new();
 
     while let Some(update) = client.run().await {
@@ -212,109 +438,10 @@ async fn main() -> Result<(), Error> {
                 );
 
                 let header = &msg.sd_header;
-                let options: Vec<_> = header.options.iter().cloned().collect();
+                let options = header.options.clone();
 
                 for entry in &header.entries {
-                    match entry {
-                        Entry::OfferService(svc) => {
-                            let key = (svc.service_id, svc.instance_id);
-                            let endpoints = extract_endpoints(
-                                svc.index_first_options_run,
-                                svc.options_count.first_options_count,
-                                &options,
-                            );
-                            let is_new = !state.services.contains_key(&key);
-                            let info = state.services.entry(key).or_insert(ServiceInfo {
-                                major_version: svc.major_version,
-                                minor_version: svc.minor_version,
-                                ttl: svc.ttl,
-                                endpoints: Vec::new(),
-                                offer_count: 0,
-                            });
-                            info.major_version = svc.major_version;
-                            info.minor_version = svc.minor_version;
-                            info.ttl = svc.ttl;
-                            info.endpoints = endpoints;
-                            info.offer_count += 1;
-
-                            if is_new {
-                                info!(
-                                    "NEW service 0x{:04X}.0x{:04X} v{}.{}",
-                                    svc.service_id,
-                                    svc.instance_id,
-                                    svc.major_version,
-                                    svc.minor_version,
-                                );
-                            }
-                        }
-                        Entry::StopOfferService(svc) => {
-                            let key = (svc.service_id, svc.instance_id);
-                            if state.services.remove(&key).is_some() {
-                                warn!(
-                                    "REMOVED service 0x{:04X}.0x{:04X}",
-                                    svc.service_id, svc.instance_id,
-                                );
-                            }
-                        }
-                        Entry::FindService(svc) => {
-                            state.find_service_count += 1;
-                            info!(
-                                "FindService 0x{:04X}.0x{:04X}",
-                                svc.service_id, svc.instance_id,
-                            );
-                        }
-                        Entry::SubscribeEventGroup(eg) => {
-                            let key = (eg.service_id, eg.instance_id, eg.event_group_id);
-                            let is_new = !state.event_groups.contains_key(&key);
-                            let info = state.event_groups.entry(key).or_insert(EventGroupInfo {
-                                major_version: eg.major_version,
-                                ttl: eg.ttl,
-                                counter: eg.counter,
-                                subscribe_count: 0,
-                                ack_count: 0,
-                                nack_count: 0,
-                            });
-                            info.major_version = eg.major_version;
-                            info.ttl = eg.ttl;
-                            info.counter = eg.counter;
-                            info.subscribe_count += 1;
-
-                            if is_new {
-                                info!(
-                                    "NEW subscription 0x{:04X}.0x{:04X} group=0x{:04X}",
-                                    eg.service_id, eg.instance_id, eg.event_group_id,
-                                );
-                            }
-                        }
-                        Entry::SubscribeAckEventGroup(eg) => {
-                            let key = (eg.service_id, eg.instance_id, eg.event_group_id);
-                            let info = state.event_groups.entry(key).or_insert(EventGroupInfo {
-                                major_version: eg.major_version,
-                                ttl: eg.ttl,
-                                counter: eg.counter,
-                                subscribe_count: 0,
-                                ack_count: 0,
-                                nack_count: 0,
-                            });
-                            info.major_version = eg.major_version;
-                            info.counter = eg.counter;
-
-                            if eg.ttl == 0 {
-                                info.nack_count += 1;
-                                warn!(
-                                    "Subscribe NACK 0x{:04X}.0x{:04X} group=0x{:04X}",
-                                    eg.service_id, eg.instance_id, eg.event_group_id,
-                                );
-                            } else {
-                                info.ttl = eg.ttl;
-                                info.ack_count += 1;
-                                info!(
-                                    "Subscribe ACK 0x{:04X}.0x{:04X} group=0x{:04X}",
-                                    eg.service_id, eg.instance_id, eg.event_group_id,
-                                );
-                            }
-                        }
-                    }
+                    state.process_entry(entry, &options);
                 }
 
                 state.print_summary();

@@ -4,6 +4,9 @@ mod flags;
 mod header;
 mod options;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 use core::net::Ipv4Addr;
 
 /// Standard SOME/IP-SD multicast group address (239.255.0.255).
@@ -20,7 +23,7 @@ pub use entry::{
 };
 pub use error::Error;
 pub use flags::Flags;
-pub use header::{Header, MAX_SD_ENTRIES, MAX_SD_OPTIONS, SdEntries, SdHeaderView, SdOptions};
+pub use header::{Header, SdHeaderView};
 pub use options::{
     MAX_CONFIGURATION_STRING_LENGTH, OptionIter, OptionType, OptionView, Options,
     TransportProtocol, extract_ipv4_endpoint,

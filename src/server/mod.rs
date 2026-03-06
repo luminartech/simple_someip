@@ -16,15 +16,13 @@ pub use event_publisher::EventPublisher;
 pub use service_info::{EventGroupInfo, ServiceInfo};
 pub use subscription_manager::SubscriptionManager;
 
-use crate::protocol::sd::{
-    self, Entry, Flags, OptionsCount, SdEntries, SdOptions, ServiceEntry, TransportProtocol,
-};
+use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
 use core::sync::atomic::Ordering;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
-    prelude::rust_2024::*,
     sync::{Arc, atomic::AtomicU16},
     vec,
+    vec::Vec,
 };
 use tokio::{net::UdpSocket, sync::RwLock};
 
@@ -64,10 +62,7 @@ impl ServerConfig {
 }
 
 /// SOME/IP Server that can offer services and publish events
-pub struct Server<
-    const MAX_ENTRIES: usize = { sd::MAX_SD_ENTRIES },
-    const MAX_OPTIONS: usize = { sd::MAX_SD_OPTIONS },
-> {
+pub struct Server {
     config: ServerConfig,
     /// Socket for receiving subscription requests
     unicast_socket: Arc<UdpSocket>,
@@ -81,7 +76,7 @@ pub struct Server<
     sd_session_id: Arc<AtomicU16>,
 }
 
-impl<const E: usize, const O: usize> Server<E, O> {
+impl Server {
     /// Create a new SOME/IP server
     ///
     /// # Errors
@@ -222,20 +217,9 @@ impl<const E: usize, const O: usize> Server<E, O> {
             protocol: TransportProtocol::Udp,
         };
 
-        // Create SD header with reboot flag set
-        let mut entries = SdEntries::<E>::new();
-        let mut options = SdOptions::<O>::new();
-        entries
-            .push(entry)
-            .expect("SdEntries capacity E must be at least 1 to send OfferService");
-        options
-            .push(option)
-            .expect("SdOptions capacity O must be at least 1 to send OfferService");
-        let sd_payload = sd::Header::<E, O> {
-            flags: Flags::new(true, true),
-            entries,
-            options,
-        };
+        let entries = [entry];
+        let options = [option];
+        let sd_payload = sd::Header::new(Flags::new(true, true), &entries, &options);
 
         // Encode SD payload
         let mut sd_data = Vec::new();
@@ -301,19 +285,9 @@ impl<const E: usize, const O: usize> Server<E, O> {
             protocol: TransportProtocol::Udp,
         };
 
-        let mut entries = SdEntries::<E>::new();
-        let mut options = SdOptions::<O>::new();
-        entries
-            .push(entry)
-            .expect("SdEntries capacity E must be at least 1 for unicast offers");
-        options
-            .push(option)
-            .expect("SdOptions capacity O must be at least 1 for unicast offers");
-        let sd_payload = sd::Header::<E, O> {
-            flags: Flags::new(true, true), // reboot + unicast flags set
-            entries,
-            options,
-        };
+        let entries = [entry];
+        let options = [option];
+        let sd_payload = sd::Header::new(Flags::new(true, true), &entries, &options);
 
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
@@ -574,15 +548,8 @@ impl<const E: usize, const O: usize> Server<E, O> {
             event_group_id: entry_view.event_group_id(),
         });
 
-        let mut entries = SdEntries::<E>::new();
-        entries
-            .push(ack_entry)
-            .expect("SdEntries capacity E must allow at least one entry for SubscribeAck");
-        let sd_payload = sd::Header::<E, O> {
-            flags: Flags::new(true, true),
-            entries,
-            options: SdOptions::<O>::new(),
-        };
+        let entries = [ack_entry];
+        let sd_payload = sd::Header::new(Flags::new(true, true), &entries, &[]);
 
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
@@ -628,15 +595,8 @@ impl<const E: usize, const O: usize> Server<E, O> {
             event_group_id: entry_view.event_group_id(),
         });
 
-        let mut entries = SdEntries::<E>::new();
-        entries.push(nack_entry).expect(
-            "SdEntries<E> must have capacity for at least one entry when sending SubscribeNack",
-        );
-        let sd_payload = sd::Header::<E, O> {
-            flags: Flags::new(true, true),
-            entries,
-            options: SdOptions::<O>::new(),
-        };
+        let entries = [nack_entry];
+        let sd_payload = sd::Header::new(Flags::new(true, true), &entries, &[]);
 
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
@@ -680,7 +640,7 @@ mod tests {
     }
 
     /// Helper: wrap an SD header in a SOME/IP SD message and return the bytes
-    fn build_sd_message(sd_header: &sd::Header) -> Vec<u8> {
+    fn build_sd_message(sd_header: &sd::Header<'_>) -> Vec<u8> {
         let mut sd_data = Vec::new();
         sd_header.encode(&mut sd_data).unwrap();
 
@@ -710,7 +670,7 @@ mod tests {
     async fn create_test_server(service_id: u16, instance_id: u16) -> (Server, u16) {
         // Use port 0 to get an ephemeral port
         let config = ServerConfig::new(Ipv4Addr::new(127, 0, 0, 1), 0, service_id, instance_id);
-        let mut server: Server = Server::new(config).await.expect("Failed to create server");
+        let mut server = Server::new(config).await.expect("Failed to create server");
         let port = match server.unicast_local_addr().unwrap() {
             std::net::SocketAddr::V4(addr) => addr.port(),
             _ => panic!("Expected IPv4 address"),
@@ -720,16 +680,42 @@ mod tests {
         (server, port)
     }
 
+    fn make_subscription_header(
+        service_id: u16,
+        instance_id: u16,
+        major_version: u8,
+        ttl: u32,
+        event_group_id: u16,
+        client_ip: Ipv4Addr,
+        protocol: sd::TransportProtocol,
+        client_port: u16,
+    ) -> Vec<u8> {
+        let entry = Entry::SubscribeEventGroup(sd::EventGroupEntry::new(
+            service_id,
+            instance_id,
+            major_version,
+            ttl,
+            event_group_id,
+        ));
+        let endpoint = sd::Options::IpV4Endpoint {
+            ip: client_ip,
+            protocol,
+            port: client_port,
+        };
+        let entries = [entry];
+        let options = [endpoint];
+        let sd_header = sd::Header::new(Flags::new_sd(false), &entries, &options);
+        build_sd_message(&sd_header)
+    }
+
     #[tokio::test]
     async fn test_subscribe_ack_success() {
         let (mut server, server_port) = create_test_server(0x5B, 1).await;
 
         // Create a client socket to send subscription and receive response
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let _client_addr = client_socket.local_addr().unwrap();
 
-        // Build a SubscribeEventGroup message with the correct port
-        let sd_header = sd::Header::new_subscription(
+        let message = make_subscription_header(
             0x5B,
             1,
             1,
@@ -737,9 +723,8 @@ mod tests {
             0x01,
             Ipv4Addr::new(127, 0, 0, 1),
             sd::TransportProtocol::Udp,
-            server_port, // Correct port
+            server_port,
         );
-        let message = build_sd_message(&sd_header);
 
         // Send to the server
         client_socket
@@ -784,8 +769,7 @@ mod tests {
         let (mut server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        // Subscribe with wrong service ID (0x99 instead of 0x5B)
-        let sd_header = sd::Header::new_subscription(
+        let message = make_subscription_header(
             0x99, // Wrong service
             1,
             1,
@@ -795,7 +779,6 @@ mod tests {
             sd::TransportProtocol::Udp,
             server_port,
         );
-        let message = build_sd_message(&sd_header);
         client_socket
             .send_to(&message, format!("127.0.0.1:{}", server_port))
             .await
@@ -836,8 +819,7 @@ mod tests {
         let (mut server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        // Subscribe with wrong instance ID (99 instead of 1)
-        let sd_header = sd::Header::new_subscription(
+        let message = make_subscription_header(
             0x5B,
             99, // Wrong instance
             1,
@@ -847,7 +829,6 @@ mod tests {
             sd::TransportProtocol::Udp,
             server_port,
         );
-        let message = build_sd_message(&sd_header);
         client_socket
             .send_to(&message, format!("127.0.0.1:{}", server_port))
             .await
@@ -886,7 +867,9 @@ mod tests {
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // Send a FindService for 0x5B
-        let sd_header = sd::Header::new_find_services(false, &[0x5B]);
+        let find_entry = Entry::FindService(ServiceEntry::find(0x5B));
+        let find_entries = [find_entry];
+        let sd_header = sd::Header::new(Flags::new_sd(false), &find_entries, &[]);
         let message = build_sd_message(&sd_header);
         client_socket
             .send_to(&message, format!("127.0.0.1:{}", server_port))
@@ -931,7 +914,9 @@ mod tests {
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // Send wildcard FindService (0xFFFF)
-        let sd_header = sd::Header::new_find_services(false, &[0xFFFF]);
+        let find_entry = Entry::FindService(ServiceEntry::find(0xFFFF));
+        let find_entries = [find_entry];
+        let sd_header = sd::Header::new(Flags::new_sd(false), &find_entries, &[]);
         let message = build_sd_message(&sd_header);
         client_socket
             .send_to(&message, format!("127.0.0.1:{}", server_port))
@@ -972,7 +957,9 @@ mod tests {
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // Send FindService for 0x99 (not our service)
-        let sd_header = sd::Header::new_find_services(false, &[0x99]);
+        let find_entry = Entry::FindService(ServiceEntry::find(0x99));
+        let find_entries = [find_entry];
+        let sd_header = sd::Header::new(Flags::new_sd(false), &find_entries, &[]);
         let message = build_sd_message(&sd_header);
         client_socket
             .send_to(&message, format!("127.0.0.1:{}", server_port))
@@ -1010,13 +997,8 @@ mod tests {
 
         // Build a SubscribeEventGroup with NO endpoint option
         let entry = sd::Entry::SubscribeEventGroup(sd::EventGroupEntry::new(0x5B, 1, 1, 3, 0x01));
-        let mut entries = sd::SdEntries::new();
-        entries.push(entry).unwrap();
-        let sd_header = sd::Header {
-            flags: sd::Flags::new(true, true),
-            entries,
-            options: sd::SdOptions::new(), // empty — no endpoint
-        };
+        let sub_entries = [entry];
+        let sd_header = sd::Header::new(Flags::new(true, true), &sub_entries, &[]);
         let message = build_sd_message(&sd_header);
 
         client_socket
@@ -1124,7 +1106,7 @@ mod tests {
 
         // Small delay, then send valid subscribe
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let sd_header = sd::Header::new_subscription(
+        let message = make_subscription_header(
             0x5B,
             1,
             1,
@@ -1134,7 +1116,6 @@ mod tests {
             sd::TransportProtocol::Udp,
             client_port,
         );
-        let message = build_sd_message(&sd_header);
         client_socket
             .send_to(&message, format!("127.0.0.1:{}", server_port))
             .await
@@ -1183,7 +1164,7 @@ mod tests {
 
         // Small delay, then send valid subscribe
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let sd_header = sd::Header::new_subscription(
+        let message = make_subscription_header(
             0x5B,
             1,
             1,
@@ -1193,7 +1174,6 @@ mod tests {
             sd::TransportProtocol::Udp,
             client_port,
         );
-        let message = build_sd_message(&sd_header);
         client_socket
             .send_to(&message, format!("127.0.0.1:{}", server_port))
             .await
@@ -1249,13 +1229,8 @@ mod tests {
             ttl: 0,
             minor_version: 0,
         });
-        let mut entries = sd::SdEntries::new();
-        entries.push(entry).unwrap();
-        let sd_msg: sd::Header<1, 0> = sd::Header {
-            flags: sd::Flags::new(true, true),
-            entries,
-            options: sd::SdOptions::new(),
-        };
+        let stop_entries = [entry];
+        let sd_msg = sd::Header::new(Flags::new(true, true), &stop_entries, &[]);
 
         // Encode and parse through view types
         let mut buf = [0u8; 64];
@@ -1274,8 +1249,7 @@ mod tests {
         let (mut server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        // Subscribe with a different endpoint port (subscriber's own receive port)
-        let sd_header = sd::Header::new_subscription(
+        let message = make_subscription_header(
             0x5B,
             1,
             1,
@@ -1285,7 +1259,6 @@ mod tests {
             sd::TransportProtocol::Udp,
             server_port.wrapping_add(1), // Subscriber's port, different from server
         );
-        let message = build_sd_message(&sd_header);
         client_socket
             .send_to(&message, format!("127.0.0.1:{}", server_port))
             .await
