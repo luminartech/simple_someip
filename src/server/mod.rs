@@ -20,9 +20,9 @@ use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, Transp
 use core::sync::atomic::Ordering;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
-    prelude::rust_2024::*,
     sync::{Arc, atomic::AtomicU16},
     vec,
+    vec::Vec,
 };
 use tokio::{net::UdpSocket, sync::RwLock};
 

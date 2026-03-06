@@ -1,8 +1,8 @@
 use std::{
+    borrow::ToOwned,
     collections::HashMap,
     future,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    prelude::rust_2024::*,
     task::Poll,
 };
 use tokio::{

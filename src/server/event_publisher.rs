@@ -4,7 +4,7 @@ use super::Error;
 use super::subscription_manager::SubscriptionManager;
 use crate::protocol::{Header, Message};
 use crate::traits::{PayloadWireFormat, WireFormat};
-use std::{prelude::rust_2024::*, sync::Arc};
+use std::{sync::Arc, vec::Vec};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 

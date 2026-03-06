@@ -6,7 +6,6 @@ use crate::{
 use super::error::Error;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
-    prelude::rust_2024::*,
     task::{Context, Poll},
     vec,
 };

@@ -1,6 +1,6 @@
 //! Service and event group information
 
-use std::{net::SocketAddrV4, prelude::rust_2024::*};
+use std::{net::SocketAddrV4, vec::Vec};
 
 /// Information about a SOME/IP service being provided
 #[derive(Debug, Clone)]
