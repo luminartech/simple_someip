@@ -28,6 +28,19 @@ impl Profile4State {
         }
     }
 
+    /// Returns the current protection counter value.
+    #[must_use]
+    pub const fn protect_counter(&self) -> u16 {
+        self.protect_counter
+    }
+
+    /// Returns the last received counter value, or `None` if no message
+    /// has been checked yet.
+    #[must_use]
+    pub const fn last_counter(&self) -> Option<u16> {
+        self.last_counter
+    }
+
     /// Reset the state to initial values.
     pub fn reset(&mut self) {
         self.protect_counter = 0;
@@ -67,6 +80,19 @@ impl Profile5State {
             protect_counter: counter,
             last_counter: None,
         }
+    }
+
+    /// Returns the current protection counter value.
+    #[must_use]
+    pub const fn protect_counter(&self) -> u8 {
+        self.protect_counter
+    }
+
+    /// Returns the last received counter value, or `None` if no message
+    /// has been checked yet.
+    #[must_use]
+    pub const fn last_counter(&self) -> Option<u8> {
+        self.last_counter
     }
 
     /// Reset the state to initial values.
