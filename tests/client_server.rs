@@ -1,154 +1,19 @@
 //! Integration tests exercising the Client and Server together on localhost.
 
-use simple_someip::protocol::{self, Message, MessageId, sd};
+use simple_someip::protocol::{Message, sd};
 use simple_someip::server::ServerConfig;
-use simple_someip::{Client, ClientUpdate, OfferedEndpoint, PayloadWireFormat, Server, WireFormat};
+use simple_someip::{Client, ClientUpdate, RawPayload, Server, VecSdHeader};
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-// ---------------------------------------------------------------------------
-// Test-local payload implementation (Vec-based, std only)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct OwnedSdHeader {
-    flags: sd::Flags,
-    entries: Vec<sd::Entry>,
-    options: Vec<sd::Options>,
-}
-
-impl WireFormat for OwnedSdHeader {
-    fn required_size(&self) -> usize {
-        sd::Header::new(self.flags, &self.entries, &self.options).required_size()
-    }
-
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
-        sd::Header::new(self.flags, &self.entries, &self.options).encode(writer)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DiscoveryOnlyPayload {
-    header: OwnedSdHeader,
-}
-
-impl PayloadWireFormat for DiscoveryOnlyPayload {
-    type SdHeader = OwnedSdHeader;
-
-    fn message_id(&self) -> MessageId {
-        MessageId::SD
-    }
-
-    fn as_sd_header(&self) -> Option<&OwnedSdHeader> {
-        Some(&self.header)
-    }
-
-    fn from_payload_bytes(message_id: MessageId, payload: &[u8]) -> Result<Self, protocol::Error> {
-        match message_id {
-            MessageId::SD => {
-                let view = sd::SdHeaderView::parse(payload)?;
-                let mut entries = Vec::new();
-                for ev in view.entries() {
-                    entries.push(ev.to_owned()?);
-                }
-                let mut options = Vec::new();
-                for ov in view.options() {
-                    options.push(ov.to_owned()?);
-                }
-                Ok(Self {
-                    header: OwnedSdHeader {
-                        flags: view.flags(),
-                        entries,
-                        options,
-                    },
-                })
-            }
-            _ => Err(protocol::Error::UnsupportedMessageID(message_id)),
-        }
-    }
-
-    fn new_sd_payload(header: &OwnedSdHeader) -> Self {
-        Self {
-            header: header.clone(),
-        }
-    }
-
-    fn sd_flags(&self) -> Option<sd::Flags> {
-        Some(self.header.flags)
-    }
-
-    fn required_size(&self) -> usize {
-        self.header.required_size()
-    }
-
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
-        self.header.encode(writer)
-    }
-
-    fn new_subscription_sd_header(
-        service_id: u16,
-        instance_id: u16,
-        major_version: u8,
-        ttl: u32,
-        event_group_id: u16,
-        client_ip: Ipv4Addr,
-        protocol: sd::TransportProtocol,
-        client_port: u16,
-    ) -> OwnedSdHeader {
-        let entry = sd::Entry::SubscribeEventGroup(sd::EventGroupEntry::new(
-            service_id,
-            instance_id,
-            major_version,
-            ttl,
-            event_group_id,
-        ));
-        let endpoint = sd::Options::IpV4Endpoint {
-            ip: client_ip,
-            protocol,
-            port: client_port,
-        };
-        OwnedSdHeader {
-            flags: sd::Flags::new_sd(false),
-            entries: vec![entry],
-            options: vec![endpoint],
-        }
-    }
-
-    fn offered_endpoints(&self) -> Vec<OfferedEndpoint> {
-        self.header
-            .entries
-            .iter()
-            .filter_map(|entry| match entry {
-                sd::Entry::OfferService(svc) | sd::Entry::StopOfferService(svc) => {
-                    let is_offer = matches!(entry, sd::Entry::OfferService(_));
-                    let addr = sd::extract_ipv4_endpoint(&self.header.options);
-                    Some(OfferedEndpoint {
-                        service_id: svc.service_id,
-                        instance_id: svc.instance_id,
-                        major_version: svc.major_version,
-                        minor_version: svc.minor_version,
-                        addr,
-                        is_offer,
-                    })
-                }
-                _ => None,
-            })
-            .collect()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helper to build an empty SD header for constructing minimal test messages
-// ---------------------------------------------------------------------------
-
-fn empty_sd_header() -> OwnedSdHeader {
-    OwnedSdHeader {
+fn empty_sd_header() -> VecSdHeader {
+    VecSdHeader {
         flags: sd::Flags::new_sd(false),
         entries: vec![],
         options: vec![],
     }
 }
 
-type TestClient = Client<DiscoveryOnlyPayload>;
+type TestClient = Client<RawPayload>;
 
 /// Create a server on an ephemeral unicast port, returning (Server, actual_port).
 async fn create_server(service_id: u16, instance_id: u16) -> (Server, u16) {
@@ -204,7 +69,7 @@ async fn test_client_server_subscribe_and_receive_event() {
     let _ = tokio::time::timeout(std::time::Duration::from_millis(250), client.run()).await;
 
     // Publish an event from the server to the client's unicast port
-    let event_msg = Message::<DiscoveryOnlyPayload>::new_sd(0x0001, &empty_sd_header());
+    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
     let sent = publisher
         .publish_event(0x5B, 1, 0x01, &event_msg)
         .await
@@ -236,7 +101,7 @@ async fn test_client_send_sd_auto_binds_discovery() {
     let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
 
     // send_sd_message should auto-bind discovery and succeed
-    let sd_header = OwnedSdHeader {
+    let sd_header = VecSdHeader {
         flags: sd::Flags::new_sd(false),
         entries: vec![sd::Entry::SubscribeEventGroup(sd::EventGroupEntry::new(
             0x5B, 1, 1, 3, 0x01,
@@ -312,7 +177,7 @@ async fn test_add_endpoint_and_send_to_service() {
     let _ = tokio::time::timeout(std::time::Duration::from_millis(250), client.run()).await;
 
     // Publish an event from the server
-    let event_msg = Message::<DiscoveryOnlyPayload>::new_sd(0x0001, &empty_sd_header());
+    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
     let sent = publisher
         .publish_event(0x5B, 1, 0x01, &event_msg)
         .await
@@ -330,7 +195,7 @@ async fn test_add_endpoint_and_send_to_service() {
 
     // Remove the endpoint and verify send_to_service returns ServiceNotFound
     client.remove_endpoint(0x5B, 1).await.unwrap();
-    let msg = Message::<DiscoveryOnlyPayload>::new_sd(0x0001, &empty_sd_header());
+    let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
     let result = client.send_to_service(0x5B, 1, msg).await;
     assert!(
         matches!(result, Err(simple_someip::client::Error::ServiceNotFound)),

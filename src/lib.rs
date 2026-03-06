@@ -71,10 +71,15 @@ pub mod client;
 pub mod e2e;
 /// SOME/IP protocol primitives: headers, messages, return codes, and service discovery.
 pub mod protocol;
+/// A general-purpose, heap-allocated [`PayloadWireFormat`] implementation.
+#[cfg(feature = "std")]
+mod raw_payload;
 /// SOME/IP server for offering services and handling incoming requests.
 #[cfg(feature = "server")]
 pub mod server;
 mod traits;
+#[cfg(feature = "std")]
+pub use raw_payload::{RawPayload, VecSdHeader};
 #[cfg(feature = "std")]
 pub use traits::OfferedEndpoint;
 pub use traits::{PayloadWireFormat, WireFormat};

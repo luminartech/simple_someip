@@ -1,149 +1,15 @@
 use std::{collections::HashMap, fmt, net::Ipv4Addr};
 
 use simple_someip::{
-    PayloadWireFormat, WireFormat,
+    RawPayload,
     protocol::{
-        Error, MessageId,
-        sd::{self, Entry, EventGroupEntry, Flags, Options, SdHeaderView, TransportProtocol},
+        Error,
+        sd::{Entry, Options, TransportProtocol},
     },
 };
 use tracing::{error, info, level_filters::LevelFilter, warn};
 
-// ---------------------------------------------------------------------------
-// Payload — a simple PayloadWireFormat for SD-only usage
-// ---------------------------------------------------------------------------
-
-/// Owned SD header using heap-allocated vectors (std-only).
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct OwnedSdHeader {
-    flags: Flags,
-    entries: Vec<Entry>,
-    options: Vec<Options>,
-}
-
-impl WireFormat for OwnedSdHeader {
-    fn required_size(&self) -> usize {
-        let header = sd::Header::new(self.flags, &self.entries, &self.options);
-        header.required_size()
-    }
-
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
-        let header = sd::Header::new(self.flags, &self.entries, &self.options);
-        header.encode(writer)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DiscoveryOnlyPayload {
-    header: OwnedSdHeader,
-}
-
-impl PayloadWireFormat for DiscoveryOnlyPayload {
-    type SdHeader = OwnedSdHeader;
-
-    fn message_id(&self) -> MessageId {
-        MessageId::SD
-    }
-
-    fn as_sd_header(&self) -> Option<&OwnedSdHeader> {
-        Some(&self.header)
-    }
-
-    fn from_payload_bytes(message_id: MessageId, payload: &[u8]) -> Result<Self, Error> {
-        match message_id {
-            MessageId::SD => {
-                let view = SdHeaderView::parse(payload)?;
-                let mut entries = Vec::new();
-                for entry_view in view.entries() {
-                    entries.push(entry_view.to_owned()?);
-                }
-                let mut options = Vec::new();
-                for option_view in view.options() {
-                    options.push(option_view.to_owned()?);
-                }
-                Ok(Self {
-                    header: OwnedSdHeader {
-                        flags: view.flags(),
-                        entries,
-                        options,
-                    },
-                })
-            }
-            _ => Err(Error::UnsupportedMessageID(message_id)),
-        }
-    }
-
-    fn new_sd_payload(header: &OwnedSdHeader) -> Self {
-        Self {
-            header: header.clone(),
-        }
-    }
-
-    fn sd_flags(&self) -> Option<Flags> {
-        Some(self.header.flags)
-    }
-
-    fn required_size(&self) -> usize {
-        self.header.required_size()
-    }
-
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
-        self.header.encode(writer)
-    }
-
-    fn new_subscription_sd_header(
-        service_id: u16,
-        instance_id: u16,
-        major_version: u8,
-        ttl: u32,
-        event_group_id: u16,
-        client_ip: Ipv4Addr,
-        protocol: TransportProtocol,
-        client_port: u16,
-    ) -> OwnedSdHeader {
-        let entry = Entry::SubscribeEventGroup(EventGroupEntry::new(
-            service_id,
-            instance_id,
-            major_version,
-            ttl,
-            event_group_id,
-        ));
-        let endpoint = Options::IpV4Endpoint {
-            ip: client_ip,
-            protocol,
-            port: client_port,
-        };
-        OwnedSdHeader {
-            flags: Flags::new_sd(false),
-            entries: vec![entry],
-            options: vec![endpoint],
-        }
-    }
-
-    fn offered_endpoints(&self) -> Vec<simple_someip::OfferedEndpoint> {
-        self.header
-            .entries
-            .iter()
-            .filter_map(|entry| match entry {
-                Entry::OfferService(svc) | Entry::StopOfferService(svc) => {
-                    let is_offer = matches!(entry, Entry::OfferService(_));
-                    let addr = sd::extract_ipv4_endpoint(&self.header.options);
-                    Some(simple_someip::OfferedEndpoint {
-                        service_id: svc.service_id,
-                        instance_id: svc.instance_id,
-                        major_version: svc.major_version,
-                        minor_version: svc.minor_version,
-                        addr,
-                        is_offer,
-                    })
-                }
-                _ => None,
-            })
-            .collect()
-    }
-}
-
-type Payload = DiscoveryOnlyPayload;
+type Payload = RawPayload;
 
 /// Endpoint information extracted from SD options.
 #[derive(Clone)]
