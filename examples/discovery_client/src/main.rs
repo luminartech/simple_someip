@@ -3,11 +3,8 @@ use std::{collections::HashMap, fmt, net::Ipv4Addr};
 use simple_someip::{
     PayloadWireFormat, WireFormat,
     protocol::{
-        self, Error, MessageId,
-        sd::{
-            self, Entry, EventGroupEntry, Flags, Options, OptionsCount, SdHeaderView, ServiceEntry,
-            TransportProtocol,
-        },
+        Error, MessageId,
+        sd::{self, Entry, EventGroupEntry, Flags, Options, SdHeaderView, TransportProtocol},
     },
 };
 use tracing::{error, info, level_filters::LevelFilter, warn};
@@ -234,10 +231,10 @@ impl fmt::Display for EventGroupInfo {
     }
 }
 
-/// Key for identifying a service: (service_id, instance_id).
+/// Key for identifying a service: (`service_id`, `instance_id`).
 type ServiceKey = (u16, u16);
 
-/// Key for identifying an event group: (service_id, instance_id, event_group_id).
+/// Key for identifying an event group: (`service_id`, `instance_id`, `event_group_id`).
 type EventGroupKey = (u16, u16, u16);
 
 struct DiscoveryState {
@@ -254,6 +251,106 @@ impl DiscoveryState {
             event_groups: HashMap::new(),
             total_messages: 0,
             find_service_count: 0,
+        }
+    }
+
+    fn process_entry(&mut self, entry: &Entry, options: &[Options]) {
+        match entry {
+            Entry::OfferService(svc) => {
+                let key = (svc.service_id, svc.instance_id);
+                let endpoints = extract_endpoints(
+                    svc.index_first_options_run,
+                    svc.options_count.first_options_count,
+                    options,
+                );
+                let is_new = !self.services.contains_key(&key);
+                let info = self.services.entry(key).or_insert(ServiceInfo {
+                    major_version: svc.major_version,
+                    minor_version: svc.minor_version,
+                    ttl: svc.ttl,
+                    endpoints: Vec::new(),
+                    offer_count: 0,
+                });
+                info.major_version = svc.major_version;
+                info.minor_version = svc.minor_version;
+                info.ttl = svc.ttl;
+                info.endpoints = endpoints;
+                info.offer_count += 1;
+
+                if is_new {
+                    info!(
+                        "NEW service 0x{:04X}.0x{:04X} v{}.{}",
+                        svc.service_id, svc.instance_id, svc.major_version, svc.minor_version,
+                    );
+                }
+            }
+            Entry::StopOfferService(svc) => {
+                let key = (svc.service_id, svc.instance_id);
+                if self.services.remove(&key).is_some() {
+                    warn!(
+                        "REMOVED service 0x{:04X}.0x{:04X}",
+                        svc.service_id, svc.instance_id,
+                    );
+                }
+            }
+            Entry::FindService(svc) => {
+                self.find_service_count += 1;
+                info!(
+                    "FindService 0x{:04X}.0x{:04X}",
+                    svc.service_id, svc.instance_id,
+                );
+            }
+            Entry::SubscribeEventGroup(eg) => {
+                let key = (eg.service_id, eg.instance_id, eg.event_group_id);
+                let is_new = !self.event_groups.contains_key(&key);
+                let info = self.event_groups.entry(key).or_insert(EventGroupInfo {
+                    major_version: eg.major_version,
+                    ttl: eg.ttl,
+                    counter: eg.counter,
+                    subscribe_count: 0,
+                    ack_count: 0,
+                    nack_count: 0,
+                });
+                info.major_version = eg.major_version;
+                info.ttl = eg.ttl;
+                info.counter = eg.counter;
+                info.subscribe_count += 1;
+
+                if is_new {
+                    info!(
+                        "NEW subscription 0x{:04X}.0x{:04X} group=0x{:04X}",
+                        eg.service_id, eg.instance_id, eg.event_group_id,
+                    );
+                }
+            }
+            Entry::SubscribeAckEventGroup(eg) => {
+                let key = (eg.service_id, eg.instance_id, eg.event_group_id);
+                let info = self.event_groups.entry(key).or_insert(EventGroupInfo {
+                    major_version: eg.major_version,
+                    ttl: eg.ttl,
+                    counter: eg.counter,
+                    subscribe_count: 0,
+                    ack_count: 0,
+                    nack_count: 0,
+                });
+                info.major_version = eg.major_version;
+                info.counter = eg.counter;
+
+                if eg.ttl == 0 {
+                    info.nack_count += 1;
+                    warn!(
+                        "Subscribe NACK 0x{:04X}.0x{:04X} group=0x{:04X}",
+                        eg.service_id, eg.instance_id, eg.event_group_id,
+                    );
+                } else {
+                    info.ttl = eg.ttl;
+                    info.ack_count += 1;
+                    info!(
+                        "Subscribe ACK 0x{:04X}.0x{:04X} group=0x{:04X}",
+                        eg.service_id, eg.instance_id, eg.event_group_id,
+                    );
+                }
+            }
         }
     }
 
@@ -341,109 +438,10 @@ async fn main() -> Result<(), Error> {
                 );
 
                 let header = &msg.sd_header;
-                let options: Vec<_> = header.options.iter().cloned().collect();
+                let options = header.options.clone();
 
                 for entry in &header.entries {
-                    match entry {
-                        Entry::OfferService(svc) => {
-                            let key = (svc.service_id, svc.instance_id);
-                            let endpoints = extract_endpoints(
-                                svc.index_first_options_run,
-                                svc.options_count.first_options_count,
-                                &options,
-                            );
-                            let is_new = !state.services.contains_key(&key);
-                            let info = state.services.entry(key).or_insert(ServiceInfo {
-                                major_version: svc.major_version,
-                                minor_version: svc.minor_version,
-                                ttl: svc.ttl,
-                                endpoints: Vec::new(),
-                                offer_count: 0,
-                            });
-                            info.major_version = svc.major_version;
-                            info.minor_version = svc.minor_version;
-                            info.ttl = svc.ttl;
-                            info.endpoints = endpoints;
-                            info.offer_count += 1;
-
-                            if is_new {
-                                info!(
-                                    "NEW service 0x{:04X}.0x{:04X} v{}.{}",
-                                    svc.service_id,
-                                    svc.instance_id,
-                                    svc.major_version,
-                                    svc.minor_version,
-                                );
-                            }
-                        }
-                        Entry::StopOfferService(svc) => {
-                            let key = (svc.service_id, svc.instance_id);
-                            if state.services.remove(&key).is_some() {
-                                warn!(
-                                    "REMOVED service 0x{:04X}.0x{:04X}",
-                                    svc.service_id, svc.instance_id,
-                                );
-                            }
-                        }
-                        Entry::FindService(svc) => {
-                            state.find_service_count += 1;
-                            info!(
-                                "FindService 0x{:04X}.0x{:04X}",
-                                svc.service_id, svc.instance_id,
-                            );
-                        }
-                        Entry::SubscribeEventGroup(eg) => {
-                            let key = (eg.service_id, eg.instance_id, eg.event_group_id);
-                            let is_new = !state.event_groups.contains_key(&key);
-                            let info = state.event_groups.entry(key).or_insert(EventGroupInfo {
-                                major_version: eg.major_version,
-                                ttl: eg.ttl,
-                                counter: eg.counter,
-                                subscribe_count: 0,
-                                ack_count: 0,
-                                nack_count: 0,
-                            });
-                            info.major_version = eg.major_version;
-                            info.ttl = eg.ttl;
-                            info.counter = eg.counter;
-                            info.subscribe_count += 1;
-
-                            if is_new {
-                                info!(
-                                    "NEW subscription 0x{:04X}.0x{:04X} group=0x{:04X}",
-                                    eg.service_id, eg.instance_id, eg.event_group_id,
-                                );
-                            }
-                        }
-                        Entry::SubscribeAckEventGroup(eg) => {
-                            let key = (eg.service_id, eg.instance_id, eg.event_group_id);
-                            let info = state.event_groups.entry(key).or_insert(EventGroupInfo {
-                                major_version: eg.major_version,
-                                ttl: eg.ttl,
-                                counter: eg.counter,
-                                subscribe_count: 0,
-                                ack_count: 0,
-                                nack_count: 0,
-                            });
-                            info.major_version = eg.major_version;
-                            info.counter = eg.counter;
-
-                            if eg.ttl == 0 {
-                                info.nack_count += 1;
-                                warn!(
-                                    "Subscribe NACK 0x{:04X}.0x{:04X} group=0x{:04X}",
-                                    eg.service_id, eg.instance_id, eg.event_group_id,
-                                );
-                            } else {
-                                info.ttl = eg.ttl;
-                                info.ack_count += 1;
-                                info!(
-                                    "Subscribe ACK 0x{:04X}.0x{:04X} group=0x{:04X}",
-                                    eg.service_id, eg.instance_id, eg.event_group_id,
-                                );
-                            }
-                        }
-                    }
+                    state.process_entry(entry, &options);
                 }
 
                 state.print_summary();
