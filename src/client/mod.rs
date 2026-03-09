@@ -160,9 +160,16 @@ where
         major_version: u8,
         ttl: u32,
         event_group_id: u16,
+        client_port: u16,
     ) -> Result<(), Error> {
-        let (response, message) =
-            ControlMessage::subscribe(service_id, instance_id, major_version, ttl, event_group_id);
+        let (response, message) = ControlMessage::subscribe(
+            service_id,
+            instance_id,
+            major_version,
+            ttl,
+            event_group_id,
+            client_port,
+        );
         self.control_sender.send(message).await.unwrap();
         response.await.unwrap()
     }
@@ -322,7 +329,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_unknown_service_returns_error() {
         let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
-        let result = client.subscribe(0xFFFF, 0xFFFF, 1, 3, 0x01).await;
+        let result = client.subscribe(0xFFFF, 0xFFFF, 1, 3, 0x01, 0).await;
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),
             "expected ServiceNotFound, got {result:?}"

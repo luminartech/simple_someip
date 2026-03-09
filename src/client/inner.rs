@@ -46,6 +46,7 @@ pub(super) enum ControlMessage<P: PayloadWireFormat> {
         major_version: u8,
         ttl: u32,
         event_group_id: u16,
+        client_port: u16,
         response: oneshot::Sender<Result<(), Error>>,
     },
 }
@@ -154,6 +155,7 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
         major_version: u8,
         ttl: u32,
         event_group_id: u16,
+        client_port: u16,
     ) -> (oneshot::Receiver<Result<(), Error>>, Self) {
         let (sender, receiver) = oneshot::channel();
         (
@@ -164,6 +166,7 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
                 major_version,
                 ttl,
                 event_group_id,
+                client_port,
                 response: sender,
             },
         )
@@ -430,6 +433,7 @@ where
                         },
                         ServiceEndpointInfo {
                             addr,
+                            sd_source: None,
                             major_version: 0xFF,
                             minor_version: 0xFFFF_FFFF,
                         },
@@ -509,6 +513,7 @@ where
                     major_version,
                     ttl,
                     event_group_id,
+                    client_port,
                     response,
                 } => {
                     // Look up endpoint from service registry
@@ -521,20 +526,17 @@ where
                         return;
                     }
 
-                    // Auto-bind unicast if no sockets exist
-                    if self.unicast_sockets.is_empty() {
-                        match self.bind_unicast(0) {
-                            Ok(port) => {
-                                debug!("Auto-bound unicast on port {} for Subscribe", port);
-                            }
-                            Err(e) => {
-                                let _ = response.send(Err(e));
-                                return;
-                            }
+                    // Bind unicast on the requested port (0 = ephemeral)
+                    let unicast_port = match self.bind_unicast(client_port) {
+                        Ok(port) => {
+                            debug!("Bound unicast on port {} for Subscribe", port);
+                            port
                         }
-                    }
-
-                    let unicast_port = *self.unicast_sockets.keys().next().unwrap();
+                        Err(e) => {
+                            let _ = response.send(Err(e));
+                            return;
+                        }
+                    };
 
                     // Auto-bind discovery if not bound (re-queue like SendSD does)
                     match &mut self.discovery_socket {
@@ -546,6 +548,7 @@ where
                                     major_version,
                                     ttl,
                                     event_group_id,
+                                    client_port,
                                     response,
                                 });
                             }
@@ -567,7 +570,11 @@ where
                             let session_id = u32::from(discovery_socket.session_id());
                             let message =
                                 Message::<PayloadDefinitions>::new_sd(session_id, &sd_header);
-                            let target = self.service_registry.get(id).unwrap().addr;
+                            // Use the SD source address if known (correct for auto-discovered
+                            // services), otherwise fall back to the registered data endpoint
+                            // (correct for manually-added services in tests).
+                            let reg = self.service_registry.get(id).unwrap();
+                            let target = reg.sd_source.unwrap_or(reg.addr);
                             debug!("Sending Subscribe {:?} to {}", &message, target);
                             let send_result = self
                                 .discovery_socket
@@ -658,6 +665,10 @@ where
                                 }
 
                                 // Auto-populate service registry from SD entries
+                                let sd_source = match source {
+                                    std::net::SocketAddr::V4(v4) => Some(SocketAddrV4::new(*v4.ip(), protocol::sd::MULTICAST_PORT)),
+                                    _ => None,
+                                };
                                 let sd_payload = PayloadDefinitions::new_sd_payload(&sd_header);
                                 for ep in sd_payload.offered_endpoints() {
                                     let id = ServiceInstanceId {
@@ -670,6 +681,7 @@ where
                                                 id,
                                                 ServiceEndpointInfo {
                                                     addr,
+                                                    sd_source,
                                                     major_version: ep.major_version,
                                                     minor_version: ep.minor_version,
                                                 },

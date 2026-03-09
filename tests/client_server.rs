@@ -58,7 +58,7 @@ async fn test_client_server_subscribe_and_receive_event() {
     let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr).await.unwrap();
-    client.subscribe(0x5B, 1, 1, 3, 0x01).await.unwrap();
+    client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
 
     assert!(
         wait_for_subscribers(&publisher, 0x5B, 1, 0x01).await,
@@ -135,7 +135,7 @@ async fn test_client_bind_unbind_lifecycle_with_server() {
     client.bind_discovery().await.unwrap();
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr).await.unwrap();
-    client.subscribe(0x5B, 1, 1, 3, 0x01).await.unwrap();
+    client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
 
     // Unbind and rebind discovery — covers unbind_discovery + re-bind path
     client.unbind_discovery().await.unwrap();
@@ -165,7 +165,7 @@ async fn test_add_endpoint_and_send_to_service() {
     client.add_endpoint(0x5B, 1, server_addr).await.unwrap();
 
     // Subscribe to server's event group (auto-binds unicast internally)
-    client.subscribe(0x5B, 1, 1, 3, 0x01).await.unwrap();
+    client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
 
     // Wait for the server to process the subscription
     assert!(
