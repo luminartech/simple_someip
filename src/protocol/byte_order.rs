@@ -5,22 +5,41 @@ use embedded_io::Error as _;
 ///
 /// The only required method is [`write_bytes`](WriteBytesExt::write_bytes).
 /// Backed by `embedded_io::Write` via a blanket impl.
-pub(crate) trait WriteBytesExt {
+pub trait WriteBytesExt {
     /// Write all bytes from `buf` to the stream.
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`] if the underlying writer fails.
     fn write_bytes(&mut self, buf: &[u8]) -> Result<(), Error>;
 
+    /// Write a single byte to the stream.
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`] if the underlying writer fails.
     fn write_u8(&mut self, val: u8) -> Result<(), Error> {
         self.write_bytes(&[val])
     }
 
+    /// Write a `u16` in big-endian byte order.
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`] if the underlying writer fails.
     fn write_u16_be(&mut self, val: u16) -> Result<(), Error> {
         self.write_bytes(&val.to_be_bytes())
     }
 
+    /// Write the lower 3 bytes of a `u32` in big-endian byte order.
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`] if the underlying writer fails.
     fn write_u24_be(&mut self, val: u32) -> Result<(), Error> {
         self.write_bytes(&val.to_be_bytes()[1..])
     }
 
+    /// Write a `u32` in big-endian byte order.
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`] if the underlying writer fails.
     fn write_u32_be(&mut self, val: u32) -> Result<(), Error> {
         self.write_bytes(&val.to_be_bytes())
     }
