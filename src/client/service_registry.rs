@@ -9,11 +9,6 @@ pub struct ServiceInstanceId {
 #[derive(Clone, Debug)]
 pub struct ServiceEndpointInfo {
     pub addr: SocketAddrV4,
-    /// SD source address (set when auto-populated from SD offers).
-    /// Used as the subscribe target instead of `addr` when present,
-    /// because `addr` is the service data endpoint while subscribes
-    /// must reach the remote SD listener.
-    pub sd_source: Option<SocketAddrV4>,
     #[allow(dead_code)]
     pub major_version: u8,
     #[allow(dead_code)]
@@ -54,7 +49,6 @@ mod tests {
     fn test_info(port: u16) -> ServiceEndpointInfo {
         ServiceEndpointInfo {
             addr: SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), port),
-            sd_source: None,
             major_version: 1,
             minor_version: 0,
         }

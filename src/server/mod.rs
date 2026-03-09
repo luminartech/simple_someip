@@ -96,16 +96,15 @@ impl Server {
         // Bind SD socket for sending/receiving SD messages (must use SD port 30490)
         let expected_sd_port = sd::MULTICAST_PORT;
         let sd_bind_addr =
-            std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), expected_sd_port);
+            std::net::SocketAddr::new(IpAddr::V4(config.interface), expected_sd_port);
         let sd_raw_socket = socket2::Socket::new(
             socket2::Domain::IPV4,
             socket2::Type::DGRAM,
             Some(socket2::Protocol::UDP),
         )?;
         sd_raw_socket.set_reuse_address(true)?;
-        #[cfg(unix)]
-        sd_raw_socket.set_reuse_port(true)?;
         sd_raw_socket.set_multicast_if_v4(&config.interface)?;
+        sd_raw_socket.set_multicast_loop_v4(false)?;
         sd_raw_socket.bind(&sd_bind_addr.into())?;
         sd_raw_socket.set_nonblocking(true)?;
         let sd_std_socket: std::net::UdpSocket = sd_raw_socket.into();
@@ -372,14 +371,8 @@ impl Server {
             };
             let data = &data[..len];
 
-            // Skip our own multicast messages
-            if let std::net::SocketAddr::V4(v4) = addr
-                && *v4.ip() == self.config.interface
-                && source == "sd-multicast"
-            {
-                tracing::trace!("Ignoring our own SD multicast message");
-                continue;
-            }
+            // Own multicast messages are suppressed via IP_MULTICAST_LOOP=false
+            // on the SD socket, so no source-IP filtering is needed here.
 
             tracing::trace!("Received {} bytes from {} on {} socket", len, addr, source);
             tracing::trace!("Raw data: {:02X?}", &data[..len.min(64_usize)]);
@@ -1069,6 +1062,7 @@ mod tests {
         assert_eq!(entry.instance_id(), 1);
 
         // Also test that start_announcing doesn't error
+        drop(server);
         let (server2, _) = create_test_server(0x5B, 1).await;
         assert!(server2.start_announcing().is_ok());
     }
