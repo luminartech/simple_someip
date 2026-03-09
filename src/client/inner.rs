@@ -667,7 +667,7 @@ where
                                 // Auto-populate service registry from SD entries
                                 let sd_source = match source {
                                     std::net::SocketAddr::V4(v4) => Some(SocketAddrV4::new(*v4.ip(), protocol::sd::MULTICAST_PORT)),
-                                    _ => None,
+                                    std::net::SocketAddr::V6(_) => None,
                                 };
                                 let sd_payload = PayloadDefinitions::new_sd_payload(&sd_header);
                                 for ep in sd_payload.offered_endpoints() {
