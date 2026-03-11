@@ -1,4 +1,4 @@
-pub(crate) mod byte_order;
+pub mod byte_order;
 mod error;
 mod header;
 mod message;
