@@ -797,6 +797,20 @@ mod tests {
         let sd_header = empty_sd_header();
         let (_rx, msg) = TestControl::send_sd(target, sd_header);
         assert!(matches!(msg, ControlMessage::SendSD(..)));
+
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (_rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        assert!(matches!(msg, ControlMessage::AddEndpoint(..)));
+
+        let (_rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
+        assert!(matches!(msg, ControlMessage::RemoveEndpoint(..)));
+
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let (_send_rx, _resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
+        assert!(matches!(msg, ControlMessage::SendToService { .. }));
+
+        let (_rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
+        assert!(matches!(msg, ControlMessage::Subscribe { .. }));
     }
 
     #[test]
@@ -815,6 +829,28 @@ mod tests {
         let sd_header = empty_sd_header();
         let (_rx, msg) = TestControl::send_sd(target, sd_header);
         assert!(format!("{msg:?}").contains("SendSD"));
+
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (_rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        let s = format!("{msg:?}");
+        assert!(s.contains("AddEndpoint"));
+
+        let (_rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
+        let s = format!("{msg:?}");
+        assert!(s.contains("RemoveEndpoint"));
+
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let (_send_rx, _resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
+        let s = format!("{msg:?}");
+        assert!(s.contains("SendToService"));
+        assert!(s.contains("service_id"));
+        assert!(s.contains("instance_id"));
+
+        let (_rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
+        let s = format!("{msg:?}");
+        assert!(s.contains("Subscribe"));
+        assert!(s.contains("service_id"));
+        assert!(s.contains("event_group_id"));
     }
 
     #[tokio::test]
@@ -952,6 +988,77 @@ mod tests {
         );
 
         // Verify inner loop is still alive
+        assert_inner_alive(&control_sender).await;
+    }
+
+    #[test]
+    fn test_send_to_service_constructor_returns_two_receivers() {
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let (send_rx, resp_rx, _msg) = TestControl::send_to_service(0x1234, 0x0001, message);
+
+        // Extract the senders from the control message
+        if let ControlMessage::SendToService {
+            send_complete,
+            response,
+            ..
+        } = _msg
+        {
+            // Both channels are independent — sending on one doesn't affect the other
+            send_complete.send(Ok(())).unwrap();
+            assert!(send_rx.blocking_recv().unwrap().is_ok());
+
+            let payload = TestPayload {
+                header: empty_sd_header(),
+            };
+            response.send(Ok(payload.clone())).unwrap();
+            assert_eq!(resp_rx.blocking_recv().unwrap().unwrap(), payload);
+        } else {
+            panic!("expected SendToService variant");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dropped_receiver_add_endpoint_continues() {
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        drop(rx);
+        control_sender.send(msg).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert_inner_alive(&control_sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_dropped_receiver_remove_endpoint_continues() {
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        let (rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
+        drop(rx);
+        control_sender.send(msg).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert_inner_alive(&control_sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_dropped_receiver_send_to_service_send_complete_continues() {
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        // Add an endpoint first so SendToService doesn't fail with ServiceNotFound
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // Send SendToService with the send_complete receiver dropped
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let (send_rx, _resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
+        drop(send_rx);
+        control_sender.send(msg).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
         assert_inner_alive(&control_sender).await;
     }
 }

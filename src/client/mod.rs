@@ -420,4 +420,36 @@ mod tests {
         client.remove_endpoint(0x1234, 0x0001).await.unwrap();
         client.shut_down().await;
     }
+
+    #[test]
+    fn test_pending_response_debug() {
+        let (_tx, rx) = oneshot::channel::<Result<TestPayload, Error>>();
+        let pending = PendingResponse { receiver: rx };
+        let s = format!("{pending:?}");
+        assert!(s.contains("PendingResponse"));
+    }
+
+    #[tokio::test]
+    async fn test_pending_response_resolves_ok() {
+        let (tx, rx) = oneshot::channel::<Result<TestPayload, Error>>();
+        let pending = PendingResponse { receiver: rx };
+        let payload = TestPayload {
+            header: empty_sd_header(),
+        };
+        tx.send(Ok(payload.clone())).unwrap();
+        let result = pending.response().await;
+        assert_eq!(result.unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn test_pending_response_resolves_err() {
+        let (tx, rx) = oneshot::channel::<Result<TestPayload, Error>>();
+        let pending = PendingResponse { receiver: rx };
+        tx.send(Err(Error::ServiceNotFound)).unwrap();
+        let result = pending.response().await;
+        assert!(
+            matches!(result, Err(Error::ServiceNotFound)),
+            "expected ServiceNotFound, got {result:?}"
+        );
+    }
 }
