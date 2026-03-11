@@ -1,5 +1,10 @@
 [profile.default]
 
+# Synchronous tests in the main binary share a process with tokio-based tests.
+# The tokio worker threads can take slightly longer to tear down under load,
+# causing false-positive leak reports with the default 100ms timeout.
+leak-timeout = "1s"
+
 # Server tests and client-server integration tests all bind the SD multicast
 # port (30490) and must run serially.
 [[profile.default.overrides]]
