@@ -201,6 +201,8 @@ async fn test_add_endpoint_and_send_to_service() {
         matches!(result, Err(simple_someip::client::Error::ServiceNotFound)),
         "expected ServiceNotFound after remove, got {result:?}"
     );
+    // Verify that PendingResponse is importable from the crate root
+    let _: fn() -> Option<simple_someip::PendingResponse<RawPayload>> = || None;
 
     client.shut_down().await;
     server_handle.abort();

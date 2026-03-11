@@ -9,8 +9,38 @@ pub use error::Error;
 use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
 use inner::{ControlMessage, Inner};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::info;
+
+/// Handle to a pending SOME/IP request-response transaction.
+/// Resolves when the inner loop receives a matching unicast reply.
+/// Does not borrow `Client`.
+pub struct PendingResponse<P> {
+    receiver: oneshot::Receiver<Result<P, Error>>,
+}
+
+impl<P> std::fmt::Debug for PendingResponse<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingResponse").finish_non_exhaustive()
+    }
+}
+
+impl<P> PendingResponse<P> {
+    /// Await the response payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as the request itself (e.g. deserialization failure).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner loop dropped the response channel.
+    pub async fn response(self) -> Result<P, Error> {
+        self.receiver
+            .await
+            .expect("inner loop dropped response channel")
+    }
+}
 
 /// A discovery message together with its source address and SOME/IP header.
 pub struct DiscoveryMessage<P: PayloadWireFormat> {
@@ -232,11 +262,15 @@ where
         response.await.unwrap()
     }
 
-    /// Sends a message to a service and awaits the response payload.
+    /// Sends a message to a service and returns a handle to await the response.
+    ///
+    /// The `&mut self` borrow is released once the UDP send completes.
+    /// Call `.response()` on the returned handle to await the reply payload.
     ///
     /// # Errors
     ///
-    /// Returns an error if the service is not found or sending fails.
+    /// Returns an error if the service is not found, unicast binding fails,
+    /// or the UDP send fails.
     ///
     /// # Panics
     ///
@@ -246,10 +280,14 @@ where
         service_id: u16,
         instance_id: u16,
         message: crate::protocol::Message<MessageDefinitions>,
-    ) -> Result<MessageDefinitions, Error> {
-        let (response, message) = ControlMessage::send_to_service(service_id, instance_id, message);
-        self.control_sender.send(message).await.unwrap();
-        response.await.unwrap()
+    ) -> Result<PendingResponse<MessageDefinitions>, Error> {
+        let (send_rx, response_rx, ctrl_msg) =
+            ControlMessage::send_to_service(service_id, instance_id, message);
+        self.control_sender.send(ctrl_msg).await.unwrap();
+        send_rx.await.unwrap()?;
+        Ok(PendingResponse {
+            receiver: response_rx,
+        })
     }
 
     /// Shuts down the client, dropping the control channel and draining remaining updates.
