@@ -38,7 +38,7 @@ pub(super) enum ControlMessage<P: PayloadWireFormat> {
         P::SdHeader,
         oneshot::Sender<Result<(), Error>>,
     ),
-    AddEndpoint(u16, u16, SocketAddrV4, oneshot::Sender<Result<(), Error>>),
+    AddEndpoint(u16, u16, SocketAddrV4, u16, oneshot::Sender<Result<(), Error>>),
     RemoveEndpoint(u16, u16, oneshot::Sender<Result<(), Error>>),
     SendToService {
         service_id: u16,
@@ -69,11 +69,12 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ControlMessage<P> {
             Self::SendSD(addr, header, _) => {
                 f.debug_tuple("SendSD").field(addr).field(header).finish()
             }
-            Self::AddEndpoint(sid, iid, addr, _) => f
+            Self::AddEndpoint(sid, iid, addr, local_port, _) => f
                 .debug_tuple("AddEndpoint")
                 .field(sid)
                 .field(iid)
                 .field(addr)
+                .field(local_port)
                 .finish(),
             Self::RemoveEndpoint(sid, iid, _) => f
                 .debug_tuple("RemoveEndpoint")
@@ -131,11 +132,12 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
         service_id: u16,
         instance_id: u16,
         addr: SocketAddrV4,
+        local_port: u16,
     ) -> (oneshot::Receiver<Result<(), Error>>, Self) {
         let (sender, receiver) = oneshot::channel();
         (
             receiver,
-            Self::AddEndpoint(service_id, instance_id, addr, sender),
+            Self::AddEndpoint(service_id, instance_id, addr, local_port, sender),
         )
     }
 
@@ -459,7 +461,7 @@ where
                         }
                     }
                 }
-                ControlMessage::AddEndpoint(service_id, instance_id, addr, response) => {
+                ControlMessage::AddEndpoint(service_id, instance_id, addr, local_port, response) => {
                     self.service_registry.insert(
                         ServiceInstanceId {
                             service_id,
@@ -467,6 +469,7 @@ where
                         },
                         ServiceEndpointInfo {
                             addr,
+                            local_port,
                             major_version: 0xFF,
                             minor_version: 0xFFFF_FFFF,
                         },
@@ -508,22 +511,37 @@ where
                         return;
                     };
                     let target = endpoint.addr;
+                    let desired_port = endpoint.local_port;
 
-                    // Auto-bind unicast if no sockets exist
-                    if self.unicast_sockets.is_empty() {
-                        match self.bind_unicast(0) {
-                            Ok(port) => {
-                                debug!("Auto-bound unicast on port {} for SendToService", port);
+                    let source_port = if desired_port == 0 {
+                        // Ephemeral: auto-bind only if no sockets exist, then use first
+                        if self.unicast_sockets.is_empty() {
+                            match self.bind_unicast(0) {
+                                Ok(port) => {
+                                    debug!(
+                                        "Auto-bound unicast on port {} for SendToService",
+                                        port
+                                    );
+                                    port
+                                }
+                                Err(e) => {
+                                    let _ = send_complete.send(Err(e));
+                                    return;
+                                }
                             }
+                        } else {
+                            *self.unicast_sockets.keys().next().unwrap()
+                        }
+                    } else {
+                        // Specific port: bind if not already bound
+                        match self.bind_unicast(desired_port) {
+                            Ok(port) => port,
                             Err(e) => {
                                 let _ = send_complete.send(Err(e));
                                 return;
                             }
                         }
-                    }
-
-                    // Use the first available unicast socket
-                    let source_port = *self.unicast_sockets.keys().next().unwrap();
+                    };
                     let socket = self.unicast_sockets.get_mut(&source_port).unwrap();
 
                     // Stamp request ID
@@ -707,6 +725,7 @@ where
                                                 id,
                                                 ServiceEndpointInfo {
                                                     addr,
+                                                    local_port: 0,
                                                     major_version: ep.major_version,
                                                     minor_version: ep.minor_version,
                                                 },
@@ -806,7 +825,7 @@ mod tests {
         assert!(matches!(msg, ControlMessage::SendSD(..)));
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
-        let (_rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        let (_rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         assert!(matches!(msg, ControlMessage::AddEndpoint(..)));
 
         let (_rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
@@ -838,7 +857,7 @@ mod tests {
         assert!(format!("{msg:?}").contains("SendSD"));
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
-        let (_rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        let (_rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         let s = format!("{msg:?}");
         assert!(s.contains("AddEndpoint"));
 
@@ -879,7 +898,7 @@ mod tests {
     /// checking that a response arrives within 2 seconds.
     async fn assert_inner_alive(control_sender: &Sender<ControlMessage<TestPayload>>) {
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
-        let (rx, msg) = TestControl::add_endpoint(0xFFFE, 0xFFFE, addr);
+        let (rx, msg) = TestControl::add_endpoint(0xFFFE, 0xFFFE, addr, 0);
         control_sender.send(msg).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
             .await
@@ -990,7 +1009,7 @@ mod tests {
         // 2) AddEndpoint — should be rejected while SetInterface is in-flight
         let (rx_set, msg_set) = TestControl::set_interface(Ipv4Addr::LOCALHOST);
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
-        let (rx_add, msg_add) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        let (rx_add, msg_add) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         control_sender.send(msg_set).await.unwrap();
         control_sender.send(msg_add).await.unwrap();
 
@@ -1049,7 +1068,7 @@ mod tests {
         );
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
-        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         drop(rx);
         control_sender.send(msg).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1081,7 +1100,7 @@ mod tests {
 
         // Add an endpoint first so SendToService doesn't fail with ServiceNotFound
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
-        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         control_sender.send(msg).await.unwrap();
         rx.await.unwrap().unwrap();
 

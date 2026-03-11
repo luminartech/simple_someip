@@ -258,8 +258,10 @@ where
         service_id: u16,
         instance_id: u16,
         addr: SocketAddrV4,
+        local_port: u16,
     ) -> Result<(), Error> {
-        let (response, message) = ControlMessage::add_endpoint(service_id, instance_id, addr);
+        let (response, message) =
+            ControlMessage::add_endpoint(service_id, instance_id, addr, local_port);
         self.control_sender.send(message).await.unwrap();
         response.await.unwrap()
     }
@@ -448,7 +450,7 @@ mod tests {
     async fn test_add_endpoint_succeeds() {
         let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 30000);
-        client.add_endpoint(0x1234, 0x0001, addr).await.unwrap();
+        client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
         client.shut_down().await;
     }
 
@@ -468,7 +470,7 @@ mod tests {
     async fn test_remove_endpoint_succeeds() {
         let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 30000);
-        client.add_endpoint(0x1234, 0x0001, addr).await.unwrap();
+        client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
         client.remove_endpoint(0x1234, 0x0001).await.unwrap();
         client.shut_down().await;
     }
