@@ -21,4 +21,7 @@ pub enum Error {
     /// The requested service was not found in the endpoint registry.
     #[error("Service not found in endpoint registry")]
     ServiceNotFound,
+    /// An E2E protection or checking error occurred.
+    #[error(transparent)]
+    E2e(#[from] crate::e2e::Error),
 }

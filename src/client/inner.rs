@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     future,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    sync::{Arc, Mutex},
     task::Poll,
 };
 use tokio::{
@@ -21,6 +22,7 @@ use crate::{
         session::{SessionTracker, SessionVerdict, TransportKind},
         socket_manager::{ReceivedMessage, SocketManager},
     },
+    e2e::E2ERegistry,
     protocol::{self, Message},
     traits::PayloadWireFormat,
 };
@@ -226,6 +228,8 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     client_id: u16,
     /// Incrementing session counter for SOME/IP request headers (lower 16 bits of request ID)
     session_counter: u16,
+    /// Shared E2E registry for runtime E2E configuration
+    e2e_registry: Arc<Mutex<E2ERegistry>>,
     /// Phantom data to represent the generic message definitions
     phantom: std::marker::PhantomData<PayloadDefinitions>,
 }
@@ -248,6 +252,7 @@ where
 {
     pub fn spawn(
         interface: Ipv4Addr,
+        e2e_registry: Arc<Mutex<E2ERegistry>>,
     ) -> (
         Sender<ControlMessage<PayloadDefinitions>>,
         Receiver<ClientUpdate<PayloadDefinitions>>,
@@ -268,6 +273,7 @@ where
             run: true,
             client_id: 0x1234,
             session_counter: 1,
+            e2e_registry,
             phantom: std::marker::PhantomData,
         };
         inner.run();
@@ -278,7 +284,8 @@ where
         if self.discovery_socket.is_some() {
             Ok(())
         } else {
-            let socket = SocketManager::bind_discovery(self.interface)?;
+            let socket =
+                SocketManager::bind_discovery(self.interface, Arc::clone(&self.e2e_registry))?;
             self.discovery_socket = Some(socket);
             Ok(())
         }
@@ -302,7 +309,7 @@ where
         {
             return Ok(socket.port());
         }
-        let unicast_socket = SocketManager::bind(port)?;
+        let unicast_socket = SocketManager::bind(port, Arc::clone(&self.e2e_registry))?;
         let bound_port = unicast_socket.port();
         self.unicast_sockets.insert(bound_port, unicast_socket);
         debug!("Bound unicast socket on port {}", bound_port);
@@ -740,7 +747,7 @@ where
                          trace!("Received unicast message: {:?}", unicast);
                          match unicast {
                              Ok(received) => {
-                                 let received_message = received.message;
+                                 let ReceivedMessage { message: received_message, e2e_status, .. } = received;
                                  // Check if this matches a pending request-response
                                  if let Some((pending_id, _)) = pending_response
                                      && *pending_id == received_message.header().message_id()
@@ -750,7 +757,7 @@ where
                                      continue;
                                  }
                                  // Not a response — forward as ClientUpdate::Unicast
-                                 if update_sender.send(ClientUpdate::Unicast(received_message)).await.is_err() {
+                                 if update_sender.send(ClientUpdate::Unicast { message: received_message, e2e_status }).await.is_err() {
                                      *run = false;
                                  }
                              }
@@ -855,8 +862,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_inner_spawn_and_shutdown() {
-        let (control_sender, mut update_receiver) =
-            Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, mut update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
         // Drop control sender to trigger loop exit
         drop(control_sender);
         // The update receiver should eventually return None when the inner loop exits
@@ -886,7 +895,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_bind_discovery_continues() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         let (rx, msg) = TestControl::bind_discovery();
         drop(rx);
@@ -898,7 +910,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_unbind_discovery_continues() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         let (rx, msg) = TestControl::unbind_discovery();
         drop(rx);
@@ -910,7 +925,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_set_interface_continues() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         // SetInterface(LOCALHOST) on a fresh inner goes straight to
         // bind_discovery + send response (interface already matches).
@@ -924,7 +942,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_send_sd_continues() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         // Bind discovery first so the SendSD path has a socket to use
         let (rx, msg) = TestControl::bind_discovery();
@@ -949,7 +970,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_preemptible_active_request_rejects_new_message() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         // Bind discovery so SetInterface will take the multi-step path:
         // iteration 1: unbind discovery, re-queue SetInterface

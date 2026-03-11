@@ -317,7 +317,7 @@ async fn main() -> Result<(), Error> {
                 state.services.clear();
                 state.event_groups.clear();
             }
-            simple_someip::ClientUpdate::Unicast(message) => {
+            simple_someip::ClientUpdate::Unicast { message, .. } => {
                 info!("Unicast message: {:?}", message.header());
             }
             simple_someip::ClientUpdate::Error(err) => {

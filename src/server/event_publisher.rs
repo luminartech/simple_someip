@@ -2,9 +2,12 @@
 
 use super::Error;
 use super::subscription_manager::SubscriptionManager;
+use crate::e2e::{E2EKey, E2ERegistry, PROFILE4_HEADER_SIZE};
 use crate::protocol::{Header, Message};
 use crate::traits::{PayloadWireFormat, WireFormat};
-use std::{sync::Arc, vec::Vec};
+use std::sync::{Arc, Mutex};
+use std::vec;
+use std::vec::Vec;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
@@ -12,14 +15,20 @@ use tokio::sync::RwLock;
 pub struct EventPublisher {
     subscriptions: Arc<RwLock<SubscriptionManager>>,
     socket: Arc<UdpSocket>,
+    e2e_registry: Arc<Mutex<E2ERegistry>>,
 }
 
 impl EventPublisher {
     /// Create a new event publisher
-    pub fn new(subscriptions: Arc<RwLock<SubscriptionManager>>, socket: Arc<UdpSocket>) -> Self {
+    pub fn new(
+        subscriptions: Arc<RwLock<SubscriptionManager>>,
+        socket: Arc<UdpSocket>,
+        e2e_registry: Arc<Mutex<E2ERegistry>>,
+    ) -> Self {
         Self {
             subscriptions,
             socket,
+            e2e_registry,
         }
     }
 
@@ -34,6 +43,10 @@ impl EventPublisher {
     /// # Errors
     ///
     /// Returns an error if the message fails to serialize.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the E2E registry mutex is poisoned.
     pub async fn publish_event<P: PayloadWireFormat>(
         &self,
         service_id: u16,
@@ -60,6 +73,34 @@ impl EventPublisher {
         // Serialize the message once
         let mut buffer = Vec::new();
         message.encode(&mut buffer)?;
+
+        // Apply E2E protect if configured
+        {
+            let key = E2EKey::from_message_id(message.header().message_id());
+            let mut registry = self
+                .e2e_registry
+                .lock()
+                .expect("e2e registry lock poisoned");
+            if registry.contains_key(&key) {
+                let message_length = buffer.len();
+                let original_payload = buffer[16..message_length].to_vec();
+                let upper_header: [u8; 8] = buffer[8..16].try_into().expect("upper header slice");
+                let mut protected = vec![0u8; original_payload.len() + PROFILE4_HEADER_SIZE];
+                match registry.protect(key, &original_payload, upper_header, &mut protected) {
+                    Some(Ok(protected_len)) => {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let new_length: u32 = 8 + protected_len as u32;
+                        buffer[4..8].copy_from_slice(&new_length.to_be_bytes());
+                        buffer.resize(16 + protected_len, 0);
+                        buffer[16..16 + protected_len].copy_from_slice(&protected[..protected_len]);
+                    }
+                    Some(Err(e)) => {
+                        tracing::error!("E2E protect error: {:?}", e);
+                    }
+                    None => unreachable!("contains_key was true"),
+                }
+            }
+        }
 
         // Send to all subscribers
         let mut sent_count = 0;
@@ -196,11 +237,15 @@ mod tests {
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
     use std::net::{Ipv4Addr, SocketAddrV4};
 
+    fn test_registry() -> Arc<Mutex<E2ERegistry>> {
+        Arc::new(Mutex::new(E2ERegistry::new()))
+    }
+
     async fn make_publisher(
         subscriptions: Arc<RwLock<SubscriptionManager>>,
     ) -> (EventPublisher, Arc<UdpSocket>) {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let publisher = EventPublisher::new(subscriptions, Arc::clone(&socket));
+        let publisher = EventPublisher::new(subscriptions, Arc::clone(&socket), test_registry());
         (publisher, socket)
     }
 
@@ -217,7 +262,7 @@ mod tests {
                 .expect("Failed to bind socket"),
         );
 
-        let publisher = EventPublisher::new(subscriptions, socket);
+        let publisher = EventPublisher::new(subscriptions, socket, test_registry());
         assert!(std::mem::size_of_val(&publisher) > 0);
     }
 

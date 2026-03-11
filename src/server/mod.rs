@@ -16,11 +16,12 @@ pub use event_publisher::EventPublisher;
 pub use service_info::{EventGroupInfo, ServiceInfo};
 pub use subscription_manager::SubscriptionManager;
 
+use crate::e2e::{E2EKey, E2EProfile, E2ERegistry};
 use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
 use core::sync::atomic::Ordering;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
-    sync::{Arc, atomic::AtomicU16},
+    sync::{Arc, Mutex, atomic::AtomicU16},
     vec,
     vec::Vec,
 };
@@ -74,6 +75,8 @@ pub struct Server {
     publisher: Arc<EventPublisher>,
     /// Incrementing session ID for SD messages
     sd_session_id: Arc<AtomicU16>,
+    /// Shared E2E registry for runtime E2E configuration
+    e2e_registry: Arc<Mutex<E2ERegistry>>,
 }
 
 impl Server {
@@ -130,9 +133,11 @@ impl Server {
         }
 
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
         let publisher = Arc::new(EventPublisher::new(
             Arc::clone(&subscriptions),
             Arc::clone(&unicast_socket),
+            Arc::clone(&e2e_registry),
         ));
 
         Ok(Self {
@@ -142,6 +147,7 @@ impl Server {
             subscriptions,
             publisher,
             sd_session_id: Arc::new(AtomicU16::new(1)),
+            e2e_registry,
         })
     }
 
@@ -341,6 +347,33 @@ impl Server {
     /// Update the configured local port (useful after binding to ephemeral port 0).
     pub fn set_local_port(&mut self, port: u16) {
         self.config.local_port = port;
+    }
+
+    /// Register an E2E profile for the given key.
+    ///
+    /// Once registered, outgoing events published via [`EventPublisher::publish_event`]
+    /// will have E2E protection applied automatically.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the E2E registry mutex is poisoned.
+    pub fn register_e2e(&self, key: E2EKey, profile: E2EProfile) {
+        self.e2e_registry
+            .lock()
+            .expect("e2e registry lock poisoned")
+            .register(key, profile);
+    }
+
+    /// Remove E2E configuration for the given key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the E2E registry mutex is poisoned.
+    pub fn unregister_e2e(&self, key: &E2EKey) {
+        self.e2e_registry
+            .lock()
+            .expect("e2e registry lock poisoned")
+            .unregister(key);
     }
 
     /// Run the server event loop

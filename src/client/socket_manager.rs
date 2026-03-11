@@ -1,4 +1,5 @@
 use crate::{
+    e2e::{E2ECheckStatus, E2EKey, E2ERegistry, PROFILE4_HEADER_SIZE},
     protocol::{Message, MessageView, sd},
     traits::{PayloadWireFormat, WireFormat},
 };
@@ -6,6 +7,7 @@ use crate::{
 use super::error::Error;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     vec,
 };
@@ -17,6 +19,7 @@ use tracing::{error, info, trace};
 pub struct ReceivedMessage<P> {
     pub message: Message<P>,
     pub source: SocketAddr,
+    pub e2e_status: Option<E2ECheckStatus>,
 }
 
 /// Structure representing a request to send a message
@@ -56,7 +59,10 @@ impl<MessageDefinitions> SocketManager<MessageDefinitions>
 where
     MessageDefinitions: PayloadWireFormat + 'static,
 {
-    pub fn bind_discovery(interface: Ipv4Addr) -> Result<Self, Error> {
+    pub fn bind_discovery(
+        interface: Ipv4Addr,
+        e2e_registry: Arc<Mutex<E2ERegistry>>,
+    ) -> Result<Self, Error> {
         let (rx_tx, rx_rx) = mpsc::channel(16);
         let (tx_tx, tx_rx) = mpsc::channel(16);
         let bind_addr =
@@ -79,7 +85,7 @@ where
 
         socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
 
-        Self::spawn_socket_loop(socket, rx_tx, tx_rx);
+        Self::spawn_socket_loop(socket, rx_tx, tx_rx, e2e_registry);
         Ok(Self {
             receiver: rx_rx,
             sender: tx_tx,
@@ -88,7 +94,7 @@ where
         })
     }
 
-    pub fn bind(port: u16) -> Result<Self, Error> {
+    pub fn bind(port: u16, e2e_registry: Arc<Mutex<E2ERegistry>>) -> Result<Self, Error> {
         let (rx_tx, rx_rx) = mpsc::channel(4);
         let (tx_tx, tx_rx) = mpsc::channel(4);
         let bind_addr = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
@@ -105,7 +111,7 @@ where
         let socket: std::net::UdpSocket = socket.into();
         let socket = UdpSocket::from_std(socket)?;
         let port = socket.local_addr()?.port();
-        Self::spawn_socket_loop(socket, rx_tx, tx_rx);
+        Self::spawn_socket_loop(socket, rx_tx, tx_rx, e2e_registry);
         Ok(Self {
             receiver: rx_rx,
             sender: tx_tx,
@@ -162,10 +168,12 @@ where
         _ = receiver.recv().await;
     }
 
+    #[allow(clippy::too_many_lines)]
     fn spawn_socket_loop(
         socket: UdpSocket,
         rx_tx: mpsc::Sender<Result<ReceivedMessage<MessageDefinitions>, Error>>,
         mut tx_rx: mpsc::Receiver<SendMessage<MessageDefinitions>>,
+        e2e_registry: Arc<Mutex<E2ERegistry>>,
     ) {
         tokio::spawn(async move {
             let mut buf = vec![0; 1400];
@@ -177,10 +185,24 @@ where
                                 let parse_result = MessageView::parse(&buf[..bytes_received])
                                     .and_then(|view| {
                                         let header = view.header().to_owned();
-                                        let payload = MessageDefinitions::from_payload_bytes(header.message_id(), view.payload_bytes())?;
+                                        let upper_header = header.upper_header_bytes();
+                                        let key = E2EKey::from_message_id(header.message_id());
+                                        let payload_bytes = view.payload_bytes();
+
+                                        // Apply E2E check if configured
+                                        let (e2e_status, effective_payload) = {
+                                            let mut registry = e2e_registry.lock().expect("e2e registry lock poisoned");
+                                            match registry.check(key, payload_bytes, upper_header) {
+                                                Some((status, stripped)) => (Some(status), stripped),
+                                                None => (None, payload_bytes),
+                                            }
+                                        };
+
+                                        let payload = MessageDefinitions::from_payload_bytes(header.message_id(), effective_payload)?;
                                         Ok(ReceivedMessage {
                                             message: Message::new(header, payload),
                                             source: source_address,
+                                            e2e_status,
                                         })
                                     })
                                     .map_err(Error::from);
@@ -199,7 +221,7 @@ where
                     message = tx_rx.recv() => {
                         if let Some(send_message) = message {
                             trace!("Sending: {:?}", &send_message);
-                            let message_length = match send_message.message.encode(&mut buf.as_mut_slice()) {
+                            let mut message_length = match send_message.message.encode(&mut buf.as_mut_slice()) {
                                 Ok(length) => length,
                                 Err(e) => {
                                     error!("Failed to encode message: {:?}", e);
@@ -212,6 +234,34 @@ where
                                     break;
                                 }
                             };
+
+                            // Apply E2E protect if configured
+                            {
+                                let key = E2EKey::from_message_id(send_message.message.header().message_id());
+                                let mut registry = e2e_registry.lock().expect("e2e registry lock poisoned");
+                                if registry.contains_key(&key) {
+                                    let original_payload = buf[16..message_length].to_vec();
+                                    let upper_header: [u8; 8] = buf[8..16].try_into().expect("upper header slice");
+                                    let mut protected = vec![0u8; original_payload.len() + PROFILE4_HEADER_SIZE];
+                                    match registry.protect(key, &original_payload, upper_header, &mut protected) {
+                                        Some(Ok(protected_len)) => {
+                                            #[allow(clippy::cast_possible_truncation)]
+                                            let new_length: u32 = 8 + protected_len as u32;
+                                            buf[4..8].copy_from_slice(&new_length.to_be_bytes());
+                                            if 16 + protected_len > buf.len() {
+                                                buf.resize(16 + protected_len, 0);
+                                            }
+                                            buf[16..16 + protected_len].copy_from_slice(&protected[..protected_len]);
+                                            message_length = 16 + protected_len;
+                                        }
+                                        Some(Err(e)) => {
+                                            error!("E2E protect error: {:?}", e);
+                                        }
+                                        None => unreachable!("contains_key was true"),
+                                    }
+                                }
+                            }
+
                             match socket.send_to(&buf[..message_length], send_message.target_addr).await {
                                 Ok(_bytes_sent) => {
                                     trace!("Sent {} bytes to {}", message_length, send_message.target_addr);
@@ -249,9 +299,13 @@ mod tests {
 
     type TestSocketManager = SocketManager<TestPayload>;
 
+    fn test_registry() -> Arc<Mutex<E2ERegistry>> {
+        Arc::new(Mutex::new(E2ERegistry::new()))
+    }
+
     #[tokio::test]
     async fn test_bind_ephemeral_port() {
-        let sm = TestSocketManager::bind(0).unwrap();
+        let sm = TestSocketManager::bind(0, test_registry()).unwrap();
         assert!(sm.port() > 0);
         assert_eq!(sm.session_id(), 0);
     }
@@ -269,13 +323,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_socket_manager_shut_down() {
-        let sm = TestSocketManager::bind(0).unwrap();
+        let sm = TestSocketManager::bind(0, test_registry()).unwrap();
         sm.shut_down().await;
     }
 
     #[tokio::test]
     async fn test_socket_manager_send_and_receive() {
-        let mut sm = TestSocketManager::bind(0).unwrap();
+        let mut sm = TestSocketManager::bind(0, test_registry()).unwrap();
         let sm_port = sm.port();
 
         // Create a raw UDP socket to send data to the SocketManager
@@ -384,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_socket_manager_send_to_target() {
-        let mut sm = TestSocketManager::bind(0).unwrap();
+        let mut sm = TestSocketManager::bind(0, test_registry()).unwrap();
 
         // Create a raw socket to receive
         let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
