@@ -1043,7 +1043,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_add_endpoint_continues() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
@@ -1056,7 +1059,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_remove_endpoint_continues() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         let (rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
         drop(rx);
@@ -1068,7 +1074,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_send_to_service_send_complete_continues() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         // Add an endpoint first so SendToService doesn't fail with ServiceNotFound
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
