@@ -54,6 +54,31 @@
 //! assert_eq!(view.entry_count(), 1);
 //! ```
 //!
+//! ### Async client (requires `feature = "client"`)
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "client")]
+//! # fn wrapper() {
+//! use simple_someip::{Client, ClientUpdate, RawPayload};
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     // Client::new returns a Clone-able handle and an update stream.
+//!     let (client, mut updates) = Client::<RawPayload>::new([192, 168, 1, 100].into());
+//!     client.bind_discovery().await.unwrap();
+//!
+//!     while let Some(update) = updates.recv().await {
+//!         match update {
+//!             ClientUpdate::DiscoveryUpdated(msg) => { /* SD message received */ }
+//!             ClientUpdate::Unicast { message, e2e_status } => { /* unicast reply */ }
+//!             ClientUpdate::SenderRebooted(addr) => { /* remote reboot */ }
+//!             ClientUpdate::Error(err) => { /* error */ }
+//!         }
+//!     }
+//! }
+//! # }
+//! ```
+//!
 //! ## References
 //!
 //! - [Open SOME/IP Specification](https://github.com/some-ip-com/open-someip-spec)

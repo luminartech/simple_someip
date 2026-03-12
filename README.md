@@ -31,16 +31,16 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 # Protocol/E2E only (default) — no_std compatible, no tokio dependency
-simple-someip = "0.4"
+simple-someip = "0.5"
 
 # Client only
-simple-someip = { version = "0.4", features = ["client"] }
+simple-someip = { version = "0.5", features = ["client"] }
 
 # Server only
-simple-someip = { version = "0.4", features = ["server"] }
+simple-someip = { version = "0.5", features = ["server"] }
 
 # Both client and server
-simple-someip = { version = "0.4", features = ["client", "server"] }
+simple-someip = { version = "0.5", features = ["client", "server"] }
 ```
 
 ### Feature flags
@@ -52,6 +52,55 @@ simple-someip = { version = "0.4", features = ["client", "server"] }
 | `std` | no | Enables std-dependent code |
 
 By default only the `protocol`, `traits`, and `e2e` modules are available, and the crate compiles in `no_std` mode. Most applications only need one of `client` or `server`.
+
+## Quick Start
+
+### Client
+
+```rust
+use simple_someip::{Client, ClientUpdate, RawPayload};
+use std::net::Ipv4Addr;
+
+#[tokio::main]
+async fn main() {
+    // Client::new returns a (Client, ClientUpdates) pair.
+    // Client is Clone-able and can be shared across tasks.
+    let (client, mut updates) = Client::<RawPayload>::new(Ipv4Addr::new(192, 168, 1, 100));
+
+    // Bind the SD multicast socket to discover services
+    client.bind_discovery().await.unwrap();
+
+    // Receive discovery, unicast, and error updates
+    while let Some(update) = updates.recv().await {
+        match update {
+            ClientUpdate::DiscoveryUpdated(msg) => { /* SD message */ }
+            ClientUpdate::Unicast { message, e2e_status } => { /* unicast reply */ }
+            ClientUpdate::SenderRebooted(addr) => { /* remote reboot detected */ }
+            ClientUpdate::Error(err) => { /* error */ }
+        }
+    }
+}
+```
+
+### Server
+
+```rust
+use simple_someip::server::{Server, ServerConfig};
+use std::net::Ipv4Addr;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServerConfig::new(Ipv4Addr::new(192, 168, 1, 200), 30500, 0x1234, 1);
+    let mut server = Server::new(config).await?;
+    server.start_announcing()?;
+
+    let publisher = server.publisher();
+    tokio::spawn(async move { server.run().await });
+
+    // Publish events to subscribers...
+    Ok(())
+}
+```
 
 ## Examples
 
