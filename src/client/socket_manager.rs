@@ -361,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_poll_receive() {
-        let mut sm = TestSocketManager::bind(0).unwrap();
+        let mut sm = TestSocketManager::bind(0, test_registry()).unwrap();
         let sm_port = sm.port();
 
         // Send a message to the socket manager from a raw socket
@@ -387,7 +387,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_drops_when_socket_loop_exits() {
-        let mut sm = TestSocketManager::bind(0).unwrap();
+        let mut sm = TestSocketManager::bind(0, test_registry()).unwrap();
         // Shut down the socket loop by dropping the internal channels
         // We can't directly kill the loop, but we can test the error path
         // by sending to a socket manager that has been shut down.
@@ -414,6 +414,7 @@ mod tests {
         let received = ReceivedMessage {
             message: msg,
             source: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 5000),
+            e2e_status: None,
         };
         let s = format!("{received:?}");
         assert!(s.contains("ReceivedMessage"));
@@ -430,7 +431,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_socket_manager_debug() {
-        let sm = TestSocketManager::bind(0).unwrap();
+        let sm = TestSocketManager::bind(0, test_registry()).unwrap();
         let s = format!("{sm:?}");
         assert!(s.contains("SocketManager"));
         sm.shut_down().await;
