@@ -56,3 +56,46 @@ impl Flags {
         self.unicast
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_sd_sets_unicast_true() {
+        let flags = Flags::new_sd(false);
+        assert!(!flags.reboot());
+        assert!(flags.unicast());
+    }
+
+    #[test]
+    fn new_sd_with_reboot_true() {
+        let flags = Flags::new_sd(true);
+        assert!(flags.reboot());
+        assert!(flags.unicast());
+    }
+
+    #[test]
+    fn unicast_accessor() {
+        assert!(Flags::new(false, true).unicast());
+        assert!(!Flags::new(false, false).unicast());
+    }
+
+    #[test]
+    fn roundtrip_both_flags_set() {
+        let flags = Flags::new(true, true);
+        let byte: u8 = flags.into();
+        let back = Flags::from(byte);
+        assert_eq!(flags, back);
+        assert_eq!(byte, 0b1100_0000);
+    }
+
+    #[test]
+    fn roundtrip_no_flags_set() {
+        let flags = Flags::new(false, false);
+        let byte: u8 = flags.into();
+        assert_eq!(byte, 0);
+        let back = Flags::from(byte);
+        assert_eq!(flags, back);
+    }
+}

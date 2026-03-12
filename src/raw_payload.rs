@@ -196,3 +196,215 @@ impl PayloadWireFormat for RawPayload {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::WireFormat;
+    use std::net::Ipv4Addr;
+
+    fn make_sd_payload() -> RawPayload {
+        let header = VecSdHeader {
+            flags: sd::Flags::new_sd(false),
+            entries: std::vec![],
+            options: std::vec![],
+        };
+        RawPayload::new_sd_payload(&header)
+    }
+
+    fn make_raw_payload() -> RawPayload {
+        let mid = MessageId::new_from_service_and_method(0x1234, 0x0001);
+        RawPayload::from_payload_bytes(mid, &[0xDE, 0xAD]).unwrap()
+    }
+
+    #[test]
+    fn raw_bytes_returns_some_for_raw_payload() {
+        let p = make_raw_payload();
+        assert_eq!(p.raw_bytes(), Some(&[0xDE, 0xAD][..]));
+    }
+
+    #[test]
+    fn raw_bytes_returns_none_for_sd_payload() {
+        let p = make_sd_payload();
+        assert_eq!(p.raw_bytes(), None);
+    }
+
+    #[test]
+    fn as_sd_header_returns_some_for_sd() {
+        let p = make_sd_payload();
+        assert!(p.as_sd_header().is_some());
+    }
+
+    #[test]
+    fn as_sd_header_returns_none_for_raw() {
+        let p = make_raw_payload();
+        assert!(p.as_sd_header().is_none());
+    }
+
+    #[test]
+    fn sd_flags_returns_some_for_sd() {
+        let p = make_sd_payload();
+        let flags = p.sd_flags().unwrap();
+        assert!(flags.unicast());
+    }
+
+    #[test]
+    fn sd_flags_returns_none_for_raw() {
+        let p = make_raw_payload();
+        assert!(p.sd_flags().is_none());
+    }
+
+    #[test]
+    fn message_id_correct() {
+        let p = make_raw_payload();
+        assert_eq!(p.message_id().service_id(), 0x1234);
+
+        let sd = make_sd_payload();
+        assert_eq!(sd.message_id(), MessageId::SD);
+    }
+
+    #[test]
+    fn required_size_raw() {
+        let p = make_raw_payload();
+        assert_eq!(p.required_size(), 2);
+    }
+
+    #[test]
+    fn encode_raw_payload() {
+        let p = make_raw_payload();
+        let mut buf = std::vec![0u8; p.required_size()];
+        let n = p.encode(&mut buf.as_mut_slice()).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&buf, &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn encode_sd_payload() {
+        let p = make_sd_payload();
+        let mut buf = std::vec![0u8; p.required_size()];
+        let n = p.encode(&mut buf.as_mut_slice()).unwrap();
+        assert_eq!(n, p.required_size());
+    }
+
+    #[test]
+    fn from_payload_bytes_sd_roundtrip() {
+        // Build an SD header with an entry, encode it, then parse it back
+        let entry = sd::Entry::FindService(sd::ServiceEntry::find(0x5B));
+        let entries = [entry];
+        let header = sd::Header::new(sd::Flags::new_sd(false), &entries, &[]);
+        let mut buf = std::vec![0u8; header.required_size()];
+        header.encode(&mut buf.as_mut_slice()).unwrap();
+
+        let p = RawPayload::from_payload_bytes(MessageId::SD, &buf).unwrap();
+        assert!(p.as_sd_header().is_some());
+        let sd = p.as_sd_header().unwrap();
+        assert_eq!(sd.entries.len(), 1);
+    }
+
+    #[test]
+    fn from_payload_bytes_non_sd() {
+        let mid = MessageId::new_from_service_and_method(0x5B, 0x01);
+        let p = RawPayload::from_payload_bytes(mid, &[1, 2, 3]).unwrap();
+        assert_eq!(p.raw_bytes(), Some(&[1, 2, 3][..]));
+    }
+
+    #[test]
+    fn new_subscription_sd_header_structure() {
+        let header = RawPayload::new_subscription_sd_header(
+            0x5B,
+            1,
+            1,
+            3,
+            0x01,
+            Ipv4Addr::LOCALHOST,
+            sd::TransportProtocol::Udp,
+            12345,
+        );
+        assert_eq!(header.entries.len(), 1);
+        assert_eq!(header.options.len(), 1);
+        assert!(header.flags.unicast());
+    }
+
+    #[test]
+    fn offered_endpoints_from_raw_returns_empty() {
+        let p = make_raw_payload();
+        assert!(p.offered_endpoints().is_empty());
+    }
+
+    fn make_offer_entry(service_id: u16, instance_id: u16) -> sd::ServiceEntry {
+        sd::ServiceEntry {
+            index_first_options_run: 0,
+            index_second_options_run: 0,
+            options_count: sd::OptionsCount::new(1, 0),
+            service_id,
+            instance_id,
+            major_version: 1,
+            ttl: 100,
+            minor_version: 0,
+        }
+    }
+
+    #[test]
+    fn offered_endpoints_with_offer_service() {
+        let offer = sd::Entry::OfferService(make_offer_entry(0x5B, 1));
+        let endpoint = sd::Options::IpV4Endpoint {
+            ip: Ipv4Addr::LOCALHOST,
+            protocol: sd::TransportProtocol::Udp,
+            port: 30000,
+        };
+        let header = VecSdHeader {
+            flags: sd::Flags::new_sd(false),
+            entries: std::vec![offer],
+            options: std::vec![endpoint],
+        };
+        let p = RawPayload::new_sd_payload(&header);
+        let endpoints = p.offered_endpoints();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].service_id, 0x5B);
+        assert!(endpoints[0].is_offer);
+        assert!(endpoints[0].addr.is_some());
+    }
+
+    #[test]
+    fn offered_endpoints_with_stop_offer() {
+        let mut entry = make_offer_entry(0x5B, 1);
+        entry.ttl = 0;
+        let stop = sd::Entry::StopOfferService(entry);
+        let header = VecSdHeader {
+            flags: sd::Flags::new_sd(false),
+            entries: std::vec![stop],
+            options: std::vec![],
+        };
+        let p = RawPayload::new_sd_payload(&header);
+        let endpoints = p.offered_endpoints();
+        assert_eq!(endpoints.len(), 1);
+        assert!(!endpoints[0].is_offer);
+        assert!(endpoints[0].addr.is_none());
+    }
+
+    #[test]
+    fn offered_endpoints_ignores_non_offer_entries() {
+        let find = sd::Entry::FindService(sd::ServiceEntry::find(0x5B));
+        let header = VecSdHeader {
+            flags: sd::Flags::new_sd(false),
+            entries: std::vec![find],
+            options: std::vec![],
+        };
+        let p = RawPayload::new_sd_payload(&header);
+        assert!(p.offered_endpoints().is_empty());
+    }
+
+    #[test]
+    fn vec_sd_header_required_size_and_encode() {
+        let header = VecSdHeader {
+            flags: sd::Flags::new_sd(false),
+            entries: std::vec![],
+            options: std::vec![],
+        };
+        let size = header.required_size();
+        assert!(size > 0);
+        let mut buf = std::vec![0u8; size];
+        let n = header.encode(&mut buf.as_mut_slice()).unwrap();
+        assert_eq!(n, size);
+    }
+}

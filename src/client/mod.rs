@@ -246,6 +246,15 @@ where
 
     /// Registers a service endpoint in the client's endpoint registry.
     ///
+    /// `local_port` controls which source port is used when sending to this
+    /// endpoint via [`send_to_service`](Self::send_to_service). Pass `0` to
+    /// use an ephemeral (OS-assigned) port.
+    ///
+    /// Service-discovery (SD) automatically populates endpoints with
+    /// `local_port = 0`. If your configuration requires a specific source
+    /// port, you must call `add_endpoint` explicitly — even if SD has already
+    /// registered the service — so that the correct `local_port` is stored.
+    ///
     /// # Errors
     ///
     /// Returns an error if registering the endpoint fails.
@@ -258,8 +267,10 @@ where
         service_id: u16,
         instance_id: u16,
         addr: SocketAddrV4,
+        local_port: u16,
     ) -> Result<(), Error> {
-        let (response, message) = ControlMessage::add_endpoint(service_id, instance_id, addr);
+        let (response, message) =
+            ControlMessage::add_endpoint(service_id, instance_id, addr, local_port);
         self.control_sender.send(message).await.unwrap();
         response.await.unwrap()
     }
@@ -448,7 +459,7 @@ mod tests {
     async fn test_add_endpoint_succeeds() {
         let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 30000);
-        client.add_endpoint(0x1234, 0x0001, addr).await.unwrap();
+        client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
         client.shut_down().await;
     }
 
@@ -468,7 +479,7 @@ mod tests {
     async fn test_remove_endpoint_succeeds() {
         let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 30000);
-        client.add_endpoint(0x1234, 0x0001, addr).await.unwrap();
+        client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
         client.remove_endpoint(0x1234, 0x0001).await.unwrap();
         client.shut_down().await;
     }
@@ -520,7 +531,7 @@ mod tests {
     async fn test_send_to_service_success_returns_pending_response() {
         let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30000);
-        client.add_endpoint(0x1234, 0x0001, addr).await.unwrap();
+        client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         // send_to_service succeeds (send completes), returning a PendingResponse
         let pending = client.send_to_service(0x1234, 0x0001, msg).await;

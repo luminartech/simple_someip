@@ -9,6 +9,7 @@ pub struct ServiceInstanceId {
 #[derive(Clone, Debug)]
 pub struct ServiceEndpointInfo {
     pub addr: SocketAddrV4,
+    pub local_port: u16,
     #[allow(dead_code)]
     pub major_version: u8,
     #[allow(dead_code)]
@@ -49,6 +50,7 @@ mod tests {
     fn test_info(port: u16) -> ServiceEndpointInfo {
         ServiceEndpointInfo {
             addr: SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), port),
+            local_port: 0,
             major_version: 1,
             minor_version: 0,
         }

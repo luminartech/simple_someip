@@ -203,4 +203,44 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn generic_error_as_u8_preserves_value() {
+        for byte in 0x10u8..=0x1f {
+            assert_eq!(ReturnCode::GenericError(byte).as_u8(), byte);
+        }
+    }
+
+    #[test]
+    fn interface_error_as_u8_preserves_value() {
+        for byte in 0x20u8..=0x5e {
+            assert_eq!(ReturnCode::InterfaceError(byte).as_u8(), byte);
+        }
+    }
+
+    #[test]
+    fn from_u8_for_generic_and_interface_errors() {
+        assert_eq!(u8::from(ReturnCode::GenericError(0x15)), 0x15);
+        assert_eq!(u8::from(ReturnCode::InterfaceError(0x30)), 0x30);
+    }
+
+    #[test]
+    fn as_u8_all_named_variants() {
+        assert_eq!(ReturnCode::Ok.as_u8(), 0x00);
+        assert_eq!(ReturnCode::NotOk.as_u8(), 0x01);
+        assert_eq!(ReturnCode::UnknownService.as_u8(), 0x02);
+        assert_eq!(ReturnCode::UnknownMethod.as_u8(), 0x03);
+        assert_eq!(ReturnCode::NotReady.as_u8(), 0x04);
+        assert_eq!(ReturnCode::NotReachable.as_u8(), 0x05);
+        assert_eq!(ReturnCode::Timeout.as_u8(), 0x06);
+        assert_eq!(ReturnCode::WrongProtocolVersion.as_u8(), 0x07);
+        assert_eq!(ReturnCode::WrongInterfaceVersion.as_u8(), 0x08);
+        assert_eq!(ReturnCode::MalformedMessage.as_u8(), 0x09);
+        assert_eq!(ReturnCode::WrongMessageType.as_u8(), 0x0a);
+        assert_eq!(ReturnCode::E2ERepeated.as_u8(), 0x0b);
+        assert_eq!(ReturnCode::E2EWrongSequence.as_u8(), 0x0c);
+        assert_eq!(ReturnCode::E2E.as_u8(), 0x0d);
+        assert_eq!(ReturnCode::E2ENotAvailable.as_u8(), 0x0e);
+        assert_eq!(ReturnCode::E2ENoNewData.as_u8(), 0x0f);
+    }
 }

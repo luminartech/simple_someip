@@ -118,3 +118,59 @@ pub(crate) fn empty_sd_header() -> TestSdHeader {
         options: heapless::Vec::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_sd_header_has_no_entries() {
+        let h = empty_sd_header();
+        assert!(h.entries.is_empty());
+        assert!(h.options.is_empty());
+        assert!(h.flags.unicast());
+    }
+
+    #[test]
+    fn from_payload_bytes_non_sd_returns_error() {
+        let mid = crate::protocol::MessageId::new_from_service_and_method(0x1234, 0x0001);
+        let result = TestPayload::from_payload_bytes(mid, &[1, 2, 3]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_payload_bytes_sd_parses_correctly() {
+        let header = sd::Header::new(sd::Flags::new_sd(false), &[], &[]);
+        let mut buf = [0u8; 64];
+        let n = header.encode(&mut buf.as_mut_slice()).unwrap();
+        let payload =
+            TestPayload::from_payload_bytes(crate::protocol::MessageId::SD, &buf[..n]).unwrap();
+        assert!(payload.header.entries.is_empty());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn new_subscription_sd_header_creates_valid_structure() {
+        let header = TestPayload::new_subscription_sd_header(
+            0x5B,
+            1,
+            1,
+            3,
+            0x01,
+            std::net::Ipv4Addr::LOCALHOST,
+            sd::TransportProtocol::Udp,
+            12345,
+        );
+        assert_eq!(header.entries.len(), 1);
+        assert_eq!(header.options.len(), 1);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_payload_offered_endpoints_default_empty() {
+        let p = TestPayload {
+            header: empty_sd_header(),
+        };
+        assert!(p.offered_endpoints().is_empty());
+    }
+}

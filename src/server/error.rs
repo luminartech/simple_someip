@@ -19,3 +19,15 @@ impl From<crate::protocol::sd::Error> for Error {
         Self::Protocol(crate::protocol::Error::from(err))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_sd_error_produces_protocol_variant() {
+        let sd_err = crate::protocol::sd::Error::IncorrectEntriesSize(0);
+        let err: Error = sd_err.into();
+        assert!(matches!(err, Error::Protocol(_)));
+    }
+}

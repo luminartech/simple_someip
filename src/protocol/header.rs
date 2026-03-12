@@ -503,6 +503,54 @@ mod tests {
         ));
     }
 
+    // --- from_fields ---
+
+    #[test]
+    fn from_fields_round_trip() {
+        let h = make_header();
+        let h2 = Header::from_fields(
+            h.message_id(),
+            h.length(),
+            h.request_id(),
+            h.protocol_version(),
+            h.interface_version(),
+            h.message_type(),
+            h.return_code(),
+        );
+        assert_eq!(h, h2);
+    }
+
+    // --- new_event ---
+
+    #[test]
+    fn new_event_fields() {
+        let h = Header::new_event(0x5B, 0x8001, 0x0001, 0x01, 0x03, 10);
+        assert_eq!(h.message_id().service_id(), 0x5B);
+        assert_eq!(h.message_id().method_id(), 0x8001);
+        assert_eq!(h.request_id(), 0x0001);
+        assert_eq!(h.protocol_version(), 0x01);
+        assert_eq!(h.interface_version(), 0x03);
+        assert_eq!(h.length(), 18); // 8 + 10
+        assert_eq!(h.return_code(), ReturnCode::Ok);
+    }
+
+    // --- new constructor ---
+
+    #[test]
+    fn new_constructor_sets_length() {
+        let h = Header::new(
+            MessageId::new_from_service_and_method(0x1234, 0x0001),
+            0x0001,
+            0x01,
+            0x01,
+            MessageTypeField::try_from(0x00).unwrap(),
+            ReturnCode::Ok,
+            100,
+        );
+        assert_eq!(h.length(), 108); // 8 + 100
+        assert_eq!(h.payload_size(), 100);
+    }
+
     // --- HeaderView accessors ---
 
     #[test]
@@ -519,6 +567,28 @@ mod tests {
         assert_eq!(view.message_type(), h.message_type());
         assert_eq!(view.return_code(), h.return_code());
         assert_eq!(view.is_sd(), h.is_sd());
+    }
+
+    // --- WireFormat default methods ---
+
+    #[test]
+    fn encode_to_slice_works() {
+        let h = make_header();
+        let mut buf = [0u8; 16];
+        let n = h.encode_to_slice(&mut buf).unwrap();
+        assert_eq!(n, 16);
+        let (view, _) = HeaderView::parse(&buf).unwrap();
+        assert_eq!(view.to_owned(), h);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn encode_to_vec_works() {
+        let h = make_header();
+        let buf = h.encode_to_vec().unwrap();
+        assert_eq!(buf.len(), 16);
+        let (view, _) = HeaderView::parse(&buf).unwrap();
+        assert_eq!(view.to_owned(), h);
     }
 }
 
