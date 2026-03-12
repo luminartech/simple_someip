@@ -531,7 +531,7 @@ mod tests {
     async fn test_send_to_service_success_returns_pending_response() {
         let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30000);
-        client.add_endpoint(0x1234, 0x0001, addr).await.unwrap();
+        client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         // send_to_service succeeds (send completes), returning a PendingResponse
         let pending = client.send_to_service(0x1234, 0x0001, msg).await;

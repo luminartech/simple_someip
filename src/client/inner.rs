@@ -38,7 +38,13 @@ pub(super) enum ControlMessage<P: PayloadWireFormat> {
         P::SdHeader,
         oneshot::Sender<Result<(), Error>>,
     ),
-    AddEndpoint(u16, u16, SocketAddrV4, u16, oneshot::Sender<Result<(), Error>>),
+    AddEndpoint(
+        u16,
+        u16,
+        SocketAddrV4,
+        u16,
+        oneshot::Sender<Result<(), Error>>,
+    ),
     RemoveEndpoint(u16, u16, oneshot::Sender<Result<(), Error>>),
     SendToService {
         service_id: u16,
@@ -461,7 +467,13 @@ where
                         }
                     }
                 }
-                ControlMessage::AddEndpoint(service_id, instance_id, addr, local_port, response) => {
+                ControlMessage::AddEndpoint(
+                    service_id,
+                    instance_id,
+                    addr,
+                    local_port,
+                    response,
+                ) => {
                     self.service_registry.insert(
                         ServiceInstanceId {
                             service_id,
@@ -518,10 +530,7 @@ where
                         if self.unicast_sockets.is_empty() {
                             match self.bind_unicast(0) {
                                 Ok(port) => {
-                                    debug!(
-                                        "Auto-bound unicast on port {} for SendToService",
-                                        port
-                                    );
+                                    debug!("Auto-bound unicast on port {} for SendToService", port);
                                     port
                                 }
                                 Err(e) => {
@@ -1160,7 +1169,7 @@ mod tests {
         );
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
-        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         control_sender.send(msg).await.unwrap();
         rx.await.unwrap().unwrap();
 
@@ -1189,7 +1198,7 @@ mod tests {
 
         // Add endpoint
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
-        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         control_sender.send(msg).await.unwrap();
         rx.await.unwrap().unwrap();
 
@@ -1213,7 +1222,7 @@ mod tests {
 
         // Add endpoint but do NOT bind discovery
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
-        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         control_sender.send(msg).await.unwrap();
         rx.await.unwrap().unwrap();
 
@@ -1252,7 +1261,7 @@ mod tests {
         );
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
-        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         control_sender.send(msg).await.unwrap();
         rx.await.unwrap().unwrap();
 
@@ -1358,7 +1367,7 @@ mod tests {
         rx.await.unwrap().unwrap();
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
-        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         control_sender.send(msg).await.unwrap();
         rx.await.unwrap().unwrap();
 
