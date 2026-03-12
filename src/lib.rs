@@ -85,6 +85,6 @@ pub use traits::OfferedEndpoint;
 pub use traits::{PayloadWireFormat, WireFormat};
 
 #[cfg(feature = "client")]
-pub use client::{Client, ClientUpdate, DiscoveryMessage};
+pub use client::{Client, ClientUpdate, DiscoveryMessage, PendingResponse};
 #[cfg(feature = "server")]
 pub use server::Server;

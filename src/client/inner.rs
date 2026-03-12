@@ -36,10 +36,17 @@ pub(super) enum ControlMessage<P: PayloadWireFormat> {
         P::SdHeader,
         oneshot::Sender<Result<(), Error>>,
     ),
-    AwaitResponse(Message<P>, oneshot::Sender<Result<P, Error>>),
     AddEndpoint(u16, u16, SocketAddrV4, oneshot::Sender<Result<(), Error>>),
     RemoveEndpoint(u16, u16, oneshot::Sender<Result<(), Error>>),
-    SendToService(u16, u16, Message<P>, oneshot::Sender<Result<P, Error>>),
+    SendToService {
+        service_id: u16,
+        instance_id: u16,
+        message: Message<P>,
+        /// Fires when the UDP send completes (or errors on lookup/bind).
+        send_complete: oneshot::Sender<Result<(), Error>>,
+        /// Fires when a matching unicast response arrives.
+        response: oneshot::Sender<Result<P, Error>>,
+    },
     Subscribe {
         service_id: u16,
         instance_id: u16,
@@ -60,7 +67,6 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ControlMessage<P> {
             Self::SendSD(addr, header, _) => {
                 f.debug_tuple("SendSD").field(addr).field(header).finish()
             }
-            Self::AwaitResponse(msg, _) => f.debug_tuple("AwaitResponse").field(msg).finish(),
             Self::AddEndpoint(sid, iid, addr, _) => f
                 .debug_tuple("AddEndpoint")
                 .field(sid)
@@ -72,12 +78,17 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ControlMessage<P> {
                 .field(sid)
                 .field(iid)
                 .finish(),
-            Self::SendToService(sid, iid, msg, _) => f
-                .debug_tuple("SendToService")
-                .field(sid)
-                .field(iid)
-                .field(msg)
-                .finish(),
+            Self::SendToService {
+                service_id,
+                instance_id,
+                message,
+                ..
+            } => f
+                .debug_struct("SendToService")
+                .field("service_id", service_id)
+                .field("instance_id", instance_id)
+                .field("message", message)
+                .finish_non_exhaustive(),
             Self::Subscribe {
                 service_id,
                 instance_id,
@@ -137,15 +148,28 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
         )
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn send_to_service(
         service_id: u16,
         instance_id: u16,
         message: Message<P>,
-    ) -> (oneshot::Receiver<Result<P, Error>>, Self) {
-        let (sender, receiver) = oneshot::channel();
+    ) -> (
+        oneshot::Receiver<Result<(), Error>>,
+        oneshot::Receiver<Result<P, Error>>,
+        Self,
+    ) {
+        let (send_complete_tx, send_complete_rx) = oneshot::channel();
+        let (response_tx, response_rx) = oneshot::channel();
         (
-            receiver,
-            Self::SendToService(service_id, instance_id, message, sender),
+            send_complete_rx,
+            response_rx,
+            Self::SendToService {
+                service_id,
+                instance_id,
+                message,
+                send_complete: send_complete_tx,
+                response: response_tx,
+            },
         )
     }
 
@@ -178,6 +202,12 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     control_receiver: Receiver<ControlMessage<PayloadDefinitions>>,
     /// The active request, if one is being served
     active_request: Option<ControlMessage<PayloadDefinitions>>,
+    /// Pending request-response: (`message_id`, `response_sender`).
+    /// Set by `SendToService`, cleared when a matching unicast arrives or sender is dropped.
+    pending_response: Option<(
+        protocol::MessageId,
+        oneshot::Sender<Result<PayloadDefinitions, Error>>,
+    )>,
     /// MPSC Sender used to send updates to outer client
     update_sender: mpsc::Sender<ClientUpdate<PayloadDefinitions>>,
     /// Target interface for sockets
@@ -228,6 +258,7 @@ where
         let inner = Self {
             control_receiver,
             active_request: None,
+            pending_response: None,
             update_sender,
             interface,
             discovery_socket: None,
@@ -421,10 +452,6 @@ where
                         }
                     }
                 }
-                // Nothing to do here, this is handled in the run loop when receiving messages
-                ControlMessage::AwaitResponse(message, response) => {
-                    self.active_request = Some(ControlMessage::AwaitResponse(message, response));
-                }
                 ControlMessage::AddEndpoint(service_id, instance_id, addr, response) => {
                     self.service_registry.insert(
                         ServiceInstanceId {
@@ -458,13 +485,19 @@ where
                         warn!("RemoveEndpoint response receiver dropped (caller canceled)");
                     }
                 }
-                ControlMessage::SendToService(service_id, instance_id, mut message, response) => {
+                ControlMessage::SendToService {
+                    service_id,
+                    instance_id,
+                    mut message,
+                    send_complete,
+                    response,
+                } => {
                     let id = ServiceInstanceId {
                         service_id,
                         instance_id,
                     };
                     let Some(endpoint) = self.service_registry.get(id) else {
-                        let _ = response.send(Err(Error::ServiceNotFound));
+                        let _ = send_complete.send(Err(Error::ServiceNotFound));
                         return;
                     };
                     let target = endpoint.addr;
@@ -476,7 +509,7 @@ where
                                 debug!("Auto-bound unicast on port {} for SendToService", port);
                             }
                             Err(e) => {
-                                let _ = response.send(Err(e));
+                                let _ = send_complete.send(Err(e));
                                 return;
                             }
                         }
@@ -495,14 +528,16 @@ where
                         self.session_counter = 1;
                     }
 
-                    let send_result = socket.send(target, message.clone()).await;
+                    let message_id = message.header().message_id();
+                    let send_result = socket.send(target, message).await;
                     match send_result {
                         Ok(()) => {
-                            self.active_request =
-                                Some(ControlMessage::AwaitResponse(message.clone(), response));
+                            let _ = send_complete.send(Ok(()));
+                            // Drop any prior pending response (caller gets RecvError)
+                            self.pending_response = Some((message_id, response));
                         }
                         Err(e) => {
-                            let _ = response.send(Err(e));
+                            let _ = send_complete.send(Err(e));
                         }
                     }
                 }
@@ -596,6 +631,7 @@ where
             loop {
                 let Self {
                     control_receiver,
+                    pending_response,
                     discovery_socket,
                     unicast_sockets,
                     update_sender,
@@ -610,25 +646,15 @@ where
                     // Receive a control message
                     ctrl = control_receiver.recv() => {
                         if let Some(ctrl) = ctrl {
-                            match active_request {
-                                // Only AwaitResponse is safe to preempt — it represents
-                                // waiting for an external UDP reply, and the caller may
-                                // have already abandoned the oneshot.
-                                Some(ControlMessage::AwaitResponse(..)) => {
-                                    warn!("Clearing stale active_request (caller abandoned AwaitResponse)");
-                                    *active_request = None;
-                                }
-                                // For multi-step operations (e.g. SetInterface, SendSD)
-                                // that re-queue themselves across loop iterations, do not
+                            if active_request.is_some() {
+                                // Multi-step operations (e.g. SetInterface, SendSD)
+                                // re-queue themselves across loop iterations. Do not
                                 // discard mid-operation. Let the existing request finish.
-                                Some(_) => {
-                                    error!(
-                                        "Received new control message while non-preemptible \
-                                         active_request is in progress; ignoring new message"
-                                    );
-                                    continue;
-                                }
-                                None => {}
+                                error!(
+                                    "Received new control message while active_request \
+                                     is in progress; ignoring new message"
+                                );
+                                continue;
                             }
                             debug!("Received control message: {:?}", ctrl);
                             *active_request = Some(ctrl);
@@ -715,34 +741,17 @@ where
                          match unicast {
                              Ok(received) => {
                                  let received_message = received.message;
-                                 if let Some(active) = active_request.take() {
-                                     if let ControlMessage::AwaitResponse(request_message, response) = active {
-                                         if request_message.header().message_id() == received_message.header().message_id() {
-                                            if response.send(Ok(
-                                                 received_message.payload().clone(),
-                                             )).is_err() {
-                                                 // Receiver was dropped (caller timed out or canceled).
-                                                 // active_request is already None from .take() above.
-                                                 warn!("AwaitResponse receiver dropped (caller canceled)");
-                                             }
-                                         } else {
-                                             *active_request = Some(ControlMessage::AwaitResponse(request_message, response));
-                                             // Use try_send to avoid blocking the select loop
-                                             // while waiting for a response. If the channel is
-                                             // full, drop the event rather than deadlocking.
-                                             match update_sender.try_send(ClientUpdate::Unicast(received_message)) {
-                                                 Ok(()) => {}
-                                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                                     trace!("Update channel full, dropping event while awaiting response");
-                                                 }
-                                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                                     *run = false;
-                                                 }
-                                             }
-                                         }
-                                     } else {*active_request = Some(active);}
-                                 } else if update_sender.send(ClientUpdate::Unicast(received_message)).await.is_err(){
-                                        *run = false;
+                                 // Check if this matches a pending request-response
+                                 if let Some((pending_id, _)) = pending_response
+                                     && *pending_id == received_message.header().message_id()
+                                 {
+                                     let (_, sender) = pending_response.take().unwrap();
+                                     let _ = sender.send(Ok(received_message.payload().clone()));
+                                     continue;
+                                 }
+                                 // Not a response — forward as ClientUpdate::Unicast
+                                 if update_sender.send(ClientUpdate::Unicast(received_message)).await.is_err() {
+                                     *run = false;
                                  }
                              }
                              Err(err) => {
@@ -768,7 +777,7 @@ where
 mod tests {
     use super::*;
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
-    use std::{format, vec};
+    use std::format;
 
     type TestControl = ControlMessage<TestPayload>;
 
@@ -788,6 +797,20 @@ mod tests {
         let sd_header = empty_sd_header();
         let (_rx, msg) = TestControl::send_sd(target, sd_header);
         assert!(matches!(msg, ControlMessage::SendSD(..)));
+
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (_rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        assert!(matches!(msg, ControlMessage::AddEndpoint(..)));
+
+        let (_rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
+        assert!(matches!(msg, ControlMessage::RemoveEndpoint(..)));
+
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let (_send_rx, _resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
+        assert!(matches!(msg, ControlMessage::SendToService { .. }));
+
+        let (_rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
+        assert!(matches!(msg, ControlMessage::Subscribe { .. }));
     }
 
     #[test]
@@ -806,6 +829,28 @@ mod tests {
         let sd_header = empty_sd_header();
         let (_rx, msg) = TestControl::send_sd(target, sd_header);
         assert!(format!("{msg:?}").contains("SendSD"));
+
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (_rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        let s = format!("{msg:?}");
+        assert!(s.contains("AddEndpoint"));
+
+        let (_rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
+        let s = format!("{msg:?}");
+        assert!(s.contains("RemoveEndpoint"));
+
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let (_send_rx, _resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
+        let s = format!("{msg:?}");
+        assert!(s.contains("SendToService"));
+        assert!(s.contains("service_id"));
+        assert!(s.contains("instance_id"));
+
+        let (_rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
+        let s = format!("{msg:?}");
+        assert!(s.contains("Subscribe"));
+        assert!(s.contains("service_id"));
+        assert!(s.contains("event_group_id"));
     }
 
     #[tokio::test]
@@ -897,88 +942,6 @@ mod tests {
         assert_inner_alive(&control_sender).await;
     }
 
-    // -- Stale active_request test --
-    // Verifies that when a new control message arrives while the inner loop
-    // already has an outstanding AwaitResponse, the stale request is cleared
-    // and the new message is processed (rather than panicking via assert!).
-
-    #[tokio::test]
-    async fn test_stale_active_request_cleared_on_new_message() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
-
-        // Register an endpoint pointing to a port nobody is listening on
-        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 55555);
-        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, target);
-        control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
-
-        // Send a request via SendToService — the UDP send succeeds but no
-        // reply will ever come, leaving the inner loop in AwaitResponse state.
-        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
-        let (_rx_send, msg_send) = TestControl::send_to_service(0x1234, 0x0001, message);
-        control_sender.send(msg_send).await.unwrap();
-
-        // Wait for inner to enter AwaitResponse state
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Send a new control message — this should clear the stale
-        // AwaitResponse and process normally.
-        let (rx_remove, msg_remove) = TestControl::remove_endpoint(0x1234, 0x0001);
-        control_sender.send(msg_remove).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx_remove)
-            .await
-            .expect("Timed out — stale active_request was not cleared")
-            .expect("Oneshot closed");
-        assert!(result.is_ok());
-    }
-
-    // -- AwaitResponse dropped receiver test --
-    // Verifies that when a matching unicast response arrives but the caller
-    // already dropped their oneshot receiver, the inner loop continues.
-
-    #[tokio::test]
-    async fn test_dropped_receiver_await_response_continues() {
-        use tokio::net::UdpSocket;
-
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
-
-        // Create a raw socket to receive the request and echo it back
-        let raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let raw_port = raw.local_addr().unwrap().port();
-
-        // Register the raw socket as an endpoint
-        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_port);
-        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, target);
-        control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
-
-        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
-
-        // Send request through inner — it will be forwarded to raw_port
-        let (rx_send, msg_send) = TestControl::send_to_service(0x1234, 0x0001, message);
-        control_sender.send(msg_send).await.unwrap();
-
-        // Receive the request on the raw socket
-        let mut buf = vec![0u8; 1400];
-        let (len, source_addr) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), raw.recv_from(&mut buf))
-                .await
-                .expect("Timed out waiting for request on raw socket")
-                .unwrap();
-
-        // Drop the response receiver — inner still holds the sender in AwaitResponse
-        drop(rx_send);
-
-        // Echo the request back (same message_id, so it matches AwaitResponse)
-        raw.send_to(&buf[..len], source_addr).await.unwrap();
-
-        // Give inner time to receive the echo and hit the dropped-receiver warn path
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Verify inner loop is still alive
-        assert_inner_alive(&control_sender).await;
-    }
-
     // -- Non-preemptible active_request test --
     // Verifies that when a new control message arrives while a multi-step
     // operation (SetInterface) is mid-way through processing, the new message
@@ -1025,6 +988,231 @@ mod tests {
         );
 
         // Verify inner loop is still alive
+        assert_inner_alive(&control_sender).await;
+    }
+
+    #[test]
+    fn test_send_to_service_constructor_returns_two_receivers() {
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let (send_rx, resp_rx, _msg) = TestControl::send_to_service(0x1234, 0x0001, message);
+
+        // Extract the senders from the control message
+        if let ControlMessage::SendToService {
+            send_complete,
+            response,
+            ..
+        } = _msg
+        {
+            // Both channels are independent — sending on one doesn't affect the other
+            send_complete.send(Ok(())).unwrap();
+            assert!(send_rx.blocking_recv().unwrap().is_ok());
+
+            let payload = TestPayload {
+                header: empty_sd_header(),
+            };
+            response.send(Ok(payload.clone())).unwrap();
+            assert_eq!(resp_rx.blocking_recv().unwrap().unwrap(), payload);
+        } else {
+            panic!("expected SendToService variant");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dropped_receiver_add_endpoint_continues() {
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        drop(rx);
+        control_sender.send(msg).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert_inner_alive(&control_sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_dropped_receiver_remove_endpoint_continues() {
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        let (rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
+        drop(rx);
+        control_sender.send(msg).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert_inner_alive(&control_sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_dropped_receiver_send_to_service_send_complete_continues() {
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        // Add an endpoint first so SendToService doesn't fail with ServiceNotFound
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // Send SendToService with the send_complete receiver dropped
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let (send_rx, _resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
+        drop(send_rx);
+        control_sender.send(msg).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert_inner_alive(&control_sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_bind_discovery_idempotent() {
+        // Binding discovery twice should succeed (early return on already-bound)
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        let (rx, msg) = TestControl::bind_discovery();
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // Second bind should also succeed (idempotent path)
+        let (rx, msg) = TestControl::bind_discovery();
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_send_sd_auto_binds_discovery() {
+        // SendSD without a bound discovery socket should auto-bind and succeed
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30490);
+        let sd_header = empty_sd_header();
+        let (rx, msg) = TestControl::send_sd(target, sd_header);
+        control_sender.send(msg).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("Timed out waiting for SendSD")
+            .expect("SendSD oneshot closed");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_send_to_service_auto_binds_unicast() {
+        // SendToService with no unicast sockets should auto-bind ephemeral
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let (send_rx, _resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
+        control_sender.send(msg).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), send_rx)
+            .await
+            .expect("Timed out waiting for SendToService")
+            .expect("SendToService oneshot closed");
+        assert!(result.is_ok(), "send should succeed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_with_endpoint_sends_sd() {
+        // Subscribe with a known endpoint and bound discovery should send the SD message
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        // Bind discovery first
+        let (rx, msg) = TestControl::bind_discovery();
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // Add endpoint
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // Subscribe
+        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
+        control_sender.send(msg).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("Timed out waiting for Subscribe")
+            .expect("Subscribe oneshot closed");
+        assert!(result.is_ok(), "subscribe should succeed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_auto_binds_discovery() {
+        // Subscribe without discovery bound should auto-bind and succeed
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        // Add endpoint but do NOT bind discovery
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // Subscribe should auto-bind discovery
+        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
+        control_sender.send(msg).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("Timed out waiting for Subscribe")
+            .expect("Subscribe oneshot closed");
+        assert!(result.is_ok(), "subscribe should auto-bind: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_unknown_service_returns_error() {
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        let (rx, msg) = TestControl::subscribe(0xFFFF, 0xFFFF, 1, 3, 0x01, 0);
+        control_sender.send(msg).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("Timed out")
+            .expect("oneshot closed");
+        assert!(matches!(result, Err(Error::ServiceNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_send_to_service_reuses_existing_unicast_socket() {
+        // When a unicast socket already exists, SendToService should reuse it
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // First send auto-binds unicast
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let (send_rx, _resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
+        control_sender.send(msg).await.unwrap();
+        send_rx.await.unwrap().unwrap();
+
+        // Second send reuses the existing socket (no auto-bind needed)
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let (send_rx, _resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
+        control_sender.send(msg).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), send_rx)
+            .await
+            .expect("Timed out")
+            .expect("oneshot closed");
+        assert!(
+            result.is_ok(),
+            "second send should reuse socket: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dropped_receiver_subscribe_service_not_found_continues() {
+        // Subscribe with no endpoint → ServiceNotFound response is dropped
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+
+        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
+        drop(rx);
+        control_sender.send(msg).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
         assert_inner_alive(&control_sender).await;
     }
 }
