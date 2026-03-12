@@ -145,4 +145,40 @@ mod tests {
         assert_eq!(from_new.protect_counter, from_default.protect_counter);
         assert_eq!(from_new.last_counter, from_default.last_counter);
     }
+
+    #[test]
+    fn profile4_with_initial_counter_sets_counter() {
+        let state = Profile4State::with_initial_counter(42);
+        assert_eq!(state.protect_counter(), 42);
+        assert_eq!(state.last_counter(), None);
+    }
+
+    #[test]
+    fn profile4_accessors() {
+        let mut state = Profile4State::new();
+        assert_eq!(state.protect_counter(), 0);
+        assert_eq!(state.last_counter(), None);
+        state.protect_counter = 5;
+        state.last_counter = Some(3);
+        assert_eq!(state.protect_counter(), 5);
+        assert_eq!(state.last_counter(), Some(3));
+    }
+
+    #[test]
+    fn profile5_with_initial_counter_sets_counter() {
+        let state = Profile5State::with_initial_counter(42);
+        assert_eq!(state.protect_counter(), 42);
+        assert_eq!(state.last_counter(), None);
+    }
+
+    #[test]
+    fn profile5_accessors() {
+        let mut state = Profile5State::new();
+        assert_eq!(state.protect_counter(), 0);
+        assert_eq!(state.last_counter(), None);
+        state.protect_counter = 5;
+        state.last_counter = Some(3);
+        assert_eq!(state.protect_counter(), 5);
+        assert_eq!(state.last_counter(), Some(3));
+    }
 }

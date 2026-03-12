@@ -422,4 +422,24 @@ mod tests {
         let result = check_profile5(&config, &mut check_state, &short_message);
         assert_eq!(result.status, E2ECheckStatus::BadArgument);
     }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_check_result_to_owned_payload() {
+        let data = b"hello";
+        let result = E2ECheckResult::success(E2ECheckStatus::Ok, 0, data);
+        let owned = result.to_owned_payload();
+        assert_eq!(owned, Some(b"hello".to_vec()));
+
+        let err_result = E2ECheckResult::error(E2ECheckStatus::CrcError);
+        assert_eq!(err_result.to_owned_payload(), None);
+    }
+
+    #[test]
+    fn test_e2e_key_from_message_id() {
+        let mid = crate::protocol::MessageId::new_from_service_and_method(0x1234, 0x0001);
+        let key = E2EKey::from_message_id(mid);
+        assert_eq!(key.service_id, 0x1234);
+        assert_eq!(key.method_or_event_id, 0x0001);
+    }
 }
