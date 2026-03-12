@@ -452,4 +452,47 @@ mod tests {
             "expected ServiceNotFound, got {result:?}"
         );
     }
+
+    #[tokio::test]
+    async fn test_send_sd_message() {
+        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        // Bind discovery first so the send path uses the existing socket
+        client.bind_discovery().await.unwrap();
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30490);
+        let sd_header = empty_sd_header();
+        client.send_sd_message(target, sd_header).await.unwrap();
+        client.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn test_send_to_service_success_returns_pending_response() {
+        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30000);
+        client.add_endpoint(0x1234, 0x0001, addr).await.unwrap();
+        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
+        // send_to_service succeeds (send completes), returning a PendingResponse
+        let pending = client.send_to_service(0x1234, 0x0001, msg).await;
+        assert!(pending.is_ok());
+        client.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn test_run_returns_none_after_shutdown() {
+        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        // Drop the control sender by taking ownership, then check run() returns None
+        let control_sender = client.control_sender.clone();
+        drop(control_sender);
+        // The original sender in client is still alive; drop it via shut_down
+        // Instead, test that run() returns None when inner loop exits
+        let cs = std::mem::replace(
+            &mut client.control_sender,
+            mpsc::channel::<inner::ControlMessage<TestPayload>>(1).0,
+        );
+        drop(cs);
+        // Now the inner loop should exit; run() should return None
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client.run()).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
 }
