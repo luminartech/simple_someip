@@ -287,12 +287,12 @@ async fn main() -> Result<(), Error> {
 
     info!("Starting discovery client on interface {interface}");
 
-    let mut client = simple_someip::Client::<Payload>::new(interface);
+    let (client, mut updates) = simple_someip::Client::<Payload>::new(interface);
     client.bind_discovery().await.unwrap();
 
     let mut state = DiscoveryState::new();
 
-    while let Some(update) = client.run().await {
+    while let Some(update) = updates.recv().await {
         match update {
             simple_someip::ClientUpdate::DiscoveryUpdated(msg) => {
                 state.total_messages += 1;

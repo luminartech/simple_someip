@@ -55,7 +55,7 @@ async fn test_client_server_subscribe_and_receive_event() {
     let server_handle = tokio::spawn(async move { server.run().await });
 
     // Create client and subscribe to the server's event group
-    let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+    let (client, mut updates) = TestClient::new(Ipv4Addr::LOCALHOST);
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
@@ -66,7 +66,7 @@ async fn test_client_server_subscribe_and_receive_event() {
     );
 
     // Drain any discovery update that may have arrived (SubscribeAck)
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(250), client.run()).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(250), updates.recv()).await;
 
     // Publish an event from the server to the client's unicast port
     let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
@@ -77,7 +77,7 @@ async fn test_client_server_subscribe_and_receive_event() {
     assert_eq!(sent, 1);
 
     // Client receives the unicast event
-    let update = tokio::time::timeout(std::time::Duration::from_secs(2), client.run())
+    let update = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv())
         .await
         .expect("timeout waiting for Unicast");
     assert!(
@@ -87,7 +87,7 @@ async fn test_client_server_subscribe_and_receive_event() {
 
     // Tear down
     client.unbind_discovery().await.unwrap();
-    client.shut_down().await;
+    client.shut_down();
     server_handle.abort();
 }
 
@@ -98,7 +98,7 @@ async fn test_client_send_sd_auto_binds_discovery() {
     let server_handle = tokio::spawn(async move { server.run().await });
 
     // Create client — NO bind_discovery
-    let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+    let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
 
     // send_sd_message should auto-bind discovery and succeed
     let sd_header = VecSdHeader {
@@ -118,7 +118,7 @@ async fn test_client_send_sd_auto_binds_discovery() {
         .await
         .expect("send_sd_message should auto-bind discovery and succeed");
 
-    client.shut_down().await;
+    client.shut_down();
     server_handle.abort();
 }
 
@@ -129,7 +129,7 @@ async fn test_client_bind_unbind_lifecycle_with_server() {
     let (mut server, server_port) = create_server(0x5B, 1).await;
     let server_handle = tokio::spawn(async move { server.run().await });
 
-    let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+    let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
 
     // Bind discovery, subscribe, then unbind and rebind
     client.bind_discovery().await.unwrap();
@@ -145,7 +145,7 @@ async fn test_client_bind_unbind_lifecycle_with_server() {
     // that unbinds discovery, changes interface, and rebinds
     client.set_interface(Ipv4Addr::LOCALHOST).await.unwrap();
 
-    client.shut_down().await;
+    client.shut_down();
     server_handle.abort();
 }
 
@@ -157,7 +157,7 @@ async fn test_add_endpoint_and_send_to_service() {
     let publisher = server.publisher();
     let server_handle = tokio::spawn(async move { server.run().await });
 
-    let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+    let (client, mut updates) = TestClient::new(Ipv4Addr::LOCALHOST);
     client.bind_discovery().await.unwrap();
 
     // Register the server's endpoint manually (simulating non-broadcasting service)
@@ -174,7 +174,7 @@ async fn test_add_endpoint_and_send_to_service() {
     );
 
     // Drain any pending discovery update
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(250), client.run()).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(250), updates.recv()).await;
 
     // Publish an event from the server
     let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
@@ -185,7 +185,7 @@ async fn test_add_endpoint_and_send_to_service() {
     assert_eq!(sent, 1);
 
     // Client receives the unicast event
-    let update = tokio::time::timeout(std::time::Duration::from_secs(2), client.run())
+    let update = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv())
         .await
         .expect("timeout waiting for Unicast");
     assert!(
@@ -204,6 +204,6 @@ async fn test_add_endpoint_and_send_to_service() {
     // Verify that PendingResponse is importable from the crate root
     let _: fn() -> Option<simple_someip::PendingResponse<RawPayload>> = || None;
 
-    client.shut_down().await;
+    client.shut_down();
     server_handle.abort();
 }

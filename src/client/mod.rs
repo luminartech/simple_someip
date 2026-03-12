@@ -10,7 +10,7 @@ use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry};
 use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
 use inner::{ControlMessage, Inner};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
@@ -103,18 +103,48 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ClientUpdate<P> {
     }
 }
 
+/// Stream of updates from the SOME/IP client event loop.
+///
+/// Returned by [`Client::new`]. Call [`recv`](Self::recv) to receive
+/// discovery, unicast, and error updates.
+pub struct ClientUpdates<MessageDefinitions: PayloadWireFormat> {
+    update_receiver: mpsc::UnboundedReceiver<ClientUpdate<MessageDefinitions>>,
+}
+
+impl<MessageDefinitions: PayloadWireFormat> std::fmt::Debug for ClientUpdates<MessageDefinitions> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientUpdates").finish_non_exhaustive()
+    }
+}
+
+impl<MessageDefinitions: PayloadWireFormat> ClientUpdates<MessageDefinitions> {
+    /// Waits for the next update from the client event loop.
+    ///
+    /// Returns `None` when the inner loop has exited (all `Client` handles
+    /// dropped and the event loop finished draining).
+    pub async fn recv(&mut self) -> Option<ClientUpdate<MessageDefinitions>> {
+        self.update_receiver.recv().await
+    }
+}
+
 /// A SOME/IP client that handles service discovery and message exchange.
+///
+/// `Client` is cheaply [`Clone`]-able. All clones share the same underlying
+/// event loop and can be used concurrently from different tasks.
+#[derive(Clone)]
 pub struct Client<MessageDefinitions: PayloadWireFormat> {
-    interface: Ipv4Addr,
+    interface: Arc<RwLock<Ipv4Addr>>,
     control_sender: mpsc::Sender<inner::ControlMessage<MessageDefinitions>>,
-    update_receiver: mpsc::Receiver<ClientUpdate<MessageDefinitions>>,
     e2e_registry: Arc<Mutex<E2ERegistry>>,
 }
 
 impl<MessageDefinitions: PayloadWireFormat> std::fmt::Debug for Client<MessageDefinitions> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
-            .field("interface", &self.interface)
+            .field(
+                "interface",
+                &*self.interface.read().expect("interface lock poisoned"),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -124,28 +154,32 @@ where
     MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
 {
     /// Creates a new client bound to the given network interface and spawns its event loop.
+    ///
+    /// Returns a `(Client, ClientUpdates)` pair. The `Client` handle is
+    /// [`Clone`]-able and can be shared across tasks. `ClientUpdates` receives
+    /// discovery, unicast, and error updates from the event loop.
     #[must_use]
-    pub fn new(interface: Ipv4Addr) -> Self {
+    pub fn new(interface: Ipv4Addr) -> (Self, ClientUpdates<MessageDefinitions>) {
         let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
         let (control_sender, update_receiver) = Inner::spawn(interface, Arc::clone(&e2e_registry));
 
-        Self {
-            interface,
+        let client = Self {
+            interface: Arc::new(RwLock::new(interface)),
             control_sender,
-            update_receiver,
             e2e_registry,
-        }
-    }
-
-    /// Waits for the next update from the client event loop.
-    pub async fn run(&mut self) -> Option<ClientUpdate<MessageDefinitions>> {
-        self.update_receiver.recv().await
+        };
+        let updates = ClientUpdates { update_receiver };
+        (client, updates)
     }
 
     /// Returns the current network interface address.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the interface lock is poisoned.
     #[must_use]
     pub fn interface(&self) -> Ipv4Addr {
-        self.interface
+        *self.interface.read().expect("interface lock poisoned")
     }
 
     /// Changes the network interface and rebinds sockets.
@@ -156,12 +190,12 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if the internal control channel is closed.
-    pub async fn set_interface(&mut self, interface: Ipv4Addr) -> Result<(), Error> {
+    /// Panics if the internal control channel or interface lock is poisoned/closed.
+    pub async fn set_interface(&self, interface: Ipv4Addr) -> Result<(), Error> {
         let (response, message) = ControlMessage::set_interface(interface);
         self.control_sender.send(message).await.unwrap();
         response.await.unwrap()?;
-        self.interface = interface;
+        *self.interface.write().expect("interface lock poisoned") = interface;
         Ok(())
     }
 
@@ -174,7 +208,7 @@ where
     /// # Panics
     ///
     /// Panics if the internal control channel is closed.
-    pub async fn bind_discovery(&mut self) -> Result<(), Error> {
+    pub async fn bind_discovery(&self) -> Result<(), Error> {
         let (response, message) = ControlMessage::bind_discovery();
         self.control_sender.send(message).await.unwrap();
         response.await.unwrap()
@@ -189,7 +223,7 @@ where
     /// # Panics
     ///
     /// Panics if the internal control channel is closed.
-    pub async fn unbind_discovery(&mut self) -> Result<(), Error> {
+    pub async fn unbind_discovery(&self) -> Result<(), Error> {
         let (response, message) = ControlMessage::unbind_discovery();
         self.control_sender.send(message).await.unwrap();
         response.await.unwrap()
@@ -205,7 +239,7 @@ where
     ///
     /// Panics if the internal control channel is closed.
     pub async fn subscribe(
-        &mut self,
+        &self,
         service_id: u16,
         instance_id: u16,
         major_version: u8,
@@ -235,7 +269,7 @@ where
     ///
     /// Panics if the internal control channel is closed.
     pub async fn send_sd_message(
-        &mut self,
+        &self,
         target: SocketAddrV4,
         sd_header: <MessageDefinitions as PayloadWireFormat>::SdHeader,
     ) -> Result<(), Error> {
@@ -263,7 +297,7 @@ where
     ///
     /// Panics if the internal control channel is closed.
     pub async fn add_endpoint(
-        &mut self,
+        &self,
         service_id: u16,
         instance_id: u16,
         addr: SocketAddrV4,
@@ -284,11 +318,7 @@ where
     /// # Panics
     ///
     /// Panics if the internal control channel is closed.
-    pub async fn remove_endpoint(
-        &mut self,
-        service_id: u16,
-        instance_id: u16,
-    ) -> Result<(), Error> {
+    pub async fn remove_endpoint(&self, service_id: u16, instance_id: u16) -> Result<(), Error> {
         let (response, message) = ControlMessage::remove_endpoint(service_id, instance_id);
         self.control_sender.send(message).await.unwrap();
         response.await.unwrap()
@@ -296,7 +326,6 @@ where
 
     /// Sends a message to a service and returns a handle to await the response.
     ///
-    /// The `&mut self` borrow is released once the UDP send completes.
     /// Call `.response()` on the returned handle to await the reply payload.
     ///
     /// # Errors
@@ -308,7 +337,7 @@ where
     ///
     /// Panics if the internal control channel is closed.
     pub async fn send_to_service(
-        &mut self,
+        &self,
         service_id: u16,
         instance_id: u16,
         message: crate::protocol::Message<MessageDefinitions>,
@@ -320,6 +349,35 @@ where
         Ok(PendingResponse {
             receiver: response_rx,
         })
+    }
+
+    /// Sends a request to a service and awaits the response in one call.
+    ///
+    /// Unlike [`send_to_service`](Self::send_to_service), this method does not
+    /// require manually driving [`ClientUpdates::recv`] — the inner event loop
+    /// resolves the response independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service is not found, unicast binding fails,
+    /// the UDP send fails, or the response payload fails to deserialize.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal control channel is closed.
+    pub async fn request(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        message: crate::protocol::Message<MessageDefinitions>,
+    ) -> Result<MessageDefinitions, Error> {
+        let (send_rx, response_rx, ctrl_msg) =
+            ControlMessage::send_to_service(service_id, instance_id, message);
+        self.control_sender.send(ctrl_msg).await.unwrap();
+        send_rx.await.unwrap()?;
+        response_rx
+            .await
+            .expect("inner loop dropped response channel")
     }
 
     /// Register an E2E profile for the given key.
@@ -350,18 +408,13 @@ where
             .unregister(key);
     }
 
-    /// Shuts down the client, dropping the control channel and draining remaining updates.
-    pub async fn shut_down(self) {
-        let Self {
-            control_sender,
-            mut update_receiver,
-            ..
-        } = self;
-        drop(control_sender);
+    /// Shuts down the client by dropping the control channel.
+    ///
+    /// The inner event loop will exit once all `Client` clones are dropped.
+    /// Remaining updates can be drained via [`ClientUpdates::recv`].
+    pub fn shut_down(self) {
+        drop(self.control_sender);
         info!("Shutting Down SOME/IP client");
-        while update_receiver.recv().await.is_some() {
-            info!(".");
-        }
     }
 }
 
@@ -376,18 +429,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_new_and_interface() {
-        let client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
         assert_eq!(client.interface(), Ipv4Addr::LOCALHOST);
-        client.shut_down().await;
+        client.shut_down();
     }
 
     #[tokio::test]
     async fn test_client_debug() {
-        let client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
         let debug_str = format!("{client:?}");
         assert!(debug_str.contains("Client"));
         assert!(debug_str.contains("127.0.0.1"));
-        client.shut_down().await;
+        client.shut_down();
     }
 
     #[tokio::test]
@@ -429,59 +482,59 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_unknown_service_returns_error() {
-        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
         let result = client.subscribe(0xFFFF, 0xFFFF, 1, 3, 0x01, 0).await;
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),
             "expected ServiceNotFound, got {result:?}"
         );
-        client.shut_down().await;
+        client.shut_down();
     }
 
     #[tokio::test]
     async fn test_bind_discovery_and_unbind() {
-        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
         client.bind_discovery().await.unwrap();
         client.unbind_discovery().await.unwrap();
-        client.shut_down().await;
+        client.shut_down();
     }
 
     #[tokio::test]
     async fn test_set_interface() {
-        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
         let new_addr = Ipv4Addr::LOCALHOST;
         client.set_interface(new_addr).await.unwrap();
         assert_eq!(client.interface(), new_addr);
-        client.shut_down().await;
+        client.shut_down();
     }
 
     #[tokio::test]
     async fn test_add_endpoint_succeeds() {
-        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 30000);
         client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
-        client.shut_down().await;
+        client.shut_down();
     }
 
     #[tokio::test]
     async fn test_send_to_service_unknown_returns_error() {
-        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         let result = client.send_to_service(0xFFFF, 0xFFFF, msg).await;
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),
             "expected ServiceNotFound, got {result:?}"
         );
-        client.shut_down().await;
+        client.shut_down();
     }
 
     #[tokio::test]
     async fn test_remove_endpoint_succeeds() {
-        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 30000);
         client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
         client.remove_endpoint(0x1234, 0x0001).await.unwrap();
-        client.shut_down().await;
+        client.shut_down();
     }
 
     #[test]
@@ -518,49 +571,40 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_sd_message() {
-        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
         // Bind discovery first so the send path uses the existing socket
         client.bind_discovery().await.unwrap();
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30490);
         let sd_header = empty_sd_header();
         client.send_sd_message(target, sd_header).await.unwrap();
-        client.shut_down().await;
+        client.shut_down();
     }
 
     #[tokio::test]
     async fn test_send_to_service_success_returns_pending_response() {
-        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30000);
         client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         // send_to_service succeeds (send completes), returning a PendingResponse
         let pending = client.send_to_service(0x1234, 0x0001, msg).await;
         assert!(pending.is_ok());
-        client.shut_down().await;
+        client.shut_down();
     }
 
     #[tokio::test]
-    async fn test_run_returns_none_after_shutdown() {
-        let mut client = TestClient::new(Ipv4Addr::LOCALHOST);
-        // Drop the control sender by taking ownership, then check run() returns None
-        let control_sender = client.control_sender.clone();
-        drop(control_sender);
-        // The original sender in client is still alive; drop it via shut_down
-        // Instead, test that run() returns None when inner loop exits
-        let cs = std::mem::replace(
-            &mut client.control_sender,
-            mpsc::channel::<inner::ControlMessage<TestPayload>>(1).0,
-        );
-        drop(cs);
-        // Now the inner loop should exit; run() should return None
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), client.run()).await;
+    async fn test_recv_returns_none_after_shutdown() {
+        let (client, mut updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        client.shut_down();
+        // Now the inner loop should exit; recv() should return None
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv()).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn test_register_and_unregister_e2e() {
-        let client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
         let key = E2EKey {
             service_id: 0x1234,
             method_or_event_id: 0x0001,
@@ -568,6 +612,33 @@ mod tests {
         let profile = E2EProfile::Profile4(crate::e2e::Profile4Config::new(42, 10));
         client.register_e2e(key, profile);
         client.unregister_e2e(&key);
-        client.shut_down().await;
+        client.shut_down();
+    }
+
+    #[tokio::test]
+    async fn test_client_is_clone() {
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let client2 = client.clone();
+        assert_eq!(client.interface(), client2.interface());
+        client.shut_down();
+    }
+
+    #[tokio::test]
+    async fn test_client_updates_debug() {
+        let (_client, updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let debug_str = format!("{updates:?}");
+        assert!(debug_str.contains("ClientUpdates"));
+    }
+
+    #[tokio::test]
+    async fn test_request_unknown_service_returns_error() {
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
+        let result = client.request(0xFFFF, 0xFFFF, msg).await;
+        assert!(
+            matches!(result, Err(Error::ServiceNotFound)),
+            "expected ServiceNotFound, got {result:?}"
+        );
+        client.shut_down();
     }
 }
