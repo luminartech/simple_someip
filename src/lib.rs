@@ -57,6 +57,8 @@
 //! ### Async client (requires `feature = "client"`)
 //!
 //! ```rust,no_run
+//! # #[cfg(feature = "client")]
+//! # fn wrapper() {
 //! use simple_someip::{Client, ClientUpdate, RawPayload};
 //!
 //! #[tokio::main]
@@ -74,6 +76,7 @@
 //!         }
 //!     }
 //! }
+//! # }
 //! ```
 //!
 //! ## References
