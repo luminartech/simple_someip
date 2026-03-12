@@ -9,7 +9,8 @@ The server implementation provides:
 1. **Service Announcement** - Periodically broadcast OfferService messages via Service Discovery (SD)
 2. **Event Publishing** - Send events to subscribed clients
 3. **Subscription Management** - Track who's subscribed to which event groups
-4. **UDP Socket Management** - Handle unicast and multicast communication
+4. **End-to-End Protection** - Automatic E2E protection/checking per message key
+5. **UDP Socket Management** - Handle unicast and multicast communication
 
 ## Architecture
 
@@ -55,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut server = Server::new(config).await?;
 
     // Start announcing the service (sends OfferService every 1s)
-    server.start_announcing().await?;
+    server.start_announcing()?;
 
     // Get event publisher for sending events
     let publisher = server.publisher();
@@ -67,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Publish events to subscribers
+    // Publish events to subscribers using raw bytes
     publisher.publish_raw_event(
         0x1234,    // service_id
         1,         // instance_id
@@ -155,16 +156,24 @@ Main server struct:
 - `start_announcing() -> Result<()>` - Start SD announcements
 - `publisher() -> Arc<EventPublisher>` - Get event publisher
 - `run() -> Result<()>` - Run event loop (handles subscriptions)
+- `register_e2e(key, profile)` - Register E2E protection for a message key
+- `unregister_e2e(key)` - Remove E2E protection for a message key
 
 ### `EventPublisher`
 
 Publishes events to subscribers:
 
+- `publish_event(service_id, instance_id, event_group_id, message) -> Result<usize>`
+  - Type-safe event publishing using `Message<P>`
+  - Automatically applies E2E protection if configured for the message key
+  - Returns number of subscribers that received the event
 - `publish_raw_event(service_id, instance_id, event_group_id, event_id, session_id, protocol_version, interface_version, payload) -> Result<usize>`
-  - Sends event to all subscribers
+  - Low-level event publishing using raw bytes
   - Returns number of subscribers that received the event
 - `has_subscribers(service_id, instance_id, event_group_id) -> bool`
   - Check if any subscribers exist for an event group
+- `subscriber_count(service_id, instance_id, event_group_id) -> usize`
+  - Returns the number of subscribers for an event group
 
 ### `SubscriptionManager`
 
