@@ -6,9 +6,11 @@ mod socket_manager;
 
 pub use error::Error;
 
+use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry};
 use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
 use inner::{ControlMessage, Inner};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
@@ -69,7 +71,16 @@ pub enum ClientUpdate<P: PayloadWireFormat> {
     /// A remote sender has rebooted (detected via SD session tracking).
     SenderRebooted(SocketAddr),
     /// Unicast message received.
-    Unicast(Message<P>),
+    ///
+    /// When E2E is configured for this message's key, `e2e_status` contains
+    /// the check result and the payload has its E2E header stripped.
+    /// When no E2E is configured, `e2e_status` is `None`.
+    Unicast {
+        /// The received SOME/IP message.
+        message: Message<P>,
+        /// E2E check status, if E2E was configured for this message.
+        e2e_status: Option<E2ECheckStatus>,
+    },
     /// The client encountered an error.
     Error(Error),
 }
@@ -79,7 +90,14 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ClientUpdate<P> {
         match self {
             Self::DiscoveryUpdated(msg) => f.debug_tuple("DiscoveryUpdated").field(msg).finish(),
             Self::SenderRebooted(addr) => f.debug_tuple("SenderRebooted").field(addr).finish(),
-            Self::Unicast(msg) => f.debug_tuple("Unicast").field(msg).finish(),
+            Self::Unicast {
+                message,
+                e2e_status,
+            } => f
+                .debug_struct("Unicast")
+                .field("message", message)
+                .field("e2e_status", e2e_status)
+                .finish(),
             Self::Error(err) => f.debug_tuple("Error").field(err).finish(),
         }
     }
@@ -90,6 +108,7 @@ pub struct Client<MessageDefinitions: PayloadWireFormat> {
     interface: Ipv4Addr,
     control_sender: mpsc::Sender<inner::ControlMessage<MessageDefinitions>>,
     update_receiver: mpsc::Receiver<ClientUpdate<MessageDefinitions>>,
+    e2e_registry: Arc<Mutex<E2ERegistry>>,
 }
 
 impl<MessageDefinitions: PayloadWireFormat> std::fmt::Debug for Client<MessageDefinitions> {
@@ -107,12 +126,14 @@ where
     /// Creates a new client bound to the given network interface and spawns its event loop.
     #[must_use]
     pub fn new(interface: Ipv4Addr) -> Self {
-        let (control_sender, update_receiver) = Inner::spawn(interface);
+        let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
+        let (control_sender, update_receiver) = Inner::spawn(interface, Arc::clone(&e2e_registry));
 
         Self {
             interface,
             control_sender,
             update_receiver,
+            e2e_registry,
         }
     }
 
@@ -290,6 +311,34 @@ where
         })
     }
 
+    /// Register an E2E profile for the given key.
+    ///
+    /// Once registered, incoming messages matching `key` will have their E2E
+    /// header checked and stripped, and outgoing messages will have E2E
+    /// protection applied automatically.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the E2E registry mutex is poisoned.
+    pub fn register_e2e(&self, key: E2EKey, profile: E2EProfile) {
+        self.e2e_registry
+            .lock()
+            .expect("e2e registry lock poisoned")
+            .register(key, profile);
+    }
+
+    /// Remove E2E configuration for the given key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the E2E registry mutex is poisoned.
+    pub fn unregister_e2e(&self, key: &E2EKey) {
+        self.e2e_registry
+            .lock()
+            .expect("e2e registry lock poisoned")
+            .unregister(key);
+    }
+
     /// Shuts down the client, dropping the control channel and draining remaining updates.
     pub async fn shut_down(self) {
         let Self {
@@ -354,7 +403,10 @@ mod tests {
 
         // Unicast
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
-        let update: ClientUpdate<TestPayload> = ClientUpdate::Unicast(msg);
+        let update: ClientUpdate<TestPayload> = ClientUpdate::Unicast {
+            message: msg,
+            e2e_status: None,
+        };
         let debug_str = format!("{update:?}");
         assert!(debug_str.contains("Unicast"));
 
@@ -493,5 +545,18 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), client.run()).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_register_and_unregister_e2e() {
+        let client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let key = E2EKey {
+            service_id: 0x1234,
+            method_or_event_id: 0x0001,
+        };
+        let profile = E2EProfile::Profile4(crate::e2e::Profile4Config::new(42, 10));
+        client.register_e2e(key, profile);
+        client.unregister_e2e(&key);
+        client.shut_down().await;
     }
 }

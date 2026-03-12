@@ -29,6 +29,8 @@ mod crc;
 mod e2e_checker;
 mod e2e_protector;
 mod error;
+#[cfg(feature = "std")]
+mod registry;
 mod state;
 
 pub use config::{Profile4Config, Profile5Config};
@@ -38,6 +40,8 @@ pub use e2e_protector::{
     protect_profile5_with_header,
 };
 pub use error::Error;
+#[cfg(feature = "std")]
+pub use registry::E2ERegistry;
 pub use state::{Profile4State, Profile5State};
 
 /// Status result from E2E check operations.
@@ -113,6 +117,120 @@ impl<'a> E2ECheckResult<'a> {
     #[must_use]
     pub fn to_owned_payload(&self) -> Option<std::vec::Vec<u8>> {
         self.payload.map(<[u8]>::to_vec)
+    }
+}
+
+/// Describes which E2E profile to apply for a given data element.
+#[derive(Debug, Clone)]
+pub enum E2EProfile {
+    /// E2E Profile 4 (CRC-32, 12-byte header).
+    Profile4(Profile4Config),
+    /// E2E Profile 5 (CRC-16, 3-byte header, no upper-header in CRC).
+    Profile5(Profile5Config),
+    /// E2E Profile 5 with SOME/IP upper-header included in the CRC.
+    Profile5WithHeader(Profile5Config),
+}
+
+/// Identifies a data element for E2E protection lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct E2EKey {
+    /// SOME/IP service ID.
+    pub service_id: u16,
+    /// SOME/IP method or event ID.
+    pub method_or_event_id: u16,
+}
+
+impl E2EKey {
+    /// Create a new key from explicit service and method/event IDs.
+    #[must_use]
+    pub const fn new(service_id: u16, method_or_event_id: u16) -> Self {
+        Self {
+            service_id,
+            method_or_event_id,
+        }
+    }
+
+    /// Derive a key from a [`MessageId`](crate::protocol::MessageId).
+    #[must_use]
+    pub fn from_message_id(message_id: crate::protocol::MessageId) -> Self {
+        Self {
+            service_id: message_id.service_id(),
+            method_or_event_id: message_id.method_id(),
+        }
+    }
+}
+
+/// Internal E2E state, one per registered key.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone)]
+pub(crate) enum E2EState {
+    /// State for Profile 4.
+    Profile4(Profile4State),
+    /// State for Profile 5 (used by both `Profile5` and `Profile5WithHeader`).
+    Profile5(Profile5State),
+}
+
+#[cfg(feature = "std")]
+impl E2EState {
+    pub(crate) fn from_profile(profile: &E2EProfile) -> Self {
+        match profile {
+            E2EProfile::Profile4(_) => Self::Profile4(Profile4State::new()),
+            E2EProfile::Profile5(_) | E2EProfile::Profile5WithHeader(_) => {
+                Self::Profile5(Profile5State::new())
+            }
+        }
+    }
+}
+
+/// Run the appropriate E2E check for the given profile, returning the status
+/// and the best available payload slice (stripped on success, original on error).
+#[cfg(feature = "std")]
+pub(crate) fn e2e_check<'a>(
+    profile: &E2EProfile,
+    state: &mut E2EState,
+    payload: &'a [u8],
+    upper_header: [u8; 8],
+) -> (E2ECheckStatus, &'a [u8]) {
+    let result = match (profile, state) {
+        (E2EProfile::Profile4(config), E2EState::Profile4(st)) => {
+            check_profile4(config, st, payload)
+        }
+        (E2EProfile::Profile5(config), E2EState::Profile5(st)) => {
+            check_profile5(config, st, payload)
+        }
+        (E2EProfile::Profile5WithHeader(config), E2EState::Profile5(st)) => {
+            check_profile5_with_header(config, st, payload, upper_header)
+        }
+        _ => return (E2ECheckStatus::BadArgument, payload),
+    };
+    let stripped = result.payload.unwrap_or(payload);
+    (result.status, stripped)
+}
+
+/// Run the appropriate E2E protect for the given profile.
+///
+/// # Errors
+///
+/// Returns [`Error::BufferTooSmall`] if `output` cannot hold the protected payload.
+#[cfg(feature = "std")]
+pub(crate) fn e2e_protect(
+    profile: &E2EProfile,
+    state: &mut E2EState,
+    payload: &[u8],
+    upper_header: [u8; 8],
+    output: &mut [u8],
+) -> Result<usize, Error> {
+    match (profile, state) {
+        (E2EProfile::Profile4(config), E2EState::Profile4(st)) => {
+            protect_profile4(config, st, payload, output)
+        }
+        (E2EProfile::Profile5(config), E2EState::Profile5(st)) => {
+            protect_profile5(config, st, payload, output)
+        }
+        (E2EProfile::Profile5WithHeader(config), E2EState::Profile5(st)) => {
+            protect_profile5_with_header(config, st, payload, upper_header, output)
+        }
+        _ => unreachable!("E2EState is always created from E2EProfile"),
     }
 }
 

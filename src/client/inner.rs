@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     future,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    sync::{Arc, Mutex},
     task::Poll,
 };
 use tokio::{
@@ -21,6 +22,7 @@ use crate::{
         session::{SessionTracker, SessionVerdict, TransportKind},
         socket_manager::{ReceivedMessage, SocketManager},
     },
+    e2e::E2ERegistry,
     protocol::{self, Message},
     traits::PayloadWireFormat,
 };
@@ -226,6 +228,8 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     client_id: u16,
     /// Incrementing session counter for SOME/IP request headers (lower 16 bits of request ID)
     session_counter: u16,
+    /// Shared E2E registry for runtime E2E configuration
+    e2e_registry: Arc<Mutex<E2ERegistry>>,
     /// Phantom data to represent the generic message definitions
     phantom: std::marker::PhantomData<PayloadDefinitions>,
 }
@@ -248,6 +252,7 @@ where
 {
     pub fn spawn(
         interface: Ipv4Addr,
+        e2e_registry: Arc<Mutex<E2ERegistry>>,
     ) -> (
         Sender<ControlMessage<PayloadDefinitions>>,
         Receiver<ClientUpdate<PayloadDefinitions>>,
@@ -268,6 +273,7 @@ where
             run: true,
             client_id: 0x1234,
             session_counter: 1,
+            e2e_registry,
             phantom: std::marker::PhantomData,
         };
         inner.run();
@@ -278,7 +284,8 @@ where
         if self.discovery_socket.is_some() {
             Ok(())
         } else {
-            let socket = SocketManager::bind_discovery(self.interface)?;
+            let socket =
+                SocketManager::bind_discovery(self.interface, Arc::clone(&self.e2e_registry))?;
             self.discovery_socket = Some(socket);
             Ok(())
         }
@@ -302,7 +309,7 @@ where
         {
             return Ok(socket.port());
         }
-        let unicast_socket = SocketManager::bind(port)?;
+        let unicast_socket = SocketManager::bind(port, Arc::clone(&self.e2e_registry))?;
         let bound_port = unicast_socket.port();
         self.unicast_sockets.insert(bound_port, unicast_socket);
         debug!("Bound unicast socket on port {}", bound_port);
@@ -740,7 +747,7 @@ where
                          trace!("Received unicast message: {:?}", unicast);
                          match unicast {
                              Ok(received) => {
-                                 let received_message = received.message;
+                                 let ReceivedMessage { message: received_message, e2e_status, .. } = received;
                                  // Check if this matches a pending request-response
                                  if let Some((pending_id, _)) = pending_response
                                      && *pending_id == received_message.header().message_id()
@@ -750,7 +757,7 @@ where
                                      continue;
                                  }
                                  // Not a response — forward as ClientUpdate::Unicast
-                                 if update_sender.send(ClientUpdate::Unicast(received_message)).await.is_err() {
+                                 if update_sender.send(ClientUpdate::Unicast { message: received_message, e2e_status }).await.is_err() {
                                      *run = false;
                                  }
                              }
@@ -855,8 +862,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_inner_spawn_and_shutdown() {
-        let (control_sender, mut update_receiver) =
-            Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, mut update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
         // Drop control sender to trigger loop exit
         drop(control_sender);
         // The update receiver should eventually return None when the inner loop exits
@@ -886,7 +895,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_bind_discovery_continues() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         let (rx, msg) = TestControl::bind_discovery();
         drop(rx);
@@ -898,7 +910,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_unbind_discovery_continues() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         let (rx, msg) = TestControl::unbind_discovery();
         drop(rx);
@@ -910,7 +925,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_set_interface_continues() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         // SetInterface(LOCALHOST) on a fresh inner goes straight to
         // bind_discovery + send response (interface already matches).
@@ -924,7 +942,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_send_sd_continues() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         // Bind discovery first so the SendSD path has a socket to use
         let (rx, msg) = TestControl::bind_discovery();
@@ -949,7 +970,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_preemptible_active_request_rejects_new_message() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         // Bind discovery so SetInterface will take the multi-step path:
         // iteration 1: unbind discovery, re-queue SetInterface
@@ -1019,7 +1043,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_add_endpoint_continues() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
@@ -1032,7 +1059,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_remove_endpoint_continues() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         let (rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
         drop(rx);
@@ -1044,7 +1074,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_send_to_service_send_complete_continues() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         // Add an endpoint first so SendToService doesn't fail with ServiceNotFound
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
@@ -1065,7 +1098,10 @@ mod tests {
     #[tokio::test]
     async fn test_bind_discovery_idempotent() {
         // Binding discovery twice should succeed (early return on already-bound)
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         let (rx, msg) = TestControl::bind_discovery();
         control_sender.send(msg).await.unwrap();
@@ -1080,7 +1116,10 @@ mod tests {
     #[tokio::test]
     async fn test_send_sd_auto_binds_discovery() {
         // SendSD without a bound discovery socket should auto-bind and succeed
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30490);
         let sd_header = empty_sd_header();
@@ -1096,7 +1135,10 @@ mod tests {
     #[tokio::test]
     async fn test_send_to_service_auto_binds_unicast() {
         // SendToService with no unicast sockets should auto-bind ephemeral
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
@@ -1116,7 +1158,10 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_with_endpoint_sends_sd() {
         // Subscribe with a known endpoint and bound discovery should send the SD message
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         // Bind discovery first
         let (rx, msg) = TestControl::bind_discovery();
@@ -1142,7 +1187,10 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_auto_binds_discovery() {
         // Subscribe without discovery bound should auto-bind and succeed
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         // Add endpoint but do NOT bind discovery
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
@@ -1162,7 +1210,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_unknown_service_returns_error() {
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         let (rx, msg) = TestControl::subscribe(0xFFFF, 0xFFFF, 1, 3, 0x01, 0);
         control_sender.send(msg).await.unwrap();
@@ -1176,7 +1227,10 @@ mod tests {
     #[tokio::test]
     async fn test_send_to_service_reuses_existing_unicast_socket() {
         // When a unicast socket already exists, SendToService should reuse it
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
@@ -1206,7 +1260,10 @@ mod tests {
     #[tokio::test]
     async fn test_dropped_receiver_subscribe_service_not_found_continues() {
         // Subscribe with no endpoint → ServiceNotFound response is dropped
-        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(Ipv4Addr::LOCALHOST);
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
 
         let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
         drop(rx);
@@ -1214,5 +1271,97 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         assert_inner_alive(&control_sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_set_interface_changes_interface() {
+        // SetInterface to a different address exercises the interface!=current path
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
+
+        // Change to a different loopback-range address (127.0.0.2).
+        // Binding discovery on 127.0.0.2 should succeed on most systems.
+        let (rx, msg) = TestControl::set_interface(Ipv4Addr::new(127, 0, 0, 2));
+        control_sender.send(msg).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), rx)
+            .await
+            .expect("Timed out waiting for SetInterface")
+            .expect("SetInterface oneshot closed");
+        // The result may be Ok or Err depending on whether 127.0.0.2 is bindable,
+        // but the important thing is that the inner loop didn't panic or deadlock.
+        let _ = result;
+
+        assert_inner_alive(&control_sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_set_interface_with_discovery_bound_changes_interface() {
+        // SetInterface when discovery is already bound: unbind → change → rebind
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
+
+        // Bind discovery on LOCALHOST first
+        let (rx, msg) = TestControl::bind_discovery();
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // Change to 127.0.0.2 — this takes the multi-step path:
+        // 1. unbind discovery, re-queue
+        // 2. interface != 127.0.0.2, set_interface, re-queue
+        // 3. interface == 127.0.0.2, bind discovery
+        let (rx, msg) = TestControl::set_interface(Ipv4Addr::new(127, 0, 0, 2));
+        control_sender.send(msg).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), rx)
+            .await
+            .expect("Timed out waiting for SetInterface")
+            .expect("SetInterface oneshot closed");
+        let _ = result;
+
+        assert_inner_alive(&control_sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_specific_port_reuse() {
+        // Subscribe twice with the same specific client_port exercises the
+        // bind_unicast port-reuse path (port != 0 && already bound).
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+        );
+
+        // Add endpoint and bind discovery
+        let (rx, msg) = TestControl::bind_discovery();
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr);
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // First subscribe with specific port — binds the port
+        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 44444);
+        control_sender.send(msg).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("Timed out")
+            .expect("oneshot closed");
+        assert!(result.is_ok(), "first subscribe should succeed: {result:?}");
+
+        // Second subscribe with the same port — reuses the existing socket
+        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x02, 44444);
+        control_sender.send(msg).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("Timed out")
+            .expect("oneshot closed");
+        assert!(
+            result.is_ok(),
+            "second subscribe should reuse port: {result:?}"
+        );
     }
 }

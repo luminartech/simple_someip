@@ -81,7 +81,7 @@ async fn test_client_server_subscribe_and_receive_event() {
         .await
         .expect("timeout waiting for Unicast");
     assert!(
-        matches!(update, Some(ClientUpdate::Unicast(..))),
+        matches!(update, Some(ClientUpdate::Unicast { .. })),
         "expected Unicast, got {update:?}"
     );
 
@@ -189,7 +189,7 @@ async fn test_add_endpoint_and_send_to_service() {
         .await
         .expect("timeout waiting for Unicast");
     assert!(
-        matches!(update, Some(ClientUpdate::Unicast(..))),
+        matches!(update, Some(ClientUpdate::Unicast { .. })),
         "expected Unicast, got {update:?}"
     );
 
