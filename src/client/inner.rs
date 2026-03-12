@@ -1,6 +1,6 @@
 use std::{
     borrow::ToOwned,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
@@ -210,16 +210,13 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
 pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     /// MPSC Receiver used to receive control messages from outer client
     control_receiver: Receiver<ControlMessage<PayloadDefinitions>>,
-    /// The active request, if one is being served
-    active_request: Option<ControlMessage<PayloadDefinitions>>,
-    /// Pending request-response: (`message_id`, `response_sender`).
-    /// Set by `SendToService`, cleared when a matching unicast arrives or sender is dropped.
-    pending_response: Option<(
-        protocol::MessageId,
-        oneshot::Sender<Result<PayloadDefinitions, Error>>,
-    )>,
-    /// MPSC Sender used to send updates to outer client
-    update_sender: mpsc::Sender<ClientUpdate<PayloadDefinitions>>,
+    /// Queue of pending control messages to process
+    request_queue: VecDeque<ControlMessage<PayloadDefinitions>>,
+    /// Pending request-responses keyed by `request_id` (`client_id` << 16 | `session_counter`).
+    /// Set by `SendToService`, cleared when a matching unicast arrives.
+    pending_responses: HashMap<u32, oneshot::Sender<Result<PayloadDefinitions, Error>>>,
+    /// Unbounded sender used to send updates to outer client
+    update_sender: mpsc::UnboundedSender<ClientUpdate<PayloadDefinitions>>,
     /// Target interface for sockets
     interface: Ipv4Addr,
     /// Socket manager for service discovery if bound
@@ -263,15 +260,15 @@ where
         e2e_registry: Arc<Mutex<E2ERegistry>>,
     ) -> (
         Sender<ControlMessage<PayloadDefinitions>>,
-        Receiver<ClientUpdate<PayloadDefinitions>>,
+        mpsc::UnboundedReceiver<ClientUpdate<PayloadDefinitions>>,
     ) {
         info!("Initializing SOME/IP Client");
         let (control_sender, control_receiver) = mpsc::channel(4);
-        let (update_sender, update_receiver) = mpsc::channel(4);
+        let (update_sender, update_receiver) = mpsc::unbounded_channel();
         let inner = Self {
             control_receiver,
-            active_request: None,
-            pending_response: None,
+            request_queue: VecDeque::new(),
+            pending_responses: HashMap::new(),
             update_sender,
             interface,
             discovery_socket: None,
@@ -381,7 +378,7 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn handle_control_message(&mut self) {
-        if let Some(active_request) = self.active_request.take() {
+        if let Some(active_request) = self.request_queue.pop_front() {
             match active_request {
                 ControlMessage::SetInterface(interface, response) => {
                     if self.discovery_socket.is_some() {
@@ -390,14 +387,14 @@ where
                             self.interface
                         );
                         self.unbind_discovery().await;
-                        self.active_request =
-                            Some(ControlMessage::SetInterface(interface, response));
+                        self.request_queue
+                            .push_front(ControlMessage::SetInterface(interface, response));
                         return;
                     }
                     if self.interface != interface {
                         self.set_interface(interface);
-                        self.active_request =
-                            Some(ControlMessage::SetInterface(interface, response));
+                        self.request_queue
+                            .push_front(ControlMessage::SetInterface(interface, response));
                         return;
                     }
                     info!("Binding to interface: {}", interface);
@@ -433,8 +430,9 @@ where
                             match self.bind_discovery() {
                                 Ok(()) => {
                                     // Discovery socket successfully bound, send the message on the next loop
-                                    self.active_request =
-                                        Some(ControlMessage::SendSD(target, header, response));
+                                    self.request_queue.push_front(ControlMessage::SendSD(
+                                        target, header, response,
+                                    ));
                                 }
                                 Err(e) => {
                                     error!(
@@ -562,13 +560,11 @@ where
                         self.session_counter = 1;
                     }
 
-                    let message_id = message.header().message_id();
                     let send_result = socket.send(target, message).await;
                     match send_result {
                         Ok(()) => {
                             let _ = send_complete.send(Ok(()));
-                            // Drop any prior pending response (caller gets RecvError)
-                            self.pending_response = Some((message_id, response));
+                            self.pending_responses.insert(request_id, response);
                         }
                         Err(e) => {
                             let _ = send_complete.send(Err(e));
@@ -610,7 +606,7 @@ where
                     match &mut self.discovery_socket {
                         None => match self.bind_discovery() {
                             Ok(()) => {
-                                self.active_request = Some(ControlMessage::Subscribe {
+                                self.request_queue.push_front(ControlMessage::Subscribe {
                                     service_id,
                                     instance_id,
                                     major_version,
@@ -665,11 +661,11 @@ where
             loop {
                 let Self {
                     control_receiver,
-                    pending_response,
+                    pending_responses,
                     discovery_socket,
                     unicast_sockets,
                     update_sender,
-                    active_request,
+                    request_queue,
                     session_tracker,
                     service_registry,
                     run,
@@ -680,18 +676,8 @@ where
                     // Receive a control message
                     ctrl = control_receiver.recv() => {
                         if let Some(ctrl) = ctrl {
-                            if active_request.is_some() {
-                                // Multi-step operations (e.g. SetInterface, SendSD)
-                                // re-queue themselves across loop iterations. Do not
-                                // discard mid-operation. Let the existing request finish.
-                                error!(
-                                    "Received new control message while active_request \
-                                     is in progress; ignoring new message"
-                                );
-                                continue;
-                            }
                             debug!("Received control message: {:?}", ctrl);
-                            *active_request = Some(ctrl);
+                            request_queue.push_back(ctrl);
                         } else {
                             // The sender has been dropped, so we should exit
                             *run = false;
@@ -714,11 +700,8 @@ where
                                     session_id,
                                     reboot_flag,
                                 );
-                                if verdict == SessionVerdict::Reboot
-                                    && update_sender.send(ClientUpdate::SenderRebooted(source)).await.is_err()
-                                {
-                                    *run = false;
-                                    continue;
+                                if verdict == SessionVerdict::Reboot {
+                                    let _ = update_sender.send(ClientUpdate::SenderRebooted(source));
                                 }
 
                                 // Auto-populate service registry from SD entries
@@ -758,16 +741,11 @@ where
                                     someip_header,
                                     sd_header,
                                 };
-                                if update_sender.send(ClientUpdate::DiscoveryUpdated(discovery_msg)).await.is_err() {
-                                    *run = false;
-                                }
+                                let _ = update_sender.send(ClientUpdate::DiscoveryUpdated(discovery_msg));
                             }
                             Err(err) => {
                                 error!("Error receiving discovery message: {:?}", err);
-                                if update_sender.send(ClientUpdate::Error(err)).await.is_err() {
-                                    // The sender has been dropped, so we should exit
-                                    *run = false;
-                                }
+                                let _ = update_sender.send(ClientUpdate::Error(err));
                             }
                         }
                      }
@@ -776,24 +754,17 @@ where
                          match unicast {
                              Ok(received) => {
                                  let ReceivedMessage { message: received_message, e2e_status, .. } = received;
-                                 // Check if this matches a pending request-response
-                                 if let Some((pending_id, _)) = pending_response
-                                     && *pending_id == received_message.header().message_id()
-                                 {
-                                     let (_, sender) = pending_response.take().unwrap();
+                                 // Check if this matches a pending request-response by request_id
+                                 let request_id = received_message.header().request_id();
+                                 if let Some(sender) = pending_responses.remove(&request_id) {
                                      let _ = sender.send(Ok(received_message.payload().clone()));
                                      continue;
                                  }
                                  // Not a response — forward as ClientUpdate::Unicast
-                                 if update_sender.send(ClientUpdate::Unicast { message: received_message, e2e_status }).await.is_err() {
-                                     *run = false;
-                                 }
+                                 let _ = update_sender.send(ClientUpdate::Unicast { message: received_message, e2e_status });
                              }
                              Err(err) => {
-                                 if update_sender.send(ClientUpdate::Error(err)).await.is_err() {
-                                     // The sender has been dropped, so we should exit
-                                     *run = false;
-                                 }
+                                 let _ = update_sender.send(ClientUpdate::Error(err));
                              }
                          }
                      }
@@ -991,13 +962,13 @@ mod tests {
         assert_inner_alive(&control_sender).await;
     }
 
-    // -- Non-preemptible active_request test --
+    // -- Request queue test --
     // Verifies that when a new control message arrives while a multi-step
     // operation (SetInterface) is mid-way through processing, the new message
-    // is rejected and the in-progress operation completes successfully.
+    // is queued and both complete successfully.
 
     #[tokio::test]
-    async fn test_non_preemptible_active_request_rejects_new_message() {
+    async fn test_queued_messages_all_complete() {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
@@ -1015,29 +986,25 @@ mod tests {
         // yielding, so both land before the spawned task runs.
         //
         // 1) SetInterface(LOCALHOST) — will unbind discovery, re-queue itself
-        // 2) AddEndpoint — should be rejected while SetInterface is in-flight
+        // 2) AddEndpoint — queued behind SetInterface, processed after it
         let (rx_set, msg_set) = TestControl::set_interface(Ipv4Addr::LOCALHOST);
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
         let (rx_add, msg_add) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         control_sender.send(msg_set).await.unwrap();
         control_sender.send(msg_add).await.unwrap();
 
-        // SetInterface should complete successfully despite the intervening message
+        // Both should complete successfully
         let set_result = tokio::time::timeout(std::time::Duration::from_secs(3), rx_set)
             .await
             .expect("Timed out waiting for SetInterface")
             .expect("SetInterface oneshot closed");
         assert!(set_result.is_ok());
 
-        // AddEndpoint's oneshot sender was dropped when the non-preemptible
-        // arm rejected the message, so the receiver gets RecvError.
-        let add_result = tokio::time::timeout(std::time::Duration::from_secs(1), rx_add)
+        let add_result = tokio::time::timeout(std::time::Duration::from_secs(3), rx_add)
             .await
-            .expect("Timed out waiting for AddEndpoint rejection");
-        assert!(
-            add_result.is_err(),
-            "AddEndpoint should have been rejected (oneshot sender dropped)"
-        );
+            .expect("Timed out waiting for AddEndpoint")
+            .expect("AddEndpoint oneshot closed");
+        assert!(add_result.is_ok());
 
         // Verify inner loop is still alive
         assert_inner_alive(&control_sender).await;
