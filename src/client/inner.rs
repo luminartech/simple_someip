@@ -1197,7 +1197,10 @@ mod tests {
             .await
             .expect("Timed out")
             .expect("oneshot closed");
-        assert!(result.is_ok(), "second send should reuse socket: {result:?}");
+        assert!(
+            result.is_ok(),
+            "second send should reuse socket: {result:?}"
+        );
     }
 
     #[tokio::test]

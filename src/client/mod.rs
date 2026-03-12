@@ -490,8 +490,7 @@ mod tests {
         );
         drop(cs);
         // Now the inner loop should exit; run() should return None
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(2), client.run()).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), client.run()).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
