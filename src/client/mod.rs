@@ -246,6 +246,15 @@ where
 
     /// Registers a service endpoint in the client's endpoint registry.
     ///
+    /// `local_port` controls which source port is used when sending to this
+    /// endpoint via [`send_to_service`](Self::send_to_service). Pass `0` to
+    /// use an ephemeral (OS-assigned) port.
+    ///
+    /// Service-discovery (SD) automatically populates endpoints with
+    /// `local_port = 0`. If your configuration requires a specific source
+    /// port, you must call `add_endpoint` explicitly — even if SD has already
+    /// registered the service — so that the correct `local_port` is stored.
+    ///
     /// # Errors
     ///
     /// Returns an error if registering the endpoint fails.
