@@ -588,7 +588,7 @@ impl Server {
         someip_header.encode(&mut buffer)?;
         buffer.extend_from_slice(&sd_data);
 
-        self.unicast_socket.send_to(&buffer, subscriber).await?;
+        self.sd_socket.send_to(&buffer, subscriber).await?;
 
         tracing::debug!(
             "Sent SubscribeAck to {} for service 0x{:04X}, eventgroup 0x{:04X}",
@@ -635,7 +635,7 @@ impl Server {
         someip_header.encode(&mut buffer)?;
         buffer.extend_from_slice(&sd_data);
 
-        self.unicast_socket.send_to(&buffer, subscriber).await?;
+        self.sd_socket.send_to(&buffer, subscriber).await?;
 
         tracing::warn!(
             "Sent SubscribeNack to {} for service 0x{:04X}, eventgroup 0x{:04X} (reason: {})",
