@@ -604,7 +604,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_and_unregister_e2e() {
-        let client = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
         let key = E2EKey {
             service_id: 0x1234,
             method_or_event_id: 0x0001,
@@ -612,7 +612,7 @@ mod tests {
         let profile = E2EProfile::Profile4(crate::e2e::Profile4Config::new(42, 10));
         client.register_e2e(key, profile);
         client.unregister_e2e(&key);
-        client.shut_down().await;
+        client.shut_down();
     }
 
     #[tokio::test]
