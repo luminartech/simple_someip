@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "examples/discovery_client"]
+members = [".", "examples/discovery_client", "examples/mock_server"]
 
 [package]
 name = "simple-someip"
