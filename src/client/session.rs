@@ -55,13 +55,13 @@ impl SessionTracker {
             None => SessionVerdict::Initial,
             Some(prev) => {
                 if !prev.last_reboot_flag && reboot_flag {
-                    // Reboot flag 0 -> 1 transition
-                    SessionVerdict::Reboot
-                } else if prev.last_reboot_flag && reboot_flag && session_id < prev.last_session_id
-                {
-                    // Session ID decreased while reboot flag stays 1
+                    // Reboot flag 0 -> 1 transition — authoritative reboot signal
                     SessionVerdict::Reboot
                 } else {
+                    // Do NOT use session ID decrease as a reboot indicator.
+                    // Sensors may interleave multiple SD service instances on the
+                    // same address with independent session counters, causing
+                    // natural session ID decreases that are not reboots.
                     SessionVerdict::Ok
                 }
             }
@@ -110,11 +110,13 @@ mod tests {
     }
 
     #[test]
-    fn session_id_decrease_with_reboot_flag_1_returns_reboot() {
+    fn session_id_decrease_with_reboot_flag_1_returns_ok() {
+        // Session ID decreases are expected when a sender interleaves
+        // multiple SD service instances with independent session counters.
         let mut tracker = SessionTracker::default();
         tracker.check(addr(1000), TransportKind::Multicast, 100, true);
         let verdict = tracker.check(addr(1000), TransportKind::Multicast, 50, true);
-        assert_eq!(verdict, SessionVerdict::Reboot);
+        assert_eq!(verdict, SessionVerdict::Ok);
     }
 
     #[test]
