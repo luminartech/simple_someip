@@ -433,7 +433,8 @@ mod tests {
 
     #[test]
     fn service_instances_empty_for_raw_payload() {
-        let p = RawPayload::from_bytes(&[1, 2, 3]);
+        let mid = MessageId::new_from_service_and_method(0x5B, 0x01);
+        let p = RawPayload::from_payload_bytes(mid, &[1, 2, 3]).unwrap();
         assert!(p.service_instances().is_empty());
     }
 
