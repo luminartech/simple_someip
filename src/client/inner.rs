@@ -690,22 +690,34 @@ where
                             Ok((source, someip_header, sd_header)) => {
                                 // Extract session ID from SOME/IP request_id (lower 16 bits)
                                 let session_id = (someip_header.request_id() & 0xFFFF) as u16;
+                                let sd_payload = PayloadDefinitions::new_sd_payload(&sd_header);
                                 // Extract reboot flag from the SD payload flags
-                                let reboot_flag = PayloadDefinitions::new_sd_payload(&sd_header)
+                                let reboot_flag = sd_payload
                                     .sd_flags()
                                     .is_some_and(crate::protocol::sd::Flags::reboot);
-                                let verdict = session_tracker.check(
-                                    source,
-                                    TransportKind::Multicast,
-                                    session_id,
-                                    reboot_flag,
-                                );
-                                if verdict == SessionVerdict::Reboot {
-                                    let _ = update_sender.send(ClientUpdate::SenderRebooted(source));
+
+                                // Track sender session/reboot state for every SD entry
+                                // that identifies a service instance, not only
+                                // offer/stop-offer entries. This ensures reboot
+                                // detection works for all SD traffic (FindService,
+                                // Subscribe, SubscribeAck, etc.).
+                                let mut rebooted = false;
+                                for (svc_id, inst_id) in sd_payload.service_instances() {
+                                    let verdict = session_tracker.check(
+                                        source,
+                                        TransportKind::Multicast,
+                                        svc_id,
+                                        inst_id,
+                                        session_id,
+                                        reboot_flag,
+                                    );
+                                    if verdict == SessionVerdict::Reboot {
+                                        rebooted = true;
+                                    }
                                 }
 
-                                // Auto-populate service registry from SD entries
-                                let sd_payload = PayloadDefinitions::new_sd_payload(&sd_header);
+                                // Auto-populate service registry from offer/stop-offer
+                                // SD entries.
                                 for ep in sd_payload.offered_endpoints() {
                                     let id = ServiceInstanceId {
                                         service_id: ep.service_id,
@@ -734,6 +746,10 @@ where
                                             ep.service_id, ep.instance_id,
                                         );
                                     }
+                                }
+
+                                if rebooted {
+                                    let _ = update_sender.send(ClientUpdate::SenderRebooted(source));
                                 }
 
                                 let discovery_msg = DiscoveryMessage {
