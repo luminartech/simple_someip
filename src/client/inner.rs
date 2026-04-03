@@ -672,18 +672,8 @@ where
                     ..
                 } = &mut self;
                 select! {
-                    () = tokio::time::sleep(std::time::Duration::from_millis(125)) => {}
-                    // Receive a control message
-                    ctrl = control_receiver.recv() => {
-                        if let Some(ctrl) = ctrl {
-                            debug!("Received control message: {:?}", ctrl);
-                            request_queue.push_back(ctrl);
-                        } else {
-                            // The sender has been dropped, so we should exit
-                            *run = false;
-                        }
-                    }
-                    // Receive a discovery message
+                    biased;
+                    // I/O first: receive a discovery message
                     discovery = Inner::receive_discovery(discovery_socket) => {
                         trace!("Received discovery message: {:?}", discovery);
                         match discovery {
@@ -768,11 +758,22 @@ where
                              }
                          }
                      }
+                     // Receive a control message (lower priority than I/O)
+                     ctrl = control_receiver.recv() => {
+                         if let Some(ctrl) = ctrl {
+                             debug!("Received control message: {:?}", ctrl);
+                             request_queue.push_back(ctrl);
+                         } else {
+                             // The sender has been dropped, so we should exit
+                             *run = false;
+                         }
+                     }
                 }
                 if !*run {
                     info!("SOME/IP Client processing loop exiting");
                     break;
                 }
+                // Process one queued control message per iteration.
                 self.handle_control_message().await;
             }
         });
