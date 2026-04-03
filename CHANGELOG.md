@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.1](https://github.com/luminartech/simple_someip/compare/v0.5.0...v0.5.1) - 2026-04-03
+
+### Other
+
+- Automatically create semver appropriate release PR
+- Fix test.
+- Respond to Copilot feedback
+- Add a "Subscribe No Wait" to avoid blocking on subscriptions, + tests
+- Formatted & remove duplicate sd payload.
+- Tie SD session IDs to per service instances
+- Pacify Clippy.
+- Fix false reboot detection with interleaved SD session IDs
+
 ## [0.5.0] - 2026-03-12
 
 ### Breaking Changes
