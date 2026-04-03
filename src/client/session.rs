@@ -71,9 +71,7 @@ impl SessionTracker {
                 if !prev.last_reboot_flag && reboot_flag {
                     // Reboot flag 0 -> 1 transition — authoritative reboot signal
                     SessionVerdict::Reboot
-                } else if prev.last_reboot_flag
-                    && reboot_flag
-                    && session_id < prev.last_session_id
+                } else if prev.last_reboot_flag && reboot_flag && session_id < prev.last_session_id
                 {
                     // Session ID decreased within the same service instance
                     // while reboot flag stays 1 — this is a reboot.

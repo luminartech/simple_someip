@@ -690,8 +690,9 @@ where
                             Ok((source, someip_header, sd_header)) => {
                                 // Extract session ID from SOME/IP request_id (lower 16 bits)
                                 let session_id = (someip_header.request_id() & 0xFFFF) as u16;
+                                let sd_payload = PayloadDefinitions::new_sd_payload(&sd_header);
                                 // Extract reboot flag from the SD payload flags
-                                let reboot_flag = PayloadDefinitions::new_sd_payload(&sd_header)
+                                let reboot_flag = sd_payload
                                     .sd_flags()
                                     .is_some_and(crate::protocol::sd::Flags::reboot);
 
@@ -699,7 +700,6 @@ where
                                 // Session/reboot checking is done per service instance
                                 // so interleaved SD offers with independent session
                                 // counters don't cause false reboot detections.
-                                let sd_payload = PayloadDefinitions::new_sd_payload(&sd_header);
                                 let mut rebooted = false;
                                 for ep in sd_payload.offered_endpoints() {
                                     let verdict = session_tracker.check(
