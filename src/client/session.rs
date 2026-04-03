@@ -9,12 +9,16 @@ pub enum TransportKind {
     Unicast,
 }
 
-/// Composite key identifying a sender on a specific transport.
-type SessionKey = (SocketAddr, TransportKind);
+/// Composite key identifying a specific service instance from a sender on a
+/// specific transport. Tracking per service instance avoids false reboot
+/// detection when a sender interleaves SD offers for multiple services, each
+/// with its own independent session counter.
+type SessionKey = (SocketAddr, TransportKind, u16, u16);
 
-/// Per-sender session state for reboot detection.
+/// Per-service-instance session state for reboot detection.
 #[derive(Clone, Copy, Debug)]
-struct SenderSessionState {
+struct SessionState {
+    last_session_id: u16,
     last_reboot_flag: bool,
 }
 
@@ -23,52 +27,66 @@ struct SenderSessionState {
 pub enum SessionVerdict {
     /// Session is valid (normal increment or first message with matching state).
     Ok,
-    /// Sender has rebooted (reboot flag transitioned from 0 to 1).
+    /// Sender has rebooted (reboot flag 0→1 transition, or session ID decreased
+    /// while reboot flag remains 1 within the same service instance stream).
     Reboot,
-    /// First message ever seen from this sender on this transport.
+    /// First message ever seen from this service instance on this transport.
     Initial,
 }
 
-/// Tracks per-sender session state for reboot detection.
+/// Tracks per-service-instance session state for reboot detection.
 ///
-/// A reboot is detected when the reboot flag transitions from 0 to 1.
-/// Session ID decreases are **not** used as a reboot signal because
-/// sensors may interleave multiple SD service instances on the same
-/// address with independent session counters.
+/// A reboot is detected when, for a given `(sender, transport, service_id,
+/// instance_id)` tuple:
+/// - The reboot flag transitions from 0 to 1, **or**
+/// - The session ID decreases while the reboot flag remains 1
+///
+/// Tracking per service instance (rather than per sender) avoids false
+/// positives when a sensor interleaves SD offers for multiple services
+/// with independent session counters on the same source address.
 #[derive(Debug, Default)]
 pub struct SessionTracker {
-    state: HashMap<SessionKey, SenderSessionState>,
+    state: HashMap<SessionKey, SessionState>,
 }
 
 impl SessionTracker {
-    /// Check the session ID and reboot flag from a sender and return a verdict.
-    /// Always updates the stored state after the check.
+    /// Check the session ID and reboot flag for a specific service instance
+    /// and return a verdict. Always updates the stored state after the check.
+    ///
+    /// Call this once per service entry in an SD message (not once per message),
+    /// so each service instance gets its own session counter.
     pub fn check(
         &mut self,
         sender: SocketAddr,
         transport: TransportKind,
-        _session_id: u16,
+        service_id: u16,
+        instance_id: u16,
+        session_id: u16,
         reboot_flag: bool,
     ) -> SessionVerdict {
-        let key = (sender, transport);
+        let key = (sender, transport, service_id, instance_id);
         let verdict = match self.state.get(&key) {
             None => SessionVerdict::Initial,
             Some(prev) => {
                 if !prev.last_reboot_flag && reboot_flag {
                     // Reboot flag 0 -> 1 transition — authoritative reboot signal
                     SessionVerdict::Reboot
+                } else if prev.last_reboot_flag
+                    && reboot_flag
+                    && session_id < prev.last_session_id
+                {
+                    // Session ID decreased within the same service instance
+                    // while reboot flag stays 1 — this is a reboot.
+                    SessionVerdict::Reboot
                 } else {
-                    // Do NOT use session ID decrease as a reboot indicator.
-                    // Sensors may interleave multiple SD service instances on the
-                    // same address with independent session counters, causing
-                    // natural session ID decreases that are not reboots.
                     SessionVerdict::Ok
                 }
             }
         };
         self.state.insert(
             key,
-            SenderSessionState {
+            SessionState {
+                last_session_id: session_id,
                 last_reboot_flag: reboot_flag,
             },
         );
@@ -85,81 +103,115 @@ mod tests {
         SocketAddr::new(Ipv4Addr::new(192, 168, 1, 10).into(), port)
     }
 
+    const SVC: u16 = 0x0047;
+    const INST: u16 = 0x0001;
+    const SVC_B: u16 = 0x005D;
+
     #[test]
     fn first_message_returns_initial() {
         let mut tracker = SessionTracker::default();
-        let verdict = tracker.check(addr(1000), TransportKind::Multicast, 1, true);
+        let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, true);
         assert_eq!(verdict, SessionVerdict::Initial);
     }
 
     #[test]
     fn normal_increment_returns_ok() {
         let mut tracker = SessionTracker::default();
-        tracker.check(addr(1000), TransportKind::Multicast, 1, true);
-        let verdict = tracker.check(addr(1000), TransportKind::Multicast, 2, true);
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, true);
+        let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 2, true);
         assert_eq!(verdict, SessionVerdict::Ok);
     }
 
     #[test]
     fn reboot_flag_0_to_1_returns_reboot() {
         let mut tracker = SessionTracker::default();
-        tracker.check(addr(1000), TransportKind::Multicast, 100, false);
-        let verdict = tracker.check(addr(1000), TransportKind::Multicast, 1, true);
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 100, false);
+        let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, true);
         assert_eq!(verdict, SessionVerdict::Reboot);
     }
 
     #[test]
-    fn session_id_decrease_with_reboot_flag_1_returns_ok() {
-        // Session ID decreases are expected when a sender interleaves
-        // multiple SD service instances with independent session counters.
+    fn session_id_decrease_same_service_with_reboot_flag_1_returns_reboot() {
+        // Within a single service instance, session ID decrease is a real reboot.
         let mut tracker = SessionTracker::default();
-        tracker.check(addr(1000), TransportKind::Multicast, 100, true);
-        let verdict = tracker.check(addr(1000), TransportKind::Multicast, 50, true);
-        assert_eq!(verdict, SessionVerdict::Ok);
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 100, true);
+        let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 50, true);
+        assert_eq!(verdict, SessionVerdict::Reboot);
+    }
+
+    #[test]
+    fn session_id_decrease_different_services_no_false_reboot() {
+        // Different service instances have independent counters — interleaving
+        // does not cause false reboots.
+        let mut tracker = SessionTracker::default();
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 100, true);
+        // Different service, lower session ID — this is Initial, not Reboot.
+        let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC_B, INST, 50, true);
+        assert_eq!(verdict, SessionVerdict::Initial);
+    }
+
+    #[test]
+    fn interleaved_sd_offers_no_false_reboot() {
+        // Simulates the real-world scenario: sensor sends alternating SD offers
+        // for service A (session 1,2,3...) and service B (session 1,2,3...).
+        // The old per-sender tracking would see: 1, 1(decrease!), 2, 2(decrease!), ...
+        // Per-service tracking sees each stream independently.
+        let mut tracker = SessionTracker::default();
+        // Service A: session 1
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, true);
+        // Service B: session 1 (would have been "decrease" with per-sender tracking)
+        let v = tracker.check(addr(1000), TransportKind::Multicast, SVC_B, INST, 1, true);
+        assert_eq!(v, SessionVerdict::Initial);
+        // Service A: session 2
+        let v = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 2, true);
+        assert_eq!(v, SessionVerdict::Ok);
+        // Service B: session 2
+        let v = tracker.check(addr(1000), TransportKind::Multicast, SVC_B, INST, 2, true);
+        assert_eq!(v, SessionVerdict::Ok);
     }
 
     #[test]
     fn session_id_decrease_with_reboot_flag_0_returns_ok() {
         let mut tracker = SessionTracker::default();
-        tracker.check(addr(1000), TransportKind::Multicast, 100, false);
-        // Session ID decrease while reboot flag is 0 is not a reboot signal
-        let verdict = tracker.check(addr(1000), TransportKind::Multicast, 50, false);
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 100, false);
+        // Session ID decrease while reboot flag is 0 — not a reboot
+        let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 50, false);
         assert_eq!(verdict, SessionVerdict::Ok);
     }
 
     #[test]
     fn different_transports_tracked_separately() {
         let mut tracker = SessionTracker::default();
-        tracker.check(addr(1000), TransportKind::Multicast, 100, true);
-        // Same sender, different transport — first message on Unicast
-        let verdict = tracker.check(addr(1000), TransportKind::Unicast, 1, true);
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 100, true);
+        // Same sender+service, different transport — first message on Unicast
+        let verdict = tracker.check(addr(1000), TransportKind::Unicast, SVC, INST, 1, true);
         assert_eq!(verdict, SessionVerdict::Initial);
     }
 
     #[test]
     fn different_senders_tracked_separately() {
         let mut tracker = SessionTracker::default();
-        tracker.check(addr(1000), TransportKind::Multicast, 100, true);
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 100, true);
         // Different sender — first message
-        let verdict = tracker.check(addr(2000), TransportKind::Multicast, 1, true);
+        let verdict = tracker.check(addr(2000), TransportKind::Multicast, SVC, INST, 1, true);
         assert_eq!(verdict, SessionVerdict::Initial);
     }
 
     #[test]
     fn reboot_flag_1_to_0_returns_ok() {
         let mut tracker = SessionTracker::default();
-        tracker.check(addr(1000), TransportKind::Multicast, 100, true);
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 100, true);
         // Reboot flag going 1->0 is not a reboot (it means session ID wrapped)
-        let verdict = tracker.check(addr(1000), TransportKind::Multicast, 101, false);
+        let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 101, false);
         assert_eq!(verdict, SessionVerdict::Ok);
     }
 
     #[test]
     fn same_session_id_with_reboot_flag_1_returns_ok() {
         let mut tracker = SessionTracker::default();
-        tracker.check(addr(1000), TransportKind::Multicast, 5, true);
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 5, true);
         // Same session ID (not a decrease) should be OK
-        let verdict = tracker.check(addr(1000), TransportKind::Multicast, 5, true);
+        let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 5, true);
         assert_eq!(verdict, SessionVerdict::Ok);
     }
 }

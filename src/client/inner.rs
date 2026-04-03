@@ -694,19 +694,25 @@ where
                                 let reboot_flag = PayloadDefinitions::new_sd_payload(&sd_header)
                                     .sd_flags()
                                     .is_some_and(crate::protocol::sd::Flags::reboot);
-                                let verdict = session_tracker.check(
-                                    source,
-                                    TransportKind::Multicast,
-                                    session_id,
-                                    reboot_flag,
-                                );
-                                if verdict == SessionVerdict::Reboot {
-                                    let _ = update_sender.send(ClientUpdate::SenderRebooted(source));
-                                }
 
-                                // Auto-populate service registry from SD entries
+                                // Auto-populate service registry from SD entries.
+                                // Session/reboot checking is done per service instance
+                                // so interleaved SD offers with independent session
+                                // counters don't cause false reboot detections.
                                 let sd_payload = PayloadDefinitions::new_sd_payload(&sd_header);
+                                let mut rebooted = false;
                                 for ep in sd_payload.offered_endpoints() {
+                                    let verdict = session_tracker.check(
+                                        source,
+                                        TransportKind::Multicast,
+                                        ep.service_id,
+                                        ep.instance_id,
+                                        session_id,
+                                        reboot_flag,
+                                    );
+                                    if verdict == SessionVerdict::Reboot {
+                                        rebooted = true;
+                                    }
                                     let id = ServiceInstanceId {
                                         service_id: ep.service_id,
                                         instance_id: ep.instance_id,
@@ -734,6 +740,10 @@ where
                                             ep.service_id, ep.instance_id,
                                         );
                                     }
+                                }
+
+                                if rebooted {
+                                    let _ = update_sender.send(ClientUpdate::SenderRebooted(source));
                                 }
 
                                 let discovery_msg = DiscoveryMessage {
