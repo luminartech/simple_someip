@@ -108,4 +108,14 @@ pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
     fn offered_endpoints(&self) -> std::vec::Vec<OfferedEndpoint> {
         std::vec::Vec::new()
     }
+
+    /// Return `(service_id, instance_id)` pairs for every SD entry in this
+    /// payload, regardless of entry type.
+    ///
+    /// Used for per-service-instance session/reboot tracking so that all SD
+    /// traffic (not just offers) contributes to reboot detection.
+    #[cfg(feature = "std")]
+    fn service_instances(&self) -> std::vec::Vec<(u16, u16)> {
+        std::vec::Vec::new()
+    }
 }

@@ -696,23 +696,29 @@ where
                                     .sd_flags()
                                     .is_some_and(crate::protocol::sd::Flags::reboot);
 
-                                // Auto-populate service registry from SD entries.
-                                // Session/reboot checking is done per service instance
-                                // so interleaved SD offers with independent session
-                                // counters don't cause false reboot detections.
+                                // Track sender session/reboot state for every SD entry
+                                // that identifies a service instance, not only
+                                // offer/stop-offer entries. This ensures reboot
+                                // detection works for all SD traffic (FindService,
+                                // Subscribe, SubscribeAck, etc.).
                                 let mut rebooted = false;
-                                for ep in sd_payload.offered_endpoints() {
+                                for (svc_id, inst_id) in sd_payload.service_instances() {
                                     let verdict = session_tracker.check(
                                         source,
                                         TransportKind::Multicast,
-                                        ep.service_id,
-                                        ep.instance_id,
+                                        svc_id,
+                                        inst_id,
                                         session_id,
                                         reboot_flag,
                                     );
                                     if verdict == SessionVerdict::Reboot {
                                         rebooted = true;
                                     }
+                                }
+
+                                // Auto-populate service registry from offer/stop-offer
+                                // SD entries.
+                                for ep in sd_payload.offered_endpoints() {
                                     let id = ServiceInstanceId {
                                         service_id: ep.service_id,
                                         instance_id: ep.instance_id,

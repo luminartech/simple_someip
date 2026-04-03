@@ -223,19 +223,16 @@ mod tests {
     }
 
     #[test]
-    fn session_id_wrap_around_not_treated_as_reboot() {
-        // Session ID wrapping from 65535 to 1 is a normal increment, not a
-        // decrease. The u16 comparison (1 < 65535) would technically be "less
-        // than", but per SOME/IP-SD the reboot flag is the authoritative
-        // signal — and here it stays 1 without a 0→1 transition.
-        // NOTE: with the current simple < comparison this WILL trigger a
-        // reboot verdict. This documents the known limitation.
+    fn session_id_wrap_around_currently_treated_as_reboot() {
+        // Session ID wrapping from 65535 to 1 would ideally be treated as a
+        // normal increment rather than a reboot, since the reboot flag stays 1
+        // and there is no 0→1 transition.
+        // However, the current implementation uses a simple numeric decrease
+        // check, so wrap-around is treated as a reboot. This test documents
+        // that known limitation.
         let mut tracker = SessionTracker::default();
         tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 65535, true);
         let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, true);
-        // This is a known false positive — session ID wrap looks like a decrease.
-        // A future improvement could use wrapping distance to distinguish wrap
-        // from genuine reboot.
         assert_eq!(verdict, SessionVerdict::Reboot);
     }
 

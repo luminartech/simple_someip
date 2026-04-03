@@ -195,6 +195,25 @@ impl PayloadWireFormat for RawPayload {
             })
             .collect()
     }
+
+    fn service_instances(&self) -> Vec<(u16, u16)> {
+        let header = match &self.kind {
+            RawPayloadKind::Sd(header) => header,
+            RawPayloadKind::Raw(_) => return Vec::new(),
+        };
+        header
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                sd::Entry::FindService(svc)
+                | sd::Entry::OfferService(svc)
+                | sd::Entry::StopOfferService(svc) => (svc.service_id, svc.instance_id),
+                sd::Entry::SubscribeEventGroup(eg) | sd::Entry::SubscribeAckEventGroup(eg) => {
+                    (eg.service_id, eg.instance_id)
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -392,6 +411,41 @@ mod tests {
         };
         let p = RawPayload::new_sd_payload(&header);
         assert!(p.offered_endpoints().is_empty());
+    }
+
+    #[test]
+    fn service_instances_returns_all_entry_types() {
+        let offer = sd::Entry::OfferService(make_offer_entry(0x47, 1));
+        let find = sd::Entry::FindService(sd::ServiceEntry::find(0x5D));
+        let sub = sd::Entry::SubscribeEventGroup(sd::EventGroupEntry::new(0x5B, 1, 1, 3, 0x01));
+        let header = VecSdHeader {
+            flags: sd::Flags::new_sd(false),
+            entries: std::vec![offer, find, sub],
+            options: std::vec![],
+        };
+        let p = RawPayload::new_sd_payload(&header);
+        let instances = p.service_instances();
+        assert_eq!(instances.len(), 3);
+        assert_eq!(instances[0], (0x47, 1)); // OfferService
+        assert_eq!(instances[1], (0x5D, 0xFFFF)); // FindService (wildcard instance)
+        assert_eq!(instances[2], (0x5B, 1)); // SubscribeEventGroup
+    }
+
+    #[test]
+    fn service_instances_empty_for_raw_payload() {
+        let p = RawPayload::from_bytes(&[1, 2, 3]);
+        assert!(p.service_instances().is_empty());
+    }
+
+    #[test]
+    fn service_instances_empty_for_no_entries() {
+        let header = VecSdHeader {
+            flags: sd::Flags::new_sd(false),
+            entries: std::vec![],
+            options: std::vec![],
+        };
+        let p = RawPayload::new_sd_payload(&header);
+        assert!(p.service_instances().is_empty());
     }
 
     #[test]

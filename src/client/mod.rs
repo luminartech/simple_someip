@@ -259,9 +259,13 @@ where
         response.await.unwrap()
     }
 
-    /// Like [`subscribe`](Self::subscribe) but does not wait for the send to
-    /// complete. Useful for periodic renewals where blocking the caller's
-    /// event loop is undesirable.
+    /// Like [`subscribe`](Self::subscribe) but does not wait for the
+    /// subscription result.
+    ///
+    /// This still awaits enqueueing the control message on the internal
+    /// channel, so it may block if that bounded channel is full. Useful for
+    /// periodic renewals where waiting for subscription processing is
+    /// unnecessary.
     pub async fn subscribe_no_wait(
         &self,
         service_id: u16,
@@ -271,7 +275,7 @@ where
         event_group_id: u16,
         client_port: u16,
     ) {
-        let (_response, message) = ControlMessage::subscribe(
+        let (response, message) = ControlMessage::subscribe(
             service_id,
             instance_id,
             major_version,
@@ -280,6 +284,11 @@ where
             client_port,
         );
         let _ = self.control_sender.send(message).await;
+        // Consume the response in the background so the inner loop doesn't
+        // warn about a dropped receiver.
+        tokio::spawn(async move {
+            let _ = response.await;
+        });
     }
 
     /// Sends an SD message to a specific target address.
@@ -511,6 +520,18 @@ mod tests {
             matches!(result, Err(Error::ServiceNotFound)),
             "expected ServiceNotFound, got {result:?}"
         );
+        client.shut_down();
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_no_wait_unknown_service_does_not_panic() {
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        // subscribe_no_wait is fire-and-forget — it should not panic even
+        // when the service is unknown (the inner loop sends ServiceNotFound
+        // on the dropped response channel, which is harmless).
+        client
+            .subscribe_no_wait(0xFFFF, 0xFFFF, 1, 3, 0x01, 0)
+            .await;
         client.shut_down();
     }
 
