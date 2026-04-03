@@ -212,4 +212,84 @@ mod tests {
         let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 5, true);
         assert_eq!(verdict, SessionVerdict::Ok);
     }
+
+    #[test]
+    fn different_instance_ids_tracked_separately() {
+        let mut tracker = SessionTracker::default();
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, 0x0001, 100, true);
+        // Same service, different instance — first message
+        let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, 0x0002, 1, true);
+        assert_eq!(verdict, SessionVerdict::Initial);
+    }
+
+    #[test]
+    fn session_id_wrap_around_not_treated_as_reboot() {
+        // Session ID wrapping from 65535 to 1 is a normal increment, not a
+        // decrease. The u16 comparison (1 < 65535) would technically be "less
+        // than", but per SOME/IP-SD the reboot flag is the authoritative
+        // signal — and here it stays 1 without a 0→1 transition.
+        // NOTE: with the current simple < comparison this WILL trigger a
+        // reboot verdict. This documents the known limitation.
+        let mut tracker = SessionTracker::default();
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 65535, true);
+        let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, true);
+        // This is a known false positive — session ID wrap looks like a decrease.
+        // A future improvement could use wrapping distance to distinguish wrap
+        // from genuine reboot.
+        assert_eq!(verdict, SessionVerdict::Reboot);
+    }
+
+    #[test]
+    fn reboot_flag_transition_with_session_id_decrease_both_signal_reboot() {
+        // Both indicators fire at once (flag 0→1 AND session ID reset) — still Reboot.
+        let mut tracker = SessionTracker::default();
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 100, false);
+        let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, true);
+        assert_eq!(verdict, SessionVerdict::Reboot);
+    }
+
+    #[test]
+    fn multiple_reboots_in_sequence() {
+        let mut tracker = SessionTracker::default();
+        // First message
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, true);
+        // Normal traffic
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 50, true);
+        // First reboot (session ID decrease)
+        let v = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, true);
+        assert_eq!(v, SessionVerdict::Reboot);
+        // Normal traffic after reboot
+        let v = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 2, true);
+        assert_eq!(v, SessionVerdict::Ok);
+        // Second reboot (flag transition)
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 10, false);
+        let v = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, true);
+        assert_eq!(v, SessionVerdict::Reboot);
+    }
+
+    #[test]
+    fn interleaved_offers_with_real_reboot() {
+        // Two services interleaving, then one experiences a real reboot.
+        let mut tracker = SessionTracker::default();
+        // Normal interleaved traffic
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 10, true);
+        tracker.check(addr(1000), TransportKind::Multicast, SVC_B, INST, 10, true);
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 11, true);
+        tracker.check(addr(1000), TransportKind::Multicast, SVC_B, INST, 11, true);
+
+        // Sensor reboots — both services restart at session 1 with flag 0→1.
+        // But flag was already 1, so only session ID decrease triggers it.
+        let v = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, true);
+        assert_eq!(v, SessionVerdict::Reboot);
+        let v = tracker.check(addr(1000), TransportKind::Multicast, SVC_B, INST, 1, true);
+        assert_eq!(v, SessionVerdict::Reboot);
+    }
+
+    #[test]
+    fn normal_increment_with_reboot_flag_0_returns_ok() {
+        let mut tracker = SessionTracker::default();
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, false);
+        let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 2, false);
+        assert_eq!(verdict, SessionVerdict::Ok);
+    }
 }

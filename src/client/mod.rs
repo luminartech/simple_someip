@@ -259,6 +259,29 @@ where
         response.await.unwrap()
     }
 
+    /// Like [`subscribe`](Self::subscribe) but does not wait for the send to
+    /// complete. Useful for periodic renewals where blocking the caller's
+    /// event loop is undesirable.
+    pub async fn subscribe_no_wait(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        major_version: u8,
+        ttl: u32,
+        event_group_id: u16,
+        client_port: u16,
+    ) {
+        let (_response, message) = ControlMessage::subscribe(
+            service_id,
+            instance_id,
+            major_version,
+            ttl,
+            event_group_id,
+            client_port,
+        );
+        let _ = self.control_sender.send(message).await;
+    }
+
     /// Sends an SD message to a specific target address.
     ///
     /// # Errors
