@@ -15,7 +15,6 @@ type SessionKey = (SocketAddr, TransportKind);
 /// Per-sender session state for reboot detection.
 #[derive(Clone, Copy, Debug)]
 struct SenderSessionState {
-    last_session_id: u16,
     last_reboot_flag: bool,
 }
 
@@ -24,7 +23,7 @@ struct SenderSessionState {
 pub enum SessionVerdict {
     /// Session is valid (normal increment or first message with matching state).
     Ok,
-    /// Sender has rebooted (reboot flag transition or session ID decrease).
+    /// Sender has rebooted (reboot flag transitioned from 0 to 1).
     Reboot,
     /// First message ever seen from this sender on this transport.
     Initial,
@@ -32,9 +31,10 @@ pub enum SessionVerdict {
 
 /// Tracks per-sender session state for reboot detection.
 ///
-/// Per the AUTOSAR SOME/IP-SD spec, a reboot is detected when:
-/// - The reboot flag transitions from 0 to 1
-/// - The session ID decreases while the reboot flag remains 1
+/// A reboot is detected when the reboot flag transitions from 0 to 1.
+/// Session ID decreases are **not** used as a reboot signal because
+/// sensors may interleave multiple SD service instances on the same
+/// address with independent session counters.
 #[derive(Debug, Default)]
 pub struct SessionTracker {
     state: HashMap<SessionKey, SenderSessionState>,
@@ -47,7 +47,7 @@ impl SessionTracker {
         &mut self,
         sender: SocketAddr,
         transport: TransportKind,
-        session_id: u16,
+        _session_id: u16,
         reboot_flag: bool,
     ) -> SessionVerdict {
         let key = (sender, transport);
@@ -69,7 +69,6 @@ impl SessionTracker {
         self.state.insert(
             key,
             SenderSessionState {
-                last_session_id: session_id,
                 last_reboot_flag: reboot_flag,
             },
         );
