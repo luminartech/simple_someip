@@ -106,6 +106,8 @@ impl Server {
             Some(socket2::Protocol::UDP),
         )?;
         sd_raw_socket.set_reuse_address(true)?;
+        #[cfg(unix)]
+        sd_raw_socket.set_reuse_port(true)?;
         sd_raw_socket.set_multicast_if_v4(&config.interface)?;
         sd_raw_socket.set_multicast_loop_v4(false)?;
         sd_raw_socket.bind(&sd_bind_addr.into())?;
