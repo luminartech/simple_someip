@@ -351,6 +351,9 @@ where
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Consume the immediate first tick so we don't send before
+            // the caller has finished setting up (e.g. subscribing).
+            tick.tick().await;
             let mut count = 0u64;
             loop {
                 tick.tick().await;
@@ -363,7 +366,12 @@ where
 
                 let (response, message) = ControlMessage::send_sd(target, sd_header.clone());
 
-                if sender.send(message).await.is_err() {
+                let send_ok = sender.send(message).await.is_ok();
+                // Drop the strong sender immediately so it doesn't keep
+                // the channel alive across the response await.
+                drop(sender);
+
+                if !send_ok {
                     tracing::warn!("SD announcement channel closed, stopping");
                     break;
                 }
