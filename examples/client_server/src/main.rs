@@ -13,10 +13,14 @@
 //! client's `start_sd_announcements()` handles all periodic SD messages.
 //!
 //! Usage:
-//!   cargo run -p client_server -- <interface_ip>
+//! ```text
+//! cargo run -p client_server -- <interface_ip>
+//! ```
 //!
 //! Example:
-//!   cargo run -p client_server -- 192.168.11.87
+//! ```text
+//! cargo run -p client_server -- 192.168.11.87
+//! ```
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -37,6 +41,43 @@ const MY_SERVER_PORT: u16 = 40000;
 
 const REMOTE_SERVICE_ID: u16 = 0x5678;
 const REMOTE_INSTANCE_ID: u16 = 0x0001;
+
+/// Build the combined `FindService` + `OfferService` SD header.
+fn build_sd_header(interface: Ipv4Addr) -> VecSdHeader {
+    let find_remote = Entry::FindService(ServiceEntry {
+        index_first_options_run: 0,
+        index_second_options_run: 0,
+        options_count: OptionsCount::new(0, 0),
+        service_id: REMOTE_SERVICE_ID,
+        instance_id: REMOTE_INSTANCE_ID,
+        major_version: 1,
+        ttl: 3,
+        minor_version: 0,
+    });
+
+    let offer_mine = Entry::OfferService(ServiceEntry {
+        index_first_options_run: 0,
+        index_second_options_run: 0,
+        options_count: OptionsCount::new(1, 0),
+        service_id: MY_SERVER_SERVICE_ID,
+        instance_id: MY_SERVER_INSTANCE_ID,
+        major_version: 1,
+        ttl: 3,
+        minor_version: 0,
+    });
+
+    let endpoint = Options::IpV4Endpoint {
+        ip: interface,
+        protocol: TransportProtocol::Udp,
+        port: MY_SERVER_PORT,
+    };
+
+    VecSdHeader {
+        flags: Flags::new(true, true),
+        entries: vec![find_remote, offer_mine],
+        options: vec![endpoint],
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -92,47 +133,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // ── Build combined Find+Offer SD header ─────────────────────────────
-
-    // FindService: we want to discover the remote service.
-    let find_remote = Entry::FindService(ServiceEntry {
-        index_first_options_run: 0,
-        index_second_options_run: 0,
-        options_count: OptionsCount::new(0, 0),
-        service_id: REMOTE_SERVICE_ID,
-        instance_id: REMOTE_INSTANCE_ID,
-        major_version: 1,
-        ttl: 3,
-        minor_version: 0,
-    });
-
-    // OfferService: we offer our own service.
-    // References option index 0 (the IPv4 endpoint below).
-    let offer_mine = Entry::OfferService(ServiceEntry {
-        index_first_options_run: 0,
-        index_second_options_run: 0,
-        options_count: OptionsCount::new(1, 0),
-        service_id: MY_SERVER_SERVICE_ID,
-        instance_id: MY_SERVER_INSTANCE_ID,
-        major_version: 1,
-        ttl: 3,
-        minor_version: 0,
-    });
-
-    let endpoint = Options::IpV4Endpoint {
-        ip: interface,
-        protocol: TransportProtocol::Udp,
-        port: MY_SERVER_PORT,
-    };
-
-    let sd_header = VecSdHeader {
-        flags: Flags::new(true, true),
-        entries: vec![find_remote, offer_mine],
-        options: vec![endpoint],
-    };
-
     // ── Start combined SD announcements from the client socket ───────────
 
+    let sd_header = build_sd_header(interface);
     let _announce_handle = client.start_sd_announcements(sd_header, Duration::from_secs(1));
     info!("Started combined Find+Offer SD announcements (1s interval)");
 
