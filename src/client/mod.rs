@@ -322,14 +322,15 @@ where
     /// `FindService` messages.
     ///
     /// Returns a [`tokio::task::JoinHandle`] that can be used to abort the
-    /// background task. Dropping the handle detaches the task; call
-    /// `.abort()` for explicit cancellation.
+    /// background task. The task uses a weak reference to the client's
+    /// control channel, so it exits automatically when all `Client` handles
+    /// are dropped (via `shut_down()` or going out of scope).
     ///
     /// # Arguments
     ///
     /// * `sd_header` — The SD header to send (entries + options).
-    /// * `interval` — How often to send. Must be > 0; clamped to a minimum
-    ///   of 100ms to prevent tight loops.
+    /// * `interval` — How often to send (e.g. every 1 second). Values below
+    ///   100ms are clamped to 100ms to prevent tight loops.
     pub fn start_sd_announcements(
         &self,
         sd_header: <MessageDefinitions as PayloadWireFormat>::SdHeader,
@@ -340,7 +341,10 @@ where
     {
         use crate::protocol::sd;
 
-        let client = self.clone();
+        // Use a WeakSender so this task does NOT keep the control channel
+        // alive. When all strong Client handles are dropped (shut_down),
+        // the weak sender will fail to upgrade and the task exits cleanly.
+        let weak_sender = self.control_sender.downgrade();
         let target = SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT);
         let interval = interval.max(std::time::Duration::from_millis(100));
 
@@ -350,27 +354,34 @@ where
             loop {
                 tick.tick().await;
 
-                // catch_unwind guards against the channel-closed panic in
-                // send_sd_message. If the inner loop has shut down, we
-                // stop announcing rather than panicking the task.
-                let Ok(future) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    client.send_sd_message(target, sd_header.clone())
-                })) else {
-                    tracing::warn!("SD announcement channel closed, stopping announcements");
+                // Upgrade the weak sender — fails if the client has shut down.
+                let Some(sender) = weak_sender.upgrade() else {
+                    tracing::info!("Client shut down, stopping SD announcements");
                     break;
                 };
 
-                match future.await {
-                    Ok(()) => {
+                let (response, message) = ControlMessage::send_sd(target, sd_header.clone());
+
+                if sender.send(message).await.is_err() {
+                    tracing::warn!("SD announcement channel closed, stopping");
+                    break;
+                }
+
+                match response.await {
+                    Ok(Ok(())) => {
                         count += 1;
                         if count == 1 {
                             tracing::info!("Sent first client SD announcement");
                         } else {
-                            tracing::trace!("Sent {} client SD announcements", count);
+                            tracing::trace!("Sent {count} client SD announcements");
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::error!("Failed to send SD announcement: {e:?}");
+                    }
+                    Err(_) => {
+                        tracing::warn!("SD announcement response dropped, stopping");
+                        break;
                     }
                 }
             }
@@ -766,6 +777,13 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
         handle.abort();
+        let result = handle.await;
+        let err = result.unwrap_err();
+        assert!(
+            err.is_cancelled(),
+            "task should have been cancelled, not panicked"
+        );
+
         client.shut_down();
     }
 
@@ -780,6 +798,13 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
         handle.abort();
+        let result = handle.await;
+        let err = result.unwrap_err();
+        assert!(
+            err.is_cancelled(),
+            "task should have been cancelled, not panicked"
+        );
+
         client.shut_down();
     }
 
@@ -794,8 +819,29 @@ mod tests {
 
         handle.abort();
         let result = handle.await;
-        assert!(result.is_err(), "task should have been cancelled");
+        let err = result.unwrap_err();
+        assert!(
+            err.is_cancelled(),
+            "task should have been cancelled, not panicked"
+        );
 
         client.shut_down();
+    }
+
+    #[tokio::test]
+    async fn test_start_sd_announcements_stops_on_shutdown() {
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        client.bind_discovery().await.unwrap();
+
+        let sd_header = empty_sd_header();
+        let handle =
+            client.start_sd_announcements(sd_header, std::time::Duration::from_millis(100));
+
+        // Shut down the client — the weak sender should fail to upgrade
+        // and the task should exit cleanly without needing abort().
+        client.shut_down();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(result.is_ok(), "task should have exited after shutdown");
     }
 }
