@@ -77,6 +77,11 @@ pub struct Server {
     sd_session_id: Arc<AtomicU16>,
     /// Shared E2E registry for runtime E2E configuration
     e2e_registry: Arc<Mutex<E2ERegistry>>,
+    /// Additional SD entries to include in every announcement (e.g. FindService
+    /// entries for services this application subscribes to as a client).
+    /// Per AUTOSAR SOME/IP-SD, a node that is both client and server should
+    /// bundle Find and Offer entries in the same SD message.
+    additional_sd_entries: Arc<std::sync::Mutex<Vec<Entry>>>,
 }
 
 impl Server {
@@ -150,7 +155,18 @@ impl Server {
             publisher,
             sd_session_id: Arc::new(AtomicU16::new(1)),
             e2e_registry,
+            additional_sd_entries: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
+    }
+
+    /// Set additional SD entries to include in every announcement.
+    ///
+    /// Use this to bundle FindService entries alongside the server's
+    /// OfferService when the application is both a client and server.
+    /// Per AUTOSAR SOME/IP-SD, nodes should bundle Find and Offer entries
+    /// in the same SD message for proper service discovery.
+    pub fn set_additional_sd_entries(&self, entries: Vec<Entry>) {
+        *self.additional_sd_entries.lock().unwrap() = entries;
     }
 
     /// Start announcing the service via Service Discovery
@@ -164,11 +180,13 @@ impl Server {
         let config = self.config.clone();
         let sd_socket = Arc::clone(&self.sd_socket);
         let sd_session_id = Arc::clone(&self.sd_session_id);
+        let additional_entries = Arc::clone(&self.additional_sd_entries);
 
         tokio::spawn(async move {
             let mut announcement_count = 0u32;
             loop {
-                match Self::send_offer_service(&config, &sd_socket, &sd_session_id).await {
+                let extra = additional_entries.lock().unwrap().clone();
+                match Self::send_offer_service(&config, &sd_socket, &sd_session_id, &extra).await {
                     Ok(()) => {
                         announcement_count += 1;
                         if announcement_count == 1 {
@@ -197,17 +215,21 @@ impl Server {
         Ok(())
     }
 
-    /// Send an `OfferService` message via Service Discovery
+    /// Send an `OfferService` message via Service Discovery, optionally
+    /// bundled with additional entries (e.g. FindService for client role).
     async fn send_offer_service(
         config: &ServerConfig,
         socket: &UdpSocket,
         session_id: &AtomicU16,
+        additional_entries: &[Entry],
     ) -> Result<(), Error> {
         use crate::protocol::Header as SomeIpHeader;
         use crate::traits::WireFormat;
 
-        // Create OfferService entry
-        let entry = Entry::OfferService(ServiceEntry {
+        // Build entries: additional entries first, then the OfferService.
+        // The Offer entry references option index 0 (the IPv4 endpoint).
+        // Additional entries (e.g. FindService) typically have no options.
+        let offer = Entry::OfferService(ServiceEntry {
             index_first_options_run: 0,
             index_second_options_run: 0,
             options_count: OptionsCount::new(1, 0),
@@ -218,6 +240,9 @@ impl Server {
             minor_version: config.minor_version,
         });
 
+        let mut entries: Vec<Entry> = additional_entries.to_vec();
+        entries.push(offer);
+
         // Create IPv4 endpoint option
         let option = sd::Options::IpV4Endpoint {
             ip: config.interface,
@@ -225,7 +250,6 @@ impl Server {
             protocol: TransportProtocol::Udp,
         };
 
-        let entries = [entry];
         let options = [option];
         let sd_payload = sd::Header::new(Flags::new(true, true), &entries, &options);
 
