@@ -310,6 +310,51 @@ where
         response.await.unwrap()
     }
 
+    /// Start periodic SD announcements on the client's discovery socket.
+    ///
+    /// Spawns a background task that sends the given SD header to the
+    /// multicast group at a regular interval. Use this to bundle
+    /// FindService + OfferService entries from a single SD identity when
+    /// the application acts as both client and server.
+    ///
+    /// The announcements are sent via the client's SD socket, ensuring
+    /// they share the same source address as the client's Subscribe and
+    /// FindService messages.
+    ///
+    /// # Arguments
+    ///
+    /// * `sd_header` — The SD header to send (entries + options).
+    /// * `interval` — How often to send (e.g. every 1 second).
+    pub fn start_sd_announcements(
+        &self,
+        sd_header: <MessageDefinitions as PayloadWireFormat>::SdHeader,
+        interval: std::time::Duration,
+    ) where
+        <MessageDefinitions as PayloadWireFormat>::SdHeader: Send + Sync + 'static,
+    {
+        use crate::protocol::sd;
+
+        let client = self.clone();
+        let target = SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT);
+
+        tokio::spawn(async move {
+            let mut count = 0u64;
+            loop {
+                if let Err(e) = client.send_sd_message(target, sd_header.clone()).await {
+                    tracing::error!("Failed to send SD announcement: {e:?}");
+                } else {
+                    count += 1;
+                    if count == 1 {
+                        tracing::info!("Sent first client SD announcement");
+                    } else {
+                        tracing::trace!("Sent {} client SD announcements", count);
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
     /// Registers a service endpoint in the client's endpoint registry.
     ///
     /// `local_port` controls which source port is used when sending to this
