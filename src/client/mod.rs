@@ -842,7 +842,13 @@ mod tests {
         // and the task should exit cleanly without needing abort().
         client.shut_down();
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
-        assert!(result.is_ok(), "task should have exited after shutdown");
+        let join_result = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("task should have exited within timeout");
+        // Verify clean exit — not a panic
+        assert!(
+            join_result.is_ok() || join_result.as_ref().unwrap_err().is_cancelled(),
+            "task should have exited cleanly, not panicked"
+        );
     }
 }
