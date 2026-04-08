@@ -730,4 +730,32 @@ mod tests {
         );
         client.shut_down();
     }
+
+    #[tokio::test]
+    async fn test_start_sd_announcements_does_not_panic() {
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        // Bind discovery so the SD socket is available for sending.
+        client.bind_discovery().await.unwrap();
+
+        let sd_header = empty_sd_header();
+        client.start_sd_announcements(sd_header, std::time::Duration::from_secs(1));
+
+        // Let the announcement task fire at least once.
+        // It will fail to send (loopback multicast) but should not panic.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        client.shut_down();
+    }
+
+    #[tokio::test]
+    async fn test_start_sd_announcements_without_discovery_bound() {
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        // Don't bind discovery — the task should handle the error gracefully.
+        let sd_header = empty_sd_header();
+        client.start_sd_announcements(sd_header, std::time::Duration::from_secs(1));
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        client.shut_down();
+    }
 }
