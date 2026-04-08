@@ -350,6 +350,7 @@ where
 
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut count = 0u64;
             loop {
                 tick.tick().await;

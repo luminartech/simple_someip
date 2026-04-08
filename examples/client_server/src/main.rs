@@ -4,13 +4,17 @@
 //! - A **client** subscribing to a remote service's events
 //! - A **server** offering its own service for remote nodes to subscribe to
 //!
-//! The key pattern: when acting as both client and server, SD announcements
-//! must bundle `FindService` (client role) and `OfferService` (server role)
-//! in the same SD message, sent from the client's SD socket. This ensures
-//! remote nodes see a single coherent network identity.
+//! The key pattern: when acting as both client and server, periodic SD
+//! announcements must bundle `FindService` (client role) and `OfferService`
+//! (server role) in the same SD message, sent from the client's SD socket.
+//! This ensures remote nodes see a single coherent network identity for
+//! multicast announcements.
 //!
 //! The server's built-in `start_announcing()` is NOT used — instead, the
-//! client's `start_sd_announcements()` handles all periodic SD messages.
+//! client's `start_sd_announcements()` handles periodic multicast
+//! announcements. The server's `run()` loop still handles unicast SD
+//! traffic (e.g. `SubscribeAck`/`SubscribeNack` responses) on its own
+//! socket, which is necessary for subscription management.
 //!
 //! Usage:
 //! ```text
