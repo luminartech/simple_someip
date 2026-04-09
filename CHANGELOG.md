@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.2](https://github.com/luminartech/simple_someip/compare/v0.5.1...v0.5.2) - 2026-04-09
+
+### Other
+
+- Update src/client/mod.rs
+- Drop the client sender to avoid hanging and delay our first sd message
+- Respond to PR Feedback
+- More Copilot comments
+- Address PR comments - made the sender weak to avoid a hanging reference
+- Add an example of how to submit SD messages while a client and server
+- Respond to PR feedback and add unit tests.
+- Undo server changes and add unit tests.
+- Add an explicit command to the client to send SD announcements on a loop
+- Allow users to add extra SD entries when sending offers.
+- Fix issues sending someip commands on shared ports
+
 ## [0.5.1](https://github.com/luminartech/simple_someip/compare/v0.5.0...v0.5.1) - 2026-04-03
 
 ### Other
