@@ -337,7 +337,7 @@ where
         interval: std::time::Duration,
     ) -> tokio::task::JoinHandle<()>
     where
-        <MessageDefinitions as PayloadWireFormat>::SdHeader: Send + Sync + 'static,
+        <MessageDefinitions as PayloadWireFormat>::SdHeader: Send + 'static,
     {
         use crate::protocol::sd;
 
