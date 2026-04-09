@@ -310,6 +310,93 @@ where
         response.await.unwrap()
     }
 
+    /// Start periodic SD announcements on the client's discovery socket.
+    ///
+    /// Spawns a background task that sends the given SD header to the
+    /// multicast group at a regular interval. Use this to bundle
+    /// `FindService` + `OfferService` entries from a single SD identity
+    /// when the application acts as both client and server.
+    ///
+    /// The announcements are sent via the client's SD socket, ensuring
+    /// they share the same source address as the client's `Subscribe` and
+    /// `FindService` messages.
+    ///
+    /// Returns a [`tokio::task::JoinHandle`] that can be used to abort the
+    /// background task. The task uses a weak reference to the client's
+    /// control channel, so it exits automatically when all `Client` handles
+    /// are dropped (via `shut_down()` or going out of scope).
+    ///
+    /// # Arguments
+    ///
+    /// * `sd_header` — The SD header to send (entries + options).
+    /// * `interval` — How often to send (e.g. every 1 second). Values below
+    ///   100ms are clamped to 100ms to prevent tight loops.
+    pub fn start_sd_announcements(
+        &self,
+        sd_header: <MessageDefinitions as PayloadWireFormat>::SdHeader,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        <MessageDefinitions as PayloadWireFormat>::SdHeader: Send + 'static,
+    {
+        use crate::protocol::sd;
+
+        // Use a WeakSender so this task does NOT keep the control channel
+        // alive. When all strong Client handles are dropped (shut_down),
+        // the weak sender will fail to upgrade and the task exits cleanly.
+        let weak_sender = self.control_sender.downgrade();
+        let target = SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT);
+        let interval = interval.max(std::time::Duration::from_millis(100));
+
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Consume the immediate first tick so we don't send before
+            // the caller has finished setting up (e.g. subscribing).
+            tick.tick().await;
+            let mut count = 0u64;
+            loop {
+                tick.tick().await;
+
+                // Upgrade the weak sender — fails if the client has shut down.
+                let Some(sender) = weak_sender.upgrade() else {
+                    tracing::info!("Client shut down, stopping SD announcements");
+                    break;
+                };
+
+                let (response, message) = ControlMessage::send_sd(target, sd_header.clone());
+
+                let send_ok = sender.send(message).await.is_ok();
+                // Drop the strong sender immediately so it doesn't keep
+                // the channel alive across the response await.
+                drop(sender);
+
+                if !send_ok {
+                    tracing::warn!("SD announcement channel closed, stopping");
+                    break;
+                }
+
+                match response.await {
+                    Ok(Ok(())) => {
+                        count += 1;
+                        if count == 1 {
+                            tracing::info!("Sent first client SD announcement");
+                        } else {
+                            tracing::trace!("Sent {count} client SD announcements");
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("Failed to send SD announcement: {e:?}");
+                    }
+                    Err(_) => {
+                        tracing::warn!("SD announcement response dropped, stopping");
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
     /// Registers a service endpoint in the client's endpoint registry.
     ///
     /// `local_port` controls which source port is used when sending to this
@@ -684,5 +771,92 @@ mod tests {
             "expected ServiceNotFound, got {result:?}"
         );
         client.shut_down();
+    }
+
+    #[tokio::test]
+    async fn test_start_sd_announcements_does_not_panic() {
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        client.bind_discovery().await.unwrap();
+
+        let sd_header = empty_sd_header();
+        let handle =
+            client.start_sd_announcements(sd_header, std::time::Duration::from_millis(100));
+
+        // Let the task fire at least once (may fail to send on loopback, that's OK).
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        handle.abort();
+        let result = handle.await;
+        let err = result.unwrap_err();
+        assert!(
+            err.is_cancelled(),
+            "task should have been cancelled, not panicked"
+        );
+
+        client.shut_down();
+    }
+
+    #[tokio::test]
+    async fn test_start_sd_announcements_without_discovery_bound() {
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        // Don't bind discovery — the task should handle the error gracefully.
+        let sd_header = empty_sd_header();
+        let handle =
+            client.start_sd_announcements(sd_header, std::time::Duration::from_millis(100));
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        handle.abort();
+        let result = handle.await;
+        let err = result.unwrap_err();
+        assert!(
+            err.is_cancelled(),
+            "task should have been cancelled, not panicked"
+        );
+
+        client.shut_down();
+    }
+
+    #[tokio::test]
+    async fn test_start_sd_announcements_abort_stops_task() {
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        client.bind_discovery().await.unwrap();
+
+        let sd_header = empty_sd_header();
+        let handle =
+            client.start_sd_announcements(sd_header, std::time::Duration::from_millis(100));
+
+        handle.abort();
+        let result = handle.await;
+        let err = result.unwrap_err();
+        assert!(
+            err.is_cancelled(),
+            "task should have been cancelled, not panicked"
+        );
+
+        client.shut_down();
+    }
+
+    #[tokio::test]
+    async fn test_start_sd_announcements_stops_on_shutdown() {
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        client.bind_discovery().await.unwrap();
+
+        let sd_header = empty_sd_header();
+        let handle =
+            client.start_sd_announcements(sd_header, std::time::Duration::from_millis(100));
+
+        // Shut down the client — the weak sender should fail to upgrade
+        // and the task should exit cleanly without needing abort().
+        client.shut_down();
+
+        let join_result = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("task should have exited within timeout");
+        // Verify clean exit — not a panic
+        assert!(
+            join_result.is_ok() || join_result.as_ref().unwrap_err().is_cancelled(),
+            "task should have exited cleanly, not panicked"
+        );
     }
 }
