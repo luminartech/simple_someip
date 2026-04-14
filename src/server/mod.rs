@@ -691,19 +691,29 @@ impl Server {
         // cheap view over borrowed bytes so `clone` is free. Taking
         // `options` by reference lets the caller keep ownership and
         // keeps the clippy `needless_pass_by_value` lint quiet.
-        let mut endpoints: Vec<SocketAddrV4> = Vec::new();
-        let mut ignored_other = 0usize;
+        //
+        // We only ever return the first `IpV4Endpoint` found, so rather
+        // than collect into a `Vec` (heap alloc on every Subscribe) we
+        // track the first hit in an `Option` and keep a count so the
+        // multi-endpoint warn path still reports how many additional
+        // endpoints were present. This keeps the SD receive loop
+        // allocation-free on the happy path.
+        let mut first_endpoint: Option<SocketAddrV4> = None;
+        let mut endpoint_count: usize = 0;
+        let mut ignored_other: usize = 0;
 
-        let mut collect_run = |index: usize, count: usize| {
+        let mut walk_run = |index: usize, count: usize| {
             if count == 0 {
                 return;
             }
-            let run = options.clone().skip(index).take(count);
-            for option_view in run {
+            for option_view in options.clone().skip(index).take(count) {
                 match option_view.option_type() {
                     Ok(sd::OptionType::IpV4Endpoint) => {
                         if let Ok((ip, _, port)) = option_view.as_ipv4() {
-                            endpoints.push(SocketAddrV4::new(ip, port));
+                            endpoint_count += 1;
+                            if first_endpoint.is_none() {
+                                first_endpoint = Some(SocketAddrV4::new(ip, port));
+                            }
                         }
                     }
                     Ok(_) | Err(_) => ignored_other += 1,
@@ -711,10 +721,10 @@ impl Server {
             }
         };
 
-        collect_run(first_index, first_count);
-        collect_run(second_index, second_count);
+        walk_run(first_index, first_count);
+        walk_run(second_index, second_count);
 
-        match endpoints.len() {
+        match endpoint_count {
             0 => {
                 tracing::warn!(
                     "No IPv4 endpoint in options runs \
@@ -725,19 +735,22 @@ impl Server {
                 None
             }
             1 => {
-                tracing::trace!("Found IPv4 endpoint {}", endpoints[0]);
-                Some(endpoints[0])
+                // Unwrap is safe: count == 1 implies we set `first_endpoint`.
+                let ep = first_endpoint.expect("endpoint_count=1 implies first_endpoint is Some");
+                tracing::trace!("Found IPv4 endpoint {}", ep);
+                Some(ep)
             }
             n => {
+                let ep = first_endpoint.expect("endpoint_count>=1 implies first_endpoint is Some");
                 tracing::warn!(
                     "{} IPv4 endpoints found in subscribe options runs; \
                      using first ({}) and ignoring {} additional. \
                      Multi-endpoint (e.g. TCP+UDP) subscribers are not yet supported.",
                     n,
-                    endpoints[0],
+                    ep,
                     n - 1
                 );
-                Some(endpoints[0])
+                Some(ep)
             }
         }
     }
@@ -1939,8 +1952,10 @@ mod tests {
             .start_announcing()
             .expect("start_announcing on a regular server must still succeed");
         // The announcer task runs forever; the test succeeds as soon as
-        // start_announcing returns Ok. Dropping the server aborts the
-        // spawned task via Arc refcounting on the SD socket.
+        // start_announcing returns Ok. The spawned task is cleaned up
+        // when the Tokio test runtime shuts down at the end of this
+        // test — `tokio::spawn` tasks are not aborted by dropping
+        // unrelated handles, they ride the runtime lifecycle.
     }
 
     #[tokio::test]
