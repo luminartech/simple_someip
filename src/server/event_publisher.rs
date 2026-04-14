@@ -221,8 +221,27 @@ impl EventPublisher {
     /// Register a subscriber for an event group.
     ///
     /// This is useful when subscription handling is managed externally
-    /// (e.g., by a client that shares the SD socket) rather than by the
+    /// (e.g. by a client that shares the SD socket) rather than by the
     /// server's own `run()` loop.
+    ///
+    /// Calling this method with the same `(service_id, instance_id,
+    /// event_group_id, subscriber_addr)` tuple is idempotent — the
+    /// underlying [`SubscriptionManager`] deduplicates — so external
+    /// dispatchers can safely call it on every incoming
+    /// `SubscribeEventGroup` (including TTL refreshes) without growing
+    /// the subscriber list.
+    ///
+    /// # TTL / expiration
+    ///
+    /// This method does **not** track the SOME/IP-SD Subscribe TTL.
+    /// Subscribers registered here persist until explicitly removed via
+    /// [`EventPublisher::remove_subscriber`] (or until the
+    /// [`EventPublisher`] itself is dropped). External dispatchers are
+    /// responsible for detecting stale subscriptions — for example, by
+    /// tracking the last refresh time per subscriber and calling
+    /// `remove_subscriber` when no refresh has arrived within the
+    /// advertised TTL — otherwise subscribers accumulate for the
+    /// lifetime of the process.
     pub async fn register_subscriber(
         &self,
         service_id: u16,
@@ -232,6 +251,27 @@ impl EventPublisher {
     ) {
         let mut mgr = self.subscriptions.write().await;
         mgr.subscribe(service_id, instance_id, event_group_id, subscriber_addr);
+    }
+
+    /// Remove a previously-registered subscriber from an event group.
+    ///
+    /// Counterpart to [`EventPublisher::register_subscriber`] for
+    /// externally managed subscriptions. Calling this method with an
+    /// address that is not currently subscribed is a no-op.
+    ///
+    /// Intended for use by external SD dispatchers to clean up stale
+    /// subscriptions whose TTL has expired or whose remote peer has
+    /// rebooted. The server's own `run()` loop does not call this
+    /// method; it is purely for external management.
+    pub async fn remove_subscriber(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+        subscriber_addr: std::net::SocketAddrV4,
+    ) {
+        let mut mgr = self.subscriptions.write().await;
+        mgr.unsubscribe(service_id, instance_id, event_group_id, subscriber_addr);
     }
 
     /// Get the current number of subscribers for a specific event group

@@ -416,6 +416,17 @@ impl<'a> OptionView<'a> {
 
 /// Iterator over variable-length SD options in a validated buffer.
 /// Options are guaranteed valid (validated upfront in `SdHeaderView::parse`).
+///
+/// `OptionIter` is a thin wrapper around a borrowed byte slice and is
+/// `Clone`, so callers that need to walk the same options multiple
+/// times (e.g. to extract the subset referenced by a particular entry's
+/// options run) can explicitly clone the iterator. It is deliberately
+/// **not** `Copy` — making an iterator `Copy` is a footgun because
+/// advancing the original does not advance the hidden copies, which
+/// makes "this iterator is already exhausted" invariants easy to break
+/// accidentally. Clone when you mean to reuse; don't let the compiler
+/// duplicate for you.
+#[derive(Clone)]
 pub struct OptionIter<'a> {
     remaining: &'a [u8],
 }

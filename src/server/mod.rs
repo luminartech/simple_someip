@@ -20,6 +20,7 @@ use crate::e2e::{E2EKey, E2EProfile, E2ERegistry};
 use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
 use core::sync::atomic::Ordering;
 use std::{
+    format,
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
     sync::{Arc, Mutex, atomic::AtomicU16},
     vec,
@@ -77,6 +78,12 @@ pub struct Server {
     sd_session_id: Arc<AtomicU16>,
     /// Shared E2E registry for runtime E2E configuration
     e2e_registry: Arc<Mutex<E2ERegistry>>,
+    /// `true` if this server was constructed via [`Server::new_passive`].
+    /// Passive servers have no real SD socket bound to port 30490; their
+    /// SD handling is managed externally. Calling [`Self::start_announcing`]
+    /// or [`Self::run`] on a passive server is a programming error and
+    /// returns an [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`].
+    is_passive: bool,
 }
 
 impl Server {
@@ -150,6 +157,7 @@ impl Server {
             publisher,
             sd_session_id: Arc::new(AtomicU16::new(1)),
             e2e_registry,
+            is_passive: false,
         })
     }
 
@@ -191,8 +199,7 @@ impl Server {
         // `start_announcing` nor `run` should be called for a passive
         // server. We still allocate it so the `Server` struct shape is
         // identical to the full-server path.
-        let sd_placeholder_addr =
-            std::net::SocketAddr::new(IpAddr::V4(config.interface), 0);
+        let sd_placeholder_addr = std::net::SocketAddr::new(IpAddr::V4(config.interface), 0);
         let sd_socket = UdpSocket::bind(sd_placeholder_addr).await?;
         tracing::debug!(
             "Passive server SD placeholder socket bound to {} (not in SD reuseport group)",
@@ -215,6 +222,7 @@ impl Server {
             publisher,
             sd_session_id: Arc::new(AtomicU16::new(1)),
             e2e_registry,
+            is_passive: true,
         })
     }
 
@@ -224,8 +232,25 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// Currently always returns `Ok(())`; SD send failures are logged internally.
+    /// Returns [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`] if
+    /// called on a server constructed via [`Server::new_passive`] — passive
+    /// servers have no real SD socket bound to port 30490, so any
+    /// announcements would go out with an incorrect source port.
+    ///
+    /// Otherwise currently always returns `Ok(())`; SD send failures are
+    /// logged internally.
     pub fn start_announcing(&self) -> Result<(), Error> {
+        if self.is_passive {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "start_announcing called on passive Server for service 0x{:04X}; \
+                     announcements must be driven externally (e.g. via \
+                     `simple_someip::Client::start_sd_announcements`)",
+                    self.config.service_id
+                ),
+            )));
+        }
         let config = self.config.clone();
         let sd_socket = Arc::clone(&self.sd_socket);
         let sd_session_id = Arc::clone(&self.sd_session_id);
@@ -451,8 +476,26 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// Returns an error if receiving from a socket fails or handling an SD message fails.
+    /// Returns [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`] if
+    /// called on a server constructed via [`Server::new_passive`] — passive
+    /// servers have no real SD socket to read from, so the run loop would
+    /// block forever on the ephemeral placeholder socket.
+    ///
+    /// Otherwise returns an error if receiving from a socket fails or
+    /// handling an SD message fails.
     pub async fn run(&mut self) -> Result<(), Error> {
+        if self.is_passive {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "run called on passive Server for service 0x{:04X}; \
+                     SD receive must be driven externally (e.g. via the \
+                     Client's discovery socket, routing Subscribes to \
+                     `EventPublisher::register_subscriber`)",
+                    self.config.service_id
+                ),
+            )));
+        }
         use crate::protocol::MessageView;
 
         let mut unicast_buf = vec![0u8; 65535];
@@ -554,14 +597,23 @@ impl Server {
                         )
                         .await?;
                     } else {
-                        // Extract subscriber endpoint from the option referenced
-                        // by this entry's index_first_options_run, not just the
-                        // first option in the header (which may belong to a
-                        // different entry in a combined SD message).
-                        let option_index = entry_view.index_first_options_run() as usize;
-                        if let Some(endpoint_addr) =
-                            Self::extract_endpoint_at_index(sd_view.options(), option_index)
-                        {
+                        // Extract the subscriber endpoint from the entry's
+                        // own options run. Each SD entry describes two runs
+                        // of options via `(index_first_options_run,
+                        // first_options_count)` and the symmetric second
+                        // pair; we walk both runs, collect every
+                        // `IpV4Endpoint` option in them, and take the first.
+                        let first_index = entry_view.index_first_options_run() as usize;
+                        let first_count = entry_view.options_count().first_options_count as usize;
+                        let second_index = entry_view.index_second_options_run() as usize;
+                        let second_count = entry_view.options_count().second_options_count as usize;
+                        if let Some(endpoint_addr) = Self::extract_subscriber_endpoint(
+                            sd_view.options(),
+                            first_index,
+                            first_count,
+                            second_index,
+                            second_count,
+                        ) {
                             let mut subs = self.subscriptions.write().await;
                             subs.subscribe(
                                 entry_view.service_id(),
@@ -611,28 +663,75 @@ impl Server {
         Ok(())
     }
 
-    /// Extract endpoint address from the SD option at a specific index.
+    /// Extract a single subscriber endpoint from the options runs
+    /// associated with an SD entry.
     ///
-    /// Each SD entry references its options via `index_first_options_run`.
-    /// In combined SD messages (e.g. OfferService + SubscribeEventGroup),
-    /// different entries reference different options — so we must use the
-    /// entry's index rather than blindly taking the first option.
-    fn extract_endpoint_at_index(
+    /// Each SD entry owns up to two options runs. A run is a contiguous
+    /// slice of the options array starting at `index_*_options_run` with
+    /// `*_options_count` entries. This helper walks both runs, collects
+    /// every `IpV4Endpoint` option it finds, returns the first, and logs
+    /// a `warn!` if more than one endpoint is present (we do not yet
+    /// support multi-endpoint subscribers — e.g. TCP+UDP — and will pick
+    /// an arbitrary one).
+    ///
+    /// Returns `None` if no `IpV4Endpoint` is found in either run.
+    fn extract_subscriber_endpoint(
         options: sd::OptionIter<'_>,
-        index: usize,
+        first_index: usize,
+        first_count: usize,
+        second_index: usize,
+        second_count: usize,
     ) -> Option<SocketAddrV4> {
-        let option_view = options.into_iter().nth(index)?;
-        if let Ok(sd::OptionType::IpV4Endpoint) = option_view.option_type()
-            && let Ok((ip, _, port)) = option_view.as_ipv4()
-        {
-            tracing::trace!("Found IPv4 endpoint at index {}: {}:{}", index, ip, port);
-            Some(SocketAddrV4::new(ip, port))
-        } else {
-            tracing::warn!(
-                "Option at index {} is not an IPv4 endpoint",
-                index
-            );
-            None
+        // Collect by cloning the option iterator for each run; `OptionIter`
+        // is a cheap view over borrowed bytes so `clone` is free.
+        let mut endpoints: Vec<SocketAddrV4> = Vec::new();
+        let mut ignored_other = 0usize;
+
+        let mut collect_run = |index: usize, count: usize| {
+            if count == 0 {
+                return;
+            }
+            let run = options.clone().into_iter().skip(index).take(count);
+            for option_view in run {
+                match option_view.option_type() {
+                    Ok(sd::OptionType::IpV4Endpoint) => {
+                        if let Ok((ip, _, port)) = option_view.as_ipv4() {
+                            endpoints.push(SocketAddrV4::new(ip, port));
+                        }
+                    }
+                    Ok(_) | Err(_) => ignored_other += 1,
+                }
+            }
+        };
+
+        collect_run(first_index, first_count);
+        collect_run(second_index, second_count);
+
+        match endpoints.len() {
+            0 => {
+                tracing::warn!(
+                    "No IPv4 endpoint in options runs \
+                     (first: idx={first_index}, count={first_count}; \
+                     second: idx={second_index}, count={second_count}; \
+                     ignored={ignored_other})"
+                );
+                None
+            }
+            1 => {
+                tracing::trace!("Found IPv4 endpoint {}", endpoints[0]);
+                Some(endpoints[0])
+            }
+            n => {
+                tracing::warn!(
+                    "{} IPv4 endpoints found in subscribe options runs; \
+                     using first ({}) and ignoring {} additional. \
+                     Multi-endpoint (e.g. TCP+UDP) subscribers are not yet supported.",
+                    n,
+                    endpoints[0],
+                    n - 1
+                );
+                Some(endpoints[0])
+            }
         }
     }
 
