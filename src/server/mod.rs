@@ -2061,20 +2061,20 @@ mod tests {
             );
 
             // 1 endpoint → trace! "Found IPv4 endpoint" branch.
-            let mut buf1 = [0u8; 32];
-            let total1 = fill_ipv4_endpoints(&mut buf1, 1, 31000);
-            let iter1 = sd::OptionIter::new(&buf1[..total1]);
+            let mut buf_one = [0u8; 32];
+            let len_one = fill_ipv4_endpoints(&mut buf_one, 1, 31000);
+            let iter_one = sd::OptionIter::new(&buf_one[..len_one]);
             assert_eq!(
-                Server::extract_subscriber_endpoint(&iter1, 0, 1, 0, 0),
+                Server::extract_subscriber_endpoint(&iter_one, 0, 1, 0, 0),
                 Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 31000))
             );
 
             // n endpoints → warn! "{} IPv4 endpoints found" branch.
-            let mut bufn = [0u8; 64];
-            let totaln = fill_ipv4_endpoints(&mut bufn, 3, 31100);
-            let itern = sd::OptionIter::new(&bufn[..totaln]);
+            let mut buf_many = [0u8; 64];
+            let len_many = fill_ipv4_endpoints(&mut buf_many, 3, 31100);
+            let iter_many = sd::OptionIter::new(&buf_many[..len_many]);
             assert_eq!(
-                Server::extract_subscriber_endpoint(&itern, 0, 3, 0, 0),
+                Server::extract_subscriber_endpoint(&iter_many, 0, 3, 0, 0),
                 Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 31100))
             );
         });
