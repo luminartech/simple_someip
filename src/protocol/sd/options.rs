@@ -822,4 +822,77 @@ mod tests {
         assert_eq!(v2.to_owned().unwrap(), opt2);
         assert!(iter.next().is_none());
     }
+
+    #[test]
+    fn option_iter_clone_allows_reuse() {
+        // Cloning should snapshot the iterator state — advancing the
+        // original must not affect the clone, and the clone must be
+        // able to walk the full sequence independently.
+        let opt1 = Options::IpV4Endpoint {
+            ip: Ipv4Addr::new(10, 0, 0, 1),
+            protocol: TransportProtocol::Udp,
+            port: 30490,
+        };
+        let opt2 = Options::IpV4Endpoint {
+            ip: Ipv4Addr::new(10, 0, 0, 2),
+            protocol: TransportProtocol::Udp,
+            port: 30491,
+        };
+        let mut buf = [0u8; 24];
+        let n1 = opt1.write(&mut &mut buf[..12]).unwrap();
+        let n2 = opt2.write(&mut &mut buf[12..24]).unwrap();
+        let total = n1 + n2;
+
+        let iter = OptionIter::new(&buf[..total]);
+        let clone = iter.clone();
+
+        // Walk the original: it should produce opt1 then opt2.
+        let mut walker = iter;
+        let a = walker.next().unwrap().to_owned().unwrap();
+        let b = walker.next().unwrap().to_owned().unwrap();
+        assert!(walker.next().is_none());
+        assert_eq!(a, opt1);
+        assert_eq!(b, opt2);
+
+        // The clone is untouched by the original's advance — it still
+        // starts from the beginning and yields both options.
+        let mut walker2 = clone;
+        let a2 = walker2.next().unwrap().to_owned().unwrap();
+        let b2 = walker2.next().unwrap().to_owned().unwrap();
+        assert!(walker2.next().is_none());
+        assert_eq!(a2, opt1);
+        assert_eq!(b2, opt2);
+    }
+
+    #[test]
+    fn option_iter_clone_mid_walk_preserves_position() {
+        // After partially walking the original iterator, cloning it
+        // should yield a new iterator that starts from the current
+        // position of the original — not from the beginning.
+        let opt1 = Options::IpV4Endpoint {
+            ip: Ipv4Addr::new(10, 0, 0, 1),
+            protocol: TransportProtocol::Udp,
+            port: 30490,
+        };
+        let opt2 = Options::IpV4Endpoint {
+            ip: Ipv4Addr::new(10, 0, 0, 2),
+            protocol: TransportProtocol::Udp,
+            port: 30491,
+        };
+        let mut buf = [0u8; 24];
+        let n1 = opt1.write(&mut &mut buf[..12]).unwrap();
+        let n2 = opt2.write(&mut &mut buf[12..24]).unwrap();
+        let total = n1 + n2;
+
+        let mut iter = OptionIter::new(&buf[..total]);
+        // Advance past opt1.
+        let _ = iter.next().unwrap();
+
+        // Clone from this mid-walk position; the clone should yield
+        // only opt2 (and then end).
+        let mut clone = iter.clone();
+        let remaining = clone.next().unwrap().to_owned().unwrap();
+        assert!(clone.next().is_none());
+        assert_eq!(remaining, opt2);
+    }
 }

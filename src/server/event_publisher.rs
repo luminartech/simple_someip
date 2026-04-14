@@ -449,4 +449,137 @@ mod tests {
 
         assert!(publisher.has_subscribers(0x5B, 1, 0x01).await);
     }
+
+    // ── register_subscriber / remove_subscriber ──────────────────────────
+    //
+    // These cover the externally-managed subscription path used by
+    // clients that drive SD through their own discovery socket and
+    // dispatch `SubscribeEventGroup` messages into an `EventPublisher`.
+
+    const ADDR_A: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9001);
+    const ADDR_B: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9002);
+    const ADDR_C: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9003);
+
+    #[tokio::test]
+    async fn register_subscriber_adds_to_manager() {
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
+
+        assert!(!publisher.has_subscribers(0x5B, 1, 0x01).await);
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        assert!(publisher.has_subscribers(0x5B, 1, 0x01).await);
+        assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
+    }
+
+    #[tokio::test]
+    async fn register_subscriber_is_idempotent_on_repeat() {
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
+
+        // Simulate TTL refreshes — the same (tuple, addr) called repeatedly
+        // must not grow the subscriber list.
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+
+        assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
+    }
+
+    #[tokio::test]
+    async fn register_subscriber_separates_different_eventgroups() {
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
+
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        publisher.register_subscriber(0x5B, 1, 0x02, ADDR_A).await;
+
+        assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
+        assert_eq!(publisher.subscriber_count(0x5B, 1, 0x02).await, 1);
+        assert!(publisher.has_subscribers(0x5B, 1, 0x01).await);
+        assert!(publisher.has_subscribers(0x5B, 1, 0x02).await);
+    }
+
+    #[tokio::test]
+    async fn remove_subscriber_happy_path() {
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
+
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        assert!(publisher.has_subscribers(0x5B, 1, 0x01).await);
+
+        publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        assert!(!publisher.has_subscribers(0x5B, 1, 0x01).await);
+        assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 0);
+    }
+
+    #[tokio::test]
+    async fn remove_subscriber_leaves_siblings_alone() {
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
+
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_B).await;
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_C).await;
+        assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 3);
+
+        publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_B).await;
+        assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 2);
+
+        // The remaining two are still in the list.
+        let mgr = subscriptions.read().await;
+        let subscribers = mgr.get_subscribers(0x5B, 1, 0x01);
+        let addrs: Vec<_> = subscribers.iter().map(|s| s.address).collect();
+        assert!(addrs.contains(&ADDR_A));
+        assert!(addrs.contains(&ADDR_C));
+        assert!(!addrs.contains(&ADDR_B));
+    }
+
+    #[tokio::test]
+    async fn remove_subscriber_nonexistent_is_noop() {
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
+
+        // Remove from an empty manager.
+        publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 0);
+
+        // Register one subscriber, then remove a different address.
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_B).await;
+        assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
+
+        // Remove with wrong service_id is also a no-op.
+        publisher.remove_subscriber(0x99, 1, 0x01, ADDR_A).await;
+        assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
+    }
+
+    #[tokio::test]
+    async fn remove_subscriber_all_then_has_subscribers_false() {
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
+
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_B).await;
+        assert!(publisher.has_subscribers(0x5B, 1, 0x01).await);
+
+        publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        assert!(publisher.has_subscribers(0x5B, 1, 0x01).await);
+
+        publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_B).await;
+        assert!(!publisher.has_subscribers(0x5B, 1, 0x01).await);
+    }
+
+    #[tokio::test]
+    async fn register_and_remove_roundtrip_preserves_idempotence() {
+        // Register → remove → register again should end with exactly one
+        // subscriber; the remove in the middle should not leave ghost state.
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
+
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+
+        assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
+    }
 }
