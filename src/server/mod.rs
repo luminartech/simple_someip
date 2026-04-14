@@ -153,6 +153,71 @@ impl Server {
         })
     }
 
+    /// Create a passive SOME/IP server.
+    ///
+    /// A passive server binds its unicast socket at `config.local_port` as
+    /// usual (so `publish_raw_event` has a real source port matching the
+    /// endpoint advertised in external `OfferService` messages), but binds
+    /// its SD socket to an ephemeral port instead of the SOME/IP SD port
+    /// (30490). The passive server is therefore **not** part of the
+    /// `SO_REUSEPORT` group at 30490, and the kernel will never deliver SD
+    /// traffic destined for 30490 to it.
+    ///
+    /// Passive servers are intended for use with an external SD dispatcher
+    /// (for example, a `Client` whose discovery socket receives all
+    /// incoming `SubscribeEventGroup` / `FindService` messages and routes
+    /// them to the right `EventPublisher` via
+    /// [`EventPublisher::register_subscriber`]). Do **not** call
+    /// [`Server::start_announcing`] or spawn [`Server::run`] on a passive
+    /// server — the external dispatcher owns those responsibilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding either socket fails.
+    pub async fn new_passive(config: ServerConfig) -> Result<Self, Error> {
+        // Bind unicast socket at the configured local_port — the passive
+        // server still needs a real source port so published events appear
+        // to come from the endpoint advertised in the external OfferService.
+        let unicast_addr = SocketAddrV4::new(config.interface, config.local_port);
+        let unicast_socket = Arc::new(UdpSocket::bind(unicast_addr).await?);
+        tracing::info!(
+            "Passive server bound to {} for service 0x{:04X}",
+            unicast_addr,
+            config.service_id
+        );
+
+        // Bind a placeholder SD socket on an ephemeral port. Nothing will
+        // route to it (neither multicast nor unicast on 30490), and neither
+        // `start_announcing` nor `run` should be called for a passive
+        // server. We still allocate it so the `Server` struct shape is
+        // identical to the full-server path.
+        let sd_placeholder_addr =
+            std::net::SocketAddr::new(IpAddr::V4(config.interface), 0);
+        let sd_socket = UdpSocket::bind(sd_placeholder_addr).await?;
+        tracing::debug!(
+            "Passive server SD placeholder socket bound to {} (not in SD reuseport group)",
+            sd_socket.local_addr()?
+        );
+
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
+        let publisher = Arc::new(EventPublisher::new(
+            Arc::clone(&subscriptions),
+            Arc::clone(&unicast_socket),
+            Arc::clone(&e2e_registry),
+        ));
+
+        Ok(Self {
+            config,
+            unicast_socket,
+            sd_socket: Arc::new(sd_socket),
+            subscriptions,
+            publisher,
+            sd_session_id: Arc::new(AtomicU16::new(1)),
+            e2e_registry,
+        })
+    }
+
     /// Start announcing the service via Service Discovery
     ///
     /// This sends periodic `OfferService` messages to the SD multicast group
@@ -467,7 +532,7 @@ impl Server {
                         entry_view.event_group_id()
                     );
 
-                    // Check if this is for our service
+                    // Check if this is for our service.
                     if entry_view.service_id() != self.config.service_id {
                         tracing::warn!(
                             "Subscribe for wrong service: expected 0x{:04X}, got 0x{:04X}",
@@ -489,9 +554,13 @@ impl Server {
                         )
                         .await?;
                     } else {
-                        // Extract subscriber endpoint from options
+                        // Extract subscriber endpoint from the option referenced
+                        // by this entry's index_first_options_run, not just the
+                        // first option in the header (which may belong to a
+                        // different entry in a combined SD message).
+                        let option_index = entry_view.index_first_options_run() as usize;
                         if let Some(endpoint_addr) =
-                            Self::extract_endpoint_from_views(sd_view.options())
+                            Self::extract_endpoint_at_index(sd_view.options(), option_index)
                         {
                             let mut subs = self.subscriptions.write().await;
                             subs.subscribe(
@@ -542,18 +611,29 @@ impl Server {
         Ok(())
     }
 
-    /// Extract endpoint address from SD option views
-    fn extract_endpoint_from_views(options: sd::OptionIter<'_>) -> Option<SocketAddrV4> {
-        for option_view in options {
-            if let Ok(sd::OptionType::IpV4Endpoint) = option_view.option_type()
-                && let Ok((ip, _, port)) = option_view.as_ipv4()
-            {
-                tracing::trace!("Found IPv4 endpoint: {}:{}", ip, port);
-                return Some(SocketAddrV4::new(ip, port));
-            }
+    /// Extract endpoint address from the SD option at a specific index.
+    ///
+    /// Each SD entry references its options via `index_first_options_run`.
+    /// In combined SD messages (e.g. OfferService + SubscribeEventGroup),
+    /// different entries reference different options — so we must use the
+    /// entry's index rather than blindly taking the first option.
+    fn extract_endpoint_at_index(
+        options: sd::OptionIter<'_>,
+        index: usize,
+    ) -> Option<SocketAddrV4> {
+        let option_view = options.into_iter().nth(index)?;
+        if let Ok(sd::OptionType::IpV4Endpoint) = option_view.option_type()
+            && let Ok((ip, _, port)) = option_view.as_ipv4()
+        {
+            tracing::trace!("Found IPv4 endpoint at index {}: {}:{}", index, ip, port);
+            Some(SocketAddrV4::new(ip, port))
+        } else {
+            tracing::warn!(
+                "Option at index {} is not an IPv4 endpoint",
+                index
+            );
+            None
         }
-        tracing::warn!("No IPv4 endpoint found in options");
-        None
     }
 
     /// Send `SubscribeAck` from an entry view

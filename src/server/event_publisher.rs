@@ -218,6 +218,22 @@ impl EventPublisher {
             .is_empty()
     }
 
+    /// Register a subscriber for an event group.
+    ///
+    /// This is useful when subscription handling is managed externally
+    /// (e.g., by a client that shares the SD socket) rather than by the
+    /// server's own `run()` loop.
+    pub async fn register_subscriber(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+        subscriber_addr: std::net::SocketAddrV4,
+    ) {
+        let mut mgr = self.subscriptions.write().await;
+        mgr.subscribe(service_id, instance_id, event_group_id, subscriber_addr);
+    }
+
     /// Get the current number of subscribers for a specific event group
     pub async fn subscriber_count(
         &self,
