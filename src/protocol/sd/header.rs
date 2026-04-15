@@ -53,12 +53,14 @@ impl<'a> SdHeaderView<'a> {
     /// - Buffer has enough data for flags + `entries_size` + entries + `options_size` + options
     /// - `entries_size` is a multiple of `ENTRY_SIZE` (16)
     /// - All entry type bytes are valid
-    /// - All options have valid types and lengths
+    /// - All options have valid types and lengths, and IP-bearing options have a
+    ///   recognized transport protocol byte
     ///
     /// # Errors
     ///
     /// Returns an error if the buffer is too short, `entries_size` is not a multiple of 16,
-    /// any entry type byte is invalid, or any option has an invalid type or length.
+    /// any entry type byte is invalid, or any option has an invalid type, length, or
+    /// transport protocol byte.
     pub fn parse(buf: &'a [u8]) -> Result<Self, crate::protocol::Error> {
         // Minimum: 4 (flags+reserved) + 4 (entries_size) + 4 (options_size) = 12
         if buf.len() < 12 {
@@ -183,22 +185,26 @@ mod tests {
     use super::*;
     use crate::{
         protocol::sd::{
-            Error as SdError, EventGroupEntry, OptionsCount, ServiceEntry, TransportProtocol,
+            Error as SdError, EventGroupEntry, OptionType, OptionsCount, ServiceEntry,
+            TransportProtocol,
+            options::{
+                IPV4_OPTION_IP_OFFSET, IPV4_OPTION_LENGTH_FIELD, IPV4_OPTION_PORT_OFFSET,
+                IPV4_OPTION_PROTOCOL_OFFSET, IPV4_OPTION_WIRE_SIZE,
+            },
         },
         traits::WireFormat,
     };
 
-    fn ipv4_endpoint_bytes(ip: [u8; 4], protocol: u8, port: u16) -> [u8; 12] {
-        let mut b = [0u8; 12];
-        b[0] = 0x00;
-        b[1] = 0x09; // length = 9 (size - 3)
-        b[2] = 0x04; // type = IpV4Endpoint
-        b[3] = 0x00; // discard flag = 0
-        b[4..8].copy_from_slice(&ip);
-        b[8] = 0x00; // reserved
-        b[9] = protocol;
-        b[10] = (port >> 8) as u8;
-        b[11] = (port & 0xFF) as u8;
+    fn ipv4_endpoint_bytes(ip: [u8; 4], protocol: u8, port: u16) -> [u8; IPV4_OPTION_WIRE_SIZE] {
+        let mut b = [0u8; IPV4_OPTION_WIRE_SIZE];
+        b[0..2].copy_from_slice(&IPV4_OPTION_LENGTH_FIELD.to_be_bytes());
+        b[2] = u8::from(OptionType::IpV4Endpoint);
+        // b[3] is the discard flag (0).
+        b[IPV4_OPTION_IP_OFFSET..IPV4_OPTION_IP_OFFSET + 4].copy_from_slice(&ip);
+        // b[IPV4_OPTION_IP_OFFSET + 4] is reserved (0).
+        b[IPV4_OPTION_PROTOCOL_OFFSET] = protocol;
+        b[IPV4_OPTION_PORT_OFFSET..IPV4_OPTION_PORT_OFFSET + 2]
+            .copy_from_slice(&port.to_be_bytes());
         b
     }
 
@@ -346,6 +352,27 @@ mod tests {
         assert!(matches!(
             SdHeaderView::parse(&buf),
             Err(crate::protocol::Error::Sd(SdError::IncorrectEntriesSize(5)))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_ipv4_option_with_invalid_transport_protocol() {
+        // An IPv4 endpoint option with an otherwise-valid wire layout but a
+        // transport protocol byte that is neither UDP (0x11) nor TCP (0x06)
+        // must be rejected by parse, so downstream `as_ipv4()` calls cannot
+        // observe a bad protocol byte at walk time.
+        const SD_HEADER_PREFIX_SIZE: usize = 12;
+        let options_size = u32::try_from(IPV4_OPTION_WIRE_SIZE).expect("wire size fits u32");
+        let prefix = raw_header(0, options_size);
+        let option = ipv4_endpoint_bytes([10, 0, 0, 1], 0xAB, 30490);
+        let mut buf = [0u8; SD_HEADER_PREFIX_SIZE + IPV4_OPTION_WIRE_SIZE];
+        buf[..SD_HEADER_PREFIX_SIZE].copy_from_slice(&prefix);
+        buf[SD_HEADER_PREFIX_SIZE..].copy_from_slice(&option);
+        assert!(matches!(
+            SdHeaderView::parse(&buf),
+            Err(crate::protocol::Error::Sd(
+                SdError::InvalidOptionTransportProtocol(0xAB)
+            ))
         ));
     }
 }

@@ -20,6 +20,7 @@ use crate::e2e::{E2EKey, E2EProfile, E2ERegistry};
 use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
 use core::sync::atomic::Ordering;
 use std::{
+    format,
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
     sync::{Arc, Mutex, atomic::AtomicU16},
     vec,
@@ -77,6 +78,12 @@ pub struct Server {
     sd_session_id: Arc<AtomicU16>,
     /// Shared E2E registry for runtime E2E configuration
     e2e_registry: Arc<Mutex<E2ERegistry>>,
+    /// `true` if this server was constructed via [`Server::new_passive`].
+    /// Passive servers have no real SD socket bound to port 30490; their
+    /// SD handling is managed externally. Calling [`Self::start_announcing`]
+    /// or [`Self::run`] on a passive server is a programming error and
+    /// returns an [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`].
+    is_passive: bool,
 }
 
 impl Server {
@@ -150,6 +157,76 @@ impl Server {
             publisher,
             sd_session_id: Arc::new(AtomicU16::new(1)),
             e2e_registry,
+            is_passive: false,
+        })
+    }
+
+    /// Create a passive SOME/IP server.
+    ///
+    /// A passive server binds its unicast socket at `config.local_port` as
+    /// usual (so `publish_raw_event` has a real source port matching the
+    /// endpoint advertised in external `OfferService` messages), but binds
+    /// its SD socket to an ephemeral port instead of the SOME/IP SD port
+    /// (30490). The passive server is therefore **not** part of the
+    /// `SO_REUSEPORT` group at 30490, and the kernel will never deliver SD
+    /// traffic destined for 30490 to it.
+    ///
+    /// Passive servers are intended for use with an external SD dispatcher
+    /// (for example, a `Client` whose discovery socket receives all
+    /// incoming `SubscribeEventGroup` / `FindService` messages and routes
+    /// them to the right `EventPublisher` via
+    /// [`EventPublisher::register_subscriber`]). Do **not** call
+    /// [`Server::start_announcing`] or spawn [`Server::run`] on a passive
+    /// server — the external dispatcher owns those responsibilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding either socket fails.
+    pub async fn new_passive(config: ServerConfig) -> Result<Self, Error> {
+        // Bind unicast socket at the configured local_port — the passive
+        // server still needs a real source port so published events appear
+        // to come from the endpoint advertised in the external OfferService.
+        let unicast_addr = SocketAddrV4::new(config.interface, config.local_port);
+        let unicast_socket = Arc::new(UdpSocket::bind(unicast_addr).await?);
+        tracing::info!(
+            "Passive server bound to {} for service 0x{:04X}",
+            unicast_addr,
+            config.service_id
+        );
+
+        // Bind a placeholder SD socket on an ephemeral port. Nothing will
+        // route to it (neither multicast nor unicast on 30490), and neither
+        // `start_announcing` nor `run` should be called for a passive
+        // server. We still allocate it so the `Server` struct shape is
+        // identical to the full-server path.
+        let sd_placeholder_addr = std::net::SocketAddr::new(IpAddr::V4(config.interface), 0);
+        let sd_socket = UdpSocket::bind(sd_placeholder_addr).await?;
+        // Log the bound address using `Debug` on the `Result<SocketAddr>`
+        // so a hypothetical `local_addr` failure does not propagate as a
+        // construction error and we do not introduce an unreachable Err
+        // arm purely for defensive logging.
+        tracing::info!(
+            "Passive server SD placeholder socket bound to {:?} (not in SD reuseport group)",
+            sd_socket.local_addr()
+        );
+
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
+        let publisher = Arc::new(EventPublisher::new(
+            Arc::clone(&subscriptions),
+            Arc::clone(&unicast_socket),
+            Arc::clone(&e2e_registry),
+        ));
+
+        Ok(Self {
+            config,
+            unicast_socket,
+            sd_socket: Arc::new(sd_socket),
+            subscriptions,
+            publisher,
+            sd_session_id: Arc::new(AtomicU16::new(1)),
+            e2e_registry,
+            is_passive: true,
         })
     }
 
@@ -159,8 +236,25 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// Currently always returns `Ok(())`; SD send failures are logged internally.
+    /// Returns [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`] if
+    /// called on a server constructed via [`Server::new_passive`] — passive
+    /// servers have no real SD socket bound to port 30490, so any
+    /// announcements would go out with an incorrect source port.
+    ///
+    /// Otherwise currently always returns `Ok(())`; SD send failures are
+    /// logged internally.
     pub fn start_announcing(&self) -> Result<(), Error> {
+        if self.is_passive {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "start_announcing called on passive Server for service 0x{:04X}; \
+                     announcements must be driven externally (e.g. via \
+                     `simple_someip::Client::start_sd_announcements`)",
+                    self.config.service_id
+                ),
+            )));
+        }
         let config = self.config.clone();
         let sd_socket = Arc::clone(&self.sd_socket);
         let sd_session_id = Arc::clone(&self.sd_session_id);
@@ -386,9 +480,28 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// Returns an error if receiving from a socket fails or handling an SD message fails.
+    /// Returns [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`] if
+    /// called on a server constructed via [`Server::new_passive`] — passive
+    /// servers have no real SD socket to read from, so the run loop would
+    /// block forever on the ephemeral placeholder socket.
+    ///
+    /// Otherwise returns an error if receiving from a socket fails or
+    /// handling an SD message fails.
     pub async fn run(&mut self) -> Result<(), Error> {
         use crate::protocol::MessageView;
+
+        if self.is_passive {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "run called on passive Server for service 0x{:04X}; \
+                     SD receive must be driven externally (e.g. via the \
+                     Client's discovery socket, routing Subscribes to \
+                     `EventPublisher::register_subscriber`)",
+                    self.config.service_id
+                ),
+            )));
+        }
 
         let mut unicast_buf = vec![0u8; 65535];
         let mut sd_buf = vec![0u8; 65535];
@@ -467,7 +580,7 @@ impl Server {
                         entry_view.event_group_id()
                     );
 
-                    // Check if this is for our service
+                    // Check if this is for our service.
                     if entry_view.service_id() != self.config.service_id {
                         tracing::warn!(
                             "Subscribe for wrong service: expected 0x{:04X}, got 0x{:04X}",
@@ -489,10 +602,23 @@ impl Server {
                         )
                         .await?;
                     } else {
-                        // Extract subscriber endpoint from options
-                        if let Some(endpoint_addr) =
-                            Self::extract_endpoint_from_views(sd_view.options())
-                        {
+                        // Extract the subscriber endpoint from the entry's
+                        // own options run. Each SD entry describes two runs
+                        // of options via `(index_first_options_run,
+                        // first_options_count)` and the symmetric second
+                        // pair; we walk both runs, collect every
+                        // `IpV4Endpoint` option in them, and take the first.
+                        let first_index = entry_view.index_first_options_run() as usize;
+                        let first_count = entry_view.options_count().first_options_count as usize;
+                        let second_index = entry_view.index_second_options_run() as usize;
+                        let second_count = entry_view.options_count().second_options_count as usize;
+                        if let Some(endpoint_addr) = Self::extract_subscriber_endpoint(
+                            &sd_view.options(),
+                            first_index,
+                            first_count,
+                            second_index,
+                            second_count,
+                        ) {
                             let mut subs = self.subscriptions.write().await;
                             subs.subscribe(
                                 entry_view.service_id(),
@@ -542,18 +668,91 @@ impl Server {
         Ok(())
     }
 
-    /// Extract endpoint address from SD option views
-    fn extract_endpoint_from_views(options: sd::OptionIter<'_>) -> Option<SocketAddrV4> {
-        for option_view in options {
-            if let Ok(sd::OptionType::IpV4Endpoint) = option_view.option_type()
-                && let Ok((ip, _, port)) = option_view.as_ipv4()
-            {
-                tracing::trace!("Found IPv4 endpoint: {}:{}", ip, port);
-                return Some(SocketAddrV4::new(ip, port));
+    /// Extract a single subscriber endpoint from the options runs
+    /// associated with an SD entry.
+    ///
+    /// Each SD entry owns up to two options runs. A run is a contiguous
+    /// slice of the options array starting at `index_*_options_run` with
+    /// `*_options_count` entries. This helper walks both runs, collects
+    /// every `IpV4Endpoint` option it finds, returns the first, and logs
+    /// a `warn!` if more than one endpoint is present (we do not yet
+    /// support multi-endpoint subscribers — e.g. TCP+UDP — and will pick
+    /// an arbitrary one).
+    ///
+    /// Returns `None` if no `IpV4Endpoint` is found in either run.
+    fn extract_subscriber_endpoint(
+        options: &sd::OptionIter<'_>,
+        first_index: usize,
+        first_count: usize,
+        second_index: usize,
+        second_count: usize,
+    ) -> Option<SocketAddrV4> {
+        // Walk each run by cloning the iterator — `OptionIter` is a
+        // cheap view over borrowed bytes so `clone` is free. Taking
+        // `options` by reference lets the caller keep ownership and
+        // keeps the clippy `needless_pass_by_value` lint quiet.
+        //
+        // We only ever return the first `IpV4Endpoint` found, so rather
+        // than collect into a `Vec` (heap alloc on every Subscribe) we
+        // track the first hit in an `Option` and keep a count so the
+        // multi-endpoint warn path still reports how many additional
+        // endpoints were present. This keeps the SD receive loop
+        // allocation-free on the happy path.
+        let mut first_endpoint: Option<SocketAddrV4> = None;
+        let mut endpoint_count: usize = 0;
+        let mut ignored_other: usize = 0;
+
+        let mut walk_run = |index: usize, count: usize| {
+            if count == 0 {
+                return;
+            }
+            for option_view in options.clone().skip(index).take(count) {
+                match option_view.option_type() {
+                    Ok(sd::OptionType::IpV4Endpoint) => {
+                        if let Ok((ip, _, port)) = option_view.as_ipv4() {
+                            endpoint_count += 1;
+                            if first_endpoint.is_none() {
+                                first_endpoint = Some(SocketAddrV4::new(ip, port));
+                            }
+                        }
+                    }
+                    Ok(_) | Err(_) => ignored_other += 1,
+                }
+            }
+        };
+
+        walk_run(first_index, first_count);
+        walk_run(second_index, second_count);
+
+        match endpoint_count {
+            0 => {
+                tracing::warn!(
+                    "No IPv4 endpoint in options runs \
+                     (first: idx={first_index}, count={first_count}; \
+                     second: idx={second_index}, count={second_count}; \
+                     ignored={ignored_other})"
+                );
+                None
+            }
+            1 => {
+                // Unwrap is safe: count == 1 implies we set `first_endpoint`.
+                let ep = first_endpoint.expect("endpoint_count=1 implies first_endpoint is Some");
+                tracing::trace!("Found IPv4 endpoint {}", ep);
+                Some(ep)
+            }
+            n => {
+                let ep = first_endpoint.expect("endpoint_count>=1 implies first_endpoint is Some");
+                tracing::warn!(
+                    "{} IPv4 endpoints found in subscribe options runs; \
+                     using first ({}) and ignoring {} additional. \
+                     Multi-endpoint (e.g. TCP+UDP) subscribers are not yet supported.",
+                    n,
+                    ep,
+                    n - 1
+                );
+                Some(ep)
             }
         }
-        tracing::warn!("No IPv4 endpoint found in options");
-        None
     }
 
     /// Send `SubscribeAck` from an entry view
@@ -1320,5 +1519,579 @@ mod tests {
         assert!(ttl > 0, "Expected ACK (TTL > 0), got TTL={}", ttl);
 
         server_handle.await.unwrap();
+    }
+
+    // ── extract_subscriber_endpoint ──────────────────────────────────────
+    //
+    // These tests cover the helper that walks an entry's first/second
+    // options runs and returns the first IPv4 endpoint. They use
+    // `sd::Options::IpV4Endpoint::write` to build wire bytes directly
+    // so we can precisely control what the options array looks like and
+    // what indices the entry references.
+
+    /// Serialize one `IpV4Endpoint` option into the given buffer slot.
+    /// Returns the number of bytes written (always 12 for `IpV4Endpoint`).
+    fn write_ipv4_endpoint_option(
+        buf: &mut [u8],
+        ip: Ipv4Addr,
+        port: u16,
+        protocol: sd::TransportProtocol,
+    ) -> usize {
+        let opt = sd::Options::IpV4Endpoint { ip, protocol, port };
+        let mut slot = buf;
+        opt.write(&mut slot).unwrap()
+    }
+
+    fn write_load_balancing_option(buf: &mut [u8], priority: u16, weight: u16) -> usize {
+        let opt = sd::Options::LoadBalancing { priority, weight };
+        let mut slot = buf;
+        opt.write(&mut slot).unwrap()
+    }
+
+    /// Build a byte buffer holding `count` `IpV4Endpoint` options with
+    /// successive port numbers starting at `base_port`, and return the
+    /// total byte length.
+    fn fill_ipv4_endpoints(buf: &mut [u8], count: usize, base_port: u16) -> usize {
+        let mut offset = 0;
+        for i in 0..count {
+            let port_offset = u16::try_from(i).expect("test fixture count fits in u16");
+            let n = write_ipv4_endpoint_option(
+                &mut buf[offset..],
+                Ipv4Addr::new(10, 0, 0, 1),
+                base_port + port_offset,
+                sd::TransportProtocol::Udp,
+            );
+            offset += n;
+        }
+        offset
+    }
+
+    #[test]
+    fn extract_endpoint_single_option_first_run() {
+        let mut buf = [0u8; 64];
+        let total = fill_ipv4_endpoints(&mut buf, 1, 30000);
+        let iter = sd::OptionIter::new(&buf[..total]);
+
+        let got = Server::extract_subscriber_endpoint(&iter, 0, 1, 0, 0);
+        assert_eq!(
+            got,
+            Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30000))
+        );
+    }
+
+    #[test]
+    fn extract_endpoint_zero_options_in_both_runs_returns_none() {
+        let iter = sd::OptionIter::new(&[]);
+        assert_eq!(Server::extract_subscriber_endpoint(&iter, 0, 0, 0, 0), None);
+    }
+
+    #[test]
+    fn extract_endpoint_count_zero_with_nonzero_index_returns_none() {
+        // An entry with first_count = 0 at a non-zero index must not
+        // dereference anything, even if the options array has data past
+        // that index.
+        let mut buf = [0u8; 64];
+        let total = fill_ipv4_endpoints(&mut buf, 2, 30100);
+        let iter = sd::OptionIter::new(&buf[..total]);
+
+        assert_eq!(Server::extract_subscriber_endpoint(&iter, 1, 0, 0, 0), None);
+    }
+
+    #[test]
+    fn extract_endpoint_multi_option_first_run_returns_first() {
+        // Two IpV4Endpoint options in the first run. The helper should
+        // return the first and log a warning about the second. We just
+        // verify the return value here.
+        let mut buf = [0u8; 64];
+        let total = fill_ipv4_endpoints(&mut buf, 2, 30200);
+        let iter = sd::OptionIter::new(&buf[..total]);
+
+        let got = Server::extract_subscriber_endpoint(&iter, 0, 2, 0, 0);
+        assert_eq!(
+            got,
+            Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30200))
+        );
+    }
+
+    #[test]
+    fn extract_endpoint_split_across_first_and_second_runs() {
+        // Three options [A, B, C]. Entry references option A in the
+        // first run (first_index=0, first_count=1) and option C in the
+        // second run (second_index=2, second_count=1). We expect to
+        // pick A — the first run is walked first — and we also expect
+        // a multi-endpoint warning because the helper collects endpoints
+        // from BOTH runs without deduplication and sees two total.
+        let mut buf = [0u8; 96];
+        let total = fill_ipv4_endpoints(&mut buf, 3, 30300);
+        let iter = sd::OptionIter::new(&buf[..total]);
+
+        let got = Server::extract_subscriber_endpoint(&iter, 0, 1, 2, 1);
+        assert_eq!(
+            got,
+            Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30300))
+        );
+    }
+
+    #[test]
+    fn extract_endpoint_honors_first_index_offset() {
+        // Four options [A, B, C, D]. Entry references options starting
+        // at index 2 with count 1 — that's option C (port 30402).
+        let mut buf = [0u8; 128];
+        let total = fill_ipv4_endpoints(&mut buf, 4, 30400);
+        let iter = sd::OptionIter::new(&buf[..total]);
+
+        let got = Server::extract_subscriber_endpoint(&iter, 2, 1, 0, 0);
+        assert_eq!(
+            got,
+            Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30402))
+        );
+    }
+
+    #[test]
+    fn extract_endpoint_respects_first_count_cap() {
+        // If first_count=1 but there are more options after the starting
+        // index, we must NOT accidentally pick up the later ones.
+        let mut buf = [0u8; 128];
+        let total = fill_ipv4_endpoints(&mut buf, 4, 30500);
+        let iter = sd::OptionIter::new(&buf[..total]);
+
+        // Take only 1 option starting at index 1 -> port 30501.
+        let got = Server::extract_subscriber_endpoint(&iter, 1, 1, 0, 0);
+        assert_eq!(
+            got,
+            Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30501))
+        );
+    }
+
+    #[test]
+    fn extract_endpoint_skips_non_ipv4_options() {
+        // Build options = [LoadBalancing, IpV4Endpoint, LoadBalancing].
+        // Entry references all three in the first run. We must return
+        // the single IpV4Endpoint (at index 1) and skip the other two.
+        let mut buf = [0u8; 64];
+        let mut offset = 0;
+        offset += write_load_balancing_option(&mut buf[offset..], 1, 2);
+        offset += write_ipv4_endpoint_option(
+            &mut buf[offset..],
+            Ipv4Addr::new(10, 0, 0, 1),
+            30600,
+            sd::TransportProtocol::Udp,
+        );
+        offset += write_load_balancing_option(&mut buf[offset..], 3, 4);
+        let iter = sd::OptionIter::new(&buf[..offset]);
+
+        let got = Server::extract_subscriber_endpoint(&iter, 0, 3, 0, 0);
+        assert_eq!(
+            got,
+            Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30600))
+        );
+    }
+
+    #[test]
+    fn extract_endpoint_all_non_ipv4_returns_none() {
+        let mut buf = [0u8; 32];
+        let mut offset = 0;
+        offset += write_load_balancing_option(&mut buf[offset..], 1, 2);
+        offset += write_load_balancing_option(&mut buf[offset..], 3, 4);
+        let iter = sd::OptionIter::new(&buf[..offset]);
+
+        assert_eq!(Server::extract_subscriber_endpoint(&iter, 0, 2, 0, 0), None);
+    }
+
+    #[test]
+    fn extract_endpoint_second_run_only() {
+        // Two options, entry references only the second one via the
+        // second_options_run pair.
+        let mut buf = [0u8; 64];
+        let total = fill_ipv4_endpoints(&mut buf, 2, 30700);
+        let iter = sd::OptionIter::new(&buf[..total]);
+
+        let got = Server::extract_subscriber_endpoint(&iter, 0, 0, 1, 1);
+        assert_eq!(
+            got,
+            Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30701))
+        );
+    }
+
+    /// End-to-end regression: drive a real `Server::handle_sd_message` with
+    /// a single SD packet that carries *two* entries — an `OfferService`
+    /// referencing option index 0 and a `SubscribeEventGroup` referencing
+    /// option index 1 — where each option is a different
+    /// `IpV4Endpoint`. The subscription recorded by the server must use the
+    /// Subscribe entry's endpoint (options[1]), not the first option in
+    /// the packet (options[0]).
+    ///
+    /// Before the `extract_subscriber_endpoint` fix, the server would
+    /// silently take options[0] for every subscribe and register the
+    /// wrong endpoint.
+    #[tokio::test]
+    async fn combined_sd_subscribe_uses_its_own_options_run() {
+        let (mut server, _port) = create_test_server(0x5B, 1).await;
+
+        let offer_endpoint_port: u16 = 40_111;
+        let subscribe_endpoint_port: u16 = 40_222;
+
+        // Entry 0: OfferService for (0x5B, instance 1) — references
+        // options[0] (the offer's own endpoint).
+        let offer_entry = Entry::OfferService(sd::ServiceEntry {
+            index_first_options_run: 0,
+            index_second_options_run: 0,
+            options_count: sd::OptionsCount::new(1, 0),
+            service_id: 0x5B,
+            instance_id: 1,
+            major_version: 1,
+            ttl: 3,
+            minor_version: 0,
+        });
+        // Entry 1: SubscribeEventGroup for (0x5B, instance 1, eg 0x01) —
+        // references options[1] (the subscriber's endpoint).
+        let subscribe_entry = Entry::SubscribeEventGroup(sd::EventGroupEntry {
+            index_first_options_run: 1,
+            index_second_options_run: 0,
+            options_count: sd::OptionsCount::new(1, 0),
+            service_id: 0x5B,
+            instance_id: 1,
+            major_version: 1,
+            ttl: 3,
+            counter: 0,
+            event_group_id: 0x0001,
+        });
+        let entries = [offer_entry, subscribe_entry];
+        let options = [
+            sd::Options::IpV4Endpoint {
+                ip: Ipv4Addr::LOCALHOST,
+                protocol: sd::TransportProtocol::Udp,
+                port: offer_endpoint_port,
+            },
+            sd::Options::IpV4Endpoint {
+                ip: Ipv4Addr::LOCALHOST,
+                protocol: sd::TransportProtocol::Udp,
+                port: subscribe_endpoint_port,
+            },
+        ];
+        let sd_header = sd::Header::new(sd::Flags::new_sd(false), &entries, &options);
+        let message = build_sd_message(&sd_header);
+
+        // Send the combined SD message to the server's SD socket from a
+        // fresh client socket and have the server handle exactly one
+        // datagram. We drive `handle_sd_message` directly rather than
+        // `server.run()` so we can assert state after the call.
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sd_addr = match server.sd_socket.local_addr().unwrap() {
+            std::net::SocketAddr::V4(v4) => v4,
+            std::net::SocketAddr::V6(_) => panic!("expected v4 sd socket"),
+        };
+        client_socket.send_to(&message, sd_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 65_535];
+        let (len, sender) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.sd_socket.recv_from(&mut buf),
+        )
+        .await
+        .expect("timeout receiving combined SD packet")
+        .unwrap();
+        let view = MessageView::parse(&buf[..len]).unwrap();
+        let sd_view = view.sd_header().unwrap();
+        server.handle_sd_message(&sd_view, sender).await.unwrap();
+
+        // The server must have registered exactly one subscriber, and
+        // its endpoint must be the SubscribeEventGroup entry's options[1]
+        // endpoint — NOT the OfferService entry's options[0] endpoint.
+        let subs = server.subscriptions.read().await;
+        let subscribers = subs.get_subscribers(0x5B, 1, 0x0001);
+        assert_eq!(
+            subscribers.len(),
+            1,
+            "combined SD packet must yield exactly one subscriber"
+        );
+        assert_eq!(
+            subscribers[0].address.port(),
+            subscribe_endpoint_port,
+            "subscription endpoint must come from the Subscribe entry's own \
+             options run (options[1]={subscribe_endpoint_port}), not from \
+             the Offer entry's options[0]={offer_endpoint_port}"
+        );
+        assert_ne!(
+            subscribers[0].address.port(),
+            offer_endpoint_port,
+            "regression: subscription picked up the OfferService endpoint \
+             instead of its own SubscribeEventGroup endpoint"
+        );
+    }
+
+    // ── Server::new_passive and passive misuse guards ───────────────────
+    //
+    // These tests cover the passive-server path added for clients that
+    // drive SD through a shared Client discovery socket rather than the
+    // Server's own SD socket.
+
+    /// Construct a passive server on loopback with an ephemeral unicast
+    /// port. Tests use this as a standard fixture.
+    async fn make_passive_server(service_id: u16, instance_id: u16) -> Server {
+        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, service_id, instance_id);
+        Server::new_passive(config)
+            .await
+            .expect("new_passive should succeed")
+    }
+
+    #[tokio::test]
+    async fn new_passive_unicast_bound_to_requested_port() {
+        let server = make_passive_server(0x005C, 0x0001).await;
+        let local = server.unicast_local_addr().unwrap();
+        match local {
+            std::net::SocketAddr::V4(v4) => {
+                assert_ne!(
+                    v4.port(),
+                    0,
+                    "kernel should assign an ephemeral port when local_port=0"
+                );
+            }
+            std::net::SocketAddr::V6(_) => panic!("expected IPv4 unicast address"),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_passive_sd_socket_is_not_bound_to_30490() {
+        // The whole point of a passive server is that its SD socket is
+        // NOT in the SO_REUSEPORT group at port 30490. We check directly
+        // against the internal `sd_socket` field since tests live in
+        // the same module.
+        let server = make_passive_server(0x005C, 0x0001).await;
+        let sd_addr = server.sd_socket.local_addr().unwrap();
+        match sd_addr {
+            std::net::SocketAddr::V4(v4) => {
+                assert_ne!(
+                    v4.port(),
+                    30490,
+                    "passive SD socket must not bind the SOME/IP SD port"
+                );
+            }
+            std::net::SocketAddr::V6(_) => panic!("expected IPv4 SD address"),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_passive_publisher_accepts_register_subscriber() {
+        // End-to-end: construct a passive server, get its publisher,
+        // register a subscriber via the external path, and verify the
+        // publisher sees it.
+        let server = make_passive_server(0x005C, 0x0001).await;
+        let publisher = server.publisher();
+
+        assert!(!publisher.has_subscribers(0x005C, 0x0001, 0x0001).await);
+
+        let subscriber = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 40_000);
+        publisher
+            .register_subscriber(0x005C, 0x0001, 0x0001, subscriber)
+            .await;
+
+        assert!(publisher.has_subscribers(0x005C, 0x0001, 0x0001).await);
+        assert_eq!(publisher.subscriber_count(0x005C, 0x0001, 0x0001).await, 1);
+
+        // Clean up via the symmetric API.
+        publisher
+            .remove_subscriber(0x005C, 0x0001, 0x0001, subscriber)
+            .await;
+        assert!(!publisher.has_subscribers(0x005C, 0x0001, 0x0001).await);
+    }
+
+    #[tokio::test]
+    async fn start_announcing_on_passive_returns_invalid_input() {
+        let server = make_passive_server(0x005C, 0x0001).await;
+        let err = server
+            .start_announcing()
+            .expect_err("start_announcing on a passive server must fail");
+        match err {
+            Error::Io(io_err) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidInput);
+                let msg = format!("{io_err}");
+                assert!(
+                    msg.contains("passive"),
+                    "error message should mention 'passive': {msg}"
+                );
+                assert!(
+                    msg.contains("0x005C"),
+                    "error message should include the service_id: {msg}"
+                );
+            }
+            other => panic!("expected Error::Io(InvalidInput), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_on_passive_returns_invalid_input() {
+        let mut server = make_passive_server(0x005C, 0x0001).await;
+        let err = server
+            .run()
+            .await
+            .expect_err("run on a passive server must fail");
+        match err {
+            Error::Io(io_err) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidInput);
+                let msg = format!("{io_err}");
+                assert!(
+                    msg.contains("passive"),
+                    "error message should mention 'passive': {msg}"
+                );
+                assert!(
+                    msg.contains("0x005C"),
+                    "error message should include the service_id: {msg}"
+                );
+            }
+            other => panic!("expected Error::Io(InvalidInput), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn start_announcing_on_regular_server_still_succeeds() {
+        // Regression guard: the new is_passive check must not break the
+        // standard non-passive path.
+        let (server, _port) = create_test_server(0x005C, 0x0001).await;
+        server
+            .start_announcing()
+            .expect("start_announcing on a regular server must still succeed");
+        // The announcer task runs forever; the test succeeds as soon as
+        // start_announcing returns Ok. The spawned task is cleaned up
+        // when the Tokio test runtime shuts down at the end of this
+        // test — `tokio::spawn` tasks are not aborted by dropping
+        // unrelated handles, they ride the runtime lifecycle.
+    }
+
+    #[tokio::test]
+    async fn new_passive_two_instances_do_not_fight_over_sd_port() {
+        // Two passive servers on the same interface must both construct
+        // successfully — they would collide if either tried to bind
+        // 30490, but since they each bind an ephemeral SD placeholder
+        // port, they stay out of each other's way.
+        let a = make_passive_server(0x005B, 0x0002).await;
+        let b = make_passive_server(0x005C, 0x0001).await;
+
+        let addr_a = a.sd_socket.local_addr().unwrap();
+        let addr_b = b.sd_socket.local_addr().unwrap();
+        // Different placeholder ports.
+        assert_ne!(addr_a, addr_b);
+        // And neither is 30490.
+        if let std::net::SocketAddr::V4(v4) = addr_a {
+            assert_ne!(v4.port(), 30490);
+        }
+        if let std::net::SocketAddr::V4(v4) = addr_b {
+            assert_ne!(v4.port(), 30490);
+        }
+    }
+
+    #[tokio::test]
+    async fn new_passive_returns_error_when_unicast_bind_fails() {
+        // Bind a unicast port first so the subsequent `new_passive` call
+        // collides on (interface, local_port) — covers the `?` error
+        // path on the unicast `UdpSocket::bind` inside `new_passive`.
+        let blocker = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("blocker bind should succeed");
+        let blocker_port = match blocker.local_addr().unwrap() {
+            std::net::SocketAddr::V4(v4) => v4.port(),
+            std::net::SocketAddr::V6(_) => panic!("expected IPv4"),
+        };
+
+        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, blocker_port, 0x005C, 0x0001);
+        let result = Server::new_passive(config).await;
+        let Err(err) = result else {
+            panic!("new_passive must fail when the unicast port is taken");
+        };
+        match err {
+            Error::Io(io_err) => {
+                assert!(
+                    matches!(
+                        io_err.kind(),
+                        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                    ),
+                    "expected AddrInUse or PermissionDenied, got {:?}",
+                    io_err.kind()
+                );
+            }
+            other => panic!("expected Error::Io, got {other:?}"),
+        }
+        drop(blocker);
+    }
+
+    #[tokio::test]
+    async fn new_passive_with_tracing_subscriber_evaluates_format_args() {
+        // Coverage helper: with no global tracing subscriber, `tracing::info!`
+        // and `tracing::debug!` short-circuit before evaluating their
+        // formatted arguments, leaving the format-arg lines in `new_passive`
+        // marked as uncovered. This test installs a max-level subscriber so
+        // the macros take their full format path and the arg-evaluation
+        // regions show as covered.
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::fmt;
+
+        let subscriber = fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_test_writer()
+            .finish();
+
+        let fut = async {
+            let _server = make_passive_server(0x00AA, 0x00BB).await;
+        };
+        // `with_default` only applies to the synchronous block where it is
+        // installed, so we drive the future to completion inside the block
+        // by repeatedly polling it on a manual executor — but the simplest
+        // approach is to use `block_on` of an inner runtime. Since we are
+        // already inside a tokio test, we instead spawn the work onto a
+        // thread that owns its own runtime.
+        let handle = std::thread::spawn(move || {
+            with_default(subscriber, || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(fut);
+            });
+        });
+        handle.join().expect("subscriber thread panicked");
+    }
+
+    #[test]
+    fn extract_subscriber_endpoint_with_tracing_evaluates_log_args() {
+        // Coverage helper: with no global tracing subscriber, the format
+        // args of the `warn!` (no endpoint, multi-endpoint) and `trace!`
+        // (single endpoint) macros inside `extract_subscriber_endpoint`
+        // are not evaluated and show as uncovered. This test installs a
+        // TRACE-level subscriber and exercises all three branches so the
+        // arg-evaluation regions become covered.
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::fmt;
+
+        let subscriber = fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_test_writer()
+            .finish();
+
+        with_default(subscriber, || {
+            // 0 endpoints → warn! "No IPv4 endpoint" branch.
+            let iter_empty = sd::OptionIter::new(&[]);
+            assert_eq!(
+                Server::extract_subscriber_endpoint(&iter_empty, 0, 0, 0, 0),
+                None
+            );
+
+            // 1 endpoint → trace! "Found IPv4 endpoint" branch.
+            let mut buf_one = [0u8; 32];
+            let len_one = fill_ipv4_endpoints(&mut buf_one, 1, 31000);
+            let iter_one = sd::OptionIter::new(&buf_one[..len_one]);
+            assert_eq!(
+                Server::extract_subscriber_endpoint(&iter_one, 0, 1, 0, 0),
+                Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 31000))
+            );
+
+            // n endpoints → warn! "{} IPv4 endpoints found" branch.
+            let mut buf_many = [0u8; 64];
+            let len_many = fill_ipv4_endpoints(&mut buf_many, 3, 31100);
+            let iter_many = sd::OptionIter::new(&buf_many[..len_many]);
+            assert_eq!(
+                Server::extract_subscriber_endpoint(&iter_many, 0, 3, 0, 0),
+                Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 31100))
+            );
+        });
     }
 }

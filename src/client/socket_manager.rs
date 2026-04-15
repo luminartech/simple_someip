@@ -78,6 +78,12 @@ where
         #[cfg(unix)]
         socket.set_reuse_port(true)?;
         socket.set_multicast_if_v4(&interface)?;
+        // Disable multicast loopback so this socket does not receive the
+        // SD messages it sends. Matches the Server's SD socket setup —
+        // otherwise a client that acts as both server and client (e.g.
+        // offering services via `start_sd_announcements`) will parse its
+        // own OfferService entries as peer offers.
+        socket.set_multicast_loop_v4(false)?;
         socket.bind(&bind_addr.into())?;
         socket.set_nonblocking(true)?;
         let socket: std::net::UdpSocket = socket.into();
