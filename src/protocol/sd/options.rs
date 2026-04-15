@@ -6,6 +6,60 @@ use crate::protocol::byte_order::WriteBytesExt;
 /// Maximum length of an SD configuration option string in bytes.
 pub const MAX_CONFIGURATION_STRING_LENGTH: usize = 256;
 
+// --- SD option wire-layout constants ---
+//
+// Every SD option begins with a 4-byte fixed header:
+//   [0..2]: length (u16 BE)        — value is `wire_size - OPTION_LENGTH_SIZE_DELTA`
+//   [2]:    option type (u8)
+//   [3]:    reserved/discard flag (u8)
+// Per-type payload follows starting at offset `OPTION_PAYLOAD_OFFSET`.
+
+/// Size of the fixed SD option header (length + type + discard flag).
+pub(crate) const OPTION_HEADER_SIZE: usize = 4;
+/// The SD option length field encodes `wire_size - OPTION_LENGTH_SIZE_DELTA`.
+pub(crate) const OPTION_LENGTH_SIZE_DELTA: usize = 3;
+/// Byte offset of the option type byte inside the fixed header.
+const OPTION_TYPE_OFFSET: usize = 2;
+/// Byte offset at which per-type payload begins.
+const OPTION_PAYLOAD_OFFSET: usize = 4;
+
+// IPv4 endpoint / multicast / SD options.
+/// Total wire size of an IPv4 endpoint/multicast/SD option.
+pub(crate) const IPV4_OPTION_WIRE_SIZE: usize = 12;
+/// Length-field value stored on the wire for an IPv4 option.
+pub(crate) const IPV4_OPTION_LENGTH_FIELD: u16 = 9;
+/// Byte offset of the 4-octet IPv4 address within the option.
+pub(crate) const IPV4_OPTION_IP_OFFSET: usize = OPTION_PAYLOAD_OFFSET;
+/// Byte offset of the transport protocol byte inside an IPv4 option.
+pub(crate) const IPV4_OPTION_PROTOCOL_OFFSET: usize = 9;
+/// Byte offset of the port (u16 BE) inside an IPv4 option.
+pub(crate) const IPV4_OPTION_PORT_OFFSET: usize = 10;
+
+// IPv6 endpoint / multicast / SD options.
+/// Total wire size of an IPv6 endpoint/multicast/SD option.
+pub(crate) const IPV6_OPTION_WIRE_SIZE: usize = 24;
+/// Length-field value stored on the wire for an IPv6 option.
+pub(crate) const IPV6_OPTION_LENGTH_FIELD: u16 = 21;
+/// Byte offset of the 16-octet IPv6 address within the option.
+const IPV6_OPTION_IP_OFFSET: usize = OPTION_PAYLOAD_OFFSET;
+/// Byte offset (exclusive) marking the end of the 16-octet IPv6 address.
+const IPV6_OPTION_IP_END: usize = IPV6_OPTION_IP_OFFSET + 16;
+/// Byte offset of the transport protocol byte inside an IPv6 option.
+pub(crate) const IPV6_OPTION_PROTOCOL_OFFSET: usize = 21;
+/// Byte offset of the port (u16 BE) inside an IPv6 option.
+const IPV6_OPTION_PORT_OFFSET: usize = 22;
+
+// Load-balancing option.
+/// Total wire size of a load-balancing option.
+const LOAD_BALANCING_OPTION_WIRE_SIZE: usize = 8;
+/// Length-field value stored on the wire for a load-balancing option.
+pub(crate) const LOAD_BALANCING_OPTION_LENGTH_FIELD: u16 = 5;
+
+// Configuration option.
+/// The configuration option's length field value is `1 + string_len`
+/// (the `+1` accounts for the trailing null terminator byte).
+const CONFIGURATION_OPTION_LENGTH_STRING_DELTA: u16 = 1;
+
 /// Transport protocol used in SD endpoint options.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TransportProtocol {
@@ -168,14 +222,14 @@ impl Options {
         match self {
             Options::Configuration {
                 configuration_string,
-            } => 4 + configuration_string.len(),
-            Options::LoadBalancing { .. } => 8,
+            } => OPTION_HEADER_SIZE + configuration_string.len(),
+            Options::LoadBalancing { .. } => LOAD_BALANCING_OPTION_WIRE_SIZE,
             Options::IpV4Endpoint { .. }
             | Options::IpV4Multicast { .. }
-            | Options::IpV4SD { .. } => 12,
+            | Options::IpV4SD { .. } => IPV4_OPTION_WIRE_SIZE,
             Options::IpV6Endpoint { .. }
             | Options::IpV6Multicast { .. }
-            | Options::IpV6SD { .. } => 24,
+            | Options::IpV6SD { .. } => IPV6_OPTION_WIRE_SIZE,
         }
     }
 
@@ -187,12 +241,15 @@ impl Options {
     ///
     /// # Panics
     ///
-    /// Panics if the option size minus 3 exceeds `u16::MAX` (unreachable in practice).
+    /// Panics if the option size minus [`OPTION_LENGTH_SIZE_DELTA`] exceeds `u16::MAX`
+    /// (unreachable in practice).
     pub fn write<T: embedded_io::Write>(
         &self,
         writer: &mut T,
     ) -> Result<usize, crate::protocol::Error> {
-        writer.write_u16_be(u16::try_from(self.size() - 3).expect("option size fits u16"))?;
+        writer.write_u16_be(
+            u16::try_from(self.size() - OPTION_LENGTH_SIZE_DELTA).expect("option size fits u16"),
+        )?;
         match self {
             Options::Configuration {
                 configuration_string,
@@ -207,7 +264,7 @@ impl Options {
                 writer.write_u8(0)?;
                 writer.write_u16_be(*priority)?;
                 writer.write_u16_be(*weight)?;
-                Ok(8)
+                Ok(LOAD_BALANCING_OPTION_WIRE_SIZE)
             }
             Options::IpV4Endpoint { ip, protocol, port } => {
                 write_ipv4_option(writer, OptionType::IpV4Endpoint, *ip, *protocol, *port)
@@ -244,7 +301,7 @@ fn write_ipv4_option<T: embedded_io::Write>(
     writer.write_u8(0)?;
     writer.write_u8(u8::from(protocol))?;
     writer.write_u16_be(port)?;
-    Ok(12)
+    Ok(IPV4_OPTION_WIRE_SIZE)
 }
 
 fn write_ipv6_option<T: embedded_io::Write>(
@@ -260,7 +317,7 @@ fn write_ipv6_option<T: embedded_io::Write>(
     writer.write_u8(0)?;
     writer.write_u8(u8::from(protocol))?;
     writer.write_u16_be(port)?;
-    Ok(24)
+    Ok(IPV6_OPTION_WIRE_SIZE)
 }
 
 /// Extract the first `IpV4Endpoint` address from a slice of owned options.
@@ -293,14 +350,14 @@ impl<'a> OptionView<'a> {
     ///
     /// Returns [`Error::InvalidOptionType`] if the type byte is unrecognized.
     pub fn option_type(&self) -> Result<OptionType, Error> {
-        OptionType::try_from(self.0[2])
+        OptionType::try_from(self.0[OPTION_TYPE_OFFSET])
     }
 
-    /// Total wire size of this option (length field value + 3).
+    /// Total wire size of this option (length field value + [`OPTION_LENGTH_SIZE_DELTA`]).
     #[must_use]
     pub fn wire_size(&self) -> usize {
         let length = u16::from_be_bytes([self.0[0], self.0[1]]);
-        usize::from(length) + 3
+        usize::from(length) + OPTION_LENGTH_SIZE_DELTA
     }
 
     /// Parse as IPv4 endpoint/multicast/SD option.
@@ -309,13 +366,22 @@ impl<'a> OptionView<'a> {
     /// # Errors
     ///
     /// Returns [`Error::InvalidOptionTransportProtocol`] if the protocol byte is unrecognized.
+    /// Views obtained via [`SdHeaderView::parse`](super::SdHeaderView::parse) have already
+    /// had their protocol byte validated, so this error cannot occur for those callers —
+    /// it is retained only to keep the API usable if an `OptionView` is ever constructed
+    /// outside the validated parse path.
     pub fn as_ipv4(&self) -> Result<(Ipv4Addr, TransportProtocol, u16), Error> {
         let ip = Ipv4Addr::from_bits(u32::from_be_bytes([
-            self.0[4], self.0[5], self.0[6], self.0[7],
+            self.0[IPV4_OPTION_IP_OFFSET],
+            self.0[IPV4_OPTION_IP_OFFSET + 1],
+            self.0[IPV4_OPTION_IP_OFFSET + 2],
+            self.0[IPV4_OPTION_IP_OFFSET + 3],
         ]));
-        // [8] is reserved
-        let protocol = TransportProtocol::try_from(self.0[9])?;
-        let port = u16::from_be_bytes([self.0[10], self.0[11]]);
+        let protocol = TransportProtocol::try_from(self.0[IPV4_OPTION_PROTOCOL_OFFSET])?;
+        let port = u16::from_be_bytes([
+            self.0[IPV4_OPTION_PORT_OFFSET],
+            self.0[IPV4_OPTION_PORT_OFFSET + 1],
+        ]);
         Ok((ip, protocol, port))
     }
 
@@ -325,13 +391,19 @@ impl<'a> OptionView<'a> {
     /// # Errors
     ///
     /// Returns [`Error::InvalidOptionTransportProtocol`] if the protocol byte is unrecognized.
+    /// Views obtained via [`SdHeaderView::parse`](super::SdHeaderView::parse) have already
+    /// had their protocol byte validated, so this error cannot occur for those callers —
+    /// it is retained only to keep the API usable if an `OptionView` is ever constructed
+    /// outside the validated parse path.
     pub fn as_ipv6(&self) -> Result<(Ipv6Addr, TransportProtocol, u16), Error> {
         let mut octets = [0u8; 16];
-        octets.copy_from_slice(&self.0[4..20]);
+        octets.copy_from_slice(&self.0[IPV6_OPTION_IP_OFFSET..IPV6_OPTION_IP_END]);
         let ip = Ipv6Addr::from(octets);
-        // [20] is reserved
-        let protocol = TransportProtocol::try_from(self.0[21])?;
-        let port = u16::from_be_bytes([self.0[22], self.0[23]]);
+        let protocol = TransportProtocol::try_from(self.0[IPV6_OPTION_PROTOCOL_OFFSET])?;
+        let port = u16::from_be_bytes([
+            self.0[IPV6_OPTION_PORT_OFFSET],
+            self.0[IPV6_OPTION_PORT_OFFSET + 1],
+        ]);
         Ok((ip, protocol, port))
     }
 
@@ -339,8 +411,8 @@ impl<'a> OptionView<'a> {
     #[must_use]
     pub fn configuration_bytes(&self) -> &'a [u8] {
         let length = u16::from_be_bytes([self.0[0], self.0[1]]);
-        let string_len = length.saturating_sub(1);
-        &self.0[4..4 + usize::from(string_len)]
+        let string_len = length.saturating_sub(CONFIGURATION_OPTION_LENGTH_STRING_DELTA);
+        &self.0[OPTION_PAYLOAD_OFFSET..OPTION_PAYLOAD_OFFSET + usize::from(string_len)]
     }
 
     /// Parse as load-balancing option. Returns `(priority, weight)`.
@@ -349,8 +421,14 @@ impl<'a> OptionView<'a> {
     ///
     /// Currently always succeeds; the `Result` return type is reserved for future validation.
     pub fn as_load_balancing(&self) -> Result<(u16, u16), Error> {
-        let priority = u16::from_be_bytes([self.0[4], self.0[5]]);
-        let weight = u16::from_be_bytes([self.0[6], self.0[7]]);
+        let priority = u16::from_be_bytes([
+            self.0[OPTION_PAYLOAD_OFFSET],
+            self.0[OPTION_PAYLOAD_OFFSET + 1],
+        ]);
+        let weight = u16::from_be_bytes([
+            self.0[OPTION_PAYLOAD_OFFSET + 2],
+            self.0[OPTION_PAYLOAD_OFFSET + 3],
+        ]);
         Ok((priority, weight))
     }
 
@@ -441,11 +519,11 @@ impl<'a> Iterator for OptionIter<'a> {
     type Item = OptionView<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining.len() < 4 {
+        if self.remaining.len() < OPTION_HEADER_SIZE {
             return None;
         }
         let length = u16::from_be_bytes([self.remaining[0], self.remaining[1]]);
-        let wire_size = usize::from(length) + 3;
+        let wire_size = usize::from(length) + OPTION_LENGTH_SIZE_DELTA;
         if wire_size > self.remaining.len() {
             return None;
         }
@@ -457,48 +535,56 @@ impl<'a> Iterator for OptionIter<'a> {
 
 /// Validate a single option's wire format and return its wire size.
 /// Used during `SdHeaderView::parse` for upfront validation.
+///
+/// In addition to length/type checks, this validates the transport protocol
+/// byte of IP-bearing options so that `OptionView::as_ipv4` / `as_ipv6` on
+/// views obtained through `SdHeaderView::parse` cannot observe an unknown
+/// protocol byte.
 pub(crate) fn validate_option(buf: &[u8]) -> Result<usize, Error> {
-    if buf.len() < 4 {
+    if buf.len() < OPTION_HEADER_SIZE {
         return Err(Error::IncorrectOptionsSize(buf.len()));
     }
     let length = u16::from_be_bytes([buf[0], buf[1]]);
-    let wire_size = usize::from(length) + 3;
+    let wire_size = usize::from(length) + OPTION_LENGTH_SIZE_DELTA;
     if wire_size > buf.len() {
         return Err(Error::IncorrectOptionsSize(buf.len()));
     }
-    let option_type = OptionType::try_from(buf[2])?;
+    let option_type_byte = buf[OPTION_TYPE_OFFSET];
+    let option_type = OptionType::try_from(option_type_byte)?;
     // Validate expected lengths for fixed-size options
     match option_type {
         OptionType::IpV4Endpoint | OptionType::IpV4Multicast | OptionType::IpV4SD => {
-            if length != 9 {
+            if length != IPV4_OPTION_LENGTH_FIELD {
                 return Err(Error::InvalidOptionLength {
-                    option_type: buf[2],
-                    expected: 9,
+                    option_type: option_type_byte,
+                    expected: IPV4_OPTION_LENGTH_FIELD,
                     actual: length,
                 });
             }
+            TransportProtocol::try_from(buf[IPV4_OPTION_PROTOCOL_OFFSET])?;
         }
         OptionType::IpV6Endpoint | OptionType::IpV6Multicast | OptionType::IpV6SD => {
-            if length != 21 {
+            if length != IPV6_OPTION_LENGTH_FIELD {
                 return Err(Error::InvalidOptionLength {
-                    option_type: buf[2],
-                    expected: 21,
+                    option_type: option_type_byte,
+                    expected: IPV6_OPTION_LENGTH_FIELD,
                     actual: length,
                 });
             }
+            TransportProtocol::try_from(buf[IPV6_OPTION_PROTOCOL_OFFSET])?;
         }
         OptionType::LoadBalancing => {
-            if length != 5 {
+            if length != LOAD_BALANCING_OPTION_LENGTH_FIELD {
                 return Err(Error::InvalidOptionLength {
-                    option_type: buf[2],
-                    expected: 5,
+                    option_type: option_type_byte,
+                    expected: LOAD_BALANCING_OPTION_LENGTH_FIELD,
                     actual: length,
                 });
             }
         }
         OptionType::Configuration => {
             // Configuration strings are variable length; just check it doesn't exceed max
-            let string_len = length.saturating_sub(1);
+            let string_len = length.saturating_sub(CONFIGURATION_OPTION_LENGTH_STRING_DELTA);
             if usize::from(string_len) > MAX_CONFIGURATION_STRING_LENGTH {
                 return Err(Error::ConfigurationStringTooLong(string_len.into()));
             }
@@ -770,6 +856,87 @@ mod tests {
                 expected: 9,
                 actual: 5,
             })
+        ));
+    }
+
+    /// Build a well-formed IPv4 option wire buffer (length + type correct) with a
+    /// caller-chosen transport protocol byte — used to exercise protocol-byte
+    /// validation without hand-rolling wire offsets.
+    fn ipv4_option_with_protocol(
+        option_type: OptionType,
+        protocol_byte: u8,
+    ) -> [u8; IPV4_OPTION_WIRE_SIZE] {
+        let mut buf = [0u8; IPV4_OPTION_WIRE_SIZE];
+        buf[0..2].copy_from_slice(&IPV4_OPTION_LENGTH_FIELD.to_be_bytes());
+        buf[OPTION_TYPE_OFFSET] = u8::from(option_type);
+        buf[IPV4_OPTION_PROTOCOL_OFFSET] = protocol_byte;
+        buf
+    }
+
+    /// Build a well-formed IPv6 option wire buffer (length + type correct) with a
+    /// caller-chosen transport protocol byte.
+    fn ipv6_option_with_protocol(
+        option_type: OptionType,
+        protocol_byte: u8,
+    ) -> [u8; IPV6_OPTION_WIRE_SIZE] {
+        let mut buf = [0u8; IPV6_OPTION_WIRE_SIZE];
+        buf[0..2].copy_from_slice(&IPV6_OPTION_LENGTH_FIELD.to_be_bytes());
+        buf[OPTION_TYPE_OFFSET] = u8::from(option_type);
+        buf[IPV6_OPTION_PROTOCOL_OFFSET] = protocol_byte;
+        buf
+    }
+
+    #[test]
+    fn ipv4_endpoint_invalid_transport_protocol_returns_error() {
+        let buf = ipv4_option_with_protocol(OptionType::IpV4Endpoint, 0xAB);
+        assert!(matches!(
+            validate_option(&buf),
+            Err(Error::InvalidOptionTransportProtocol(0xAB))
+        ));
+    }
+
+    #[test]
+    fn ipv4_multicast_invalid_transport_protocol_returns_error() {
+        let buf = ipv4_option_with_protocol(OptionType::IpV4Multicast, 0x42);
+        assert!(matches!(
+            validate_option(&buf),
+            Err(Error::InvalidOptionTransportProtocol(0x42))
+        ));
+    }
+
+    #[test]
+    fn ipv4_sd_invalid_transport_protocol_returns_error() {
+        let buf = ipv4_option_with_protocol(OptionType::IpV4SD, 0x01);
+        assert!(matches!(
+            validate_option(&buf),
+            Err(Error::InvalidOptionTransportProtocol(0x01))
+        ));
+    }
+
+    #[test]
+    fn ipv6_endpoint_invalid_transport_protocol_returns_error() {
+        let buf = ipv6_option_with_protocol(OptionType::IpV6Endpoint, 0x99);
+        assert!(matches!(
+            validate_option(&buf),
+            Err(Error::InvalidOptionTransportProtocol(0x99))
+        ));
+    }
+
+    #[test]
+    fn ipv6_multicast_invalid_transport_protocol_returns_error() {
+        let buf = ipv6_option_with_protocol(OptionType::IpV6Multicast, 0x00);
+        assert!(matches!(
+            validate_option(&buf),
+            Err(Error::InvalidOptionTransportProtocol(0x00))
+        ));
+    }
+
+    #[test]
+    fn ipv6_sd_invalid_transport_protocol_returns_error() {
+        let buf = ipv6_option_with_protocol(OptionType::IpV6SD, 0xFE);
+        assert!(matches!(
+            validate_option(&buf),
+            Err(Error::InvalidOptionTransportProtocol(0xFE))
         ));
     }
 
