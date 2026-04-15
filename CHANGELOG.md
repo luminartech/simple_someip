@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.3](https://github.com/luminartech/simple_someip/compare/v0.5.2...v0.5.3) - 2026-04-15
+
+### Other
+
+- Unify Service Discover across multiple server offers without conflict, HBs flow nicely
+- Add a lot of robustness through unit testing and input validation.
+
 ## [0.5.2](https://github.com/luminartech/simple_someip/compare/v0.5.1...v0.5.2) - 2026-04-09
 
 ### Other

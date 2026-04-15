@@ -3,7 +3,7 @@ members = [".", "examples/discovery_client", "examples/client_server"]
 
 [package]
 name = "simple-someip"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A lightweight SOME/IP serialization and communication library"
