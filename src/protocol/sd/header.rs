@@ -195,11 +195,7 @@ mod tests {
         traits::WireFormat,
     };
 
-    fn ipv4_endpoint_bytes(
-        ip: [u8; 4],
-        protocol: u8,
-        port: u16,
-    ) -> [u8; IPV4_OPTION_WIRE_SIZE] {
+    fn ipv4_endpoint_bytes(ip: [u8; 4], protocol: u8, port: u16) -> [u8; IPV4_OPTION_WIRE_SIZE] {
         let mut b = [0u8; IPV4_OPTION_WIRE_SIZE];
         b[0..2].copy_from_slice(&IPV4_OPTION_LENGTH_FIELD.to_be_bytes());
         b[2] = u8::from(OptionType::IpV4Endpoint);
@@ -366,8 +362,7 @@ mod tests {
         // must be rejected by parse, so downstream `as_ipv4()` calls cannot
         // observe a bad protocol byte at walk time.
         const SD_HEADER_PREFIX_SIZE: usize = 12;
-        let options_size =
-            u32::try_from(IPV4_OPTION_WIRE_SIZE).expect("wire size fits u32");
+        let options_size = u32::try_from(IPV4_OPTION_WIRE_SIZE).expect("wire size fits u32");
         let prefix = raw_header(0, options_size);
         let option = ipv4_endpoint_bytes([10, 0, 0, 1], 0xAB, 30490);
         let mut buf = [0u8; SD_HEADER_PREFIX_SIZE + IPV4_OPTION_WIRE_SIZE];
