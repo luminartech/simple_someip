@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.3](https://github.com/luminartech/simple_someip/compare/v0.5.2...v0.5.3) - 2026-04-15
+
+### Other
+
+- linting
+- Add IP Validation and removed magic numbers.
+- Address Copilot comments 9 and 10 on PR #66
+- be more explicit in naming conventions
+- Add more comprehensive round-trip SD testing
+- Add exhaustive unit testing for new functionality
+- PR Fixes:  Clarify doc on register_subscriber, allow removal of subs
+- Unify SD across multiple server offers without conflict, HBs flow nicely
+
 ## [0.5.2](https://github.com/luminartech/simple_someip/compare/v0.5.1...v0.5.2) - 2026-04-09
 
 ### Other
