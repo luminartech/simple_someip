@@ -45,8 +45,6 @@ pub struct ServerConfig {
     pub minor_version: u32,
     /// Service Discovery TTL (time to live)
     pub ttl: u32,
-    /// Enable multicast loopback on the SD socket for same-host testing.
-    pub multicast_loopback: bool,
 }
 
 impl ServerConfig {
@@ -61,7 +59,6 @@ impl ServerConfig {
             major_version: 1,
             minor_version: 0,
             ttl: 3, // 3 seconds is typical for SOME/IP
-            multicast_loopback: false,
         }
     }
 }
@@ -97,6 +94,24 @@ impl Server {
     /// Returns an error if binding the unicast or SD socket fails, or if joining the
     /// SD multicast group fails.
     pub async fn new(config: ServerConfig) -> Result<Self, Error> {
+        Self::new_with_loopback(config, false).await
+    }
+
+    /// Like [`Self::new`], but with explicit control over multicast loopback.
+    ///
+    /// When `multicast_loopback` is `true`, SD messages sent by this server
+    /// are looped back to other sockets on the same host. This is required
+    /// when running both a server and a client/simulator on the same machine
+    /// for testing. Defaults to `false` in [`Self::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding the unicast or SD socket fails, or if joining the
+    /// SD multicast group fails.
+    pub async fn new_with_loopback(
+        config: ServerConfig,
+        multicast_loopback: bool,
+    ) -> Result<Self, Error> {
         // Bind unicast socket for receiving subscriptions
         let unicast_addr = SocketAddrV4::new(config.interface, config.local_port);
         let unicast_socket = Arc::new(UdpSocket::bind(unicast_addr).await?);
@@ -119,7 +134,7 @@ impl Server {
         #[cfg(unix)]
         sd_raw_socket.set_reuse_port(true)?;
         sd_raw_socket.set_multicast_if_v4(&config.interface)?;
-        sd_raw_socket.set_multicast_loop_v4(config.multicast_loopback)?;
+        sd_raw_socket.set_multicast_loop_v4(multicast_loopback)?;
         sd_raw_socket.bind(&sd_bind_addr.into())?;
         sd_raw_socket.set_nonblocking(true)?;
         let sd_std_socket: std::net::UdpSocket = sd_raw_socket.into();
@@ -522,8 +537,12 @@ impl Server {
             };
             let data = &data[..len];
 
-            // Own multicast messages are suppressed via IP_MULTICAST_LOOP=false
-            // on the SD socket, so no source-IP filtering is needed here.
+            // By default IP_MULTICAST_LOOP=false suppresses own multicast
+            // messages on the SD socket, so no source-IP filtering is needed.
+            // When the server was constructed via `Server::new_with_loopback`
+            // with `multicast_loopback = true` (e.g. for same-host testing),
+            // the kernel will deliver our own SD multicasts back to us here;
+            // callers are expected to tolerate or filter those.
 
             tracing::trace!("Received {} bytes from {} on {} socket", len, addr, source);
             tracing::trace!("Raw data: {:02X?}", &data[..len.min(64_usize)]);

@@ -887,6 +887,7 @@ mod tests {
         let (control_sender, mut update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
         // Drop control sender to trigger loop exit
         drop(control_sender);
@@ -920,6 +921,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         let (rx, msg) = TestControl::bind_discovery();
@@ -935,6 +937,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         let (rx, msg) = TestControl::unbind_discovery();
@@ -950,6 +953,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         // SetInterface(LOCALHOST) on a fresh inner goes straight to
@@ -967,6 +971,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         // Bind discovery first so the SendSD path has a socket to use
@@ -995,6 +1000,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         // Bind discovery so SetInterface will take the multi-step path:
@@ -1064,6 +1070,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
@@ -1080,6 +1087,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         let (rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
@@ -1095,6 +1103,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         // Add an endpoint first so SendToService doesn't fail with ServiceNotFound
@@ -1119,6 +1128,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         let (rx, msg) = TestControl::bind_discovery();
@@ -1137,6 +1147,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30490);
@@ -1156,6 +1167,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
@@ -1179,6 +1191,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         // Bind discovery first
@@ -1208,6 +1221,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         // Add endpoint but do NOT bind discovery
@@ -1231,6 +1245,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         let (rx, msg) = TestControl::subscribe(0xFFFF, 0xFFFF, 1, 3, 0x01, 0);
@@ -1248,6 +1263,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
@@ -1281,6 +1297,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
@@ -1297,6 +1314,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         // Change to a different loopback-range address (127.0.0.2).
@@ -1320,6 +1338,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         // Bind discovery on LOCALHOST first
@@ -1349,6 +1368,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         // Add endpoint and bind discovery
