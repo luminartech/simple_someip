@@ -1123,6 +1123,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bind_discovery_with_loopback() {
+        // Spawn inner with multicast_loopback=true so bind_discovery exercises
+        // the loopback-enabled branch of SocketManager::bind_discovery.
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+            true,
+        );
+
+        let (rx, msg) = TestControl::bind_discovery();
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn test_bind_discovery_idempotent() {
         // Binding discovery twice should succeed (early return on already-bound)
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
