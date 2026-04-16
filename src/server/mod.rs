@@ -45,6 +45,8 @@ pub struct ServerConfig {
     pub minor_version: u32,
     /// Service Discovery TTL (time to live)
     pub ttl: u32,
+    /// Enable multicast loopback on the SD socket for same-host testing.
+    pub multicast_loopback: bool,
 }
 
 impl ServerConfig {
@@ -59,6 +61,7 @@ impl ServerConfig {
             major_version: 1,
             minor_version: 0,
             ttl: 3, // 3 seconds is typical for SOME/IP
+            multicast_loopback: false,
         }
     }
 }
@@ -116,7 +119,7 @@ impl Server {
         #[cfg(unix)]
         sd_raw_socket.set_reuse_port(true)?;
         sd_raw_socket.set_multicast_if_v4(&config.interface)?;
-        sd_raw_socket.set_multicast_loop_v4(false)?;
+        sd_raw_socket.set_multicast_loop_v4(config.multicast_loopback)?;
         sd_raw_socket.bind(&sd_bind_addr.into())?;
         sd_raw_socket.set_nonblocking(true)?;
         let sd_std_socket: std::net::UdpSocket = sd_raw_socket.into();

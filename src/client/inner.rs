@@ -235,6 +235,8 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     session_counter: u16,
     /// Shared E2E registry for runtime E2E configuration
     e2e_registry: Arc<Mutex<E2ERegistry>>,
+    /// Enable multicast loopback on SD sockets for same-host testing
+    multicast_loopback: bool,
     /// Phantom data to represent the generic message definitions
     phantom: std::marker::PhantomData<PayloadDefinitions>,
 }
@@ -258,6 +260,7 @@ where
     pub fn spawn(
         interface: Ipv4Addr,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
+        multicast_loopback: bool,
     ) -> (
         Sender<ControlMessage<PayloadDefinitions>>,
         mpsc::UnboundedReceiver<ClientUpdate<PayloadDefinitions>>,
@@ -279,6 +282,7 @@ where
             client_id: 0x1234,
             session_counter: 1,
             e2e_registry,
+            multicast_loopback,
             phantom: std::marker::PhantomData,
         };
         inner.run();
@@ -289,8 +293,11 @@ where
         if self.discovery_socket.is_some() {
             Ok(())
         } else {
-            let socket =
-                SocketManager::bind_discovery(self.interface, Arc::clone(&self.e2e_registry))?;
+            let socket = SocketManager::bind_discovery(
+                self.interface,
+                Arc::clone(&self.e2e_registry),
+                self.multicast_loopback,
+            )?;
             self.discovery_socket = Some(socket);
             Ok(())
         }

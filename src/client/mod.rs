@@ -160,8 +160,23 @@ where
     /// discovery, unicast, and error updates from the event loop.
     #[must_use]
     pub fn new(interface: Ipv4Addr) -> (Self, ClientUpdates<MessageDefinitions>) {
+        Self::new_with_loopback(interface, false)
+    }
+
+    /// Like [`Self::new`], but with explicit control over multicast loopback.
+    ///
+    /// When `multicast_loopback` is `true`, SD messages sent by this client
+    /// are looped back to other sockets on the same host. This is required
+    /// when running both a client and a server/simulator on the same machine
+    /// for testing. Defaults to `false` in [`Self::new`].
+    #[must_use]
+    pub fn new_with_loopback(
+        interface: Ipv4Addr,
+        multicast_loopback: bool,
+    ) -> (Self, ClientUpdates<MessageDefinitions>) {
         let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
-        let (control_sender, update_receiver) = Inner::spawn(interface, Arc::clone(&e2e_registry));
+        let (control_sender, update_receiver) =
+            Inner::spawn(interface, Arc::clone(&e2e_registry), multicast_loopback);
 
         let client = Self {
             interface: Arc::new(RwLock::new(interface)),

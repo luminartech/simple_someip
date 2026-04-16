@@ -62,6 +62,7 @@ where
     pub fn bind_discovery(
         interface: Ipv4Addr,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
+        multicast_loopback: bool,
     ) -> Result<Self, Error> {
         let (rx_tx, rx_rx) = mpsc::channel(16);
         let (tx_tx, tx_rx) = mpsc::channel(16);
@@ -78,12 +79,12 @@ where
         #[cfg(unix)]
         socket.set_reuse_port(true)?;
         socket.set_multicast_if_v4(&interface)?;
-        // Disable multicast loopback so this socket does not receive the
-        // SD messages it sends. Matches the Server's SD socket setup —
-        // otherwise a client that acts as both server and client (e.g.
-        // offering services via `start_sd_announcements`) will parse its
-        // own OfferService entries as peer offers.
-        socket.set_multicast_loop_v4(false)?;
+        // Control whether multicast packets sent by this socket are looped
+        // back to other sockets on the same host. Disabled by default to
+        // avoid parsing self-sent OfferService entries as peer offers.
+        // Enable for same-host testing (e.g. simulator + client on one
+        // machine).
+        socket.set_multicast_loop_v4(multicast_loopback)?;
         socket.bind(&bind_addr.into())?;
         socket.set_nonblocking(true)?;
         let socket: std::net::UdpSocket = socket.into();
