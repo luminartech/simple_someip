@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0](https://github.com/luminartech/simple_someip/compare/v0.5.3...v0.6.0) - 2026-04-20
+
+### Other
+
+- Bump to 0.6.0 and fix linting
+- Default the reboot flag enum and have it to default to RecentlyRebooted(1) instead of Continuous(0)
+- Add loopback support for simple someip.
+
 ## [0.5.3](https://github.com/luminartech/simple_someip/compare/v0.5.2...v0.5.3) - 2026-04-15
 
 ### Other
