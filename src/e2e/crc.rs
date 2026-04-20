@@ -41,7 +41,7 @@ pub fn compute_crc32_p4(length: u16, counter: u16, data_id: u32, payload: &[u8])
 /// Note: CRC field itself is not included in the calculation.
 /// Note: `DataLength` is NOT included in the CRC calculation.
 pub fn compute_crc16_p5(data_id: u16, counter: u8, payload: &[u8]) -> u16 {
-    crate::trace_log!(
+    tracing::trace!(
         "CRC-16 Profile5: data_id=0x{:04X}, counter={}, payload_len={}, payload={:02X?}",
         data_id,
         counter,
@@ -62,7 +62,7 @@ pub fn compute_crc16_p5(data_id: u16, counter: u8, payload: &[u8]) -> u16 {
     digest.update(&data_id_bytes);
 
     let crc = digest.finalize();
-    crate::trace_log!(
+    tracing::trace!(
         "CRC-16 Profile5: computed CRC = 0x{:04X} (bytes: {:02X?})",
         crc,
         crc.to_le_bytes()
@@ -83,7 +83,7 @@ pub fn compute_crc16_p5_with_header(
     payload: &[u8],
     upper_header: [u8; 8],
 ) -> u16 {
-    crate::trace_log!(
+    tracing::trace!(
         "CRC-16 Profile5 (with header): data_id=0x{:04X}, counter={}, payload_len={}, upper_header={:02X?}, payload={:02X?}",
         data_id,
         counter,
@@ -99,7 +99,7 @@ pub fn compute_crc16_p5_with_header(
     digest.update(&data_id.to_le_bytes());
 
     let crc = digest.finalize();
-    crate::trace_log!(
+    tracing::trace!(
         "CRC-16 Profile5 (with header): computed CRC = 0x{:04X} (bytes: {:02X?})",
         crc,
         crc.to_le_bytes()
