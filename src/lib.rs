@@ -89,7 +89,6 @@
 #![no_std]
 #![warn(clippy::pedantic)]
 
-
 #[cfg(feature = "std")]
 extern crate std;
 
@@ -100,7 +99,7 @@ macro_rules! trace_log {
 }
 #[cfg(not(feature = "std"))]
 macro_rules! trace_log {
-    ($($arg:tt)*) => {}
+    ($($arg:tt)*) => {};
 }
 
 #[cfg(feature = "std")]
@@ -109,7 +108,7 @@ macro_rules! warn_log {
 }
 #[cfg(not(feature = "std"))]
 macro_rules! warn_log {
-    ($($arg:tt)*) => {}
+    ($($arg:tt)*) => {};
 }
 
 pub(crate) use trace_log;

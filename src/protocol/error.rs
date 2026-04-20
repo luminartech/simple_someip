@@ -28,7 +28,6 @@ pub enum Error {
     Sd(#[cfg_attr(feature = "std", from)] super::sd::Error),
 }
 
-
 #[cfg(not(feature = "std"))]
 impl From<super::sd::Error> for Error {
     fn from(e: super::sd::Error) -> Self {

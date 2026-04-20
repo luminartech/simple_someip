@@ -6,10 +6,16 @@ use thiserror::Error;
 #[cfg_attr(feature = "std", derive(Error))]
 pub enum Error {
     /// The entry type byte is not a recognized SD entry type.
-    #[cfg_attr(feature = "std", error("Invalid value for Service Discovery entry type: {0:X}"))]
+    #[cfg_attr(
+        feature = "std",
+        error("Invalid value for Service Discovery entry type: {0:X}")
+    )]
     InvalidEntryType(u8),
     /// The option type byte is not a recognized SD option type.
-    #[cfg_attr(feature = "std", error("Invalid value for Service Discovery Option Type: {0:X}"))]
+    #[cfg_attr(
+        feature = "std",
+        error("Invalid value for Service Discovery Option Type: {0:X}")
+    )]
     InvalidOptionType(u8),
     /// The transport protocol byte is not a recognized value.
     #[cfg_attr(
@@ -48,4 +54,3 @@ pub enum Error {
     )]
     IncorrectEntriesSize(usize),
 }
-
