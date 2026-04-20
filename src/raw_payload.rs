@@ -150,6 +150,7 @@ impl PayloadWireFormat for RawPayload {
         client_ip: std::net::Ipv4Addr,
         protocol: sd::TransportProtocol,
         client_port: u16,
+        reboot_flag: bool,
     ) -> VecSdHeader {
         let entry = sd::Entry::SubscribeEventGroup(sd::EventGroupEntry::new(
             service_id,
@@ -164,7 +165,7 @@ impl PayloadWireFormat for RawPayload {
             port: client_port,
         };
         VecSdHeader {
-            flags: sd::Flags::new_sd(false),
+            flags: sd::Flags::new_sd(reboot_flag),
             entries: std::vec![entry],
             options: std::vec![endpoint],
         }
@@ -338,6 +339,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             sd::TransportProtocol::Udp,
             12345,
+            false,
         );
         assert_eq!(header.entries.len(), 1);
         assert_eq!(header.options.len(), 1);

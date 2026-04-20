@@ -86,6 +86,7 @@ impl PayloadWireFormat for TestPayload {
         client_ip: std::net::Ipv4Addr,
         protocol: sd::TransportProtocol,
         client_port: u16,
+        reboot_flag: bool,
     ) -> TestSdHeader {
         let entry = sd::Entry::SubscribeEventGroup(sd::EventGroupEntry::new(
             service_id,
@@ -104,7 +105,7 @@ impl PayloadWireFormat for TestPayload {
         let mut options = heapless::Vec::new();
         options.push(endpoint).unwrap();
         TestSdHeader {
-            flags: sd::Flags::new_sd(false),
+            flags: sd::Flags::new_sd(reboot_flag),
             entries,
             options,
         }

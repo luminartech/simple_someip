@@ -71,10 +71,14 @@ impl SessionTracker {
                 if !prev.last_reboot_flag && reboot_flag {
                     // Reboot flag 0 -> 1 transition — authoritative reboot signal
                     SessionVerdict::Reboot
-                } else if prev.last_reboot_flag && reboot_flag && session_id < prev.last_session_id
+                } else if prev.last_reboot_flag
+                    && reboot_flag
+                    && session_id < prev.last_session_id
+                    && !(prev.last_session_id == u16::MAX && session_id == 1)
                 {
                     // Session ID decreased within the same service instance
                     // while reboot flag stays 1 — this is a reboot.
+                    // Exception: 0xFFFF→1 is a normal counter wrap, not a reboot.
                     SessionVerdict::Reboot
                 } else {
                     SessionVerdict::Ok
@@ -223,18 +227,24 @@ mod tests {
     }
 
     #[test]
-    fn session_id_wrap_around_currently_treated_as_reboot() {
-        // Session ID wrapping from 65535 to 1 would ideally be treated as a
-        // normal increment rather than a reboot, since the reboot flag stays 1
-        // and there is no 0→1 transition.
-        // However, the current implementation uses a simple numeric decrease
-        // check, so wrap-around is treated as a reboot. This test documents
-        // that known limitation.
+    fn session_id_wrap_around_returns_ok() {
+        // 0xFFFF→1 with reboot flag staying 1 is a normal counter wrap, not a reboot.
         let mut tracker = SessionTracker::default();
         tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 65535, true);
         let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, true);
-        assert_eq!(verdict, SessionVerdict::Reboot);
+        assert_eq!(verdict, SessionVerdict::Ok);
     }
+
+    #[test]
+    fn session_id_wrap_around_then_normal_increment() {
+        // After a wrap (0xFFFF→1), normal incrementing should continue as Ok.
+        let mut tracker = SessionTracker::default();
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 65535, true);
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, true);
+        let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 2, true);
+        assert_eq!(verdict, SessionVerdict::Ok);
+    }
+
 
     #[test]
     fn reboot_flag_transition_with_session_id_decrease_both_signal_reboot() {
