@@ -165,7 +165,7 @@ impl<PayloadDefinition: PayloadWireFormat> WireFormat for Message<PayloadDefinit
 mod tests {
     use super::*;
     use crate::protocol::sd::test_support::{TestPayload, TestSdHeader, empty_sd_header};
-    use crate::protocol::{MessageId, sd};
+    use crate::protocol::{MessageId, sd, sd::RebootFlag};
 
     type Msg = Message<TestPayload>;
 

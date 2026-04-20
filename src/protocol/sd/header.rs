@@ -185,7 +185,7 @@ mod tests {
     use super::*;
     use crate::{
         protocol::sd::{
-            Error as SdError, EventGroupEntry, OptionType, OptionsCount, ServiceEntry,
+            Error as SdError, EventGroupEntry, OptionType, OptionsCount, RebootFlag, ServiceEntry,
             TransportProtocol,
             options::{
                 IPV4_OPTION_IP_OFFSET, IPV4_OPTION_LENGTH_FIELD, IPV4_OPTION_PORT_OFFSET,

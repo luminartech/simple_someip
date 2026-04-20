@@ -8,7 +8,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 fn empty_sd_header() -> VecSdHeader {
     VecSdHeader {
-        flags: sd::Flags::new_sd(false),
+        flags: sd::Flags::new_sd(sd::RebootFlag::Continuous),
         entries: vec![],
         options: vec![],
     }
@@ -103,7 +103,7 @@ async fn test_client_send_sd_auto_binds_discovery() {
 
     // send_sd_message should auto-bind discovery and succeed
     let sd_header = VecSdHeader {
-        flags: sd::Flags::new_sd(false),
+        flags: sd::Flags::new_sd(sd::RebootFlag::Continuous),
         entries: vec![sd::Entry::SubscribeEventGroup(sd::EventGroupEntry::new(
             0x5B, 1, 1, 3, 0x01,
         ))],

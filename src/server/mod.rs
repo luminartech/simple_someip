@@ -997,7 +997,11 @@ mod tests {
         };
         let entries = [entry];
         let options = [endpoint];
-        let sd_header = sd::Header::new(Flags::new_sd(false), &entries, &options);
+        let sd_header = sd::Header::new(
+            Flags::new_sd(sd::RebootFlag::Continuous),
+            &entries,
+            &options,
+        );
         build_sd_message(&sd_header)
     }
 
@@ -1162,7 +1166,11 @@ mod tests {
         // Send a FindService for 0x5B
         let find_entry = Entry::FindService(ServiceEntry::find(0x5B));
         let find_entries = [find_entry];
-        let sd_header = sd::Header::new(Flags::new_sd(false), &find_entries, &[]);
+        let sd_header = sd::Header::new(
+            Flags::new_sd(sd::RebootFlag::Continuous),
+            &find_entries,
+            &[],
+        );
         let message = build_sd_message(&sd_header);
         client_socket
             .send_to(&message, format!("127.0.0.1:{}", server_port))
@@ -1209,7 +1217,11 @@ mod tests {
         // Send wildcard FindService (0xFFFF)
         let find_entry = Entry::FindService(ServiceEntry::find(0xFFFF));
         let find_entries = [find_entry];
-        let sd_header = sd::Header::new(Flags::new_sd(false), &find_entries, &[]);
+        let sd_header = sd::Header::new(
+            Flags::new_sd(sd::RebootFlag::Continuous),
+            &find_entries,
+            &[],
+        );
         let message = build_sd_message(&sd_header);
         client_socket
             .send_to(&message, format!("127.0.0.1:{}", server_port))
@@ -1252,7 +1264,11 @@ mod tests {
         // Send FindService for 0x99 (not our service)
         let find_entry = Entry::FindService(ServiceEntry::find(0x99));
         let find_entries = [find_entry];
-        let sd_header = sd::Header::new(Flags::new_sd(false), &find_entries, &[]);
+        let sd_header = sd::Header::new(
+            Flags::new_sd(sd::RebootFlag::Continuous),
+            &find_entries,
+            &[],
+        );
         let message = build_sd_message(&sd_header);
         client_socket
             .send_to(&message, format!("127.0.0.1:{}", server_port))
@@ -1834,7 +1850,11 @@ mod tests {
                 port: subscribe_endpoint_port,
             },
         ];
-        let sd_header = sd::Header::new(sd::Flags::new_sd(false), &entries, &options);
+        let sd_header = sd::Header::new(
+            sd::Flags::new_sd(sd::RebootFlag::Continuous),
+            &entries,
+            &options,
+        );
         let message = build_sd_message(&sd_header);
 
         // Send the combined SD message to the server's SD socket from a
