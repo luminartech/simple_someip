@@ -89,8 +89,31 @@
 #![no_std]
 #![warn(clippy::pedantic)]
 
+
 #[cfg(feature = "std")]
 extern crate std;
+
+// Internal tracing shims: forward to `tracing` when available, no-op otherwise.
+#[cfg(feature = "std")]
+macro_rules! trace_log {
+    ($($arg:tt)*) => { tracing::trace!($($arg)*) }
+}
+#[cfg(not(feature = "std"))]
+macro_rules! trace_log {
+    ($($arg:tt)*) => {}
+}
+
+#[cfg(feature = "std")]
+macro_rules! warn_log {
+    ($($arg:tt)*) => { tracing::warn!($($arg)*) }
+}
+#[cfg(not(feature = "std"))]
+macro_rules! warn_log {
+    ($($arg:tt)*) => {}
+}
+
+pub(crate) use trace_log;
+pub(crate) use warn_log;
 
 /// SOME/IP client for discovering services and exchanging messages.
 #[cfg(feature = "client")]

@@ -92,7 +92,7 @@ pub fn check_profile5<'a>(
     // Verify data length matches configuration (header + payload = config.data_length)
     let expected_total_length = PROFILE5_HEADER_SIZE + config.data_length as usize;
     if protected.len() != expected_total_length {
-        tracing::warn!(
+        crate::warn_log!(
             "E2E Profile 5 length mismatch: expected {} bytes (3 header + {} payload), got {} bytes",
             expected_total_length,
             config.data_length,
@@ -155,7 +155,7 @@ pub fn check_profile5_with_header<'a>(
 
     let expected_total_length = PROFILE5_HEADER_SIZE + config.data_length as usize;
     if protected.len() != expected_total_length {
-        tracing::warn!(
+        crate::warn_log!(
             "E2E Profile 5 length mismatch: expected {} bytes (3 header + {} payload), got {} bytes",
             expected_total_length,
             config.data_length,
