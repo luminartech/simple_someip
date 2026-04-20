@@ -344,6 +344,20 @@ mod tests {
         assert_eq!(header.entries.len(), 1);
         assert_eq!(header.options.len(), 1);
         assert!(header.flags.unicast());
+        assert!(!header.flags.reboot());
+
+        let header_reboot = RawPayload::new_subscription_sd_header(
+            0x5B,
+            1,
+            1,
+            3,
+            0x01,
+            Ipv4Addr::LOCALHOST,
+            sd::TransportProtocol::Udp,
+            12345,
+            true,
+        );
+        assert!(header_reboot.flags.reboot());
     }
 
     #[test]

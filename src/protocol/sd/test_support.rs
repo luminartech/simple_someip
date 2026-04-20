@@ -161,9 +161,11 @@ mod tests {
             std::net::Ipv4Addr::LOCALHOST,
             sd::TransportProtocol::Udp,
             12345,
+            false,
         );
         assert_eq!(header.entries.len(), 1);
         assert_eq!(header.options.len(), 1);
+        assert!(!header.flags.reboot());
     }
 
     #[cfg(feature = "std")]

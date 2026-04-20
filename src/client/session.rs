@@ -245,7 +245,6 @@ mod tests {
         assert_eq!(verdict, SessionVerdict::Ok);
     }
 
-
     #[test]
     fn reboot_flag_transition_with_session_id_decrease_both_signal_reboot() {
         // Both indicators fire at once (flag 0→1 AND session ID reset) — still Reboot.
