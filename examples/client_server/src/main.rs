@@ -30,7 +30,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use simple_someip::protocol::sd::{
-    Entry, Flags, Options, OptionsCount, ServiceEntry, TransportProtocol,
+    Entry, Flags, Options, OptionsCount, RebootFlag, ServiceEntry, TransportProtocol,
 };
 use simple_someip::server::{Server, ServerConfig};
 use simple_someip::{ClientUpdate, RawPayload, VecSdHeader};
@@ -77,7 +77,7 @@ fn build_sd_header(interface: Ipv4Addr) -> VecSdHeader {
     };
 
     VecSdHeader {
-        flags: Flags::new_sd(false),
+        flags: Flags::new_sd(RebootFlag::RecentlyRebooted),
         entries: vec![find_remote, offer_mine],
         options: vec![endpoint],
     }

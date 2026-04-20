@@ -165,7 +165,7 @@ impl<PayloadDefinition: PayloadWireFormat> WireFormat for Message<PayloadDefinit
 mod tests {
     use super::*;
     use crate::protocol::sd::test_support::{TestPayload, TestSdHeader, empty_sd_header};
-    use crate::protocol::{MessageId, sd};
+    use crate::protocol::{MessageId, sd, sd::RebootFlag};
 
     type Msg = Message<TestPayload>;
 
@@ -273,7 +273,7 @@ mod tests {
             .push(sd::Entry::FindService(sd::ServiceEntry::find(0xABCD)))
             .unwrap();
         let sd_hdr = TestSdHeader {
-            flags: sd::Flags::new_sd(true),
+            flags: sd::Flags::new_sd(RebootFlag::RecentlyRebooted),
             entries,
             options: heapless::Vec::new(),
         };

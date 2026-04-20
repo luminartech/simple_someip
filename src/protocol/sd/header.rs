@@ -185,7 +185,7 @@ mod tests {
     use super::*;
     use crate::{
         protocol::sd::{
-            Error as SdError, EventGroupEntry, OptionType, OptionsCount, ServiceEntry,
+            Error as SdError, EventGroupEntry, OptionType, OptionsCount, RebootFlag, ServiceEntry,
             TransportProtocol,
             options::{
                 IPV4_OPTION_IP_OFFSET, IPV4_OPTION_LENGTH_FIELD, IPV4_OPTION_PORT_OFFSET,
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn header_new_stores_fields() {
-        let flags = Flags::new_sd(true);
+        let flags = Flags::new_sd(RebootFlag::RecentlyRebooted);
         let entries: &[Entry] = &[];
         let options: &[Options] = &[];
         let h = Header::new(flags, entries, options);
@@ -247,7 +247,11 @@ mod tests {
         };
         let entries = [entry];
         let options = [endpoint];
-        let h = Header::new(Flags::new_sd(false), &entries, &options);
+        let h = Header::new(
+            Flags::new_sd(RebootFlag::RecentlyRebooted),
+            &entries,
+            &options,
+        );
         assert_eq!(h.required_size(), 40);
         let mut buf = [0u8; 64];
         h.encode(&mut buf.as_mut_slice()).unwrap();
@@ -263,7 +267,7 @@ mod tests {
             0xAAAA, 0x0001, 1, 0xFFFFFF, 0x0010,
         ));
         let entries = [entry];
-        let h = Header::new(Flags::new_sd(true), &entries, &[]);
+        let h = Header::new(Flags::new_sd(RebootFlag::RecentlyRebooted), &entries, &[]);
         assert_eq!(h.required_size(), 28);
         let mut buf = [0u8; 32];
         h.encode(&mut buf.as_mut_slice()).unwrap();
@@ -290,7 +294,11 @@ mod tests {
         };
         let entries = [entry];
         let options = [endpoint];
-        let h = Header::new(Flags::new_sd(false), &entries, &options);
+        let h = Header::new(
+            Flags::new_sd(RebootFlag::RecentlyRebooted),
+            &entries,
+            &options,
+        );
         let mut buf = [0u8; 64];
         let n = h.encode(&mut buf.as_mut_slice()).unwrap();
         let view = SdHeaderView::parse(&buf[..n]).unwrap();
@@ -329,7 +337,7 @@ mod tests {
             Entry::FindService(ServiceEntry::find(0x0001)),
             Entry::FindService(ServiceEntry::find(0x0002)),
         ];
-        let h = Header::new(Flags::new_sd(false), &entries, &[]);
+        let h = Header::new(Flags::new_sd(RebootFlag::RecentlyRebooted), &entries, &[]);
         let mut buf = [0u8; 64];
         h.encode(&mut buf.as_mut_slice()).unwrap();
         let view = SdHeaderView::parse(&buf[..h.required_size()]).unwrap();
@@ -338,7 +346,7 @@ mod tests {
 
     #[test]
     fn sd_header_view_flags() {
-        let h = Header::new(Flags::new_sd(true), &[], &[]);
+        let h = Header::new(Flags::new_sd(RebootFlag::RecentlyRebooted), &[], &[]);
         let mut buf = [0u8; 16];
         h.encode(&mut buf.as_mut_slice()).unwrap();
         let view = SdHeaderView::parse(&buf[..h.required_size()]).unwrap();

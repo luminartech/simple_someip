@@ -233,6 +233,10 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     client_id: u16,
     /// Incrementing session counter for SOME/IP request headers (lower 16 bits of request ID)
     session_counter: u16,
+    /// SD session state persisted across discovery socket rebinds so that
+    /// `unbind_discovery` + `bind_discovery` does not emit a false reboot signal.
+    sd_session_id: u16,
+    sd_session_has_wrapped: bool,
     /// Shared E2E registry for runtime E2E configuration
     e2e_registry: Arc<Mutex<E2ERegistry>>,
     /// Enable multicast loopback on SD sockets for same-host testing
@@ -281,6 +285,8 @@ where
             run: true,
             client_id: 0x1234,
             session_counter: 1,
+            sd_session_id: 1,
+            sd_session_has_wrapped: false,
             e2e_registry,
             multicast_loopback,
             phantom: std::marker::PhantomData,
@@ -293,9 +299,11 @@ where
         if self.discovery_socket.is_some() {
             Ok(())
         } else {
-            let socket = SocketManager::bind_discovery(
+            let socket = SocketManager::bind_discovery_seeded(
                 self.interface,
                 Arc::clone(&self.e2e_registry),
+                self.sd_session_id,
+                self.sd_session_has_wrapped,
                 self.multicast_loopback,
             )?;
             self.discovery_socket = Some(socket);
@@ -306,8 +314,11 @@ where
     // Dropping the receiver kills the loop
     async fn unbind_discovery(&mut self) {
         debug!("Unbinding Discovery socket.");
-        if let Some(socket_manger) = self.discovery_socket.take() {
-            socket_manger.shut_down().await;
+        if let Some(socket) = self.discovery_socket.take() {
+            self.sd_session_id = socket.session_id();
+            self.sd_session_has_wrapped =
+                socket.reboot_flag() == crate::protocol::sd::RebootFlag::Continuous;
+            socket.shut_down().await;
         }
     }
 
@@ -637,6 +648,7 @@ where
                                 self.interface,
                                 crate::protocol::sd::TransportProtocol::Udp,
                                 unicast_port,
+                                discovery_socket.reboot_flag(),
                             );
                             let session_id = u32::from(discovery_socket.session_id());
                             let message =
@@ -701,7 +713,9 @@ where
                                 // Extract reboot flag from the SD payload flags
                                 let reboot_flag = sd_payload
                                     .sd_flags()
-                                    .is_some_and(crate::protocol::sd::Flags::reboot);
+                                    .map_or(crate::protocol::sd::RebootFlag::Continuous, |f| {
+                                        f.reboot()
+                                    });
 
                                 // Track sender session/reboot state for every SD entry
                                 // that identifies a service instance, not only
@@ -1415,6 +1429,76 @@ mod tests {
         assert!(
             result.is_ok(),
             "second subscribe should reuse port: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sd_session_id_persists_across_rebind() {
+        // Verify that unbind_discovery + bind_discovery carries the session counter
+        // forward rather than resetting it to 1, which would send a false reboot signal.
+        use crate::protocol::MessageView;
+        use std::vec;
+        use tokio::net::UdpSocket;
+
+        let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
+        );
+
+        let raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw.local_addr().unwrap().port());
+
+        // Bind and send one SD message to advance the session counter.
+        let (rx, msg) = TestControl::bind_discovery();
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        let (rx, msg) = TestControl::send_sd(target, empty_sd_header());
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        let mut buf = vec![0u8; 1400];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), raw.recv_from(&mut buf))
+                .await
+                .expect("timed out waiting for first SD message")
+                .unwrap();
+        let first = MessageView::parse(&buf[..len]).unwrap();
+        let session_id_before = (first.header().request_id() & 0xFFFF) as u16;
+        let reboot_flag_before = first.sd_header().unwrap().flags().reboot();
+        assert!(session_id_before >= 1, "session_id must never be 0");
+
+        // Unbind, then rebind.
+        let (rx, msg) = TestControl::unbind_discovery();
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        let (rx, msg) = TestControl::bind_discovery();
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        // Send a second SD message and verify both session counter and reboot flag persisted.
+        let (rx, msg) = TestControl::send_sd(target, empty_sd_header());
+        control_sender.send(msg).await.unwrap();
+        rx.await.unwrap().unwrap();
+
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), raw.recv_from(&mut buf))
+                .await
+                .expect("timed out waiting for second SD message")
+                .unwrap();
+        let second = MessageView::parse(&buf[..len]).unwrap();
+        let session_id_after = (second.header().request_id() & 0xFFFF) as u16;
+        let reboot_flag_after = second.sd_header().unwrap().flags().reboot();
+
+        assert!(
+            session_id_after > session_id_before,
+            "session_id should continue after rebind (before={session_id_before}, after={session_id_after})"
+        );
+        assert_eq!(
+            reboot_flag_after, reboot_flag_before,
+            "reboot_flag should be preserved across rebind"
         );
     }
 }

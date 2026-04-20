@@ -53,15 +53,25 @@ pub struct SocketManager<PayloadDefinitions> {
     sender: mpsc::Sender<SendMessage<PayloadDefinitions>>,
     local_port: u16,
     session_id: u16,
+    /// Set to true once `session_id` has wrapped from 0xFFFF → 1.
+    /// Per AUTOSAR SOME/IP-SD, the reboot flag must be cleared after the
+    /// first counter wrap and stay cleared.
+    session_has_wrapped: bool,
 }
 
 impl<MessageDefinitions> SocketManager<MessageDefinitions>
 where
     MessageDefinitions: PayloadWireFormat + 'static,
 {
-    pub fn bind_discovery(
+    /// Bind the SD multicast socket, seeding the session counter and wrap state from
+    /// a previous socket when rebinding. Pass `(1, false)` for a fresh bind.
+    /// Preserving state across rebinds avoids emitting a false reboot signal
+    /// (`reboot_flag=1`) to peers after `unbind_discovery` + `bind_discovery`.
+    pub fn bind_discovery_seeded(
         interface: Ipv4Addr,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
+        session_id: u16,
+        session_has_wrapped: bool,
         multicast_loopback: bool,
     ) -> Result<Self, Error> {
         let (rx_tx, rx_rx) = mpsc::channel(16);
@@ -100,7 +110,8 @@ where
             receiver: rx_rx,
             sender: tx_tx,
             local_port: sd::MULTICAST_PORT,
-            session_id: 0,
+            session_id: session_id.max(1),
+            session_has_wrapped,
         })
     }
 
@@ -126,7 +137,8 @@ where
             receiver: rx_rx,
             sender: tx_tx,
             local_port: port,
-            session_id: 0,
+            session_id: 1,
+            session_has_wrapped: false,
         })
     }
 
@@ -143,8 +155,22 @@ where
         result_channel
             .await
             .expect("Socket manager must always return result of send before dropping channel")?;
-        self.session_id += 1;
+        if self.session_id == u16::MAX {
+            self.session_id = 1;
+            self.session_has_wrapped = true;
+        } else {
+            self.session_id += 1;
+        }
         Ok(())
+    }
+
+    /// Returns the SD reboot flag value to use in outgoing SD messages.
+    ///
+    /// Per AUTOSAR SOME/IP-SD, this is [`RebootFlag::RecentlyRebooted`] from startup
+    /// until the session counter wraps from `0xFFFF` to `1`, then
+    /// [`RebootFlag::Continuous`] permanently.
+    pub fn reboot_flag(&self) -> crate::protocol::sd::RebootFlag {
+        crate::protocol::sd::RebootFlag::from(!self.session_has_wrapped)
     }
 
     pub async fn receive(&mut self) -> Option<Result<ReceivedMessage<MessageDefinitions>, Error>> {
@@ -317,7 +343,7 @@ mod tests {
     async fn test_bind_ephemeral_port() {
         let sm = TestSocketManager::bind(0, test_registry()).unwrap();
         assert!(sm.port() > 0);
-        assert_eq!(sm.session_id(), 0);
+        assert_eq!(sm.session_id(), 1);
     }
 
     #[tokio::test]
@@ -410,12 +436,12 @@ mod tests {
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_port);
         let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
         sm.send(target, msg).await.unwrap();
-        assert_eq!(sm.session_id(), 1);
+        assert_eq!(sm.session_id(), 2);
 
         // Second send increments session
         let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
         sm.send(target, msg).await.unwrap();
-        assert_eq!(sm.session_id(), 2);
+        assert_eq!(sm.session_id(), 3);
     }
 
     #[tokio::test]
@@ -459,7 +485,7 @@ mod tests {
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_port);
 
         sm.send(target, msg.clone()).await.unwrap();
-        assert_eq!(sm.session_id(), 1);
+        assert_eq!(sm.session_id(), 2);
 
         // Verify the raw socket received data
         let mut recv_buf = vec![0u8; 1400];
@@ -476,6 +502,64 @@ mod tests {
         assert_eq!(
             view.header().to_owned().message_id(),
             msg.header().message_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bind_discovery_seeded_normalizes_zero_session_id() {
+        let sm = TestSocketManager::bind_discovery_seeded(
+            Ipv4Addr::LOCALHOST,
+            test_registry(),
+            0,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(sm.session_id(), 1, "session_id 0 must be normalized to 1");
+    }
+
+    #[tokio::test]
+    async fn test_session_id_wraps_to_one_and_clears_reboot_flag() {
+        let mut sm = TestSocketManager::bind(0, test_registry()).unwrap();
+        let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target =
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_socket.local_addr().unwrap().port());
+        let msg = || Message::<TestPayload>::new_sd(1, &empty_sd_header());
+
+        use crate::protocol::sd::RebootFlag;
+        // Set session_id to one before the wrap point
+        sm.session_id = u16::MAX - 1;
+        assert_eq!(
+            sm.reboot_flag(),
+            RebootFlag::RecentlyRebooted,
+            "reboot flag should be RecentlyRebooted before wrap"
+        );
+
+        // Send one message: session_id reaches MAX
+        sm.send(target, msg()).await.unwrap();
+        assert_eq!(sm.session_id(), u16::MAX);
+        assert_eq!(
+            sm.reboot_flag(),
+            RebootFlag::RecentlyRebooted,
+            "reboot flag should still be RecentlyRebooted at MAX"
+        );
+
+        // Send one more: triggers the wrap, session_id becomes 1
+        sm.send(target, msg()).await.unwrap();
+        assert_eq!(sm.session_id(), 1, "session_id should wrap to 1, not 0");
+        assert_eq!(
+            sm.reboot_flag(),
+            RebootFlag::Continuous,
+            "reboot flag should be Continuous after wrap"
+        );
+
+        // Subsequent sends continue incrementing normally from 1
+        sm.send(target, msg()).await.unwrap();
+        assert_eq!(sm.session_id(), 2);
+        assert_eq!(
+            sm.reboot_flag(),
+            RebootFlag::Continuous,
+            "reboot flag stays Continuous after wrap"
         );
     }
 }

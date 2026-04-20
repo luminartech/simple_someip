@@ -150,6 +150,7 @@ impl PayloadWireFormat for RawPayload {
         client_ip: std::net::Ipv4Addr,
         protocol: sd::TransportProtocol,
         client_port: u16,
+        reboot_flag: sd::RebootFlag,
     ) -> VecSdHeader {
         let entry = sd::Entry::SubscribeEventGroup(sd::EventGroupEntry::new(
             service_id,
@@ -164,7 +165,7 @@ impl PayloadWireFormat for RawPayload {
             port: client_port,
         };
         VecSdHeader {
-            flags: sd::Flags::new_sd(false),
+            flags: sd::Flags::new_sd(reboot_flag),
             entries: std::vec![entry],
             options: std::vec![endpoint],
         }
@@ -224,7 +225,7 @@ mod tests {
 
     fn make_sd_payload() -> RawPayload {
         let header = VecSdHeader {
-            flags: sd::Flags::new_sd(false),
+            flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
             entries: std::vec![],
             options: std::vec![],
         };
@@ -310,7 +311,11 @@ mod tests {
         // Build an SD header with an entry, encode it, then parse it back
         let entry = sd::Entry::FindService(sd::ServiceEntry::find(0x5B));
         let entries = [entry];
-        let header = sd::Header::new(sd::Flags::new_sd(false), &entries, &[]);
+        let header = sd::Header::new(
+            sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+            &entries,
+            &[],
+        );
         let mut buf = std::vec![0u8; header.required_size()];
         header.encode(&mut buf.as_mut_slice()).unwrap();
 
@@ -338,10 +343,28 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             sd::TransportProtocol::Udp,
             12345,
+            sd::RebootFlag::Continuous,
         );
         assert_eq!(header.entries.len(), 1);
         assert_eq!(header.options.len(), 1);
         assert!(header.flags.unicast());
+        assert_eq!(header.flags.reboot(), sd::RebootFlag::Continuous);
+
+        let header_reboot = RawPayload::new_subscription_sd_header(
+            0x5B,
+            1,
+            1,
+            3,
+            0x01,
+            Ipv4Addr::LOCALHOST,
+            sd::TransportProtocol::Udp,
+            12345,
+            sd::RebootFlag::RecentlyRebooted,
+        );
+        assert_eq!(
+            header_reboot.flags.reboot(),
+            sd::RebootFlag::RecentlyRebooted
+        );
     }
 
     #[test]
@@ -372,7 +395,7 @@ mod tests {
             port: 30000,
         };
         let header = VecSdHeader {
-            flags: sd::Flags::new_sd(false),
+            flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
             entries: std::vec![offer],
             options: std::vec![endpoint],
         };
@@ -390,7 +413,7 @@ mod tests {
         entry.ttl = 0;
         let stop = sd::Entry::StopOfferService(entry);
         let header = VecSdHeader {
-            flags: sd::Flags::new_sd(false),
+            flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
             entries: std::vec![stop],
             options: std::vec![],
         };
@@ -405,7 +428,7 @@ mod tests {
     fn offered_endpoints_ignores_non_offer_entries() {
         let find = sd::Entry::FindService(sd::ServiceEntry::find(0x5B));
         let header = VecSdHeader {
-            flags: sd::Flags::new_sd(false),
+            flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
             entries: std::vec![find],
             options: std::vec![],
         };
@@ -419,7 +442,7 @@ mod tests {
         let find = sd::Entry::FindService(sd::ServiceEntry::find(0x5D));
         let sub = sd::Entry::SubscribeEventGroup(sd::EventGroupEntry::new(0x5B, 1, 1, 3, 0x01));
         let header = VecSdHeader {
-            flags: sd::Flags::new_sd(false),
+            flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
             entries: std::vec![offer, find, sub],
             options: std::vec![],
         };
@@ -441,7 +464,7 @@ mod tests {
     #[test]
     fn service_instances_empty_for_no_entries() {
         let header = VecSdHeader {
-            flags: sd::Flags::new_sd(false),
+            flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
             entries: std::vec![],
             options: std::vec![],
         };
@@ -452,7 +475,7 @@ mod tests {
     #[test]
     fn vec_sd_header_required_size_and_encode() {
         let header = VecSdHeader {
-            flags: sd::Flags::new_sd(false),
+            flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
             entries: std::vec![],
             options: std::vec![],
         };

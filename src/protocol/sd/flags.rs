@@ -1,6 +1,35 @@
 const REBOOT_FLAG: u8 = 0b1000_0000;
 const UNICAST_FLAG: u8 = 0b0100_0000;
 
+/// Whether the sender has recently rebooted, as encoded in the SOME/IP-SD flags byte.
+///
+/// Per AUTOSAR SOME/IP-SD, this flag is set to [`RebootFlag::RecentlyRebooted`] from
+/// startup until the session counter wraps from `0xFFFF` to `1`, then permanently
+/// cleared to [`RebootFlag::Continuous`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RebootFlag {
+    /// Sender has recently rebooted; session counter has not yet wrapped.
+    RecentlyRebooted,
+    /// Sender is running continuously; session counter has wrapped at least once.
+    Continuous,
+}
+
+impl From<bool> for RebootFlag {
+    fn from(b: bool) -> Self {
+        if b {
+            Self::RecentlyRebooted
+        } else {
+            Self::Continuous
+        }
+    }
+}
+
+impl From<RebootFlag> for bool {
+    fn from(r: RebootFlag) -> Self {
+        matches!(r, RebootFlag::RecentlyRebooted)
+    }
+}
+
 /// Flags byte in the SD protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Flags {
@@ -39,16 +68,16 @@ impl Flags {
     }
     /// Creates SD flags with unicast always set to `true`.
     #[must_use]
-    pub const fn new_sd(reboot: bool) -> Self {
+    pub fn new_sd(reboot: RebootFlag) -> Self {
         Self {
-            reboot,
+            reboot: bool::from(reboot),
             unicast: true,
         }
     }
-    /// Returns `true` if the reboot flag is set.
+    /// Returns the reboot flag.
     #[must_use]
-    pub const fn reboot(self) -> bool {
-        self.reboot
+    pub fn reboot(self) -> RebootFlag {
+        RebootFlag::from(self.reboot)
     }
     /// Returns `true` if the unicast flag is set.
     #[must_use]
@@ -63,15 +92,15 @@ mod tests {
 
     #[test]
     fn new_sd_sets_unicast_true() {
-        let flags = Flags::new_sd(false);
-        assert!(!flags.reboot());
+        let flags = Flags::new_sd(RebootFlag::Continuous);
+        assert_eq!(flags.reboot(), RebootFlag::Continuous);
         assert!(flags.unicast());
     }
 
     #[test]
     fn new_sd_with_reboot_true() {
-        let flags = Flags::new_sd(true);
-        assert!(flags.reboot());
+        let flags = Flags::new_sd(RebootFlag::RecentlyRebooted);
+        assert_eq!(flags.reboot(), RebootFlag::RecentlyRebooted);
         assert!(flags.unicast());
     }
 
