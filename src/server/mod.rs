@@ -100,9 +100,22 @@ impl Server {
     /// Like [`Self::new`], but with explicit control over multicast loopback.
     ///
     /// When `multicast_loopback` is `true`, SD messages sent by this server
-    /// are looped back to other sockets on the same host. This is required
-    /// when running both a server and a client/simulator on the same machine
-    /// for testing. Defaults to `false` in [`Self::new`].
+    /// are looped back to sockets on the same host — including this server's
+    /// own SD socket. This is required when running both a server and a
+    /// client/simulator on the same machine for testing. Defaults to `false`
+    /// in [`Self::new`].
+    ///
+    /// # Loopback caveat
+    ///
+    /// With loopback enabled, this server's SD receive loop (see
+    /// [`Self::run`]) will observe the `OfferService` announcements it just
+    /// sent. [`Self::run`] already ignores SD entry types that are
+    /// not `Subscribe` / `SubscribeAck` / `FindService`, so self-sent
+    /// offers are harmless. If this server has ever offered its own
+    /// service ID, any self-sent `FindService` for that same service would
+    /// also be answered with a unicast `OfferService` reply back to itself;
+    /// this is expected and symmetric with how an external peer's
+    /// `FindService` would be handled.
     ///
     /// # Errors
     ///
@@ -541,8 +554,14 @@ impl Server {
             // messages on the SD socket, so no source-IP filtering is needed.
             // When the server was constructed via `Server::new_with_loopback`
             // with `multicast_loopback = true` (e.g. for same-host testing),
-            // the kernel will deliver our own SD multicasts back to us here;
-            // callers are expected to tolerate or filter those.
+            // the kernel delivers our own SD multicasts back to this loop.
+            // That is tolerated here: `handle_sd_message` only acts on
+            // `Subscribe` / `SubscribeAck` / `FindService` entries, so the
+            // `OfferService` entries we send ourselves are effectively
+            // ignored. A self-sent `FindService` for our own service ID
+            // would trigger a unicast `OfferService` reply back to
+            // ourselves, which is the same behavior an external peer's
+            // `FindService` would produce and is therefore safe.
 
             tracing::trace!("Received {} bytes from {} on {} socket", len, addr, source);
             tracing::trace!("Raw data: {:02X?}", &data[..len.min(64_usize)]);
@@ -887,6 +906,30 @@ mod tests {
 
         let server: Result<Server, _> = Server::new(config).await;
         assert!(server.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_server_creation_with_loopback_enabled() {
+        // Use a unicast port distinct from other tests to avoid EADDRINUSE
+        // when the test binary runs tests in parallel. The SD socket binds
+        // the SD multicast port (30490) and relies on SO_REUSEPORT, the same
+        // as `test_server_creation`.
+        let config = ServerConfig::new(Ipv4Addr::new(127, 0, 0, 1), 30683, 0x5C, 1);
+
+        let server = Server::new_with_loopback(config, true)
+            .await
+            .expect("new_with_loopback(true) should succeed on localhost");
+
+        // Confirm the SD socket was actually configured with IP_MULTICAST_LOOP
+        // enabled — this is the behavior the new code path is supposed to
+        // produce and is what makes same-host testing possible.
+        let sock_ref = socket2::SockRef::from(&*server.sd_socket);
+        assert!(
+            sock_ref
+                .multicast_loop_v4()
+                .expect("multicast_loop_v4 getter should succeed"),
+            "multicast loopback should be enabled on the SD socket",
+        );
     }
 
     /// Helper: wrap an SD header in a SOME/IP SD message and return the bytes

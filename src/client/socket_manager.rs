@@ -80,10 +80,13 @@ where
         socket.set_reuse_port(true)?;
         socket.set_multicast_if_v4(&interface)?;
         // Control whether multicast packets sent by this socket are looped
-        // back to other sockets on the same host. Disabled by default to
-        // avoid parsing self-sent OfferService entries as peer offers.
-        // Enable for same-host testing (e.g. simulator + client on one
-        // machine).
+        // back to sockets on the same host — INCLUDING this socket itself.
+        // Disabled by default to avoid parsing self-sent OfferService /
+        // FindService entries as if they came from a peer. When enabled
+        // (e.g. for a same-host simulator + client setup), the kernel will
+        // deliver this socket's own SD multicasts back to it, so higher-level
+        // consumers must be prepared to see their own announcements surface
+        // as inbound discovery traffic.
         socket.set_multicast_loop_v4(multicast_loopback)?;
         socket.bind(&bind_addr.into())?;
         socket.set_nonblocking(true)?;

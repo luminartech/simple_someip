@@ -169,6 +169,23 @@ where
     /// are looped back to other sockets on the same host. This is required
     /// when running both a client and a server/simulator on the same machine
     /// for testing. Defaults to `false` in [`Self::new`].
+    ///
+    /// # Loopback caveat
+    ///
+    /// With loopback enabled, the client's own discovery socket also receives
+    /// the multicast SD traffic this client sends (e.g. `FindService` probes
+    /// and periodic `OfferService` announcements driven by
+    /// [`Self::start_sd_announcements`]). Those self-sent messages are parsed
+    /// the same as any other inbound SD traffic, so callers may observe:
+    ///
+    /// - [`ClientUpdate::DiscoveryUpdated`] events originating from this
+    ///   client's own IP/port, and
+    /// - self-advertised services appearing in the internal discovery
+    ///   registry.
+    ///
+    /// Consumers of [`ClientUpdates`] that need to ignore self-sent SD should
+    /// filter on source address (the sender's IP/port is included on the
+    /// update).
     #[must_use]
     pub fn new_with_loopback(
         interface: Ipv4Addr,
