@@ -49,39 +49,3 @@ pub enum Error {
     IncorrectEntriesSize(usize),
 }
 
-#[cfg(not(feature = "std"))]
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::InvalidEntryType(v) => {
-                write!(f, "Invalid value for Service Discovery entry type: {v:X}")
-            }
-            Self::InvalidOptionType(v) => {
-                write!(f, "Invalid value for Service Discovery Option Type: {v:X}")
-            }
-            Self::InvalidOptionTransportProtocol(v) => write!(
-                f,
-                "Invalid value for Service Discovery Option Transport Protocol: {v:X}"
-            ),
-            Self::IncorrectOptionsSize(v) => {
-                write!(f, "Incorrect options size, {v} bytes remaining")
-            }
-            Self::InvalidOptionLength {
-                option_type,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "Invalid SD option length for type 0x{option_type:02X}: expected {expected}, got {actual}"
-            ),
-            Self::ConfigurationStringTooLong(v) => {
-                write!(f, "Configuration string too long: {v} bytes")
-            }
-            Self::InvalidMessage(msg) => write!(f, "Invalid SD message: {msg}"),
-            Self::IncorrectEntriesSize(v) => write!(
-                f,
-                "Entries array length {v} is not a multiple of entry size (16)"
-            ),
-        }
-    }
-}

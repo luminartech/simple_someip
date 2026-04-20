@@ -18,13 +18,3 @@ pub enum Error {
     },
 }
 
-#[cfg(not(feature = "std"))]
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::BufferTooSmall { needed, actual } => {
-                write!(f, "output buffer too small: need {needed} bytes, got {actual}")
-            }
-        }
-    }
-}

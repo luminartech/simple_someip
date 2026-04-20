@@ -28,22 +28,6 @@ pub enum Error {
     Sd(#[cfg_attr(feature = "std", from)] super::sd::Error),
 }
 
-#[cfg(not(feature = "std"))]
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Io(kind) => write!(f, "I/O error: {kind:?}"),
-            Self::UnexpectedEof => write!(f, "Unexpected end of input"),
-            Self::InvalidProtocolVersion(v) => write!(f, "Invalid protocol version: {v:X}"),
-            Self::InvalidMessageTypeField(v) => {
-                write!(f, "Invalid value in MessageType field: {v:X}")
-            }
-            Self::InvalidReturnCode(v) => write!(f, "Invalid value in ReturnCode field: {v:X}"),
-            Self::UnsupportedMessageID(id) => write!(f, "Unsupported MessageID {id:X?}"),
-            Self::Sd(e) => write!(f, "{e}"),
-        }
-    }
-}
 
 #[cfg(not(feature = "std"))]
 impl From<super::sd::Error> for Error {
