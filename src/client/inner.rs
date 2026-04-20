@@ -233,6 +233,10 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     client_id: u16,
     /// Incrementing session counter for SOME/IP request headers (lower 16 bits of request ID)
     session_counter: u16,
+    /// SD session state persisted across discovery socket rebinds so that
+    /// unbind_discovery + bind_discovery does not emit a false reboot signal.
+    sd_session_id: u16,
+    sd_session_has_wrapped: bool,
     /// Shared E2E registry for runtime E2E configuration
     e2e_registry: Arc<Mutex<E2ERegistry>>,
     /// Enable multicast loopback on SD sockets for same-host testing
@@ -281,6 +285,8 @@ where
             run: true,
             client_id: 0x1234,
             session_counter: 1,
+            sd_session_id: 1,
+            sd_session_has_wrapped: false,
             e2e_registry,
             multicast_loopback,
             phantom: std::marker::PhantomData,
@@ -293,9 +299,11 @@ where
         if self.discovery_socket.is_some() {
             Ok(())
         } else {
-            let socket = SocketManager::bind_discovery(
+            let socket = SocketManager::bind_discovery_seeded(
                 self.interface,
                 Arc::clone(&self.e2e_registry),
+                self.sd_session_id,
+                self.sd_session_has_wrapped,
                 self.multicast_loopback,
             )?;
             self.discovery_socket = Some(socket);
@@ -306,8 +314,10 @@ where
     // Dropping the receiver kills the loop
     async fn unbind_discovery(&mut self) {
         debug!("Unbinding Discovery socket.");
-        if let Some(socket_manger) = self.discovery_socket.take() {
-            socket_manger.shut_down().await;
+        if let Some(socket) = self.discovery_socket.take() {
+            self.sd_session_id = socket.session_id();
+            self.sd_session_has_wrapped = !socket.reboot_flag();
+            socket.shut_down().await;
         }
     }
 

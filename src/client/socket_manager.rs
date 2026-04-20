@@ -53,7 +53,7 @@ pub struct SocketManager<PayloadDefinitions> {
     sender: mpsc::Sender<SendMessage<PayloadDefinitions>>,
     local_port: u16,
     session_id: u16,
-    /// Set to true once session_id has wrapped from 0xFFFF → 1.
+    /// Set to true once `session_id` has wrapped from 0xFFFF → 1.
     /// Per AUTOSAR SOME/IP-SD, the reboot flag must be cleared after the
     /// first counter wrap and stay cleared.
     session_has_wrapped: bool,
@@ -63,9 +63,18 @@ impl<MessageDefinitions> SocketManager<MessageDefinitions>
 where
     MessageDefinitions: PayloadWireFormat + 'static,
 {
-    pub fn bind_discovery(
+    /// Binds the discovery socket, seeding the session counter and wrap
+    /// state from a previous socket.
+    ///
+    /// When rebinding after `unbind_discovery`, callers should pass through
+    /// the `session_id` / `session_has_wrapped` observed on the prior socket
+    /// to avoid emitting a false reboot signal (reboot_flag=1) to peers. A
+    /// fresh client should pass `session_id = 1, session_has_wrapped = false`.
+    pub fn bind_discovery_seeded(
         interface: Ipv4Addr,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
+        session_id: u16,
+        session_has_wrapped: bool,
         multicast_loopback: bool,
     ) -> Result<Self, Error> {
         let (rx_tx, rx_rx) = mpsc::channel(16);
@@ -104,8 +113,8 @@ where
             receiver: rx_rx,
             sender: tx_tx,
             local_port: sd::MULTICAST_PORT,
-            session_id: 0,
-            session_has_wrapped: false,
+            session_id,
+            session_has_wrapped,
         })
     }
 
@@ -131,7 +140,7 @@ where
             receiver: rx_rx,
             sender: tx_tx,
             local_port: port,
-            session_id: 0,
+            session_id: 1,
             session_has_wrapped: false,
         })
     }
@@ -336,7 +345,7 @@ mod tests {
     async fn test_bind_ephemeral_port() {
         let sm = TestSocketManager::bind(0, test_registry()).unwrap();
         assert!(sm.port() > 0);
-        assert_eq!(sm.session_id(), 0);
+        assert_eq!(sm.session_id(), 1);
     }
 
     #[tokio::test]
@@ -429,12 +438,12 @@ mod tests {
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_port);
         let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
         sm.send(target, msg).await.unwrap();
-        assert_eq!(sm.session_id(), 1);
+        assert_eq!(sm.session_id(), 2);
 
         // Second send increments session
         let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
         sm.send(target, msg).await.unwrap();
-        assert_eq!(sm.session_id(), 2);
+        assert_eq!(sm.session_id(), 3);
     }
 
     #[tokio::test]
@@ -478,7 +487,7 @@ mod tests {
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_port);
 
         sm.send(target, msg.clone()).await.unwrap();
-        assert_eq!(sm.session_id(), 1);
+        assert_eq!(sm.session_id(), 2);
 
         // Verify the raw socket received data
         let mut recv_buf = vec![0u8; 1400];
