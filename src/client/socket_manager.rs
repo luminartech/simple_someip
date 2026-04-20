@@ -63,13 +63,10 @@ impl<MessageDefinitions> SocketManager<MessageDefinitions>
 where
     MessageDefinitions: PayloadWireFormat + 'static,
 {
-    /// Binds the discovery socket, seeding the session counter and wrap
-    /// state from a previous socket.
-    ///
-    /// When rebinding after `unbind_discovery`, callers should pass through
-    /// the `session_id` / `session_has_wrapped` observed on the prior socket
-    /// to avoid emitting a false reboot signal (reboot_flag=1) to peers. A
-    /// fresh client should pass `session_id = 1, session_has_wrapped = false`.
+    /// Bind the SD multicast socket, seeding the session counter and wrap state from
+    /// a previous socket when rebinding. Pass `(1, false)` for a fresh bind.
+    /// Preserving state across rebinds avoids emitting a false reboot signal
+    /// (`reboot_flag=1`) to peers after `unbind_discovery` + `bind_discovery`.
     pub fn bind_discovery_seeded(
         interface: Ipv4Addr,
         e2e_registry: Arc<Mutex<E2ERegistry>>,

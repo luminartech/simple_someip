@@ -234,7 +234,7 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     /// Incrementing session counter for SOME/IP request headers (lower 16 bits of request ID)
     session_counter: u16,
     /// SD session state persisted across discovery socket rebinds so that
-    /// unbind_discovery + bind_discovery does not emit a false reboot signal.
+    /// `unbind_discovery` + `bind_discovery` does not emit a false reboot signal.
     sd_session_id: u16,
     sd_session_has_wrapped: bool,
     /// Shared E2E registry for runtime E2E configuration
