@@ -247,7 +247,11 @@ mod tests {
         };
         let entries = [entry];
         let options = [endpoint];
-        let h = Header::new(Flags::new_sd(RebootFlag::Continuous), &entries, &options);
+        let h = Header::new(
+            Flags::new_sd(RebootFlag::RecentlyRebooted),
+            &entries,
+            &options,
+        );
         assert_eq!(h.required_size(), 40);
         let mut buf = [0u8; 64];
         h.encode(&mut buf.as_mut_slice()).unwrap();
@@ -290,7 +294,11 @@ mod tests {
         };
         let entries = [entry];
         let options = [endpoint];
-        let h = Header::new(Flags::new_sd(RebootFlag::Continuous), &entries, &options);
+        let h = Header::new(
+            Flags::new_sd(RebootFlag::RecentlyRebooted),
+            &entries,
+            &options,
+        );
         let mut buf = [0u8; 64];
         let n = h.encode(&mut buf.as_mut_slice()).unwrap();
         let view = SdHeaderView::parse(&buf[..n]).unwrap();
@@ -329,7 +337,7 @@ mod tests {
             Entry::FindService(ServiceEntry::find(0x0001)),
             Entry::FindService(ServiceEntry::find(0x0002)),
         ];
-        let h = Header::new(Flags::new_sd(RebootFlag::Continuous), &entries, &[]);
+        let h = Header::new(Flags::new_sd(RebootFlag::RecentlyRebooted), &entries, &[]);
         let mut buf = [0u8; 64];
         h.encode(&mut buf.as_mut_slice()).unwrap();
         let view = SdHeaderView::parse(&buf[..h.required_size()]).unwrap();

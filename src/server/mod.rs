@@ -998,7 +998,7 @@ mod tests {
         let entries = [entry];
         let options = [endpoint];
         let sd_header = sd::Header::new(
-            Flags::new_sd(sd::RebootFlag::Continuous),
+            Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
             &entries,
             &options,
         );
@@ -1167,7 +1167,7 @@ mod tests {
         let find_entry = Entry::FindService(ServiceEntry::find(0x5B));
         let find_entries = [find_entry];
         let sd_header = sd::Header::new(
-            Flags::new_sd(sd::RebootFlag::Continuous),
+            Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
             &find_entries,
             &[],
         );
@@ -1218,7 +1218,7 @@ mod tests {
         let find_entry = Entry::FindService(ServiceEntry::find(0xFFFF));
         let find_entries = [find_entry];
         let sd_header = sd::Header::new(
-            Flags::new_sd(sd::RebootFlag::Continuous),
+            Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
             &find_entries,
             &[],
         );
@@ -1265,7 +1265,7 @@ mod tests {
         let find_entry = Entry::FindService(ServiceEntry::find(0x99));
         let find_entries = [find_entry];
         let sd_header = sd::Header::new(
-            Flags::new_sd(sd::RebootFlag::Continuous),
+            Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
             &find_entries,
             &[],
         );
@@ -1851,7 +1851,7 @@ mod tests {
             },
         ];
         let sd_header = sd::Header::new(
-            sd::Flags::new_sd(sd::RebootFlag::Continuous),
+            sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
             &entries,
             &options,
         );

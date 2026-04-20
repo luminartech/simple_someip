@@ -77,7 +77,7 @@ fn build_sd_header(interface: Ipv4Addr) -> VecSdHeader {
     };
 
     VecSdHeader {
-        flags: Flags::new_sd(RebootFlag::Continuous),
+        flags: Flags::new_sd(RebootFlag::RecentlyRebooted),
         entries: vec![find_remote, offer_mine],
         options: vec![endpoint],
     }

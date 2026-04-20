@@ -114,7 +114,7 @@ impl PayloadWireFormat for TestPayload {
 
 pub(crate) fn empty_sd_header() -> TestSdHeader {
     TestSdHeader {
-        flags: sd::Flags::new_sd(sd::RebootFlag::Continuous),
+        flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
         entries: heapless::Vec::new(),
         options: heapless::Vec::new(),
     }
@@ -141,7 +141,11 @@ mod tests {
 
     #[test]
     fn from_payload_bytes_sd_parses_correctly() {
-        let header = sd::Header::new(sd::Flags::new_sd(sd::RebootFlag::Continuous), &[], &[]);
+        let header = sd::Header::new(
+            sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+            &[],
+            &[],
+        );
         let mut buf = [0u8; 64];
         let n = header.encode(&mut buf.as_mut_slice()).unwrap();
         let payload =

@@ -43,7 +43,10 @@
 //!
 //! // Build an SD header with a FindService entry
 //! let entries = [Entry::FindService(ServiceEntry::find(0x1234))];
-//! let sd_header = sd::Header::new(sd::Flags::new_sd(RebootFlag::Continuous), &entries, &[]);
+//! // A fresh process should set RebootFlag::RecentlyRebooted until its
+//! // session counter wraps past 0xFFFF for the first time.
+//! let sd_header =
+//!     sd::Header::new(sd::Flags::new_sd(RebootFlag::RecentlyRebooted), &entries, &[]);
 //!
 //! // Encode to bytes
 //! let mut buf = [0u8; 64];

@@ -1465,7 +1465,7 @@ mod tests {
                 .expect("timed out waiting for first SD message")
                 .unwrap();
         let first = MessageView::parse(&buf[..len]).unwrap();
-        let session_id_before = first.header().request_id() as u16;
+        let session_id_before = (first.header().request_id() & 0xFFFF) as u16;
         let reboot_flag_before = first.sd_header().unwrap().flags().reboot();
         assert!(session_id_before >= 1, "session_id must never be 0");
 
@@ -1489,7 +1489,7 @@ mod tests {
                 .expect("timed out waiting for second SD message")
                 .unwrap();
         let second = MessageView::parse(&buf[..len]).unwrap();
-        let session_id_after = second.header().request_id() as u16;
+        let session_id_after = (second.header().request_id() & 0xFFFF) as u16;
         let reboot_flag_after = second.sd_header().unwrap().flags().reboot();
 
         assert!(
