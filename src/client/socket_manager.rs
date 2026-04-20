@@ -512,6 +512,7 @@ mod tests {
             test_registry(),
             0,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(sm.session_id(), 1, "session_id 0 must be normalized to 1");

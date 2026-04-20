@@ -1443,6 +1443,7 @@ mod tests {
         let (control_sender, _update_receiver) = Inner::<TestPayload>::spawn(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
+            false,
         );
 
         let raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
