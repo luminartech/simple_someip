@@ -80,7 +80,7 @@ impl SessionTracker {
                     && !(prev.last_session_id == u16::MAX && session_id <= 1)
                 {
                     // Session ID decreased within the same service instance
-                    // while reboot flag stays 1 — this is a reboot.
+                    // while reboot flag stays `RecentlyRebooted`` — this is a reboot.
                     // Exception: 0xFFFF→1 is the spec-compliant counter wrap; 0xFFFF→0
                     // is tolerated for non-compliant implementations. Neither is a reboot.
                     SessionVerdict::Reboot
