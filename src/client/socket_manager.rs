@@ -505,8 +505,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_bind_discovery_seeded_normalizes_zero_session_id() {
+    #[tokio::test]
+    async fn test_bind_discovery_seeded_normalizes_zero_session_id() {
         let sm = TestSocketManager::bind_discovery_seeded(
             Ipv4Addr::LOCALHOST,
             test_registry(),
