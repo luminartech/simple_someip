@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.6.0](https://github.com/luminartech/simple_someip/compare/v0.5.3...v0.6.0) - 2026-04-20
+
+### Other
+
+- Responding to more PR comments
+- Forward multicast_loopback through seeded discovery bind
+- Fix async unit test behavior
+- Responding to PR feedback.
+- Fixing busted tests / removing any references to reboot as a bool
+- Even more linting
+- Responding to PR Feedback; converted RebootFlag to an enum
+- Even more linting
+- Default session ID to 1 and not 0
+- Linting
+- Adding additional test coverage around reboot flags
+- Socket manager can track when to change the reboot flag.
+- Bump to 0.6.0 and fix linting
+- Bump SemVer, fix unit tests.
+- Add a reboot flag and properly apply it for someip reconnections
+- Respond to PR Feedback
+- Add line coverage for discovery with loopback.
+- Fix cargo and dont break the 0.5 interface
+- Add loopback support for simple someip.
+
 ## [0.5.3](https://github.com/luminartech/simple_someip/compare/v0.5.2...v0.5.3) - 2026-04-15
 
 ### Other
