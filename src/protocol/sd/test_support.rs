@@ -86,7 +86,7 @@ impl PayloadWireFormat for TestPayload {
         client_ip: std::net::Ipv4Addr,
         protocol: sd::TransportProtocol,
         client_port: u16,
-        reboot_flag: bool,
+        reboot_flag: sd::RebootFlag,
     ) -> TestSdHeader {
         let entry = sd::Entry::SubscribeEventGroup(sd::EventGroupEntry::new(
             service_id,
@@ -114,7 +114,7 @@ impl PayloadWireFormat for TestPayload {
 
 pub(crate) fn empty_sd_header() -> TestSdHeader {
     TestSdHeader {
-        flags: sd::Flags::new_sd(false),
+        flags: sd::Flags::new_sd(sd::RebootFlag::Continuous),
         entries: heapless::Vec::new(),
         options: heapless::Vec::new(),
     }
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn from_payload_bytes_sd_parses_correctly() {
-        let header = sd::Header::new(sd::Flags::new_sd(false), &[], &[]);
+        let header = sd::Header::new(sd::Flags::new_sd(sd::RebootFlag::Continuous), &[], &[]);
         let mut buf = [0u8; 64];
         let n = header.encode(&mut buf.as_mut_slice()).unwrap();
         let payload =
@@ -161,11 +161,11 @@ mod tests {
             std::net::Ipv4Addr::LOCALHOST,
             sd::TransportProtocol::Udp,
             12345,
-            false,
+            sd::RebootFlag::Continuous,
         );
         assert_eq!(header.entries.len(), 1);
         assert_eq!(header.options.len(), 1);
-        assert!(!header.flags.reboot());
+        assert_eq!(header.flags.reboot(), sd::RebootFlag::Continuous);
 
         let header_reboot = TestPayload::new_subscription_sd_header(
             0x5B,
@@ -176,9 +176,12 @@ mod tests {
             std::net::Ipv4Addr::LOCALHOST,
             sd::TransportProtocol::Udp,
             12345,
-            true,
+            sd::RebootFlag::RecentlyRebooted,
         );
-        assert!(header_reboot.flags.reboot());
+        assert_eq!(
+            header_reboot.flags.reboot(),
+            sd::RebootFlag::RecentlyRebooted
+        );
     }
 
     #[cfg(feature = "std")]

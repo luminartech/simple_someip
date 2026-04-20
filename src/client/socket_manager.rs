@@ -110,7 +110,7 @@ where
             receiver: rx_rx,
             sender: tx_tx,
             local_port: sd::MULTICAST_PORT,
-            session_id,
+            session_id: session_id.max(1),
             session_has_wrapped,
         })
     }
@@ -166,10 +166,11 @@ where
 
     /// Returns the SD reboot flag value to use in outgoing SD messages.
     ///
-    /// Per AUTOSAR SOME/IP-SD, the reboot flag is `true` from startup until
-    /// the session counter wraps from `0xFFFF` to `1`, then `false` permanently.
-    pub fn reboot_flag(&self) -> bool {
-        !self.session_has_wrapped
+    /// Per AUTOSAR SOME/IP-SD, this is [`RebootFlag::RecentlyRebooted`] from startup
+    /// until the session counter wraps from `0xFFFF` to `1`, then
+    /// [`RebootFlag::Continuous`] permanently.
+    pub fn reboot_flag(&self) -> crate::protocol::sd::RebootFlag {
+        crate::protocol::sd::RebootFlag::from(!self.session_has_wrapped)
     }
 
     pub async fn receive(&mut self) -> Option<Result<ReceivedMessage<MessageDefinitions>, Error>> {
@@ -504,6 +505,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_bind_discovery_seeded_normalizes_zero_session_id() {
+        let sm = TestSocketManager::bind_discovery_seeded(
+            Ipv4Addr::LOCALHOST,
+            test_registry(),
+            0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(sm.session_id(), 1, "session_id 0 must be normalized to 1");
+    }
+
     #[tokio::test]
     async fn test_session_id_wraps_to_one_and_clears_reboot_flag() {
         let mut sm = TestSocketManager::bind(0, test_registry()).unwrap();
@@ -512,23 +525,24 @@ mod tests {
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_socket.local_addr().unwrap().port());
         let msg = || Message::<TestPayload>::new_sd(1, &empty_sd_header());
 
+        use crate::protocol::sd::RebootFlag;
         // Set session_id to one before the wrap point
         sm.session_id = u16::MAX - 1;
-        assert!(sm.reboot_flag(), "reboot flag should be true before wrap");
+        assert_eq!(sm.reboot_flag(), RebootFlag::RecentlyRebooted, "reboot flag should be RecentlyRebooted before wrap");
 
         // Send one message: session_id reaches MAX
         sm.send(target, msg()).await.unwrap();
         assert_eq!(sm.session_id(), u16::MAX);
-        assert!(sm.reboot_flag(), "reboot flag should still be true at MAX");
+        assert_eq!(sm.reboot_flag(), RebootFlag::RecentlyRebooted, "reboot flag should still be RecentlyRebooted at MAX");
 
         // Send one more: triggers the wrap, session_id becomes 1
         sm.send(target, msg()).await.unwrap();
         assert_eq!(sm.session_id(), 1, "session_id should wrap to 1, not 0");
-        assert!(!sm.reboot_flag(), "reboot flag should be false after wrap");
+        assert_eq!(sm.reboot_flag(), RebootFlag::Continuous, "reboot flag should be Continuous after wrap");
 
         // Subsequent sends continue incrementing normally from 1
         sm.send(target, msg()).await.unwrap();
         assert_eq!(sm.session_id(), 2);
-        assert!(!sm.reboot_flag(), "reboot flag stays false after wrap");
+        assert_eq!(sm.reboot_flag(), RebootFlag::Continuous, "reboot flag stays Continuous after wrap");
     }
 }

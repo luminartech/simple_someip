@@ -22,7 +22,7 @@ pub use entry::{
     Entry, EntryIter, EntryType, EntryView, EventGroupEntry, OptionsCount, ServiceEntry,
 };
 pub use error::Error;
-pub use flags::Flags;
+pub use flags::{Flags, RebootFlag};
 pub use header::{Header, SdHeaderView};
 pub use options::{
     MAX_CONFIGURATION_STRING_LENGTH, OptionIter, OptionType, OptionView, Options,

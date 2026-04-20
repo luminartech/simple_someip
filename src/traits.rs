@@ -98,7 +98,7 @@ pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
         client_ip: std::net::Ipv4Addr,
         protocol: sd::TransportProtocol,
         client_port: u16,
-        reboot_flag: bool,
+        reboot_flag: sd::RebootFlag,
     ) -> Self::SdHeader;
 
     /// Extract offered/stopped service endpoints from this SD payload.
