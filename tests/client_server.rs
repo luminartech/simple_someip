@@ -59,7 +59,10 @@ async fn test_client_server_subscribe_and_receive_event() {
     let (client, mut updates) = TestClient::new(Ipv4Addr::LOCALHOST);
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
-    client.subscribe(0x5B, 1, 1, 3, 0x01, 0, false).await.unwrap();
+    client
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .await
+        .unwrap();
 
     assert!(
         wait_for_subscribers(&publisher, 0x5B, 1, 0x01).await,
@@ -136,7 +139,10 @@ async fn test_client_bind_unbind_lifecycle_with_server() {
     client.bind_discovery().await.unwrap();
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
-    client.subscribe(0x5B, 1, 1, 3, 0x01, 0, false).await.unwrap();
+    client
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .await
+        .unwrap();
 
     // Unbind and rebind discovery — covers unbind_discovery + re-bind path
     client.unbind_discovery().await.unwrap();
@@ -166,7 +172,10 @@ async fn test_add_endpoint_and_send_to_service() {
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
 
     // Subscribe to server's event group (auto-binds unicast internally)
-    client.subscribe(0x5B, 1, 1, 3, 0x01, 0, false).await.unwrap();
+    client
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .await
+        .unwrap();
 
     // Wait for the server to process the subscription
     assert!(
@@ -222,7 +231,10 @@ async fn test_subscribe_auto_binds_discovery() {
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     // Subscribe should auto-bind discovery internally
-    client.subscribe(0x5B, 1, 1, 3, 0x01, 0, false).await.unwrap();
+    client
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .await
+        .unwrap();
 
     assert!(
         wait_for_subscribers(&publisher, 0x5B, 1, 0x01).await,
@@ -263,7 +275,10 @@ async fn test_client_request_resolves_via_unicast_reply() {
     let (client, mut updates) = TestClient::new(Ipv4Addr::LOCALHOST);
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
-    client.subscribe(0x5B, 1, 1, 3, 0x01, 0, false).await.unwrap();
+    client
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .await
+        .unwrap();
 
     assert!(
         wait_for_subscribers(&publisher, 0x5B, 1, 0x01).await,
@@ -328,7 +343,10 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
 
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
-    client.subscribe(0x5B, 1, 1, 3, 0x01, 0, false).await.unwrap();
+    client
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .await
+        .unwrap();
 
     assert!(
         wait_for_subscribers(&publisher, 0x5B, 1, 0x01).await,
@@ -387,12 +405,18 @@ async fn test_multiple_subscribers_receive_events() {
     // Client 1
     let (client1, mut updates1) = TestClient::new(Ipv4Addr::LOCALHOST);
     client1.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
-    client1.subscribe(0x5B, 1, 1, 3, 0x01, 0, false).await.unwrap();
+    client1
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .await
+        .unwrap();
 
     // Client 2
     let (client2, mut updates2) = TestClient::new(Ipv4Addr::LOCALHOST);
     client2.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
-    client2.subscribe(0x5B, 1, 1, 3, 0x01, 0, false).await.unwrap();
+    client2
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .await
+        .unwrap();
 
     // Wait for both subscribers
     for _ in 0..40 {
@@ -464,7 +488,10 @@ async fn test_cloned_client_works() {
     // Both clones can send commands
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
-    client2.subscribe(0x5B, 1, 1, 3, 0x01, 0, false).await.unwrap();
+    client2
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .await
+        .unwrap();
 
     client.shut_down();
     // client2 is also dropped
