@@ -528,21 +528,37 @@ mod tests {
         use crate::protocol::sd::RebootFlag;
         // Set session_id to one before the wrap point
         sm.session_id = u16::MAX - 1;
-        assert_eq!(sm.reboot_flag(), RebootFlag::RecentlyRebooted, "reboot flag should be RecentlyRebooted before wrap");
+        assert_eq!(
+            sm.reboot_flag(),
+            RebootFlag::RecentlyRebooted,
+            "reboot flag should be RecentlyRebooted before wrap"
+        );
 
         // Send one message: session_id reaches MAX
         sm.send(target, msg()).await.unwrap();
         assert_eq!(sm.session_id(), u16::MAX);
-        assert_eq!(sm.reboot_flag(), RebootFlag::RecentlyRebooted, "reboot flag should still be RecentlyRebooted at MAX");
+        assert_eq!(
+            sm.reboot_flag(),
+            RebootFlag::RecentlyRebooted,
+            "reboot flag should still be RecentlyRebooted at MAX"
+        );
 
         // Send one more: triggers the wrap, session_id becomes 1
         sm.send(target, msg()).await.unwrap();
         assert_eq!(sm.session_id(), 1, "session_id should wrap to 1, not 0");
-        assert_eq!(sm.reboot_flag(), RebootFlag::Continuous, "reboot flag should be Continuous after wrap");
+        assert_eq!(
+            sm.reboot_flag(),
+            RebootFlag::Continuous,
+            "reboot flag should be Continuous after wrap"
+        );
 
         // Subsequent sends continue incrementing normally from 1
         sm.send(target, msg()).await.unwrap();
         assert_eq!(sm.session_id(), 2);
-        assert_eq!(sm.reboot_flag(), RebootFlag::Continuous, "reboot flag stays Continuous after wrap");
+        assert_eq!(
+            sm.reboot_flag(),
+            RebootFlag::Continuous,
+            "reboot flag stays Continuous after wrap"
+        );
     }
 }
