@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/luminartech/simple_someip/compare/v0.6.0...v0.6.1) - 2026-04-20
+
+### Other
+
+- Update CHANGELOG.md
+- release v0.5.4
+
 ## [0.6.0](https://github.com/luminartech/simple_someip/compare/v0.5.3...v0.6.0) - 2026-04-20
 
 ### Other
