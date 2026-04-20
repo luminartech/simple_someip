@@ -502,7 +502,8 @@ mod tests {
     async fn test_session_id_wraps_to_one_and_clears_reboot_flag() {
         let mut sm = TestSocketManager::bind(0, test_registry()).unwrap();
         let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_socket.local_addr().unwrap().port());
+        let target =
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_socket.local_addr().unwrap().port());
         let msg = || Message::<TestPayload>::new_sd(1, &empty_sd_header());
 
         // Set session_id to one before the wrap point
