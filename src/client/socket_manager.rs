@@ -53,6 +53,10 @@ pub struct SocketManager<PayloadDefinitions> {
     sender: mpsc::Sender<SendMessage<PayloadDefinitions>>,
     local_port: u16,
     session_id: u16,
+    /// Set to true once session_id has wrapped from 0xFFFF → 1.
+    /// Per AUTOSAR SOME/IP-SD, the reboot flag must be cleared after the
+    /// first counter wrap and stay cleared.
+    session_has_wrapped: bool,
 }
 
 impl<MessageDefinitions> SocketManager<MessageDefinitions>
@@ -101,6 +105,7 @@ where
             sender: tx_tx,
             local_port: sd::MULTICAST_PORT,
             session_id: 0,
+            session_has_wrapped: false,
         })
     }
 
@@ -127,6 +132,7 @@ where
             sender: tx_tx,
             local_port: port,
             session_id: 0,
+            session_has_wrapped: false,
         })
     }
 
@@ -143,8 +149,21 @@ where
         result_channel
             .await
             .expect("Socket manager must always return result of send before dropping channel")?;
-        self.session_id += 1;
+        if self.session_id == u16::MAX {
+            self.session_id = 1;
+            self.session_has_wrapped = true;
+        } else {
+            self.session_id += 1;
+        }
         Ok(())
+    }
+
+    /// Returns the SD reboot flag value to use in outgoing SD messages.
+    ///
+    /// Per AUTOSAR SOME/IP-SD, the reboot flag is `true` from startup until
+    /// the session counter wraps from `0xFFFF` to `1`, then `false` permanently.
+    pub fn reboot_flag(&self) -> bool {
+        !self.session_has_wrapped
     }
 
     pub async fn receive(&mut self) -> Option<Result<ReceivedMessage<MessageDefinitions>, Error>> {
@@ -477,5 +496,32 @@ mod tests {
             view.header().to_owned().message_id(),
             msg.header().message_id()
         );
+    }
+
+    #[tokio::test]
+    async fn test_session_id_wraps_to_one_and_clears_reboot_flag() {
+        let mut sm = TestSocketManager::bind(0, test_registry()).unwrap();
+        let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_socket.local_addr().unwrap().port());
+        let msg = || Message::<TestPayload>::new_sd(1, &empty_sd_header());
+
+        // Set session_id to one before the wrap point
+        sm.session_id = u16::MAX - 1;
+        assert!(sm.reboot_flag(), "reboot flag should be true before wrap");
+
+        // Send one message: session_id reaches MAX
+        sm.send(target, msg()).await.unwrap();
+        assert_eq!(sm.session_id(), u16::MAX);
+        assert!(sm.reboot_flag(), "reboot flag should still be true at MAX");
+
+        // Send one more: triggers the wrap, session_id becomes 1
+        sm.send(target, msg()).await.unwrap();
+        assert_eq!(sm.session_id(), 1, "session_id should wrap to 1, not 0");
+        assert!(!sm.reboot_flag(), "reboot flag should be false after wrap");
+
+        // Subsequent sends continue incrementing normally from 1
+        sm.send(target, msg()).await.unwrap();
+        assert_eq!(sm.session_id(), 2);
+        assert!(!sm.reboot_flag(), "reboot flag stays false after wrap");
     }
 }

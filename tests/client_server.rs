@@ -60,7 +60,7 @@ async fn test_client_server_subscribe_and_receive_event() {
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client
-        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0)
         .await
         .unwrap();
 
@@ -140,7 +140,7 @@ async fn test_client_bind_unbind_lifecycle_with_server() {
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client
-        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0)
         .await
         .unwrap();
 
@@ -173,7 +173,7 @@ async fn test_add_endpoint_and_send_to_service() {
 
     // Subscribe to server's event group (auto-binds unicast internally)
     client
-        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0)
         .await
         .unwrap();
 
@@ -232,7 +232,7 @@ async fn test_subscribe_auto_binds_discovery() {
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     // Subscribe should auto-bind discovery internally
     client
-        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0)
         .await
         .unwrap();
 
@@ -276,7 +276,7 @@ async fn test_client_request_resolves_via_unicast_reply() {
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client
-        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0)
         .await
         .unwrap();
 
@@ -344,7 +344,7 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client
-        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0)
         .await
         .unwrap();
 
@@ -406,7 +406,7 @@ async fn test_multiple_subscribers_receive_events() {
     let (client1, mut updates1) = TestClient::new(Ipv4Addr::LOCALHOST);
     client1.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client1
-        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0)
         .await
         .unwrap();
 
@@ -414,7 +414,7 @@ async fn test_multiple_subscribers_receive_events() {
     let (client2, mut updates2) = TestClient::new(Ipv4Addr::LOCALHOST);
     client2.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client2
-        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0)
         .await
         .unwrap();
 
@@ -489,7 +489,7 @@ async fn test_cloned_client_works() {
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client2
-        .subscribe(0x5B, 1, 1, 3, 0x01, 0, false)
+        .subscribe(0x5B, 1, 1, 3, 0x01, 0)
         .await
         .unwrap();
 
@@ -512,12 +512,12 @@ async fn test_subscribe_specific_port_reuse() {
     // Use specific port
     let specific_port = 44444;
     client
-        .subscribe(0x5B, 1, 1, 3, 0x01, specific_port, false)
+        .subscribe(0x5B, 1, 1, 3, 0x01, specific_port)
         .await
         .unwrap();
     // Second subscribe reuses the port
     client
-        .subscribe(0x5B, 1, 1, 3, 0x02, specific_port, false)
+        .subscribe(0x5B, 1, 1, 3, 0x02, specific_port)
         .await
         .unwrap();
 

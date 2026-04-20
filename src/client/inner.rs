@@ -62,7 +62,6 @@ pub(super) enum ControlMessage<P: PayloadWireFormat> {
         ttl: u32,
         event_group_id: u16,
         client_port: u16,
-        reboot_flag: bool,
         response: oneshot::Sender<Result<(), Error>>,
     },
 }
@@ -191,7 +190,6 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
         ttl: u32,
         event_group_id: u16,
         client_port: u16,
-        reboot_flag: bool,
     ) -> (oneshot::Receiver<Result<(), Error>>, Self) {
         let (sender, receiver) = oneshot::channel();
         (
@@ -203,7 +201,6 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
                 ttl,
                 event_group_id,
                 client_port,
-                reboot_flag,
                 response: sender,
             },
         )
@@ -588,7 +585,6 @@ where
                     ttl,
                     event_group_id,
                     client_port,
-                    reboot_flag,
                     response,
                 } => {
                     // Look up endpoint from service registry
@@ -624,7 +620,6 @@ where
                                     ttl,
                                     event_group_id,
                                     client_port,
-                                    reboot_flag,
                                     response,
                                 });
                             }
@@ -642,7 +637,7 @@ where
                                 self.interface,
                                 crate::protocol::sd::TransportProtocol::Udp,
                                 unicast_port,
-                                reboot_flag,
+                                discovery_socket.reboot_flag(),
                             );
                             let session_id = u32::from(discovery_socket.session_id());
                             let message =
@@ -844,7 +839,7 @@ mod tests {
         let (_send_rx, _resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
         assert!(matches!(msg, ControlMessage::SendToService { .. }));
 
-        let (_rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0, false);
+        let (_rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
         assert!(matches!(msg, ControlMessage::Subscribe { .. }));
     }
 
@@ -881,7 +876,7 @@ mod tests {
         assert!(s.contains("service_id"));
         assert!(s.contains("instance_id"));
 
-        let (_rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0, false);
+        let (_rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
         let s = format!("{msg:?}");
         assert!(s.contains("Subscribe"));
         assert!(s.contains("service_id"));
@@ -1227,7 +1222,7 @@ mod tests {
         rx.await.unwrap().unwrap();
 
         // Subscribe
-        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0, false);
+        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
         control_sender.send(msg).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
             .await
@@ -1252,7 +1247,7 @@ mod tests {
         rx.await.unwrap().unwrap();
 
         // Subscribe should auto-bind discovery
-        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0, false);
+        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
         control_sender.send(msg).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
             .await
@@ -1269,7 +1264,7 @@ mod tests {
             false,
         );
 
-        let (rx, msg) = TestControl::subscribe(0xFFFF, 0xFFFF, 1, 3, 0x01, 0, false);
+        let (rx, msg) = TestControl::subscribe(0xFFFF, 0xFFFF, 1, 3, 0x01, 0);
         control_sender.send(msg).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
             .await
@@ -1321,7 +1316,7 @@ mod tests {
             false,
         );
 
-        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0, false);
+        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
         drop(rx);
         control_sender.send(msg).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1403,7 +1398,7 @@ mod tests {
         rx.await.unwrap().unwrap();
 
         // First subscribe with specific port — binds the port
-        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 44444, false);
+        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 44444);
         control_sender.send(msg).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
             .await
@@ -1412,7 +1407,7 @@ mod tests {
         assert!(result.is_ok(), "first subscribe should succeed: {result:?}");
 
         // Second subscribe with the same port — reuses the existing socket
-        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x02, 44444, false);
+        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x02, 44444);
         control_sender.send(msg).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
             .await

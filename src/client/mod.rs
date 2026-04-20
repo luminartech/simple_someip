@@ -278,7 +278,6 @@ where
         ttl: u32,
         event_group_id: u16,
         client_port: u16,
-        reboot_flag: bool,
     ) -> Result<(), Error> {
         let (response, message) = ControlMessage::subscribe(
             service_id,
@@ -287,7 +286,6 @@ where
             ttl,
             event_group_id,
             client_port,
-            reboot_flag,
         );
         self.control_sender.send(message).await.unwrap();
         response.await.unwrap()
@@ -308,7 +306,6 @@ where
         ttl: u32,
         event_group_id: u16,
         client_port: u16,
-        reboot_flag: bool,
     ) {
         let (response, message) = ControlMessage::subscribe(
             service_id,
@@ -317,7 +314,6 @@ where
             ttl,
             event_group_id,
             client_port,
-            reboot_flag,
         );
         let _ = self.control_sender.send(message).await;
         // Consume the response in the background so the inner loop doesn't

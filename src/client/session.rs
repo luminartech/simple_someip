@@ -74,11 +74,11 @@ impl SessionTracker {
                 } else if prev.last_reboot_flag
                     && reboot_flag
                     && session_id < prev.last_session_id
-                    && !(prev.last_session_id == u16::MAX && session_id == 1)
+                    && !(prev.last_session_id == u16::MAX && session_id <= 1)
                 {
                     // Session ID decreased within the same service instance
                     // while reboot flag stays 1 — this is a reboot.
-                    // Exception: 0xFFFF→1 is a normal counter wrap, not a reboot.
+                    // Exception: 0xFFFF→{0,1} is a normal counter wrap, not a reboot.
                     SessionVerdict::Reboot
                 } else {
                     SessionVerdict::Ok
@@ -242,6 +242,15 @@ mod tests {
         tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 65535, true);
         tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, true);
         let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 2, true);
+        assert_eq!(verdict, SessionVerdict::Ok);
+    }
+
+    #[test]
+    fn session_id_wrap_to_zero_returns_ok() {
+        // 0xFFFF→0: non-spec-compliant wrap scheme, still treated as a normal wrap.
+        let mut tracker = SessionTracker::default();
+        tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 65535, true);
+        let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 0, true);
         assert_eq!(verdict, SessionVerdict::Ok);
     }
 
