@@ -323,13 +323,21 @@ where
         });
     }
 
-    /// Returns the current SD reboot flag tracked by the client's discovery socket.
+    /// Returns the current SD reboot flag tracked by the client.
     ///
     /// Per AUTOSAR SOME/IP-SD, the reboot flag is
     /// [`RebootFlag::RecentlyRebooted`](protocol::sd::RebootFlag::RecentlyRebooted)
     /// from startup until the session counter wraps from `0xFFFF` to `1`, then
     /// [`RebootFlag::Continuous`](protocol::sd::RebootFlag::Continuous) permanently.
-    /// If the discovery socket is not bound,
+    ///
+    /// While discovery is bound, the returned value is the discovery socket's
+    /// live reboot flag. While discovery is **unbound**, the inner loop's
+    /// persisted wrap state is used instead — so this method correctly returns
+    /// [`RebootFlag::Continuous`](protocol::sd::RebootFlag::Continuous) even
+    /// between `unbind_discovery` and a subsequent `bind_discovery`, provided
+    /// the session counter had already wrapped at least once. On a fresh
+    /// client that has never bound discovery (or that unbound before any
+    /// wrap),
     /// [`RebootFlag::RecentlyRebooted`](protocol::sd::RebootFlag::RecentlyRebooted)
     /// is returned.
     ///
