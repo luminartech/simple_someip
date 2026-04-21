@@ -30,8 +30,11 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-# Protocol/E2E only (default) — no_std compatible, no tokio dependency
+# Default — includes std, thiserror, and tracing
 simple-someip = "0.5"
+
+# no_std only (protocol/E2E/traits, no heap allocation)
+simple-someip = { version = "0.5", default-features = false }
 
 # Client only
 simple-someip = { version = "0.5", features = ["client"] }
@@ -47,11 +50,11 @@ simple-someip = { version = "0.5", features = ["client", "server"] }
 
 | Feature | Default | Description |
 |---------|---------|-------------|
+| `std` | **yes** | Enables `thiserror`, `tracing`, and `embedded-io/std` |
 | `client` | no | Async tokio client; implies `std` + tokio + socket2 |
 | `server` | no | Async tokio server; implies `std` + tokio + socket2 |
-| `std` | no | Enables std-dependent code |
 
-By default only the `protocol`, `traits`, and `e2e` modules are available, and the crate compiles in `no_std` mode. Most applications only need one of `client` or `server`.
+By default the crate enables `std`. To use in a `no_std` environment (e.g., embedded targets), disable default features with `default-features = false`. In that mode only the `protocol`, `traits`, and `e2e` modules are available, and the crate compiles in `no_std` mode. Most applications only need one of `client` or `server`.
 
 ## Quick Start
 
