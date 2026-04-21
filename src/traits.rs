@@ -101,6 +101,13 @@ pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
         reboot_flag: sd::RebootFlag,
     ) -> Self::SdHeader;
 
+    /// Override the reboot flag on an SD header in-place.
+    ///
+    /// Used by [`Client::start_sd_announcements`](crate::Client::start_sd_announcements)
+    /// to refresh the reboot flag per-tick from the client's tracked state.
+    #[cfg(feature = "std")]
+    fn set_reboot_flag(header: &mut Self::SdHeader, reboot: sd::RebootFlag);
+
     /// Extract offered/stopped service endpoints from this SD payload.
     ///
     /// Default implementation returns an empty vec. Concrete implementations

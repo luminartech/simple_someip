@@ -171,6 +171,10 @@ impl PayloadWireFormat for RawPayload {
         }
     }
 
+    fn set_reboot_flag(header: &mut VecSdHeader, reboot: sd::RebootFlag) {
+        header.flags = sd::Flags::new(bool::from(reboot), header.flags.unicast());
+    }
+
     fn offered_endpoints(&self) -> Vec<crate::OfferedEndpoint> {
         let header = match &self.kind {
             RawPayloadKind::Sd(header) => header,

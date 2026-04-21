@@ -110,6 +110,10 @@ impl PayloadWireFormat for TestPayload {
             options,
         }
     }
+    #[cfg(feature = "std")]
+    fn set_reboot_flag(header: &mut TestSdHeader, reboot: sd::RebootFlag) {
+        header.flags = sd::Flags::new(bool::from(reboot), header.flags.unicast());
+    }
 }
 
 pub(crate) fn empty_sd_header() -> TestSdHeader {

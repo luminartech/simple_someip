@@ -64,6 +64,7 @@ pub(super) enum ControlMessage<P: PayloadWireFormat> {
         client_port: u16,
         response: oneshot::Sender<Result<(), Error>>,
     },
+    QueryRebootFlag(oneshot::Sender<crate::protocol::sd::RebootFlag>),
 }
 
 impl<P: PayloadWireFormat> std::fmt::Debug for ControlMessage<P> {
@@ -109,6 +110,7 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ControlMessage<P> {
                 .field("instance_id", instance_id)
                 .field("event_group_id", event_group_id)
                 .finish_non_exhaustive(),
+            Self::QueryRebootFlag(_) => f.write_str("QueryRebootFlag"),
         }
     }
 }
@@ -204,6 +206,11 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
                 response: sender,
             },
         )
+    }
+
+    pub fn query_reboot_flag() -> (oneshot::Receiver<crate::protocol::sd::RebootFlag>, Self) {
+        let (sender, receiver) = oneshot::channel();
+        (receiver, Self::QueryRebootFlag(sender))
     }
 }
 
@@ -587,6 +594,17 @@ where
                         Err(e) => {
                             let _ = send_complete.send(Err(e));
                         }
+                    }
+                }
+                ControlMessage::QueryRebootFlag(response) => {
+                    let flag = self
+                        .discovery_socket
+                        .as_ref()
+                        .map_or(crate::protocol::sd::RebootFlag::RecentlyRebooted, |s| {
+                            s.reboot_flag()
+                        });
+                    if response.send(flag).is_err() {
+                        warn!("QueryRebootFlag response receiver dropped (caller canceled)");
                     }
                 }
                 ControlMessage::Subscribe {

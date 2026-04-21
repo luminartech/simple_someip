@@ -323,6 +323,31 @@ where
         });
     }
 
+    /// Returns the current SD reboot flag tracked by the client's discovery socket.
+    ///
+    /// Per AUTOSAR SOME/IP-SD, the reboot flag is
+    /// [`RebootFlag::RecentlyRebooted`](protocol::sd::RebootFlag::RecentlyRebooted)
+    /// from startup until the session counter wraps from `0xFFFF` to `1`, then
+    /// [`RebootFlag::Continuous`](protocol::sd::RebootFlag::Continuous) permanently.
+    /// If the discovery socket is not bound,
+    /// [`RebootFlag::RecentlyRebooted`](protocol::sd::RebootFlag::RecentlyRebooted)
+    /// is returned.
+    ///
+    /// Call this before manually building an SD header (e.g. one passed to
+    /// [`send_sd_message`](Self::send_sd_message)) so the reboot flag reflects
+    /// the current tracked state instead of a stale value baked at call time.
+    /// Headers passed to [`start_sd_announcements`](Self::start_sd_announcements)
+    /// are refreshed automatically per-tick and do not need this call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal control channel is closed.
+    pub async fn reboot_flag(&self) -> protocol::sd::RebootFlag {
+        let (response, message) = ControlMessage::query_reboot_flag();
+        self.control_sender.send(message).await.unwrap();
+        response.await.unwrap()
+    }
+
     /// Sends an SD message to a specific target address.
     ///
     /// # Errors
@@ -352,6 +377,14 @@ where
     /// The announcements are sent via the client's SD socket, ensuring
     /// they share the same source address as the client's `Subscribe` and
     /// `FindService` messages.
+    ///
+    /// **Reboot flag auto-refresh:** the `reboot` bit on `sd_header.flags` is
+    /// overridden at each tick with the client's currently tracked reboot
+    /// flag (via [`PayloadWireFormat::set_reboot_flag`]). The reboot bit the
+    /// caller supplies on `sd_header` is therefore ignored. This ensures the
+    /// flag transitions from `RecentlyRebooted` to `Continuous` once the
+    /// session counter wraps past `0xFFFF`, rather than staying stuck on
+    /// whatever value was baked at call time.
     ///
     /// Returns a [`tokio::task::JoinHandle`] that can be used to abort the
     /// background task. The task uses a weak reference to the client's
@@ -396,7 +429,22 @@ where
                     break;
                 };
 
-                let (response, message) = ControlMessage::send_sd(target, sd_header.clone());
+                // Refresh the reboot flag from the client's tracked state
+                // so long-running announcers transition from RecentlyRebooted
+                // to Continuous once the session counter wraps.
+                let (flag_rx, flag_msg) = ControlMessage::query_reboot_flag();
+                if sender.send(flag_msg).await.is_err() {
+                    tracing::warn!("SD announcement channel closed, stopping");
+                    break;
+                }
+                let Ok(reboot) = flag_rx.await else {
+                    tracing::warn!("SD announcement reboot-flag query dropped, stopping");
+                    break;
+                };
+                let mut header = sd_header.clone();
+                MessageDefinitions::set_reboot_flag(&mut header, reboot);
+
+                let (response, message) = ControlMessage::send_sd(target, header);
 
                 let send_ok = sender.send(message).await.is_ok();
                 // Drop the strong sender immediately so it doesn't keep
@@ -866,6 +914,23 @@ mod tests {
             "task should have been cancelled, not panicked"
         );
 
+        client.shut_down();
+    }
+
+    #[tokio::test]
+    async fn test_reboot_flag_defaults_to_recently_rebooted() {
+        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        // Discovery not bound — should fall back to RecentlyRebooted.
+        assert_eq!(
+            client.reboot_flag().await,
+            crate::protocol::sd::RebootFlag::RecentlyRebooted
+        );
+        client.bind_discovery().await.unwrap();
+        // Freshly bound socket also reports RecentlyRebooted (session has not wrapped).
+        assert_eq!(
+            client.reboot_flag().await,
+            crate::protocol::sd::RebootFlag::RecentlyRebooted
+        );
         client.shut_down();
     }
 
