@@ -242,6 +242,43 @@ mod tests {
     }
 
     #[test]
+    fn set_reboot_flag_flips_reboot_and_preserves_unicast() {
+        // Start with RecentlyRebooted + unicast=true (the `new_sd` preset).
+        let mut header = VecSdHeader {
+            flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+            entries: std::vec![],
+            options: std::vec![],
+        };
+        assert_eq!(header.flags.reboot(), sd::RebootFlag::RecentlyRebooted);
+        assert!(header.flags.unicast());
+
+        RawPayload::set_reboot_flag(&mut header, sd::RebootFlag::Continuous);
+        assert_eq!(header.flags.reboot(), sd::RebootFlag::Continuous);
+        assert!(
+            header.flags.unicast(),
+            "unicast bit must not be disturbed by set_reboot_flag"
+        );
+
+        RawPayload::set_reboot_flag(&mut header, sd::RebootFlag::RecentlyRebooted);
+        assert_eq!(header.flags.reboot(), sd::RebootFlag::RecentlyRebooted);
+        assert!(header.flags.unicast());
+    }
+
+    #[test]
+    fn set_reboot_flag_preserves_cleared_unicast() {
+        // Unicast-cleared headers are unusual but legal; set_reboot_flag
+        // must not flip unicast back on.
+        let mut header = VecSdHeader {
+            flags: sd::Flags::new(true, false),
+            entries: std::vec![],
+            options: std::vec![],
+        };
+        RawPayload::set_reboot_flag(&mut header, sd::RebootFlag::Continuous);
+        assert_eq!(header.flags.reboot(), sd::RebootFlag::Continuous);
+        assert!(!header.flags.unicast());
+    }
+
+    #[test]
     fn raw_bytes_returns_some_for_raw_payload() {
         let p = make_raw_payload();
         assert_eq!(p.raw_bytes(), Some(&[0xDE, 0xAD][..]));
