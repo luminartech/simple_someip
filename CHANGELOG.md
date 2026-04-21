@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/luminartech/simple_someip/compare/v0.6.0...v0.6.1) - 2026-04-21
+
+### Added
+
+- make std the default feature
+
+### Fixed
+
+- gate std-requiring deps behind 'std' feature for true no_std support
+
+### Other
+
+- Update docs
+- update error handling to use `thiserror` directly and remove conditional compilation
+- run `cargo fmt`
+- remove Display implementations for Error enums in no_std context
+- Update CHANGELOG.md
+- release v0.5.4
+
 ### Changed
 
 - **`std` is now the default feature** — the crate enables `std` (with `thiserror` and `tracing`) by default. Users targeting `no_std` environments must set `default-features = false` in their `Cargo.toml`.
