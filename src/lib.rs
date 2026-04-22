@@ -133,6 +133,9 @@ mod raw_payload;
 #[cfg(feature = "server")]
 pub mod server;
 mod traits;
+/// Executor-agnostic UDP transport abstraction used by the client and
+/// server modules. `no_std`-compatible; no default implementations ship.
+pub mod transport;
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
 #[cfg(feature = "std")]
@@ -144,3 +147,7 @@ pub use client::{Client, ClientUpdate, ClientUpdates, DiscoveryMessage, PendingR
 pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
 pub use server::Server;
+pub use transport::{
+    IoErrorKind, ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory,
+    TransportSocket,
+};
