@@ -8,6 +8,7 @@
 
 mod error;
 mod event_publisher;
+mod sd_state;
 mod service_info;
 mod subscription_manager;
 
@@ -16,13 +17,14 @@ pub use event_publisher::EventPublisher;
 pub use service_info::{EventGroupInfo, ServiceInfo};
 pub use subscription_manager::SubscriptionManager;
 
+use sd_state::SdStateManager;
+
 use crate::e2e::{E2EKey, E2EProfile, E2ERegistry};
 use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
-use core::sync::atomic::Ordering;
 use std::{
     format,
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
-    sync::{Arc, Mutex, atomic::AtomicU16},
+    sync::{Arc, Mutex},
     vec,
     vec::Vec,
 };
@@ -74,8 +76,8 @@ pub struct Server {
     subscriptions: Arc<RwLock<SubscriptionManager>>,
     /// Event publisher
     publisher: Arc<EventPublisher>,
-    /// Incrementing session ID for SD messages
-    sd_session_id: Arc<AtomicU16>,
+    /// SD session-ID counter and announcement emitter
+    sd_state: Arc<SdStateManager>,
     /// Shared E2E registry for runtime E2E configuration
     e2e_registry: Arc<Mutex<E2ERegistry>>,
     /// `true` if this server was constructed via [`Server::new_passive`].
@@ -186,7 +188,7 @@ impl Server {
             sd_socket: Arc::new(sd_socket),
             subscriptions,
             publisher,
-            sd_session_id: Arc::new(AtomicU16::new(1)),
+            sd_state: Arc::new(SdStateManager::new()),
             e2e_registry,
             is_passive: false,
         })
@@ -255,7 +257,7 @@ impl Server {
             sd_socket: Arc::new(sd_socket),
             subscriptions,
             publisher,
-            sd_session_id: Arc::new(AtomicU16::new(1)),
+            sd_state: Arc::new(SdStateManager::new()),
             e2e_registry,
             is_passive: true,
         })
@@ -288,12 +290,12 @@ impl Server {
         }
         let config = self.config.clone();
         let sd_socket = Arc::clone(&self.sd_socket);
-        let sd_session_id = Arc::clone(&self.sd_session_id);
+        let sd_state = Arc::clone(&self.sd_state);
 
         tokio::spawn(async move {
             let mut announcement_count = 0u32;
             loop {
-                match Self::send_offer_service(&config, &sd_socket, &sd_session_id).await {
+                match sd_state.send_offer_service(&config, &sd_socket).await {
                     Ok(()) => {
                         announcement_count += 1;
                         if announcement_count == 1 {
@@ -318,80 +320,6 @@ impl Server {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
         });
-
-        Ok(())
-    }
-
-    /// Send an `OfferService` message via Service Discovery
-    async fn send_offer_service(
-        config: &ServerConfig,
-        socket: &UdpSocket,
-        session_id: &AtomicU16,
-    ) -> Result<(), Error> {
-        use crate::protocol::Header as SomeIpHeader;
-        use crate::traits::WireFormat;
-
-        // Create OfferService entry
-        let entry = Entry::OfferService(ServiceEntry {
-            index_first_options_run: 0,
-            index_second_options_run: 0,
-            options_count: OptionsCount::new(1, 0),
-            service_id: config.service_id,
-            instance_id: config.instance_id,
-            major_version: config.major_version,
-            ttl: config.ttl,
-            minor_version: config.minor_version,
-        });
-
-        // Create IPv4 endpoint option
-        let option = sd::Options::IpV4Endpoint {
-            ip: config.interface,
-            port: config.local_port,
-            protocol: TransportProtocol::Udp,
-        };
-
-        let entries = [entry];
-        let options = [option];
-        let sd_payload = sd::Header::new(Flags::new(true, true), &entries, &options);
-
-        // Encode SD payload
-        let mut sd_data = Vec::new();
-        sd_payload.encode(&mut sd_data)?;
-
-        // Increment session ID (wrapping from 0xFFFF back to 0x0001, skipping 0)
-        let prev = session_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                let next = v.wrapping_add(1);
-                Some(if next == 0 { 1 } else { next })
-            })
-            .unwrap();
-        let next = prev.wrapping_add(1);
-        let sid = u32::from(if next == 0 { 1 } else { next });
-
-        // Wrap in SOME/IP header for SD (service 0xFFFF, method 0x8100)
-        let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
-
-        // Encode complete SOME/IP-SD message
-        let mut buffer = Vec::new();
-        someip_header.encode(&mut buffer)?;
-        buffer.extend_from_slice(&sd_data);
-
-        let multicast_addr = SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT);
-
-        tracing::trace!(
-            "Sending OfferService: service=0x{:04X}, instance={}, port={}, size={} bytes",
-            config.service_id,
-            config.instance_id,
-            config.local_port,
-            buffer.len()
-        );
-        tracing::trace!(
-            "OfferService data: {:02X?}",
-            &buffer[..buffer.len().min(64)]
-        );
-
-        socket.send_to(&buffer, multicast_addr).await?;
-        tracing::trace!("Sent to {}", multicast_addr);
 
         Ok(())
     }
@@ -425,7 +353,7 @@ impl Server {
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
 
-        let sid = self.next_sd_session_id();
+        let sid = self.sd_state.next_session_id();
         let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
 
         let mut buffer = Vec::new();
@@ -440,20 +368,6 @@ impl Server {
         );
 
         Ok(())
-    }
-
-    /// Get the next SD session ID (`client_id=0`, `session_id` incrementing), skipping 0
-    fn next_sd_session_id(&self) -> u32 {
-        let prev = self
-            .sd_session_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                let next = v.wrapping_add(1);
-                Some(if next == 0 { 1 } else { next })
-            })
-            .unwrap();
-        // fetch_update returns the previous value; compute the same next value
-        let next = prev.wrapping_add(1);
-        u32::from(if next == 0 { 1 } else { next })
     }
 
     /// Get the event publisher for sending events
@@ -823,7 +737,7 @@ impl Server {
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
 
-        let sid = self.next_sd_session_id();
+        let sid = self.sd_state.next_session_id();
         let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
 
         let mut buffer = Vec::new();
@@ -870,7 +784,7 @@ impl Server {
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
 
-        let sid = self.next_sd_session_id();
+        let sid = self.sd_state.next_session_id();
         let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
 
         let mut buffer = Vec::new();
@@ -1513,14 +1427,14 @@ mod tests {
         let (server, _) = create_test_server(0x5B, 1).await;
 
         // Set session ID to 0xFFFE
-        server.sd_session_id.store(0xFFFE, Ordering::Relaxed);
+        server.sd_state.store_for_test(0xFFFE);
 
         // First call: 0xFFFE -> 0xFFFF, returns 0xFFFF
-        let sid1 = server.next_sd_session_id();
+        let sid1 = server.sd_state.next_session_id();
         assert_eq!(sid1, 0xFFFF);
 
         // Second call: 0xFFFF -> wraps to 0x0001 (skipping 0), returns 0x0001
-        let sid2 = server.next_sd_session_id();
+        let sid2 = server.sd_state.next_session_id();
         assert_eq!(sid2, 0x0001);
     }
 
