@@ -17,6 +17,13 @@ use tokio::{select, sync::mpsc};
 use tracing::{error, info, trace};
 
 /// A received message together with the source address it came from.
+///
+/// TODO(phase 6): narrow `source` to `SocketAddrV4` to match the
+/// `TransportSocket` trait's IPv4-only contract — today the field is
+/// always a `SocketAddr::V4(_)` wrapping, and the V6 variant is
+/// unreachable. Deferred here because the rename ripples through
+/// `DiscoveryMessage` and `ClientUpdate::Unicast`, which is scope creep
+/// for phase 5.
 #[derive(Clone, Debug)]
 pub struct ReceivedMessage<P> {
     pub message: Message<P>,
@@ -760,6 +767,15 @@ mod tests {
     /// a thin interceptor that counts how many times `bind` is called; it
     /// delegates to the built-in `TokioTransport`, which is what the
     /// current `Socket = TokioSocket` bound requires.
+    ///
+    /// TODO: extend this with an end-to-end round-trip test that uses a
+    /// custom factory to actually carry traffic (send from socket A,
+    /// receive on socket B, assert bytes match), and a negative test
+    /// where the factory returns `Err(TransportError::AddressInUse)`
+    /// and asserts that surfaces as `Error::Transport(...)` through the
+    /// `?` + `From` chain. Both are scoped for the phase-6 branch where
+    /// the spawn hoist lets us swap the socket type, not just the bind
+    /// logic.
     #[tokio::test]
     async fn bind_with_transport_accepts_custom_factory() {
         use crate::tokio_transport::{TokioSocket, TokioTransport};

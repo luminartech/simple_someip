@@ -57,6 +57,13 @@ pub struct TokioSocket {
 }
 
 /// Sleep backed by [`tokio::time::sleep`].
+///
+/// TODO(phase 7): wire this into the `tokio::time::sleep` call sites in
+/// `client::inner::Inner::run` (125 ms tick), `server::mod::Server::run`,
+/// and `Client::start_sd_announcements` (1 s tick) so the crate's own
+/// timing is also routed through the `Timer` trait. Today `TokioTimer`
+/// is shipped as public API but unused internally — consumers can rely
+/// on it, but the crate's own code still uses tokio directly.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TokioTimer;
 
@@ -183,9 +190,16 @@ fn bind_with_options(addr: SocketAddrV4, options: &SocketOptions) -> std::io::Re
 /// conservative — anything that is not a clear match becomes
 /// [`TransportError::Io`] with [`IoErrorKind::Other`] — and is not
 /// considered stable (adding finer mappings is not a breaking change).
+///
+/// The full `std::io::Error` (raw errno, OS message, chained source) is
+/// discarded by design to keep the public [`TransportError`] enum
+/// portable and `no_std`-safe. To keep field debugging possible anyway,
+/// the original error is emitted at `warn!` level here before mapping —
+/// ops sees the detailed message in logs while callers get the portable
+/// enum.
 fn map_io_error(e: std::io::Error) -> TransportError {
     use std::io::ErrorKind as K;
-    match e.kind() {
+    let mapped = match e.kind() {
         K::AddrInUse => TransportError::AddressInUse,
         K::Unsupported => TransportError::Unsupported,
         K::TimedOut => TransportError::Io(IoErrorKind::TimedOut),
@@ -196,7 +210,13 @@ fn map_io_error(e: std::io::Error) -> TransportError {
             TransportError::Io(IoErrorKind::NetworkUnreachable)
         }
         _ => TransportError::Io(IoErrorKind::Other),
-    }
+    };
+    tracing::warn!(
+        "tokio transport io error: {e} (raw_os={:?}, kind={:?}) mapped to {mapped}",
+        e.raw_os_error(),
+        e.kind(),
+    );
+    mapped
 }
 
 #[cfg(test)]
