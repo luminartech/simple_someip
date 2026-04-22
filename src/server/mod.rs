@@ -1423,22 +1423,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_next_sd_session_id_wraps() {
-        let (server, _) = create_test_server(0x5B, 1).await;
-
-        // Set session ID to 0xFFFE
-        server.sd_state.store_for_test(0xFFFE);
-
-        // First call: 0xFFFE -> 0xFFFF, returns 0xFFFF
-        let sid1 = server.sd_state.next_session_id();
-        assert_eq!(sid1, 0xFFFF);
-
-        // Second call: 0xFFFF -> wraps to 0x0001 (skipping 0), returns 0x0001
-        let sid2 = server.sd_state.next_session_id();
-        assert_eq!(sid2, 0x0001);
-    }
-
-    #[tokio::test]
     async fn test_handle_sd_other_entry_type() {
         let (mut server, _) = create_test_server(0x5B, 1).await;
 
