@@ -46,4 +46,8 @@ pub enum Error {
     /// (→ `crate::UDP_BUFFER_SIZE`).
     #[error("internal capacity exceeded: {0}")]
     Capacity(&'static str),
+    /// An error surfaced by the pluggable transport backend (see
+    /// [`crate::transport::TransportError`]).
+    #[error("transport error: {0:?}")]
+    Transport(#[from] crate::transport::TransportError),
 }

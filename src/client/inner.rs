@@ -366,7 +366,7 @@ where
         (control_sender, update_receiver)
     }
 
-    fn bind_discovery(&mut self) -> Result<(), Error> {
+    async fn bind_discovery(&mut self) -> Result<(), Error> {
         if self.discovery_socket.is_some() {
             Ok(())
         } else {
@@ -376,7 +376,8 @@ where
                 self.sd_session_id,
                 self.sd_session_has_wrapped,
                 self.multicast_loopback,
-            )?;
+            )
+            .await?;
             self.discovery_socket = Some(socket);
             Ok(())
         }
@@ -397,7 +398,7 @@ where
         self.interface = interface;
     }
 
-    fn bind_unicast(&mut self, port: u16) -> Result<u16, Error> {
+    async fn bind_unicast(&mut self, port: u16) -> Result<u16, Error> {
         if port != 0
             && let Some(socket) = self.unicast_sockets.get(&port)
         {
@@ -412,7 +413,7 @@ where
             );
             return Err(Error::Capacity("unicast_sockets"));
         }
-        let unicast_socket = SocketManager::bind(port, Arc::clone(&self.e2e_registry))?;
+        let unicast_socket = SocketManager::bind(port, Arc::clone(&self.e2e_registry)).await?;
         let bound_port = unicast_socket.port();
         // Capacity was checked above, so insert cannot report "full" here.
         // A defensive check guards against a future refactor that changes
@@ -571,7 +572,7 @@ where
                         return;
                     }
                     info!("Binding to interface: {}", interface);
-                    let bind_result = self.bind_discovery();
+                    let bind_result = self.bind_discovery().await;
                     match &bind_result {
                         Ok(()) => {
                             info!("Successfully Bound to interface: {}", interface);
@@ -585,7 +586,7 @@ where
                     }
                 }
                 ControlMessage::BindDiscovery(response) => {
-                    let result = self.bind_discovery();
+                    let result = self.bind_discovery().await;
                     if response.send(result).is_err() {
                         warn!("BindDiscovery response receiver dropped (caller canceled)");
                     }
@@ -600,7 +601,7 @@ where
                     // SD Message, If the discovery socket is not bound, bind it
                     match &mut self.discovery_socket {
                         None => {
-                            match self.bind_discovery() {
+                            match self.bind_discovery().await {
                                 Ok(()) => {
                                     // See re-enqueue note on SetInterface above.
                                     if let Err(rejected) = self.request_queue.push_front(
@@ -704,7 +705,7 @@ where
                     let source_port = if desired_port == 0 {
                         // Ephemeral: auto-bind only if no sockets exist, then use first
                         if self.unicast_sockets.is_empty() {
-                            match self.bind_unicast(0) {
+                            match self.bind_unicast(0).await {
                                 Ok(port) => {
                                     debug!("Auto-bound unicast on port {} for SendToService", port);
                                     port
@@ -719,7 +720,7 @@ where
                         }
                     } else {
                         // Specific port: bind if not already bound
-                        match self.bind_unicast(desired_port) {
+                        match self.bind_unicast(desired_port).await {
                             Ok(port) => port,
                             Err(e) => {
                                 let _ = send_complete.send(Err(e));
@@ -792,7 +793,7 @@ where
                     }
 
                     // Bind unicast on the requested port (0 = ephemeral)
-                    let unicast_port = match self.bind_unicast(client_port) {
+                    let unicast_port = match self.bind_unicast(client_port).await {
                         Ok(port) => {
                             debug!("Bound unicast on port {} for Subscribe", port);
                             port
@@ -805,7 +806,7 @@ where
 
                     // Auto-bind discovery if not bound (re-queue like SendSD does)
                     match &mut self.discovery_socket {
-                        None => match self.bind_discovery() {
+                        None => match self.bind_discovery().await {
                             Ok(()) => {
                                 // See re-enqueue note on SetInterface above.
                                 if let Err(rejected) =
@@ -1194,6 +1195,7 @@ mod tests {
         for _ in 0..UNICAST_SOCKETS_CAP {
             let bound = inner
                 .bind_unicast(0)
+                .await
                 .expect("ephemeral bind below cap should succeed");
             assert_ne!(bound, 0, "OS should assign a non-zero ephemeral port");
         }
@@ -1203,6 +1205,7 @@ mod tests {
         // socket (pre-bind capacity check).
         let err = inner
             .bind_unicast(0)
+            .await
             .expect_err("bind past cap should fail");
         match err {
             Error::Capacity(name) => assert_eq!(name, "unicast_sockets"),
