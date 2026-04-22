@@ -185,11 +185,37 @@ where
 {
     /// Creates a new client bound to the given network interface and spawns its event loop.
     ///
-    /// Returns a `(Client, ClientUpdates)` pair. The `Client` handle is
-    /// [`Clone`]-able and can be shared across tasks. `ClientUpdates` receives
-    /// discovery, unicast, and error updates from the event loop.
+    /// Returns a `(Client, ClientUpdates, run_future)` triple. The `Client`
+    /// handle is [`Clone`]-able and can be shared across tasks.
+    /// `ClientUpdates` receives discovery, unicast, and error updates from
+    /// the event loop. `run_future` is the event loop itself — the caller
+    /// must drive it to completion (typically via `tokio::spawn`) for the
+    /// client to process any messages.
+    ///
+    /// The future is not bounded `Send + 'static` at this layer; the
+    /// concrete captured state is `Send + 'static` in practice, and
+    /// `tokio::spawn` will bind those where required at the call site.
+    /// Bare-metal callers driving the future on a single-task executor
+    /// pay no `Send` tax.
+    ///
+    /// ```no_run
+    /// # use simple_someip::{Client, RawPayload};
+    /// # use std::net::Ipv4Addr;
+    /// # async fn demo() {
+    /// let (client, mut updates, run) = Client::<RawPayload>::new(Ipv4Addr::LOCALHOST);
+    /// tokio::spawn(run);
+    /// // ...interact with `client` and `updates`...
+    /// # let _ = (client, updates);
+    /// # }
+    /// ```
     #[must_use]
-    pub fn new(interface: Ipv4Addr) -> (Self, ClientUpdates<MessageDefinitions>) {
+    pub fn new(
+        interface: Ipv4Addr,
+    ) -> (
+        Self,
+        ClientUpdates<MessageDefinitions>,
+        impl core::future::Future<Output = ()>,
+    ) {
         Self::new_with_loopback(interface, false)
     }
 
@@ -220,10 +246,14 @@ where
     pub fn new_with_loopback(
         interface: Ipv4Addr,
         multicast_loopback: bool,
-    ) -> (Self, ClientUpdates<MessageDefinitions>) {
+    ) -> (
+        Self,
+        ClientUpdates<MessageDefinitions>,
+        impl core::future::Future<Output = ()>,
+    ) {
         let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
-        let (control_sender, update_receiver) =
-            Inner::spawn(interface, Arc::clone(&e2e_registry), multicast_loopback);
+        let (control_sender, update_receiver, run_future) =
+            Inner::new(interface, Arc::clone(&e2e_registry), multicast_loopback);
 
         let client = Self {
             interface: Arc::new(RwLock::new(interface)),
@@ -231,7 +261,7 @@ where
             e2e_registry,
         };
         let updates = ClientUpdates { update_receiver };
-        (client, updates)
+        (client, updates, run_future)
     }
 
     /// Returns the current network interface address.
@@ -693,14 +723,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_new_and_interface() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         assert_eq!(client.interface(), Ipv4Addr::LOCALHOST);
         client.shut_down();
     }
 
     #[tokio::test]
     async fn test_client_debug() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         let debug_str = format!("{client:?}");
         assert!(debug_str.contains("Client"));
         assert!(debug_str.contains("127.0.0.1"));
@@ -746,7 +778,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_unknown_service_returns_error() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         let result = client.subscribe(0xFFFF, 0xFFFF, 1, 3, 0x01, 0).await;
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),
@@ -757,7 +790,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_no_wait_unknown_service_does_not_panic() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         // subscribe_no_wait is fire-and-forget — it should not panic even
         // when the service is unknown (the inner loop sends ServiceNotFound
         // on the dropped response channel, which is harmless).
@@ -769,7 +803,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_bind_discovery_and_unbind() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         client.bind_discovery().await.unwrap();
         client.unbind_discovery().await.unwrap();
         client.shut_down();
@@ -777,7 +812,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_interface() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         let new_addr = Ipv4Addr::LOCALHOST;
         client.set_interface(new_addr).await.unwrap();
         assert_eq!(client.interface(), new_addr);
@@ -786,7 +822,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_endpoint_succeeds() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 30000);
         client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
         client.shut_down();
@@ -794,7 +831,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_to_service_unknown_returns_error() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         let result = client.send_to_service(0xFFFF, 0xFFFF, msg).await;
         assert!(
@@ -806,7 +844,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_endpoint_succeeds() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 30000);
         client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
         client.remove_endpoint(0x1234, 0x0001).await.unwrap();
@@ -847,7 +886,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_sd_message() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         // Bind discovery first so the send path uses the existing socket
         client.bind_discovery().await.unwrap();
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30490);
@@ -858,7 +898,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_to_service_success_returns_pending_response() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30000);
         client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
@@ -870,7 +911,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_recv_returns_none_after_shutdown() {
-        let (client, mut updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         client.shut_down();
         // Now the inner loop should exit; recv() should return None
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv()).await;
@@ -880,7 +922,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_and_unregister_e2e() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         let key = E2EKey {
             service_id: 0x1234,
             method_or_event_id: 0x0001,
@@ -893,7 +936,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_is_clone() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         let client2 = client.clone();
         assert_eq!(client.interface(), client2.interface());
         client.shut_down();
@@ -901,14 +945,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_updates_debug() {
-        let (_client, updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (_client, updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         let debug_str = format!("{updates:?}");
         assert!(debug_str.contains("ClientUpdates"));
     }
 
     #[tokio::test]
     async fn test_request_unknown_service_returns_error() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         let result = client.request(0xFFFF, 0xFFFF, msg).await;
         assert!(
@@ -920,7 +966,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_sd_announcements_does_not_panic() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         client.bind_discovery().await.unwrap();
 
         let sd_header = empty_sd_header();
@@ -943,7 +990,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_sd_announcements_without_discovery_bound() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         // Don't bind discovery — the task should handle the error gracefully.
         let sd_header = empty_sd_header();
         let handle =
@@ -964,7 +1012,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_sd_announcements_abort_stops_task() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         client.bind_discovery().await.unwrap();
 
         let sd_header = empty_sd_header();
@@ -1089,7 +1138,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_sd_announcements_stops_on_shutdown() {
-        let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
         client.bind_discovery().await.unwrap();
 
         let sd_header = empty_sd_header();

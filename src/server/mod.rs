@@ -263,9 +263,21 @@ impl Server {
         })
     }
 
-    /// Start announcing the service via Service Discovery
+    /// Build the periodic-SD-announcement future.
     ///
-    /// This sends periodic `OfferService` messages to the SD multicast group
+    /// Returns a future that sends an `OfferService` message to the SD
+    /// multicast group every second. The caller must drive the future
+    /// (typically via `tokio::spawn`) for announcements to fire; this
+    /// function does no work on its own.
+    ///
+    /// ```no_run
+    /// # use simple_someip::server::Server;
+    /// # async fn demo(server: Server) -> Result<(), simple_someip::server::Error> {
+    /// let announce_fut = server.announcement_loop()?;
+    /// tokio::spawn(announce_fut);
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
@@ -273,15 +285,14 @@ impl Server {
     /// called on a server constructed via [`Server::new_passive`] — passive
     /// servers have no real SD socket bound to port 30490, so any
     /// announcements would go out with an incorrect source port.
-    ///
-    /// Otherwise currently always returns `Ok(())`; SD send failures are
-    /// logged internally.
-    pub fn start_announcing(&self) -> Result<(), Error> {
+    pub fn announcement_loop(
+        &self,
+    ) -> Result<impl core::future::Future<Output = ()> + 'static, Error> {
         if self.is_passive {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "start_announcing called on passive Server for service 0x{:04X}; \
+                    "announcement_loop called on passive Server for service 0x{:04X}; \
                      announcements must be driven externally (e.g. via \
                      `simple_someip::Client::start_sd_announcements`)",
                     self.config.service_id
@@ -292,7 +303,7 @@ impl Server {
         let sd_socket = Arc::clone(&self.sd_socket);
         let sd_state = Arc::clone(&self.sd_state);
 
-        tokio::spawn(async move {
+        Ok(async move {
             let mut announcement_count = 0u32;
             loop {
                 match sd_state.send_offer_service(&config, &sd_socket).await {
@@ -319,8 +330,21 @@ impl Server {
                 // Send announcements every 1 second
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
-        });
+        })
+    }
 
+    /// Deprecated shim for [`Self::announcement_loop`] that spawns the
+    /// returned future on tokio internally. Kept so the old
+    /// `server.start_announcing()?;` idiom continues to compile; new code
+    /// should call `announcement_loop` and spawn on its own executor so
+    /// the server is portable to bare-metal.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::announcement_loop`].
+    pub fn start_announcing(&self) -> Result<(), Error> {
+        let fut = self.announcement_loop()?;
+        tokio::spawn(fut);
         Ok(())
     }
 
