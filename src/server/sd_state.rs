@@ -29,8 +29,15 @@ pub(super) struct SdStateManager {
 
 impl SdStateManager {
     pub(super) const fn new() -> Self {
+        Self::with_initial(1)
+    }
+
+    /// Construct with a specific starting session counter. Primarily used by
+    /// tests to validate wrap behavior; callers in production should use
+    /// [`Self::new`].
+    pub(super) const fn with_initial(initial: u16) -> Self {
         Self {
-            session_id: AtomicU16::new(1),
+            session_id: AtomicU16::new(initial),
         }
     }
 
@@ -107,15 +114,27 @@ impl SdStateManager {
 
         Ok(())
     }
-
-    #[cfg(test)]
-    pub(super) fn store_for_test(&self, v: u16) {
-        self.session_id.store(v, Ordering::Relaxed);
-    }
 }
 
-impl Default for SdStateManager {
-    fn default() -> Self {
-        Self::new()
+#[cfg(test)]
+mod tests {
+    use super::SdStateManager;
+
+    #[test]
+    fn next_session_id_wraps_past_ffff_skipping_zero() {
+        let sd = SdStateManager::with_initial(0xFFFE);
+
+        // 0xFFFE -> 0xFFFF
+        assert_eq!(sd.next_session_id(), 0xFFFF);
+
+        // 0xFFFF -> wraps to 0x0001 (0 is skipped)
+        assert_eq!(sd.next_session_id(), 0x0001);
+    }
+
+    #[test]
+    fn next_session_id_starts_at_two_from_default_new() {
+        let sd = SdStateManager::new();
+        // new() seeds at 1; first next_session_id increments to 2
+        assert_eq!(sd.next_session_id(), 2);
     }
 }
