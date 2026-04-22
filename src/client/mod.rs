@@ -3,16 +3,23 @@
 //! # Memory footprint
 //!
 //! The client's internal `Inner` state is allocated inline rather than on
-//! the heap. With the default capacity constants used by the client
-//! internals — `REQUEST_QUEUE_CAP=32`, `PENDING_RESPONSES_CAP=64`, and
-//! `UNICAST_SOCKETS_CAP=8` in `inner.rs`, plus `SESSION_CAP=64` in
-//! `session.rs` — `Inner<P>` occupies on the order of **8–12 KiB**,
-//! depending on `sizeof::<P>()` and `sizeof::<SocketManager<P>>()`. On
-//! `std + tokio`, this is allocated on the heap when the run-loop is
-//! spawned, so the overhead is invisible to callers. On the bare-metal
-//! port (future), whoever drives the future must arrange storage for it
-//! (either a `static` or a heap allocator); these capacity constants are
-//! the primary knobs for trimming this footprint.
+//! the heap. With the default capacity constants declared in `inner.rs` —
+//! `REQUEST_QUEUE_CAP=32`, `PENDING_RESPONSES_CAP=64`, `UNICAST_SOCKETS_CAP=8`,
+//! and `SESSION_CAP=64` — `Inner<P>` occupies on the order of **8–12 KiB**,
+//! depending on `sizeof::<P>()` and `sizeof::<SocketManager<P>>()`.
+//!
+//! In addition, each `SocketManager`'s spawn loop holds a persistent
+//! `[u8; UDP_BUFFER_SIZE]` receive/send buffer (1500 bytes) and transiently
+//! allocates a second `[u8; UDP_BUFFER_SIZE]` on the stack for E2E-protect
+//! output — so an active socket-loop future carries **~3 KiB** of buffer
+//! state on top of its control-plane fields. With `UNICAST_SOCKETS_CAP=8`
+//! sockets bound, the per-client buffer budget is therefore ~24 KiB.
+//!
+//! On `std + tokio`, all of this is allocated on the heap when each future
+//! is spawned, so the overhead is invisible to callers. On the bare-metal
+//! port (future), whoever drives the futures must arrange storage for them
+//! (either a `static` or a heap allocator); the capacity constants plus
+//! [`crate::UDP_BUFFER_SIZE`] are the knobs for trimming this footprint.
 mod error;
 mod inner;
 mod service_registry;

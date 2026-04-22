@@ -2,12 +2,11 @@
 
 use super::Error;
 use super::subscription_manager::SubscriptionManager;
-use crate::e2e::{E2EKey, E2ERegistry, PROFILE4_HEADER_SIZE};
+use crate::UDP_BUFFER_SIZE;
+use crate::e2e::{E2EKey, E2ERegistry};
 use crate::protocol::{Header, Message};
 use crate::traits::{PayloadWireFormat, WireFormat};
 use std::sync::{Arc, Mutex};
-use std::vec;
-use std::vec::Vec;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
@@ -70,11 +69,13 @@ impl EventPublisher {
             return Ok(0);
         }
 
-        // Serialize the message once
-        let mut buffer = Vec::new();
-        message.encode(&mut buffer)?;
+        // Serialize the message into a stack buffer sized to MTU.
+        let mut buffer = [0u8; UDP_BUFFER_SIZE];
+        let mut message_length = message.encode_to_slice(&mut buffer)?;
 
-        // Apply E2E protect if configured
+        // Apply E2E protect if configured. The `protected` stack buffer is
+        // disjoint from `buffer`, so we can read the unprotected payload
+        // directly out of `buffer[16..]` without a separate copy.
         {
             let key = E2EKey::from_message_id(message.header().message_id());
             let mut registry = self
@@ -82,17 +83,30 @@ impl EventPublisher {
                 .lock()
                 .expect("e2e registry lock poisoned");
             if registry.contains_key(&key) {
-                let message_length = buffer.len();
-                let original_payload = buffer[16..message_length].to_vec();
                 let upper_header: [u8; 8] = buffer[8..16].try_into().expect("upper header slice");
-                let mut protected = vec![0u8; original_payload.len() + PROFILE4_HEADER_SIZE];
-                match registry.protect(key, &original_payload, upper_header, &mut protected) {
+                let mut protected = [0u8; UDP_BUFFER_SIZE];
+                let result = registry.protect(
+                    key,
+                    &buffer[16..message_length],
+                    upper_header,
+                    &mut protected,
+                );
+                match result {
                     Some(Ok(protected_len)) => {
+                        if 16 + protected_len > UDP_BUFFER_SIZE {
+                            tracing::error!(
+                                "E2E-protected payload ({} bytes) exceeds UDP_BUFFER_SIZE ({}); \
+                                 dropping publish",
+                                16 + protected_len,
+                                UDP_BUFFER_SIZE
+                            );
+                            return Err(Error::Capacity("udp_buffer"));
+                        }
                         #[allow(clippy::cast_possible_truncation)]
                         let new_length: u32 = 8 + protected_len as u32;
                         buffer[4..8].copy_from_slice(&new_length.to_be_bytes());
-                        buffer.resize(16 + protected_len, 0);
                         buffer[16..16 + protected_len].copy_from_slice(&protected[..protected_len]);
+                        message_length = 16 + protected_len;
                     }
                     Some(Err(e)) => {
                         tracing::error!("E2E protect error: {:?}", e);
@@ -102,16 +116,18 @@ impl EventPublisher {
             }
         }
 
+        let datagram = &buffer[..message_length];
+
         // Send to all subscribers
         let mut sent_count = 0;
         for subscriber in &subscribers {
-            match self.socket.send_to(&buffer, subscriber.address).await {
+            match self.socket.send_to(datagram, subscriber.address).await {
                 Ok(_) => {
                     sent_count += 1;
                     tracing::trace!(
                         "Sent event to subscriber {} ({} bytes)",
                         subscriber.address,
-                        buffer.len()
+                        message_length
                     );
                 }
                 Err(e) => {
@@ -173,15 +189,25 @@ impl EventPublisher {
             payload.len(),
         );
 
-        // Serialize header + payload
-        let mut buffer = Vec::new();
-        header.encode(&mut buffer)?;
-        buffer.extend_from_slice(payload);
+        // Serialize header + payload into a stack buffer sized to MTU.
+        let mut buffer = [0u8; UDP_BUFFER_SIZE];
+        let header_len = header.encode_to_slice(&mut buffer)?;
+        let total_len = header_len + payload.len();
+        if total_len > UDP_BUFFER_SIZE {
+            tracing::error!(
+                "raw event ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping publish",
+                total_len,
+                UDP_BUFFER_SIZE
+            );
+            return Err(Error::Capacity("udp_buffer"));
+        }
+        buffer[header_len..total_len].copy_from_slice(payload);
+        let datagram = &buffer[..total_len];
 
         // Send to all subscribers
         let mut sent_count = 0;
         for subscriber in &subscribers {
-            match self.socket.send_to(&buffer, subscriber.address).await {
+            match self.socket.send_to(datagram, subscriber.address).await {
                 Ok(_) => {
                     sent_count += 1;
                 }
@@ -309,6 +335,8 @@ mod tests {
     use super::*;
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
     use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::vec;
+    use std::vec::Vec;
 
     fn test_registry() -> Arc<Mutex<E2ERegistry>> {
         Arc::new(Mutex::new(E2ERegistry::new()))
@@ -391,6 +419,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_publish_raw_event_exceeds_udp_buffer_returns_capacity_error() {
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
+        {
+            let mut mgr = subscriptions.write().await;
+            mgr.subscribe(0x5B, 1, 0x01, addr);
+        }
+        let (publisher, _) = make_publisher(subscriptions).await;
+
+        // Payload = UDP_BUFFER_SIZE forces total (header + payload) over the cap.
+        let too_big = vec![0u8; UDP_BUFFER_SIZE];
+        let err = publisher
+            .publish_raw_event(0x5B, 1, 0x01, 0x8001, 0x0001, 0x01, 0x01, &too_big)
+            .await
+            .expect_err("oversize payload must error, not report Ok(0)");
+        match err {
+            Error::Capacity(tag) => assert_eq!(tag, "udp_buffer"),
+            other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
+        }
     }
 
     #[tokio::test]

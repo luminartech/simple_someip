@@ -92,6 +92,13 @@
 #[cfg(feature = "std")]
 extern crate std;
 
+/// Maximum size, in bytes, of UDP datagrams produced by the `client` and
+/// `server` send paths. Sized to Ethernet MTU; messages larger than this
+/// cannot be serialized and will error out. Every outgoing stack buffer in
+/// the crate is sized to this constant — bare-metal ports with a smaller
+/// link MTU may want to lower it by forking.
+pub const UDP_BUFFER_SIZE: usize = 1500;
+
 /// SOME/IP client for discovering services and exchanging messages.
 #[cfg(feature = "client")]
 pub mod client;
