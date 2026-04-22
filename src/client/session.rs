@@ -1,5 +1,12 @@
 use crate::protocol::sd::RebootFlag;
-use std::{collections::HashMap, net::SocketAddr};
+use heapless::index_map::FnvIndexMap;
+use std::net::SocketAddr;
+
+/// Max number of distinct `(sender, transport, service, instance)` tuples tracked
+/// for reboot detection. Must be a power of two (heapless `FnvIndexMap`
+/// requirement). Sized for a small fleet of peers each offering several
+/// services; bare-metal builds with more peers may need to edit this constant.
+const SESSION_CAP: usize = 64;
 
 /// Distinguishes multicast vs unicast transport for per-sender session tracking.
 /// The AUTOSAR spec requires separate session ID tracking per transport.
@@ -45,9 +52,30 @@ pub enum SessionVerdict {
 /// Tracking per service instance (rather than per sender) avoids false
 /// positives when a sensor interleaves SD offers for multiple services
 /// with independent session counters on the same source address.
-#[derive(Debug, Default)]
+///
+/// Capacity is bounded at compile time ([`SESSION_CAP`]); see module docs.
+/// When the map is full, new sender entries are dropped with a `warn!` log
+/// and reboot detection for those senders is disabled.
+///
+/// # Security posture
+///
+/// The backing map uses FNV hashing rather than the DoS-resistant hasher used
+/// by `std::collections::HashMap`. For SOME/IP on isolated automotive or
+/// sensor networks this is not a concern. Deployments where `SessionKey`
+/// inputs (notably `SocketAddr`) are adversary-controlled should be aware
+/// that an attacker can craft keys to force collisions and degrade lookup
+/// cost; the blast radius is bounded by [`SESSION_CAP`].
+#[derive(Debug)]
 pub struct SessionTracker {
-    state: HashMap<SessionKey, SessionState>,
+    state: FnvIndexMap<SessionKey, SessionState, SESSION_CAP>,
+}
+
+impl Default for SessionTracker {
+    fn default() -> Self {
+        Self {
+            state: FnvIndexMap::new(),
+        }
+    }
 }
 
 impl SessionTracker {
@@ -89,13 +117,22 @@ impl SessionTracker {
                 }
             }
         };
-        self.state.insert(
-            key,
-            SessionState {
-                last_session_id: session_id,
-                last_reboot_flag: reboot_flag,
-            },
-        );
+        let new_state = SessionState {
+            last_session_id: session_id,
+            last_reboot_flag: reboot_flag,
+        };
+        if self.state.insert(key, new_state).is_err() {
+            // Map at capacity and key is new — silently dropping the update
+            // would lose reboot-detection state. Log once so bare-metal users
+            // can size `SESSION_CAP` up.
+            tracing::warn!(
+                "SessionTracker at capacity ({}); dropping new sender state for \
+                 svc=0x{:04X} inst=0x{:04X}. Reboot detection disabled for this entry.",
+                SESSION_CAP,
+                service_id,
+                instance_id
+            );
+        }
         verdict
     }
 }
@@ -309,5 +346,31 @@ mod tests {
         tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, CONT);
         let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 2, CONT);
         assert_eq!(verdict, SessionVerdict::Ok);
+    }
+
+    #[test]
+    fn capacity_overflow_drops_new_entries_but_keeps_existing_tracking() {
+        // Fill the tracker to capacity with unique (sender, service) tuples.
+        let mut tracker = SessionTracker::default();
+        for i in 0..super::SESSION_CAP {
+            let port = 1000 + u16::try_from(i).unwrap();
+            let v = tracker.check(addr(port), TransportKind::Multicast, SVC, INST, 1, RB);
+            assert_eq!(v, SessionVerdict::Initial);
+        }
+
+        // One more insert — map is full, new entry dropped. The verdict is
+        // still Initial (no prior state for this key), but the state is
+        // never stored so a follow-up is also Initial.
+        let overflow_addr = addr(9999);
+        let v = tracker.check(overflow_addr, TransportKind::Multicast, SVC, INST, 1, RB);
+        assert_eq!(v, SessionVerdict::Initial);
+        // Because the insert failed, a second call with the same key still
+        // sees no stored state.
+        let v = tracker.check(overflow_addr, TransportKind::Multicast, SVC, INST, 2, RB);
+        assert_eq!(v, SessionVerdict::Initial);
+
+        // Previously-tracked senders continue to work normally.
+        let v = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 2, RB);
+        assert_eq!(v, SessionVerdict::Ok);
     }
 }

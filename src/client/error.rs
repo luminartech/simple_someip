@@ -1,7 +1,12 @@
 use thiserror::Error;
 
 /// Errors that can occur during SOME/IP client operations.
+///
+/// Marked `#[non_exhaustive]` so that future variants (for example, new
+/// transport-specific error conditions in upcoming releases) can be added
+/// without a further breaking change.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// A SOME/IP protocol-level error.
     #[error(transparent)]
@@ -24,4 +29,9 @@ pub enum Error {
     /// An E2E protection or checking error occurred.
     #[error(transparent)]
     E2e(#[from] crate::e2e::Error),
+    /// A fixed-capacity internal structure is full. The argument names the
+    /// structure so bare-metal users can size the corresponding compile-time
+    /// constant up (e.g. `"unicast_sockets"`).
+    #[error("internal capacity exceeded: {0}")]
+    Capacity(&'static str),
 }
