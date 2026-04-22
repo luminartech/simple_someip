@@ -208,21 +208,27 @@ use core::time::Duration;
 /// kinds can be added without a breaking change. Kept local to this crate
 /// (rather than re-exporting `embedded_io::ErrorKind`) so our public API
 /// does not move when `embedded_io` bumps major versions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum IoErrorKind {
     /// The operation timed out.
+    #[error("operation timed out")]
     TimedOut,
     /// The operation was interrupted and can be retried.
+    #[error("operation interrupted")]
     Interrupted,
     /// The caller lacks permission for the operation.
+    #[error("permission denied")]
     PermissionDenied,
     /// A remote peer actively refused the connection / destination was
     /// unreachable.
+    #[error("connection refused")]
     ConnectionRefused,
     /// The network layer rejected the operation (routing, MTU, etc.).
+    #[error("network unreachable")]
     NetworkUnreachable,
     /// Any error that does not fit a more specific variant.
+    #[error("i/o error")]
     Other,
 }
 
@@ -234,16 +240,19 @@ pub enum IoErrorKind {
 /// native error types into one of these variants; anything that does not
 /// fit a specific variant should use [`TransportError::Io`] with an
 /// appropriate [`IoErrorKind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum TransportError {
     /// Bind failed because the address or port is already in use.
+    #[error("address in use")]
     AddressInUse,
     /// The operation is not supported by this transport (for example,
     /// multicast on a backend that has none, or an IPv6 address on an
     /// IPv4-only stack).
+    #[error("unsupported transport operation")]
     Unsupported,
     /// A generic I/O error, classified by a portable [`IoErrorKind`].
+    #[error("transport i/o: {0}")]
     Io(IoErrorKind),
 }
 
