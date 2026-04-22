@@ -22,7 +22,7 @@ tokio = { version = "1", default-features = false, features = [
     "sync",
     "time",
 ], optional = true }
-tracing = { version = "0.1", default-features = false }
+tracing = { version = "0.1", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread"] }
@@ -30,7 +30,7 @@ tracing-subscriber = "0.3"
 
 [features]
 default = ["std"]
-std = ["embedded-io/std", "thiserror/std", "tracing/std"]
+std = ["embedded-io/std", "thiserror/std", "dep:tracing", "tracing/std"]
 client = ["std", "dep:tokio", "dep:socket2"]
 server = ["std", "dep:tokio", "dep:socket2"]
 

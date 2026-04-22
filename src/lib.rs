@@ -92,6 +92,30 @@
 #[cfg(feature = "std")]
 extern crate std;
 
+// When the `tracing` crate is available, re-export its macros directly.
+// In no_std builds without tracing, provide no-op shims so the e2e module
+// compiles without conditional compilation at every call site.
+#[cfg(feature = "tracing")]
+#[allow(unused_imports)]
+pub(crate) use tracing::{trace, warn, error, debug, info};
+
+#[cfg(not(feature = "tracing"))]
+mod tracing_shims {
+    macro_rules! trace  { ($($t:tt)*) => {} }
+    macro_rules! warn   { ($($t:tt)*) => {} }
+    macro_rules! error  { ($($t:tt)*) => {} }
+    macro_rules! debug  { ($($t:tt)*) => {} }
+    macro_rules! info   { ($($t:tt)*) => {} }
+    pub(crate) use trace;
+    pub(crate) use warn;
+    pub(crate) use error;
+    pub(crate) use debug;
+    pub(crate) use info;
+}
+#[cfg(not(feature = "tracing"))]
+pub(crate) use tracing_shims::{trace, warn, error, debug, info};
+
+
 /// SOME/IP client for discovering services and exchanging messages.
 #[cfg(feature = "client")]
 pub mod client;
