@@ -1,6 +1,6 @@
+use heapless::{Deque, index_map::FnvIndexMap};
 use std::{
     borrow::ToOwned,
-    collections::{HashMap, VecDeque},
     future,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
@@ -28,6 +28,19 @@ use crate::{
 };
 
 use super::error::Error;
+
+/// Max depth of the internal control-message queue. Each entry is one
+/// in-flight `ControlMessage`. Must be generous enough to absorb bursts
+/// from `Client` callers between event-loop ticks.
+const REQUEST_QUEUE_CAP: usize = 32;
+
+/// Max number of outstanding unicast request-response pairs. Each entry is
+/// a `request_id` awaiting a reply. Must be a power of two.
+const PENDING_RESPONSES_CAP: usize = 64;
+
+/// Max number of bound unicast sockets tracked by port. Must be a power of
+/// two.
+const UNICAST_SOCKETS_CAP: usize = 8;
 
 pub(super) enum ControlMessage<P: PayloadWireFormat> {
     SetInterface(Ipv4Addr, oneshot::Sender<Result<(), Error>>),
@@ -238,10 +251,11 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     /// MPSC Receiver used to receive control messages from outer client
     control_receiver: Receiver<ControlMessage<PayloadDefinitions>>,
     /// Queue of pending control messages to process
-    request_queue: VecDeque<ControlMessage<PayloadDefinitions>>,
+    request_queue: Deque<ControlMessage<PayloadDefinitions>, REQUEST_QUEUE_CAP>,
     /// Pending request-responses keyed by `request_id` (`client_id` << 16 | `session_counter`).
     /// Set by `SendToService`, cleared when a matching unicast arrives.
-    pending_responses: HashMap<u32, oneshot::Sender<Result<PayloadDefinitions, Error>>>,
+    pending_responses:
+        FnvIndexMap<u32, oneshot::Sender<Result<PayloadDefinitions, Error>>, PENDING_RESPONSES_CAP>,
     /// Unbounded sender used to send updates to outer client
     update_sender: mpsc::UnboundedSender<ClientUpdate<PayloadDefinitions>>,
     /// Target interface for sockets
@@ -255,7 +269,7 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     /// keys (prevents interleaved-counter false reboots).
     discovery_unicast_socket: Option<SocketManager<PayloadDefinitions>>,
     /// Socket managers for unicast messages, keyed by local port
-    unicast_sockets: HashMap<u16, SocketManager<PayloadDefinitions>>,
+    unicast_sockets: FnvIndexMap<u16, SocketManager<PayloadDefinitions>, UNICAST_SOCKETS_CAP>,
     /// Per-sender SD session state for reboot detection
     session_tracker: SessionTracker,
     /// Registry of known service endpoints (auto-populated from SD + manual)
@@ -386,13 +400,12 @@ where
         let (update_sender, update_receiver) = mpsc::unbounded_channel();
         let inner = Self {
             control_receiver,
-            request_queue: VecDeque::new(),
-            pending_responses: HashMap::new(),
+            request_queue: Deque::new(),
+            pending_responses: FnvIndexMap::new(),
             update_sender,
             interface,
             discovery_socket: None,
-            discovery_unicast_socket: None,
-            unicast_sockets: HashMap::new(),
+            unicast_sockets: FnvIndexMap::new(),
             session_tracker: SessionTracker::default(),
             service_registry: ServiceRegistry::default(),
             run: true,
@@ -459,9 +472,30 @@ where
         {
             return Ok(socket.port());
         }
+        // Check capacity before asking the OS for a port so we don't
+        // bind-then-drop a socket we can't track.
+        if self.unicast_sockets.len() >= UNICAST_SOCKETS_CAP {
+            warn!(
+                "unicast_sockets at capacity ({}); refusing new bind of port {}",
+                UNICAST_SOCKETS_CAP, port
+            );
+            return Err(Error::Capacity("unicast_sockets"));
+        }
         let unicast_socket = SocketManager::bind(port, Arc::clone(&self.e2e_registry))?;
         let bound_port = unicast_socket.port();
-        self.unicast_sockets.insert(bound_port, unicast_socket);
+        // Capacity was checked above, so insert cannot report "full" here.
+        // A defensive check guards against a future refactor that changes
+        // the ordering.
+        if self
+            .unicast_sockets
+            .insert(bound_port, unicast_socket)
+            .is_err()
+        {
+            error!(
+                "unicast_sockets insert failed after capacity check passed — invariant violation"
+            );
+            return Err(Error::Capacity("unicast_sockets"));
+        }
         debug!("Bound unicast socket on port {}", bound_port);
         Ok(bound_port)
     }
@@ -500,7 +534,11 @@ where
     /// Receive from any bound unicast socket. Returns the first message ready
     /// from any socket. If no sockets are bound, returns a future that never resolves.
     async fn receive_any_unicast(
-        unicast_sockets: &mut HashMap<u16, SocketManager<PayloadDefinitions>>,
+        unicast_sockets: &mut FnvIndexMap<
+            u16,
+            SocketManager<PayloadDefinitions>,
+            UNICAST_SOCKETS_CAP,
+        >,
     ) -> Result<ReceivedMessage<PayloadDefinitions>, Error> {
         if unicast_sockets.is_empty() {
             return future::pending().await;
@@ -532,14 +570,18 @@ where
                             self.interface
                         );
                         self.unbind_discovery().await;
+                        // Re-enqueue after pop — queue has a free slot.
                         self.request_queue
-                            .push_front(ControlMessage::SetInterface(interface, response));
+                            .push_front(ControlMessage::SetInterface(interface, response))
+                            .ok();
                         return;
                     }
                     if self.interface != interface {
                         self.set_interface(interface);
+                        // Re-enqueue after pop — queue has a free slot.
                         self.request_queue
-                            .push_front(ControlMessage::SetInterface(interface, response));
+                            .push_front(ControlMessage::SetInterface(interface, response))
+                            .ok();
                         return;
                     }
                     info!("Binding to interface: {}", interface);
@@ -574,10 +616,12 @@ where
                         None => {
                             match self.bind_discovery() {
                                 Ok(()) => {
-                                    // Discovery socket successfully bound, send the message on the next loop
-                                    self.request_queue.push_front(ControlMessage::SendSD(
-                                        target, header, response,
-                                    ));
+                                    // Re-enqueue after pop — queue has a free slot.
+                                    self.request_queue
+                                        .push_front(ControlMessage::SendSD(
+                                            target, header, response,
+                                        ))
+                                        .ok();
                                 }
                                 Err(e) => {
                                     error!(
@@ -709,7 +753,18 @@ where
                     match send_result {
                         Ok(()) => {
                             let _ = send_complete.send(Ok(()));
-                            self.pending_responses.insert(request_id, response);
+                            if self.pending_responses.insert(request_id, response).is_err() {
+                                // Map full: the response Sender was returned
+                                // and is now dropped; caller's response oneshot
+                                // will observe cancellation. Send already
+                                // succeeded — the peer's reply, if any, will
+                                // arrive as a ClientUpdate::Unicast instead.
+                                warn!(
+                                    "pending_responses at capacity ({}); response tracking \
+                                     dropped for request_id 0x{:08X}",
+                                    PENDING_RESPONSES_CAP, request_id
+                                );
+                            }
                         }
                         Err(e) => {
                             let _ = send_complete.send(Err(e));
@@ -774,15 +829,18 @@ where
                     match &mut self.discovery_socket {
                         None => match self.bind_discovery() {
                             Ok(()) => {
-                                self.request_queue.push_front(ControlMessage::Subscribe {
-                                    service_id,
-                                    instance_id,
-                                    major_version,
-                                    ttl,
-                                    event_group_id,
-                                    client_port,
-                                    response,
-                                });
+                                // Re-enqueue after pop — queue has a free slot.
+                                self.request_queue
+                                    .push_front(ControlMessage::Subscribe {
+                                        service_id,
+                                        instance_id,
+                                        major_version,
+                                        ttl,
+                                        event_group_id,
+                                        client_port,
+                                        response,
+                                    })
+                                    .ok();
                             }
                             Err(e) => {
                                 let _ = response.send(Err(e));
@@ -847,7 +905,16 @@ where
                     ctrl = control_receiver.recv() => {
                         if let Some(ctrl) = ctrl {
                             debug!("Received control message: {:?}", ctrl);
-                            request_queue.push_back(ctrl);
+                            if request_queue.push_back(ctrl).is_err() {
+                                // Queue full: the rejected ControlMessage is
+                                // dropped, so any oneshot senders inside it
+                                // cancel — callers awaiting those receivers
+                                // will observe `RecvError`.
+                                warn!(
+                                    "request_queue at capacity ({}); dropping control message",
+                                    REQUEST_QUEUE_CAP
+                                );
+                            }
                         } else {
                             // The sender has been dropped, so we should exit
                             *run = false;
@@ -1004,6 +1071,63 @@ mod tests {
         assert!(s.contains("Subscribe"));
         assert!(s.contains("service_id"));
         assert!(s.contains("event_group_id"));
+    }
+
+    /// Build an [`Inner`] without spawning the run loop, for direct
+    /// unit-testing of state-mutating methods.
+    fn make_inner_for_test() -> Inner<TestPayload> {
+        let (_control_sender, control_receiver) = mpsc::channel(4);
+        let (update_sender, _update_receiver) = mpsc::unbounded_channel();
+        Inner {
+            control_receiver,
+            request_queue: Deque::new(),
+            pending_responses: FnvIndexMap::new(),
+            update_sender,
+            interface: Ipv4Addr::LOCALHOST,
+            discovery_socket: None,
+            unicast_sockets: FnvIndexMap::new(),
+            session_tracker: SessionTracker::default(),
+            service_registry: ServiceRegistry::default(),
+            run: true,
+            client_id: 0x1234,
+            session_counter: 1,
+            sd_session_id: 1,
+            sd_session_has_wrapped: false,
+            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            multicast_loopback: false,
+            phantom: std::marker::PhantomData,
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_unicast_returns_capacity_error_when_map_full() {
+        let mut inner = make_inner_for_test();
+
+        // Fill unicast_sockets to capacity using ephemeral binds (port 0).
+        // Each call with port=0 creates a fresh socket on a distinct OS-chosen
+        // port, so the cap is what gates — not duplicate-key collapse.
+        for _ in 0..UNICAST_SOCKETS_CAP {
+            let bound = inner
+                .bind_unicast(0)
+                .expect("ephemeral bind below cap should succeed");
+            assert_ne!(bound, 0, "OS should assign a non-zero ephemeral port");
+        }
+        assert_eq!(inner.unicast_sockets.len(), UNICAST_SOCKETS_CAP);
+
+        // The next bind must fail with Error::Capacity and must NOT bind a
+        // socket (pre-bind capacity check).
+        let err = inner
+            .bind_unicast(0)
+            .expect_err("bind past cap should fail");
+        match err {
+            Error::Capacity(name) => assert_eq!(name, "unicast_sockets"),
+            other => panic!("expected Error::Capacity, got {other:?}"),
+        }
+        assert_eq!(
+            inner.unicast_sockets.len(),
+            UNICAST_SOCKETS_CAP,
+            "map should remain at capacity, not bind-then-drop a new socket"
+        );
     }
 
     #[tokio::test]
