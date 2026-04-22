@@ -65,14 +65,15 @@ impl<MessageDefinitions> SocketManager<MessageDefinitions>
 where
     MessageDefinitions: PayloadWireFormat + 'static,
 {
-    /// Bind the SD multicast socket, seeding the session counter and wrap state from
-    /// a previous socket when rebinding. Pass `(1, false)` for a fresh bind.
-    /// Preserving state across rebinds avoids emitting a false reboot signal
-    /// (`reboot_flag=1`) to peers after `unbind_discovery` + `bind_discovery`.
+    /// Bind the SD multicast socket, seeding the session counter and wrap
+    /// state from a previous socket when rebinding. Pass `(1, false)` for a
+    /// fresh bind. Preserving state across rebinds avoids emitting a false
+    /// reboot signal (`reboot_flag=1`) to peers after
+    /// `unbind_discovery` + `bind_discovery`.
     ///
-    /// Uses the default [`TokioTransport`] backend. Bare-metal callers can
-    /// construct a `SocketManager` directly via the `_with_transport`
-    /// variant once that lands alongside the phase-6 spawn-hoist refactor.
+    /// Uses the default [`TokioTransport`] backend. For tests or alternate
+    /// bind logic (e.g. an interceptor factory around `TokioTransport`),
+    /// use [`Self::bind_discovery_seeded_with_transport`].
     pub async fn bind_discovery_seeded(
         interface: Ipv4Addr,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
@@ -80,6 +81,35 @@ where
         session_has_wrapped: bool,
         multicast_loopback: bool,
     ) -> Result<Self, Error> {
+        Self::bind_discovery_seeded_with_transport(
+            &TokioTransport,
+            interface,
+            e2e_registry,
+            session_id,
+            session_has_wrapped,
+            multicast_loopback,
+        )
+        .await
+    }
+
+    /// Variant of [`Self::bind_discovery_seeded`] that constructs the
+    /// underlying socket through a caller-supplied [`TransportFactory`].
+    /// The factory must still produce a
+    /// [`TokioSocket`](crate::tokio_transport::TokioSocket) because the
+    /// spawned I/O loop is currently tokio-specific; once phase 6 hoists
+    /// the spawn out of this function, this bound will be relaxed to any
+    /// `TransportSocket`.
+    pub async fn bind_discovery_seeded_with_transport<F>(
+        factory: &F,
+        interface: Ipv4Addr,
+        e2e_registry: Arc<Mutex<E2ERegistry>>,
+        session_id: u16,
+        session_has_wrapped: bool,
+        multicast_loopback: bool,
+    ) -> Result<Self, Error>
+    where
+        F: TransportFactory<Socket = crate::tokio_transport::TokioSocket>,
+    {
         let (rx_tx, rx_rx) = mpsc::channel(16);
         let (tx_tx, tx_rx) = mpsc::channel(16);
 
@@ -101,7 +131,6 @@ where
         };
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, sd::MULTICAST_PORT);
 
-        let factory = TokioTransport;
         let mut socket = factory.bind(bind_addr, &options).await?;
         socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
 
@@ -116,6 +145,21 @@ where
     }
 
     pub async fn bind(port: u16, e2e_registry: Arc<Mutex<E2ERegistry>>) -> Result<Self, Error> {
+        Self::bind_with_transport(&TokioTransport, port, e2e_registry).await
+    }
+
+    /// Variant of [`Self::bind`] that constructs the underlying socket
+    /// through a caller-supplied [`TransportFactory`]. See
+    /// [`Self::bind_discovery_seeded_with_transport`] for the factory
+    /// bound rationale.
+    pub async fn bind_with_transport<F>(
+        factory: &F,
+        port: u16,
+        e2e_registry: Arc<Mutex<E2ERegistry>>,
+    ) -> Result<Self, Error>
+    where
+        F: TransportFactory<Socket = crate::tokio_transport::TokioSocket>,
+    {
         let (rx_tx, rx_rx) = mpsc::channel(4);
         let (tx_tx, tx_rx) = mpsc::channel(4);
 
@@ -126,7 +170,6 @@ where
         };
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
 
-        let factory = TokioTransport;
         let socket = factory.bind(bind_addr, &options).await?;
         let port = socket.local_addr()?.port();
         Self::spawn_socket_loop(socket, rx_tx, tx_rx, e2e_registry);
@@ -710,5 +753,54 @@ mod tests {
             Error::Capacity(tag) => assert_eq!(tag, "udp_buffer"),
             other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
         }
+    }
+
+    /// Proves the public `bind_with_transport` entry point accepts an
+    /// alternative `TransportFactory` implementation. The factory here is
+    /// a thin interceptor that counts how many times `bind` is called; it
+    /// delegates to the built-in `TokioTransport`, which is what the
+    /// current `Socket = TokioSocket` bound requires.
+    #[tokio::test]
+    async fn bind_with_transport_accepts_custom_factory() {
+        use crate::tokio_transport::{TokioSocket, TokioTransport};
+        use core::future::Future;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingFactory {
+            inner: TokioTransport,
+            calls: AtomicUsize,
+        }
+
+        impl TransportFactory for CountingFactory {
+            type Socket = TokioSocket;
+            fn bind(
+                &self,
+                addr: SocketAddrV4,
+                options: &SocketOptions,
+            ) -> impl Future<Output = Result<Self::Socket, crate::transport::TransportError>>
+            {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                // Clone the options into the async block so no borrow
+                // escapes the returned future.
+                let options = *options;
+                let inner = self.inner;
+                async move { inner.bind(addr, &options).await }
+            }
+        }
+
+        let factory = CountingFactory {
+            inner: TokioTransport,
+            calls: AtomicUsize::new(0),
+        };
+
+        let sm = TestSocketManager::bind_with_transport(&factory, 0, test_registry())
+            .await
+            .expect("bind via custom factory");
+        assert_eq!(
+            factory.calls.load(Ordering::SeqCst),
+            1,
+            "custom factory should have been invoked exactly once"
+        );
+        drop(sm);
     }
 }
