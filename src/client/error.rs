@@ -39,9 +39,11 @@ pub enum Error {
     /// An E2E protection or checking error occurred.
     #[error(transparent)]
     E2e(#[from] crate::e2e::Error),
-    /// A fixed-capacity internal structure is full. The argument names the
-    /// structure so bare-metal users can size the corresponding compile-time
-    /// constant up (e.g. `"unicast_sockets"`).
+    /// A fixed-capacity internal structure is full. The argument is a
+    /// lowercase `snake_case` tag naming the resource; grep the crate for
+    /// the tag to find the compile-time constant that governs it. Current
+    /// tags: `"unicast_sockets"` (→ `UNICAST_SOCKETS_CAP`), `"udp_buffer"`
+    /// (→ `crate::UDP_BUFFER_SIZE`).
     #[error("internal capacity exceeded: {0}")]
     Capacity(&'static str),
 }
