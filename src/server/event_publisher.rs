@@ -69,6 +69,20 @@ impl EventPublisher {
             return Ok(0);
         }
 
+        // Fail fast with the capacity error rather than letting
+        // `encode_to_slice` report a less-actionable protocol I/O error
+        // when it runs out of buffer. Matches the raw-event path below
+        // and the client socket_manager path.
+        let required_size = message.required_size();
+        if required_size > UDP_BUFFER_SIZE {
+            tracing::error!(
+                "Message size ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping publish",
+                required_size,
+                UDP_BUFFER_SIZE
+            );
+            return Err(Error::Capacity("udp_buffer"));
+        }
+
         // Serialize the message into a stack buffer sized to MTU.
         let mut buffer = [0u8; UDP_BUFFER_SIZE];
         let mut message_length = message.encode_to_slice(&mut buffer)?;
