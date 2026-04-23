@@ -245,6 +245,36 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
             Self::ForceSdSessionWrappedForTest(wrapped, sender),
         )
     }
+
+    /// Consume this message and notify its oneshot senders with
+    /// `Error::Capacity(structure_name)` instead of silently dropping them.
+    ///
+    /// Dropping the senders would let the awaiting `oneshot::Receiver`s
+    /// resolve to `RecvError`, which the public APIs currently `.unwrap()`
+    /// — that would panic callers under load. Delivering an explicit
+    /// `Err(Error::Capacity(..))` turns a would-be panic into a normal
+    /// `Result` with a stable, descriptive error.
+    fn reject_with_capacity(self, structure_name: &'static str) {
+        match self {
+            Self::SetInterface(_, response)
+            | Self::BindDiscovery(response)
+            | Self::UnbindDiscovery(response)
+            | Self::SendSD(_, _, response)
+            | Self::AddEndpoint(_, _, _, _, response)
+            | Self::RemoveEndpoint(_, _, response)
+            | Self::Subscribe { response, .. } => {
+                let _ = response.send(Err(Error::Capacity(structure_name)));
+            }
+            Self::SendToService {
+                send_complete,
+                response,
+                ..
+            } => {
+                let _ = send_complete.send(Err(Error::Capacity(structure_name)));
+                let _ = response.send(Err(Error::Capacity(structure_name)));
+            }
+        }
+    }
 }
 
 pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
@@ -753,17 +783,24 @@ where
                     match send_result {
                         Ok(()) => {
                             let _ = send_complete.send(Ok(()));
-                            if self.pending_responses.insert(request_id, response).is_err() {
-                                // Map full: the response Sender was returned
-                                // and is now dropped; caller's response oneshot
-                                // will observe cancellation. Send already
-                                // succeeded — the peer's reply, if any, will
-                                // arrive as a ClientUpdate::Unicast instead.
+                            if let Err((_req_id, response)) =
+                                self.pending_responses.insert(request_id, response)
+                            {
+                                // Map full: the send already succeeded, but
+                                // we cannot track the reply. Deliver an
+                                // explicit capacity error through the
+                                // returned response sender rather than
+                                // dropping it — otherwise `.expect(...)` on
+                                // the receiver side would panic. Any reply
+                                // that later arrives for `request_id` is
+                                // delivered as `ClientUpdate::Unicast` on
+                                // the update stream instead.
                                 warn!(
                                     "pending_responses at capacity ({}); response tracking \
                                      dropped for request_id 0x{:08X}",
                                     PENDING_RESPONSES_CAP, request_id
                                 );
+                                let _ = response.send(Err(Error::Capacity("pending_responses")));
                             }
                         }
                         Err(e) => {
@@ -905,15 +942,18 @@ where
                     ctrl = control_receiver.recv() => {
                         if let Some(ctrl) = ctrl {
                             debug!("Received control message: {:?}", ctrl);
-                            if request_queue.push_back(ctrl).is_err() {
-                                // Queue full: the rejected ControlMessage is
-                                // dropped, so any oneshot senders inside it
-                                // cancel — callers awaiting those receivers
-                                // will observe `RecvError`.
+                            if let Err(rejected) = request_queue.push_back(ctrl) {
+                                // Queue full: rather than silently drop the
+                                // rejected ControlMessage (which would
+                                // cancel its oneshot senders and panic any
+                                // caller awaiting with `.unwrap()`), reply
+                                // on each sender with
+                                // `Err(Error::Capacity("request_queue"))`.
                                 warn!(
-                                    "request_queue at capacity ({}); dropping control message",
+                                    "request_queue at capacity ({}); rejecting control message",
                                     REQUEST_QUEUE_CAP
                                 );
+                                rejected.reject_with_capacity("request_queue");
                             }
                         } else {
                             // The sender has been dropped, so we should exit
@@ -1031,6 +1071,65 @@ mod tests {
 
         let (_rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
         assert!(matches!(msg, ControlMessage::Subscribe { .. }));
+    }
+
+    /// `reject_with_capacity` must notify every oneshot sender inside a
+    /// rejected `ControlMessage` with `Err(Error::Capacity(..))` — for
+    /// `SendToService`, _both_ the `send_complete` and `response`
+    /// channels. Dropping either channel would let a caller's `.unwrap()`
+    /// (or `.expect(...)` inside `PendingResponse::response()`) panic on
+    /// the resulting `RecvError`, which is exactly what Copilot flagged.
+    #[test]
+    fn reject_with_capacity_notifies_every_sender() {
+        fn expect_capacity<T: std::fmt::Debug>(
+            rx: &mut oneshot::Receiver<Result<T, Error>>,
+            label: &str,
+        ) {
+            match rx.try_recv() {
+                Ok(Err(Error::Capacity(s))) => assert_eq!(s, "request_queue", "{label}"),
+                other => panic!("{label}: expected Err(Capacity), got {other:?}"),
+            }
+        }
+
+        // Variants carrying a single Result<(), Error> response sender.
+        let (mut rx, msg) = TestControl::set_interface(Ipv4Addr::LOCALHOST);
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut rx, "SetInterface");
+
+        let (mut rx, msg) = TestControl::bind_discovery();
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut rx, "BindDiscovery");
+
+        let (mut rx, msg) = TestControl::unbind_discovery();
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut rx, "UnbindDiscovery");
+
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
+        let (mut rx, msg) = TestControl::send_sd(target, empty_sd_header());
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut rx, "SendSD");
+
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (mut rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut rx, "AddEndpoint");
+
+        let (mut rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut rx, "RemoveEndpoint");
+
+        let (mut rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut rx, "Subscribe");
+
+        // SendToService carries two senders — both must be notified so that
+        // neither `send_rx.await.unwrap()?` nor `PendingResponse::response()`
+        // panics.
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let (mut send_rx, mut resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut send_rx, "SendToService.send_complete");
+        expect_capacity(&mut resp_rx, "SendToService.response");
     }
 
     #[test]

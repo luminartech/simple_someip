@@ -3,15 +3,16 @@
 //! # Memory footprint
 //!
 //! The client's internal `Inner` state is allocated inline rather than on
-//! the heap. With the default capacity constants declared in `inner.rs` —
-//! `REQUEST_QUEUE_CAP=32`, `PENDING_RESPONSES_CAP=64`, `UNICAST_SOCKETS_CAP=8`,
-//! and `SESSION_CAP=64` — `Inner<P>` occupies on the order of **8–12 KiB**,
+//! the heap. With the default capacity constants used by the client
+//! internals — `REQUEST_QUEUE_CAP=32`, `PENDING_RESPONSES_CAP=64`, and
+//! `UNICAST_SOCKETS_CAP=8` in `inner.rs`, plus `SESSION_CAP=64` in
+//! `session.rs` — `Inner<P>` occupies on the order of **8–12 KiB**,
 //! depending on `sizeof::<P>()` and `sizeof::<SocketManager<P>>()`. On
 //! `std + tokio`, this is allocated on the heap when the run-loop is
 //! spawned, so the overhead is invisible to callers. On the bare-metal
 //! port (future), whoever drives the future must arrange storage for it
-//! (either a `static` or a heap allocator); the capacity constants are the
-//! primary knob for trimming this footprint.
+//! (either a `static` or a heap allocator); these capacity constants are
+//! the primary knobs for trimming this footprint.
 mod error;
 mod inner;
 mod service_registry;
@@ -570,10 +571,10 @@ where
     /// saturated at the moment the reply-tracking slot would be installed,
     /// this method still returns `Ok(PendingResponse)` — the UDP send has
     /// already happened — but the returned `PendingResponse` will resolve to
-    /// `Err(RecvError)` because the tracking slot was dropped. Any reply that
-    /// later arrives for that `request_id` is delivered as
+    /// `Err(Error::Capacity("pending_responses"))`. Any reply that later
+    /// arrives for that `request_id` is delivered as
     /// [`ClientUpdate::Unicast`] on the update stream instead of through the
-    /// `PendingResponse`. Treat `RecvError` as "reply lost to saturation",
+    /// `PendingResponse`. Treat this error as "reply lost to saturation",
     /// not "send failed". A `warn!`-level log accompanies the drop.
     ///
     /// # Errors

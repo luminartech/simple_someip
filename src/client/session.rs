@@ -68,12 +68,17 @@ pub enum SessionVerdict {
 #[derive(Debug)]
 pub struct SessionTracker {
     state: FnvIndexMap<SessionKey, SessionState, SESSION_CAP>,
+    /// Set after the first saturation warning. Prevents the saturated-map
+    /// log from firing on every `check()` for every new key once capacity
+    /// is reached — which would spam the log at the packet rate.
+    saturation_warned: bool,
 }
 
 impl Default for SessionTracker {
     fn default() -> Self {
         Self {
             state: FnvIndexMap::new(),
+            saturation_warned: false,
         }
     }
 }
@@ -123,15 +128,21 @@ impl SessionTracker {
         };
         if self.state.insert(key, new_state).is_err() {
             // Map at capacity and key is new — silently dropping the update
-            // would lose reboot-detection state. Log once so bare-metal users
-            // can size `SESSION_CAP` up.
-            tracing::warn!(
-                "SessionTracker at capacity ({}); dropping new sender state for \
-                 svc=0x{:04X} inst=0x{:04X}. Reboot detection disabled for this entry.",
-                SESSION_CAP,
-                service_id,
-                instance_id
-            );
+            // would lose reboot-detection state. Log the first time we hit
+            // the wall so bare-metal users can size `SESSION_CAP` up, then
+            // suppress further warnings so a saturated tracker does not
+            // spam the log at the incoming-packet rate.
+            if !self.saturation_warned {
+                tracing::warn!(
+                    "SessionTracker at capacity ({}); dropping new sender state for \
+                     svc=0x{:04X} inst=0x{:04X}. Reboot detection disabled for this \
+                     entry and any further new entries (subsequent drops not logged).",
+                    SESSION_CAP,
+                    service_id,
+                    instance_id
+                );
+                self.saturation_warned = true;
+            }
         }
         verdict
     }
@@ -372,5 +383,32 @@ mod tests {
         // Previously-tracked senders continue to work normally.
         let v = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 2, RB);
         assert_eq!(v, SessionVerdict::Ok);
+    }
+
+    #[test]
+    fn capacity_overflow_warns_only_on_first_hit() {
+        // `saturation_warned` is the latch that guards the tracing::warn!
+        // call in `check()`. It must flip false → true on the first
+        // rejected insert and stay true for subsequent hits — otherwise
+        // a saturated tracker spams the log at the packet rate.
+        let mut tracker = SessionTracker::default();
+        for i in 0..super::SESSION_CAP {
+            let port = 1000 + u16::try_from(i).unwrap();
+            tracker.check(addr(port), TransportKind::Multicast, SVC, INST, 1, RB);
+        }
+        assert!(
+            !tracker.saturation_warned,
+            "filling to exactly capacity must not trip the warn flag",
+        );
+
+        // First overflowing key: flag flips to true.
+        tracker.check(addr(9001), TransportKind::Multicast, SVC, INST, 1, RB);
+        assert!(tracker.saturation_warned);
+
+        // Subsequent overflows leave the flag true; the flag is what the
+        // implementation checks before emitting a fresh warn!.
+        tracker.check(addr(9002), TransportKind::Multicast, SVC, INST, 1, RB);
+        tracker.check(addr(9003), TransportKind::Multicast, SVC, INST, 1, RB);
+        assert!(tracker.saturation_warned);
     }
 }

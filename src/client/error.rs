@@ -2,11 +2,10 @@ use thiserror::Error;
 
 /// Errors that can occur during SOME/IP client operations.
 ///
-/// Marked `#[non_exhaustive]` so that future variants (for example, new
-/// transport-specific error conditions in upcoming releases) can be added
-/// without a further breaking change.
+/// Not marked `#[non_exhaustive]` today: downstream crates that match on
+/// this enum rely on exhaustiveness, and adding the attribute now would be
+/// a silent breaking change. Revisit when a breaking release is planned.
 #[derive(Error, Debug)]
-#[non_exhaustive]
 pub enum Error {
     /// A SOME/IP protocol-level error.
     #[error(transparent)]
