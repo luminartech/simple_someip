@@ -19,11 +19,15 @@
 //!    the returned futures. Callers that need those bounds (e.g. to
 //!    `tokio::spawn`) require them at the consumer site. Bare-metal callers
 //!    driving the future on a single executor task pay no `Send` tax.
-//! 2. **IPv4-only address type.** SOME/IP Service Discovery is IPv4-only by
-//!    spec (multicast group is `239.0.0.0/8`), so the trait uses
-//!    [`core::net::SocketAddrV4`] directly rather than `SocketAddr`. This
-//!    saves every backend from writing a `SocketAddr::V6(_) => Unsupported`
-//!    arm, and documents the crate's actual reach.
+//! 2. **IPv4-only address type.** This transport abstraction currently
+//!    uses [`core::net::SocketAddrV4`] directly rather than `SocketAddr`,
+//!    matching the crate's present transport-layer reach for unicast and
+//!    the standard SD IPv4 multicast address
+//!    ([`crate::protocol::sd::MULTICAST_IP`], `239.255.0.255`). This
+//!    saves every backend from writing a `SocketAddr::V6(_) =>
+//!    Unsupported` arm, and documents the crate's actual reach at this
+//!    layer. (The protocol layer parses IPv6 SD option endpoints too;
+//!    only the transport bind / send is IPv4-today.)
 //! 3. **No object safety.** Because `impl Future` is used in method return
 //!    positions, the traits cannot be made into trait objects
 //!    (`Box<dyn TransportSocket>` will not compile). This is intentional:
