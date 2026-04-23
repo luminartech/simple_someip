@@ -526,18 +526,31 @@ where
                             self.interface
                         );
                         self.unbind_discovery().await;
-                        // Re-enqueue after pop — queue has a free slot.
-                        self.request_queue
+                        // Re-enqueue after pop. The slot we popped is free,
+                        // so `push_front` should never fail here — but if a
+                        // future refactor breaks that invariant, reject via
+                        // the capacity path instead of silently dropping the
+                        // response oneshot (matches the primary `push_back`
+                        // overflow arm in the control-channel receiver).
+                        if let Err(rejected) = self
+                            .request_queue
                             .push_front(ControlMessage::SetInterface(interface, response))
-                            .ok();
+                        {
+                            error!("request_queue push_front failed after pop — invariant broken");
+                            rejected.reject_with_capacity("request_queue");
+                        }
                         return;
                     }
                     if self.interface != interface {
                         self.set_interface(interface);
-                        // Re-enqueue after pop — queue has a free slot.
-                        self.request_queue
+                        // See re-enqueue note above.
+                        if let Err(rejected) = self
+                            .request_queue
                             .push_front(ControlMessage::SetInterface(interface, response))
-                            .ok();
+                        {
+                            error!("request_queue push_front failed after pop — invariant broken");
+                            rejected.reject_with_capacity("request_queue");
+                        }
                         return;
                     }
                     info!("Binding to interface: {}", interface);
@@ -572,12 +585,15 @@ where
                         None => {
                             match self.bind_discovery() {
                                 Ok(()) => {
-                                    // Re-enqueue after pop — queue has a free slot.
-                                    self.request_queue
-                                        .push_front(ControlMessage::SendSD(
-                                            target, header, response,
-                                        ))
-                                        .ok();
+                                    // See re-enqueue note on SetInterface above.
+                                    if let Err(rejected) = self.request_queue.push_front(
+                                        ControlMessage::SendSD(target, header, response),
+                                    ) {
+                                        error!(
+                                            "request_queue push_front failed after pop — invariant broken"
+                                        );
+                                        rejected.reject_with_capacity("request_queue");
+                                    }
                                 }
                                 Err(e) => {
                                     error!(
@@ -774,9 +790,9 @@ where
                     match &mut self.discovery_socket {
                         None => match self.bind_discovery() {
                             Ok(()) => {
-                                // Re-enqueue after pop — queue has a free slot.
-                                self.request_queue
-                                    .push_front(ControlMessage::Subscribe {
+                                // See re-enqueue note on SetInterface above.
+                                if let Err(rejected) =
+                                    self.request_queue.push_front(ControlMessage::Subscribe {
                                         service_id,
                                         instance_id,
                                         major_version,
@@ -785,7 +801,12 @@ where
                                         client_port,
                                         response,
                                     })
-                                    .ok();
+                                {
+                                    error!(
+                                        "request_queue push_front failed after pop — invariant broken"
+                                    );
+                                    rejected.reject_with_capacity("request_queue");
+                                }
                             }
                             Err(e) => {
                                 let _ = response.send(Err(e));

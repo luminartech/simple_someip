@@ -83,14 +83,21 @@ impl SubscriptionManager {
 
         // New event group — allocate the list and insert.
         let mut list = SubscribersList::new();
-        // Pushing into an empty heapless::Vec with cap >= 1 cannot fail.
+        // The first push into an empty heapless::Vec cannot fail as long
+        // as SUBSCRIBERS_PER_GROUP >= 1 (enforced by the constant's
+        // definition). Use `expect` here — a future refactor setting the
+        // cap to 0 would trip this at test time instead of silently
+        // dropping the only subscriber for a new event group.
         list.push(Subscriber::new(
             subscriber_addr,
             service_id,
             instance_id,
             event_group_id,
         ))
-        .ok();
+        .expect(
+            "new SubscribersList must accept the first subscriber; \
+             SUBSCRIBERS_PER_GROUP must be >= 1",
+        );
 
         if self.subscriptions.insert(key, list).is_err() {
             tracing::warn!(

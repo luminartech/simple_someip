@@ -53,7 +53,7 @@ pub enum SessionVerdict {
 /// positives when a sensor interleaves SD offers for multiple services
 /// with independent session counters on the same source address.
 ///
-/// Capacity is bounded at compile time ([`SESSION_CAP`]); see module docs.
+/// Capacity is bounded at compile time by [`SESSION_CAP`].
 /// When the map is full, new sender entries are dropped with a `warn!` log
 /// and reboot detection for those senders is disabled.
 ///
