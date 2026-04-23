@@ -257,6 +257,20 @@ where
                     message = tx_rx.recv() => {
                         if let Some(send_message) = message {
                             trace!("Sending: {:?}", &send_message);
+                            // Fail fast with the capacity error rather than
+                            // letting `encode` report a less-actionable
+                            // protocol I/O error when it runs out of
+                            // buffer. Matches the E2E-overflow arm below
+                            // and the server event_publisher path.
+                            let required_size = send_message.message.required_size();
+                            if required_size > UDP_BUFFER_SIZE {
+                                error!(
+                                    "outgoing message ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping send",
+                                    required_size, UDP_BUFFER_SIZE
+                                );
+                                let _ = send_message.response.send(Err(Error::Capacity("udp_buffer")));
+                                continue;
+                            }
                             let mut message_length = match send_message.message.encode(&mut buf.as_mut_slice()) {
                                 Ok(length) => length,
                                 Err(e) => {
@@ -614,6 +628,50 @@ mod tests {
             .send(target, message)
             .await
             .expect_err("E2E-protected oversize message must error");
+        match err {
+            Error::Capacity(tag) => assert_eq!(tag, "udp_buffer"),
+            other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
+        }
+    }
+
+    /// Messages whose raw encoded size already exceeds `UDP_BUFFER_SIZE`
+    /// — with no E2E in play — must be rejected up front with
+    /// `Error::Capacity("udp_buffer")` rather than bubbling out the
+    /// less-actionable protocol I/O error that `encode` would report
+    /// after running out of buffer.
+    #[tokio::test]
+    async fn send_raw_message_exceeding_udp_buffer_returns_capacity_error() {
+        use crate::RawPayload;
+        use crate::protocol::{Header, MessageId, MessageType, MessageTypeField, ReturnCode};
+
+        let message_id = MessageId::new_from_service_and_method(0x1234, 0x5678);
+        // No E2E registered — goes straight through the pre-encode check.
+        let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
+        let mut sm = SocketManager::<RawPayload>::bind(0, e2e_registry).unwrap();
+
+        // 16-byte header + 1485-byte payload = 1501 bytes, one over the cap.
+        let payload_bytes = [0u8; 1485];
+        let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
+        let header = Header::new(
+            message_id,
+            0x0001_0001,
+            0x01,
+            0x01,
+            MessageTypeField::new(MessageType::Request, false),
+            ReturnCode::Ok,
+            payload_bytes.len(),
+        );
+        let message = Message::new(header, payload);
+        assert!(
+            message.required_size() > UDP_BUFFER_SIZE,
+            "fixture must actually exceed the cap for this test to exercise the new path",
+        );
+
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
+        let err = sm
+            .send(target, message)
+            .await
+            .expect_err("raw oversize message must error");
         match err {
             Error::Capacity(tag) => assert_eq!(tag, "udp_buffer"),
             other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
