@@ -10,7 +10,7 @@
 //! This ensures remote nodes see a single coherent network identity for
 //! multicast announcements.
 //!
-//! The server's built-in `start_announcing()` is NOT used — instead, the
+//! The server's built-in `announcement_loop()` is NOT used — instead, the
 //! client's `start_sd_announcements()` handles periodic multicast
 //! announcements. The server's `run()` loop still handles unicast SD
 //! traffic (e.g. `SubscribeAck`/`SubscribeNack` responses) on its own
@@ -125,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut server = Server::new(config).await?;
     info!("Server bound on port {MY_SERVER_PORT}");
 
-    // NOTE: We intentionally do NOT call server.start_announcing().
+    // NOTE: We intentionally do NOT spawn server.announcement_loop().
     // The client's start_sd_announcements handles all SD traffic.
 
     let _publisher = server.publisher();

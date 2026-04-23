@@ -192,11 +192,10 @@ where
     /// must drive it to completion (typically via `tokio::spawn`) for the
     /// client to process any messages.
     ///
-    /// The future is not bounded `Send + 'static` at this layer; the
-    /// concrete captured state is `Send + 'static` in practice, and
-    /// `tokio::spawn` will bind those where required at the call site.
-    /// Bare-metal callers driving the future on a single-task executor
-    /// pay no `Send` tax.
+    /// The future is bounded `Send + 'static` because every in-repo
+    /// consumer spawns it on a multithreaded executor. Bare-metal
+    /// consumers whose transport produces `!Send` state will get a
+    /// cfg-gated alternative constructor alongside the bare-metal port.
     ///
     /// ```no_run
     /// # use simple_someip::{Client, RawPayload};
@@ -214,7 +213,7 @@ where
     ) -> (
         Self,
         ClientUpdates<MessageDefinitions>,
-        impl core::future::Future<Output = ()>,
+        impl core::future::Future<Output = ()> + Send + 'static,
     ) {
         Self::new_with_loopback(interface, false)
     }
@@ -249,7 +248,7 @@ where
     ) -> (
         Self,
         ClientUpdates<MessageDefinitions>,
-        impl core::future::Future<Output = ()>,
+        impl core::future::Future<Output = ()> + Send + 'static,
     ) {
         let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
         let (control_sender, update_receiver, run_future) =
@@ -1158,5 +1157,45 @@ mod tests {
             join_result.is_ok() || join_result.as_ref().unwrap_err().is_cancelled(),
             "task should have exited cleanly, not panicked"
         );
+    }
+
+    /// Documents the footgun: if the caller drops `run_fut` without ever
+    /// polling it, the control channel's receiver goes with it and
+    /// subsequent `Client` method calls panic on `control_sender.send()`.
+    ///
+    /// This is intrinsic to the caller-driven lifecycle introduced in
+    /// phase 6 — the run loop is no longer owned by `Client::new`, so
+    /// failing to spawn it is the caller's responsibility. The test
+    /// pins the behavior deterministically so that any attempt to
+    /// silently "fix" this (e.g. internal spawn fallback) would break it
+    /// and force a review.
+    #[tokio::test]
+    #[should_panic(expected = "SendError")]
+    async fn dropping_run_future_without_spawn_panics_on_next_client_call() {
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        // Caller explicitly discards the run loop.
+        drop(run_fut);
+        // Any client method that enqueues a control message panics on
+        // `.unwrap()` of the send Result — document it instead of
+        // hiding it.
+        client.bind_discovery().await.unwrap();
+    }
+
+    /// If the run loop is cancelled mid-poll (caller-initiated timeout,
+    /// graceful shutdown), subsequent `Client` calls see the control
+    /// channel closed and surface a panic from `control_sender.send()`.
+    /// Same structural contract as dropping the run future.
+    #[tokio::test]
+    #[should_panic(expected = "SendError")]
+    async fn cancelling_run_future_closes_control_channel() {
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let handle = tokio::spawn(run_fut);
+        // Let the loop start.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.abort();
+        // Give the abort time to land.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        client.bind_discovery().await.unwrap();
     }
 }
