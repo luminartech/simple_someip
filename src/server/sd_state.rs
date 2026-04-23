@@ -244,7 +244,9 @@ mod tests {
                 if view.header().message_id().service_id() != 0xFFFF {
                     continue;
                 }
-                let Ok(sd_view) = view.sd_header() else { continue };
+                let Ok(sd_view) = view.sd_header() else {
+                    continue;
+                };
                 let Some(entry) = sd_view.entries().next() else {
                     continue;
                 };
@@ -290,7 +292,11 @@ mod tests {
     /// `send_offer_service` is responsible for — not just the entry body.
     /// A future regression that garbles the endpoint option, flips a flag,
     /// or changes the SOME/IP message type should fail here.
-    fn assert_offer_matches(offer: &ReceivedOffer, config: &ServerConfig, expected_request_id: u32) {
+    fn assert_offer_matches(
+        offer: &ReceivedOffer,
+        config: &ServerConfig,
+        expected_request_id: u32,
+    ) {
         // SOME/IP envelope
         assert_eq!(offer.someip_service_id, 0xFFFF, "SD uses service_id 0xFFFF");
         assert_eq!(offer.someip_method_id, 0x8100, "SD uses method_id 0x8100");
@@ -395,7 +401,10 @@ mod tests {
         let first = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
         let second = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
         assert_eq!(first.request_id, 0x0000_FFFF);
-        assert_eq!(second.request_id, 0x0000_0001, "must skip reserved 0 on wrap");
+        assert_eq!(
+            second.request_id, 0x0000_0001,
+            "must skip reserved 0 on wrap"
+        );
     }
 
     #[ignore = "requires MULTICAST on loopback; re-enable after lo fix on this branch"]

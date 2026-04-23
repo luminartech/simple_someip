@@ -2136,7 +2136,9 @@ mod tests {
                 if view.header().message_id().service_id() != 0xFFFF {
                     continue;
                 }
-                let Ok(sd_view) = view.sd_header() else { continue };
+                let Ok(sd_view) = view.sd_header() else {
+                    continue;
+                };
                 let Some(entry) = sd_view.entries().next() else {
                     continue;
                 };
