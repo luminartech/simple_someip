@@ -115,12 +115,19 @@ impl SdStateManager {
 
         let entries = [entry];
         let options = [option];
+        // Advance the session counter FIRST so `has_wrapped` latches on
+        // the wrap transition, then derive the reboot flag for this
+        // same message. Without this ordering the message carrying
+        // session_id=0x0001 after a wrap would still advertise
+        // `RebootFlag::RecentlyRebooted`, and the flip would only land
+        // on the NEXT emission — violating AUTOSAR SOME/IP-SD semantics
+        // (the wrap message itself should carry `Continuous`).
+        let sid = self.next_session_id();
         let sd_payload = sd::Header::new(Flags::new_sd(self.reboot_flag()), &entries, &options);
 
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
 
-        let sid = self.next_session_id();
         let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
 
         let mut buffer = Vec::new();
@@ -264,10 +271,11 @@ mod tests {
     //
     // All tests below drive `send_offer_service` against a real UDP socket
     // and read the emitted packet off a second socket joined to the SD
-    // multicast group. These are `#[ignore]`d until the `lo` MULTICAST
-    // flag fix lands on this branch (`feature/firmware_someip_conversion`);
-    // hosts without that flag drop the packet silently and the tests time
-    // out on recv.
+    // multicast group. These are `#[ignore]`d on environments whose
+    // loopback interface does not carry the `MULTICAST` flag (check with
+    // `ip link show lo`); on such hosts the kernel drops multicast on
+    // `lo` before loopback reflection, so the receiver times out. Runs
+    // in any environment where loopback multicast is available.
 
     /// Bind a receiver socket on the SD multicast port, ready to
     /// `join_multicast_v4`.
@@ -446,7 +454,9 @@ mod tests {
         (rx, tx)
     }
 
-    #[ignore = "requires MULTICAST on loopback; re-enable after lo fix on this branch"]
+    #[ignore = "requires MULTICAST on loopback; skipped on hosts whose `lo` \
+                lacks the MULTICAST flag. Runs in any environment where \
+                loopback multicast is available."]
     #[tokio::test]
     async fn send_offer_service_emits_parseable_offer_to_multicast() {
         let config = ServerConfig::new(
@@ -471,7 +481,9 @@ mod tests {
         assert_offer_matches(&offer, &config, 0x0000_1234, RebootFlag::RecentlyRebooted);
     }
 
-    #[ignore = "requires MULTICAST on loopback; re-enable after lo fix on this branch"]
+    #[ignore = "requires MULTICAST on loopback; skipped on hosts whose `lo` \
+                lacks the MULTICAST flag. Runs in any environment where \
+                loopback multicast is available."]
     #[tokio::test]
     async fn send_offer_service_advances_session_id_across_calls() {
         // Back-to-back sends must consume distinct, incrementing session
@@ -495,7 +507,9 @@ mod tests {
         assert_eq!(second.request_id, 0x0000_1235);
     }
 
-    #[ignore = "requires MULTICAST on loopback; re-enable after lo fix on this branch"]
+    #[ignore = "requires MULTICAST on loopback; skipped on hosts whose `lo` \
+                lacks the MULTICAST flag. Runs in any environment where \
+                loopback multicast is available."]
     #[tokio::test]
     async fn send_offer_service_wraps_session_id_through_zero_on_send() {
         // Session counter wrap must be visible on the wire: 0xFFFE -> 0xFFFF
@@ -537,7 +551,9 @@ mod tests {
         );
     }
 
-    #[ignore = "requires MULTICAST on loopback; re-enable after lo fix on this branch"]
+    #[ignore = "requires MULTICAST on loopback; skipped on hosts whose `lo` \
+                lacks the MULTICAST flag. Runs in any environment where \
+                loopback multicast is available."]
     #[tokio::test]
     async fn send_offer_service_preserves_zero_ttl() {
         // TTL=0 is a legitimate SOME/IP-SD value meaning "stop offering";

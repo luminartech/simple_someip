@@ -348,6 +348,11 @@ impl Server {
 
         let entries = [entry];
         let options = [option];
+        // See the ordering note on `SdStateManager::send_offer_service`:
+        // advance the session counter first so `has_wrapped` latches,
+        // then read the reboot flag so the wrap message itself carries
+        // `Continuous`.
+        let sid = self.sd_state.next_session_id();
         let sd_payload = sd::Header::new(
             Flags::new_sd(self.sd_state.reboot_flag()),
             &entries,
@@ -357,7 +362,6 @@ impl Server {
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
 
-        let sid = self.sd_state.next_session_id();
         let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
 
         let mut buffer = Vec::new();
@@ -736,12 +740,14 @@ impl Server {
         });
 
         let entries = [ack_entry];
+        // Ordering: advance the session id first so `has_wrapped` latches
+        // on the wrap boundary, then read `reboot_flag()` for this
+        // message — see `SdStateManager::send_offer_service`.
+        let sid = self.sd_state.next_session_id();
         let sd_payload = sd::Header::new(Flags::new_sd(self.sd_state.reboot_flag()), &entries, &[]);
 
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
-
-        let sid = self.sd_state.next_session_id();
         let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
 
         let mut buffer = Vec::new();
@@ -783,12 +789,13 @@ impl Server {
         });
 
         let entries = [nack_entry];
+        // Ordering: advance first so `has_wrapped` latches, then read
+        // reboot flag — see `SdStateManager::send_offer_service`.
+        let sid = self.sd_state.next_session_id();
         let sd_payload = sd::Header::new(Flags::new_sd(self.sd_state.reboot_flag()), &entries, &[]);
 
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
-
-        let sid = self.sd_state.next_session_id();
         let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
 
         let mut buffer = Vec::new();
