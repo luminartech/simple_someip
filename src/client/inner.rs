@@ -1300,7 +1300,10 @@ mod tests {
             let (tx, rx) = oneshot::channel::<Result<TestPayload, Error>>();
             inner
                 .pending_responses
-                .insert(i as u32, tx)
+                .insert(
+                    u32::try_from(i).expect("PENDING_RESPONSES_CAP fits in u32"),
+                    tx,
+                )
                 .expect("filling under cap must succeed");
             stashed.push(rx);
         }

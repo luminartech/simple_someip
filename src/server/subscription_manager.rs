@@ -34,6 +34,12 @@ impl SubscriptionManager {
     }
 
     /// Add a subscriber to an event group
+    ///
+    /// # Panics
+    ///
+    /// Panics if `SUBSCRIBERS_PER_GROUP == 0`, a compile-time constant that
+    /// must be at least one for a newly-allocated subscriber list to accept
+    /// its first entry.
     pub fn subscribe(
         &mut self,
         service_id: u16,
