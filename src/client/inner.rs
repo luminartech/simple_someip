@@ -439,7 +439,7 @@ where
     /// is already Send. A bare-metal consumer whose transport produces
     /// `!Send` state needs a cfg-gated alternative constructor; none
     /// exists yet — it's planned alongside the bare-metal port.
-    pub fn new(
+    pub fn build(
         interface: Ipv4Addr,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
         multicast_loopback: bool,
@@ -1029,74 +1029,115 @@ where
                         }
                     }
                     // Receive a discovery message
-                    discovery = Inner::receive_discovery(discovery_socket) => {
-                        trace!("Received discovery message: {:?}", discovery);
-                        match discovery {
-                            Ok((source, someip_header, sd_header)) => {
-                                process_discovery::<PayloadDefinitions>(
+                discovery = Inner::receive_discovery(discovery_socket) => {
+                    trace!("Received discovery message: {:?}", discovery);
+                    match discovery {
+                        Ok((source, someip_header, sd_header)) => {
+                            // Extract session ID from SOME/IP request_id (lower 16 bits)
+                            let session_id = (someip_header.request_id() & 0xFFFF) as u16;
+                            let sd_payload = PayloadDefinitions::new_sd_payload(&sd_header);
+                            // Extract reboot flag from the SD payload flags
+                            let reboot_flag = sd_payload
+                                .sd_flags()
+                                .map_or(crate::protocol::sd::RebootFlag::Continuous, |f| {
+                                    f.reboot()
+                                });
+
+                            // Track sender session/reboot state for every SD entry
+                            // that identifies a service instance, not only
+                            // offer/stop-offer entries. This ensures reboot
+                            // detection works for all SD traffic (FindService,
+                            // Subscribe, SubscribeAck, etc.).
+                            let mut rebooted = false;
+                            for (svc_id, inst_id) in sd_payload.service_instances() {
+                                let verdict = session_tracker.check(
                                     source,
                                     TransportKind::Multicast,
-                                    someip_header,
-                                    sd_header,
-                                    session_tracker,
-                                    service_registry,
-                                    update_sender,
+                                    svc_id,
+                                    inst_id,
+                                    session_id,
+                                    reboot_flag,
                                 );
+                                if verdict == SessionVerdict::Reboot {
+                                    rebooted = true;
+                                }
                             }
-                            Err(err) => {
-                                error!("Error receiving discovery message: {:?}", err);
-                                let _ = update_sender.send(ClientUpdate::Error(err));
+
+                            // Auto-populate service registry from offer/stop-offer
+                            // SD entries.
+                            for ep in sd_payload.offered_endpoints() {
+                                let id = ServiceInstanceId {
+                                    service_id: ep.service_id,
+                                    instance_id: ep.instance_id,
+                                };
+                                if ep.is_offer {
+                                    if let Some(addr) = ep.addr {
+                                        service_registry.insert(
+                                            id,
+                                            ServiceEndpointInfo {
+                                                addr,
+                                                local_port: 0,
+                                                major_version: ep.major_version,
+                                                minor_version: ep.minor_version,
+                                            },
+                                        );
+                                        trace!(
+                                            "Registry: added 0x{:04X}.0x{:04X} -> {}",
+                                            ep.service_id, ep.instance_id, addr,
+                                        );
+                                    }
+                                } else {
+                                    service_registry.remove(id);
+                                    trace!(
+                                        "Registry: removed 0x{:04X}.0x{:04X}",
+                                        ep.service_id, ep.instance_id,
+                                    );
+                                }
                             }
+
+                            if rebooted {
+                                let _ = update_sender.send(ClientUpdate::SenderRebooted(source));
+                            }
+
+                            let discovery_msg = DiscoveryMessage {
+                                source,
+                                someip_header,
+                                sd_header,
+                            };
+                            let _ = update_sender.send(ClientUpdate::DiscoveryUpdated(discovery_msg));
                         }
-                     }
-                    // Unicast SD arrives on the interface-IP-bound socket (the
-                    // sensor's separate unicast SD session domain).
-                    unicast_discovery = Inner::receive_discovery(discovery_unicast_socket) => {
-                        trace!("Received unicast discovery message: {:?}", unicast_discovery);
-                        match unicast_discovery {
-                            Ok((source, someip_header, sd_header)) => {
-                                process_discovery::<PayloadDefinitions>(
-                                    source,
-                                    TransportKind::Unicast,
-                                    someip_header,
-                                    sd_header,
-                                    session_tracker,
-                                    service_registry,
-                                    update_sender,
-                                );
-                            }
-                            Err(err) => {
-                                error!("Error receiving unicast discovery message: {:?}", err);
-                                let _ = update_sender.send(ClientUpdate::Error(err));
-                            }
+                        Err(err) => {
+                            error!("Error receiving discovery message: {:?}", err);
+                            let _ = update_sender.send(ClientUpdate::Error(err));
                         }
-                     }
-                     unicast = Inner::receive_any_unicast(unicast_sockets) => {
-                         trace!("Received unicast message: {:?}", unicast);
-                         match unicast {
-                             Ok(received) => {
-                                 let ReceivedMessage { message: received_message, e2e_status, .. } = received;
-                                 // Check if this matches a pending request-response by request_id
-                                 let request_id = received_message.header().request_id();
-                                 if let Some(sender) = pending_responses.remove(&request_id) {
-                                     let _ = sender.send(Ok(received_message.payload().clone()));
-                                     continue;
-                                 }
-                                 // Not a response — forward as ClientUpdate::Unicast
-                                 let _ = update_sender.send(ClientUpdate::Unicast { message: received_message, e2e_status });
+                    }
+                 }
+                 unicast = Inner::receive_any_unicast(unicast_sockets) => {
+                     trace!("Received unicast message: {:?}", unicast);
+                     match unicast {
+                         Ok(received) => {
+                             let ReceivedMessage { message: received_message, e2e_status, .. } = received;
+                             // Check if this matches a pending request-response by request_id
+                             let request_id = received_message.header().request_id();
+                             if let Some(sender) = pending_responses.remove(&request_id) {
+                                 let _ = sender.send(Ok(received_message.payload().clone()));
+                                 continue;
                              }
-                             Err(err) => {
-                                 let _ = update_sender.send(ClientUpdate::Error(err));
-                             }
+                             // Not a response — forward as ClientUpdate::Unicast
+                             let _ = update_sender.send(ClientUpdate::Unicast { message: received_message, e2e_status });
+                         }
+                         Err(err) => {
+                             let _ = update_sender.send(ClientUpdate::Error(err));
                          }
                      }
-                }
-                if !*run {
-                    info!("SOME/IP Client processing loop exiting");
-                    break;
-                }
-                self.handle_control_message().await;
+                 }
             }
+            if !*run {
+                info!("SOME/IP Client processing loop exiting");
+                break;
+            }
+            self.handle_control_message().await;
+        }
         }
     }
 }
@@ -1436,12 +1477,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_inner_spawn_and_shutdown() {
-        let (control_sender, mut update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, mut update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
         // Drop control sender to trigger loop exit
         drop(control_sender);
         // The update receiver should eventually return None when the inner loop exits
@@ -1471,12 +1512,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_bind_discovery_continues() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         let (rx, msg) = TestControl::bind_discovery();
         drop(rx);
@@ -1488,12 +1529,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_unbind_discovery_continues() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         let (rx, msg) = TestControl::unbind_discovery();
         drop(rx);
@@ -1505,12 +1546,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_set_interface_continues() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         // SetInterface(LOCALHOST) on a fresh inner goes straight to
         // bind_discovery + send response (interface already matches).
@@ -1524,12 +1565,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_send_sd_continues() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         // Bind discovery first so the SendSD path has a socket to use
         let (rx, msg) = TestControl::bind_discovery();
@@ -1554,12 +1595,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_queued_messages_all_complete() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         // Bind discovery so SetInterface will take the multi-step path:
         // iteration 1: unbind discovery, re-queue SetInterface
@@ -1625,12 +1666,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_add_endpoint_continues() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
@@ -1643,12 +1684,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_remove_endpoint_continues() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         let (rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
         drop(rx);
@@ -1660,12 +1701,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_send_to_service_send_complete_continues() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         // Add an endpoint first so SendToService doesn't fail with ServiceNotFound
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
@@ -1687,12 +1728,12 @@ mod tests {
     async fn test_bind_discovery_with_loopback() {
         // Spawn inner with multicast_loopback=true so bind_discovery exercises
         // the loopback-enabled branch of SocketManager::bind_discovery.
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             true,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         let (rx, msg) = TestControl::bind_discovery();
         control_sender.send(msg).await.unwrap();
@@ -1702,12 +1743,12 @@ mod tests {
     #[tokio::test]
     async fn test_bind_discovery_idempotent() {
         // Binding discovery twice should succeed (early return on already-bound)
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         let (rx, msg) = TestControl::bind_discovery();
         control_sender.send(msg).await.unwrap();
@@ -1722,12 +1763,12 @@ mod tests {
     #[tokio::test]
     async fn test_send_sd_auto_binds_discovery() {
         // SendSD without a bound discovery socket should auto-bind and succeed
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30490);
         let sd_header = empty_sd_header();
@@ -1743,12 +1784,12 @@ mod tests {
     #[tokio::test]
     async fn test_send_to_service_auto_binds_unicast() {
         // SendToService with no unicast sockets should auto-bind ephemeral
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
@@ -1768,12 +1809,12 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_with_endpoint_sends_sd() {
         // Subscribe with a known endpoint and bound discovery should send the SD message
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         // Bind discovery first
         let (rx, msg) = TestControl::bind_discovery();
@@ -1799,12 +1840,12 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_auto_binds_discovery() {
         // Subscribe without discovery bound should auto-bind and succeed
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         // Add endpoint but do NOT bind discovery
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
@@ -1824,12 +1865,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_unknown_service_returns_error() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         let (rx, msg) = TestControl::subscribe(0xFFFF, 0xFFFF, 1, 3, 0x01, 0);
         control_sender.send(msg).await.unwrap();
@@ -1843,12 +1884,12 @@ mod tests {
     #[tokio::test]
     async fn test_send_to_service_reuses_existing_unicast_socket() {
         // When a unicast socket already exists, SendToService should reuse it
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
@@ -1878,12 +1919,12 @@ mod tests {
     #[tokio::test]
     async fn test_dropped_receiver_subscribe_service_not_found_continues() {
         // Subscribe with no endpoint → ServiceNotFound response is dropped
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
         drop(rx);
@@ -1896,12 +1937,12 @@ mod tests {
     #[tokio::test]
     async fn test_set_interface_changes_interface() {
         // SetInterface to a different address exercises the interface!=current path
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         // Change to a different loopback-range address (127.0.0.2).
         // Binding discovery on 127.0.0.2 should succeed on most systems.
@@ -1921,12 +1962,12 @@ mod tests {
     #[tokio::test]
     async fn test_set_interface_with_discovery_bound_changes_interface() {
         // SetInterface when discovery is already bound: unbind → change → rebind
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         // Bind discovery on LOCALHOST first
         let (rx, msg) = TestControl::bind_discovery();
@@ -1952,12 +1993,12 @@ mod tests {
     async fn test_subscribe_specific_port_reuse() {
         // Subscribe twice with the same specific client_port exercises the
         // bind_unicast port-reuse path (port != 0 && already bound).
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         // Add endpoint and bind discovery
         let (rx, msg) = TestControl::bind_discovery();
@@ -1999,12 +2040,12 @@ mod tests {
         use std::vec;
         use tokio::net::UdpSocket;
 
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::new(
+        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
 
         let raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw.local_addr().unwrap().port());
