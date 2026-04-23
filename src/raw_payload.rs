@@ -171,6 +171,10 @@ impl PayloadWireFormat for RawPayload {
         }
     }
 
+    fn set_reboot_flag(header: &mut VecSdHeader, reboot: sd::RebootFlag) {
+        header.flags = sd::Flags::new(bool::from(reboot), header.flags.unicast());
+    }
+
     fn offered_endpoints(&self) -> Vec<crate::OfferedEndpoint> {
         let header = match &self.kind {
             RawPayloadKind::Sd(header) => header,
@@ -235,6 +239,43 @@ mod tests {
     fn make_raw_payload() -> RawPayload {
         let mid = MessageId::new_from_service_and_method(0x1234, 0x0001);
         RawPayload::from_payload_bytes(mid, &[0xDE, 0xAD]).unwrap()
+    }
+
+    #[test]
+    fn set_reboot_flag_flips_reboot_and_preserves_unicast() {
+        // Start with RecentlyRebooted + unicast=true (the `new_sd` preset).
+        let mut header = VecSdHeader {
+            flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+            entries: std::vec![],
+            options: std::vec![],
+        };
+        assert_eq!(header.flags.reboot(), sd::RebootFlag::RecentlyRebooted);
+        assert!(header.flags.unicast());
+
+        RawPayload::set_reboot_flag(&mut header, sd::RebootFlag::Continuous);
+        assert_eq!(header.flags.reboot(), sd::RebootFlag::Continuous);
+        assert!(
+            header.flags.unicast(),
+            "unicast bit must not be disturbed by set_reboot_flag"
+        );
+
+        RawPayload::set_reboot_flag(&mut header, sd::RebootFlag::RecentlyRebooted);
+        assert_eq!(header.flags.reboot(), sd::RebootFlag::RecentlyRebooted);
+        assert!(header.flags.unicast());
+    }
+
+    #[test]
+    fn set_reboot_flag_preserves_cleared_unicast() {
+        // Unicast-cleared headers are unusual but legal; set_reboot_flag
+        // must not flip unicast back on.
+        let mut header = VecSdHeader {
+            flags: sd::Flags::new(true, false),
+            entries: std::vec![],
+            options: std::vec![],
+        };
+        RawPayload::set_reboot_flag(&mut header, sd::RebootFlag::Continuous);
+        assert_eq!(header.flags.reboot(), sd::RebootFlag::Continuous);
+        assert!(!header.flags.unicast());
     }
 
     #[test]

@@ -110,6 +110,10 @@ impl PayloadWireFormat for TestPayload {
             options,
         }
     }
+    #[cfg(feature = "std")]
+    fn set_reboot_flag(header: &mut TestSdHeader, reboot: sd::RebootFlag) {
+        header.flags = sd::Flags::new(bool::from(reboot), header.flags.unicast());
+    }
 }
 
 pub(crate) fn empty_sd_header() -> TestSdHeader {
@@ -123,6 +127,22 @@ pub(crate) fn empty_sd_header() -> TestSdHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn set_reboot_flag_flips_reboot_and_preserves_unicast() {
+        let mut header = empty_sd_header();
+        assert_eq!(header.flags.reboot(), sd::RebootFlag::RecentlyRebooted);
+        assert!(header.flags.unicast());
+
+        TestPayload::set_reboot_flag(&mut header, sd::RebootFlag::Continuous);
+        assert_eq!(header.flags.reboot(), sd::RebootFlag::Continuous);
+        assert!(header.flags.unicast());
+
+        TestPayload::set_reboot_flag(&mut header, sd::RebootFlag::RecentlyRebooted);
+        assert_eq!(header.flags.reboot(), sd::RebootFlag::RecentlyRebooted);
+        assert!(header.flags.unicast());
+    }
 
     #[test]
     fn empty_sd_header_has_no_entries() {

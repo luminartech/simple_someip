@@ -64,6 +64,13 @@ pub(super) enum ControlMessage<P: PayloadWireFormat> {
         client_port: u16,
         response: oneshot::Sender<Result<(), Error>>,
     },
+    QueryRebootFlag(oneshot::Sender<crate::protocol::sd::RebootFlag>),
+    /// Test-only: force `sd_session_has_wrapped` to simulate the state a
+    /// long-running client reaches after its SD session counter wraps past
+    /// `0xFFFF`, without actually sending 65k SD messages. Fires the
+    /// accompanying oneshot once the mutation is applied.
+    #[cfg(test)]
+    ForceSdSessionWrappedForTest(bool, oneshot::Sender<()>),
 }
 
 impl<P: PayloadWireFormat> std::fmt::Debug for ControlMessage<P> {
@@ -109,6 +116,12 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ControlMessage<P> {
                 .field("instance_id", instance_id)
                 .field("event_group_id", event_group_id)
                 .finish_non_exhaustive(),
+            Self::QueryRebootFlag(_) => f.write_str("QueryRebootFlag"),
+            #[cfg(test)]
+            Self::ForceSdSessionWrappedForTest(b, _) => f
+                .debug_tuple("ForceSdSessionWrappedForTest")
+                .field(b)
+                .finish(),
         }
     }
 }
@@ -203,6 +216,20 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
                 client_port,
                 response: sender,
             },
+        )
+    }
+
+    pub fn query_reboot_flag() -> (oneshot::Receiver<crate::protocol::sd::RebootFlag>, Self) {
+        let (sender, receiver) = oneshot::channel();
+        (receiver, Self::QueryRebootFlag(sender))
+    }
+
+    #[cfg(test)]
+    pub fn force_sd_session_wrapped_for_test(wrapped: bool) -> (oneshot::Receiver<()>, Self) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            receiver,
+            Self::ForceSdSessionWrappedForTest(wrapped, sender),
         )
     }
 }
@@ -587,6 +614,29 @@ where
                         Err(e) => {
                             let _ = send_complete.send(Err(e));
                         }
+                    }
+                }
+                #[cfg(test)]
+                ControlMessage::ForceSdSessionWrappedForTest(wrapped, response) => {
+                    self.sd_session_has_wrapped = wrapped;
+                    let _ = response.send(());
+                }
+                ControlMessage::QueryRebootFlag(response) => {
+                    // Prefer the live socket's tracked flag when bound. When
+                    // unbound, fall back to `sd_session_has_wrapped`, which
+                    // persists wrap state across unbind/rebind (updated in
+                    // `unbind_discovery` from the socket manager before it's
+                    // dropped). Without this fallback, a long-running client
+                    // that wraps past 0xFFFF and then unbinds discovery
+                    // would erroneously revert to `RecentlyRebooted` on the
+                    // next `reboot_flag()` call.
+                    let flag = if let Some(socket) = self.discovery_socket.as_ref() {
+                        socket.reboot_flag()
+                    } else {
+                        crate::protocol::sd::RebootFlag::from(!self.sd_session_has_wrapped)
+                    };
+                    if response.send(flag).is_err() {
+                        warn!("QueryRebootFlag response receiver dropped (caller canceled)");
                     }
                 }
                 ControlMessage::Subscribe {
