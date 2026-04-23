@@ -433,10 +433,12 @@ where
     /// the run-loop future. The caller drives the future with whatever
     /// executor it owns (typically `tokio::spawn`).
     ///
-    /// The future is kept unbounded on `Send` / `'static` at this layer
-    /// so bare-metal executors can drive it without paying the thread-
-    /// safety tax; `tokio::spawn` callers bind `Send + 'static` at their
-    /// spawn site, where the compiler can see the concrete state types.
+    /// The future is bounded `Send + 'static` because every in-repo
+    /// consumer spawns it on a multithreaded executor and because the
+    /// concrete captured state (tokio mpsc, `TokioSocket`, E2E registry)
+    /// is already Send. A bare-metal consumer whose transport produces
+    /// `!Send` state needs a cfg-gated alternative constructor; none
+    /// exists yet — it's planned alongside the bare-metal port.
     pub fn new(
         interface: Ipv4Addr,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
@@ -444,7 +446,7 @@ where
     ) -> (
         Sender<ControlMessage<PayloadDefinitions>>,
         mpsc::UnboundedReceiver<ClientUpdate<PayloadDefinitions>>,
-        impl core::future::Future<Output = ()>,
+        impl core::future::Future<Output = ()> + Send + 'static,
     ) {
         info!("Initializing SOME/IP Client");
         let (control_sender, control_receiver) = mpsc::channel(4);
@@ -985,7 +987,7 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
-    fn run_future(mut self) -> impl core::future::Future<Output = ()> {
+    fn run_future(mut self) -> impl core::future::Future<Output = ()> + Send + 'static {
         async move {
             info!("SOME/IP Client processing loop started");
             loop {

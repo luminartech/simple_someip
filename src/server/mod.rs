@@ -82,7 +82,7 @@ pub struct Server {
     e2e_registry: Arc<Mutex<E2ERegistry>>,
     /// `true` if this server was constructed via [`Server::new_passive`].
     /// Passive servers have no real SD socket bound to port 30490; their
-    /// SD handling is managed externally. Calling [`Self::start_announcing`]
+    /// SD handling is managed externally. Calling [`Self::announcement_loop`]
     /// or [`Self::run`] on a passive server is a programming error and
     /// returns an [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`].
     is_passive: bool,
@@ -209,7 +209,7 @@ impl Server {
     /// incoming `SubscribeEventGroup` / `FindService` messages and routes
     /// them to the right `EventPublisher` via
     /// [`EventPublisher::register_subscriber`]). Do **not** call
-    /// [`Server::start_announcing`] or spawn [`Server::run`] on a passive
+    /// [`Server::announcement_loop`] or spawn [`Server::run`] on a passive
     /// server — the external dispatcher owns those responsibilities.
     ///
     /// # Errors
@@ -229,7 +229,7 @@ impl Server {
 
         // Bind a placeholder SD socket on an ephemeral port. Nothing will
         // route to it (neither multicast nor unicast on 30490), and neither
-        // `start_announcing` nor `run` should be called for a passive
+        // `announcement_loop` nor `run` should be called for a passive
         // server. We still allocate it so the `Server` struct shape is
         // identical to the full-server path.
         let sd_placeholder_addr = std::net::SocketAddr::new(IpAddr::V4(config.interface), 0);
@@ -287,7 +287,7 @@ impl Server {
     /// announcements would go out with an incorrect source port.
     pub fn announcement_loop(
         &self,
-    ) -> Result<impl core::future::Future<Output = ()> + 'static, Error> {
+    ) -> Result<impl core::future::Future<Output = ()> + Send + 'static, Error> {
         if self.is_passive {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -331,21 +331,6 @@ impl Server {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
         })
-    }
-
-    /// Deprecated shim for [`Self::announcement_loop`] that spawns the
-    /// returned future on tokio internally. Kept so the old
-    /// `server.start_announcing()?;` idiom continues to compile; new code
-    /// should call `announcement_loop` and spawn on its own executor so
-    /// the server is portable to bare-metal.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::announcement_loop`].
-    pub fn start_announcing(&self) -> Result<(), Error> {
-        let fut = self.announcement_loop()?;
-        tokio::spawn(fut);
-        Ok(())
     }
 
     /// Send a unicast `OfferService` to a specific address (in response to `FindService`)
@@ -1357,10 +1342,15 @@ mod tests {
         assert_eq!(entry.service_id(), 0x5B);
         assert_eq!(entry.instance_id(), 1);
 
-        // Also test that start_announcing doesn't error
+        // Also test that announcement_loop builds a future without error.
         drop(server);
         let (server2, _) = create_test_server(0x5B, 1).await;
-        assert!(server2.start_announcing().is_ok());
+        let fut = server2
+            .announcement_loop()
+            .expect("announcement_loop on a regular server must build");
+        // Spawn and immediately drop the handle — we only care that the
+        // construction did not error here.
+        drop(tokio::spawn(fut));
     }
 
     #[tokio::test]
@@ -1942,11 +1932,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_announcing_on_passive_returns_invalid_input() {
+    async fn announcement_loop_on_passive_returns_invalid_input() {
         let server = make_passive_server(0x005C, 0x0001).await;
         let err = server
-            .start_announcing()
-            .expect_err("start_announcing on a passive server must fail");
+            .announcement_loop()
+            .err()
+            .expect("announcement_loop on a passive server must fail");
         match err {
             Error::Io(io_err) => {
                 assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidInput);
@@ -1989,18 +1980,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_announcing_on_regular_server_still_succeeds() {
-        // Regression guard: the new is_passive check must not break the
+    async fn announcement_loop_on_regular_server_still_succeeds() {
+        // Regression guard: the is_passive check must not break the
         // standard non-passive path.
         let (server, _port) = create_test_server(0x005C, 0x0001).await;
-        server
-            .start_announcing()
-            .expect("start_announcing on a regular server must still succeed");
-        // The announcer task runs forever; the test succeeds as soon as
-        // start_announcing returns Ok. The spawned task is cleaned up
-        // when the Tokio test runtime shuts down at the end of this
-        // test — `tokio::spawn` tasks are not aborted by dropping
-        // unrelated handles, they ride the runtime lifecycle.
+        let fut = server
+            .announcement_loop()
+            .expect("announcement_loop on a regular server must build");
+        // The announcer loops forever; the test succeeds as soon as
+        // construction returns Ok. Spawn + drop the JoinHandle — the
+        // task rides the runtime lifecycle until the test's tokio
+        // runtime shuts down at end-of-test.
+        drop(tokio::spawn(fut));
+    }
+
+    /// Direct test that `announcement_loop` actually emits an SD
+    /// announcement when driven. Explicit coverage for the primary entry
+    /// point (avoids regressions where only the deleted shim was exercised).
+    #[tokio::test]
+    async fn announcement_loop_sends_offer_service_when_driven() {
+        use crate::protocol::MessageId;
+
+        // Bind a receiver on the SD multicast port with loopback so we
+        // actually see the outgoing announcement. Use a dedicated
+        // receiver socket via socket2 to match the SD bind pattern.
+        let iface = std::net::Ipv4Addr::LOCALHOST;
+        let recv = {
+            let s = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .unwrap();
+            s.set_reuse_address(true).unwrap();
+            #[cfg(unix)]
+            s.set_reuse_port(true).unwrap();
+            s.bind(&std::net::SocketAddr::new(IpAddr::V4(iface), sd::MULTICAST_PORT).into())
+                .unwrap();
+            s.set_nonblocking(true).unwrap();
+            let std_s: std::net::UdpSocket = s.into();
+            let rs = tokio::net::UdpSocket::from_std(std_s).unwrap();
+            rs.join_multicast_v4(sd::MULTICAST_IP, iface).unwrap();
+            rs
+        };
+
+        let config = ServerConfig::new(iface, 30501, 0x005C, 0x0001);
+        let server = Server::new_with_loopback(config, true).await.unwrap();
+        let fut = server.announcement_loop().expect("build loop");
+        let handle = tokio::spawn(fut);
+
+        let mut buf = [0u8; 1500];
+        let (n, _src) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), recv.recv_from(&mut buf))
+                .await
+                .expect("timed out waiting for announcement")
+                .expect("recv failed");
+
+        let view = crate::protocol::MessageView::parse(&buf[..n]).unwrap();
+        assert_eq!(view.header().message_id(), MessageId::SD);
+
+        handle.abort();
     }
 
     #[tokio::test]

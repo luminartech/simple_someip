@@ -95,7 +95,7 @@ use std::net::Ipv4Addr;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig::new(Ipv4Addr::new(192, 168, 1, 200), 30500, 0x1234, 1);
     let mut server = Server::new(config).await?;
-    server.start_announcing()?;
+    tokio::spawn(server.announcement_loop()?);
 
     let publisher = server.publisher();
     tokio::spawn(async move { server.run().await });

@@ -55,8 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the server
     let mut server = Server::new(config).await?;
 
-    // Start announcing the service (sends OfferService every 1s)
-    server.start_announcing()?;
+    // Start announcing the service (sends OfferService every 1s).
+    // Spawn the announcement loop future on your executor.
+    tokio::spawn(server.announcement_loop()?);
 
     // Get event publisher for sending events
     let publisher = server.publisher();
@@ -153,7 +154,7 @@ Configuration for a SOME/IP service provider:
 Main server struct:
 
 - `new(config: ServerConfig) -> Result<Self>` - Create new server
-- `start_announcing() -> Result<()>` - Start SD announcements
+- `announcement_loop() -> Result<impl Future<Output = ()> + Send + 'static>` - Build the SD announcement future; caller spawns on their executor
 - `publisher() -> Arc<EventPublisher>` - Get event publisher
 - `run() -> Result<()>` - Run event loop (handles subscriptions)
 - `register_e2e(key, profile)` - Register E2E protection for a message key
