@@ -10,21 +10,31 @@
 //! parameter on [`SdStateManager::send_offer_service`] becomes the single
 //! migration point for the announcement path.
 
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::{net::SocketAddrV4, vec::Vec};
 use tokio::net::UdpSocket;
 
-use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
+use crate::protocol::sd::{
+    self, Entry, Flags, OptionsCount, RebootFlag, ServiceEntry, TransportProtocol,
+};
 
 use super::{Error, ServerConfig};
 
 /// Tracks the SD session-ID counter and emits `OfferService` announcements.
 ///
 /// Session IDs increment with each SD message and wrap from `0xFFFF` back
-/// to `0x0001` (skipping `0`, which is reserved).
+/// to `0x0001` (skipping `0`, which is reserved). Per AUTOSAR SOME/IP-SD,
+/// the reboot flag on emitted SD messages is
+/// [`RebootFlag::RecentlyRebooted`] from startup until the counter wraps
+/// once, then [`RebootFlag::Continuous`] permanently — `SdStateManager`
+/// tracks that transition and exposes it via [`Self::reboot_flag`] so every
+/// server-side SD emission path reads from a single source of truth.
 #[derive(Debug)]
 pub(super) struct SdStateManager {
     session_id: AtomicU16,
+    /// `true` once [`Self::next_session_id`] has advanced past `0xFFFF`.
+    /// Monotonic: never transitions back to `false`.
+    has_wrapped: AtomicBool,
 }
 
 impl SdStateManager {
@@ -38,11 +48,15 @@ impl SdStateManager {
     pub(super) const fn with_initial(initial: u16) -> Self {
         Self {
             session_id: AtomicU16::new(initial),
+            has_wrapped: AtomicBool::new(false),
         }
     }
 
     /// Advance the counter and return the next SOME/IP-SD session ID
-    /// (`client_id = 0`, session ID in the low 16 bits). Skips 0 on wrap.
+    /// (`client_id = 0`, session ID in the low 16 bits). Skips 0 on wrap,
+    /// and latches [`Self::has_wrapped`] the first time the counter crosses
+    /// the `0xFFFF → 0x0001` boundary so the reboot flag flips to
+    /// [`RebootFlag::Continuous`] permanently.
     pub(super) fn next_session_id(&self) -> u32 {
         let prev = self
             .session_id
@@ -51,8 +65,26 @@ impl SdStateManager {
                 Some(if next == 0 { 1 } else { next })
             })
             .unwrap();
+        // The only value whose successor wraps through 0 is 0xFFFF; latch
+        // the flag exactly on that transition.
+        if prev == u16::MAX {
+            self.has_wrapped.store(true, Ordering::Relaxed);
+        }
         let next = prev.wrapping_add(1);
         u32::from(if next == 0 { 1 } else { next })
+    }
+
+    /// Current SD reboot flag for this server.
+    ///
+    /// Returns [`RebootFlag::RecentlyRebooted`] until the session counter
+    /// has wrapped past `0xFFFF` at least once, then
+    /// [`RebootFlag::Continuous`] permanently. Every server-side SD
+    /// emission path ([`Self::send_offer_service`], plus the unicast
+    /// offer / `SubscribeAck` / `SubscribeNack` paths in
+    /// [`crate::server::Server`]) calls this so the flag on the wire
+    /// reflects a single tracked state.
+    pub(super) fn reboot_flag(&self) -> RebootFlag {
+        RebootFlag::from(!self.has_wrapped.load(Ordering::Relaxed))
     }
 
     /// Send a multicast `OfferService` announcement for the given config.
@@ -83,7 +115,7 @@ impl SdStateManager {
 
         let entries = [entry];
         let options = [option];
-        let sd_payload = sd::Header::new(Flags::new(true, true), &entries, &options);
+        let sd_payload = sd::Header::new(Flags::new_sd(self.reboot_flag()), &entries, &options);
 
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
@@ -153,6 +185,79 @@ mod tests {
         let sd = SdStateManager::new();
         // new() seeds at 1; first next_session_id increments to 2
         assert_eq!(sd.next_session_id(), 2);
+    }
+
+    // ── Reboot-flag tracking ────────────────────────────────────────────
+    //
+    // AUTOSAR SOME/IP-SD: the reboot bit on emitted SD messages must be
+    // set until the session counter wraps past `0xFFFF` for the first
+    // time, then cleared permanently. These tests drive `SdStateManager`
+    // directly (no socket) and verify the state machine that every
+    // server-side SD emission path (`send_offer_service`, plus unicast
+    // offer / `SubscribeAck` / `SubscribeNack` in `server::Server`) now
+    // reads from via [`SdStateManager::reboot_flag`].
+
+    #[test]
+    fn reboot_flag_is_recently_rebooted_on_fresh_manager() {
+        // Default constructor: counter hasn't wrapped, flag must indicate
+        // a recent reboot so peers can re-synchronize SD state.
+        let sd = SdStateManager::new();
+        assert_eq!(sd.reboot_flag(), RebootFlag::RecentlyRebooted);
+    }
+
+    #[test]
+    fn reboot_flag_stays_recently_rebooted_below_wrap() {
+        // Advancing the counter short of a wrap must not flip the flag —
+        // it's specifically the 0xFFFF → 0x0001 transition that matters,
+        // not "has next_session_id been called more than once".
+        let sd = SdStateManager::with_initial(0x1233);
+        for _ in 0..10 {
+            sd.next_session_id();
+        }
+        assert_eq!(sd.reboot_flag(), RebootFlag::RecentlyRebooted);
+    }
+
+    #[test]
+    fn reboot_flag_flips_to_continuous_exactly_on_wrap() {
+        // Step the counter across the wrap boundary and assert the flag
+        // transitions on the precise call that crosses 0xFFFF → 0x0001.
+        let sd = SdStateManager::with_initial(0xFFFE);
+        assert_eq!(sd.reboot_flag(), RebootFlag::RecentlyRebooted);
+
+        // 0xFFFE -> 0xFFFF: prev=0xFFFE, no wrap.
+        assert_eq!(sd.next_session_id(), 0xFFFF);
+        assert_eq!(
+            sd.reboot_flag(),
+            RebootFlag::RecentlyRebooted,
+            "counter reached 0xFFFF but has not yet wrapped — flag must still be RecentlyRebooted",
+        );
+
+        // 0xFFFF -> 0x0001 (skip 0): prev=0xFFFF, wrap latches.
+        assert_eq!(sd.next_session_id(), 0x0001);
+        assert_eq!(
+            sd.reboot_flag(),
+            RebootFlag::Continuous,
+            "wrap just occurred — flag must now be Continuous",
+        );
+    }
+
+    #[test]
+    fn reboot_flag_is_monotonic_after_wrap() {
+        // Once the flag latches to Continuous it never goes back, even
+        // after the counter wraps a second time or is advanced
+        // indefinitely. Guard against a regression that would re-derive
+        // the flag from the current counter value (which would wrongly
+        // flip back to RecentlyRebooted at 0x0001).
+        let sd = SdStateManager::with_initial(0xFFFE);
+        sd.next_session_id(); // -> 0xFFFF
+        sd.next_session_id(); // wrap -> 0x0001
+        assert_eq!(sd.reboot_flag(), RebootFlag::Continuous);
+
+        // Many further advances, including crossing 0xFFFF again.
+        for _ in 0..(u32::from(u16::MAX) + 5) {
+            sd.next_session_id();
+        }
+        assert_eq!(sd.reboot_flag(), RebootFlag::Continuous);
     }
 
     // ── Multicast-loopback harness ──────────────────────────────────────
@@ -292,10 +397,16 @@ mod tests {
     /// `send_offer_service` is responsible for — not just the entry body.
     /// A future regression that garbles the endpoint option, flips a flag,
     /// or changes the SOME/IP message type should fail here.
+    ///
+    /// `expected_reboot` lets pre-wrap callers assert `RecentlyRebooted`
+    /// and post-wrap callers assert `Continuous`; the flag is tracked by
+    /// `SdStateManager::has_wrapped` and read via `reboot_flag()` at each
+    /// send.
     fn assert_offer_matches(
         offer: &ReceivedOffer,
         config: &ServerConfig,
         expected_request_id: u32,
+        expected_reboot: RebootFlag,
     ) {
         // SOME/IP envelope
         assert_eq!(offer.someip_service_id, 0xFFFF, "SD uses service_id 0xFFFF");
@@ -308,8 +419,10 @@ mod tests {
             offer.request_id, expected_request_id,
             "request_id is session_id in low 16 bits, client_id zero in high 16",
         );
-        // SD flags — `send_offer_service` uses Flags::new(true, true).
-        assert_eq!(offer.flags.reboot(), RebootFlag::RecentlyRebooted);
+        // SD flags — reboot comes from SdStateManager::reboot_flag (latches
+        // to Continuous after the session counter wraps past 0xFFFF);
+        // unicast is always true for SD.
+        assert_eq!(offer.flags.reboot(), expected_reboot);
         assert!(offer.flags.unicast());
         // OfferService entry
         assert_eq!(offer.entry_service_id, config.service_id);
@@ -353,7 +466,9 @@ mod tests {
 
         let offer = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
         // next_session_id advances 0x1233 -> 0x1234; client_id is zero.
-        assert_offer_matches(&offer, &config, 0x0000_1234);
+        // Fresh SdStateManager: counter has not wrapped, reboot flag is
+        // RecentlyRebooted.
+        assert_offer_matches(&offer, &config, 0x0000_1234, RebootFlag::RecentlyRebooted);
     }
 
     #[ignore = "requires MULTICAST on loopback; re-enable after lo fix on this branch"]
@@ -405,6 +520,21 @@ mod tests {
             second.request_id, 0x0000_0001,
             "must skip reserved 0 on wrap"
         );
+        // Reboot flag latches: the first emission goes out before the
+        // wrap happens (prev=0xFFFE), so it still advertises
+        // RecentlyRebooted; the second emission is the one whose
+        // next_session_id call crossed 0xFFFF -> 0x0001, so the flag
+        // Flips to Continuous permanently from there on.
+        assert_eq!(
+            first.flags.reboot(),
+            RebootFlag::RecentlyRebooted,
+            "first emit is pre-wrap and must still advertise RecentlyRebooted",
+        );
+        assert_eq!(
+            second.flags.reboot(),
+            RebootFlag::Continuous,
+            "post-wrap emit must advertise Continuous",
+        );
     }
 
     #[ignore = "requires MULTICAST on loopback; re-enable after lo fix on this branch"]
@@ -426,7 +556,7 @@ mod tests {
         sd_state.send_offer_service(&config, &tx).await.unwrap();
 
         let offer = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
-        assert_offer_matches(&offer, &config, 0x0000_1234);
+        assert_offer_matches(&offer, &config, 0x0000_1234, RebootFlag::RecentlyRebooted);
         // Belt-and-suspenders: assert_offer_matches already checks this,
         // but the purpose of this test is specifically the zero case.
         assert_eq!(offer.entry_ttl, 0);

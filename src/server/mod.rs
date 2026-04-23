@@ -348,7 +348,11 @@ impl Server {
 
         let entries = [entry];
         let options = [option];
-        let sd_payload = sd::Header::new(Flags::new(true, true), &entries, &options);
+        let sd_payload = sd::Header::new(
+            Flags::new_sd(self.sd_state.reboot_flag()),
+            &entries,
+            &options,
+        );
 
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
@@ -732,7 +736,7 @@ impl Server {
         });
 
         let entries = [ack_entry];
-        let sd_payload = sd::Header::new(Flags::new(true, true), &entries, &[]);
+        let sd_payload = sd::Header::new(Flags::new_sd(self.sd_state.reboot_flag()), &entries, &[]);
 
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
@@ -779,7 +783,7 @@ impl Server {
         });
 
         let entries = [nack_entry];
-        let sd_payload = sd::Header::new(Flags::new(true, true), &entries, &[]);
+        let sd_payload = sd::Header::new(Flags::new_sd(self.sd_state.reboot_flag()), &entries, &[]);
 
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
