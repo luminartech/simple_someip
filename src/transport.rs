@@ -78,12 +78,15 @@
 //! # Status
 //!
 //! A default `std + tokio` implementation
-//! ([`crate::tokio_transport::TokioTransport`],
-//! [`crate::tokio_transport::TokioSocket`],
-//! [`crate::tokio_transport::TokioTimer`]) ships under the `client` and
-//! `server` features and is re-exported at the crate root. Other backends
-//! (for example `smoltcp::UdpSocket` + `embassy-time` on embedded) are the
-//! consumer's responsibility — the traits here are the integration point.
+//! (`crate::tokio_transport::TokioTransport`,
+//! `crate::tokio_transport::TokioSocket`, `crate::tokio_transport::TokioTimer`)
+//! ships under the `client` and `server` features and is re-exported at the
+//! crate root. The paths are rendered as code literals rather than
+//! intra-doc links because the `tokio_transport` module is feature-gated,
+//! and links would otherwise break default-feature rustdoc builds. Other
+//! backends (for example `smoltcp::UdpSocket` + `embassy-time` on embedded)
+//! are the consumer's responsibility — the traits here are the integration
+//! point.
 //!
 //! # Minimal adapter sketch
 //!
