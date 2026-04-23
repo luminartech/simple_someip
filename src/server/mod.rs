@@ -2019,6 +2019,11 @@ mod tests {
     async fn announcement_loop_sends_offer_service_when_driven() {
         use crate::protocol::MessageId;
 
+        // Use a distinct service/instance ID so parallel tests joined to
+        // the same SD multicast group do not produce false matches.
+        const SID: u16 = 0x005C;
+        const IID: u16 = 0x0001;
+
         // Bind a receiver on the SD multicast port with loopback so we
         // actually see the outgoing announcement. Use a dedicated
         // receiver socket via socket2 to match the SD bind pattern.
@@ -2042,10 +2047,6 @@ mod tests {
             rs
         };
 
-        // Use a distinct service/instance ID so parallel tests joined to
-        // the same SD multicast group do not produce false matches.
-        const SID: u16 = 0x005C;
-        const IID: u16 = 0x0001;
         let config = ServerConfig::new(iface, 30501, SID, IID);
         let server = Server::new_with_loopback(config, true).await.unwrap();
         let fut = server.announcement_loop().expect("build loop");
@@ -2279,9 +2280,10 @@ mod tests {
         let server = Server::new_with_loopback(config, true)
             .await
             .expect("server must bind with loopback enabled");
-        server
-            .start_announcing()
-            .expect("start_announcing should succeed on a non-passive server");
+        let announce_fut = server
+            .announcement_loop()
+            .expect("announcement_loop should build on a non-passive server");
+        tokio::spawn(announce_fut);
 
         // Scan the multicast group for our OfferService. The first tick
         // happens immediately; 2s is ample headroom for scheduler jitter.
