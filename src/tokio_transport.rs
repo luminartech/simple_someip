@@ -56,6 +56,21 @@ pub struct TokioSocket {
     inner: UdpSocket,
 }
 
+impl TokioSocket {
+    /// Read back the current value of the `IP_MULTICAST_LOOP` flag. Thin
+    /// wrapper over [`tokio::net::UdpSocket::multicast_loop_v4`], exposed
+    /// for tests that verify [`SocketOptions::multicast_loop_v4`] is
+    /// applied and for field debugging.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`] if the backend cannot read the flag.
+    #[allow(dead_code)] // used in tests; kept available for field debugging.
+    pub(crate) fn multicast_loop_v4(&self) -> Result<bool, TransportError> {
+        self.inner.multicast_loop_v4().map_err(map_io_error)
+    }
+}
+
 /// Sleep backed by [`tokio::time::sleep`].
 ///
 /// TODO(phase 7): wire this into the `tokio::time::sleep` call sites in
@@ -175,9 +190,7 @@ fn bind_with_options(addr: SocketAddrV4, options: &SocketOptions) -> std::io::Re
     if let Some(iface) = options.multicast_if_v4 {
         raw.set_multicast_if_v4(&iface)?;
     }
-    if options.multicast_loop_v4 {
-        raw.set_multicast_loop_v4(true)?;
-    }
+    raw.set_multicast_loop_v4(options.multicast_loop_v4)?;
     let bind_addr = SocketAddr::new(IpAddr::V4(*addr.ip()), addr.port());
     raw.bind(&bind_addr.into())?;
     raw.set_nonblocking(true)?;
@@ -298,6 +311,40 @@ mod tests {
             Err(other) => panic!("unexpected rebind error: {other:?}"),
         }
         drop(a);
+    }
+
+    #[tokio::test]
+    async fn multicast_loop_v4_option_propagates_in_both_directions() {
+        // Guards against a regression where `multicast_loop_v4: false` was
+        // silently ignored and the socket kept the OS default (often
+        // loopback ENABLED), diverging from the explicit request.
+        let factory = TokioTransport;
+
+        let opts_off = SocketOptions {
+            multicast_loop_v4: false,
+            ..SocketOptions::default()
+        };
+        let sock_off = factory
+            .bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), &opts_off)
+            .await
+            .expect("bind off");
+        assert!(
+            !sock_off.multicast_loop_v4().expect("read off flag"),
+            "multicast_loop_v4=false must disable IP_MULTICAST_LOOP"
+        );
+
+        let opts_on = SocketOptions {
+            multicast_loop_v4: true,
+            ..SocketOptions::default()
+        };
+        let sock_on = factory
+            .bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), &opts_on)
+            .await
+            .expect("bind on");
+        assert!(
+            sock_on.multicast_loop_v4().expect("read on flag"),
+            "multicast_loop_v4=true must enable IP_MULTICAST_LOOP"
+        );
     }
 
     #[tokio::test]

@@ -77,11 +77,13 @@
 //!
 //! # Status
 //!
-//! The traits are defined but not yet wired into `Client`/`Server`; that is
-//! the next refactor step. No implementations ship with the crate yet.
-//! Callers must provide their own backend — typically a thin adapter over
-//! `tokio::net::UdpSocket` + `tokio::time` on `std`, or over
-//! `smoltcp::UdpSocket` + `embassy-time` on embedded.
+//! A default `std + tokio` implementation
+//! ([`crate::tokio_transport::TokioTransport`],
+//! [`crate::tokio_transport::TokioSocket`],
+//! [`crate::tokio_transport::TokioTimer`]) ships under the `client` and
+//! `server` features and is re-exported at the crate root. Other backends
+//! (for example `smoltcp::UdpSocket` + `embassy-time` on embedded) are the
+//! consumer's responsibility — the traits here are the integration point.
 //!
 //! # Minimal adapter sketch
 //!
