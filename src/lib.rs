@@ -67,7 +67,9 @@
 //! #[tokio::main]
 //! async fn main() {
 //!     // Client::new returns a Clone-able handle, an update stream, and
-//!     // the run-loop future. Spawn the future on any executor.
+//!     // the run-loop future. Spawn the future on the tokio runtime;
+//!     // the returned future depends on `tokio::select!` / `tokio::time`
+//!     // / tokio sockets, so it is not executor-agnostic today.
 //!     let (client, mut updates, run) = Client::<RawPayload>::new([192, 168, 1, 100].into());
 //!     tokio::spawn(run);
 //!     client.bind_discovery().await.unwrap();

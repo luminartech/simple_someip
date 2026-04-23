@@ -106,7 +106,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Create the client (handles discovery, subscriptions, SD socket) ──
 
-    let (client, mut updates) = simple_someip::Client::<Payload>::new(interface);
+    let (client, mut updates, run) = simple_someip::Client::<Payload>::new(interface);
+    tokio::spawn(run);
     client.bind_discovery().await?;
     info!("Client discovery bound");
 

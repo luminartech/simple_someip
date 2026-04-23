@@ -62,15 +62,12 @@ impl<P> PendingResponse<P> {
     ///
     /// # Errors
     ///
-    /// Returns the same errors as the request itself (e.g. deserialization failure).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the inner loop dropped the response channel.
+    /// Returns the same errors as the request itself (e.g. deserialization
+    /// failure). Returns [`Error::Shutdown`] if the client's run-loop
+    /// future exits before the response is delivered — the caller's
+    /// `PendingResponse` handle outlived its driver.
     pub async fn response(self) -> Result<P, Error> {
-        self.receiver
-            .await
-            .expect("inner loop dropped response channel")
+        self.receiver.await.map_err(|_| Error::Shutdown)?
     }
 }
 
@@ -279,13 +276,21 @@ where
     ///
     /// Returns an error if rebinding sockets on the new interface fails.
     ///
+    /// Returns [`Error::Shutdown`] if the client's run-loop future has
+    /// exited before this call — the control-channel send cannot
+    /// complete without its receiver.
+    ///
     /// # Panics
     ///
-    /// Panics if the internal control channel or interface lock is poisoned/closed.
+    /// Panics if the interface lock is poisoned (indicates prior panic
+    /// while the lock was held).
     pub async fn set_interface(&self, interface: Ipv4Addr) -> Result<(), Error> {
         let (response, message) = ControlMessage::set_interface(interface);
-        self.control_sender.send(message).await.unwrap();
-        response.await.unwrap()?;
+        self.control_sender
+            .send(message)
+            .await
+            .map_err(|_| Error::Shutdown)?;
+        response.await.map_err(|_| Error::Shutdown)??;
         *self.interface.write().expect("interface lock poisoned") = interface;
         Ok(())
     }
@@ -295,14 +300,17 @@ where
     /// # Errors
     ///
     /// Returns an error if binding the multicast socket fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal control channel is closed.
+    /// Returns [`Error::Shutdown`] if the client's run-loop future has
+    /// exited before this call (dropped, cancelled, or otherwise gone)
+    /// — the `Client` handle has outlived its driver and further
+    /// control-channel sends cannot make progress.
     pub async fn bind_discovery(&self) -> Result<(), Error> {
         let (response, message) = ControlMessage::bind_discovery();
-        self.control_sender.send(message).await.unwrap();
-        response.await.unwrap()
+        self.control_sender
+            .send(message)
+            .await
+            .map_err(|_| Error::Shutdown)?;
+        response.await.map_err(|_| Error::Shutdown)?
     }
 
     /// Unbinds the SD multicast discovery socket.
@@ -310,14 +318,17 @@ where
     /// # Errors
     ///
     /// Returns an error if unbinding the multicast socket fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal control channel is closed.
+    /// Returns [`Error::Shutdown`] if the client's run-loop future has
+    /// exited before this call (dropped, cancelled, or otherwise gone)
+    /// — the `Client` handle has outlived its driver and further
+    /// control-channel sends cannot make progress.
     pub async fn unbind_discovery(&self) -> Result<(), Error> {
         let (response, message) = ControlMessage::unbind_discovery();
-        self.control_sender.send(message).await.unwrap();
-        response.await.unwrap()
+        self.control_sender
+            .send(message)
+            .await
+            .map_err(|_| Error::Shutdown)?;
+        response.await.map_err(|_| Error::Shutdown)?
     }
 
     /// Subscribes to an event group on a known service.
@@ -325,10 +336,10 @@ where
     /// # Errors
     ///
     /// Returns an error if the service is not found or subscription fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal control channel is closed.
+    /// Returns [`Error::Shutdown`] if the client's run-loop future has
+    /// exited before this call (dropped, cancelled, or otherwise gone)
+    /// — the `Client` handle has outlived its driver and further
+    /// control-channel sends cannot make progress.
     pub async fn subscribe(
         &self,
         service_id: u16,
@@ -346,8 +357,11 @@ where
             event_group_id,
             client_port,
         );
-        self.control_sender.send(message).await.unwrap();
-        response.await.unwrap()
+        self.control_sender
+            .send(message)
+            .await
+            .map_err(|_| Error::Shutdown)?;
+        response.await.map_err(|_| Error::Shutdown)?
     }
 
     /// Like [`subscribe`](Self::subscribe) but does not wait for the
@@ -429,18 +443,21 @@ where
     /// # Errors
     ///
     /// Returns an error if sending the SD message fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal control channel is closed.
+    /// Returns [`Error::Shutdown`] if the client's run-loop future has
+    /// exited before this call (dropped, cancelled, or otherwise gone)
+    /// — the `Client` handle has outlived its driver and further
+    /// control-channel sends cannot make progress.
     pub async fn send_sd_message(
         &self,
         target: SocketAddrV4,
         sd_header: <MessageDefinitions as PayloadWireFormat>::SdHeader,
     ) -> Result<(), Error> {
         let (response, message) = ControlMessage::send_sd(target, sd_header);
-        self.control_sender.send(message).await.unwrap();
-        response.await.unwrap()
+        self.control_sender
+            .send(message)
+            .await
+            .map_err(|_| Error::Shutdown)?;
+        response.await.map_err(|_| Error::Shutdown)?
     }
 
     /// Start periodic SD announcements on the client's discovery socket.
@@ -573,10 +590,10 @@ where
     /// # Errors
     ///
     /// Returns an error if registering the endpoint fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal control channel is closed.
+    /// Returns [`Error::Shutdown`] if the client's run-loop future has
+    /// exited before this call (dropped, cancelled, or otherwise gone)
+    /// — the `Client` handle has outlived its driver and further
+    /// control-channel sends cannot make progress.
     pub async fn add_endpoint(
         &self,
         service_id: u16,
@@ -586,8 +603,11 @@ where
     ) -> Result<(), Error> {
         let (response, message) =
             ControlMessage::add_endpoint(service_id, instance_id, addr, local_port);
-        self.control_sender.send(message).await.unwrap();
-        response.await.unwrap()
+        self.control_sender
+            .send(message)
+            .await
+            .map_err(|_| Error::Shutdown)?;
+        response.await.map_err(|_| Error::Shutdown)?
     }
 
     /// Removes a service endpoint from the client's endpoint registry.
@@ -595,14 +615,17 @@ where
     /// # Errors
     ///
     /// Returns an error if removing the endpoint fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal control channel is closed.
+    /// Returns [`Error::Shutdown`] if the client's run-loop future has
+    /// exited before this call (dropped, cancelled, or otherwise gone)
+    /// — the `Client` handle has outlived its driver and further
+    /// control-channel sends cannot make progress.
     pub async fn remove_endpoint(&self, service_id: u16, instance_id: u16) -> Result<(), Error> {
         let (response, message) = ControlMessage::remove_endpoint(service_id, instance_id);
-        self.control_sender.send(message).await.unwrap();
-        response.await.unwrap()
+        self.control_sender
+            .send(message)
+            .await
+            .map_err(|_| Error::Shutdown)?;
+        response.await.map_err(|_| Error::Shutdown)?
     }
 
     /// Sends a message to a service and returns a handle to await the response.
@@ -625,10 +648,10 @@ where
     ///
     /// Returns an error if the service is not found, unicast binding fails,
     /// or the UDP send fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal control channel is closed.
+    /// Returns [`Error::Shutdown`] if the client's run-loop future has
+    /// exited before this call (dropped, cancelled, or otherwise gone)
+    /// — the `Client` handle has outlived its driver and further
+    /// control-channel sends cannot make progress.
     pub async fn send_to_service(
         &self,
         service_id: u16,
@@ -637,8 +660,11 @@ where
     ) -> Result<PendingResponse<MessageDefinitions>, Error> {
         let (send_rx, response_rx, ctrl_msg) =
             ControlMessage::send_to_service(service_id, instance_id, message);
-        self.control_sender.send(ctrl_msg).await.unwrap();
-        send_rx.await.unwrap()?;
+        self.control_sender
+            .send(ctrl_msg)
+            .await
+            .map_err(|_| Error::Shutdown)?;
+        send_rx.await.map_err(|_| Error::Shutdown)??;
         Ok(PendingResponse {
             receiver: response_rx,
         })
@@ -654,10 +680,10 @@ where
     ///
     /// Returns an error if the service is not found, unicast binding fails,
     /// the UDP send fails, or the response payload fails to deserialize.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal control channel is closed.
+    /// Returns [`Error::Shutdown`] if the client's run-loop future has
+    /// exited before this call (dropped, cancelled, or otherwise gone)
+    /// — the `Client` handle has outlived its driver and further
+    /// control-channel sends cannot make progress.
     pub async fn request(
         &self,
         service_id: u16,
@@ -666,11 +692,12 @@ where
     ) -> Result<MessageDefinitions, Error> {
         let (send_rx, response_rx, ctrl_msg) =
             ControlMessage::send_to_service(service_id, instance_id, message);
-        self.control_sender.send(ctrl_msg).await.unwrap();
-        send_rx.await.unwrap()?;
-        response_rx
+        self.control_sender
+            .send(ctrl_msg)
             .await
-            .expect("inner loop dropped response channel")
+            .map_err(|_| Error::Shutdown)?;
+        send_rx.await.map_err(|_| Error::Shutdown)??;
+        response_rx.await.map_err(|_| Error::Shutdown)?
     }
 
     /// Register an E2E profile for the given key.
@@ -1161,33 +1188,41 @@ mod tests {
 
     /// Documents the footgun: if the caller drops `run_fut` without ever
     /// polling it, the control channel's receiver goes with it and
-    /// subsequent `Client` method calls panic on `control_sender.send()`.
+    /// subsequent `Client` method calls return [`Error::Shutdown`]
+    /// rather than panicking.
     ///
     /// This is intrinsic to the caller-driven lifecycle introduced in
     /// phase 6 — the run loop is no longer owned by `Client::new`, so
     /// failing to spawn it is the caller's responsibility. The test
     /// pins the behavior deterministically so that any attempt to
-    /// silently "fix" this (e.g. internal spawn fallback) would break it
-    /// and force a review.
+    /// silently "fix" this (e.g. internal spawn fallback) would break
+    /// it and force a review.
+    ///
+    /// Prior to the phase-6 API change these call sites panicked on
+    /// `.unwrap()` of the send `Result`; the typed error surfaced here
+    /// lets library consumers observe lifecycle mismatches cleanly
+    /// instead of bringing down the caller's task.
     #[tokio::test]
-    #[should_panic(expected = "SendError")]
-    async fn dropping_run_future_without_spawn_panics_on_next_client_call() {
+    async fn dropping_run_future_without_spawn_returns_shutdown_error() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         // Caller explicitly discards the run loop.
         drop(run_fut);
-        // Any client method that enqueues a control message panics on
-        // `.unwrap()` of the send Result — document it instead of
-        // hiding it.
-        client.bind_discovery().await.unwrap();
+        let err = client
+            .bind_discovery()
+            .await
+            .expect_err("must surface a typed error, not Ok or panic");
+        assert!(
+            matches!(err, Error::Shutdown),
+            "expected Error::Shutdown after run-loop drop, got {err:?}",
+        );
     }
 
     /// If the run loop is cancelled mid-poll (caller-initiated timeout,
     /// graceful shutdown), subsequent `Client` calls see the control
-    /// channel closed and surface a panic from `control_sender.send()`.
-    /// Same structural contract as dropping the run future.
+    /// channel closed and surface [`Error::Shutdown`]. Same structural
+    /// contract as dropping the run future.
     #[tokio::test]
-    #[should_panic(expected = "SendError")]
-    async fn cancelling_run_future_closes_control_channel() {
+    async fn cancelling_run_future_closes_control_channel_returns_shutdown_error() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let handle = tokio::spawn(run_fut);
         // Let the loop start.
@@ -1196,6 +1231,13 @@ mod tests {
         // Give the abort time to land.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        client.bind_discovery().await.unwrap();
+        let err = client
+            .bind_discovery()
+            .await
+            .expect_err("must surface a typed error, not Ok or panic");
+        assert!(
+            matches!(err, Error::Shutdown),
+            "expected Error::Shutdown after run-loop cancel, got {err:?}",
+        );
     }
 }

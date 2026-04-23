@@ -50,6 +50,16 @@ pub enum Error {
     /// [`crate::transport::TransportError`]).
     #[error(transparent)]
     Transport(#[from] crate::transport::TransportError),
+    /// The client's internal run-loop future has exited — either because
+    /// the caller dropped it before or during polling, the executor
+    /// cancelled its task, or it returned. All public `Client` methods
+    /// that enqueue a control message or await its response return
+    /// this variant when the control channel is closed, rather than
+    /// panicking on `.unwrap()` of the send / recv result. Treat it as
+    /// a caller-side lifecycle error: the `Client` handle has outlived
+    /// its driver and further calls on it cannot make progress.
+    #[error("client run loop is no longer running")]
+    Shutdown,
 }
 
 #[cfg(test)]

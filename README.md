@@ -66,9 +66,13 @@ use std::net::Ipv4Addr;
 
 #[tokio::main]
 async fn main() {
-    // Client::new returns a (Client, ClientUpdates) pair.
-    // Client is Clone-able and can be shared across tasks.
-    let (client, mut updates) = Client::<RawPayload>::new(Ipv4Addr::new(192, 168, 1, 100));
+    // Client::new returns a Clone-able handle, an update stream, and
+    // the run-loop future. Spawn the future on the tokio runtime;
+    // without it the control channel has no driver and Client method
+    // calls will return `Error::Shutdown`.
+    let (client, mut updates, run) =
+        Client::<RawPayload>::new(Ipv4Addr::new(192, 168, 1, 100));
+    tokio::spawn(run);
 
     // Bind the SD multicast socket to discover services
     client.bind_discovery().await.unwrap();
