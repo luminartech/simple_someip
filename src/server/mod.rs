@@ -1348,13 +1348,12 @@ mod tests {
         let fut = server2
             .announcement_loop()
             .expect("announcement_loop on a regular server must build");
-        // Spawn and immediately drop the handle — we only care that the
-        // construction did not error here.
-        // Do NOT spawn: the announcer loops forever, and spawning +
-        // dropping the JoinHandle would leave the task running and
-        // emitting multicast for the rest of the test binary's
-        // lifetime, interfering with parallel tests that bind the same
-        // multicast group. We only care that construction returned Ok.
+        // Intentionally do not poll or spawn the future: we only care
+        // that constructing it returned Ok. If this future were
+        // spawned, the announcer would loop indefinitely and emit
+        // multicast until explicitly aborted or the Tokio runtime
+        // shut down at end-of-test, which could interfere with
+        // parallel tests using the same multicast group.
         drop(fut);
     }
 

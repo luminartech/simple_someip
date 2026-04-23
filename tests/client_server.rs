@@ -57,7 +57,7 @@ async fn test_client_server_subscribe_and_receive_event() {
 
     // Create client and subscribe to the server's event group
     let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    tokio::spawn(run_fut);
+    let _ = tokio::spawn(run_fut);
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
@@ -101,7 +101,7 @@ async fn test_client_send_sd_auto_binds_discovery() {
 
     // Create client — NO bind_discovery
     let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    tokio::spawn(run_fut);
+    let _ = tokio::spawn(run_fut);
 
     // send_sd_message should auto-bind discovery and succeed
     let sd_header = VecSdHeader {
@@ -133,7 +133,7 @@ async fn test_client_bind_unbind_lifecycle_with_server() {
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    tokio::spawn(run_fut);
+    let _ = tokio::spawn(run_fut);
 
     // Bind discovery, subscribe, then unbind and rebind
     client.bind_discovery().await.unwrap();
@@ -162,7 +162,7 @@ async fn test_add_endpoint_and_send_to_service() {
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    tokio::spawn(run_fut);
+    let _ = tokio::spawn(run_fut);
     client.bind_discovery().await.unwrap();
 
     // Register the server's endpoint manually (simulating non-broadcasting service)
@@ -223,7 +223,7 @@ async fn test_subscribe_auto_binds_discovery() {
 
     // Create client — do NOT bind discovery manually
     let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    tokio::spawn(run_fut);
+    let _ = tokio::spawn(run_fut);
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     // Subscribe should auto-bind discovery internally
@@ -266,7 +266,7 @@ async fn test_client_request_resolves_via_unicast_reply() {
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    tokio::spawn(run_fut);
+    let _ = tokio::spawn(run_fut);
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
@@ -328,7 +328,7 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    tokio::spawn(run_fut);
+    let _ = tokio::spawn(run_fut);
 
     // Register matching E2E profile on client
     client.register_e2e(key, profile);
@@ -393,13 +393,13 @@ async fn test_multiple_subscribers_receive_events() {
 
     // Client 1
     let (client1, mut updates1, run_fut1) = TestClient::new(Ipv4Addr::LOCALHOST);
-    tokio::spawn(run_fut1);
+    let _ = tokio::spawn(run_fut1);
     client1.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client1.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
 
     // Client 2
     let (client2, mut updates2, run_fut2) = TestClient::new(Ipv4Addr::LOCALHOST);
-    tokio::spawn(run_fut2);
+    let _ = tokio::spawn(run_fut2);
     client2.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client2.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
 
@@ -453,7 +453,7 @@ async fn test_multiple_subscribers_receive_events() {
 #[tokio::test]
 async fn test_updates_drain_after_shutdown() {
     let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    tokio::spawn(run_fut);
+    let _ = tokio::spawn(run_fut);
     client.shut_down();
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv())
@@ -469,7 +469,7 @@ async fn test_cloned_client_works() {
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    tokio::spawn(run_fut);
+    let _ = tokio::spawn(run_fut);
     let client2 = client.clone();
 
     // Both clones can send commands
@@ -490,7 +490,7 @@ async fn test_subscribe_specific_port_reuse() {
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    tokio::spawn(run_fut);
+    let _ = tokio::spawn(run_fut);
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
 
