@@ -92,15 +92,29 @@
 #[cfg(feature = "std")]
 extern crate std;
 
-/// Maximum size, in bytes, of UDP payloads produced by the `client` and
-/// `server` send paths. Messages larger than this cannot be serialized and
-/// will error out. Note that this is an application-level payload limit,
-/// not an Ethernet-MTU-safe size: a 1500-byte UDP payload will exceed a
-/// 1500-byte L2 MTU once IP/UDP headers are added (IPv4 leaves 1472 bytes
-/// of UDP payload, IPv6 leaves 1452), so sends at this size may fragment
-/// or fail depending on the network stack. Every outgoing stack buffer in
-/// the crate is sized to this constant — bare-metal ports with a smaller
-/// link MTU may want to lower it by forking.
+/// Maximum size, in bytes, of UDP payloads for `client` / `server` send
+/// paths that serialize into a fixed-size buffer of this size.
+///
+/// Paths currently capped by this constant:
+/// - `client::SocketManager::send` (unicast + SD outbound)
+/// - `server::EventPublisher::publish_event`
+/// - `server::EventPublisher::publish_raw_event`
+///
+/// When one of these paths is actually reached and serialization is
+/// attempted, messages larger than this cap fail with
+/// `Error::Capacity("udp_buffer")`. Paths that return early before
+/// attempting serialization (e.g. `publish_event` when there are no
+/// subscribers) are not affected. Other outbound SD paths (announcement
+/// builders, `SubscribeAck` / `SubscribeNack`) currently still use
+/// heap `Vec` buffers and are not capped by this constant — that is a
+/// known gap, planned alongside the bare-metal `no_alloc` refactor.
+///
+/// Note that this is an application-level UDP payload limit, not an
+/// Ethernet-MTU-safe size: a 1500-byte UDP payload exceeds a 1500-byte
+/// L2 MTU once IP/UDP headers are added (IPv4 leaves 1472 bytes of UDP
+/// payload, IPv6 leaves 1452), so sends at this size may fragment or
+/// fail depending on the network stack. Bare-metal ports targeting a
+/// smaller link MTU may want to lower this by forking.
 pub const UDP_BUFFER_SIZE: usize = 1500;
 
 /// SOME/IP client for discovering services and exchanging messages.
