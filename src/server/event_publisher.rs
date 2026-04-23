@@ -457,6 +457,59 @@ mod tests {
         }
     }
 
+    /// Regression guard against 343da67: without the pre-check, an oversize
+    /// message would fail with a less-actionable protocol I/O error from
+    /// `encode_to_slice`'s slice writer running out of buffer, rather than
+    /// the explicit `Error::Capacity("udp_buffer")` the new branch returns.
+    ///
+    /// Note: a subscriber must be registered first — the pre-check sits
+    /// after the `subscribers.is_empty()` early return, so without one the
+    /// function would return `Ok(0)` and never touch the new branch,
+    /// giving a false positive.
+    #[tokio::test]
+    async fn publish_event_pre_encode_exceeds_udp_buffer_returns_capacity_error() {
+        use crate::RawPayload;
+        use crate::protocol::{Header, MessageId, MessageType, MessageTypeField, ReturnCode};
+
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
+        {
+            let mut mgr = subscriptions.write().await;
+            mgr.subscribe(0x5B, 1, 0x01, addr);
+        }
+        let (publisher, _) = make_publisher(subscriptions).await;
+
+        // 16-byte header + 1485-byte payload = 1501 bytes, one over the cap.
+        // Mirrors the client-side oversize fixture in
+        // `send_raw_message_exceeding_udp_buffer_returns_capacity_error`.
+        let message_id = MessageId::new_from_service_and_method(0x1234, 0x5678);
+        let payload_bytes = [0u8; 1485];
+        let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
+        let header = Header::new(
+            message_id,
+            0x0001_0001,
+            0x01,
+            0x01,
+            MessageTypeField::new(MessageType::Request, false),
+            ReturnCode::Ok,
+            payload_bytes.len(),
+        );
+        let message = Message::new(header, payload);
+        assert!(
+            message.required_size() > UDP_BUFFER_SIZE,
+            "fixture must exceed cap",
+        );
+
+        let err = publisher
+            .publish_event(0x5B, 1, 0x01, &message)
+            .await
+            .expect_err("oversize message must error, not report Ok(_)");
+        match err {
+            Error::Capacity(tag) => assert_eq!(tag, "udp_buffer"),
+            other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_publish_raw_event_with_subscriber() {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
