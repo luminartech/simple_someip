@@ -126,6 +126,17 @@ impl TransportSocket for TokioSocket {
                     return Err(TransportError::Unsupported);
                 }
             };
+            // Caveat: `tokio::net::UdpSocket::recv_from` silently
+            // truncates when the caller's `buf` is smaller than the
+            // datagram and returns only the bytes that fit — it does
+            // NOT expose a truncation flag. Surfacing a reliable
+            // `truncated: bool` here would require a platform-specific
+            // `recvmsg`/MSG_TRUNC path (libc + unsafe), which is
+            // deferred to the phase 10+ bare-metal refactor. Until
+            // then, this field is always `false` for the Tokio
+            // backend; callers must not rely on it for truncation
+            // detection. This is documented on
+            // `ReceivedDatagram::truncated`'s field doc.
             Ok(ReceivedDatagram {
                 bytes_received: n,
                 source,
@@ -212,7 +223,8 @@ fn bind_with_options(addr: SocketAddrV4, options: &SocketOptions) -> std::io::Re
 /// enum.
 fn map_io_error(e: std::io::Error) -> TransportError {
     use std::io::ErrorKind as K;
-    let mapped = match e.kind() {
+    let kind = e.kind();
+    let mapped = match kind {
         K::AddrInUse => TransportError::AddressInUse,
         K::Unsupported => TransportError::Unsupported,
         K::TimedOut => TransportError::Io(IoErrorKind::TimedOut),
@@ -224,11 +236,28 @@ fn map_io_error(e: std::io::Error) -> TransportError {
         }
         _ => TransportError::Io(IoErrorKind::Other),
     };
-    tracing::warn!(
-        "tokio transport io error: {e} (raw_os={:?}, kind={:?}) mapped to {mapped}",
-        e.raw_os_error(),
-        e.kind(),
-    );
+    // Log at `warn!` for unexpected / misconfiguration-indicating
+    // kinds (permission denied, address-in-use, network unreachable,
+    // fallback Other) where ops should probably look. Common
+    // steady-state conditions (timeouts, interrupted syscalls,
+    // connection refused during transient outages) drop to `debug!`
+    // so we don't drown out actionable warnings under load.
+    match kind {
+        K::TimedOut | K::Interrupted | K::ConnectionRefused => {
+            tracing::debug!(
+                "tokio transport io error: {e} (raw_os={:?}, kind={:?}) mapped to {mapped}",
+                e.raw_os_error(),
+                kind,
+            );
+        }
+        _ => {
+            tracing::warn!(
+                "tokio transport io error: {e} (raw_os={:?}, kind={:?}) mapped to {mapped}",
+                e.raw_os_error(),
+                kind,
+            );
+        }
+    }
     mapped
 }
 
