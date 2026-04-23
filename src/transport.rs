@@ -41,23 +41,32 @@
 //!
 //! Implementations targeting multithreaded executors such as `tokio::spawn`
 //! are expected to produce `Send + 'static` futures in practice. Consumers
-//! that require `Send` should bind it at the call site, not in the trait —
-//! e.g.:
+//! that require `Send` should enforce it through how they use the
+//! transport, not by naming the hidden future type returned by the trait
+//! methods — with RPITIT that type is anonymous and cannot be named, and
+//! there is no `TransportSocketSendFut`-style associated-type escape
+//! hatch here. Instead, wrap the call in an `async move` block and
+//! require `T: Send + 'static` on the captured state:
 //!
 //! ```ignore
-//! fn spawn_loop<T>(mut sock: T)
+//! fn spawn_loop<T>(sock: T)
 //! where
 //!     T: TransportSocket + Send + 'static,
-//!     for<'a> <T as TransportSocketSendFut<'a>>::Fut: Send,
 //! {
-//!     tokio::spawn(async move { /* ... */ });
+//!     tokio::spawn(async move {
+//!         let mut sock = sock;
+//!         /* use sock here */
+//!     });
 //! }
 //! ```
 //!
-//! In practice, a tokio-backed implementation where the underlying
-//! `UdpSocket` is already `Send + Sync` will produce `Send` futures
-//! automatically via `async` block capture inference, and the bound above
-//! reduces to `T: Send + 'static`.
+//! A tokio-backed implementation where the underlying `UdpSocket` is
+//! already `Send + Sync` will produce `Send` futures automatically via
+//! `async` block capture inference, so the pattern above works without
+//! any extra trait-level future bound. Implementations that hold
+//! `!Send` state internally simply won't satisfy the `T: Send` bound
+//! — the compiler catches the mismatch at the `tokio::spawn` call
+//! site rather than inside the trait definition.
 //!
 //! # Status
 //!
