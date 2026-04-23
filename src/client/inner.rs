@@ -431,6 +431,31 @@ where
         Ok(bound_port)
     }
 
+    /// Tracks the caller's response channel against `request_id` so a
+    /// future unicast reply can be routed back. If the
+    /// `pending_responses` map is already at `PENDING_RESPONSES_CAP`, the
+    /// `response` sender is recovered from the failed `insert` and used
+    /// to deliver `Err(Error::Capacity("pending_responses"))` — the
+    /// caller's `PendingResponse::response().await` resolves cleanly
+    /// instead of panicking on the `RecvError` that dropping the Sender
+    /// would have produced. Any reply that later arrives for a dropped
+    /// `request_id` is surfaced on the update stream via
+    /// `ClientUpdate::Unicast` instead of matching a pending entry.
+    fn track_or_reject_pending_response(
+        &mut self,
+        request_id: u32,
+        response: oneshot::Sender<Result<PayloadDefinitions, Error>>,
+    ) {
+        if let Err((_req_id, response)) = self.pending_responses.insert(request_id, response) {
+            warn!(
+                "pending_responses at capacity ({}); response tracking \
+                 dropped for request_id 0x{:08X}",
+                PENDING_RESPONSES_CAP, request_id
+            );
+            let _ = response.send(Err(Error::Capacity("pending_responses")));
+        }
+    }
+
     async fn receive_discovery(
         socket_manager: &mut Option<SocketManager<PayloadDefinitions>>,
     ) -> Result<
@@ -684,25 +709,7 @@ where
                     match send_result {
                         Ok(()) => {
                             let _ = send_complete.send(Ok(()));
-                            if let Err((_req_id, response)) =
-                                self.pending_responses.insert(request_id, response)
-                            {
-                                // Map full: the send already succeeded, but
-                                // we cannot track the reply. Deliver an
-                                // explicit capacity error through the
-                                // returned response sender rather than
-                                // dropping it — otherwise `.expect(...)` on
-                                // the receiver side would panic. Any reply
-                                // that later arrives for `request_id` is
-                                // delivered as `ClientUpdate::Unicast` on
-                                // the update stream instead.
-                                warn!(
-                                    "pending_responses at capacity ({}); response tracking \
-                                     dropped for request_id 0x{:08X}",
-                                    PENDING_RESPONSES_CAP, request_id
-                                );
-                                let _ = response.send(Err(Error::Capacity("pending_responses")));
-                            }
+                            self.track_or_reject_pending_response(request_id, response);
                         }
                         Err(e) => {
                             let _ = send_complete.send(Err(e));
@@ -1168,6 +1175,85 @@ mod tests {
             UNICAST_SOCKETS_CAP,
             "map should remain at capacity, not bind-then-drop a new socket"
         );
+    }
+
+    /// Happy path: with room in `pending_responses`, the helper tracks
+    /// the entry and does NOT signal the caller — the sender stays
+    /// alive so a future unicast reply can resolve it.
+    #[tokio::test]
+    async fn track_or_reject_pending_response_inserts_when_room_available() {
+        let mut inner = make_inner_for_test();
+        let (tx, mut rx) = oneshot::channel::<Result<TestPayload, Error>>();
+
+        inner.track_or_reject_pending_response(0xDEAD_BEEF, tx);
+
+        assert_eq!(inner.pending_responses.len(), 1);
+        assert!(
+            inner.pending_responses.contains_key(&0xDEAD_BEEF),
+            "entry should be keyed by the provided request_id",
+        );
+        // Receiver is still waiting — helper did NOT pre-emptively
+        // resolve it with a capacity error on the happy path.
+        assert!(
+            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "receiver must still be pending when the insert succeeds",
+        );
+    }
+
+    /// Regression guard against cb1d0d1: without explicit rejection,
+    /// the dropped Sender would cause `PendingResponse::response()` to
+    /// panic on `RecvError` rather than returning a clean
+    /// `Err(Error::Capacity("pending_responses"))`. Exercises the
+    /// overflow branch in `track_or_reject_pending_response`, which is
+    /// the same branch the `SendToService` run-loop arm now delegates
+    /// to.
+    #[tokio::test]
+    async fn track_or_reject_pending_response_rejects_on_saturation() {
+        let mut inner = make_inner_for_test();
+
+        // Fill the map to capacity with dummy oneshot senders. The
+        // receivers are stashed so the senders stay live (dropping the
+        // receiver would drop the sender via the channel disconnect).
+        let mut stashed: std::vec::Vec<oneshot::Receiver<Result<TestPayload, Error>>> =
+            std::vec::Vec::with_capacity(PENDING_RESPONSES_CAP);
+        for i in 0..PENDING_RESPONSES_CAP {
+            let (tx, rx) = oneshot::channel::<Result<TestPayload, Error>>();
+            inner
+                .pending_responses
+                .insert(i as u32, tx)
+                .expect("filling under cap must succeed");
+            stashed.push(rx);
+        }
+        assert_eq!(inner.pending_responses.len(), PENDING_RESPONSES_CAP);
+
+        // One more entry — map is full, the helper must recover the
+        // sender from the failed insert and deliver an explicit
+        // capacity error on it.
+        let (overflow_tx, overflow_rx) = oneshot::channel::<Result<TestPayload, Error>>();
+        let overflow_key: u32 = 0xFFFF_FFFE;
+        inner.track_or_reject_pending_response(overflow_key, overflow_tx);
+
+        // Map size unchanged — the overflow attempt was rejected, not
+        // silently dropping an existing entry.
+        assert_eq!(
+            inner.pending_responses.len(),
+            PENDING_RESPONSES_CAP,
+            "overflow must not evict existing entries",
+        );
+        assert!(
+            !inner.pending_responses.contains_key(&overflow_key),
+            "overflowed key must not be in the map",
+        );
+
+        // The caller's receiver resolves to Err(Capacity), not a
+        // panicking RecvError — this is the invariant cb1d0d1 fixes.
+        let result = overflow_rx
+            .await
+            .expect("receiver should get the explicit Err, not RecvError from dropped Sender");
+        match result {
+            Err(Error::Capacity(tag)) => assert_eq!(tag, "pending_responses"),
+            other => panic!("expected Err(Error::Capacity(\"pending_responses\")), got {other:?}"),
+        }
     }
 
     #[tokio::test]
