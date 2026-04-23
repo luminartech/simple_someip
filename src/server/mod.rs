@@ -1350,7 +1350,12 @@ mod tests {
             .expect("announcement_loop on a regular server must build");
         // Spawn and immediately drop the handle — we only care that the
         // construction did not error here.
-        drop(tokio::spawn(fut));
+        // Do NOT spawn: the announcer loops forever, and spawning +
+        // dropping the JoinHandle would leave the task running and
+        // emitting multicast for the rest of the test binary's
+        // lifetime, interfering with parallel tests that bind the same
+        // multicast group. We only care that construction returned Ok.
+        drop(fut);
     }
 
     #[tokio::test]
@@ -1991,12 +1996,20 @@ mod tests {
         // construction returns Ok. Spawn + drop the JoinHandle — the
         // task rides the runtime lifecycle until the test's tokio
         // runtime shuts down at end-of-test.
-        drop(tokio::spawn(fut));
+        // Do NOT spawn: the announcer loops forever, and spawning +
+        // dropping the JoinHandle would leave the task running and
+        // emitting multicast for the rest of the test binary's
+        // lifetime, interfering with parallel tests that bind the same
+        // multicast group. We only care that construction returned Ok.
+        drop(fut);
     }
 
     /// Direct test that `announcement_loop` actually emits an SD
     /// announcement when driven. Explicit coverage for the primary entry
     /// point (avoids regressions where only the deleted shim was exercised).
+    #[ignore = "requires MULTICAST on loopback; consistent with the \
+                #[ignore]-gated sd_state.rs tests. Runs in any environment \
+                where loopback multicast is available."]
     #[tokio::test]
     async fn announcement_loop_sends_offer_service_when_driven() {
         use crate::protocol::MessageId;
@@ -2024,20 +2037,60 @@ mod tests {
             rs
         };
 
-        let config = ServerConfig::new(iface, 30501, 0x005C, 0x0001);
+        // Use a distinct service/instance ID so parallel tests joined to
+        // the same SD multicast group do not produce false matches.
+        const SID: u16 = 0x005C;
+        const IID: u16 = 0x0001;
+        let config = ServerConfig::new(iface, 30501, SID, IID);
         let server = Server::new_with_loopback(config, true).await.unwrap();
         let fut = server.announcement_loop().expect("build loop");
         let handle = tokio::spawn(fut);
 
+        // Filter out any stray SD traffic from other parallel tests
+        // until we see one whose OfferService entry carries OUR sid/iid.
+        // Bounded by a single outer timeout so a totally-silent server
+        // (the regression we actually care about) still fails the test.
         let mut buf = [0u8; 1500];
-        let (n, _src) =
-            tokio::time::timeout(std::time::Duration::from_secs(3), recv.recv_from(&mut buf))
-                .await
-                .expect("timed out waiting for announcement")
-                .expect("recv failed");
+        let offer_fields = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let (n, _src) = recv.recv_from(&mut buf).await.expect("recv failed");
+                let Ok(view) = crate::protocol::MessageView::parse(&buf[..n]) else {
+                    continue;
+                };
+                if view.header().message_id() != MessageId::SD {
+                    continue;
+                }
+                let Ok(sd_view) = view.sd_header() else {
+                    continue;
+                };
+                let Some(entry) = sd_view.entries().next() else {
+                    continue;
+                };
+                if !matches!(entry.entry_type(), Ok(sd::EntryType::OfferService)) {
+                    continue;
+                }
+                if entry.service_id() != SID || entry.instance_id() != IID {
+                    continue;
+                }
+                break (
+                    entry.service_id(),
+                    entry.instance_id(),
+                    entry.major_version(),
+                    entry.ttl(),
+                );
+            }
+        })
+        .await
+        .expect("timed out waiting for our OfferService");
 
-        let view = crate::protocol::MessageView::parse(&buf[..n]).unwrap();
-        assert_eq!(view.header().message_id(), MessageId::SD);
+        let (svc, inst, major, ttl) = offer_fields;
+        assert_eq!(svc, SID, "emitted service_id must match server config");
+        assert_eq!(inst, IID, "emitted instance_id must match server config");
+        assert_eq!(major, 1, "default major_version from ServerConfig::new");
+        assert!(
+            ttl > 0,
+            "OfferService TTL must be non-zero (TTL=0 means StopOffering)",
+        );
 
         handle.abort();
     }
