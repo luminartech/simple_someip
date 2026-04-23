@@ -67,7 +67,9 @@ impl TokioSocket {
     /// Returns [`TransportError`] if the backend cannot read the flag.
     #[allow(dead_code)] // used in tests; kept available for field debugging.
     pub(crate) fn multicast_loop_v4(&self) -> Result<bool, TransportError> {
-        self.inner.multicast_loop_v4().map_err(map_io_error)
+        self.inner
+            .multicast_loop_v4()
+            .map_err(|e| map_io_error(&e))
     }
 }
 
@@ -93,60 +95,60 @@ impl TransportFactory for TokioTransport {
         // Capture options by value into the async block so the returned
         // future does not borrow `self` or `options`.
         let options = *options;
-        async move { bind_with_options(addr, &options).map_err(map_io_error) }
+        async move { bind_with_options(addr, options).map_err(|e| map_io_error(&e)) }
     }
 }
 
 impl TransportSocket for TokioSocket {
-    fn send_to(
+    async fn send_to(
         &mut self,
         buf: &[u8],
         target: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), TransportError>> {
-        async move {
-            self.inner
-                .send_to(buf, target)
-                .await
-                .map(|_| ())
-                .map_err(map_io_error)
-        }
+    ) -> Result<(), TransportError> {
+        self.inner
+            .send_to(buf, target)
+            .await
+            .map(|_| ())
+            .map_err(|e| map_io_error(&e))
     }
 
-    fn recv_from(
+    async fn recv_from(
         &mut self,
         buf: &mut [u8],
-    ) -> impl Future<Output = Result<ReceivedDatagram, TransportError>> {
-        async move {
-            let (n, src) = self.inner.recv_from(buf).await.map_err(map_io_error)?;
-            let source = match src {
-                SocketAddr::V4(v4) => v4,
-                SocketAddr::V6(_) => {
-                    // SOME/IP is IPv4-only; an IPv6 source on our socket is
-                    // either impossible (v4 bind) or a misconfiguration.
-                    return Err(TransportError::Unsupported);
-                }
-            };
-            // Caveat: `tokio::net::UdpSocket::recv_from` silently
-            // truncates when the caller's `buf` is smaller than the
-            // datagram and returns only the bytes that fit — it does
-            // NOT expose a truncation flag. Surfacing a reliable
-            // `truncated: bool` here would require a platform-specific
-            // `recvmsg`/MSG_TRUNC path (libc + unsafe), which is
-            // deferred to the phase 10+ bare-metal refactor. Until
-            // then, this field is always `false` for the Tokio
-            // backend; callers must not rely on it for truncation
-            // detection. This is documented on
-            // `ReceivedDatagram::truncated`'s field doc.
-            Ok(ReceivedDatagram {
-                bytes_received: n,
-                source,
-                truncated: false,
-            })
-        }
+    ) -> Result<ReceivedDatagram, TransportError> {
+        let (n, src) = self
+            .inner
+            .recv_from(buf)
+            .await
+            .map_err(|e| map_io_error(&e))?;
+        let source = match src {
+            SocketAddr::V4(v4) => v4,
+            SocketAddr::V6(_) => {
+                // SOME/IP is IPv4-only; an IPv6 source on our socket is
+                // either impossible (v4 bind) or a misconfiguration.
+                return Err(TransportError::Unsupported);
+            }
+        };
+        // Caveat: `tokio::net::UdpSocket::recv_from` silently
+        // truncates when the caller's `buf` is smaller than the
+        // datagram and returns only the bytes that fit — it does
+        // NOT expose a truncation flag. Surfacing a reliable
+        // `truncated: bool` here would require a platform-specific
+        // `recvmsg`/MSG_TRUNC path (libc + unsafe), which is
+        // deferred to the phase 10+ bare-metal refactor. Until
+        // then, this field is always `false` for the Tokio
+        // backend; callers must not rely on it for truncation
+        // detection. This is documented on
+        // `ReceivedDatagram::truncated`'s field doc.
+        Ok(ReceivedDatagram {
+            bytes_received: n,
+            source,
+            truncated: false,
+        })
     }
 
     fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
-        match self.inner.local_addr().map_err(map_io_error)? {
+        match self.inner.local_addr().map_err(|e| map_io_error(&e))? {
             SocketAddr::V4(v4) => Ok(v4),
             SocketAddr::V6(_) => Err(TransportError::Unsupported),
         }
@@ -159,7 +161,7 @@ impl TransportSocket for TokioSocket {
     ) -> Result<(), TransportError> {
         self.inner
             .join_multicast_v4(group, iface)
-            .map_err(map_io_error)
+            .map_err(|e| map_io_error(&e))
     }
 
     fn leave_multicast_v4(
@@ -169,15 +171,13 @@ impl TransportSocket for TokioSocket {
     ) -> Result<(), TransportError> {
         self.inner
             .leave_multicast_v4(group, iface)
-            .map_err(map_io_error)
+            .map_err(|e| map_io_error(&e))
     }
 }
 
 impl Timer for TokioTimer {
-    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
-        // tokio::time::sleep returns a Sleep future; we wrap in an async
-        // block so the returned type is a simple `impl Future<Output = ()>`.
-        async move { tokio::time::sleep(duration).await }
+    async fn sleep(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
     }
 }
 
@@ -185,7 +185,7 @@ impl Timer for TokioTimer {
 /// hand it to tokio. Mirrors the existing bind paths in
 /// [`crate::client::socket_manager`] and [`crate::server`] so behavior is
 /// identical.
-fn bind_with_options(addr: SocketAddrV4, options: &SocketOptions) -> std::io::Result<TokioSocket> {
+fn bind_with_options(addr: SocketAddrV4, options: SocketOptions) -> std::io::Result<TokioSocket> {
     let raw = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
@@ -221,7 +221,7 @@ fn bind_with_options(addr: SocketAddrV4, options: &SocketOptions) -> std::io::Re
 /// the original error is emitted at `warn!` level here before mapping —
 /// ops sees the detailed message in logs while callers get the portable
 /// enum.
-fn map_io_error(e: std::io::Error) -> TransportError {
+fn map_io_error(e: &std::io::Error) -> TransportError {
     use std::io::ErrorKind as K;
     let kind = e.kind();
     let mapped = match kind {
@@ -315,8 +315,10 @@ mod tests {
         // Two sockets with reuse_address=true should be able to bind the
         // same port on platforms where SO_REUSEADDR permits it (windows
         // and linux both do for DGRAM).
-        let mut opts = SocketOptions::default();
-        opts.reuse_address = true;
+        let opts = SocketOptions {
+            reuse_address: true,
+            ..SocketOptions::default()
+        };
 
         let factory = TokioTransport;
         let a = factory
@@ -388,24 +390,24 @@ mod tests {
     fn map_io_error_covers_common_kinds() {
         use std::io::{Error, ErrorKind};
         assert!(matches!(
-            map_io_error(Error::from(ErrorKind::AddrInUse)),
+            map_io_error(&Error::from(ErrorKind::AddrInUse)),
             TransportError::AddressInUse
         ));
         assert!(matches!(
-            map_io_error(Error::from(ErrorKind::TimedOut)),
+            map_io_error(&Error::from(ErrorKind::TimedOut)),
             TransportError::Io(IoErrorKind::TimedOut)
         ));
         assert!(matches!(
-            map_io_error(Error::from(ErrorKind::ConnectionRefused)),
+            map_io_error(&Error::from(ErrorKind::ConnectionRefused)),
             TransportError::Io(IoErrorKind::ConnectionRefused)
         ));
         assert!(matches!(
-            map_io_error(Error::from(ErrorKind::Unsupported)),
+            map_io_error(&Error::from(ErrorKind::Unsupported)),
             TransportError::Unsupported
         ));
         // Fallback path
         assert!(matches!(
-            map_io_error(Error::from(ErrorKind::Other)),
+            map_io_error(&Error::from(ErrorKind::Other)),
             TransportError::Io(IoErrorKind::Other)
         ));
     }
