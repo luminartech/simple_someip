@@ -83,7 +83,11 @@ impl EventPublisher {
             return Err(Error::Capacity("udp_buffer"));
         }
 
-        // Serialize the message into a stack buffer sized to MTU.
+        // Serialize the message into a fixed-size buffer of
+        // `UDP_BUFFER_SIZE` bytes. (In this `async fn` the buffer lives
+        // in the future state, not literally on the stack; "MTU-sized"
+        // is a misleading description since the cap is a UDP payload
+        // limit, not an Ethernet MTU — see `UDP_BUFFER_SIZE` docs.)
         let mut buffer = [0u8; UDP_BUFFER_SIZE];
         let mut message_length = message.encode_to_slice(&mut buffer)?;
 
@@ -203,7 +207,8 @@ impl EventPublisher {
             payload.len(),
         );
 
-        // Serialize header + payload into a stack buffer sized to MTU.
+        // Serialize header + payload into a fixed-size buffer of
+        // `UDP_BUFFER_SIZE` bytes. See note in `publish_event` above.
         let mut buffer = [0u8; UDP_BUFFER_SIZE];
         let header_len = header.encode_to_slice(&mut buffer)?;
         let total_len = header_len + payload.len();
