@@ -71,7 +71,7 @@
 //!     // the returned future depends on `tokio::select!` / `tokio::time`
 //!     // / tokio sockets, so it is not executor-agnostic today.
 //!     let (client, mut updates, run) = Client::<RawPayload>::new([192, 168, 1, 100].into());
-//!     tokio::spawn(run);
+//!     let _run_task = tokio::spawn(run);
 //!     client.bind_discovery().await.unwrap();
 //!
 //!     while let Some(update) = updates.recv().await {
