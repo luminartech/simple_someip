@@ -602,19 +602,25 @@ impl Server {
                                 Err(e) => {
                                     // Capacity-rejected subscription: NACK so
                                     // the client doesn't believe it's
-                                    // subscribed. The warn! inside
-                                    // `subscribe` already logged which
-                                    // structure was full; re-emit the
-                                    // SubscribeError at warn! here so the
-                                    // NACK and its specific cause are
-                                    // correlated in the same log line
-                                    // without allocating a String that
-                                    // would need to live across the await.
-                                    tracing::warn!("Subscription rejected: {e}");
+                                    // subscribed. Match on the specific
+                                    // SubscribeError so the NACK log line
+                                    // carries the actual cause (which
+                                    // bounded structure was full) rather
+                                    // than the generic "subscription
+                                    // rejected" string — and pick static
+                                    // reason strings so no allocation has
+                                    // to live across the await.
+                                    let reason: &'static str = match e {
+                                        SubscribeError::SubscribersPerGroupFull => {
+                                            "subscribers_per_group_full"
+                                        }
+                                        SubscribeError::EventGroupsFull => "event_groups_full",
+                                    };
+                                    tracing::warn!("Subscription rejected: {reason}");
                                     self.send_subscribe_nack_from_view(
                                         &entry_view,
                                         sender,
-                                        "subscription rejected",
+                                        reason,
                                     )
                                     .await?;
                                 }

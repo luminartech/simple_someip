@@ -9,8 +9,6 @@
 
 ### Changed
 
-- **`std` is now the default feature** — the crate enables `std` (with `thiserror` and `tracing`) by default. Users targeting `no_std` environments must set `default-features = false` in their `Cargo.toml`.
-- **`thiserror` and `tracing` use `default-features = false`** — both dependencies are always included but their `std` features are only enabled when the crate's `std` feature is active. This removes the need for `#[cfg(feature = "std")]` gating on error types and logging macros.
 - **Breaking: `server::SubscriptionManager::subscribe` signature change** — now returns `Result<(), server::SubscribeError>` instead of `()`. Previously, capacity rejections were silently dropped with only a `warn!` log, which let the server emit a `SubscribeAck` for a subscription that had not been recorded. Callers must now handle the `Err` path (the server's own SD loop emits `SubscribeNack` on `Err`).
 - **Breaking: `server::EventPublisher::register_subscriber` signature change** — now returns `Result<(), server::SubscribeError>` instead of `()`, surfacing the same capacity-rejection signal to externally managed subscription dispatchers.
 
