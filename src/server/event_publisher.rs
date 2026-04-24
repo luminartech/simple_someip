@@ -211,7 +211,13 @@ impl EventPublisher {
         // `UDP_BUFFER_SIZE` bytes. See note in `publish_event` above.
         let mut buffer = [0u8; UDP_BUFFER_SIZE];
         let header_len = header.encode_to_slice(&mut buffer)?;
-        let total_len = header_len + payload.len();
+        let Some(total_len) = header_len.checked_add(payload.len()) else {
+            tracing::error!(
+                "raw event length overflow exceeds UDP_BUFFER_SIZE ({}); dropping publish",
+                UDP_BUFFER_SIZE
+            );
+            return Err(Error::Capacity("udp_buffer"));
+        };
         if total_len > UDP_BUFFER_SIZE {
             tracing::error!(
                 "raw event ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping publish",
