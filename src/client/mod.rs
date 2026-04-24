@@ -63,9 +63,14 @@ impl<P> PendingResponse<P> {
     /// # Errors
     ///
     /// Returns the same errors as the request itself (e.g. deserialization
-    /// failure). Returns [`Error::Shutdown`] if the client's run-loop
-    /// future exits before the response is delivered — the caller's
-    /// `PendingResponse` handle outlived its driver.
+    /// failure). Returns [`Error::Capacity`] with tag `"pending_responses"`
+    /// if the inner loop's response-tracking map was full when the request
+    /// was sent — the UDP send still went out, but the reply (if any)
+    /// arrives on [`ClientUpdates`] rather than this oneshot.
+    /// Returns [`Error::Shutdown`] only if the client's run-loop future
+    /// exits before the response is delivered — the caller's
+    /// `PendingResponse` handle outlived its driver. Reserving `Shutdown`
+    /// for actual lifecycle failure keeps `RecvError` unambiguous.
     pub async fn response(self) -> Result<P, Error> {
         self.receiver.await.map_err(|_| Error::Shutdown)?
     }
@@ -680,9 +685,14 @@ where
     ///
     /// Returns an error if the service is not found, unicast binding fails,
     /// the UDP send fails, or the response payload fails to deserialize.
-    /// Returns [`Error::Shutdown`] if the client's run-loop future has
-    /// exited before this call (dropped, cancelled, or otherwise gone)
-    /// — the `Client` handle has outlived its driver and further
+    /// Returns [`Error::Capacity`] with tag `"pending_responses"` if the
+    /// inner loop's response-tracking map was full when this request was
+    /// sent — the UDP send still went out, but the reply cannot be
+    /// routed back to this caller's oneshot (it arrives on
+    /// [`ClientUpdates`] instead).
+    /// Returns [`Error::Shutdown`] only if the client's run-loop future
+    /// has exited before this call (dropped, cancelled, or otherwise
+    /// gone) — the `Client` handle has outlived its driver and further
     /// control-channel sends cannot make progress.
     pub async fn request(
         &self,
