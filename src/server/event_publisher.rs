@@ -515,6 +515,64 @@ mod tests {
         }
     }
 
+    /// Messages whose raw encoded size fits `UDP_BUFFER_SIZE` but whose
+    /// E2E-protected size does not must be rejected with
+    /// `Error::Capacity("udp_buffer")` — guarding the post-protect branch
+    /// added alongside the raw-size pre-check.
+    #[tokio::test]
+    async fn test_publish_event_e2e_protected_exceeds_udp_buffer_returns_capacity_error() {
+        use crate::RawPayload;
+        use crate::e2e::{E2EProfile, Profile4Config};
+        use crate::protocol::MessageId;
+
+        // Register an E2E profile so the protect branch actually runs.
+        let message_id = MessageId::new_from_service_and_method(0x5B, 0x8001);
+        let key = E2EKey::from_message_id(message_id);
+        let mut reg = E2ERegistry::new();
+        reg.register(key, E2EProfile::Profile4(Profile4Config::new(0, 15)));
+        let e2e_registry = Arc::new(Mutex::new(reg));
+
+        // Pre-register a subscriber so we don't short-circuit on the
+        // "no subscribers" branch before reaching the E2E guard.
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        {
+            let mut mgr = subscriptions.write().await;
+            mgr.subscribe(0x5B, 1, 0x01, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999));
+        }
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let publisher = EventPublisher::new(subscriptions, socket, e2e_registry);
+
+        // 16-byte header + 1480-byte payload = 1496 bytes raw (fits the
+        // 1500-byte cap), but Profile4 adds PROFILE4_HEADER_SIZE = 12
+        // bytes, pushing the protected total to 1508 — 8 over MTU.
+        let payload_bytes = [0u8; 1480];
+        let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
+        let header = Header::new_event(
+            message_id.service_id(),
+            message_id.method_id(),
+            0x0001_0001,
+            0x01,
+            0x01,
+            payload_bytes.len(),
+        );
+        let message = Message::new(header, payload);
+        assert!(
+            message.required_size() <= UDP_BUFFER_SIZE,
+            "fixture's raw size must fit the cap so the pre-encode check passes and \
+             we actually exercise the post-protect guard",
+        );
+
+        let err = publisher
+            .publish_event(0x5B, 1, 0x01, &message)
+            .await
+            .expect_err("E2E-protected oversize message must error, not report Ok(n)");
+        match err {
+            Error::Capacity(tag) => assert_eq!(tag, "udp_buffer"),
+            other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_publish_raw_event_with_subscriber() {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
