@@ -242,6 +242,23 @@ impl EventPublisher {
     /// `remove_subscriber` when no refresh has arrived within the
     /// advertised TTL — otherwise subscribers accumulate for the
     /// lifetime of the process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::server::SubscribeError`] when the underlying
+    /// [`SubscriptionManager`] cannot record the subscription because a
+    /// bounded capacity was hit:
+    /// - `SubscribersPerGroupFull` — the per-event-group subscriber list
+    ///   is full.
+    /// - `EventGroupsFull` — the outer event-group map is full.
+    ///
+    /// On `Err`, the subscriber was **not** registered and no events
+    /// will be delivered to `subscriber_addr` for this event group.
+    /// External dispatchers should treat this the same way the server's
+    /// own `run()` loop does: emit a `SubscribeNack` (or equivalent
+    /// upstream notification) so the peer does not assume it is
+    /// subscribed. A duplicate registration for an already-subscribed
+    /// address returns `Ok(())` (deduplicated).
     pub async fn register_subscriber(
         &self,
         service_id: u16,
