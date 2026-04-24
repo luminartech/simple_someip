@@ -218,9 +218,14 @@ fn bind_with_options(addr: SocketAddrV4, options: SocketOptions) -> std::io::Res
 /// The full `std::io::Error` (raw errno, OS message, chained source) is
 /// discarded by design to keep the public [`TransportError`] enum
 /// portable and `no_std`-safe. To keep field debugging possible anyway,
-/// the original error is emitted at `warn!` level here before mapping —
-/// ops sees the detailed message in logs while callers get the portable
-/// enum.
+/// the original error is emitted to the tracing subscriber before
+/// mapping — at `debug!` for common steady-state conditions
+/// (`TimedOut`, `Interrupted`, `ConnectionRefused`) so they don't
+/// drown out actionable warnings under load, and at `warn!` for
+/// everything else (misconfiguration-indicating kinds like
+/// `AddrInUse` / `PermissionDenied` / `NetworkUnreachable` and the
+/// fallback `Other`). Operators should look at `warn!` lines; the
+/// `debug!` lines are there for deep-dive debugging only.
 fn map_io_error(e: &std::io::Error) -> TransportError {
     use std::io::ErrorKind as K;
     let kind = e.kind();
