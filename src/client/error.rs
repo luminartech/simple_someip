@@ -2,9 +2,20 @@ use thiserror::Error;
 
 /// Errors that can occur during SOME/IP client operations.
 ///
-/// Not marked `#[non_exhaustive]` today: downstream crates that match on
-/// this enum rely on exhaustiveness, and adding the attribute now would be
-/// a silent breaking change. Revisit when a breaking release is planned.
+/// # Stability
+///
+/// This enum is **not** marked `#[non_exhaustive]`, so downstream crates
+/// may currently match it exhaustively. That convenience comes with a
+/// real cost: **any new variant added here is a breaking change** and
+/// must be flagged in the changelog and reflected in the next SemVer
+/// bump (pre-1.0, a minor bump is sufficient, but it still requires a
+/// release-notes entry). The same is true of renaming or restructuring
+/// existing variants.
+///
+/// Marking this `#[non_exhaustive]` — so future additions become
+/// non-breaking — is planned as part of an explicit breaking release;
+/// until then, treat variant additions as breaking and plan the release
+/// accordingly.
 #[derive(Error, Debug)]
 pub enum Error {
     /// A SOME/IP protocol-level error.
