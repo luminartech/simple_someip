@@ -14,7 +14,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::{select, sync::mpsc};
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, trace};
 
 /// A received message together with the source address it came from.
 ///
@@ -314,7 +314,7 @@ where
                                         })
                                     })
                                     .map_err(Error::from);
-                                if let Ok(()) = rx_tx.send( parse_result ).await {} else {
+                                if rx_tx.send(parse_result).await.is_err() {
                                     info!("Socket Dropping");
                                     // The receiver has been dropped, so we should exit
                                     break;
@@ -326,7 +326,14 @@ where
                                 // `MessageView::parse`. An `Err` here is an
                                 // I/O failure on the socket read, not a
                                 // decode failure.
-                                error!("Error receiving datagram: {:?}", e);
+                                //
+                                // `map_io_error` in tokio_transport already
+                                // logs the raw OS error + kind (at `warn!`
+                                // for actionable kinds, `debug!` for
+                                // steady-state noise like `TimedOut`), so
+                                // stay at `debug!` here to avoid double-
+                                // logging the same failure at `error!`.
+                                debug!("recv_from returned error on socket loop: {:?}", e);
                             }
                         }
                     },
@@ -352,12 +359,12 @@ where
                                 Err(e) => {
                                     error!("Failed to encode message: {:?}", e);
                                     // If the sender is already closed we can't send the error back, so we shut everything down
-                                    if let Ok(()) = send_message.response.send(Err(e.into())) {
-                                        // Successfully sent error back to sender, carry on
-                                        continue;
+                                    if send_message.response.send(Err(e.into())).is_err() {
+                                        error!("Socket owner closed channel unexpectedly, closing socket.");
+                                        break;
                                     }
-                                    error!("Socket owner closed channel unexpectedly, closing socket.");
-                                    break;
+                                    // Successfully sent error back to sender, carry on
+                                    continue;
                                 }
                             };
 
@@ -404,7 +411,7 @@ where
                             match socket.send_to(&buf[..message_length], send_message.target_addr).await {
                                 Ok(()) => {
                                     trace!("Sent {} bytes to {}", message_length, send_message.target_addr);
-                                    if let Ok(()) = send_message.response.send(Ok(())) {} else {
+                                    if send_message.response.send(Ok(())).is_err() {
                                         info!("Socket owner closed channel, closing socket.");
                                         // The sender has been dropped, so we should exit
                                         break;
@@ -412,7 +419,7 @@ where
                                 }
                                 Err(e) => {
                                     error!("Failed to send message with error: {:?}", e);
-                                    if let Ok(()) = send_message.response.send(Err(Error::Transport(e))) {  } else {
+                                    if send_message.response.send(Err(Error::Transport(e))).is_err() {
                                         error!("Socket owner closed channel unexpectedly, closing socket.");
                                         break;
                                     }
