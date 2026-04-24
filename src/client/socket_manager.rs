@@ -418,7 +418,6 @@ where
                                     }
                                 }
                                 Err(e) => {
-                                    error!("Failed to send message with error: {:?}", e);
                                     if send_message.response.send(Err(Error::Transport(e))).is_err() {
                                         error!("Socket owner closed channel unexpectedly, closing socket.");
                                         break;
