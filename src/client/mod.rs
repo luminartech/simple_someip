@@ -9,11 +9,15 @@
 //! depending on `sizeof::<P>()` and `sizeof::<SocketManager<P>>()`.
 //!
 //! In addition, each `SocketManager`'s spawn loop holds a persistent
-//! `[u8; UDP_BUFFER_SIZE]` receive/send buffer (1500 bytes) and transiently
-//! allocates a second `[u8; UDP_BUFFER_SIZE]` on the stack for E2E-protect
-//! output — so an active socket-loop future carries **~3 KiB** of buffer
-//! state on top of its control-plane fields. With `UNICAST_SOCKETS_CAP=8`
-//! sockets bound, the per-client buffer budget is therefore ~24 KiB.
+//! `[u8; UDP_BUFFER_SIZE]` receive/send buffer (1500 bytes). When the send
+//! path needs E2E protection (i.e. the destination key is registered in the
+//! `E2ERegistry`), it transiently allocates a second `[u8; UDP_BUFFER_SIZE]`
+//! on the stack for the protected output; sends without E2E protection do
+//! not pay this cost. So an active socket-loop future carries **~1.5 KiB**
+//! of always-live buffer state plus up to another ~1.5 KiB during E2E
+//! sends. With `UNICAST_SOCKETS_CAP=8` sockets bound, the always-live
+//! per-client buffer budget is ~12 KiB, with peak ~24 KiB during
+//! concurrent E2E-protected sends on every socket.
 //!
 //! On `std + tokio`, all of this is allocated on the heap when each future
 //! is spawned, so the overhead is invisible to callers. On the bare-metal

@@ -609,7 +609,7 @@ mod tests {
         // Craft a message whose raw-encoded size fits UDP_BUFFER_SIZE (16-byte
         // header + 1480-byte payload = 1496 bytes) but whose E2E-protected
         // size does not (payload grows by PROFILE4_HEADER_SIZE = 12, pushing
-        // the total to 1508 bytes, 8 over MTU).
+        // the total to 1508 bytes, 8 bytes over UDP_BUFFER_SIZE).
         let payload_bytes = [0u8; 1480];
         let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
         let header = Header::new(
