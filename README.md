@@ -103,12 +103,17 @@ use std::net::Ipv4Addr;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig::new(Ipv4Addr::new(192, 168, 1, 200), 30500, 0x1234, 1);
     let mut server = Server::new(config).await?;
-    let _ = tokio::spawn(server.announcement_loop()?);
+    let announce_handle = tokio::spawn(server.announcement_loop()?);
 
     let publisher = server.publisher();
-    let _ = tokio::spawn(async move { server.run().await });
+    let run_handle = tokio::spawn(async move { server.run().await });
 
     // Publish events to subscribers...
+
+    tokio::select! {
+        res = announce_handle => eprintln!("announcement loop exited unexpectedly: {res:?}"),
+        res = run_handle      => eprintln!("server run loop exited: {res:?}"),
+    }
     Ok(())
 }
 ```

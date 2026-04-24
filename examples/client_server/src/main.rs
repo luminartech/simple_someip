@@ -132,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _publisher = server.publisher();
 
     // Spawn the server event loop (handles incoming subscriptions).
-    tokio::spawn(async move {
+    let _server_handle = tokio::spawn(async move {
         if let Err(e) = server.run().await {
             error!("Server error: {e}");
         }
