@@ -305,7 +305,7 @@ where
                                         Some(Ok(protected_len)) => {
                                             if 16 + protected_len > UDP_BUFFER_SIZE {
                                                 error!(
-                                                    "E2E-protected payload ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping send",
+                                                    "E2E-protected datagram ({} bytes, header + protected payload) exceeds UDP_BUFFER_SIZE ({}); dropping send",
                                                     16 + protected_len, UDP_BUFFER_SIZE
                                                 );
                                                 let _ = send_message.response.send(Err(Error::Capacity("udp_buffer")));
@@ -606,11 +606,15 @@ mod tests {
 
         let mut sm = SocketManager::<RawPayload>::bind(0, e2e_registry).unwrap();
 
-        // Craft a message whose raw-encoded size fits UDP_BUFFER_SIZE (16-byte
-        // header + 1480-byte payload = 1496 bytes) but whose E2E-protected
-        // size does not (payload grows by PROFILE4_HEADER_SIZE = 12, pushing
-        // the total to 1508 bytes, 8 bytes over UDP_BUFFER_SIZE).
-        let payload_bytes = [0u8; 1480];
+        // Craft a message whose raw-encoded size fits `UDP_BUFFER_SIZE`
+        // exactly (header + payload = cap) but whose E2E-protected size
+        // does not — Profile4 adds `PROFILE4_HEADER_SIZE` bytes which
+        // pushes the protected total over the cap. Sizes derived from
+        // `UDP_BUFFER_SIZE` and `PROFILE4_HEADER_SIZE` so the fixture
+        // stays valid if the constant is retuned.
+        const SOMEIP_HEADER_SIZE: usize = 16;
+        let payload_len = UDP_BUFFER_SIZE - SOMEIP_HEADER_SIZE; // raw total == UDP_BUFFER_SIZE
+        let payload_bytes = vec![0u8; payload_len];
         let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
         let header = Header::new(
             message_id,
@@ -649,8 +653,12 @@ mod tests {
         let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
         let mut sm = SocketManager::<RawPayload>::bind(0, e2e_registry).unwrap();
 
-        // 16-byte header + 1485-byte payload = 1501 bytes, one over the cap.
-        let payload_bytes = [0u8; 1485];
+        // Derive a payload that makes the full message exceed the UDP cap
+        // by 1 byte regardless of how `UDP_BUFFER_SIZE` is retuned:
+        // 16-byte header + payload_len = UDP_BUFFER_SIZE + 1.
+        const SOMEIP_HEADER_SIZE: usize = 16;
+        let payload_len = UDP_BUFFER_SIZE - SOMEIP_HEADER_SIZE + 1;
+        let payload_bytes = vec![0u8; payload_len];
         let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
         let header = Header::new(
             message_id,

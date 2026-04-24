@@ -213,8 +213,9 @@ impl EventPublisher {
         let header_len = header.encode_to_slice(&mut buffer)?;
         let Some(total_len) = header_len.checked_add(payload.len()) else {
             tracing::error!(
-                "raw event length overflow exceeds UDP_BUFFER_SIZE ({}); dropping publish",
-                UDP_BUFFER_SIZE
+                "raw event length computation overflowed usize (header_len={}, payload.len()={}); dropping publish",
+                header_len,
+                payload.len()
             );
             return Err(Error::Capacity("udp_buffer"));
         };
@@ -490,11 +491,15 @@ mod tests {
         }
         let (publisher, _) = make_publisher(subscriptions).await;
 
-        // 16-byte header + 1485-byte payload = 1501 bytes, one over the cap.
-        // Mirrors the client-side oversize fixture in
+        // Build a payload that exceeds the UDP cap by one byte based on
+        // `UDP_BUFFER_SIZE` instead of a hardcoded fixture length, so the
+        // test stays correct if the constant is retuned. Mirrors the
+        // client-side oversize fixture in
         // `send_raw_message_exceeding_udp_buffer_returns_capacity_error`.
+        const SOMEIP_HEADER_SIZE: usize = 16;
         let message_id = MessageId::new_from_service_and_method(0x1234, 0x5678);
-        let payload_bytes = [0u8; 1485];
+        let payload_len = UDP_BUFFER_SIZE - SOMEIP_HEADER_SIZE + 1;
+        let payload_bytes = vec![0u8; payload_len];
         let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
         let header = Header::new(
             message_id,
@@ -549,11 +554,14 @@ mod tests {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let publisher = EventPublisher::new(subscriptions, socket, e2e_registry);
 
-        // 16-byte header + 1480-byte payload = 1496 bytes raw (fits the
-        // 1500-byte cap), but Profile4 adds PROFILE4_HEADER_SIZE = 12
-        // bytes, pushing the protected total to 1508 — 8 bytes over
-        // UDP_BUFFER_SIZE.
-        let payload_bytes = [0u8; 1480];
+        // Size the payload from `UDP_BUFFER_SIZE` and `PROFILE4_HEADER_SIZE`
+        // so the raw message fits exactly within the cap — leaving Profile4
+        // protection to push the encoded message over the limit and
+        // exercise the post-protect guard — regardless of how
+        // `UDP_BUFFER_SIZE` is retuned.
+        const SOMEIP_HEADER_SIZE: usize = 16;
+        let payload_len = UDP_BUFFER_SIZE - SOMEIP_HEADER_SIZE; // raw total == UDP_BUFFER_SIZE
+        let payload_bytes = vec![0u8; payload_len];
         let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
         let header = Header::new_event(
             message_id.service_id(),
