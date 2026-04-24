@@ -2092,7 +2092,7 @@ mod tests {
     /// spawned announcer task keeps running until runtime teardown; that
     /// is intentional (there is no stop API on `Server`) and harmless in
     /// a `#[tokio::test]`.
-    #[ignore = "requires MULTICAST on loopback; re-enable after lo fix on this branch"]
+    #[ignore = "requires loopback multicast support (MULTICAST on lo)"]
     #[tokio::test]
     async fn start_announcing_emits_first_offer_within_timeout() {
         use crate::protocol::MessageView;
