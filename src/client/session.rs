@@ -85,7 +85,24 @@ impl Default for SessionTracker {
 
 impl SessionTracker {
     /// Check the session ID and reboot flag for a specific service instance
-    /// and return a verdict. Always updates the stored state after the check.
+    /// and return a verdict.
+    ///
+    /// On the normal (non-saturated) path, the stored state is updated
+    /// after the check so subsequent calls see the latest session id and
+    /// reboot flag for the key.
+    ///
+    /// # Capacity behavior
+    ///
+    /// The tracker is backed by a `heapless::FnvIndexMap` bounded by
+    /// [`SESSION_CAP`]. If the map is already full and the incoming key
+    /// is new, the insert fails and stored state is **not** updated for
+    /// that key — subsequent `check()` calls with the same new key will
+    /// continue to return [`SessionVerdict::Initial`] until an existing
+    /// key is evicted or capacity is raised. A single `warn!` fires the
+    /// first time saturation is hit (further saturation drops are
+    /// suppressed to avoid log spam at the packet rate). For existing
+    /// keys under saturation the update still succeeds, because
+    /// `FnvIndexMap::insert` replaces in place.
     ///
     /// Call this once per service entry in an SD message (not once per message),
     /// so each service instance gets its own session counter.
@@ -135,9 +152,12 @@ impl SessionTracker {
             if !self.saturation_warned {
                 tracing::warn!(
                     "SessionTracker at capacity ({}); dropping new sender state for \
-                     svc=0x{:04X} inst=0x{:04X}. Reboot detection disabled for this \
-                     entry and any further new entries (subsequent drops not logged).",
+                     sender={} transport={:?} svc=0x{:04X} inst=0x{:04X}. Reboot \
+                     detection disabled for this entry and any further new entries \
+                     (subsequent drops not logged).",
                     SESSION_CAP,
+                    sender,
+                    transport,
                     service_id,
                     instance_id
                 );

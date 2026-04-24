@@ -1309,8 +1309,13 @@ mod tests {
         let mut inner = make_inner_for_test();
 
         // Fill the map to capacity with dummy oneshot senders. The
-        // receivers are stashed so the senders stay live (dropping the
-        // receiver would drop the sender via the channel disconnect).
+        // receivers are stashed to keep each channel open for the
+        // remainder of the test — on `tokio::sync::oneshot`, dropping
+        // the receiver does not drop the sender; it flips the sender
+        // into a state where `send()` fails with the value returned.
+        // The stash is what lets us later observe `sender.send(...)`
+        // succeeding against a still-open channel when the overflow
+        // case completes the displaced sender with a capacity error.
         let mut stashed: std::vec::Vec<oneshot::Receiver<Result<TestPayload, Error>>> =
             std::vec::Vec::with_capacity(PENDING_RESPONSES_CAP);
         for i in 0..PENDING_RESPONSES_CAP {
