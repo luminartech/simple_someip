@@ -102,7 +102,9 @@ extern crate std;
 ///
 /// When one of these paths is actually reached and serialization is
 /// attempted, messages larger than this cap fail with
-/// `Error::Capacity("udp_buffer")`. Paths that return early before
+/// `client::Error::Capacity("udp_buffer")` or
+/// `server::Error::Capacity("udp_buffer")`, depending on the path.
+/// Paths that return early before
 /// attempting serialization (e.g. `publish_event` when there are no
 /// subscribers) are not affected. Other outbound SD paths (announcement
 /// builders, `SubscribeAck` / `SubscribeNack`) currently still use
