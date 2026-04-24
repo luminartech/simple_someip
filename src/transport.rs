@@ -117,7 +117,7 @@
 //!
 //! impl TransportSocket for TokioSocket {
 //!     fn send_to(
-//!         &mut self,
+//!         &self,
 //!         buf: &[u8],
 //!         target: SocketAddrV4,
 //!     ) -> impl Future<Output = Result<(), TransportError>> {
@@ -130,7 +130,7 @@
 //!         }
 //!     }
 //!     fn recv_from(
-//!         &mut self,
+//!         &self,
 //!         buf: &mut [u8],
 //!     ) -> impl Future<Output = Result<ReceivedDatagram, TransportError>> {
 //!         async move {
@@ -158,7 +158,7 @@
 //!         }
 //!     }
 //!     fn join_multicast_v4(
-//!         &mut self,
+//!         &self,
 //!         group: Ipv4Addr,
 //!         iface: Ipv4Addr,
 //!     ) -> Result<(), TransportError> {
@@ -167,7 +167,7 @@
 //!             .map_err(|_| TransportError::Io(IoErrorKind::Other))
 //!     }
 //!     fn leave_multicast_v4(
-//!         &mut self,
+//!         &self,
 //!         group: Ipv4Addr,
 //!         iface: Ipv4Addr,
 //!     ) -> Result<(), TransportError> {
@@ -323,8 +323,18 @@ pub trait TransportSocket {
     /// is transmitted or an error is returned; there is no short-write
     /// case, which is why this method returns `()` on success rather than
     /// a byte count.
+    ///
+    /// Takes `&self` so a single-task socket loop can hold a pending
+    /// [`Self::recv_from`] future and still call `send_to` in another
+    /// `select!` branch. Backends that need to mutate their socket
+    /// handle on send — e.g. direct smoltcp — must provide interior
+    /// mutability (typically `RefCell<_>` on single-threaded `no_std`, or
+    /// `critical_section::Mutex<RefCell<_>>` on multi-core HAL). The
+    /// `tokio::net::UdpSocket` and `embassy_net::udp::UdpSocket` APIs
+    /// are already `&self`, so adapters over those backends need no
+    /// extra wrapping.
     fn send_to(
-        &mut self,
+        &self,
         buf: &[u8],
         target: SocketAddrV4,
     ) -> impl Future<Output = Result<(), TransportError>>;
@@ -332,8 +342,13 @@ pub trait TransportSocket {
     /// Receive the next datagram into `buf`, returning a
     /// [`ReceivedDatagram`] carrying byte count, source, and a truncation
     /// flag.
+    ///
+    /// Takes `&self` for the same reason as [`Self::send_to`]: the
+    /// pending receive future must not hold an exclusive borrow of the
+    /// socket, or the concurrent send branch of a `select!` cannot
+    /// compile.
     fn recv_from(
-        &mut self,
+        &self,
         buf: &mut [u8],
     ) -> impl Future<Output = Result<ReceivedDatagram, TransportError>>;
 
@@ -356,7 +371,7 @@ pub trait TransportSocket {
     /// Returns [`TransportError::Unsupported`] if the backend has no
     /// multicast support; otherwise [`TransportError::Io`] with an
     /// appropriate kind.
-    fn join_multicast_v4(&mut self, group: Ipv4Addr, iface: Ipv4Addr)
+    fn join_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr)
     -> Result<(), TransportError>;
 
     /// Leave IPv4 multicast group `group` on interface `iface`. Symmetric
@@ -370,7 +385,7 @@ pub trait TransportSocket {
     /// multicast support; otherwise [`TransportError::Io`] with an
     /// appropriate kind.
     fn leave_multicast_v4(
-        &mut self,
+        &self,
         group: Ipv4Addr,
         iface: Ipv4Addr,
     ) -> Result<(), TransportError>;
@@ -483,7 +498,7 @@ mod tests {
 
     impl TransportSocket for NullSocket {
         fn send_to(
-            &mut self,
+            &self,
             _buf: &[u8],
             _target: SocketAddrV4,
         ) -> impl Future<Output = Result<(), TransportError>> {
@@ -491,7 +506,7 @@ mod tests {
         }
 
         fn recv_from(
-            &mut self,
+            &self,
             _buf: &mut [u8],
         ) -> impl Future<Output = Result<ReceivedDatagram, TransportError>> {
             core::future::ready(Err(TransportError::Unsupported))
@@ -502,7 +517,7 @@ mod tests {
         }
 
         fn join_multicast_v4(
-            &mut self,
+            &self,
             _group: Ipv4Addr,
             _iface: Ipv4Addr,
         ) -> Result<(), TransportError> {
@@ -510,7 +525,7 @@ mod tests {
         }
 
         fn leave_multicast_v4(
-            &mut self,
+            &self,
             _group: Ipv4Addr,
             _iface: Ipv4Addr,
         ) -> Result<(), TransportError> {
