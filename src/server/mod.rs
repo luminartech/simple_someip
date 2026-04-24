@@ -603,12 +603,18 @@ impl Server {
                                     // Capacity-rejected subscription: NACK so
                                     // the client doesn't believe it's
                                     // subscribed. The warn! inside
-                                    // `subscribe` already logged the
-                                    // structure that was full.
+                                    // `subscribe` already logged which
+                                    // structure was full; re-emit the
+                                    // SubscribeError at warn! here so the
+                                    // NACK and its specific cause are
+                                    // correlated in the same log line
+                                    // without allocating a String that
+                                    // would need to live across the await.
+                                    tracing::warn!("Subscription rejected: {e}");
                                     self.send_subscribe_nack_from_view(
                                         &entry_view,
                                         sender,
-                                        &format!("subscription rejected: {e}"),
+                                        "subscription rejected",
                                     )
                                     .await?;
                                 }
