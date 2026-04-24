@@ -616,7 +616,7 @@ impl Server {
                                         }
                                         SubscribeError::EventGroupsFull => "event_groups_full",
                                     };
-                                    tracing::warn!("Subscription rejected: {reason}");
+                                    tracing::debug!("Subscription rejected: {reason}");
                                     self.send_subscribe_nack_from_view(
                                         &entry_view,
                                         sender,
