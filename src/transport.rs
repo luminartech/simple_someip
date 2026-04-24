@@ -7,10 +7,13 @@
 //!
 //! # Why a trait, and why like this
 //!
-//! The crate's `client` and `server` modules today bind `tokio::net::UdpSocket`
-//! directly. That works on `std + tokio` but makes no-`std` / non-tokio
-//! embedded use impossible. These traits are the integration point for
-//! alternative backends (lwIP, smoltcp, etc.).
+//! The crate's `client` and `server` modules today use a tokio-based UDP
+//! backend, with sockets created/configured via `socket2` (for reuse /
+//! multicast-interface / multicast-loop options) and then handed off as
+//! `tokio::net::UdpSocket` for the async I/O loop. That works on
+//! `std + tokio` but makes no-`std` / non-tokio embedded use impossible.
+//! These traits are the integration point for alternative backends (lwIP,
+//! smoltcp, etc.).
 //!
 //! Three explicit design choices:
 //!
@@ -333,6 +336,17 @@ pub trait TransportSocket {
     /// `tokio::net::UdpSocket` and `embassy_net::udp::UdpSocket` APIs
     /// are already `&self`, so adapters over those backends need no
     /// extra wrapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns:
+    /// - [`TransportError::Io`] with the appropriate [`IoErrorKind`] for
+    ///   transport-level send failures (e.g. the peer is unreachable,
+    ///   the interface is down, the datagram exceeds the link MTU, or a
+    ///   platform-level send error).
+    /// - [`TransportError::Unsupported`] if `target` is not representable
+    ///   on a backend that only speaks a subset of IPv4 (rare; most
+    ///   backends surface addressing issues as [`TransportError::Io`]).
     fn send_to(
         &self,
         buf: &[u8],
@@ -347,6 +361,20 @@ pub trait TransportSocket {
     /// pending receive future must not hold an exclusive borrow of the
     /// socket, or the concurrent send branch of a `select!` cannot
     /// compile.
+    ///
+    /// # Errors
+    ///
+    /// Returns:
+    /// - [`TransportError::Io`] with the appropriate [`IoErrorKind`] for
+    ///   transport-level receive failures (e.g. the socket was closed,
+    ///   the interface went down, or a platform-level recv error).
+    /// - [`TransportError::Unsupported`] if the backend surfaces a
+    ///   non-IPv4 source address that cannot be represented as
+    ///   [`SocketAddrV4`].
+    ///
+    /// A datagram whose payload exceeds `buf` is **not** an error; it is
+    /// returned with [`ReceivedDatagram::truncated`] set to `true`. The
+    /// caller decides whether to treat truncation as fatal.
     fn recv_from(
         &self,
         buf: &mut [u8],
