@@ -12,6 +12,35 @@ const EVENT_GROUPS_CAP: usize = 32;
 /// with a `warn!` log rather than silently.
 const SUBSCRIBERS_PER_GROUP: usize = 16;
 
+/// Why a call to [`SubscriptionManager::subscribe`] failed to record a new
+/// subscriber. Callers (typically the server's `Subscribe` handler) should
+/// use this to emit a `SubscribeNack` instead of a misleading `SubscribeAck`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscribeError {
+    /// The per-event-group subscriber list is already full
+    /// ([`SUBSCRIBERS_PER_GROUP`] entries). The caller's request was not
+    /// recorded.
+    SubscribersPerGroupFull,
+    /// The outer event-group map is already full ([`EVENT_GROUPS_CAP`]
+    /// distinct `(service_id, instance_id, event_group_id)` keys). The
+    /// caller's request was not recorded.
+    EventGroupsFull,
+}
+
+impl core::fmt::Display for SubscribeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::SubscribersPerGroupFull => write!(
+                f,
+                "subscribers-per-group at capacity ({SUBSCRIBERS_PER_GROUP})"
+            ),
+            Self::EventGroupsFull => {
+                write!(f, "event-group map at capacity ({EVENT_GROUPS_CAP})")
+            }
+        }
+    }
+}
+
 type SubscribersList = HeaplessVec<Subscriber, SUBSCRIBERS_PER_GROUP>;
 
 /// Manages subscriptions to event groups.
@@ -33,7 +62,13 @@ impl SubscriptionManager {
         }
     }
 
-    /// Add a subscriber to an event group
+    /// Add a subscriber to an event group.
+    ///
+    /// Returns `Ok(())` for a new or refreshed (deduplicated) subscription.
+    /// Returns `Err(SubscribeError)` when the request could not be recorded
+    /// because a bounded capacity was hit — the caller (typically the
+    /// server's `Subscribe` handler) should send a `SubscribeNack` on
+    /// `Err`, not a `SubscribeAck`.
     ///
     /// # Panics
     ///
@@ -46,7 +81,7 @@ impl SubscriptionManager {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) {
+    ) -> Result<(), SubscribeError> {
         let key = (service_id, instance_id, event_group_id);
 
         if let Some(subscribers) = self.subscriptions.get_mut(&key) {
@@ -59,7 +94,7 @@ impl SubscriptionManager {
                     instance_id,
                     event_group_id
                 );
-                return;
+                return Ok(());
             }
 
             let subscriber =
@@ -74,7 +109,7 @@ impl SubscriptionManager {
                     instance_id,
                     event_group_id
                 );
-                return;
+                return Err(SubscribeError::SubscribersPerGroupFull);
             }
 
             tracing::info!(
@@ -84,7 +119,7 @@ impl SubscriptionManager {
                 instance_id,
                 event_group_id
             );
-            return;
+            return Ok(());
         }
 
         // New event group — allocate the list and insert.
@@ -115,7 +150,7 @@ impl SubscriptionManager {
                 instance_id,
                 event_group_id
             );
-            return;
+            return Err(SubscribeError::EventGroupsFull);
         }
 
         tracing::info!(
@@ -125,6 +160,7 @@ impl SubscriptionManager {
             instance_id,
             event_group_id
         );
+        Ok(())
     }
 
     /// Remove a subscriber from an event group
@@ -193,7 +229,7 @@ mod tests {
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 8080);
 
         // Subscribe
-        manager.subscribe(0x5B, 1, 0x01, addr);
+        manager.subscribe(0x5B, 1, 0x01, addr).unwrap();
         assert_eq!(manager.subscription_count(), 1);
 
         // Get subscribers
@@ -211,11 +247,11 @@ mod tests {
         let mut manager = SubscriptionManager::new();
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 8080);
 
-        manager.subscribe(0x5B, 1, 0x01, addr);
+        manager.subscribe(0x5B, 1, 0x01, addr).unwrap();
         assert_eq!(manager.subscription_count(), 1);
 
         // Subscribe same address again — should deduplicate
-        manager.subscribe(0x5B, 1, 0x01, addr);
+        manager.subscribe(0x5B, 1, 0x01, addr).unwrap();
         assert_eq!(manager.subscription_count(), 1);
     }
 
@@ -248,13 +284,17 @@ mod tests {
         for i in 0..SUBSCRIBERS_PER_GROUP {
             let addr =
                 SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8000 + u16::try_from(i).unwrap());
-            manager.subscribe(0x5B, 1, 0x01, addr);
+            manager.subscribe(0x5B, 1, 0x01, addr).unwrap();
         }
         assert_eq!(manager.subscription_count(), SUBSCRIBERS_PER_GROUP);
 
-        // One more is dropped.
+        // One more is dropped, and the call reports SubscribersPerGroupFull
+        // so the server can NACK.
         let extra = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9999);
-        manager.subscribe(0x5B, 1, 0x01, extra);
+        assert_eq!(
+            manager.subscribe(0x5B, 1, 0x01, extra),
+            Err(SubscribeError::SubscribersPerGroupFull),
+        );
         assert_eq!(manager.subscription_count(), SUBSCRIBERS_PER_GROUP);
         // Extra subscriber should not appear in the list.
         let subs = manager.get_subscribers(0x5B, 1, 0x01);
@@ -268,13 +308,17 @@ mod tests {
         // Fill the outer map to capacity with distinct event groups.
         for i in 0..EVENT_GROUPS_CAP {
             let eg = u16::try_from(i).unwrap();
-            manager.subscribe(0x5B, 1, eg, addr);
+            manager.subscribe(0x5B, 1, eg, addr).unwrap();
         }
         assert_eq!(manager.subscription_count(), EVENT_GROUPS_CAP);
 
-        // A new event group beyond capacity is dropped.
+        // A new event group beyond capacity is dropped, and the call reports
+        // EventGroupsFull so the server can NACK.
         let overflow_eg = u16::try_from(EVENT_GROUPS_CAP).unwrap();
-        manager.subscribe(0x5B, 1, overflow_eg, addr);
+        assert_eq!(
+            manager.subscribe(0x5B, 1, overflow_eg, addr),
+            Err(SubscribeError::EventGroupsFull),
+        );
         assert_eq!(manager.subscription_count(), EVENT_GROUPS_CAP);
         assert!(manager.get_subscribers(0x5B, 1, overflow_eg).is_empty());
     }
