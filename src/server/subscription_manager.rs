@@ -64,11 +64,18 @@ impl SubscriptionManager {
 
     /// Add a subscriber to an event group.
     ///
-    /// Returns `Ok(())` for a new or refreshed (deduplicated) subscription.
-    /// Returns `Err(SubscribeError)` when the request could not be recorded
-    /// because a bounded capacity was hit — the caller (typically the
-    /// server's `Subscribe` handler) should send a `SubscribeNack` on
-    /// `Err`, not a `SubscribeAck`.
+    /// Returns `Ok(())` both when a new subscriber is added and when the
+    /// given `(service_id, instance_id, event_group_id, subscriber_addr)`
+    /// is already subscribed — the call is idempotent / deduplicated, and
+    /// no stored subscriber state is modified on a duplicate. There is no
+    /// TTL bump or other refresh side-effect today; if TTL-refresh
+    /// semantics are added later, this docstring and the duplicate-log
+    /// wording will be updated together.
+    ///
+    /// Returns `Err(SubscribeError)` when the request could not be
+    /// recorded because a bounded capacity was hit — the caller
+    /// (typically the server's `Subscribe` handler) should send a
+    /// `SubscribeNack` on `Err`, not a `SubscribeAck`.
     ///
     /// # Panics
     ///
