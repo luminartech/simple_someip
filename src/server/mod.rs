@@ -285,6 +285,7 @@ impl Server {
     /// called on a server constructed via [`Server::new_passive`] — passive
     /// servers have no real SD socket bound to port 30490, so any
     /// announcements would go out with an incorrect source port.
+    #[must_use = "the returned announcement-loop future must be spawned (e.g. tokio::spawn) or awaited for the server to emit SD announcements; dropping it silently disables announcements"]
     pub fn announcement_loop(
         &self,
     ) -> Result<impl core::future::Future<Output = ()> + Send + 'static, Error> {
