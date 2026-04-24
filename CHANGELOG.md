@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`client::Error::Capacity(&'static str)`** — new variant returned when a fixed-capacity internal structure is full (e.g. `"unicast_sockets"`, `"udp_buffer"`). Because `client::Error` is not `#[non_exhaustive]`, this is a breaking change for downstream crates that match the enum exhaustively.
+
 ### Changed
 
 - **`std` is now the default feature** — the crate enables `std` (with `thiserror` and `tracing`) by default. Users targeting `no_std` environments must set `default-features = false` in their `Cargo.toml`.
