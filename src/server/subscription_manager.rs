@@ -85,10 +85,15 @@ impl SubscriptionManager {
         let key = (service_id, instance_id, event_group_id);
 
         if let Some(subscribers) = self.subscriptions.get_mut(&key) {
-            // Deduplicate: if this address is already subscribed, just refresh (don't add again)
+            // Deduplicate: if this address is already subscribed, skip adding
+            // it again. No stored subscriber state is modified — the log
+            // message reflects that. If real refresh semantics (e.g. TTL
+            // bump on re-subscribe) are wanted later, update the per-
+            // subscriber record here and rename the log accordingly.
             if subscribers.iter().any(|s| s.address == subscriber_addr) {
                 tracing::debug!(
-                    "Refreshed existing subscriber {} for service 0x{:04X}, instance {}, event group 0x{:04X}",
+                    "Subscriber {} already subscribed for service 0x{:04X}, instance {}, \
+                     event group 0x{:04X}; skipping duplicate",
                     subscriber_addr,
                     service_id,
                     instance_id,
