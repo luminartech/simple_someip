@@ -93,9 +93,9 @@
 //!     TransportFactory, TransportSocket,
 //! };
 //!
-//! pub struct TokioTransport;
+//! struct TokioTransport;
 //!
-//! pub struct TokioSocket {
+//! struct TokioSocket {
 //!     inner: tokio::net::UdpSocket,
 //! }
 //!
@@ -177,7 +177,7 @@
 //!     }
 //! }
 //!
-//! pub struct TokioTimer;
+//! struct TokioTimer;
 //! impl Timer for TokioTimer {
 //!     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
 //!         tokio::time::sleep(duration)
