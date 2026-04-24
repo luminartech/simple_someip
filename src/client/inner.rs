@@ -906,30 +906,27 @@ where
                 } = &mut self;
                 select! {
                     () = tokio::time::sleep(std::time::Duration::from_millis(125)) => {}
-                    // Receive a control message
-                    ctrl = control_receiver.recv() => {
+                    // Receive a control message only when the request queue
+                    // has spare capacity, so we apply backpressure on the
+                    // control channel instead of dropping the message —
+                    // which would cancel any embedded oneshot senders and
+                    // surface to callers as `RecvError` (mapped to
+                    // `Error::Shutdown`), conflating overload with shutdown.
+                    ctrl = control_receiver.recv(), if request_queue.len() < REQUEST_QUEUE_CAP => {
                         if let Some(ctrl) = ctrl {
                             debug!("Received control message: {:?}", ctrl);
-                            if let Err(rejected) = request_queue.push_back(ctrl) {
-                                // Queue full: rather than silently drop the
-                                // rejected ControlMessage (which would
-                                // cancel its oneshot senders and panic any
-                                // caller awaiting with `.unwrap()`), reply
-                                // on each sender with
-                                // `Err(Error::Capacity("request_queue"))`.
-                                warn!(
-                                    "request_queue at capacity ({}); rejecting control message",
-                                    REQUEST_QUEUE_CAP
-                                );
-                                rejected.reject_with_capacity("request_queue");
-                            }
+                            let push_result = request_queue.push_back(ctrl);
+                            debug_assert!(
+                                push_result.is_ok(),
+                                "request_queue had capacity before recv but push_back failed"
+                            );
                         } else {
                             // The sender has been dropped, so we should exit
                             *run = false;
                         }
                     }
                     // Receive a discovery message
-                discovery = Inner::receive_discovery(discovery_socket) => {
+                    discovery = Inner::receive_discovery(discovery_socket) => {
                     trace!("Received discovery message: {:?}", discovery);
                     match discovery {
                         Ok((source, someip_header, sd_header)) => {
@@ -1376,7 +1373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_inner_spawn_and_shutdown() {
+    async fn test_inner_build_and_shutdown() {
         let (control_sender, mut update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),

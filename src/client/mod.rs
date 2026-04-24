@@ -180,7 +180,7 @@ impl<MessageDefinitions> Client<MessageDefinitions>
 where
     MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
 {
-    /// Creates a new client bound to the given network interface and spawns its event loop.
+    /// Creates a new client bound to the given network interface and returns its run-loop future to be driven by the caller.
     ///
     /// Returns a `(Client, ClientUpdates, run_future)` triple. The `Client`
     /// handle is [`Clone`]-able and can be shared across tasks.

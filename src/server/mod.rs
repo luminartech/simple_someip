@@ -1998,14 +1998,12 @@ mod tests {
             .announcement_loop()
             .expect("announcement_loop on a regular server must build");
         // The announcer loops forever; the test succeeds as soon as
-        // construction returns Ok. Spawn + drop the JoinHandle — the
-        // task rides the runtime lifecycle until the test's tokio
-        // runtime shuts down at end-of-test.
-        // Do NOT spawn: the announcer loops forever, and spawning +
-        // dropping the JoinHandle would leave the task running and
-        // emitting multicast for the rest of the test binary's
-        // lifetime, interfering with parallel tests that bind the same
-        // multicast group. We only care that construction returned Ok.
+        // construction returns Ok.
+        // Do not poll or spawn the future: doing so would leave the
+        // announcer running and emitting multicast for the rest of the
+        // test binary's lifetime, interfering with parallel tests that
+        // bind the same multicast group. We only care that construction
+        // returned Ok, so drop the future without polling it.
         drop(fut);
     }
 
