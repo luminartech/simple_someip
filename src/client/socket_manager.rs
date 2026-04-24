@@ -318,8 +318,12 @@ where
                                 }
                             }
                             Err(e) => {
-
-                                error!("Error decoding message: {:?}", e);
+                                // This arm is the transport-level recv_from
+                                // result; decoding runs further up inside
+                                // `MessageView::parse`. An `Err` here is an
+                                // I/O failure on the socket read, not a
+                                // decode failure.
+                                error!("Error receiving datagram: {:?}", e);
                             }
                         }
                     },
