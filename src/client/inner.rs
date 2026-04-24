@@ -537,21 +537,38 @@ where
     /// to deliver `Err(Error::Capacity("pending_responses"))` — the
     /// caller's `PendingResponse::response().await` resolves cleanly
     /// instead of panicking on the `RecvError` that dropping the Sender
-    /// would have produced. Any reply that later arrives for a dropped
-    /// `request_id` is surfaced on the update stream via
-    /// `ClientUpdate::Unicast` instead of matching a pending entry.
+    /// would have produced. If `request_id` is reused while an older
+    /// pending entry still exists (e.g. after a `session_counter`
+    /// wrap-around), the displaced sender is likewise completed with
+    /// `Err(Error::Capacity("pending_responses"))` rather than being
+    /// silently dropped — the caller awaiting the previous request
+    /// sees a clean error instead of a `RecvError` panic. Any reply
+    /// that later arrives for a dropped `request_id` is surfaced on
+    /// the update stream via `ClientUpdate::Unicast` instead of
+    /// matching a pending entry.
     fn track_or_reject_pending_response(
         &mut self,
         request_id: u32,
         response: oneshot::Sender<Result<PayloadDefinitions, Error>>,
     ) {
-        if let Err((_req_id, response)) = self.pending_responses.insert(request_id, response) {
-            warn!(
-                "pending_responses at capacity ({}); response tracking \
-                 dropped for request_id 0x{:08X}",
-                PENDING_RESPONSES_CAP, request_id
-            );
-            let _ = response.send(Err(Error::Capacity("pending_responses")));
+        match self.pending_responses.insert(request_id, response) {
+            Ok(None) => {}
+            Ok(Some(displaced_response)) => {
+                warn!(
+                    "pending_responses already contained request_id \
+                     0x{:08X}; replacing existing pending response",
+                    request_id
+                );
+                let _ = displaced_response.send(Err(Error::Capacity("pending_responses")));
+            }
+            Err((_req_id, response)) => {
+                warn!(
+                    "pending_responses at capacity ({}); response tracking \
+                     dropped for request_id 0x{:08X}",
+                    PENDING_RESPONSES_CAP, request_id
+                );
+                let _ = response.send(Err(Error::Capacity("pending_responses")));
+            }
         }
     }
 
@@ -1337,6 +1354,54 @@ mod tests {
             Err(Error::Capacity(tag)) => assert_eq!(tag, "pending_responses"),
             other => panic!("expected Err(Error::Capacity(\"pending_responses\")), got {other:?}"),
         }
+    }
+
+    /// If a `request_id` is reused while an older pending entry is still
+    /// live (e.g. `session_counter` wrap-around), `insert` returns
+    /// `Ok(Some(old_sender))`. Without handling that case, the displaced
+    /// sender is dropped and the caller awaiting the original request
+    /// hits `RecvError` (which `PendingResponse::response()` treats as a
+    /// fatal panic). This test guards against that: the displaced
+    /// sender must be completed with
+    /// `Err(Error::Capacity("pending_responses"))` so the original
+    /// caller gets a clean `Result` instead of a panicking `RecvError`.
+    #[tokio::test]
+    async fn track_or_reject_pending_response_completes_displaced_sender() {
+        let mut inner = make_inner_for_test();
+        let key: u32 = 0xCAFE_F00D;
+
+        // First tracking: the sender lives in the map.
+        let (first_tx, first_rx) = oneshot::channel::<Result<TestPayload, Error>>();
+        inner.track_or_reject_pending_response(key, first_tx);
+        assert_eq!(inner.pending_responses.len(), 1);
+
+        // Second tracking with the same key: displaces the first sender.
+        let (second_tx, mut second_rx) = oneshot::channel::<Result<TestPayload, Error>>();
+        inner.track_or_reject_pending_response(key, second_tx);
+
+        // Map still has one entry — the second one replaced the first.
+        assert_eq!(inner.pending_responses.len(), 1);
+        assert!(inner.pending_responses.contains_key(&key));
+
+        // The original caller's receiver resolves to Err(Capacity) — not
+        // a dropped-sender RecvError.
+        let displaced_result = first_rx.await.expect(
+            "displaced sender must be completed with a real Err, \
+             not dropped (which would produce RecvError)",
+        );
+        match displaced_result {
+            Err(Error::Capacity(tag)) => assert_eq!(tag, "pending_responses"),
+            other => panic!("expected Err(Error::Capacity(\"pending_responses\")), got {other:?}"),
+        }
+
+        // The new sender is still live and pending.
+        assert!(
+            matches!(
+                second_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "replacement sender must still be pending in the map",
+        );
     }
 
     #[tokio::test]
