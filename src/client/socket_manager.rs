@@ -253,11 +253,14 @@ where
 
     /// Spawn the I/O loop over a concrete [`TokioSocket`].
     ///
-    /// The socket's trait methods (`send_to`, `recv_from`,
-    /// `join_multicast_v4`) are the entire I/O surface used inside — the
-    /// loop body does not call any `TokioSocket`-specific inherent
-    /// methods, so generalizing this function over `T: TransportSocket`
-    /// is a mechanical change once the outer `tokio::spawn` is hoisted
+    /// The loop body's entire I/O surface on the socket is `send_to`
+    /// and `recv_from` — both trait methods. Multicast membership
+    /// (`join_multicast_v4`) is set up by the caller *before* calling
+    /// this function, never from inside the spawned task, so the
+    /// per-loop I/O surface stays on just the two send/recv methods.
+    /// Because no `TokioSocket`-specific inherent methods are used
+    /// inside, generalizing this function over `T: TransportSocket` is
+    /// a mechanical change once the outer `tokio::spawn` is hoisted
     /// out in phase 6 (stable Rust's `Send` bounds on RPITIT method
     /// returns are currently expressible only via return-type notation,
     /// which is nightly — hoisting the spawn avoids the issue by moving
