@@ -42,8 +42,10 @@ pub enum Error {
     /// A fixed-capacity internal structure is full. The argument is a
     /// lowercase `snake_case` tag naming the resource; grep the crate for
     /// the tag to find the compile-time constant that governs it. Current
-    /// tags: `"unicast_sockets"` (→ `UNICAST_SOCKETS_CAP`), `"udp_buffer"`
-    /// (→ `crate::UDP_BUFFER_SIZE`).
+    /// tags:
+    /// - `"unicast_sockets"` → `UNICAST_SOCKETS_CAP`
+    /// - `"udp_buffer"` → `crate::UDP_BUFFER_SIZE`
+    /// - `"pending_responses"` → `PENDING_RESPONSES_CAP`
     #[error("internal capacity exceeded: {0}")]
     Capacity(&'static str),
     /// An error surfaced by the pluggable transport backend (see
