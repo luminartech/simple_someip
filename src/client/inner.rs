@@ -1479,7 +1479,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
         // Drop control sender to trigger loop exit
         drop(control_sender);
         // The update receiver should eventually return None when the inner loop exits
@@ -1514,7 +1514,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         let (rx, msg) = TestControl::bind_discovery();
         drop(rx);
@@ -1531,7 +1531,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         let (rx, msg) = TestControl::unbind_discovery();
         drop(rx);
@@ -1548,7 +1548,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         // SetInterface(LOCALHOST) on a fresh inner goes straight to
         // bind_discovery + send response (interface already matches).
@@ -1567,7 +1567,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         // Bind discovery first so the SendSD path has a socket to use
         let (rx, msg) = TestControl::bind_discovery();
@@ -1597,7 +1597,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         // Bind discovery so SetInterface will take the multi-step path:
         // iteration 1: unbind discovery, re-queue SetInterface
@@ -1668,7 +1668,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
@@ -1686,7 +1686,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         let (rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
         drop(rx);
@@ -1703,7 +1703,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         // Add an endpoint first so SendToService doesn't fail with ServiceNotFound
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
@@ -1730,7 +1730,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             true,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         let (rx, msg) = TestControl::bind_discovery();
         control_sender.send(msg).await.unwrap();
@@ -1745,7 +1745,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         let (rx, msg) = TestControl::bind_discovery();
         control_sender.send(msg).await.unwrap();
@@ -1765,7 +1765,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30490);
         let sd_header = empty_sd_header();
@@ -1786,7 +1786,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
@@ -1811,7 +1811,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         // Bind discovery first
         let (rx, msg) = TestControl::bind_discovery();
@@ -1842,7 +1842,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         // Add endpoint but do NOT bind discovery
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
@@ -1867,7 +1867,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         let (rx, msg) = TestControl::subscribe(0xFFFF, 0xFFFF, 1, 3, 0x01, 0);
         control_sender.send(msg).await.unwrap();
@@ -1886,7 +1886,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
@@ -1921,7 +1921,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
         drop(rx);
@@ -1939,7 +1939,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         // Change to a different loopback-range address (127.0.0.2).
         // Binding discovery on 127.0.0.2 should succeed on most systems.
@@ -1964,7 +1964,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         // Bind discovery on LOCALHOST first
         let (rx, msg) = TestControl::bind_discovery();
@@ -1995,7 +1995,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         // Add endpoint and bind discovery
         let (rx, msg) = TestControl::bind_discovery();
@@ -2042,7 +2042,7 @@ mod tests {
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
         );
-        tokio::spawn(run_fut);
+        let _ = tokio::spawn(run_fut);
 
         let raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw.local_addr().unwrap().port());
