@@ -113,8 +113,8 @@ impl EventPublisher {
                     Some(Ok(protected_len)) => {
                         if 16 + protected_len > UDP_BUFFER_SIZE {
                             tracing::error!(
-                                "E2E-protected payload ({} bytes) exceeds UDP_BUFFER_SIZE ({}); \
-                                 dropping publish",
+                                "E2E-protected datagram ({} bytes, header + protected payload) \
+                                 exceeds UDP_BUFFER_SIZE ({}); dropping publish",
                                 16 + protected_len,
                                 UDP_BUFFER_SIZE
                             );
@@ -545,7 +545,8 @@ mod tests {
 
         // 16-byte header + 1480-byte payload = 1496 bytes raw (fits the
         // 1500-byte cap), but Profile4 adds PROFILE4_HEADER_SIZE = 12
-        // bytes, pushing the protected total to 1508 — 8 over MTU.
+        // bytes, pushing the protected total to 1508 — 8 bytes over
+        // UDP_BUFFER_SIZE.
         let payload_bytes = [0u8; 1480];
         let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
         let header = Header::new_event(
