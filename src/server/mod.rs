@@ -82,7 +82,7 @@ pub struct Server {
     e2e_registry: Arc<Mutex<E2ERegistry>>,
     /// `true` if this server was constructed via [`Server::new_passive`].
     /// Passive servers have no real SD socket bound to port 30490; their
-    /// SD handling is managed externally. Calling [`Self::start_announcing`]
+    /// SD handling is managed externally. Calling [`Self::announcement_loop`]
     /// or [`Self::run`] on a passive server is a programming error and
     /// returns an [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`].
     is_passive: bool,
@@ -209,7 +209,7 @@ impl Server {
     /// incoming `SubscribeEventGroup` / `FindService` messages and routes
     /// them to the right `EventPublisher` via
     /// [`EventPublisher::register_subscriber`]). Do **not** call
-    /// [`Server::start_announcing`] or spawn [`Server::run`] on a passive
+    /// [`Server::announcement_loop`] or spawn [`Server::run`] on a passive
     /// server — the external dispatcher owns those responsibilities.
     ///
     /// # Errors
@@ -229,7 +229,7 @@ impl Server {
 
         // Bind a placeholder SD socket on an ephemeral port. Nothing will
         // route to it (neither multicast nor unicast on 30490), and neither
-        // `start_announcing` nor `run` should be called for a passive
+        // `announcement_loop` nor `run` should be called for a passive
         // server. We still allocate it so the `Server` struct shape is
         // identical to the full-server path.
         let sd_placeholder_addr = std::net::SocketAddr::new(IpAddr::V4(config.interface), 0);
@@ -263,9 +263,21 @@ impl Server {
         })
     }
 
-    /// Start announcing the service via Service Discovery
+    /// Build the periodic-SD-announcement future.
     ///
-    /// This sends periodic `OfferService` messages to the SD multicast group
+    /// Returns a future that sends an `OfferService` message to the SD
+    /// multicast group every second. The caller must drive the future
+    /// (typically via `tokio::spawn`) for announcements to fire; this
+    /// function does no work on its own.
+    ///
+    /// ```no_run
+    /// # use simple_someip::server::Server;
+    /// # async fn demo(server: Server) -> Result<(), simple_someip::server::Error> {
+    /// let announce_fut = server.announcement_loop()?;
+    /// tokio::spawn(announce_fut);
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
@@ -273,15 +285,15 @@ impl Server {
     /// called on a server constructed via [`Server::new_passive`] — passive
     /// servers have no real SD socket bound to port 30490, so any
     /// announcements would go out with an incorrect source port.
-    ///
-    /// Otherwise currently always returns `Ok(())`; SD send failures are
-    /// logged internally.
-    pub fn start_announcing(&self) -> Result<(), Error> {
+    #[must_use = "the returned announcement-loop future must be spawned (e.g. tokio::spawn) or awaited for the server to emit SD announcements; dropping it silently disables announcements"]
+    pub fn announcement_loop(
+        &self,
+    ) -> Result<impl core::future::Future<Output = ()> + Send + 'static, Error> {
         if self.is_passive {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "start_announcing called on passive Server for service 0x{:04X}; \
+                    "announcement_loop called on passive Server for service 0x{:04X}; \
                      announcements must be driven externally (e.g. via \
                      `simple_someip::Client::start_sd_announcements`)",
                     self.config.service_id
@@ -292,7 +304,7 @@ impl Server {
         let sd_socket = Arc::clone(&self.sd_socket);
         let sd_state = Arc::clone(&self.sd_state);
 
-        tokio::spawn(async move {
+        Ok(async move {
             let mut announcement_count = 0u32;
             loop {
                 match sd_state.send_offer_service(&config, &sd_socket).await {
@@ -319,9 +331,7 @@ impl Server {
                 // Send announcements every 1 second
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
-        });
-
-        Ok(())
+        })
     }
 
     /// Send a unicast `OfferService` to a specific address (in response to `FindService`)
@@ -1333,10 +1343,19 @@ mod tests {
         assert_eq!(entry.service_id(), 0x5B);
         assert_eq!(entry.instance_id(), 1);
 
-        // Also test that start_announcing doesn't error
+        // Also test that announcement_loop builds a future without error.
         drop(server);
         let (server2, _) = create_test_server(0x5B, 1).await;
-        assert!(server2.start_announcing().is_ok());
+        let fut = server2
+            .announcement_loop()
+            .expect("announcement_loop on a regular server must build");
+        // Intentionally do not poll or spawn the future: we only care
+        // that constructing it returned Ok. If this future were
+        // spawned, the announcer would loop indefinitely and emit
+        // multicast until explicitly aborted or the Tokio runtime
+        // shut down at end-of-test, which could interfere with
+        // parallel tests using the same multicast group.
+        drop(fut);
     }
 
     #[tokio::test]
@@ -1924,11 +1943,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_announcing_on_passive_returns_invalid_input() {
+    async fn announcement_loop_on_passive_returns_invalid_input() {
         let server = make_passive_server(0x005C, 0x0001).await;
         let err = server
-            .start_announcing()
-            .expect_err("start_announcing on a passive server must fail");
+            .announcement_loop()
+            .err()
+            .expect("announcement_loop on a passive server must fail");
         match err {
             Error::Io(io_err) => {
                 assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidInput);
@@ -1971,18 +1991,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_announcing_on_regular_server_still_succeeds() {
-        // Regression guard: the new is_passive check must not break the
+    async fn announcement_loop_on_regular_server_still_succeeds() {
+        // Regression guard: the is_passive check must not break the
         // standard non-passive path.
         let (server, _port) = create_test_server(0x005C, 0x0001).await;
-        server
-            .start_announcing()
-            .expect("start_announcing on a regular server must still succeed");
-        // The announcer task runs forever; the test succeeds as soon as
-        // start_announcing returns Ok. The spawned task is cleaned up
-        // when the Tokio test runtime shuts down at the end of this
-        // test — `tokio::spawn` tasks are not aborted by dropping
-        // unrelated handles, they ride the runtime lifecycle.
+        let fut = server
+            .announcement_loop()
+            .expect("announcement_loop on a regular server must build");
+        // The announcer loops forever; the test succeeds as soon as
+        // construction returns Ok.
+        // Do not poll or spawn the future: doing so would leave the
+        // announcer running and emitting multicast for the rest of the
+        // test binary's lifetime, interfering with parallel tests that
+        // bind the same multicast group. We only care that construction
+        // returned Ok, so drop the future without polling it.
+        drop(fut);
+    }
+
+    /// Direct test that `announcement_loop` actually emits an SD
+    /// announcement when driven. Explicit coverage for the primary entry
+    /// point (avoids regressions where only the deleted shim was exercised).
+    #[ignore = "requires MULTICAST on loopback; consistent with the \
+                #[ignore]-gated sd_state.rs tests. Runs in any environment \
+                where loopback multicast is available."]
+    #[tokio::test]
+    async fn announcement_loop_sends_offer_service_when_driven() {
+        use crate::protocol::MessageId;
+
+        // Use service/instance IDs not used elsewhere in this test module
+        // so parallel tests joined to the same SD multicast group cannot
+        // produce false matches.
+        const SID: u16 = 0xAA01;
+        const IID: u16 = 0xFF01;
+
+        // Bind a receiver on the SD multicast port with loopback so we
+        // actually see the outgoing announcement. Use a dedicated
+        // receiver socket via socket2 to match the SD bind pattern.
+        let iface = std::net::Ipv4Addr::LOCALHOST;
+        let recv = {
+            let s = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .unwrap();
+            s.set_reuse_address(true).unwrap();
+            #[cfg(unix)]
+            s.set_reuse_port(true).unwrap();
+            s.bind(&std::net::SocketAddr::new(IpAddr::V4(iface), sd::MULTICAST_PORT).into())
+                .unwrap();
+            s.set_nonblocking(true).unwrap();
+            let std_s: std::net::UdpSocket = s.into();
+            let rs = tokio::net::UdpSocket::from_std(std_s).unwrap();
+            rs.join_multicast_v4(sd::MULTICAST_IP, iface).unwrap();
+            rs
+        };
+
+        let config = ServerConfig::new(iface, 30501, SID, IID);
+        let server = Server::new_with_loopback(config, true).await.unwrap();
+        let fut = server.announcement_loop().expect("build loop");
+        let handle = tokio::spawn(fut);
+
+        // Filter out any stray SD traffic from other parallel tests
+        // until we see one whose OfferService entry carries OUR sid/iid.
+        // Bounded by a single outer timeout so a totally-silent server
+        // (the regression we actually care about) still fails the test.
+        let mut buf = [0u8; 1500];
+        let offer_fields = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let (n, _src) = recv.recv_from(&mut buf).await.expect("recv failed");
+                let Ok(view) = crate::protocol::MessageView::parse(&buf[..n]) else {
+                    continue;
+                };
+                if view.header().message_id() != MessageId::SD {
+                    continue;
+                }
+                let Ok(sd_view) = view.sd_header() else {
+                    continue;
+                };
+                let Some(entry) = sd_view.entries().next() else {
+                    continue;
+                };
+                if !matches!(entry.entry_type(), Ok(sd::EntryType::OfferService)) {
+                    continue;
+                }
+                if entry.service_id() != SID || entry.instance_id() != IID {
+                    continue;
+                }
+                break (
+                    entry.service_id(),
+                    entry.instance_id(),
+                    entry.major_version(),
+                    entry.ttl(),
+                );
+            }
+        })
+        .await
+        .expect("timed out waiting for our OfferService");
+
+        let (svc, inst, major, ttl) = offer_fields;
+        assert_eq!(svc, SID, "emitted service_id must match server config");
+        assert_eq!(inst, IID, "emitted instance_id must match server config");
+        assert_eq!(major, 1, "default major_version from ServerConfig::new");
+        assert!(
+            ttl > 0,
+            "OfferService TTL must be non-zero (TTL=0 means StopOffering)",
+        );
+
+        handle.abort();
     }
 
     #[tokio::test]
@@ -2164,9 +2280,10 @@ mod tests {
         let server = Server::new_with_loopback(config, true)
             .await
             .expect("server must bind with loopback enabled");
-        server
-            .start_announcing()
-            .expect("start_announcing should succeed on a non-passive server");
+        let announce_fut = server
+            .announcement_loop()
+            .expect("announcement_loop should build on a non-passive server");
+        tokio::spawn(announce_fut);
 
         // Scan the multicast group for our OfferService. The first tick
         // happens immediately; 2s is ample headroom for scheduler jitter.

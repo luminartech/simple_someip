@@ -66,9 +66,17 @@ use std::net::Ipv4Addr;
 
 #[tokio::main]
 async fn main() {
-    // Client::new returns a (Client, ClientUpdates) pair.
-    // Client is Clone-able and can be shared across tasks.
-    let (client, mut updates) = Client::<RawPayload>::new(Ipv4Addr::new(192, 168, 1, 100));
+    // Client::new returns a Clone-able handle, an update stream, and
+    // the run-loop future. The future must be actively driven — either
+    // spawned on the runtime as shown below, or awaited alongside your
+    // own work in a `tokio::select!`. If the future is never polled,
+    // Client method calls that send commands over the control channel
+    // will hang indefinitely waiting on their oneshot response.
+    // `Error::Shutdown` is returned only once the run-loop future has
+    // been dropped or its task cancelled.
+    let (client, mut updates, run) =
+        Client::<RawPayload>::new(Ipv4Addr::new(192, 168, 1, 100));
+    let _run_task = tokio::spawn(run);
 
     // Bind the SD multicast socket to discover services
     client.bind_discovery().await.unwrap();
@@ -95,12 +103,17 @@ use std::net::Ipv4Addr;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig::new(Ipv4Addr::new(192, 168, 1, 200), 30500, 0x1234, 1);
     let mut server = Server::new(config).await?;
-    server.start_announcing()?;
+    let announce_handle = tokio::spawn(server.announcement_loop()?);
 
     let publisher = server.publisher();
-    tokio::spawn(async move { server.run().await });
+    let run_handle = tokio::spawn(async move { server.run().await });
 
     // Publish events to subscribers...
+
+    tokio::select! {
+        res = announce_handle => eprintln!("announcement loop exited unexpectedly: {res:?}"),
+        res = run_handle      => eprintln!("server run loop exited: {res:?}"),
+    }
     Ok(())
 }
 ```
