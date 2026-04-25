@@ -75,12 +75,13 @@ impl TokioSocket {
 
 /// Sleep backed by [`tokio::time::sleep`].
 ///
-/// TODO(phase 7): wire this into the `tokio::time::sleep` call sites in
-/// `client::inner::Inner::run` (125 ms tick), `server::mod::Server::run`,
-/// and `Client::start_sd_announcements` (1 s tick) so the crate's own
-/// timing is also routed through the `Timer` trait. Today `TokioTimer`
-/// is shipped as public API but unused internally — consumers can rely
-/// on it, but the crate's own code still uses tokio directly.
+/// Used internally at every periodic-tick site in the crate: the 125ms
+/// idle tick in `Inner::run_future`, the 1s announcement tick in
+/// `Server::announcement_loop`, and the user-supplied interval in
+/// `Client::sd_announcements_loop`. A bare-metal consumer swapping this
+/// out for `embassy_time` (or similar) needs to replace three references
+/// to `TokioTimer` with their own `Timer` impl — no trait rewrite
+/// required.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TokioTimer;
 

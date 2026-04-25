@@ -1,3 +1,4 @@
+use futures::{FutureExt, pin_mut, select};
 use heapless::{Deque, index_map::FnvIndexMap};
 use std::{
     borrow::ToOwned,
@@ -6,16 +7,14 @@ use std::{
     sync::{Arc, Mutex},
     task::Poll,
 };
-use tokio::{
-    select,
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        oneshot,
-    },
+use tokio::sync::{
+    mpsc::{self, Receiver, Sender},
+    oneshot,
 };
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
+    Timer,
     client::{
         ClientUpdate, DiscoveryMessage,
         service_registry::{ServiceEndpointInfo, ServiceInstanceId, ServiceRegistry},
@@ -24,6 +23,7 @@ use crate::{
     },
     e2e::E2ERegistry,
     protocol::{self, Message},
+    tokio_transport::TokioTimer,
     traits::PayloadWireFormat,
 };
 
@@ -991,150 +991,182 @@ where
         async move {
             info!("SOME/IP Client processing loop started");
             loop {
-                let Self {
-                    control_receiver,
-                    pending_responses,
-                    discovery_socket,
-                    discovery_unicast_socket,
-                    unicast_sockets,
-                    update_sender,
-                    request_queue,
-                    session_tracker,
-                    service_registry,
-                    run,
-                    ..
-                } = &mut self;
-                select! {
-                    () = tokio::time::sleep(std::time::Duration::from_millis(125)) => {}
-                    // Receive a control message only when the request queue
-                    // has spare capacity, so we apply backpressure on the
-                    // control channel instead of dropping the message —
-                    // which would cancel any embedded oneshot senders and
-                    // surface to callers as `RecvError` (mapped to
-                    // `Error::Shutdown`), conflating overload with shutdown.
-                    ctrl = control_receiver.recv(), if request_queue.len() < REQUEST_QUEUE_CAP => {
+                // Scope the `&mut self` destructure + pinned per-iteration
+                // futures so all borrows of `self` drop before we call
+                // `self.handle_control_message().await` below. `pin_mut!`
+                // creates stack-pinned locals that outlive the select
+                // macro, so the inner block is required to release those
+                // borrows.
+                let should_break = {
+                    let Self {
+                        control_receiver,
+                        pending_responses,
+                        discovery_socket,
+                        unicast_sockets,
+                        update_sender,
+                        request_queue,
+                        session_tracker,
+                        service_registry,
+                        run,
+                        ..
+                    } = &mut self;
+                    // Build fresh per-iteration futures and fuse them for
+                    // `select!`'s `FusedFuture + Unpin` bound.
+                    // `receive_discovery` / `receive_any_unicast` are
+                    // async fns that are not `Unpin`; the `Timer::sleep`
+                    // future likewise. Stack-pinning via `pin_mut!`
+                    // satisfies both.
+                    //
+                    // The 125ms idle tick goes through the `Timer` trait
+                    // rather than `tokio::time::sleep` directly so a
+                    // bare-metal swap to `embassy_time` (or any other
+                    // `Timer` impl) is a one-line change here. Today it
+                    // resolves to `TokioTimer`.
+                    let control_fut = control_receiver.recv().fuse();
+                    let sleep_fut = TokioTimer
+                        .sleep(std::time::Duration::from_millis(125))
+                        .fuse();
+                    let discovery_fut = Inner::receive_discovery(discovery_socket).fuse();
+                    let unicast_fut = Inner::receive_any_unicast(unicast_sockets).fuse();
+                    pin_mut!(control_fut, sleep_fut, discovery_fut, unicast_fut);
+
+                    // `select!` (not `select_biased!`) randomizes the
+                    // arm check order each poll so no single arm can
+                    // starve the others under sustained load. Matches
+                    // the original `tokio::select!` fairness behavior.
+                    select! {
+                    // Receive a control message
+                    ctrl = control_fut => {
                         if let Some(ctrl) = ctrl {
                             debug!("Received control message: {:?}", ctrl);
-                            let push_result = request_queue.push_back(ctrl);
-                            debug_assert!(
-                                push_result.is_ok(),
-                                "request_queue had capacity before recv but push_back failed"
-                            );
+                            if request_queue.push_back(ctrl).is_err() {
+                                // Queue full: the rejected ControlMessage is
+                                // dropped, so any oneshot senders inside it
+                                // cancel — callers awaiting those receivers
+                                // will observe `RecvError`.
+                                warn!(
+                                    "request_queue at capacity ({}); dropping control message",
+                                    REQUEST_QUEUE_CAP
+                                );
+                            }
                         } else {
                             // The sender has been dropped, so we should exit
                             *run = false;
                         }
                     }
+                    () = sleep_fut => {}
                     // Receive a discovery message
-                    discovery = Inner::receive_discovery(discovery_socket) => {
-                    trace!("Received discovery message: {:?}", discovery);
-                    match discovery {
-                        Ok((source, someip_header, sd_header)) => {
-                            // Extract session ID from SOME/IP request_id (lower 16 bits)
-                            let session_id = (someip_header.request_id() & 0xFFFF) as u16;
-                            let sd_payload = PayloadDefinitions::new_sd_payload(&sd_header);
-                            // Extract reboot flag from the SD payload flags
-                            let reboot_flag = sd_payload
-                                .sd_flags()
-                                .map_or(crate::protocol::sd::RebootFlag::Continuous, |f| {
-                                    f.reboot()
-                                });
+                    discovery = discovery_fut => {
+                        trace!("Received discovery message: {:?}", discovery);
+                        match discovery {
+                            Ok((source, someip_header, sd_header)) => {
+                                // Extract session ID from SOME/IP request_id (lower 16 bits)
+                                let session_id = (someip_header.request_id() & 0xFFFF) as u16;
+                                let sd_payload = PayloadDefinitions::new_sd_payload(&sd_header);
+                                // Extract reboot flag from the SD payload flags
+                                let reboot_flag = sd_payload
+                                    .sd_flags()
+                                    .map_or(crate::protocol::sd::RebootFlag::Continuous, |f| {
+                                        f.reboot()
+                                    });
 
-                            // Track sender session/reboot state for every SD entry
-                            // that identifies a service instance, not only
-                            // offer/stop-offer entries. This ensures reboot
-                            // detection works for all SD traffic (FindService,
-                            // Subscribe, SubscribeAck, etc.).
-                            let mut rebooted = false;
-                            for (svc_id, inst_id) in sd_payload.service_instances() {
-                                let verdict = session_tracker.check(
-                                    source,
-                                    TransportKind::Multicast,
-                                    svc_id,
-                                    inst_id,
-                                    session_id,
-                                    reboot_flag,
-                                );
-                                if verdict == SessionVerdict::Reboot {
-                                    rebooted = true;
+                                // Track sender session/reboot state for every SD entry
+                                // that identifies a service instance, not only
+                                // offer/stop-offer entries. This ensures reboot
+                                // detection works for all SD traffic (FindService,
+                                // Subscribe, SubscribeAck, etc.).
+                                let mut rebooted = false;
+                                for (svc_id, inst_id) in sd_payload.service_instances() {
+                                    let verdict = session_tracker.check(
+                                        source,
+                                        TransportKind::Multicast,
+                                        svc_id,
+                                        inst_id,
+                                        session_id,
+                                        reboot_flag,
+                                    );
+                                    if verdict == SessionVerdict::Reboot {
+                                        rebooted = true;
+                                    }
                                 }
-                            }
 
-                            // Auto-populate service registry from offer/stop-offer
-                            // SD entries.
-                            for ep in sd_payload.offered_endpoints() {
-                                let id = ServiceInstanceId {
-                                    service_id: ep.service_id,
-                                    instance_id: ep.instance_id,
-                                };
-                                if ep.is_offer {
-                                    if let Some(addr) = ep.addr {
-                                        service_registry.insert(
-                                            id,
-                                            ServiceEndpointInfo {
-                                                addr,
-                                                local_port: 0,
-                                                major_version: ep.major_version,
-                                                minor_version: ep.minor_version,
-                                            },
-                                        );
+                                // Auto-populate service registry from offer/stop-offer
+                                // SD entries.
+                                for ep in sd_payload.offered_endpoints() {
+                                    let id = ServiceInstanceId {
+                                        service_id: ep.service_id,
+                                        instance_id: ep.instance_id,
+                                    };
+                                    if ep.is_offer {
+                                        if let Some(addr) = ep.addr {
+                                            service_registry.insert(
+                                                id,
+                                                ServiceEndpointInfo {
+                                                    addr,
+                                                    local_port: 0,
+                                                    major_version: ep.major_version,
+                                                    minor_version: ep.minor_version,
+                                                },
+                                            );
+                                            trace!(
+                                                "Registry: added 0x{:04X}.0x{:04X} -> {}",
+                                                ep.service_id, ep.instance_id, addr,
+                                            );
+                                        }
+                                    } else {
+                                        service_registry.remove(id);
                                         trace!(
-                                            "Registry: added 0x{:04X}.0x{:04X} -> {}",
-                                            ep.service_id, ep.instance_id, addr,
+                                            "Registry: removed 0x{:04X}.0x{:04X}",
+                                            ep.service_id, ep.instance_id,
                                         );
                                     }
-                                } else {
-                                    service_registry.remove(id);
-                                    trace!(
-                                        "Registry: removed 0x{:04X}.0x{:04X}",
-                                        ep.service_id, ep.instance_id,
-                                    );
                                 }
-                            }
 
-                            if rebooted {
-                                let _ = update_sender.send(ClientUpdate::SenderRebooted(source));
-                            }
+                                if rebooted {
+                                    let _ = update_sender.send(ClientUpdate::SenderRebooted(source));
+                                }
 
-                            let discovery_msg = DiscoveryMessage {
-                                source,
-                                someip_header,
-                                sd_header,
-                            };
-                            let _ = update_sender.send(ClientUpdate::DiscoveryUpdated(discovery_msg));
+                                let discovery_msg = DiscoveryMessage {
+                                    source,
+                                    someip_header,
+                                    sd_header,
+                                };
+                                let _ = update_sender.send(ClientUpdate::DiscoveryUpdated(discovery_msg));
+                            }
+                            Err(err) => {
+                                error!("Error receiving discovery message: {:?}", err);
+                                let _ = update_sender.send(ClientUpdate::Error(err));
+                            }
                         }
-                        Err(err) => {
-                            error!("Error receiving discovery message: {:?}", err);
-                            let _ = update_sender.send(ClientUpdate::Error(err));
-                        }
-                    }
-                 }
-                 unicast = Inner::receive_any_unicast(unicast_sockets) => {
-                     trace!("Received unicast message: {:?}", unicast);
-                     match unicast {
-                         Ok(received) => {
-                             let ReceivedMessage { message: received_message, e2e_status, .. } = received;
-                             // Check if this matches a pending request-response by request_id
-                             let request_id = received_message.header().request_id();
-                             if let Some(sender) = pending_responses.remove(&request_id) {
-                                 let _ = sender.send(Ok(received_message.payload().clone()));
-                                 continue;
+                     }
+                     unicast = unicast_fut => {
+                         trace!("Received unicast message: {:?}", unicast);
+                         match unicast {
+                             Ok(received) => {
+                                 let ReceivedMessage { message: received_message, e2e_status, .. } = received;
+                                 // Check if this matches a pending request-response by request_id
+                                 let request_id = received_message.header().request_id();
+                                 if let Some(sender) = pending_responses.remove(&request_id) {
+                                     let _ = sender.send(Ok(received_message.payload().clone()));
+                                     continue;
+                                 }
+                                 // Not a response — forward as ClientUpdate::Unicast
+                                 let _ = update_sender.send(ClientUpdate::Unicast { message: received_message, e2e_status });
                              }
-                             // Not a response — forward as ClientUpdate::Unicast
-                             let _ = update_sender.send(ClientUpdate::Unicast { message: received_message, e2e_status });
-                         }
-                         Err(err) => {
-                             let _ = update_sender.send(ClientUpdate::Error(err));
+                             Err(err) => {
+                                 let _ = update_sender.send(ClientUpdate::Error(err));
+                             }
                          }
                      }
-                 }
+                    }
+                    !*run
+                };
+                if should_break {
+                    info!("SOME/IP Client processing loop exiting");
+                    break;
+                }
+                self.handle_control_message().await;
             }
-            if !*run {
-                info!("SOME/IP Client processing loop exiting");
-                break;
-            }
-            self.handle_control_message().await;
-        }
         }
     }
 }
