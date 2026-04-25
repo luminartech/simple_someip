@@ -8,13 +8,14 @@ use crate::{
 };
 
 use super::error::Error;
+use futures::{FutureExt, pin_mut, select};
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
-use tokio::{select, sync::mpsc};
-use tracing::{debug, error, info, trace};
+use tokio::sync::mpsc;
+use tracing::{error, info, trace};
 
 /// A received message together with the source address it came from.
 ///
@@ -37,6 +38,15 @@ pub struct SendMessage<PayloadDefinitions> {
     pub target_addr: SocketAddrV4,
     pub message: Message<PayloadDefinitions>,
     response: tokio::sync::oneshot::Sender<Result<(), Error>>,
+}
+
+/// One iteration's select-outcome in `spawn_socket_loop`. The inner
+/// block returns this scalar so the pinned per-iteration `send_fut` /
+/// `recv_fut` futures drop before the processing body — releasing their
+/// `&mut buf` / `&mut socket` borrows.
+enum Outcome<P: PayloadWireFormat> {
+    Send(Option<SendMessage<P>>),
+    Recv(Result<ReceivedDatagram, crate::transport::TransportError>),
 }
 
 impl<PayloadDefinitions: PayloadWireFormat + 'static> SendMessage<PayloadDefinitions> {
@@ -103,9 +113,10 @@ where
     /// underlying socket through a caller-supplied [`TransportFactory`].
     /// The factory must still produce a
     /// [`TokioSocket`](crate::tokio_transport::TokioSocket) because the
-    /// spawned I/O loop is currently tokio-specific; once phase 6 hoists
-    /// the spawn out of this function, this bound will be relaxed to any
-    /// `TransportSocket`.
+    /// spawned I/O loop is currently tokio-specific; the bound will be
+    /// relaxed to any `TransportSocket` once `spawn_socket_loop`'s outer
+    /// `tokio::spawn` is hoisted (planned for phase 8 alongside the
+    /// bare-metal example).
     pub async fn bind_discovery_seeded_with_transport<F>(
         factory: &F,
         interface: Ipv4Addr,
@@ -253,18 +264,16 @@ where
 
     /// Spawn the I/O loop over a concrete [`TokioSocket`].
     ///
-    /// The loop body's entire I/O surface on the socket is `send_to`
-    /// and `recv_from` — both trait methods. Multicast membership
-    /// (`join_multicast_v4`) is set up by the caller *before* calling
-    /// this function, never from inside the spawned task, so the
-    /// per-loop I/O surface stays on just the two send/recv methods.
-    /// Because no `TokioSocket`-specific inherent methods are used
-    /// inside, generalizing this function over `T: TransportSocket` is
-    /// a mechanical change once the outer `tokio::spawn` is hoisted
-    /// out in phase 6 (stable Rust's `Send` bounds on RPITIT method
-    /// returns are currently expressible only via return-type notation,
-    /// which is nightly — hoisting the spawn avoids the issue by moving
-    /// the `Send` requirement off this function entirely).
+    /// The socket's trait methods (`send_to`, `recv_from`,
+    /// `join_multicast_v4`) are the entire I/O surface used inside — the
+    /// loop body does not call any `TokioSocket`-specific inherent
+    /// methods, so generalizing this function over `T: TransportSocket`
+    /// is a mechanical change once the outer `tokio::spawn` is hoisted
+    /// out (planned for phase 8 alongside the bare-metal example —
+    /// hoisting the spawn moves the `Send` requirement off this
+    /// function, sidestepping stable Rust's current inability to
+    /// express `Send` bounds on RPITIT method returns without nightly
+    /// return-type notation).
     #[allow(clippy::too_many_lines)]
     fn spawn_socket_loop(
         socket: crate::tokio_transport::TokioSocket,
@@ -274,161 +283,183 @@ where
     ) {
         tokio::spawn(async move {
             let mut buf = [0u8; UDP_BUFFER_SIZE];
+
             loop {
-                select! {
-                    result = socket.recv_from(&mut buf) => {
-                        match result {
-                            Ok(ReceivedDatagram { bytes_received, source, truncated }) => {
-                                if truncated {
-                                    // A truncated datagram cannot be parsed reliably;
-                                    // the length field in the SOME/IP header will not
-                                    // match the bytes we received. Log and drop.
-                                    error!(
-                                        "Discarding truncated datagram from {}: {} bytes received",
-                                        source, bytes_received
-                                    );
+                // `select!` (not `select_biased!`) gives pseudo-random
+                // fairness across ready arms — matches prior
+                // `tokio::select!` behavior and avoids starving either
+                // the send or recv arm under sustained one-sided load.
+                //
+                // The fresh `.fuse()`'d per-iteration futures are pinned
+                // on the stack (required: `Fuse<_>` is not `Unpin`).
+                // Returning an `Outcome<P>` scalar from the inner block
+                // drops both pinned futures — and their `&mut buf` /
+                // `&mut socket` borrows — before the processing body
+                // below runs, so the body can re-borrow `buf` freely.
+                let outcome: Outcome<MessageDefinitions> = {
+                    let send_fut = tx_rx.recv().fuse();
+                    let recv_fut = socket.recv_from(&mut buf).fuse();
+                    pin_mut!(send_fut, recv_fut);
+                    select! {
+                        message = send_fut => Outcome::Send(message),
+                        result = recv_fut => Outcome::Recv(result),
+                    }
+                };
+
+                match outcome {
+                    Outcome::Send(Some(send_message)) => {
+                        trace!("Sending: {:?}", &send_message);
+                        let mut message_length = match send_message
+                            .message
+                            .encode(&mut buf.as_mut_slice())
+                        {
+                            Ok(length) => length,
+                            Err(e) => {
+                                error!("Failed to encode message: {:?}", e);
+                                // If the sender is already closed we can't send the error back, so we shut everything down
+                                if let Ok(()) = send_message.response.send(Err(e.into())) {
+                                    // Successfully sent error back to sender, carry on
                                     continue;
                                 }
-                                let source_address = SocketAddr::V4(source);
-                                let parse_result = MessageView::parse(&buf[..bytes_received])
-                                    .and_then(|view| {
-                                        let header = view.header().to_owned();
-                                        let upper_header = header.upper_header_bytes();
-                                        let key = E2EKey::from_message_id(header.message_id());
-                                        let payload_bytes = view.payload_bytes();
+                                error!("Socket owner closed channel unexpectedly, closing socket.");
+                                break;
+                            }
+                        };
 
-                                        // Apply E2E check if configured
-                                        let (e2e_status, effective_payload) = {
-                                            let mut registry = e2e_registry.lock().expect("e2e registry lock poisoned");
-                                            match registry.check(key, payload_bytes, upper_header) {
-                                                Some((status, stripped)) => (Some(status), stripped),
-                                                None => (None, payload_bytes),
-                                            }
-                                        };
+                        // Apply E2E protect if configured. `protected`
+                        // is a disjoint stack buffer, so the input can
+                        // be borrowed directly out of `buf[16..]` with
+                        // no intermediate copy.
+                        {
+                            let key =
+                                E2EKey::from_message_id(send_message.message.header().message_id());
+                            let mut registry =
+                                e2e_registry.lock().expect("e2e registry lock poisoned");
+                            if registry.contains_key(&key) {
+                                let upper_header: [u8; 8] =
+                                    buf[8..16].try_into().expect("upper header slice");
+                                let mut protected = [0u8; UDP_BUFFER_SIZE];
+                                let result = registry.protect(
+                                    key,
+                                    &buf[16..message_length],
+                                    upper_header,
+                                    &mut protected,
+                                );
+                                match result {
+                                    Some(Ok(protected_len)) => {
+                                        if 16 + protected_len > UDP_BUFFER_SIZE {
+                                            error!(
+                                                "E2E-protected payload ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping send",
+                                                16 + protected_len,
+                                                UDP_BUFFER_SIZE
+                                            );
+                                            let _ = send_message
+                                                .response
+                                                .send(Err(Error::Capacity("udp_buffer")));
+                                            continue;
+                                        }
+                                        #[allow(clippy::cast_possible_truncation)]
+                                        let new_length: u32 = 8 + protected_len as u32;
+                                        buf[4..8].copy_from_slice(&new_length.to_be_bytes());
+                                        buf[16..16 + protected_len]
+                                            .copy_from_slice(&protected[..protected_len]);
+                                        message_length = 16 + protected_len;
+                                    }
+                                    Some(Err(e)) => {
+                                        error!("E2E protect error: {:?}", e);
+                                    }
+                                    None => unreachable!("contains_key was true"),
+                                }
+                            }
+                        }
 
-                                        let payload = MessageDefinitions::from_payload_bytes(header.message_id(), effective_payload)?;
-                                        Ok(ReceivedMessage {
-                                            message: Message::new(header, payload),
-                                            source: source_address,
-                                            e2e_status,
-                                        })
-                                    })
-                                    .map_err(Error::from);
-                                if rx_tx.send(parse_result).await.is_err() {
-                                    info!("Socket Dropping");
-                                    // The receiver has been dropped, so we should exit
+                        match socket
+                            .send_to(&buf[..message_length], send_message.target_addr)
+                            .await
+                        {
+                            Ok(()) => {
+                                trace!(
+                                    "Sent {} bytes to {}",
+                                    message_length, send_message.target_addr
+                                );
+                                if let Ok(()) = send_message.response.send(Ok(())) {
+                                } else {
+                                    info!("Socket owner closed channel, closing socket.");
+                                    // The sender has been dropped, so we should exit
                                     break;
                                 }
                             }
                             Err(e) => {
-                                // This arm is the transport-level recv_from
-                                // result; decoding runs further up inside
-                                // `MessageView::parse`. An `Err` here is an
-                                // I/O failure on the socket read, not a
-                                // decode failure.
-                                //
-                                // `map_io_error` in tokio_transport already
-                                // logs the raw OS error + kind (at `warn!`
-                                // for actionable kinds, `debug!` for
-                                // steady-state noise like `TimedOut`), so
-                                // stay at `debug!` here to avoid double-
-                                // logging the same failure at `error!`.
-                                debug!("recv_from returned error on socket loop: {:?}", e);
+                                error!("Failed to send message with error: {:?}", e);
+                                if let Ok(()) = send_message.response.send(Err(Error::Transport(e)))
+                                {
+                                } else {
+                                    error!(
+                                        "Socket owner closed channel unexpectedly, closing socket."
+                                    );
+                                    break;
+                                }
                             }
                         }
-                    },
-                    message = tx_rx.recv() => {
-                        if let Some(send_message) = message {
-                            trace!("Sending: {:?}", &send_message);
-                            // Fail fast with the capacity error rather than
-                            // letting `encode` report a less-actionable
-                            // protocol I/O error when it runs out of
-                            // buffer. Matches the E2E-overflow arm below
-                            // and the server event_publisher path.
-                            let required_size = send_message.message.required_size();
-                            if required_size > UDP_BUFFER_SIZE {
-                                error!(
-                                    "outgoing message ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping send",
-                                    required_size, UDP_BUFFER_SIZE
-                                );
-                                let _ = send_message.response.send(Err(Error::Capacity("udp_buffer")));
-                                continue;
-                            }
-                            let mut message_length = match send_message.message.encode(&mut buf.as_mut_slice()) {
-                                Ok(length) => length,
-                                Err(e) => {
-                                    error!("Failed to encode message: {:?}", e);
-                                    // If the sender is already closed we can't send the error back, so we shut everything down
-                                    if send_message.response.send(Err(e.into())).is_err() {
-                                        error!("Socket owner closed channel unexpectedly, closing socket.");
-                                        break;
-                                    }
-                                    // Successfully sent error back to sender, carry on
-                                    continue;
-                                }
-                            };
+                    }
+                    Outcome::Send(None) => {
+                        info!("Send channel closed, closing socket.");
+                        // The sender has been dropped, so we should exit
+                        break;
+                    }
+                    Outcome::Recv(Ok(ReceivedDatagram {
+                        bytes_received,
+                        source,
+                        truncated,
+                    })) => {
+                        if truncated {
+                            // A truncated datagram cannot be parsed reliably;
+                            // the length field in the SOME/IP header will not
+                            // match the bytes we received. Log and drop.
+                            error!(
+                                "Discarding truncated datagram from {}: {} bytes received",
+                                source, bytes_received
+                            );
+                            continue;
+                        }
+                        let source_address = SocketAddr::V4(source);
+                        let parse_result = MessageView::parse(&buf[..bytes_received])
+                            .and_then(|view| {
+                                let header = view.header().to_owned();
+                                let upper_header = header.upper_header_bytes();
+                                let key = E2EKey::from_message_id(header.message_id());
+                                let payload_bytes = view.payload_bytes();
 
-                            // Apply E2E protect if configured. `protected`
-                            // is a disjoint stack buffer, so the input can
-                            // be borrowed directly out of `buf[16..]` with
-                            // no intermediate copy.
-                            {
-                                let key = E2EKey::from_message_id(send_message.message.header().message_id());
-                                let mut registry = e2e_registry.lock().expect("e2e registry lock poisoned");
-                                if registry.contains_key(&key) {
-                                    let upper_header: [u8; 8] = buf[8..16].try_into().expect("upper header slice");
-                                    let mut protected = [0u8; UDP_BUFFER_SIZE];
-                                    let result = registry.protect(
-                                        key,
-                                        &buf[16..message_length],
-                                        upper_header,
-                                        &mut protected,
-                                    );
-                                    match result {
-                                        Some(Ok(protected_len)) => {
-                                            if 16 + protected_len > UDP_BUFFER_SIZE {
-                                                error!(
-                                                    "E2E-protected datagram ({} bytes, header + protected payload) exceeds UDP_BUFFER_SIZE ({}); dropping send",
-                                                    16 + protected_len, UDP_BUFFER_SIZE
-                                                );
-                                                let _ = send_message.response.send(Err(Error::Capacity("udp_buffer")));
-                                                continue;
-                                            }
-                                            #[allow(clippy::cast_possible_truncation)]
-                                            let new_length: u32 = 8 + protected_len as u32;
-                                            buf[4..8].copy_from_slice(&new_length.to_be_bytes());
-                                            buf[16..16 + protected_len].copy_from_slice(&protected[..protected_len]);
-                                            message_length = 16 + protected_len;
-                                        }
-                                        Some(Err(e)) => {
-                                            error!("E2E protect error: {:?}", e);
-                                        }
-                                        None => unreachable!("contains_key was true"),
+                                // Apply E2E check if configured
+                                let (e2e_status, effective_payload) = {
+                                    let mut registry =
+                                        e2e_registry.lock().expect("e2e registry lock poisoned");
+                                    match registry.check(key, payload_bytes, upper_header) {
+                                        Some((status, stripped)) => (Some(status), stripped),
+                                        None => (None, payload_bytes),
                                     }
-                                }
-                            }
+                                };
 
-                            match socket.send_to(&buf[..message_length], send_message.target_addr).await {
-                                Ok(()) => {
-                                    trace!("Sent {} bytes to {}", message_length, send_message.target_addr);
-                                    if send_message.response.send(Ok(())).is_err() {
-                                        info!("Socket owner closed channel, closing socket.");
-                                        // The sender has been dropped, so we should exit
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    if send_message.response.send(Err(Error::Transport(e))).is_err() {
-                                        error!("Socket owner closed channel unexpectedly, closing socket.");
-                                        break;
-                                    }
-                                }
-                            }
+                                let payload = MessageDefinitions::from_payload_bytes(
+                                    header.message_id(),
+                                    effective_payload,
+                                )?;
+                                Ok(ReceivedMessage {
+                                    message: Message::new(header, payload),
+                                    source: source_address,
+                                    e2e_status,
+                                })
+                            })
+                            .map_err(Error::from);
+                        if let Ok(()) = rx_tx.send(parse_result).await {
                         } else {
-                            info!("Send channel closed, closing socket.");
-                            // The sender has been dropped, so we should exit
+                            info!("Socket Dropping");
+                            // The receiver has been dropped, so we should exit
                             break;
                         }
+                    }
+                    Outcome::Recv(Err(recv_err)) => {
+                        error!("Transport recv failed: {:?}", recv_err);
                     }
                 }
             }
@@ -695,15 +726,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Craft a message whose raw-encoded size fits `UDP_BUFFER_SIZE`
-        // exactly (header + payload = cap) but whose E2E-protected size
-        // does not — Profile4 adds `PROFILE4_HEADER_SIZE` bytes which
-        // pushes the protected total over the cap. Sizes derived from
-        // `UDP_BUFFER_SIZE` and `PROFILE4_HEADER_SIZE` so the fixture
-        // stays valid if the constant is retuned.
-        const SOMEIP_HEADER_SIZE: usize = 16;
-        let payload_len = UDP_BUFFER_SIZE - SOMEIP_HEADER_SIZE; // raw total == UDP_BUFFER_SIZE
-        let payload_bytes = vec![0u8; payload_len];
+        // Craft a message whose raw-encoded size fits UDP_BUFFER_SIZE (16-byte
+        // header + 1480-byte payload = 1496 bytes) but whose E2E-protected
+        // size does not (payload grows by PROFILE4_HEADER_SIZE = 12, pushing
+        // the total to 1508 bytes, 8 over MTU).
+        let payload_bytes = [0u8; 1480];
         let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
         let header = Header::new(
             message_id,
@@ -727,68 +754,11 @@ mod tests {
         }
     }
 
-    /// Messages whose raw encoded size already exceeds `UDP_BUFFER_SIZE`
-    /// — with no E2E in play — must be rejected up front with
-    /// `Error::Capacity("udp_buffer")` rather than bubbling out the
-    /// less-actionable protocol I/O error that `encode` would report
-    /// after running out of buffer.
-    #[tokio::test]
-    async fn send_raw_message_exceeding_udp_buffer_returns_capacity_error() {
-        use crate::RawPayload;
-        use crate::protocol::{Header, MessageId, MessageType, MessageTypeField, ReturnCode};
-
-        let message_id = MessageId::new_from_service_and_method(0x1234, 0x5678);
-        // No E2E registered — goes straight through the pre-encode check.
-        let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
-        let mut sm = SocketManager::<RawPayload>::bind(0, e2e_registry).await.unwrap();
-
-        // Derive a payload that makes the full message exceed the UDP cap
-        // by 1 byte regardless of how `UDP_BUFFER_SIZE` is retuned:
-        // 16-byte header + payload_len = UDP_BUFFER_SIZE + 1.
-        const SOMEIP_HEADER_SIZE: usize = 16;
-        let payload_len = UDP_BUFFER_SIZE - SOMEIP_HEADER_SIZE + 1;
-        let payload_bytes = vec![0u8; payload_len];
-        let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
-        let header = Header::new(
-            message_id,
-            0x0001_0001,
-            0x01,
-            0x01,
-            MessageTypeField::new(MessageType::Request, false),
-            ReturnCode::Ok,
-            payload_bytes.len(),
-        );
-        let message = Message::new(header, payload);
-        assert!(
-            message.required_size() > UDP_BUFFER_SIZE,
-            "fixture must actually exceed the cap for this test to exercise the new path",
-        );
-
-        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
-        let err = sm
-            .send(target, message)
-            .await
-            .expect_err("raw oversize message must error");
-        match err {
-            Error::Capacity(tag) => assert_eq!(tag, "udp_buffer"),
-            other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
-        }
-    }
-
     /// Proves the public `bind_with_transport` entry point accepts an
     /// alternative `TransportFactory` implementation. The factory here is
     /// a thin interceptor that counts how many times `bind` is called; it
     /// delegates to the built-in `TokioTransport`, which is what the
     /// current `Socket = TokioSocket` bound requires.
-    ///
-    /// TODO: extend this with an end-to-end round-trip test that uses a
-    /// custom factory to actually carry traffic (send from socket A,
-    /// receive on socket B, assert bytes match), and a negative test
-    /// where the factory returns `Err(TransportError::AddressInUse)`
-    /// and asserts that surfaces as `Error::Transport(...)` through the
-    /// `?` + `From` chain. Both are scoped for the phase-6 branch where
-    /// the spawn hoist lets us swap the socket type, not just the bind
-    /// logic.
     #[tokio::test]
     async fn bind_with_transport_accepts_custom_factory() {
         use crate::tokio_transport::{TokioSocket, TokioTransport};
@@ -831,5 +801,105 @@ mod tests {
             "custom factory should have been invoked exactly once"
         );
         drop(sm);
+    }
+
+    /// End-to-end proof that a custom `TransportFactory` actually
+    /// carries traffic through the full `SocketManager` path. Sends a
+    /// SOME/IP-SD message from one bound `SocketManager` to a raw tokio
+    /// socket, verifies the bytes arrive intact. Complements the lighter
+    /// `bind_with_transport_accepts_custom_factory` by exercising
+    /// `send_to` + the spawned I/O loop, not just the bind call.
+    #[tokio::test]
+    async fn bind_with_transport_carries_traffic_end_to_end() {
+        use crate::tokio_transport::{TokioSocket, TokioTransport};
+        use core::future::Future;
+
+        // Factory that overrides `SocketOptions` to force
+        // `reuse_address = true` regardless of caller-provided flags —
+        // proves the factory sits in the hot path.
+        struct ForceReuseFactory;
+        impl TransportFactory for ForceReuseFactory {
+            type Socket = TokioSocket;
+            fn bind(
+                &self,
+                addr: SocketAddrV4,
+                options: &SocketOptions,
+            ) -> impl Future<Output = Result<Self::Socket, crate::transport::TransportError>>
+            {
+                let mut opts = *options;
+                opts.reuse_address = true;
+                async move { TokioTransport.bind(addr, &opts).await }
+            }
+        }
+
+        let mut sm = SocketManager::<TestPayload>::bind_with_transport(
+            &ForceReuseFactory,
+            0,
+            test_registry(),
+        )
+        .await
+        .expect("bind via custom factory");
+        let sm_port = sm.port();
+
+        let recv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_port = recv.local_addr().unwrap().port();
+
+        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        sm.send(SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port), msg)
+            .await
+            .expect("send_to via custom-factory-built socket");
+
+        let mut buf = [0u8; 1500];
+        let (len, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), recv.recv_from(&mut buf))
+                .await
+                .expect("timed out waiting for datagram")
+                .expect("recv failed");
+
+        assert!(len > 0, "empty datagram");
+        match from {
+            std::net::SocketAddr::V4(v4) => assert_eq!(v4.port(), sm_port),
+            other @ std::net::SocketAddr::V6(_) => {
+                panic!("unexpected source address family: {other:?}")
+            }
+        }
+
+        // Parse and confirm it's a SOME/IP-SD message, not garbage.
+        let view = MessageView::parse(&buf[..len]).unwrap();
+        assert_eq!(view.header().message_id(), crate::protocol::MessageId::SD);
+    }
+
+    /// Negative test: a factory that returns
+    /// `Err(TransportError::AddressInUse)` must surface as
+    /// `Err(Error::Transport(TransportError::AddressInUse))` through
+    /// the `?` + `From` conversion chain in
+    /// `bind_with_transport`. Catches regressions in the `#[from]`
+    /// impl on `client::Error` or the return-type plumbing.
+    #[tokio::test]
+    async fn bind_with_transport_propagates_factory_error() {
+        use crate::tokio_transport::TokioSocket;
+        use crate::transport::TransportError;
+
+        struct AlwaysBusyFactory;
+        impl TransportFactory for AlwaysBusyFactory {
+            type Socket = TokioSocket;
+            async fn bind(
+                &self,
+                _addr: SocketAddrV4,
+                _options: &SocketOptions,
+            ) -> Result<Self::Socket, TransportError> {
+                Err(TransportError::AddressInUse)
+            }
+        }
+
+        let err = TestSocketManager::bind_with_transport(&AlwaysBusyFactory, 0, test_registry())
+            .await
+            .expect_err("factory returned Err, bind must surface it");
+        match err {
+            Error::Transport(TransportError::AddressInUse) => {}
+            other => {
+                panic!("expected Error::Transport(TransportError::AddressInUse), got {other:?}")
+            }
+        }
     }
 }

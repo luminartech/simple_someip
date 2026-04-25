@@ -19,8 +19,11 @@ pub use subscription_manager::{SubscribeError, SubscriptionManager};
 
 use sd_state::SdStateManager;
 
+use crate::Timer;
 use crate::e2e::{E2EKey, E2EProfile, E2ERegistry};
 use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
+use crate::tokio_transport::TokioTimer;
+use futures::{FutureExt, pin_mut, select};
 use std::{
     format,
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
@@ -295,7 +298,7 @@ impl Server {
                 format!(
                     "announcement_loop called on passive Server for service 0x{:04X}; \
                      announcements must be driven externally (e.g. via \
-                     `simple_someip::Client::start_sd_announcements`)",
+                     `simple_someip::Client::sd_announcements_loop`)",
                     self.config.service_id
                 ),
             )));
@@ -328,8 +331,11 @@ impl Server {
                     }
                 }
 
-                // Send announcements every 1 second
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                // Send announcements every 1 second. Sleep goes through
+                // the `Timer` trait so bare-metal consumers can swap in
+                // a different timer impl; today it resolves to
+                // `TokioTimer`.
+                TokioTimer.sleep(std::time::Duration::from_secs(1)).await;
             }
         })
     }
@@ -470,17 +476,35 @@ impl Server {
         let mut sd_buf = vec![0u8; 65535];
 
         loop {
-            let (data, len, addr, source) = tokio::select! {
-                result = self.unicast_socket.recv_from(&mut unicast_buf) => {
-                    let (len, addr) = result?;
-                    (&unicast_buf[..], len, addr, "unicast")
-                }
-                result = self.sd_socket.recv_from(&mut sd_buf) => {
-                    let (len, addr) = result?;
-                    (&sd_buf[..], len, addr, "sd-multicast")
+            // `select!` (not `select_biased!`) gives pseudo-random fairness
+            // across ready arms each poll — matches the prior
+            // `tokio::select!` behavior and avoids starving either the
+            // unicast or SD-multicast arm under sustained one-sided load.
+            //
+            // Fresh futures are constructed each iteration so the borrows
+            // of `unicast_buf` / `sd_buf` / the sockets end when the
+            // select macro returns, freeing the buffer we index into
+            // below.
+            let (len, addr, source, from_unicast) = {
+                let unicast_fut = self.unicast_socket.recv_from(&mut unicast_buf).fuse();
+                let sd_fut = self.sd_socket.recv_from(&mut sd_buf).fuse();
+                pin_mut!(unicast_fut, sd_fut);
+                select! {
+                    result = unicast_fut => {
+                        let (len, addr) = result?;
+                        (len, addr, "unicast", true)
+                    }
+                    result = sd_fut => {
+                        let (len, addr) = result?;
+                        (len, addr, "sd-multicast", false)
+                    }
                 }
             };
-            let data = &data[..len];
+            let data = if from_unicast {
+                &unicast_buf[..len]
+            } else {
+                &sd_buf[..len]
+            };
 
             // By default IP_MULTICAST_LOOP=false suppresses own multicast
             // messages on the SD socket, so no source-IP filtering is needed.
