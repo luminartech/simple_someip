@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "bare_metal"
+version = "0.0.0"
+dependencies = [
+ "simple-someip",
+]
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
