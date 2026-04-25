@@ -345,11 +345,11 @@ where
     PayloadDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
 {
     /// Construct an `Inner` and return the control/update channels plus
-    /// the run-loop future. The caller drives the future with whatever
-    /// executor it owns (typically `tokio::spawn`).
+    /// the run-loop future. The caller must drive the future on a Tokio
+    /// runtime (e.g. via `tokio::spawn`).
     ///
     /// The future is bounded `Send + 'static` because every in-repo
-    /// consumer spawns it on a multithreaded executor and because the
+    /// consumer spawns it on a multithreaded Tokio runtime and because the
     /// concrete captured state (tokio mpsc, `TokioSocket`, E2E registry)
     /// is already Send. A bare-metal consumer whose transport produces
     /// `!Send` state needs a cfg-gated alternative constructor; none

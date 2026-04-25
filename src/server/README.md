@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut server = Server::new(config).await?;
 
     // Start announcing the service (sends OfferService every 1s).
-    // Spawn the announcement loop future on your executor.
+    // Spawn the announcement loop future on the Tokio runtime.
     tokio::spawn(server.announcement_loop()?);
 
     // Get event publisher for sending events
