@@ -36,7 +36,9 @@ mod socket_manager;
 
 pub use error::Error;
 
+use crate::Timer;
 use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry};
+use crate::tokio_transport::TokioTimer;
 use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
 use inner::{ControlMessage, Inner};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -232,7 +234,7 @@ where
     /// With loopback enabled, the client's own discovery socket also receives
     /// the multicast SD traffic this client sends (e.g. `FindService` probes
     /// and periodic `OfferService` announcements driven by
-    /// [`Self::start_sd_announcements`]). Those self-sent messages are parsed
+    /// [`Self::sd_announcements_loop`]). Those self-sent messages are parsed
     /// the same as any other inbound SD traffic, so callers may observe:
     ///
     /// - [`ClientUpdate::DiscoveryUpdated`] events originating from this
@@ -422,7 +424,7 @@ where
     /// Call this before manually building an SD header (e.g. one passed to
     /// [`send_sd_message`](Self::send_sd_message)) so the reboot flag reflects
     /// the current tracked state instead of a stale value baked at call time.
-    /// Headers passed to [`start_sd_announcements`](Self::start_sd_announcements)
+    /// Headers passed to [`sd_announcements_loop`](Self::sd_announcements_loop)
     /// are refreshed automatically per-tick and do not need this call.
     ///
     /// # Panics
@@ -484,42 +486,69 @@ where
     /// counter wraps past `0xFFFF`, rather than staying stuck on whatever
     /// value was baked at call time.
     ///
-    /// Returns a [`tokio::task::JoinHandle`] that can be used to abort the
-    /// background task. The task uses a weak reference to the client's
-    /// control channel, so it exits automatically when all `Client` handles
-    /// are dropped (via `shut_down()` or going out of scope).
+    /// Returns an `impl Future<Output = ()> + Send + 'static` that the
+    /// caller drives on their executor (typically via `tokio::spawn`).
+    /// The loop uses a weak reference to the client's control channel,
+    /// so it exits automatically when all `Client` handles are dropped
+    /// (via `shut_down()` or going out of scope).
+    ///
+    /// ```no_run
+    /// # use simple_someip::{Client, RawPayload, VecSdHeader};
+    /// # use simple_someip::protocol::sd::{self, RebootFlag, Flags};
+    /// # async fn demo(client: Client<RawPayload>) {
+    /// let header = VecSdHeader {
+    ///     flags: Flags::new_sd(RebootFlag::RecentlyRebooted),
+    ///     entries: vec![],
+    ///     options: vec![],
+    /// };
+    /// let handle = tokio::spawn(
+    ///     client.sd_announcements_loop(header, std::time::Duration::from_secs(1))
+    /// );
+    /// // ...later: handle.abort() to stop, or let the Client drop naturally.
+    /// # }
+    /// ```
     ///
     /// # Arguments
     ///
     /// * `sd_header` — The SD header to send (entries + options).
     /// * `interval` — How often to send (e.g. every 1 second). Values below
     ///   100ms are clamped to 100ms to prevent tight loops.
-    pub fn start_sd_announcements(
+    pub fn sd_announcements_loop(
         &self,
         sd_header: <MessageDefinitions as PayloadWireFormat>::SdHeader,
         interval: std::time::Duration,
-    ) -> tokio::task::JoinHandle<()>
+    ) -> impl core::future::Future<Output = ()> + Send + 'static
     where
         <MessageDefinitions as PayloadWireFormat>::SdHeader: Send + 'static,
     {
         use crate::protocol::sd;
 
-        // Use a WeakSender so this task does NOT keep the control channel
+        // Use a WeakSender so this future does NOT keep the control channel
         // alive. When all strong Client handles are dropped (shut_down),
-        // the weak sender will fail to upgrade and the task exits cleanly.
+        // the weak sender will fail to upgrade and the loop exits cleanly.
         let weak_sender = self.control_sender.downgrade();
         let target = SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT);
         let interval = interval.max(std::time::Duration::from_millis(100));
 
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Consume the immediate first tick so we don't send before
-            // the caller has finished setting up (e.g. subscribing).
-            tick.tick().await;
+        async move {
+            // Sleep goes through the `Timer` trait so bare-metal
+            // consumers can swap in `embassy_time` or similar; today it
+            // resolves to `TokioTimer`. Note: we use `Timer::sleep`
+            // repeatedly instead of `tokio::time::interval` because the
+            // trait has no equivalent of `interval`. The resulting
+            // cadence is "interval + body time" rather than "interval
+            // aligned to wall clock"; for SD announcements (a
+            // best-effort periodic heartbeat) this difference is
+            // immaterial. A regression test pins the cadence at
+            // approximately `interval` tolerance.
+            //
+            // The first iteration's `sleep` also serves as the initial
+            // delay so the caller has a chance to finish setup (e.g.
+            // subscribing) before the first announcement goes out.
+            let timer = TokioTimer;
             let mut count = 0u64;
             loop {
-                tick.tick().await;
+                timer.sleep(interval).await;
 
                 // Refresh the reboot flag from the client's tracked state
                 // so long-running announcers transition from RecentlyRebooted
@@ -578,7 +607,7 @@ where
                     }
                 }
             }
-        })
+        }
     }
 
     /// Registers a service endpoint in the client's endpoint registry.
@@ -1001,14 +1030,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_start_sd_announcements_does_not_panic() {
+    async fn test_sd_announcements_loop_does_not_panic() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let _ = tokio::spawn(run_fut);
         client.bind_discovery().await.unwrap();
 
         let sd_header = empty_sd_header();
-        let handle =
-            client.start_sd_announcements(sd_header, std::time::Duration::from_millis(100));
+        let handle = tokio::spawn(
+            client.sd_announcements_loop(sd_header, std::time::Duration::from_millis(100)),
+        );
 
         // Let the task fire at least once (may fail to send on loopback, that's OK).
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -1025,13 +1055,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_start_sd_announcements_without_discovery_bound() {
+    async fn test_sd_announcements_loop_without_discovery_bound() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let _ = tokio::spawn(run_fut);
         // Don't bind discovery — the task should handle the error gracefully.
         let sd_header = empty_sd_header();
-        let handle =
-            client.start_sd_announcements(sd_header, std::time::Duration::from_millis(100));
+        let handle = tokio::spawn(
+            client.sd_announcements_loop(sd_header, std::time::Duration::from_millis(100)),
+        );
 
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
@@ -1047,14 +1078,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_start_sd_announcements_abort_stops_task() {
+    async fn test_sd_announcements_loop_abort_stops_task() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let _ = tokio::spawn(run_fut);
         client.bind_discovery().await.unwrap();
 
         let sd_header = empty_sd_header();
-        let handle =
-            client.start_sd_announcements(sd_header, std::time::Duration::from_millis(100));
+        let handle = tokio::spawn(
+            client.sd_announcements_loop(sd_header, std::time::Duration::from_millis(100)),
+        );
 
         handle.abort();
         let result = handle.await;
@@ -1068,7 +1100,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_start_sd_announcements_overrides_caller_reboot_flag() {
+    async fn test_sd_announcements_loop_overrides_caller_reboot_flag() {
         // Regression test for the auto-refresh behavior: a caller who bakes
         // `Continuous` into `sd_header.flags` must still observe the client's
         // tracked flag on the wire (here, `RecentlyRebooted`, because the
@@ -1085,8 +1117,9 @@ mod tests {
         sd_header.flags =
             crate::protocol::sd::Flags::new_sd(crate::protocol::sd::RebootFlag::Continuous);
 
-        let handle =
-            client.start_sd_announcements(sd_header, std::time::Duration::from_millis(100));
+        let handle = tokio::spawn(
+            client.sd_announcements_loop(sd_header, std::time::Duration::from_millis(100)),
+        );
 
         // Loopback delivers our own SD announcements back as DiscoveryUpdated.
         // Drain updates until we see one (tokio::time::interval skips the
@@ -1177,14 +1210,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_start_sd_announcements_stops_on_shutdown() {
+    async fn test_sd_announcements_loop_stops_on_shutdown() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        tokio::spawn(run_fut);
         client.bind_discovery().await.unwrap();
 
         let sd_header = empty_sd_header();
-        let handle =
-            client.start_sd_announcements(sd_header, std::time::Duration::from_millis(100));
+        let handle = tokio::spawn(
+            client.sd_announcements_loop(sd_header, std::time::Duration::from_millis(100)),
+        );
 
         // Shut down the client — the weak sender should fail to upgrade
         // and the task should exit cleanly without needing abort().
@@ -1253,5 +1287,166 @@ mod tests {
             matches!(err, Error::Shutdown),
             "expected Error::Shutdown after run-loop cancel, got {err:?}",
         );
+    }
+
+    /// Pins the cadence of `sd_announcements_loop` under a healthy
+    /// (non-backpressured) control channel by counting how many
+    /// announcements land on the `Inner` loop's discovery socket
+    /// within a bounded window.
+    ///
+    /// Phase 7.5 replaced `tokio::time::interval` (wall-clock aligned,
+    /// catches up after slow bodies) with repeated `Timer::sleep`
+    /// calls (interval + body time, no catch-up). For a healthy event
+    /// loop the body is microseconds, so the observed cadence is very
+    /// close to the requested interval. If a future change regresses
+    /// this to "2 * interval" or worse, this test fires.
+    ///
+    /// The test creates a multicast receiver on the SD port/address
+    /// with loopback enabled, then runs a client with
+    /// `new_with_loopback(true)` and counts received announcements
+    /// over a 550ms window with an interval of 100ms. Expected: the
+    /// first announcement lands at t≈100ms, then ~every 100ms after,
+    /// so we expect 4-5 announcements in the window. Asserting `>= 3`
+    /// gives tolerance for scheduler jitter but still catches a 2x+
+    /// cadence regression.
+    #[ignore = "requires MULTICAST on the loopback interface; dev \
+                machines where `lo` lacks the MULTICAST flag will not \
+                deliver loopback multicast and this test will fail. \
+                Runs in any environment where loopback multicast is \
+                available (e.g. CI)."]
+    #[tokio::test]
+    async fn sd_announcements_loop_cadence_stays_close_to_requested() {
+        use crate::protocol::sd;
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        let iface = Ipv4Addr::LOCALHOST;
+
+        // Build a loopback multicast receiver on the SD port.
+        let recv = {
+            let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            s.set_reuse_address(true).unwrap();
+            #[cfg(unix)]
+            s.set_reuse_port(true).unwrap();
+            s.bind(&std::net::SocketAddr::from((iface, sd::MULTICAST_PORT)).into())
+                .unwrap();
+            s.set_nonblocking(true).unwrap();
+            let std_s: std::net::UdpSocket = s.into();
+            let rs = tokio::net::UdpSocket::from_std(std_s).unwrap();
+            rs.join_multicast_v4(sd::MULTICAST_IP, iface).unwrap();
+            rs
+        };
+
+        let (client, _updates, run_fut) = TestClient::new_with_loopback(iface, true);
+        tokio::spawn(run_fut);
+        client.bind_discovery().await.unwrap();
+
+        let interval = std::time::Duration::from_millis(100);
+        let loop_handle = tokio::spawn(client.sd_announcements_loop(empty_sd_header(), interval));
+
+        // Collect announcements over a 550ms window. First send fires
+        // at ~100ms, subsequent at ~100ms intervals; expect 4-5 packets.
+        let start = std::time::Instant::now();
+        let mut count = 0u32;
+        let mut buf = [0u8; 1500];
+        while start.elapsed() < std::time::Duration::from_millis(550) {
+            if tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                recv.recv_from(&mut buf),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false)
+            {
+                count += 1;
+            }
+        }
+
+        loop_handle.abort();
+        client.shut_down();
+
+        assert!(
+            count >= 3,
+            "expected >= 3 announcements in 550ms at 100ms interval, got {count} — \
+             cadence may have regressed"
+        );
+    }
+
+    /// Pins the first-announcement latency of `sd_announcements_loop`
+    /// to a single interval. A prior revision slept once before the
+    /// loop AND at the top of each iteration, so the first packet
+    /// landed at ~2× interval. This test catches that regression by
+    /// measuring the time from loop start to the first received
+    /// announcement and requiring it to be well under 2× interval.
+    ///
+    /// Uses the same loopback-multicast catch pattern as
+    /// `sd_announcements_loop_cadence_stays_close_to_requested`.
+    #[ignore = "requires MULTICAST on the loopback interface; same \
+                constraint as `sd_announcements_loop_cadence_stays_close_to_requested`. \
+                Runs in any environment where loopback multicast is \
+                available (e.g. CI)."]
+    #[tokio::test]
+    async fn sd_announcements_loop_first_emit_within_one_interval() {
+        use crate::protocol::sd;
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        let iface = Ipv4Addr::LOCALHOST;
+
+        let recv = {
+            let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            s.set_reuse_address(true).unwrap();
+            #[cfg(unix)]
+            s.set_reuse_port(true).unwrap();
+            s.bind(&std::net::SocketAddr::from((iface, sd::MULTICAST_PORT)).into())
+                .unwrap();
+            s.set_nonblocking(true).unwrap();
+            let std_s: std::net::UdpSocket = s.into();
+            let rs = tokio::net::UdpSocket::from_std(std_s).unwrap();
+            rs.join_multicast_v4(sd::MULTICAST_IP, iface).unwrap();
+            rs
+        };
+
+        let (client, _updates, run_fut) = TestClient::new_with_loopback(iface, true);
+        tokio::spawn(run_fut);
+        client.bind_discovery().await.unwrap();
+
+        let interval = std::time::Duration::from_millis(100);
+        let start = std::time::Instant::now();
+        let loop_handle = tokio::spawn(client.sd_announcements_loop(empty_sd_header(), interval));
+
+        let mut buf = [0u8; 1500];
+        let first = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            recv.recv_from(&mut buf),
+        )
+        .await
+        .expect("first SD announcement did not arrive within 500ms")
+        .expect("recv_from errored");
+        let first_emit_elapsed = start.elapsed();
+        let _ = first;
+
+        loop_handle.abort();
+        client.shut_down();
+
+        assert!(
+            first_emit_elapsed < std::time::Duration::from_millis(250),
+            "first announcement took {first_emit_elapsed:?}, expected < 250ms at 100ms interval — \
+             likely double-sleep regression"
+        );
+    }
+
+    /// Compile-time-ish assertion that `Client::new`'s returned run
+    /// future is `Send + 'static`. If a future refactor captures a
+    /// `!Send` or borrowed type in `Inner::run_future`, `thread::spawn`
+    /// rejects the move and this test fails to compile — surfacing the
+    /// regression at the site that introduced it rather than at a
+    /// distant `tokio::spawn` call site.
+    ///
+    /// The test doesn't actually need to drive the future; it's a
+    /// type-level check that happens to execute a no-op thread.
+    #[test]
+    fn client_new_run_future_is_send_static() {
+        let (_client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let handle = std::thread::spawn(move || drop(run_fut));
+        handle.join().unwrap();
     }
 }
