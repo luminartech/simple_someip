@@ -153,10 +153,10 @@ Configuration for a SOME/IP service provider:
 
 Main server struct:
 
-- `new(config: ServerConfig) -> Result<Self>` - Create new server
-- `announcement_loop() -> Result<impl Future<Output = ()> + Send + 'static>` - Build the SD announcement future; caller spawns on their executor
+- `new(config: ServerConfig) -> Result<Self, Error>` - Create new server
+- `announcement_loop() -> Result<impl Future<Output = ()> + Send + 'static, Error>` - Build the SD announcement future; caller spawns on the Tokio runtime
 - `publisher() -> Arc<EventPublisher>` - Get event publisher
-- `run() -> Result<()>` - Run event loop (handles subscriptions)
+- `run() -> Result<(), Error>` - Run event loop (handles subscriptions)
 - `register_e2e(key, profile)` - Register E2E protection for a message key
 - `unregister_e2e(key)` - Remove E2E protection for a message key
 
