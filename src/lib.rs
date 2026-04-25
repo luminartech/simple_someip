@@ -26,12 +26,18 @@
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `client` | no | Async tokio client; implies `std` + tokio + socket2 |
-//! | `server` | no | Async tokio server; implies `std` + tokio + socket2 |
-//! | `std` | no | Enables std-dependent helpers |
+//! | `std` | yes | Enables std-dependent helpers (`RawPayload`, `VecSdHeader`, `OfferedEndpoint`) |
+//! | `client` | no | Async tokio client; implies `std` + tokio + socket2 + futures |
+//! | `server` | no | Async tokio server; implies `std` + tokio + socket2 + futures |
+//! | `bare_metal` | no | Pure marker feature — enables no crate code. Reserved for future phases to gate `no_std` helper types. To exercise the bare-metal trait surface today, use the `examples/bare_metal` workspace member (`cargo run -p bare_metal`). **Does not make the crate fully bare-metal-complete**: the `client`/`server` feature paths still rely on `tokio::spawn` to drive per-socket I/O loops. A fully tokio-free build additionally requires a user-provided `Spawner` impl, planned as a trait alongside `TransportSocket` and `Timer`. |
 //!
-//! By default only the `protocol`, trait, and `e2e` modules are compiled, and the crate
-//! builds in `no_std` mode with no allocator requirement.
+//! The default feature set is `["std"]`, which links `std` and enables
+//! the `RawPayload` / `VecSdHeader` helpers. For a minimal build with
+//! no allocator requirement — the `protocol`, trait, `transport`, and
+//! `e2e` modules only — pass `--no-default-features`. The
+//! trait-surface canary at `examples/bare_metal/` depends on the crate
+//! with `default-features = false, features = ["bare_metal"]` and
+//! proves the no-default-features build compiles.
 //!
 //! ## Examples
 //!

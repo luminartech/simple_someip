@@ -702,20 +702,26 @@ where
                             warn!("Failed to bind to interface: {}. Error: {:?}", interface, e);
                         }
                     }
+                    // A dropped receiver is legitimate control flow
+                    // (cancellation, `_no_wait` variants, panic
+                    // recovery). `debug!` instead of `warn!` keeps
+                    // observability for the "this shouldn't happen"
+                    // case without cluttering production warn logs
+                    // when callers deliberately drop.
                     if response.send(bind_result).is_err() {
-                        warn!("SetInterface response receiver dropped (caller canceled)");
+                        debug!("SetInterface: caller dropped the response receiver");
                     }
                 }
                 ControlMessage::BindDiscovery(response) => {
                     let result = self.bind_discovery().await;
                     if response.send(result).is_err() {
-                        warn!("BindDiscovery response receiver dropped (caller canceled)");
+                        debug!("BindDiscovery: caller dropped the response receiver");
                     }
                 }
                 ControlMessage::UnbindDiscovery(response) => {
                     self.unbind_discovery().await;
                     if response.send(Ok(())).is_err() {
-                        warn!("UnbindDiscovery response receiver dropped (caller canceled)");
+                        debug!("UnbindDiscovery: caller dropped the response receiver");
                     }
                 }
                 ControlMessage::SendSD(target, header, response) => {
@@ -740,8 +746,8 @@ where
                                         e
                                     );
                                     if response.send(Err(e)).is_err() {
-                                        warn!(
-                                            "SendSD error response receiver dropped (caller canceled)"
+                                        debug!(
+                                            "SendSD (bind-err path): caller dropped the response receiver"
                                         );
                                     }
                                 }
@@ -760,7 +766,7 @@ where
                                 .send(target, message)
                                 .await;
                             if response.send(send_result).is_err() {
-                                warn!("SendSD response receiver dropped (caller canceled)");
+                                debug!("SendSD: caller dropped the response receiver");
                             }
                         }
                     }
@@ -789,7 +795,7 @@ where
                         service_id, instance_id, addr,
                     );
                     if response.send(Ok(())).is_err() {
-                        warn!("AddEndpoint response receiver dropped (caller canceled)");
+                        debug!("AddEndpoint: caller dropped the response receiver");
                     }
                 }
                 ControlMessage::RemoveEndpoint(service_id, instance_id, response) => {
@@ -802,7 +808,7 @@ where
                         service_id, instance_id,
                     );
                     if response.send(Ok(())).is_err() {
-                        warn!("RemoveEndpoint response receiver dropped (caller canceled)");
+                        debug!("RemoveEndpoint: caller dropped the response receiver");
                     }
                 }
                 ControlMessage::SendToService {
@@ -909,7 +915,11 @@ where
                         instance_id,
                     };
                     if self.service_registry.get(id).is_none() {
-                        let _ = response.send(Err(Error::ServiceNotFound));
+                        if response.send(Err(Error::ServiceNotFound)).is_err() {
+                            debug!(
+                                "Subscribe (ServiceNotFound): caller dropped the response receiver (expected for subscribe_no_wait)"
+                            );
+                        }
                         return;
                     }
 
@@ -920,7 +930,11 @@ where
                             port
                         }
                         Err(e) => {
-                            let _ = response.send(Err(e));
+                            if response.send(Err(e)).is_err() {
+                                debug!(
+                                    "Subscribe (bind-err): caller dropped the response receiver"
+                                );
+                            }
                             return;
                         }
                     };
@@ -948,7 +962,11 @@ where
                                 }
                             }
                             Err(e) => {
-                                let _ = response.send(Err(e));
+                                if response.send(Err(e)).is_err() {
+                                    debug!(
+                                        "Subscribe (discovery-bind-err): caller dropped the response receiver"
+                                    );
+                                }
                             }
                         },
                         Some(discovery_socket) => {
@@ -977,7 +995,9 @@ where
                                 .send(target, message)
                                 .await;
                             if response.send(send_result).is_err() {
-                                warn!("Subscribe response receiver dropped (caller canceled)");
+                                debug!(
+                                    "Subscribe: caller dropped the response receiver (expected for subscribe_no_wait)"
+                                );
                             }
                         }
                     }

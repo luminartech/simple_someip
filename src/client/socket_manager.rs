@@ -1,3 +1,30 @@
+//! Client-side UDP socket management.
+//!
+//! Each bound socket is backed by a `TokioSocket` (concrete, phase-5
+//! compromise) with its I/O loop running on a `tokio::spawn`'d task.
+//! That spawn is the last `tokio::spawn` call inside the library
+//! critical path — every other spawn was hoisted out to the caller in
+//! phase 6 / 7. This one can't be hoisted until a `Spawner` trait is
+//! introduced (planned for phase 9).
+//!
+//! # Why the `tokio::spawn` in `bind_*` is still there
+//!
+//! Briefly experimented with having `Inner` drive per-socket futures
+//! via `FuturesUnordered` (phase 8 attempt, reverted). That deadlocks:
+//! `Inner::handle_control_message` awaits `SocketManager::send`,
+//! which internally awaits an mpsc→oneshot round-trip that requires
+//! the socket loop to make progress. But `Inner::run_future` is
+//! parked inside the handler, so nothing polls the socket loop.
+//! Concurrency between the two is mandatory; on tokio we get it via
+//! `tokio::spawn` giving each socket its own task.
+//!
+//! The fix is either (a) a `Spawner` trait that `Inner::bind_*` uses
+//! instead of calling `tokio::spawn` directly (small, contradicts the
+//! phase-4 "no `ExecutorAdapter`" decision but warranted given concrete
+//! evidence), or (b) a non-await `SocketManager::send` that defers
+//! completion to a later `select!` iteration (invasive). Phase 9
+//! picks (a).
+
 use crate::{
     UDP_BUFFER_SIZE,
     e2e::{E2ECheckStatus, E2EKey, E2ERegistry},
@@ -40,7 +67,7 @@ pub struct SendMessage<PayloadDefinitions> {
     response: tokio::sync::oneshot::Sender<Result<(), Error>>,
 }
 
-/// One iteration's select-outcome in `spawn_socket_loop`. The inner
+/// One iteration's select-outcome in `socket_loop_future`. The inner
 /// block returns this scalar so the pinned per-iteration `send_fut` /
 /// `recv_fut` futures drop before the processing body — releasing their
 /// `&mut buf` / `&mut socket` borrows.
@@ -114,9 +141,9 @@ where
     /// The factory must still produce a
     /// [`TokioSocket`](crate::tokio_transport::TokioSocket) because the
     /// spawned I/O loop is currently tokio-specific; the bound will be
-    /// relaxed to any `TransportSocket` once `spawn_socket_loop`'s outer
-    /// `tokio::spawn` is hoisted (planned for phase 8 alongside the
-    /// bare-metal example).
+    /// relaxed to any `TransportSocket` once the `tokio::spawn` that
+    /// drives `socket_loop_future` is hoisted out of `bind_discovery_*`
+    /// (tracked separately; phase 9+ spawner-trait work).
     pub async fn bind_discovery_seeded_with_transport<F>(
         factory: &F,
         interface: Ipv4Addr,
@@ -152,7 +179,8 @@ where
         let socket = factory.bind(bind_addr, &options).await?;
         socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
 
-        Self::spawn_socket_loop(socket, rx_tx, tx_rx, e2e_registry);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
+        tokio::spawn(fut);
         Ok(Self {
             receiver: rx_rx,
             sender: tx_tx,
@@ -190,7 +218,8 @@ where
 
         let socket = factory.bind(bind_addr, &options).await?;
         let port = socket.local_addr()?.port();
-        Self::spawn_socket_loop(socket, rx_tx, tx_rx, e2e_registry);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
+        tokio::spawn(fut);
         Ok(Self {
             receiver: rx_rx,
             sender: tx_tx,
@@ -262,57 +291,53 @@ where
         _ = receiver.recv().await;
     }
 
-    /// Spawn the I/O loop over a concrete [`TokioSocket`].
+    /// Build the I/O loop over a concrete [`TokioSocket`] as a future.
+    /// Callers are expected to `tokio::spawn` this future alongside
+    /// [`Self`]; the socket loop runs concurrently with its owner so
+    /// `SocketManager::send`'s internal oneshot wait can complete.
+    /// The reasoning for why the spawn hasn't been hoisted is in the
+    /// module-level docs.
     ///
-    /// The socket's trait methods (`send_to`, `recv_from`,
-    /// `join_multicast_v4`) are the entire I/O surface used inside — the
-    /// loop body does not call any `TokioSocket`-specific inherent
-    /// methods, so generalizing this function over `T: TransportSocket`
-    /// is a mechanical change once the outer `tokio::spawn` is hoisted
-    /// out (planned for phase 8 alongside the bare-metal example —
-    /// hoisting the spawn moves the `Send` requirement off this
-    /// function, sidestepping stable Rust's current inability to
-    /// express `Send` bounds on RPITIT method returns without nightly
-    /// return-type notation).
+    /// The function remains tied to `TokioSocket` concretely because
+    /// generalizing it to `T: TransportSocket` needs stable-Rust
+    /// return-type notation to express `Send` bounds on the trait's
+    /// RPITIT methods — still nightly as of this writing.
     #[allow(clippy::too_many_lines)]
-    fn spawn_socket_loop(
+    async fn socket_loop_future(
         socket: crate::tokio_transport::TokioSocket,
         rx_tx: mpsc::Sender<Result<ReceivedMessage<MessageDefinitions>, Error>>,
         mut tx_rx: mpsc::Receiver<SendMessage<MessageDefinitions>>,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
     ) {
-        tokio::spawn(async move {
-            let mut buf = [0u8; UDP_BUFFER_SIZE];
+        let mut buf = [0u8; UDP_BUFFER_SIZE];
 
-            loop {
-                // `select!` (not `select_biased!`) gives pseudo-random
-                // fairness across ready arms — matches prior
-                // `tokio::select!` behavior and avoids starving either
-                // the send or recv arm under sustained one-sided load.
-                //
-                // The fresh `.fuse()`'d per-iteration futures are pinned
-                // on the stack (required: `Fuse<_>` is not `Unpin`).
-                // Returning an `Outcome<P>` scalar from the inner block
-                // drops both pinned futures — and their `&mut buf` /
-                // `&mut socket` borrows — before the processing body
-                // below runs, so the body can re-borrow `buf` freely.
-                let outcome: Outcome<MessageDefinitions> = {
-                    let send_fut = tx_rx.recv().fuse();
-                    let recv_fut = socket.recv_from(&mut buf).fuse();
-                    pin_mut!(send_fut, recv_fut);
-                    select! {
-                        message = send_fut => Outcome::Send(message),
-                        result = recv_fut => Outcome::Recv(result),
-                    }
-                };
+        loop {
+            // `select!` (not `select_biased!`) gives pseudo-random
+            // fairness across ready arms — matches prior
+            // `tokio::select!` behavior and avoids starving either
+            // the send or recv arm under sustained one-sided load.
+            //
+            // The fresh `.fuse()`'d per-iteration futures are pinned
+            // on the stack (required: `Fuse<_>` is not `Unpin`).
+            // Returning an `Outcome<P>` scalar from the inner block
+            // drops both pinned futures — and their `&mut buf` /
+            // `&mut socket` borrows — before the processing body
+            // below runs, so the body can re-borrow `buf` freely.
+            let outcome: Outcome<MessageDefinitions> = {
+                let send_fut = tx_rx.recv().fuse();
+                let recv_fut = socket.recv_from(&mut buf).fuse();
+                pin_mut!(send_fut, recv_fut);
+                select! {
+                    message = send_fut => Outcome::Send(message),
+                    result = recv_fut => Outcome::Recv(result),
+                }
+            };
 
-                match outcome {
-                    Outcome::Send(Some(send_message)) => {
-                        trace!("Sending: {:?}", &send_message);
-                        let mut message_length = match send_message
-                            .message
-                            .encode(&mut buf.as_mut_slice())
-                        {
+            match outcome {
+                Outcome::Send(Some(send_message)) => {
+                    trace!("Sending: {:?}", &send_message);
+                    let mut message_length =
+                        match send_message.message.encode(&mut buf.as_mut_slice()) {
                             Ok(length) => length,
                             Err(e) => {
                                 error!("Failed to encode message: {:?}", e);
@@ -326,144 +351,139 @@ where
                             }
                         };
 
-                        // Apply E2E protect if configured. `protected`
-                        // is a disjoint stack buffer, so the input can
-                        // be borrowed directly out of `buf[16..]` with
-                        // no intermediate copy.
-                        {
-                            let key =
-                                E2EKey::from_message_id(send_message.message.header().message_id());
-                            let mut registry =
-                                e2e_registry.lock().expect("e2e registry lock poisoned");
-                            if registry.contains_key(&key) {
-                                let upper_header: [u8; 8] =
-                                    buf[8..16].try_into().expect("upper header slice");
-                                let mut protected = [0u8; UDP_BUFFER_SIZE];
-                                let result = registry.protect(
-                                    key,
-                                    &buf[16..message_length],
-                                    upper_header,
-                                    &mut protected,
-                                );
-                                match result {
-                                    Some(Ok(protected_len)) => {
-                                        if 16 + protected_len > UDP_BUFFER_SIZE {
-                                            error!(
-                                                "E2E-protected payload ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping send",
-                                                16 + protected_len,
-                                                UDP_BUFFER_SIZE
-                                            );
-                                            let _ = send_message
-                                                .response
-                                                .send(Err(Error::Capacity("udp_buffer")));
-                                            continue;
-                                        }
-                                        #[allow(clippy::cast_possible_truncation)]
-                                        let new_length: u32 = 8 + protected_len as u32;
-                                        buf[4..8].copy_from_slice(&new_length.to_be_bytes());
-                                        buf[16..16 + protected_len]
-                                            .copy_from_slice(&protected[..protected_len]);
-                                        message_length = 16 + protected_len;
-                                    }
-                                    Some(Err(e)) => {
-                                        error!("E2E protect error: {:?}", e);
-                                    }
-                                    None => unreachable!("contains_key was true"),
-                                }
-                            }
-                        }
-
-                        match socket
-                            .send_to(&buf[..message_length], send_message.target_addr)
-                            .await
-                        {
-                            Ok(()) => {
-                                trace!(
-                                    "Sent {} bytes to {}",
-                                    message_length, send_message.target_addr
-                                );
-                                if let Ok(()) = send_message.response.send(Ok(())) {
-                                } else {
-                                    info!("Socket owner closed channel, closing socket.");
-                                    // The sender has been dropped, so we should exit
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to send message with error: {:?}", e);
-                                if let Ok(()) = send_message.response.send(Err(Error::Transport(e)))
-                                {
-                                } else {
-                                    error!(
-                                        "Socket owner closed channel unexpectedly, closing socket."
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Outcome::Send(None) => {
-                        info!("Send channel closed, closing socket.");
-                        // The sender has been dropped, so we should exit
-                        break;
-                    }
-                    Outcome::Recv(Ok(ReceivedDatagram {
-                        bytes_received,
-                        source,
-                        truncated,
-                    })) => {
-                        if truncated {
-                            // A truncated datagram cannot be parsed reliably;
-                            // the length field in the SOME/IP header will not
-                            // match the bytes we received. Log and drop.
-                            error!(
-                                "Discarding truncated datagram from {}: {} bytes received",
-                                source, bytes_received
+                    // Apply E2E protect if configured. `protected`
+                    // is a disjoint stack buffer, so the input can
+                    // be borrowed directly out of `buf[16..]` with
+                    // no intermediate copy.
+                    {
+                        let key =
+                            E2EKey::from_message_id(send_message.message.header().message_id());
+                        let mut registry = e2e_registry.lock().expect("e2e registry lock poisoned");
+                        if registry.contains_key(&key) {
+                            let upper_header: [u8; 8] =
+                                buf[8..16].try_into().expect("upper header slice");
+                            let mut protected = [0u8; UDP_BUFFER_SIZE];
+                            let result = registry.protect(
+                                key,
+                                &buf[16..message_length],
+                                upper_header,
+                                &mut protected,
                             );
-                            continue;
-                        }
-                        let source_address = SocketAddr::V4(source);
-                        let parse_result = MessageView::parse(&buf[..bytes_received])
-                            .and_then(|view| {
-                                let header = view.header().to_owned();
-                                let upper_header = header.upper_header_bytes();
-                                let key = E2EKey::from_message_id(header.message_id());
-                                let payload_bytes = view.payload_bytes();
-
-                                // Apply E2E check if configured
-                                let (e2e_status, effective_payload) = {
-                                    let mut registry =
-                                        e2e_registry.lock().expect("e2e registry lock poisoned");
-                                    match registry.check(key, payload_bytes, upper_header) {
-                                        Some((status, stripped)) => (Some(status), stripped),
-                                        None => (None, payload_bytes),
+                            match result {
+                                Some(Ok(protected_len)) => {
+                                    if 16 + protected_len > UDP_BUFFER_SIZE {
+                                        error!(
+                                            "E2E-protected payload ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping send",
+                                            16 + protected_len,
+                                            UDP_BUFFER_SIZE
+                                        );
+                                        let _ = send_message
+                                            .response
+                                            .send(Err(Error::Capacity("udp_buffer")));
+                                        continue;
                                     }
-                                };
-
-                                let payload = MessageDefinitions::from_payload_bytes(
-                                    header.message_id(),
-                                    effective_payload,
-                                )?;
-                                Ok(ReceivedMessage {
-                                    message: Message::new(header, payload),
-                                    source: source_address,
-                                    e2e_status,
-                                })
-                            })
-                            .map_err(Error::from);
-                        if let Ok(()) = rx_tx.send(parse_result).await {
-                        } else {
-                            info!("Socket Dropping");
-                            // The receiver has been dropped, so we should exit
-                            break;
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    let new_length: u32 = 8 + protected_len as u32;
+                                    buf[4..8].copy_from_slice(&new_length.to_be_bytes());
+                                    buf[16..16 + protected_len]
+                                        .copy_from_slice(&protected[..protected_len]);
+                                    message_length = 16 + protected_len;
+                                }
+                                Some(Err(e)) => {
+                                    error!("E2E protect error: {:?}", e);
+                                }
+                                None => unreachable!("contains_key was true"),
+                            }
                         }
                     }
-                    Outcome::Recv(Err(recv_err)) => {
-                        error!("Transport recv failed: {:?}", recv_err);
+
+                    match socket
+                        .send_to(&buf[..message_length], send_message.target_addr)
+                        .await
+                    {
+                        Ok(()) => {
+                            trace!(
+                                "Sent {} bytes to {}",
+                                message_length, send_message.target_addr
+                            );
+                            if let Ok(()) = send_message.response.send(Ok(())) {
+                            } else {
+                                info!("Socket owner closed channel, closing socket.");
+                                // The sender has been dropped, so we should exit
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to send message with error: {:?}", e);
+                            if let Ok(()) = send_message.response.send(Err(Error::Transport(e))) {
+                            } else {
+                                error!("Socket owner closed channel unexpectedly, closing socket.");
+                                break;
+                            }
+                        }
                     }
                 }
+                Outcome::Send(None) => {
+                    info!("Send channel closed, closing socket.");
+                    // The sender has been dropped, so we should exit
+                    break;
+                }
+                Outcome::Recv(Ok(ReceivedDatagram {
+                    bytes_received,
+                    source,
+                    truncated,
+                })) => {
+                    if truncated {
+                        // A truncated datagram cannot be parsed reliably;
+                        // the length field in the SOME/IP header will not
+                        // match the bytes we received. Log and drop.
+                        error!(
+                            "Discarding truncated datagram from {}: {} bytes received",
+                            source, bytes_received
+                        );
+                        continue;
+                    }
+                    let source_address = SocketAddr::V4(source);
+                    let parse_result = MessageView::parse(&buf[..bytes_received])
+                        .and_then(|view| {
+                            let header = view.header().to_owned();
+                            let upper_header = header.upper_header_bytes();
+                            let key = E2EKey::from_message_id(header.message_id());
+                            let payload_bytes = view.payload_bytes();
+
+                            // Apply E2E check if configured
+                            let (e2e_status, effective_payload) = {
+                                let mut registry =
+                                    e2e_registry.lock().expect("e2e registry lock poisoned");
+                                match registry.check(key, payload_bytes, upper_header) {
+                                    Some((status, stripped)) => (Some(status), stripped),
+                                    None => (None, payload_bytes),
+                                }
+                            };
+
+                            let payload = MessageDefinitions::from_payload_bytes(
+                                header.message_id(),
+                                effective_payload,
+                            )?;
+                            Ok(ReceivedMessage {
+                                message: Message::new(header, payload),
+                                source: source_address,
+                                e2e_status,
+                            })
+                        })
+                        .map_err(Error::from);
+                    if let Ok(()) = rx_tx.send(parse_result).await {
+                    } else {
+                        info!("Socket Dropping");
+                        // The receiver has been dropped, so we should exit
+                        break;
+                    }
+                }
+                Outcome::Recv(Err(recv_err)) => {
+                    error!("Transport recv failed: {:?}", recv_err);
+                }
             }
-        });
+        }
     }
 }
 
@@ -484,142 +504,13 @@ mod tests {
         Arc::new(Mutex::new(E2ERegistry::new()))
     }
 
-    /// Spike for the per-transport SD fix: prove the kernel splits SD
-    /// multicast from unicast across two sockets sharing the SD port — the
-    /// multicast socket bound to `INADDR_ANY` + joined (Windows-portable, and
-    /// what the real discovery socket already does), and a more-specific
-    /// socket bound to the host interface IP (not joined). "Most-specific bind
-    /// wins" must divert the sensor's unicast SD to the interface-IP socket,
-    /// leaving the wildcard multicast socket seeing only multicast — so each
-    /// transport's session counter lands on its own `SessionTracker` key
-    /// instead of colliding (the false-reboot bug). No bind-to-group (Windows
-    /// rejects it) and no send-path change required. Skips if the host has no
-    /// usable multicast route (e.g. `lo`-only CI) — the authoritative check is
-    /// the live-sensor run.
-    #[test]
-    fn dual_socket_splits_multicast_from_unicast() {
-        use std::eprintln;
-        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-        use std::time::Duration;
-        use std::vec::Vec;
-
-        let group = crate::protocol::sd::MULTICAST_IP;
-
-        let bind_reuse = |addr: SocketAddr| -> std::io::Result<socket2::Socket> {
-            let s = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::DGRAM,
-                Some(socket2::Protocol::UDP),
-            )?;
-            s.set_reuse_address(true)?;
-            #[cfg(unix)]
-            s.set_reuse_port(true)?;
-            s.bind(&addr.into())?;
-            s.set_read_timeout(Some(Duration::from_millis(400)))?;
-            Ok(s)
-        };
-        let drain = |s: &UdpSocket| -> Vec<Vec<u8>> {
-            let mut out = Vec::new();
-            let mut buf = [0u8; 64];
-            while let Ok((n, _)) = s.recv_from(&mut buf) {
-                out.push(buf[..n].to_vec());
-            }
-            out
-        };
-
-        // Multicast socket: bound to INADDR_ANY (Windows-portable; NOT the
-        // group address) + joined. Tagged Multicast. The more-specific
-        // interface-IP unicast socket below must divert unicast away from it.
-        let mc: UdpSocket = match (|| -> std::io::Result<UdpSocket> {
-            let s = bind_reuse(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
-            s.set_multicast_loop_v4(true)?;
-            let s: UdpSocket = s.into();
-            s.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)?;
-            Ok(s)
-        })() {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("SKIP dual_socket_splits: multicast setup failed ({e})");
-                return;
-            }
-        };
-        // Reuse the OS-assigned ephemeral port for the unicast socket and the
-        // sender target too, so the test never collides with a fixed port that
-        // happens to be in use on a shared CI runner.
-        let port = match mc.local_addr() {
-            Ok(SocketAddr::V4(a)) => a.port(),
-            _ => {
-                eprintln!("SKIP dual_socket_splits: multicast socket has no IPv4 local addr");
-                return;
-            }
-        };
-        // This host's egress IPv4 for the multicast route — the analogue of
-        // the real `interface` arg the discovery socket is bound against.
-        let local_ip = {
-            let probe = UdpSocket::bind("0.0.0.0:0").expect("probe bind");
-            let _ = probe.connect(SocketAddrV4::new(group, port));
-            match probe.local_addr() {
-                Ok(SocketAddr::V4(a)) => *a.ip(),
-                _ => Ipv4Addr::UNSPECIFIED,
-            }
-        };
-        if local_ip.is_unspecified() {
-            eprintln!("SKIP dual_socket_splits: no egress IPv4");
-            return;
-        }
-
-        // Unicast socket: bound to the SPECIFIC host IP (not wildcard), NOT
-        // joined to the group — so it must not receive the group multicast.
-        let uc: UdpSocket = bind_reuse(SocketAddr::from((local_ip, port)))
-            .expect("bind unicast socket")
-            .into();
-
-        let tx: UdpSocket = bind_reuse(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
-            .expect("bind sender")
-            .into();
-        let _ = tx.set_multicast_loop_v4(true);
-        let _ = tx.set_multicast_ttl_v4(1);
-        // A send failure here is an environment issue (no route / permissions),
-        // not a logic regression — surface it as a visible SKIP rather than
-        // letting an empty drain quietly pass the test.
-        if let Err(e) = tx.send_to(b"MCAST", SocketAddrV4::new(group, port)) {
-            eprintln!("SKIP dual_socket_splits: multicast send failed ({e})");
-            return;
-        }
-        if let Err(e) = tx.send_to(b"UCAST", SocketAddrV4::new(local_ip, port)) {
-            eprintln!("SKIP dual_socket_splits: unicast send failed ({e})");
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(60));
-
-        let mc_got = drain(&mc);
-        let uc_got = drain(&uc);
-
-        if mc_got.is_empty() {
-            eprintln!("SKIP dual_socket_splits: no multicast route on this host");
-            return;
-        }
-        assert!(
-            mc_got.iter().any(|p| p == b"MCAST"),
-            "mc socket must get the multicast"
-        );
-        assert!(
-            !mc_got.iter().any(|p| p == b"UCAST"),
-            "mc socket (bound to INADDR_ANY) must NOT get the unicast"
-        );
-        assert!(
-            uc_got.iter().any(|p| p == b"UCAST"),
-            "uc socket must get the unicast"
-        );
-        assert!(
-            !uc_got.iter().any(|p| p == b"MCAST"),
-            "uc socket (never joined the group) must NOT get the multicast"
-        );
+    async fn bind_ephemeral_spawned() -> TestSocketManager {
+        TestSocketManager::bind(0, test_registry()).await.unwrap()
     }
 
     #[tokio::test]
     async fn test_bind_ephemeral_port() {
-        let sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
+        let sm = bind_ephemeral_spawned().await;
         assert!(sm.port() > 0);
         assert_eq!(sm.session_id(), 1);
     }
@@ -637,13 +528,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_socket_manager_shut_down() {
-        let sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
+        let sm = bind_ephemeral_spawned().await;
         sm.shut_down().await;
     }
 
     #[tokio::test]
     async fn test_socket_manager_send_and_receive() {
-        let mut sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
+        let mut sm = bind_ephemeral_spawned().await;
         let sm_port = sm.port();
 
         // Create a raw UDP socket to send data to the SocketManager
@@ -675,7 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_poll_receive() {
-        let mut sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
+        let mut sm = bind_ephemeral_spawned().await;
         let sm_port = sm.port();
 
         // Send a message to the socket manager from a raw socket
@@ -701,7 +592,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_drops_when_socket_loop_exits() {
-        let mut sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
+        let mut sm = bind_ephemeral_spawned().await;
         // Shut down the socket loop by dropping the internal channels
         // We can't directly kill the loop, but we can test the error path
         // by sending to a socket manager that has been shut down.
@@ -745,7 +636,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_socket_manager_debug() {
-        let sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
+        let sm = bind_ephemeral_spawned().await;
         let s = format!("{sm:?}");
         assert!(s.contains("SocketManager"));
         sm.shut_down().await;
@@ -753,7 +644,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_socket_manager_send_to_target() {
-        let mut sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
+        let mut sm = bind_ephemeral_spawned().await;
 
         // Create a raw socket to receive
         let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -799,7 +690,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_id_wraps_to_one_and_clears_reboot_flag() {
-        let mut sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
+        let mut sm = bind_ephemeral_spawned().await;
         let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target =
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_socket.local_addr().unwrap().port());

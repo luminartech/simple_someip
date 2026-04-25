@@ -1,0 +1,12 @@
+[package]
+name = "bare_metal"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# The whole point of this example: depend on `simple-someip` with
+# `default-features = false` (no `std` feature) and `bare_metal` on.
+# This exercises the `transport` trait surface in the same minimal
+# configuration a real firmware build would use.
+[dependencies]
+simple-someip = { path = "../..", default-features = false, features = ["bare_metal"] }
