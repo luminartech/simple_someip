@@ -1,6 +1,11 @@
 use thiserror::Error;
 
 /// Errors that can occur during SOME/IP server operations.
+///
+/// Not marked `#[non_exhaustive]` today: downstream crates that match on
+/// this enum rely on exhaustiveness, and adding the attribute now would be
+/// a silent breaking change that `cargo-semver-checks` would flag. Revisit
+/// when a breaking release is planned.
 #[derive(Error, Debug)]
 pub enum Error {
     /// A SOME/IP protocol-level error.
@@ -12,6 +17,13 @@ pub enum Error {
     /// An E2E protection or checking error occurred.
     #[error(transparent)]
     E2e(#[from] crate::e2e::Error),
+    /// A fixed-capacity internal structure is full (e.g. a stack send
+    /// buffer smaller than the outgoing message). The argument is a
+    /// lowercase `snake_case` tag naming the resource; grep the crate for
+    /// the tag to find the compile-time constant that governs it. Current
+    /// tags: `"udp_buffer"` (→ `crate::UDP_BUFFER_SIZE`).
+    #[error("internal capacity exceeded: {0}")]
+    Capacity(&'static str),
 }
 
 impl From<crate::protocol::sd::Error> for Error {

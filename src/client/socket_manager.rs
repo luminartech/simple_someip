@@ -1,5 +1,6 @@
 use crate::{
-    e2e::{E2ECheckStatus, E2EKey, E2ERegistry, PROFILE4_HEADER_SIZE},
+    UDP_BUFFER_SIZE,
+    e2e::{E2ECheckStatus, E2EKey, E2ERegistry},
     protocol::{Message, MessageView, sd},
     traits::{PayloadWireFormat, WireFormat},
 };
@@ -9,7 +10,6 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
     task::{Context, Poll},
-    vec,
 };
 use tokio::{net::UdpSocket, select, sync::mpsc};
 use tracing::{error, info, trace};
@@ -212,7 +212,7 @@ where
         e2e_registry: Arc<Mutex<E2ERegistry>>,
     ) {
         tokio::spawn(async move {
-            let mut buf = vec![0; 1400];
+            let mut buf = [0u8; UDP_BUFFER_SIZE];
             loop {
                 select! {
                     result = socket.recv_from(&mut buf) => {
@@ -257,6 +257,20 @@ where
                     message = tx_rx.recv() => {
                         if let Some(send_message) = message {
                             trace!("Sending: {:?}", &send_message);
+                            // Fail fast with the capacity error rather than
+                            // letting `encode` report a less-actionable
+                            // protocol I/O error when it runs out of
+                            // buffer. Matches the E2E-overflow arm below
+                            // and the server event_publisher path.
+                            let required_size = send_message.message.required_size();
+                            if required_size > UDP_BUFFER_SIZE {
+                                error!(
+                                    "outgoing message ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping send",
+                                    required_size, UDP_BUFFER_SIZE
+                                );
+                                let _ = send_message.response.send(Err(Error::Capacity("udp_buffer")));
+                                continue;
+                            }
                             let mut message_length = match send_message.message.encode(&mut buf.as_mut_slice()) {
                                 Ok(length) => length,
                                 Err(e) => {
@@ -271,22 +285,35 @@ where
                                 }
                             };
 
-                            // Apply E2E protect if configured
+                            // Apply E2E protect if configured. `protected`
+                            // is a disjoint stack buffer, so the input can
+                            // be borrowed directly out of `buf[16..]` with
+                            // no intermediate copy.
                             {
                                 let key = E2EKey::from_message_id(send_message.message.header().message_id());
                                 let mut registry = e2e_registry.lock().expect("e2e registry lock poisoned");
                                 if registry.contains_key(&key) {
-                                    let original_payload = buf[16..message_length].to_vec();
                                     let upper_header: [u8; 8] = buf[8..16].try_into().expect("upper header slice");
-                                    let mut protected = vec![0u8; original_payload.len() + PROFILE4_HEADER_SIZE];
-                                    match registry.protect(key, &original_payload, upper_header, &mut protected) {
+                                    let mut protected = [0u8; UDP_BUFFER_SIZE];
+                                    let result = registry.protect(
+                                        key,
+                                        &buf[16..message_length],
+                                        upper_header,
+                                        &mut protected,
+                                    );
+                                    match result {
                                         Some(Ok(protected_len)) => {
+                                            if 16 + protected_len > UDP_BUFFER_SIZE {
+                                                error!(
+                                                    "E2E-protected datagram ({} bytes, header + protected payload) exceeds UDP_BUFFER_SIZE ({}); dropping send",
+                                                    16 + protected_len, UDP_BUFFER_SIZE
+                                                );
+                                                let _ = send_message.response.send(Err(Error::Capacity("udp_buffer")));
+                                                continue;
+                                            }
                                             #[allow(clippy::cast_possible_truncation)]
                                             let new_length: u32 = 8 + protected_len as u32;
                                             buf[4..8].copy_from_slice(&new_length.to_be_bytes());
-                                            if 16 + protected_len > buf.len() {
-                                                buf.resize(16 + protected_len, 0);
-                                            }
                                             buf[16..16 + protected_len].copy_from_slice(&protected[..protected_len]);
                                             message_length = 16 + protected_len;
                                         }
@@ -332,6 +359,7 @@ mod tests {
     use super::*;
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
     use std::format;
+    use std::vec;
 
     type TestSocketManager = SocketManager<TestPayload>;
 
@@ -561,5 +589,100 @@ mod tests {
             RebootFlag::Continuous,
             "reboot flag stays Continuous after wrap"
         );
+    }
+
+    #[tokio::test]
+    async fn send_e2e_protected_payload_exceeding_udp_buffer_returns_capacity_error() {
+        use crate::RawPayload;
+        use crate::e2e::{E2EProfile, Profile4Config};
+        use crate::protocol::{Header, MessageId, MessageType, MessageTypeField, ReturnCode};
+
+        // Register an E2E profile so the protect branch runs.
+        let message_id = MessageId::new_from_service_and_method(0x1234, 0x5678);
+        let key = E2EKey::from_message_id(message_id);
+        let mut reg = E2ERegistry::new();
+        reg.register(key, E2EProfile::Profile4(Profile4Config::new(0, 15)));
+        let e2e_registry = Arc::new(Mutex::new(reg));
+
+        let mut sm = SocketManager::<RawPayload>::bind(0, e2e_registry).unwrap();
+
+        // Craft a message whose raw-encoded size fits `UDP_BUFFER_SIZE`
+        // exactly (header + payload = cap) but whose E2E-protected size
+        // does not — Profile4 adds `PROFILE4_HEADER_SIZE` bytes which
+        // pushes the protected total over the cap. Sizes derived from
+        // `UDP_BUFFER_SIZE` and `PROFILE4_HEADER_SIZE` so the fixture
+        // stays valid if the constant is retuned.
+        const SOMEIP_HEADER_SIZE: usize = 16;
+        let payload_len = UDP_BUFFER_SIZE - SOMEIP_HEADER_SIZE; // raw total == UDP_BUFFER_SIZE
+        let payload_bytes = vec![0u8; payload_len];
+        let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
+        let header = Header::new(
+            message_id,
+            0x0001_0001,
+            0x01,
+            0x01,
+            MessageTypeField::new(MessageType::Request, false),
+            ReturnCode::Ok,
+            payload_bytes.len(),
+        );
+        let message = Message::new(header, payload);
+
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
+        let err = sm
+            .send(target, message)
+            .await
+            .expect_err("E2E-protected oversize message must error");
+        match err {
+            Error::Capacity(tag) => assert_eq!(tag, "udp_buffer"),
+            other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
+        }
+    }
+
+    /// Messages whose raw encoded size already exceeds `UDP_BUFFER_SIZE`
+    /// — with no E2E in play — must be rejected up front with
+    /// `Error::Capacity("udp_buffer")` rather than bubbling out the
+    /// less-actionable protocol I/O error that `encode` would report
+    /// after running out of buffer.
+    #[tokio::test]
+    async fn send_raw_message_exceeding_udp_buffer_returns_capacity_error() {
+        use crate::RawPayload;
+        use crate::protocol::{Header, MessageId, MessageType, MessageTypeField, ReturnCode};
+
+        let message_id = MessageId::new_from_service_and_method(0x1234, 0x5678);
+        // No E2E registered — goes straight through the pre-encode check.
+        let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
+        let mut sm = SocketManager::<RawPayload>::bind(0, e2e_registry).unwrap();
+
+        // Derive a payload that makes the full message exceed the UDP cap
+        // by 1 byte regardless of how `UDP_BUFFER_SIZE` is retuned:
+        // 16-byte header + payload_len = UDP_BUFFER_SIZE + 1.
+        const SOMEIP_HEADER_SIZE: usize = 16;
+        let payload_len = UDP_BUFFER_SIZE - SOMEIP_HEADER_SIZE + 1;
+        let payload_bytes = vec![0u8; payload_len];
+        let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
+        let header = Header::new(
+            message_id,
+            0x0001_0001,
+            0x01,
+            0x01,
+            MessageTypeField::new(MessageType::Request, false),
+            ReturnCode::Ok,
+            payload_bytes.len(),
+        );
+        let message = Message::new(header, payload);
+        assert!(
+            message.required_size() > UDP_BUFFER_SIZE,
+            "fixture must actually exceed the cap for this test to exercise the new path",
+        );
+
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
+        let err = sm
+            .send(target, message)
+            .await
+            .expect_err("raw oversize message must error");
+        match err {
+            Error::Capacity(tag) => assert_eq!(tag, "udp_buffer"),
+            other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
+        }
     }
 }
