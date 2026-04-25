@@ -453,7 +453,7 @@ mod tests {
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
         {
             let mut mgr = subscriptions.write().await;
-            mgr.subscribe(0x5B, 1, 0x01, addr);
+            mgr.subscribe(0x5B, 1, 0x01, addr).unwrap();
         }
         let (publisher, _) = make_publisher(subscriptions).await;
 
@@ -487,7 +487,7 @@ mod tests {
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
         {
             let mut mgr = subscriptions.write().await;
-            mgr.subscribe(0x5B, 1, 0x01, addr);
+            mgr.subscribe(0x5B, 1, 0x01, addr).unwrap();
         }
         let (publisher, _) = make_publisher(subscriptions).await;
 
@@ -548,7 +548,7 @@ mod tests {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
         {
             let mut mgr = subscriptions.write().await;
-            mgr.subscribe(0x5B, 1, 0x01, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999));
+            mgr.subscribe(0x5B, 1, 0x01, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999)).unwrap();
         }
 
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());

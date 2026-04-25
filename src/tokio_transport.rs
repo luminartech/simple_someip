@@ -101,7 +101,7 @@ impl TransportFactory for TokioTransport {
 
 impl TransportSocket for TokioSocket {
     async fn send_to(
-        &mut self,
+        &self,
         buf: &[u8],
         target: SocketAddrV4,
     ) -> Result<(), TransportError> {
@@ -113,7 +113,7 @@ impl TransportSocket for TokioSocket {
     }
 
     async fn recv_from(
-        &mut self,
+        &self,
         buf: &mut [u8],
     ) -> Result<ReceivedDatagram, TransportError> {
         let (n, src) = self
@@ -155,7 +155,7 @@ impl TransportSocket for TokioSocket {
     }
 
     fn join_multicast_v4(
-        &mut self,
+        &self,
         group: Ipv4Addr,
         iface: Ipv4Addr,
     ) -> Result<(), TransportError> {
@@ -165,7 +165,7 @@ impl TransportSocket for TokioSocket {
     }
 
     fn leave_multicast_v4(
-        &mut self,
+        &self,
         group: Ipv4Addr,
         iface: Ipv4Addr,
     ) -> Result<(), TransportError> {
@@ -290,13 +290,13 @@ mod tests {
         let factory = TokioTransport;
         let opts = SocketOptions::default();
 
-        let mut recv = factory
+        let recv = factory
             .bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), &opts)
             .await
             .unwrap();
         let recv_addr = recv.local_addr().unwrap();
 
-        let mut send = factory
+        let send = factory
             .bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), &opts)
             .await
             .unwrap();

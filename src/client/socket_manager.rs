@@ -138,7 +138,7 @@ where
         };
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, sd::MULTICAST_PORT);
 
-        let mut socket = factory.bind(bind_addr, &options).await?;
+        let socket = factory.bind(bind_addr, &options).await?;
         socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
 
         Self::spawn_socket_loop(socket, rx_tx, tx_rx, e2e_registry);
@@ -267,7 +267,7 @@ where
     /// the `Send` requirement off this function entirely).
     #[allow(clippy::too_many_lines)]
     fn spawn_socket_loop(
-        mut socket: crate::tokio_transport::TokioSocket,
+        socket: crate::tokio_transport::TokioSocket,
         rx_tx: mpsc::Sender<Result<ReceivedMessage<MessageDefinitions>, Error>>,
         mut tx_rx: mpsc::Receiver<SendMessage<MessageDefinitions>>,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
@@ -873,7 +873,7 @@ mod tests {
         let message_id = MessageId::new_from_service_and_method(0x1234, 0x5678);
         // No E2E registered — goes straight through the pre-encode check.
         let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
-        let mut sm = SocketManager::<RawPayload>::bind(0, e2e_registry).unwrap();
+        let mut sm = SocketManager::<RawPayload>::bind(0, e2e_registry).await.unwrap();
 
         // Derive a payload that makes the full message exceed the UDP cap
         // by 1 byte regardless of how `UDP_BUFFER_SIZE` is retuned:

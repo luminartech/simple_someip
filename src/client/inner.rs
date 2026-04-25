@@ -273,6 +273,18 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
                 let _ = send_complete.send(Err(Error::Capacity(structure_name)));
                 let _ = response.send(Err(Error::Capacity(structure_name)));
             }
+            // QueryRebootFlag and ForceSdSessionWrappedForTest carry
+            // non-Result oneshot payloads, so there is no Err variant to
+            // deliver — drop the sender, which surfaces as RecvError on
+            // the awaiting side. These are internal/test paths, not the
+            // public APIs whose unwrap-on-RecvError would panic callers.
+            Self::QueryRebootFlag(_) => {
+                let _ = structure_name;
+            }
+            #[cfg(test)]
+            Self::ForceSdSessionWrappedForTest(_, _) => {
+                let _ = structure_name;
+            }
         }
     }
 }
