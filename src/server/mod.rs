@@ -2012,10 +2012,11 @@ mod tests {
     async fn announcement_loop_sends_offer_service_when_driven() {
         use crate::protocol::MessageId;
 
-        // Use a distinct service/instance ID so parallel tests joined to
-        // the same SD multicast group do not produce false matches.
-        const SID: u16 = 0x005C;
-        const IID: u16 = 0x0001;
+        // Use service/instance IDs not used elsewhere in this test module
+        // so parallel tests joined to the same SD multicast group cannot
+        // produce false matches.
+        const SID: u16 = 0xAA01;
+        const IID: u16 = 0xFF01;
 
         // Bind a receiver on the SD multicast port with loopback so we
         // actually see the outgoing announcement. Use a dedicated
