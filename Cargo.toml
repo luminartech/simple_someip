@@ -1,5 +1,10 @@
 [workspace]
-members = [".", "examples/discovery_client", "examples/client_server"]
+members = [
+    ".",
+    "examples/bare_metal",
+    "examples/client_server",
+    "examples/discovery_client",
+]
 
 [package]
 name = "simple-someip"
@@ -41,6 +46,21 @@ default = ["std"]
 std = ["embedded-io/std", "thiserror/std", "tracing/std"]
 client = ["std", "dep:tokio", "dep:socket2", "dep:futures"]
 server = ["std", "dep:tokio", "dep:socket2", "dep:futures"]
+# Marks a build as intended for bare-metal / no_std consumption.
+# Currently a pure marker — enables no crate code on its own. Reserved
+# for future phases to gate no_std-specific helper types.
+#
+# **To demonstrate the bare-metal trait surface, use the
+# `examples/bare_metal` workspace member directly:** `cargo run -p
+# bare_metal`. That workspace member depends on `simple-someip` with
+# `default-features = false, features = ["bare_metal"]`, so it
+# exercises the actual bare-metal configuration.
+#
+# Enabling `bare_metal` on its own does NOT make the crate
+# bare-metal-complete: the `client` and `server` feature paths still
+# spawn per-socket I/O loops on `tokio::spawn`, and a fully tokio-free
+# build additionally needs a user-provided `Spawner` impl (phase 9).
+bare_metal = []
 
 [[test]]
 name = "client_server"

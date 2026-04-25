@@ -378,6 +378,22 @@ where
     /// channel, so it may block if that bounded channel is full. Useful for
     /// periodic renewals where waiting for subscription processing is
     /// unnecessary.
+    ///
+    /// The response oneshot is simply dropped at the end of this call.
+    /// The inner loop's send-to-dropped-receiver path is not logged at
+    /// `warn!`; at most it is logged at `debug!`, so fire-and-forget usage
+    /// remains low-noise.
+    ///
+    /// # Silent drop on a closed channel
+    ///
+    /// Unlike the other `Client` methods (which `.unwrap()` the `send`
+    /// result and therefore panic if the run-loop has exited and closed
+    /// the receiver), `subscribe_no_wait` deliberately discards the
+    /// `send` result. If the client run-loop has exited, the request is
+    /// silently dropped — there is no error surface and no panic. This
+    /// matches the fire-and-forget contract: callers that need to know
+    /// whether the subscription was actually dispatched should use
+    /// [`subscribe`](Self::subscribe) instead.
     pub async fn subscribe_no_wait(
         &self,
         service_id: u16,
@@ -387,7 +403,7 @@ where
         event_group_id: u16,
         client_port: u16,
     ) {
-        let (response, message) = ControlMessage::subscribe(
+        let (_response, message) = ControlMessage::subscribe(
             service_id,
             instance_id,
             major_version,
@@ -396,11 +412,6 @@ where
             client_port,
         );
         let _ = self.control_sender.send(message).await;
-        // Consume the response in the background so the inner loop doesn't
-        // warn about a dropped receiver.
-        tokio::spawn(async move {
-            let _ = response.await;
-        });
     }
 
     /// Returns the current SD reboot flag tracked by the client.
@@ -863,6 +874,46 @@ mod tests {
         client
             .subscribe_no_wait(0xFFFF, 0xFFFF, 1, 3, 0x01, 0)
             .await;
+        client.shut_down();
+    }
+
+    /// Stress test: 200 back-to-back `subscribe_no_wait` calls, each of
+    /// which drops its response oneshot. Phase 8(a) removed the
+    /// `tokio::spawn(drain-the-oneshot)` wrapper this function used to
+    /// have, and dropped the `warn!("...response receiver dropped")`
+    /// sites in the inner loop. Regressions that re-introduce either
+    /// would show up as either (a) hundreds of orphan spawned tasks
+    /// (not directly testable without instrumentation) or (b) log-noise
+    /// pollution / a hung inner loop (directly testable — asserted by
+    /// `assert_inner_alive` at the end).
+    #[tokio::test]
+    async fn test_subscribe_no_wait_fire_and_forget_stress() {
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        tokio::spawn(run_fut);
+
+        // Unknown service so the inner loop's ServiceNotFound branch
+        // fires on every iteration — that's the path where the
+        // response oneshot is dropped and the (removed) warn used to
+        // fire. 200 iterations is well above the control-channel
+        // buffer size (4) to also exercise backpressure.
+        for _ in 0..200 {
+            client
+                .subscribe_no_wait(0xFFFF, 0xFFFF, 1, 3, 0x01, 0)
+                .await;
+        }
+
+        // Inner loop must still be responsive after the stress.
+        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.request(0xFFFF, 0xFFFF, msg),
+        )
+        .await
+        .expect("inner loop unresponsive after 200 subscribe_no_wait calls");
+        assert!(
+            matches!(result, Err(Error::ServiceNotFound)),
+            "expected ServiceNotFound, got {result:?}"
+        );
         client.shut_down();
     }
 
