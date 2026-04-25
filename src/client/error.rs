@@ -46,4 +46,46 @@ pub enum Error {
     /// (→ `crate::UDP_BUFFER_SIZE`).
     #[error("internal capacity exceeded: {0}")]
     Capacity(&'static str),
+    /// An error surfaced by the pluggable transport backend (see
+    /// [`crate::transport::TransportError`]).
+    #[error(transparent)]
+    Transport(#[from] crate::transport::TransportError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::TransportError;
+    use std::format;
+
+    #[test]
+    fn transport_variant_displays_via_inner_display_not_debug() {
+        // Regression guard: previously `{0:?}` leaked debug formatting
+        // (e.g. `AddressInUse`) into user-facing error messages. The
+        // `#[error(transparent)]` form delegates fully to the inner
+        // `TransportError`'s Display impl.
+        let err = Error::Transport(TransportError::AddressInUse);
+        let displayed = format!("{err}");
+
+        // No debug-format artifacts: no braces (`AddressInUse` is a unit
+        // variant, but struct-like variants would debug-format with
+        // braces), no quote-wrapping, no raw variant name from debug.
+        assert!(
+            !displayed.contains('{'),
+            "unexpected `{{` in Display output: {displayed:?}"
+        );
+        assert!(
+            !displayed.contains('}'),
+            "unexpected `}}` in Display output: {displayed:?}"
+        );
+        assert!(
+            !displayed.contains('"'),
+            "unexpected `\"` in Display output: {displayed:?}"
+        );
+
+        // `transparent` delegates to the inner Display verbatim.
+        let inner = format!("{}", TransportError::AddressInUse);
+        assert_eq!(displayed, inner);
+        assert_eq!(displayed, "address in use");
+    }
 }

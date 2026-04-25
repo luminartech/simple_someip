@@ -2,19 +2,28 @@ use crate::{
     UDP_BUFFER_SIZE,
     e2e::{E2ECheckStatus, E2EKey, E2ERegistry},
     protocol::{Message, MessageView, sd},
+    tokio_transport::TokioTransport,
     traits::{PayloadWireFormat, WireFormat},
+    transport::{ReceivedDatagram, SocketOptions, TransportFactory, TransportSocket},
 };
 
 use super::error::Error;
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
-use tokio::{net::UdpSocket, select, sync::mpsc};
-use tracing::{error, info, trace};
+use tokio::{select, sync::mpsc};
+use tracing::{debug, error, info, trace};
 
 /// A received message together with the source address it came from.
+///
+/// TODO(phase 6): narrow `source` to `SocketAddrV4` to match the
+/// `TransportSocket` trait's IPv4-only contract — today the field is
+/// always a `SocketAddr::V4(_)` wrapping, and the V6 variant is
+/// unreachable. Deferred here because the rename ripples through
+/// `DiscoveryMessage` and `ClientUpdate::Unicast`, which is scope creep
+/// for phase 5.
 #[derive(Clone, Debug)]
 pub struct ReceivedMessage<P> {
     pub message: Message<P>,
@@ -63,32 +72,54 @@ impl<MessageDefinitions> SocketManager<MessageDefinitions>
 where
     MessageDefinitions: PayloadWireFormat + 'static,
 {
-    /// Bind the SD multicast socket, seeding the session counter and wrap state from
-    /// a previous socket when rebinding. Pass `(1, false)` for a fresh bind.
-    /// Preserving state across rebinds avoids emitting a false reboot signal
-    /// (`reboot_flag=1`) to peers after `unbind_discovery` + `bind_discovery`.
-    pub fn bind_discovery_seeded(
+    /// Bind the SD multicast socket, seeding the session counter and wrap
+    /// state from a previous socket when rebinding. Pass `(1, false)` for a
+    /// fresh bind. Preserving state across rebinds avoids emitting a false
+    /// reboot signal (`reboot_flag=1`) to peers after
+    /// `unbind_discovery` + `bind_discovery`.
+    ///
+    /// Uses the default [`TokioTransport`] backend. For tests or alternate
+    /// bind logic (e.g. an interceptor factory around `TokioTransport`),
+    /// use [`Self::bind_discovery_seeded_with_transport`].
+    pub async fn bind_discovery_seeded(
         interface: Ipv4Addr,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
     ) -> Result<Self, Error> {
+        Self::bind_discovery_seeded_with_transport(
+            &TokioTransport,
+            interface,
+            e2e_registry,
+            session_id,
+            session_has_wrapped,
+            multicast_loopback,
+        )
+        .await
+    }
+
+    /// Variant of [`Self::bind_discovery_seeded`] that constructs the
+    /// underlying socket through a caller-supplied [`TransportFactory`].
+    /// The factory must still produce a
+    /// [`TokioSocket`](crate::tokio_transport::TokioSocket) because the
+    /// spawned I/O loop is currently tokio-specific; once phase 6 hoists
+    /// the spawn out of this function, this bound will be relaxed to any
+    /// `TransportSocket`.
+    pub async fn bind_discovery_seeded_with_transport<F>(
+        factory: &F,
+        interface: Ipv4Addr,
+        e2e_registry: Arc<Mutex<E2ERegistry>>,
+        session_id: u16,
+        session_has_wrapped: bool,
+        multicast_loopback: bool,
+    ) -> Result<Self, Error>
+    where
+        F: TransportFactory<Socket = crate::tokio_transport::TokioSocket>,
+    {
         let (rx_tx, rx_rx) = mpsc::channel(16);
         let (tx_tx, tx_rx) = mpsc::channel(16);
-        let bind_addr =
-            std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), sd::MULTICAST_PORT);
 
-        // Create socket with SO_REUSEADDR to allow quick restart
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )?;
-        socket.set_reuse_address(true)?;
-        #[cfg(unix)]
-        socket.set_reuse_port(true)?;
-        socket.set_multicast_if_v4(&interface)?;
         // Control whether multicast packets sent by this socket are looped
         // back to sockets on the same host — INCLUDING this socket itself.
         // Disabled by default to avoid parsing self-sent OfferService /
@@ -97,12 +128,17 @@ where
         // deliver this socket's own SD multicasts back to it, so higher-level
         // consumers must be prepared to see their own announcements surface
         // as inbound discovery traffic.
-        socket.set_multicast_loop_v4(multicast_loopback)?;
-        socket.bind(&bind_addr.into())?;
-        socket.set_nonblocking(true)?;
-        let socket: std::net::UdpSocket = socket.into();
-        let socket = UdpSocket::from_std(socket)?;
+        let options = {
+            let mut o = SocketOptions::new();
+            o.reuse_address = true;
+            o.reuse_port = true;
+            o.multicast_if_v4 = Some(interface);
+            o.multicast_loop_v4 = multicast_loopback;
+            o
+        };
+        let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, sd::MULTICAST_PORT);
 
+        let socket = factory.bind(bind_addr, &options).await?;
         socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
 
         Self::spawn_socket_loop(socket, rx_tx, tx_rx, e2e_registry);
@@ -115,22 +151,33 @@ where
         })
     }
 
-    pub fn bind(port: u16, e2e_registry: Arc<Mutex<E2ERegistry>>) -> Result<Self, Error> {
+    pub async fn bind(port: u16, e2e_registry: Arc<Mutex<E2ERegistry>>) -> Result<Self, Error> {
+        Self::bind_with_transport(&TokioTransport, port, e2e_registry).await
+    }
+
+    /// Variant of [`Self::bind`] that constructs the underlying socket
+    /// through a caller-supplied [`TransportFactory`]. See
+    /// [`Self::bind_discovery_seeded_with_transport`] for the factory
+    /// bound rationale.
+    pub async fn bind_with_transport<F>(
+        factory: &F,
+        port: u16,
+        e2e_registry: Arc<Mutex<E2ERegistry>>,
+    ) -> Result<Self, Error>
+    where
+        F: TransportFactory<Socket = crate::tokio_transport::TokioSocket>,
+    {
         let (rx_tx, rx_rx) = mpsc::channel(4);
         let (tx_tx, tx_rx) = mpsc::channel(4);
-        let bind_addr = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
 
-        // Create socket with SO_REUSEADDR and SO_REUSEPORT to allow quick restart
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )?;
-        socket.set_reuse_address(true)?;
-        socket.bind(&bind_addr.into())?;
-        socket.set_nonblocking(true)?;
-        let socket: std::net::UdpSocket = socket.into();
-        let socket = UdpSocket::from_std(socket)?;
+        let options = {
+            let mut o = SocketOptions::new();
+            o.reuse_address = true;
+            o
+        };
+        let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+
+        let socket = factory.bind(bind_addr, &options).await?;
         let port = socket.local_addr()?.port();
         Self::spawn_socket_loop(socket, rx_tx, tx_rx, e2e_registry);
         Ok(Self {
@@ -204,9 +251,23 @@ where
         _ = receiver.recv().await;
     }
 
+    /// Spawn the I/O loop over a concrete [`TokioSocket`].
+    ///
+    /// The loop body's entire I/O surface on the socket is `send_to`
+    /// and `recv_from` — both trait methods. Multicast membership
+    /// (`join_multicast_v4`) is set up by the caller *before* calling
+    /// this function, never from inside the spawned task, so the
+    /// per-loop I/O surface stays on just the two send/recv methods.
+    /// Because no `TokioSocket`-specific inherent methods are used
+    /// inside, generalizing this function over `T: TransportSocket` is
+    /// a mechanical change once the outer `tokio::spawn` is hoisted
+    /// out in phase 6 (stable Rust's `Send` bounds on RPITIT method
+    /// returns are currently expressible only via return-type notation,
+    /// which is nightly — hoisting the spawn avoids the issue by moving
+    /// the `Send` requirement off this function entirely).
     #[allow(clippy::too_many_lines)]
     fn spawn_socket_loop(
-        socket: UdpSocket,
+        socket: crate::tokio_transport::TokioSocket,
         rx_tx: mpsc::Sender<Result<ReceivedMessage<MessageDefinitions>, Error>>,
         mut tx_rx: mpsc::Receiver<SendMessage<MessageDefinitions>>,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
@@ -217,7 +278,18 @@ where
                 select! {
                     result = socket.recv_from(&mut buf) => {
                         match result {
-                            Ok((bytes_received, source_address)) => {
+                            Ok(ReceivedDatagram { bytes_received, source, truncated }) => {
+                                if truncated {
+                                    // A truncated datagram cannot be parsed reliably;
+                                    // the length field in the SOME/IP header will not
+                                    // match the bytes we received. Log and drop.
+                                    error!(
+                                        "Discarding truncated datagram from {}: {} bytes received",
+                                        source, bytes_received
+                                    );
+                                    continue;
+                                }
+                                let source_address = SocketAddr::V4(source);
                                 let parse_result = MessageView::parse(&buf[..bytes_received])
                                     .and_then(|view| {
                                         let header = view.header().to_owned();
@@ -242,15 +314,26 @@ where
                                         })
                                     })
                                     .map_err(Error::from);
-                                if let Ok(()) = rx_tx.send( parse_result ).await {} else {
+                                if rx_tx.send(parse_result).await.is_err() {
                                     info!("Socket Dropping");
                                     // The receiver has been dropped, so we should exit
                                     break;
                                 }
                             }
                             Err(e) => {
-
-                                error!("Error decoding message: {:?}", e);
+                                // This arm is the transport-level recv_from
+                                // result; decoding runs further up inside
+                                // `MessageView::parse`. An `Err` here is an
+                                // I/O failure on the socket read, not a
+                                // decode failure.
+                                //
+                                // `map_io_error` in tokio_transport already
+                                // logs the raw OS error + kind (at `warn!`
+                                // for actionable kinds, `debug!` for
+                                // steady-state noise like `TimedOut`), so
+                                // stay at `debug!` here to avoid double-
+                                // logging the same failure at `error!`.
+                                debug!("recv_from returned error on socket loop: {:?}", e);
                             }
                         }
                     },
@@ -276,12 +359,12 @@ where
                                 Err(e) => {
                                     error!("Failed to encode message: {:?}", e);
                                     // If the sender is already closed we can't send the error back, so we shut everything down
-                                    if let Ok(()) = send_message.response.send(Err(e.into())) {
-                                        // Successfully sent error back to sender, carry on
-                                        continue;
+                                    if send_message.response.send(Err(e.into())).is_err() {
+                                        error!("Socket owner closed channel unexpectedly, closing socket.");
+                                        break;
                                     }
-                                    error!("Socket owner closed channel unexpectedly, closing socket.");
-                                    break;
+                                    // Successfully sent error back to sender, carry on
+                                    continue;
                                 }
                             };
 
@@ -326,17 +409,16 @@ where
                             }
 
                             match socket.send_to(&buf[..message_length], send_message.target_addr).await {
-                                Ok(_bytes_sent) => {
+                                Ok(()) => {
                                     trace!("Sent {} bytes to {}", message_length, send_message.target_addr);
-                                    if let Ok(()) = send_message.response.send(Ok(())) {} else {
+                                    if send_message.response.send(Ok(())).is_err() {
                                         info!("Socket owner closed channel, closing socket.");
                                         // The sender has been dropped, so we should exit
                                         break;
                                     }
                                 }
                                 Err(e) => {
-                                    error!("Failed to send message with error: {:?}", e);
-                                    if let Ok(()) = send_message.response.send(Err(Error::Io(e))) {  } else {
+                                    if send_message.response.send(Err(Error::Transport(e))).is_err() {
                                         error!("Socket owner closed channel unexpectedly, closing socket.");
                                         break;
                                     }
@@ -360,6 +442,10 @@ mod tests {
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
     use std::format;
     use std::vec;
+    // Tests build ad-hoc UDP peers via tokio directly; this is not part of
+    // the production code path, which goes through the `TransportSocket`
+    // abstraction via `TokioTransport`.
+    use tokio::net::UdpSocket;
 
     type TestSocketManager = SocketManager<TestPayload>;
 
@@ -369,7 +455,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bind_ephemeral_port() {
-        let sm = TestSocketManager::bind(0, test_registry()).unwrap();
+        let sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
         assert!(sm.port() > 0);
         assert_eq!(sm.session_id(), 1);
     }
@@ -387,13 +473,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_socket_manager_shut_down() {
-        let sm = TestSocketManager::bind(0, test_registry()).unwrap();
+        let sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
         sm.shut_down().await;
     }
 
     #[tokio::test]
     async fn test_socket_manager_send_and_receive() {
-        let mut sm = TestSocketManager::bind(0, test_registry()).unwrap();
+        let mut sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
         let sm_port = sm.port();
 
         // Create a raw UDP socket to send data to the SocketManager
@@ -425,7 +511,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_poll_receive() {
-        let mut sm = TestSocketManager::bind(0, test_registry()).unwrap();
+        let mut sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
         let sm_port = sm.port();
 
         // Send a message to the socket manager from a raw socket
@@ -451,7 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_drops_when_socket_loop_exits() {
-        let mut sm = TestSocketManager::bind(0, test_registry()).unwrap();
+        let mut sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
         // Shut down the socket loop by dropping the internal channels
         // We can't directly kill the loop, but we can test the error path
         // by sending to a socket manager that has been shut down.
@@ -495,7 +581,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_socket_manager_debug() {
-        let sm = TestSocketManager::bind(0, test_registry()).unwrap();
+        let sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
         let s = format!("{sm:?}");
         assert!(s.contains("SocketManager"));
         sm.shut_down().await;
@@ -503,7 +589,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_socket_manager_send_to_target() {
-        let mut sm = TestSocketManager::bind(0, test_registry()).unwrap();
+        let mut sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
 
         // Create a raw socket to receive
         let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -542,13 +628,14 @@ mod tests {
             false,
             false,
         )
+        .await
         .unwrap();
         assert_eq!(sm.session_id(), 1, "session_id 0 must be normalized to 1");
     }
 
     #[tokio::test]
     async fn test_session_id_wraps_to_one_and_clears_reboot_flag() {
-        let mut sm = TestSocketManager::bind(0, test_registry()).unwrap();
+        let mut sm = TestSocketManager::bind(0, test_registry()).await.unwrap();
         let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target =
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_socket.local_addr().unwrap().port());
@@ -604,7 +691,9 @@ mod tests {
         reg.register(key, E2EProfile::Profile4(Profile4Config::new(0, 15)));
         let e2e_registry = Arc::new(Mutex::new(reg));
 
-        let mut sm = SocketManager::<RawPayload>::bind(0, e2e_registry).unwrap();
+        let mut sm = SocketManager::<RawPayload>::bind(0, e2e_registry)
+            .await
+            .unwrap();
 
         // Craft a message whose raw-encoded size fits `UDP_BUFFER_SIZE`
         // exactly (header + payload = cap) but whose E2E-protected size
@@ -651,7 +740,7 @@ mod tests {
         let message_id = MessageId::new_from_service_and_method(0x1234, 0x5678);
         // No E2E registered — goes straight through the pre-encode check.
         let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
-        let mut sm = SocketManager::<RawPayload>::bind(0, e2e_registry).unwrap();
+        let mut sm = SocketManager::<RawPayload>::bind(0, e2e_registry).await.unwrap();
 
         // Derive a payload that makes the full message exceed the UDP cap
         // by 1 byte regardless of how `UDP_BUFFER_SIZE` is retuned:
@@ -684,5 +773,63 @@ mod tests {
             Error::Capacity(tag) => assert_eq!(tag, "udp_buffer"),
             other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
         }
+    }
+
+    /// Proves the public `bind_with_transport` entry point accepts an
+    /// alternative `TransportFactory` implementation. The factory here is
+    /// a thin interceptor that counts how many times `bind` is called; it
+    /// delegates to the built-in `TokioTransport`, which is what the
+    /// current `Socket = TokioSocket` bound requires.
+    ///
+    /// TODO: extend this with an end-to-end round-trip test that uses a
+    /// custom factory to actually carry traffic (send from socket A,
+    /// receive on socket B, assert bytes match), and a negative test
+    /// where the factory returns `Err(TransportError::AddressInUse)`
+    /// and asserts that surfaces as `Error::Transport(...)` through the
+    /// `?` + `From` chain. Both are scoped for the phase-6 branch where
+    /// the spawn hoist lets us swap the socket type, not just the bind
+    /// logic.
+    #[tokio::test]
+    async fn bind_with_transport_accepts_custom_factory() {
+        use crate::tokio_transport::{TokioSocket, TokioTransport};
+        use core::future::Future;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingFactory {
+            inner: TokioTransport,
+            calls: AtomicUsize,
+        }
+
+        impl TransportFactory for CountingFactory {
+            type Socket = TokioSocket;
+            fn bind(
+                &self,
+                addr: SocketAddrV4,
+                options: &SocketOptions,
+            ) -> impl Future<Output = Result<Self::Socket, crate::transport::TransportError>>
+            {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                // Clone the options into the async block so no borrow
+                // escapes the returned future.
+                let options = *options;
+                let inner = self.inner;
+                async move { inner.bind(addr, &options).await }
+            }
+        }
+
+        let factory = CountingFactory {
+            inner: TokioTransport,
+            calls: AtomicUsize::new(0),
+        };
+
+        let sm = TestSocketManager::bind_with_transport(&factory, 0, test_registry())
+            .await
+            .expect("bind via custom factory");
+        assert_eq!(
+            factory.calls.load(Ordering::SeqCst),
+            1,
+            "custom factory should have been invoked exactly once"
+        );
+        drop(sm);
     }
 }

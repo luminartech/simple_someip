@@ -132,14 +132,15 @@ mod raw_payload;
 /// SOME/IP server for offering services and handling incoming requests.
 #[cfg(feature = "server")]
 pub mod server;
+/// Tokio + `socket2` implementation of the [`transport`] traits. Provided
+/// as the default `std` backend — available whenever `client` or `server`
+/// is enabled.
+#[cfg(any(feature = "client", feature = "server"))]
+pub mod tokio_transport;
 mod traits;
-/// Executor-agnostic UDP transport abstraction. `no_std`-compatible.
-///
-/// Intended to be consumed by the `client` and `server` modules in a
-/// future refactor; currently those paths still use `tokio` / `socket2`
-/// directly. The trait surface is defined here so bare-metal consumers
-/// can implement it today against their own stack and be ready when the
-/// higher-level modules are migrated.
+/// Executor-agnostic UDP transport abstraction used by the client and
+/// server modules. `no_std`-compatible; a default `std + tokio` backend
+/// ships in [`tokio_transport`] under the `client` / `server` features.
 pub mod transport;
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
@@ -152,6 +153,8 @@ pub use client::{Client, ClientUpdate, ClientUpdates, DiscoveryMessage, PendingR
 pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
 pub use server::Server;
+#[cfg(any(feature = "client", feature = "server"))]
+pub use tokio_transport::{TokioSocket, TokioTimer, TokioTransport};
 pub use transport::{
     IoErrorKind, ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory,
     TransportSocket,

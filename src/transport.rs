@@ -77,11 +77,16 @@
 //!
 //! # Status
 //!
-//! The traits are defined but not yet wired into `Client`/`Server`; that is
-//! the next refactor step. No implementations ship with the crate yet.
-//! Callers must provide their own backend — typically a thin adapter over
-//! `tokio::net::UdpSocket` + `tokio::time` on `std`, or over
-//! `smoltcp::UdpSocket` + `embassy-time` on embedded.
+//! A default `std + tokio` implementation
+//! (`crate::tokio_transport::TokioTransport`,
+//! `crate::tokio_transport::TokioSocket`, `crate::tokio_transport::TokioTimer`)
+//! ships under the `client` and `server` features and is re-exported at the
+//! crate root. The paths are rendered as code literals rather than
+//! intra-doc links because the `tokio_transport` module is feature-gated,
+//! and links would otherwise break default-feature rustdoc builds. Other
+//! backends (for example `smoltcp::UdpSocket` + `embassy-time` on embedded)
+//! are the consumer's responsibility — the traits here are the integration
+//! point.
 //!
 //! # Minimal adapter sketch
 //!
@@ -208,21 +213,27 @@ use core::time::Duration;
 /// kinds can be added without a breaking change. Kept local to this crate
 /// (rather than re-exporting `embedded_io::ErrorKind`) so our public API
 /// does not move when `embedded_io` bumps major versions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum IoErrorKind {
     /// The operation timed out.
+    #[error("operation timed out")]
     TimedOut,
     /// The operation was interrupted and can be retried.
+    #[error("operation interrupted")]
     Interrupted,
     /// The caller lacks permission for the operation.
+    #[error("permission denied")]
     PermissionDenied,
     /// A remote peer actively refused the connection / destination was
     /// unreachable.
+    #[error("connection refused")]
     ConnectionRefused,
     /// The network layer rejected the operation (routing, MTU, etc.).
+    #[error("network unreachable")]
     NetworkUnreachable,
     /// Any error that does not fit a more specific variant.
+    #[error("i/o error")]
     Other,
 }
 
@@ -234,16 +245,19 @@ pub enum IoErrorKind {
 /// native error types into one of these variants; anything that does not
 /// fit a specific variant should use [`TransportError::Io`] with an
 /// appropriate [`IoErrorKind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum TransportError {
     /// Bind failed because the address or port is already in use.
+    #[error("address in use")]
     AddressInUse,
     /// The operation is not supported by this transport (for example,
     /// multicast on a backend that has none, or an IPv6 address on an
     /// IPv4-only stack).
+    #[error("unsupported transport operation")]
     Unsupported,
     /// A generic I/O error, classified by a portable [`IoErrorKind`].
+    #[error("transport i/o: {0}")]
     Io(IoErrorKind),
 }
 
