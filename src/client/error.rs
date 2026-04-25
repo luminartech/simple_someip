@@ -1,6 +1,21 @@
 use thiserror::Error;
 
 /// Errors that can occur during SOME/IP client operations.
+///
+/// # Stability
+///
+/// This enum is **not** marked `#[non_exhaustive]`, so downstream crates
+/// may currently match it exhaustively. That convenience comes with a
+/// real cost: **any new variant added here is a breaking change** and
+/// must be flagged in the changelog and reflected in the next SemVer
+/// bump (pre-1.0, a minor bump is sufficient, but it still requires a
+/// release-notes entry). The same is true of renaming or restructuring
+/// existing variants.
+///
+/// Marking this `#[non_exhaustive]` — so future additions become
+/// non-breaking — is planned as part of an explicit breaking release;
+/// until then, treat variant additions as breaking and plan the release
+/// accordingly.
 #[derive(Error, Debug)]
 pub enum Error {
     /// A SOME/IP protocol-level error.
@@ -24,4 +39,9 @@ pub enum Error {
     /// An E2E protection or checking error occurred.
     #[error(transparent)]
     E2e(#[from] crate::e2e::Error),
+    /// A fixed-capacity internal structure is full. The argument names the
+    /// structure so bare-metal users can size the corresponding compile-time
+    /// constant up (e.g. `"unicast_sockets"`).
+    #[error("internal capacity exceeded: {0}")]
+    Capacity(&'static str),
 }

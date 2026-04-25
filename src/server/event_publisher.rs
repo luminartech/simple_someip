@@ -242,15 +242,32 @@ impl EventPublisher {
     /// `remove_subscriber` when no refresh has arrived within the
     /// advertised TTL — otherwise subscribers accumulate for the
     /// lifetime of the process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::server::SubscribeError`] when the underlying
+    /// [`SubscriptionManager`] cannot record the subscription because a
+    /// bounded capacity was hit:
+    /// - `SubscribersPerGroupFull` — the per-event-group subscriber list
+    ///   is full.
+    /// - `EventGroupsFull` — the outer event-group map is full.
+    ///
+    /// On `Err`, the subscriber was **not** registered and no events
+    /// will be delivered to `subscriber_addr` for this event group.
+    /// External dispatchers should treat this the same way the server's
+    /// own `run()` loop does: emit a `SubscribeNack` (or equivalent
+    /// upstream notification) so the peer does not assume it is
+    /// subscribed. A duplicate registration for an already-subscribed
+    /// address returns `Ok(())` (deduplicated).
     pub async fn register_subscriber(
         &self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: std::net::SocketAddrV4,
-    ) {
+    ) -> Result<(), crate::server::SubscribeError> {
         let mut mgr = self.subscriptions.write().await;
-        mgr.subscribe(service_id, instance_id, event_group_id, subscriber_addr);
+        mgr.subscribe(service_id, instance_id, event_group_id, subscriber_addr)
     }
 
     /// Remove a previously-registered subscriber from an event group.
@@ -345,7 +362,7 @@ mod tests {
         // Add subscriber
         {
             let mut mgr = subscriptions.write().await;
-            mgr.subscribe(0x5B, 1, 0x01, recv_addr);
+            mgr.subscribe(0x5B, 1, 0x01, recv_addr).unwrap();
         }
 
         let (publisher, _) = make_publisher(subscriptions).await;
@@ -388,7 +405,7 @@ mod tests {
 
         {
             let mut mgr = subscriptions.write().await;
-            mgr.subscribe(0x5B, 1, 0x01, recv_addr);
+            mgr.subscribe(0x5B, 1, 0x01, recv_addr).unwrap();
         }
 
         let (publisher, _) = make_publisher(subscriptions).await;
@@ -422,8 +439,8 @@ mod tests {
 
         {
             let mut mgr = subscriptions.write().await;
-            mgr.subscribe(0x5B, 1, 0x01, addr1);
-            mgr.subscribe(0x5B, 1, 0x01, addr2);
+            mgr.subscribe(0x5B, 1, 0x01, addr1).unwrap();
+            mgr.subscribe(0x5B, 1, 0x01, addr2).unwrap();
         }
 
         let (publisher, _) = make_publisher(subscriptions).await;
@@ -444,7 +461,8 @@ mod tests {
                 1,
                 0x01,
                 SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 9001),
-            );
+            )
+            .unwrap();
         }
 
         assert!(publisher.has_subscribers(0x5B, 1, 0x01).await);
@@ -466,7 +484,7 @@ mod tests {
         let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
 
         assert!(!publisher.has_subscribers(0x5B, 1, 0x01).await);
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
         assert!(publisher.has_subscribers(0x5B, 1, 0x01).await);
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
     }
@@ -478,9 +496,9 @@ mod tests {
 
         // Simulate TTL refreshes — the same (tuple, addr) called repeatedly
         // must not grow the subscriber list.
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
 
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
     }
@@ -490,8 +508,8 @@ mod tests {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
         let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
 
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
-        publisher.register_subscriber(0x5B, 1, 0x02, ADDR_A).await;
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
+        publisher.register_subscriber(0x5B, 1, 0x02, ADDR_A).await.unwrap();
 
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x02).await, 1);
@@ -504,7 +522,7 @@ mod tests {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
         let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
 
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
         assert!(publisher.has_subscribers(0x5B, 1, 0x01).await);
 
         publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_A).await;
@@ -517,9 +535,9 @@ mod tests {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
         let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
 
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_B).await;
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_C).await;
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_B).await.unwrap();
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_C).await.unwrap();
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 3);
 
         publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_B).await;
@@ -544,7 +562,7 @@ mod tests {
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 0);
 
         // Register one subscriber, then remove a different address.
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
         publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_B).await;
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
 
@@ -558,8 +576,8 @@ mod tests {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
         let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
 
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_B).await;
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_B).await.unwrap();
         assert!(publisher.has_subscribers(0x5B, 1, 0x01).await);
 
         publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_A).await;
@@ -576,9 +594,9 @@ mod tests {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
         let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
 
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
         publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_A).await;
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await;
+        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
 
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
     }

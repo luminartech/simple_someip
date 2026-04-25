@@ -2,10 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`client::Error::Capacity(&'static str)`** — new variant returned when a fixed-capacity internal structure is full (e.g. `"unicast_sockets"`, `"udp_buffer"`). Because `client::Error` is not `#[non_exhaustive]`, this is a breaking change for downstream crates that match the enum exhaustively.
+- **`server::SubscribeError`** — new public enum (`SubscribersPerGroupFull`, `EventGroupsFull`) returned by `SubscriptionManager::subscribe` and `EventPublisher::register_subscriber` when a bounded capacity rejects a subscription. Re-exported from `server::mod`.
+
 ### Changed
 
-- **`std` is now the default feature** — the crate enables `std` (with `thiserror` and `tracing`) by default. Users targeting `no_std` environments must set `default-features = false` in their `Cargo.toml`.
-- **`thiserror` and `tracing` use `default-features = false`** — both dependencies are always included but their `std` features are only enabled when the crate's `std` feature is active. This removes the need for `#[cfg(feature = "std")]` gating on error types and logging macros.
+- **Breaking: `server::SubscriptionManager::subscribe` signature change** — now returns `Result<(), server::SubscribeError>` instead of `()`. Previously, capacity rejections were silently dropped with only a `warn!` log, which let the server emit a `SubscribeAck` for a subscription that had not been recorded. Callers must now handle the `Err` path (the server's own SD loop emits `SubscribeNack` on `Err`).
+- **Breaking: `server::EventPublisher::register_subscriber` signature change** — now returns `Result<(), server::SubscribeError>` instead of `()`, surfacing the same capacity-rejection signal to externally managed subscription dispatchers.
 
 
 ## [0.6.0](https://github.com/luminartech/simple_someip/compare/v0.5.3...v0.6.0) - 2026-04-20

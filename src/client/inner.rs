@@ -1,6 +1,6 @@
+use heapless::{Deque, index_map::FnvIndexMap};
 use std::{
     borrow::ToOwned,
-    collections::{HashMap, VecDeque},
     future,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
@@ -28,6 +28,19 @@ use crate::{
 };
 
 use super::error::Error;
+
+/// Max depth of the internal control-message queue. Each entry is one
+/// in-flight `ControlMessage`. Must be generous enough to absorb bursts
+/// from `Client` callers between event-loop ticks.
+const REQUEST_QUEUE_CAP: usize = 32;
+
+/// Max number of outstanding unicast request-response pairs. Each entry is
+/// a `request_id` awaiting a reply. Must be a power of two.
+const PENDING_RESPONSES_CAP: usize = 64;
+
+/// Max number of bound unicast sockets tracked by port. Must be a power of
+/// two.
+const UNICAST_SOCKETS_CAP: usize = 8;
 
 pub(super) enum ControlMessage<P: PayloadWireFormat> {
     SetInterface(Ipv4Addr, oneshot::Sender<Result<(), Error>>),
@@ -232,16 +245,47 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
             Self::ForceSdSessionWrappedForTest(wrapped, sender),
         )
     }
+
+    /// Consume this message and notify its oneshot senders with
+    /// `Error::Capacity(structure_name)` instead of silently dropping them.
+    ///
+    /// Dropping the senders would let the awaiting `oneshot::Receiver`s
+    /// resolve to `RecvError`, which the public APIs currently `.unwrap()`
+    /// — that would panic callers under load. Delivering an explicit
+    /// `Err(Error::Capacity(..))` turns a would-be panic into a normal
+    /// `Result` with a stable, descriptive error.
+    fn reject_with_capacity(self, structure_name: &'static str) {
+        match self {
+            Self::SetInterface(_, response)
+            | Self::BindDiscovery(response)
+            | Self::UnbindDiscovery(response)
+            | Self::SendSD(_, _, response)
+            | Self::AddEndpoint(_, _, _, _, response)
+            | Self::RemoveEndpoint(_, _, response)
+            | Self::Subscribe { response, .. } => {
+                let _ = response.send(Err(Error::Capacity(structure_name)));
+            }
+            Self::SendToService {
+                send_complete,
+                response,
+                ..
+            } => {
+                let _ = send_complete.send(Err(Error::Capacity(structure_name)));
+                let _ = response.send(Err(Error::Capacity(structure_name)));
+            }
+        }
+    }
 }
 
 pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     /// MPSC Receiver used to receive control messages from outer client
     control_receiver: Receiver<ControlMessage<PayloadDefinitions>>,
     /// Queue of pending control messages to process
-    request_queue: VecDeque<ControlMessage<PayloadDefinitions>>,
+    request_queue: Deque<ControlMessage<PayloadDefinitions>, REQUEST_QUEUE_CAP>,
     /// Pending request-responses keyed by `request_id` (`client_id` << 16 | `session_counter`).
     /// Set by `SendToService`, cleared when a matching unicast arrives.
-    pending_responses: HashMap<u32, oneshot::Sender<Result<PayloadDefinitions, Error>>>,
+    pending_responses:
+        FnvIndexMap<u32, oneshot::Sender<Result<PayloadDefinitions, Error>>, PENDING_RESPONSES_CAP>,
     /// Unbounded sender used to send updates to outer client
     update_sender: mpsc::UnboundedSender<ClientUpdate<PayloadDefinitions>>,
     /// Target interface for sockets
@@ -249,7 +293,7 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     /// Socket manager for service discovery if bound
     discovery_socket: Option<SocketManager<PayloadDefinitions>>,
     /// Socket managers for unicast messages, keyed by local port
-    unicast_sockets: HashMap<u16, SocketManager<PayloadDefinitions>>,
+    unicast_sockets: FnvIndexMap<u16, SocketManager<PayloadDefinitions>, UNICAST_SOCKETS_CAP>,
     /// Per-sender SD session state for reboot detection
     session_tracker: SessionTracker,
     /// Registry of known service endpoints (auto-populated from SD + manual)
@@ -301,12 +345,12 @@ where
         let (update_sender, update_receiver) = mpsc::unbounded_channel();
         let inner = Self {
             control_receiver,
-            request_queue: VecDeque::new(),
-            pending_responses: HashMap::new(),
+            request_queue: Deque::new(),
+            pending_responses: FnvIndexMap::new(),
             update_sender,
             interface,
             discovery_socket: None,
-            unicast_sockets: HashMap::new(),
+            unicast_sockets: FnvIndexMap::new(),
             session_tracker: SessionTracker::default(),
             service_registry: ServiceRegistry::default(),
             run: true,
@@ -359,11 +403,74 @@ where
         {
             return Ok(socket.port());
         }
+        // Check capacity before asking the OS for a port so we don't
+        // bind-then-drop a socket we can't track.
+        if self.unicast_sockets.len() >= UNICAST_SOCKETS_CAP {
+            warn!(
+                "unicast_sockets at capacity ({}); refusing new bind of port {}",
+                UNICAST_SOCKETS_CAP, port
+            );
+            return Err(Error::Capacity("unicast_sockets"));
+        }
         let unicast_socket = SocketManager::bind(port, Arc::clone(&self.e2e_registry))?;
         let bound_port = unicast_socket.port();
-        self.unicast_sockets.insert(bound_port, unicast_socket);
+        // Capacity was checked above, so insert cannot report "full" here.
+        // A defensive check guards against a future refactor that changes
+        // the ordering.
+        if self
+            .unicast_sockets
+            .insert(bound_port, unicast_socket)
+            .is_err()
+        {
+            error!(
+                "unicast_sockets insert failed after capacity check passed — invariant violation"
+            );
+            return Err(Error::Capacity("unicast_sockets"));
+        }
         debug!("Bound unicast socket on port {}", bound_port);
         Ok(bound_port)
+    }
+
+    /// Tracks the caller's response channel against `request_id` so a
+    /// future unicast reply can be routed back. If the
+    /// `pending_responses` map is already at `PENDING_RESPONSES_CAP`, the
+    /// `response` sender is recovered from the failed `insert` and used
+    /// to deliver `Err(Error::Capacity("pending_responses"))` — the
+    /// caller's `PendingResponse::response().await` resolves cleanly
+    /// instead of panicking on the `RecvError` that dropping the Sender
+    /// would have produced. If `request_id` is reused while an older
+    /// pending entry still exists (e.g. after a `session_counter`
+    /// wrap-around), the displaced sender is likewise completed with
+    /// `Err(Error::Capacity("pending_responses"))` rather than being
+    /// silently dropped — the caller awaiting the previous request
+    /// sees a clean error instead of a `RecvError` panic. Any reply
+    /// that later arrives for a dropped `request_id` is surfaced on
+    /// the update stream via `ClientUpdate::Unicast` instead of
+    /// matching a pending entry.
+    fn track_or_reject_pending_response(
+        &mut self,
+        request_id: u32,
+        response: oneshot::Sender<Result<PayloadDefinitions, Error>>,
+    ) {
+        match self.pending_responses.insert(request_id, response) {
+            Ok(None) => {}
+            Ok(Some(displaced_response)) => {
+                warn!(
+                    "pending_responses already contained request_id \
+                     0x{:08X}; replacing existing pending response",
+                    request_id
+                );
+                let _ = displaced_response.send(Err(Error::Capacity("pending_responses")));
+            }
+            Err((_req_id, response)) => {
+                warn!(
+                    "pending_responses at capacity ({}); response tracking \
+                     dropped for request_id 0x{:08X}",
+                    PENDING_RESPONSES_CAP, request_id
+                );
+                let _ = response.send(Err(Error::Capacity("pending_responses")));
+            }
+        }
     }
 
     async fn receive_discovery(
@@ -400,7 +507,11 @@ where
     /// Receive from any bound unicast socket. Returns the first message ready
     /// from any socket. If no sockets are bound, returns a future that never resolves.
     async fn receive_any_unicast(
-        unicast_sockets: &mut HashMap<u16, SocketManager<PayloadDefinitions>>,
+        unicast_sockets: &mut FnvIndexMap<
+            u16,
+            SocketManager<PayloadDefinitions>,
+            UNICAST_SOCKETS_CAP,
+        >,
     ) -> Result<ReceivedMessage<PayloadDefinitions>, Error> {
         if unicast_sockets.is_empty() {
             return future::pending().await;
@@ -432,14 +543,31 @@ where
                             self.interface
                         );
                         self.unbind_discovery().await;
-                        self.request_queue
-                            .push_front(ControlMessage::SetInterface(interface, response));
+                        // Re-enqueue after pop. The slot we popped is free,
+                        // so `push_front` should never fail here — but if a
+                        // future refactor breaks that invariant, reject via
+                        // the capacity path instead of silently dropping the
+                        // response oneshot (matches the primary `push_back`
+                        // overflow arm in the control-channel receiver).
+                        if let Err(rejected) = self
+                            .request_queue
+                            .push_front(ControlMessage::SetInterface(interface, response))
+                        {
+                            error!("request_queue push_front failed after pop — invariant broken");
+                            rejected.reject_with_capacity("request_queue");
+                        }
                         return;
                     }
                     if self.interface != interface {
                         self.set_interface(interface);
-                        self.request_queue
-                            .push_front(ControlMessage::SetInterface(interface, response));
+                        // See re-enqueue note above.
+                        if let Err(rejected) = self
+                            .request_queue
+                            .push_front(ControlMessage::SetInterface(interface, response))
+                        {
+                            error!("request_queue push_front failed after pop — invariant broken");
+                            rejected.reject_with_capacity("request_queue");
+                        }
                         return;
                     }
                     info!("Binding to interface: {}", interface);
@@ -474,10 +602,15 @@ where
                         None => {
                             match self.bind_discovery() {
                                 Ok(()) => {
-                                    // Discovery socket successfully bound, send the message on the next loop
-                                    self.request_queue.push_front(ControlMessage::SendSD(
-                                        target, header, response,
-                                    ));
+                                    // See re-enqueue note on SetInterface above.
+                                    if let Err(rejected) = self.request_queue.push_front(
+                                        ControlMessage::SendSD(target, header, response),
+                                    ) {
+                                        error!(
+                                            "request_queue push_front failed after pop — invariant broken"
+                                        );
+                                        rejected.reject_with_capacity("request_queue");
+                                    }
                                 }
                                 Err(e) => {
                                     error!(
@@ -609,7 +742,7 @@ where
                     match send_result {
                         Ok(()) => {
                             let _ = send_complete.send(Ok(()));
-                            self.pending_responses.insert(request_id, response);
+                            self.track_or_reject_pending_response(request_id, response);
                         }
                         Err(e) => {
                             let _ = send_complete.send(Err(e));
@@ -674,15 +807,23 @@ where
                     match &mut self.discovery_socket {
                         None => match self.bind_discovery() {
                             Ok(()) => {
-                                self.request_queue.push_front(ControlMessage::Subscribe {
-                                    service_id,
-                                    instance_id,
-                                    major_version,
-                                    ttl,
-                                    event_group_id,
-                                    client_port,
-                                    response,
-                                });
+                                // See re-enqueue note on SetInterface above.
+                                if let Err(rejected) =
+                                    self.request_queue.push_front(ControlMessage::Subscribe {
+                                        service_id,
+                                        instance_id,
+                                        major_version,
+                                        ttl,
+                                        event_group_id,
+                                        client_port,
+                                        response,
+                                    })
+                                {
+                                    error!(
+                                        "request_queue push_front failed after pop — invariant broken"
+                                    );
+                                    rejected.reject_with_capacity("request_queue");
+                                }
                             }
                             Err(e) => {
                                 let _ = response.send(Err(e));
@@ -746,7 +887,19 @@ where
                     ctrl = control_receiver.recv() => {
                         if let Some(ctrl) = ctrl {
                             debug!("Received control message: {:?}", ctrl);
-                            request_queue.push_back(ctrl);
+                            if let Err(rejected) = request_queue.push_back(ctrl) {
+                                // Queue full: rather than silently drop the
+                                // rejected ControlMessage (which would
+                                // cancel its oneshot senders and panic any
+                                // caller awaiting with `.unwrap()`), reply
+                                // on each sender with
+                                // `Err(Error::Capacity("request_queue"))`.
+                                warn!(
+                                    "request_queue at capacity ({}); rejecting control message",
+                                    REQUEST_QUEUE_CAP
+                                );
+                                rejected.reject_with_capacity("request_queue");
+                            }
                         } else {
                             // The sender has been dropped, so we should exit
                             *run = false;
@@ -906,6 +1059,65 @@ mod tests {
         assert!(matches!(msg, ControlMessage::Subscribe { .. }));
     }
 
+    /// `reject_with_capacity` must notify every oneshot sender inside a
+    /// rejected `ControlMessage` with `Err(Error::Capacity(..))` — for
+    /// `SendToService`, _both_ the `send_complete` and `response`
+    /// channels. Dropping either channel would let a caller's `.unwrap()`
+    /// (or `.expect(...)` inside `PendingResponse::response()`) panic on
+    /// the resulting `RecvError`, which is exactly what Copilot flagged.
+    #[test]
+    fn reject_with_capacity_notifies_every_sender() {
+        fn expect_capacity<T: std::fmt::Debug>(
+            rx: &mut oneshot::Receiver<Result<T, Error>>,
+            label: &str,
+        ) {
+            match rx.try_recv() {
+                Ok(Err(Error::Capacity(s))) => assert_eq!(s, "request_queue", "{label}"),
+                other => panic!("{label}: expected Err(Capacity), got {other:?}"),
+            }
+        }
+
+        // Variants carrying a single Result<(), Error> response sender.
+        let (mut rx, msg) = TestControl::set_interface(Ipv4Addr::LOCALHOST);
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut rx, "SetInterface");
+
+        let (mut rx, msg) = TestControl::bind_discovery();
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut rx, "BindDiscovery");
+
+        let (mut rx, msg) = TestControl::unbind_discovery();
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut rx, "UnbindDiscovery");
+
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
+        let (mut rx, msg) = TestControl::send_sd(target, empty_sd_header());
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut rx, "SendSD");
+
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (mut rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut rx, "AddEndpoint");
+
+        let (mut rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut rx, "RemoveEndpoint");
+
+        let (mut rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut rx, "Subscribe");
+
+        // SendToService carries two senders — both must be notified so that
+        // neither `send_rx.await.unwrap()?` nor `PendingResponse::response()`
+        // panics.
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let (mut send_rx, mut resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
+        msg.reject_with_capacity("request_queue");
+        expect_capacity(&mut send_rx, "SendToService.send_complete");
+        expect_capacity(&mut resp_rx, "SendToService.response");
+    }
+
     #[test]
     fn test_control_message_debug() {
         let (_rx, msg) = TestControl::set_interface(Ipv4Addr::LOCALHOST);
@@ -944,6 +1156,198 @@ mod tests {
         assert!(s.contains("Subscribe"));
         assert!(s.contains("service_id"));
         assert!(s.contains("event_group_id"));
+    }
+
+    /// Build an [`Inner`] without spawning the run loop, for direct
+    /// unit-testing of state-mutating methods.
+    fn make_inner_for_test() -> Inner<TestPayload> {
+        let (_control_sender, control_receiver) = mpsc::channel(4);
+        let (update_sender, _update_receiver) = mpsc::unbounded_channel();
+        Inner {
+            control_receiver,
+            request_queue: Deque::new(),
+            pending_responses: FnvIndexMap::new(),
+            update_sender,
+            interface: Ipv4Addr::LOCALHOST,
+            discovery_socket: None,
+            unicast_sockets: FnvIndexMap::new(),
+            session_tracker: SessionTracker::default(),
+            service_registry: ServiceRegistry::default(),
+            run: true,
+            client_id: 0x1234,
+            session_counter: 1,
+            sd_session_id: 1,
+            sd_session_has_wrapped: false,
+            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            multicast_loopback: false,
+            phantom: std::marker::PhantomData,
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_unicast_returns_capacity_error_when_map_full() {
+        let mut inner = make_inner_for_test();
+
+        // Fill unicast_sockets to capacity using ephemeral binds (port 0).
+        // Each call with port=0 creates a fresh socket on a distinct OS-chosen
+        // port, so the cap is what gates — not duplicate-key collapse.
+        for _ in 0..UNICAST_SOCKETS_CAP {
+            let bound = inner
+                .bind_unicast(0)
+                .expect("ephemeral bind below cap should succeed");
+            assert_ne!(bound, 0, "OS should assign a non-zero ephemeral port");
+        }
+        assert_eq!(inner.unicast_sockets.len(), UNICAST_SOCKETS_CAP);
+
+        // The next bind must fail with Error::Capacity and must NOT bind a
+        // socket (pre-bind capacity check).
+        let err = inner
+            .bind_unicast(0)
+            .expect_err("bind past cap should fail");
+        match err {
+            Error::Capacity(name) => assert_eq!(name, "unicast_sockets"),
+            other => panic!("expected Error::Capacity, got {other:?}"),
+        }
+        assert_eq!(
+            inner.unicast_sockets.len(),
+            UNICAST_SOCKETS_CAP,
+            "map should remain at capacity, not bind-then-drop a new socket"
+        );
+    }
+
+    /// Happy path: with room in `pending_responses`, the helper tracks
+    /// the entry and does NOT signal the caller — the sender stays
+    /// alive so a future unicast reply can resolve it.
+    #[tokio::test]
+    async fn track_or_reject_pending_response_inserts_when_room_available() {
+        let mut inner = make_inner_for_test();
+        let (tx, mut rx) = oneshot::channel::<Result<TestPayload, Error>>();
+
+        inner.track_or_reject_pending_response(0xDEAD_BEEF, tx);
+
+        assert_eq!(inner.pending_responses.len(), 1);
+        assert!(
+            inner.pending_responses.contains_key(&0xDEAD_BEEF),
+            "entry should be keyed by the provided request_id",
+        );
+        // Receiver is still waiting — helper did NOT pre-emptively
+        // resolve it with a capacity error on the happy path.
+        assert!(
+            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "receiver must still be pending when the insert succeeds",
+        );
+    }
+
+    /// Regression guard against cb1d0d1: without explicit rejection,
+    /// the dropped Sender would cause `PendingResponse::response()` to
+    /// panic on `RecvError` rather than returning a clean
+    /// `Err(Error::Capacity("pending_responses"))`. Exercises the
+    /// overflow branch in `track_or_reject_pending_response`, which is
+    /// the same branch the `SendToService` run-loop arm now delegates
+    /// to.
+    #[tokio::test]
+    async fn track_or_reject_pending_response_rejects_on_saturation() {
+        let mut inner = make_inner_for_test();
+
+        // Fill the map to capacity with dummy oneshot senders. The
+        // receivers are stashed to keep each channel open for the
+        // remainder of the test — on `tokio::sync::oneshot`, dropping
+        // the receiver does not drop the sender; it flips the sender
+        // into a state where `send()` fails with the value returned.
+        // The stash is what lets us later observe `sender.send(...)`
+        // succeeding against a still-open channel when the overflow
+        // case completes the displaced sender with a capacity error.
+        let mut stashed: std::vec::Vec<oneshot::Receiver<Result<TestPayload, Error>>> =
+            std::vec::Vec::with_capacity(PENDING_RESPONSES_CAP);
+        for i in 0..PENDING_RESPONSES_CAP {
+            let (tx, rx) = oneshot::channel::<Result<TestPayload, Error>>();
+            inner
+                .pending_responses
+                .insert(
+                    u32::try_from(i).expect("PENDING_RESPONSES_CAP fits in u32"),
+                    tx,
+                )
+                .expect("filling under cap must succeed");
+            stashed.push(rx);
+        }
+        assert_eq!(inner.pending_responses.len(), PENDING_RESPONSES_CAP);
+
+        // One more entry — map is full, the helper must recover the
+        // sender from the failed insert and deliver an explicit
+        // capacity error on it.
+        let (overflow_tx, overflow_rx) = oneshot::channel::<Result<TestPayload, Error>>();
+        let overflow_key: u32 = 0xFFFF_FFFE;
+        inner.track_or_reject_pending_response(overflow_key, overflow_tx);
+
+        // Map size unchanged — the overflow attempt was rejected, not
+        // silently dropping an existing entry.
+        assert_eq!(
+            inner.pending_responses.len(),
+            PENDING_RESPONSES_CAP,
+            "overflow must not evict existing entries",
+        );
+        assert!(
+            !inner.pending_responses.contains_key(&overflow_key),
+            "overflowed key must not be in the map",
+        );
+
+        // The caller's receiver resolves to Err(Capacity), not a
+        // panicking RecvError — this is the invariant cb1d0d1 fixes.
+        let result = overflow_rx
+            .await
+            .expect("receiver should get the explicit Err, not RecvError from dropped Sender");
+        match result {
+            Err(Error::Capacity(tag)) => assert_eq!(tag, "pending_responses"),
+            other => panic!("expected Err(Error::Capacity(\"pending_responses\")), got {other:?}"),
+        }
+    }
+
+    /// If a `request_id` is reused while an older pending entry is still
+    /// live (e.g. `session_counter` wrap-around), `insert` returns
+    /// `Ok(Some(old_sender))`. Without handling that case, the displaced
+    /// sender is dropped and the caller awaiting the original request
+    /// hits `RecvError` (which `PendingResponse::response()` treats as a
+    /// fatal panic). This test guards against that: the displaced
+    /// sender must be completed with
+    /// `Err(Error::Capacity("pending_responses"))` so the original
+    /// caller gets a clean `Result` instead of a panicking `RecvError`.
+    #[tokio::test]
+    async fn track_or_reject_pending_response_completes_displaced_sender() {
+        let mut inner = make_inner_for_test();
+        let key: u32 = 0xCAFE_F00D;
+
+        // First tracking: the sender lives in the map.
+        let (first_tx, first_rx) = oneshot::channel::<Result<TestPayload, Error>>();
+        inner.track_or_reject_pending_response(key, first_tx);
+        assert_eq!(inner.pending_responses.len(), 1);
+
+        // Second tracking with the same key: displaces the first sender.
+        let (second_tx, mut second_rx) = oneshot::channel::<Result<TestPayload, Error>>();
+        inner.track_or_reject_pending_response(key, second_tx);
+
+        // Map still has one entry — the second one replaced the first.
+        assert_eq!(inner.pending_responses.len(), 1);
+        assert!(inner.pending_responses.contains_key(&key));
+
+        // The original caller's receiver resolves to Err(Capacity) — not
+        // a dropped-sender RecvError.
+        let displaced_result = first_rx.await.expect(
+            "displaced sender must be completed with a real Err, \
+             not dropped (which would produce RecvError)",
+        );
+        match displaced_result {
+            Err(Error::Capacity(tag)) => assert_eq!(tag, "pending_responses"),
+            other => panic!("expected Err(Error::Capacity(\"pending_responses\")), got {other:?}"),
+        }
+
+        // The new sender is still live and pending.
+        assert!(
+            matches!(
+                second_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "replacement sender must still be pending in the map",
+        );
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ mod subscription_manager;
 pub use error::Error;
 pub use event_publisher::EventPublisher;
 pub use service_info::{EventGroupInfo, ServiceInfo};
-pub use subscription_manager::SubscriptionManager;
+pub use subscription_manager::{SubscribeError, SubscriptionManager};
 
 use sd_state::SdStateManager;
 
@@ -583,16 +583,48 @@ impl Server {
                             second_count,
                         ) {
                             let mut subs = self.subscriptions.write().await;
-                            subs.subscribe(
+                            let subscribe_result = subs.subscribe(
                                 entry_view.service_id(),
                                 entry_view.instance_id(),
                                 entry_view.event_group_id(),
                                 endpoint_addr,
                             );
+                            // Release the write lock before any await on the
+                            // SD socket (keeps this arm off the lock while we
+                            // emit the response).
+                            drop(subs);
 
-                            // Send SubscribeAck
-                            self.send_subscribe_ack_from_view(&entry_view, sender)
-                                .await?;
+                            match subscribe_result {
+                                Ok(()) => {
+                                    self.send_subscribe_ack_from_view(&entry_view, sender)
+                                        .await?;
+                                }
+                                Err(e) => {
+                                    // Capacity-rejected subscription: NACK so
+                                    // the client doesn't believe it's
+                                    // subscribed. Match on the specific
+                                    // SubscribeError so the NACK log line
+                                    // carries the actual cause (which
+                                    // bounded structure was full) rather
+                                    // than the generic "subscription
+                                    // rejected" string — and pick static
+                                    // reason strings so no allocation has
+                                    // to live across the await.
+                                    let reason: &'static str = match e {
+                                        SubscribeError::SubscribersPerGroupFull => {
+                                            "subscribers_per_group_full"
+                                        }
+                                        SubscribeError::EventGroupsFull => "event_groups_full",
+                                    };
+                                    tracing::debug!("Subscription rejected: {reason}");
+                                    self.send_subscribe_nack_from_view(
+                                        &entry_view,
+                                        sender,
+                                        reason,
+                                    )
+                                    .await?;
+                                }
+                            }
                         } else {
                             tracing::warn!("No endpoint found in Subscribe message options");
                             self.send_subscribe_nack_from_view(
@@ -1878,7 +1910,8 @@ mod tests {
         let subscriber = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 40_000);
         publisher
             .register_subscriber(0x005C, 0x0001, 0x0001, subscriber)
-            .await;
+            .await
+            .unwrap();
 
         assert!(publisher.has_subscribers(0x005C, 0x0001, 0x0001).await);
         assert_eq!(publisher.subscriber_count(0x005C, 0x0001, 0x0001).await, 1);
