@@ -133,6 +133,14 @@ mod raw_payload;
 #[cfg(feature = "server")]
 pub mod server;
 mod traits;
+/// Executor-agnostic UDP transport abstraction. `no_std`-compatible.
+///
+/// Intended to be consumed by the `client` and `server` modules in a
+/// future refactor; currently those paths still use `tokio` / `socket2`
+/// directly. The trait surface is defined here so bare-metal consumers
+/// can implement it today against their own stack and be ready when the
+/// higher-level modules are migrated.
+pub mod transport;
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
 #[cfg(feature = "std")]
@@ -144,3 +152,7 @@ pub use client::{Client, ClientUpdate, ClientUpdates, DiscoveryMessage, PendingR
 pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
 pub use server::Server;
+pub use transport::{
+    IoErrorKind, ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory,
+    TransportSocket,
+};
