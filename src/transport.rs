@@ -487,6 +487,76 @@ pub trait Timer {
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()>;
 }
 
+/// Executor-agnostic task-spawning primitive.
+///
+/// `simple-someip`'s per-socket I/O loops need to run concurrently with
+/// the client's main event loop — otherwise `SocketManager::send`'s
+/// internal oneshot wait deadlocks (the send future parks the main
+/// loop, which is the only thing that would drive the socket loop to
+/// produce its response). Phase 8 hit this and deferred the spawn to
+/// a user-provided `Spawner` here, letting std+tokio callers pass a
+/// one-line `TokioSpawner` and bare-metal callers wrap their own
+/// executor's task-spawning primitive.
+///
+/// # Why this reverses the phase-4 "no executor adapter" rule
+///
+/// Phase 4 deliberately avoided wrapping spawn to prevent "reinventing
+/// embassy" and trait-object dispatch in the hot path. Concrete
+/// evidence from phase 8 showed that without a spawn abstraction,
+/// `Inner::bind_*` has to call `tokio::spawn` directly — making the
+/// whole crate tokio-only. The revised rule: spawn DOES need a trait,
+/// but we avoid the phase-4 concerns by (1) keeping the trait generic
+/// (monomorphized, no `dyn Spawner`) and (2) scoping it narrowly —
+/// just spawn, not select/sleep which have other solutions.
+///
+/// # Usage
+///
+/// On `std + tokio`, use `crate::tokio_transport::TokioSpawner`
+/// (available when the `client` or `server` feature is enabled) —
+/// a zero-size unit struct whose `spawn` is a thin wrapper around
+/// `tokio::spawn`. The path is rendered as a code literal rather
+/// than an intra-doc link because the target module is feature-gated
+/// and would break default-feature rustdoc builds. On embedded:
+///
+/// ```ignore
+/// struct EmbassySpawner(embassy_executor::Spawner);
+/// impl simple_someip::Spawner for EmbassySpawner {
+///     fn spawn(&self, fut: impl core::future::Future<Output = ()> + Send + 'static) {
+///         // embassy's Spawner has its own task-registration model;
+///         // the adapter layer depends on how the user defined their tasks
+///         todo!("call self.0.spawn(...)");
+///     }
+/// }
+/// ```
+pub trait Spawner {
+    /// Submit `future` to the executor. Must not block; must arrange
+    /// for the future to be polled to completion on some task.
+    ///
+    /// # Correctness requirement
+    ///
+    /// Implementations MUST poll the submitted future. Dropping it
+    /// without polling — or holding it in a queue that never drains —
+    /// will deadlock `crate::client::Client` (available when the
+    /// `client` feature is enabled): `SocketManager::send`
+    /// `await`s an internal mpsc→oneshot round-trip whose only driver
+    /// is the per-socket loop future submitted here. No poll, no
+    /// progress, no oneshot resolution; the caller's `send` hangs
+    /// forever.
+    ///
+    /// The `MockSpawner` in `examples/bare_metal/` deliberately
+    /// demonstrates the wrong pattern (drops the future) and annotates
+    /// it as DEMO-ONLY for exactly this reason.
+    ///
+    /// # Bound rationale
+    ///
+    /// The `Send + 'static` bound matches every mainstream multi-task
+    /// executor (tokio, async-std, smol, embassy with task arenas).
+    /// Bare-metal executors that use single-threaded task pools may
+    /// want to loosen this — a future release may add a
+    /// `spawn_local`-style variant gated on a cargo feature.
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static);
+}
+
 #[cfg(test)]
 mod tests {
     //! The traits are pure interfaces — these tests only verify that

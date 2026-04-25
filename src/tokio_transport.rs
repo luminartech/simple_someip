@@ -85,6 +85,16 @@ impl TokioSocket {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TokioTimer;
 
+/// [`crate::transport::Spawner`] impl that routes submitted futures
+/// to `tokio::spawn`.
+///
+/// Zero-size unit struct; every `Inner<P, TokioSpawner>` / `Client<P,
+/// TokioSpawner>` pays nothing for the abstraction. Bare-metal
+/// consumers substitute their own `Spawner` via the
+/// `crate::Client::new_with_spawner_and_loopback` constructor.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TokioSpawner;
+
 impl TransportFactory for TokioTransport {
     type Socket = TokioSocket;
 
@@ -179,6 +189,17 @@ impl TransportSocket for TokioSocket {
 impl Timer for TokioTimer {
     async fn sleep(&self, duration: Duration) {
         tokio::time::sleep(duration).await;
+    }
+}
+
+impl crate::transport::Spawner for TokioSpawner {
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+        // Drop the returned `JoinHandle` — per-socket loops run until
+        // their owning `SocketManager` drops its channel ends, at
+        // which point the future completes naturally. Callers that
+        // want cancel-on-abort semantics should spawn at their own
+        // call site; this trait is intentionally minimal.
+        drop(tokio::spawn(future));
     }
 }
 

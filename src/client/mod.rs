@@ -38,7 +38,8 @@ pub use error::Error;
 
 use crate::Timer;
 use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry};
-use crate::tokio_transport::TokioTimer;
+use crate::tokio_transport::{TokioSpawner, TokioTimer};
+use crate::transport::Spawner;
 use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
 use inner::{ControlMessage, Inner};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -254,9 +255,61 @@ where
         ClientUpdates<MessageDefinitions>,
         impl core::future::Future<Output = ()> + Send + 'static,
     ) {
+        Self::new_with_spawner_and_loopback(interface, multicast_loopback, TokioSpawner)
+    }
+
+    /// Like [`Self::new_with_loopback`], but with a caller-provided
+    /// [`Spawner`]. Per-socket I/O loops are submitted through this
+    /// spawner instead of the default [`TokioSpawner`] / `tokio::spawn`.
+    ///
+    /// ```no_run
+    /// # use simple_someip::{Client, RawPayload, Spawner};
+    /// # use std::net::Ipv4Addr;
+    /// # async fn demo() {
+    /// struct MySpawner; // ...your executor's task-submission type.
+    /// # impl Spawner for MySpawner {
+    /// #   fn spawn(&self, _: impl core::future::Future<Output = ()> + Send + 'static) {}
+    /// # }
+    /// let (client, mut updates, run) =
+    ///     Client::<RawPayload>::new_with_spawner_and_loopback(
+    ///         Ipv4Addr::LOCALHOST,
+    ///         false,
+    ///         MySpawner,
+    ///     );
+    /// tokio::spawn(run);
+    /// # let _ = (client, updates);
+    /// # }
+    /// ```
+    ///
+    /// # Bounds
+    ///
+    /// `S: Spawner + Send + Sync + 'static` — the spawner is stored in
+    /// the run-loop future, which is `Send + 'static`, so the spawner
+    /// must match those bounds. `Sync` is required because `&self.spawner`
+    /// is held across `.await` points inside
+    /// `SocketManager::bind_with_transport` and
+    /// `bind_discovery_seeded_with_transport`, both of which execute on
+    /// the driven run-loop task (not on the user's call site).
+    #[must_use = "the returned run-loop future must be spawned (e.g. via the Spawner) for the client to make progress"]
+    pub fn new_with_spawner_and_loopback<S>(
+        interface: Ipv4Addr,
+        multicast_loopback: bool,
+        spawner: S,
+    ) -> (
+        Self,
+        ClientUpdates<MessageDefinitions>,
+        impl core::future::Future<Output = ()> + Send + 'static,
+    )
+    where
+        S: Spawner + Send + Sync + 'static,
+    {
         let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
-        let (control_sender, update_receiver, run_future) =
-            Inner::build(interface, Arc::clone(&e2e_registry), multicast_loopback);
+        let (control_sender, update_receiver, run_future) = Inner::build(
+            interface,
+            Arc::clone(&e2e_registry),
+            multicast_loopback,
+            spawner,
+        );
 
         let client = Self {
             interface: Arc::new(RwLock::new(interface)),
@@ -1499,5 +1552,60 @@ mod tests {
         let (_client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let handle = std::thread::spawn(move || drop(run_fut));
         handle.join().unwrap();
+    }
+
+    /// Proves `Client::new_with_spawner_and_loopback` actually routes
+    /// per-socket spawns through the user-provided `Spawner`. The
+    /// `CountingSpawner` below increments a shared counter on every
+    /// `spawn` call AND delegates to `tokio::spawn` so the spawned
+    /// futures still run. Calling `bind_discovery` should cause
+    /// exactly one spawn (the SD socket's I/O loop); calling
+    /// `bind_discovery` again is a no-op (socket already bound) so
+    /// the count stays at 1.
+    #[tokio::test]
+    async fn client_new_with_spawner_routes_socket_spawns_through_it() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct CountingSpawner {
+            count: Arc<AtomicUsize>,
+        }
+
+        impl Spawner for CountingSpawner {
+            fn spawn(&self, future: impl core::future::Future<Output = ()> + Send + 'static) {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                let _ = tokio::spawn(future);
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let spawner = CountingSpawner {
+            count: Arc::clone(&count),
+        };
+
+        let (client, _updates, run_fut) =
+            TestClient::new_with_spawner_and_loopback(Ipv4Addr::LOCALHOST, false, spawner);
+        tokio::spawn(run_fut);
+
+        client
+            .bind_discovery()
+            .await
+            .expect("bind_discovery must succeed");
+        // Idempotent second call; must NOT spawn again.
+        client
+            .bind_discovery()
+            .await
+            .expect("second bind_discovery is idempotent");
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "expected exactly one spawn for the SD socket loop, \
+             got {}",
+            count.load(Ordering::SeqCst)
+        );
+
+        client.shut_down();
     }
 }

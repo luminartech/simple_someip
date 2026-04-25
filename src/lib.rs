@@ -19,8 +19,8 @@
 //! | [`protocol`] | Yes | Wire format: headers, messages, message types, return codes, and service discovery (SD) entries/options |
 //! | [`e2e`] | Yes | End-to-End protection — Profile 4 (CRC-32) and Profile 5 (CRC-16) |
 //! | [`WireFormat`] / [`PayloadWireFormat`] | Yes | Traits for serializing messages and defining custom payload types |
-//! | [`client`] | No | Async tokio client — service discovery, subscriptions, and request/response (feature `client`) |
-//! | [`server`] | No | Async tokio server — service offering, event publishing, and subscription management (feature `server`) |
+//! | `client` | No | Async tokio client — service discovery, subscriptions, and request/response (feature `client`) |
+//! | `server` | No | Async tokio server — service offering, event publishing, and subscription management (feature `server`) |
 //!
 //! ## Feature Flags
 //!
@@ -29,7 +29,7 @@
 //! | `std` | yes | Enables std-dependent helpers (`RawPayload`, `VecSdHeader`, `OfferedEndpoint`) |
 //! | `client` | no | Async tokio client; implies `std` + tokio + socket2 + futures |
 //! | `server` | no | Async tokio server; implies `std` + tokio + socket2 + futures |
-//! | `bare_metal` | no | Pure marker feature — enables no crate code. Reserved for future phases to gate `no_std` helper types. To exercise the bare-metal trait surface today, use the `examples/bare_metal` workspace member (`cargo run -p bare_metal`). **Does not make the crate fully bare-metal-complete**: the `client`/`server` feature paths still rely on `tokio::spawn` to drive per-socket I/O loops. A fully tokio-free build additionally requires a user-provided `Spawner` impl, planned as a trait alongside `TransportSocket` and `Timer`. |
+//! | `bare_metal` | no | Pure marker feature — enables no crate code. Reserved for future phases to gate no_std helper types. To exercise the bare-metal trait surface today, use the `examples/bare_metal` workspace member (`cargo run -p bare_metal`). **Does not make `client` / `server` bare-metal-usable.** The `Spawner` trait (phase 9) makes task submission pluggable, but the `client` / `server` feature paths still depend on: (1) `tokio::sync::mpsc` channels (heap + tokio-waker-coupled) for intra-module message passing, (2) `tokio::sync::oneshot` for send-acks, (3) `Arc<Mutex<E2ERegistry>>` for shared registry state (requires `alloc` + `std::sync`), and (4) an `F::Socket = TokioSocket` bound on `SocketManager::bind_*` that needs stable Rust Return-Type Notation to relax. Until all four are resolved, `feature = "client"` / `feature = "server"` remain `std`+tokio-only. `no_alloc` consumers today should build their own orchestrator on `protocol`, `e2e`, and the `transport` traits directly — those layers ARE fully `no_std` / `no_alloc`. |
 //!
 //! The default feature set is `["std"]`, which links `std` and enables
 //! the `RawPayload` / `VecSdHeader` helpers. For a minimal build with
@@ -164,8 +164,8 @@ pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
 pub use server::Server;
 #[cfg(any(feature = "client", feature = "server"))]
-pub use tokio_transport::{TokioSocket, TokioTimer, TokioTransport};
+pub use tokio_transport::{TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
 pub use transport::{
-    IoErrorKind, ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory,
+    IoErrorKind, ReceivedDatagram, SocketOptions, Spawner, Timer, TransportError, TransportFactory,
     TransportSocket,
 };

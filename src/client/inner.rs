@@ -23,8 +23,9 @@ use crate::{
     },
     e2e::E2ERegistry,
     protocol::{self, Message},
-    tokio_transport::TokioTimer,
+    tokio_transport::{TokioSpawner, TokioTimer, TokioTransport},
     traits::PayloadWireFormat,
+    transport::Spawner,
 };
 
 use super::error::Error;
@@ -289,7 +290,7 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
     }
 }
 
-pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
+pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat, S: Spawner = TokioSpawner> {
     /// MPSC Receiver used to receive control messages from outer client
     control_receiver: Receiver<ControlMessage<PayloadDefinitions>>,
     /// Queue of pending control messages to process
@@ -330,11 +331,15 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     e2e_registry: Arc<Mutex<E2ERegistry>>,
     /// Enable multicast loopback on SD sockets for same-host testing
     multicast_loopback: bool,
+    /// Task-spawner used by `bind_*` to drive per-socket I/O loops.
+    /// Default [`TokioSpawner`] wraps `tokio::spawn`; bare-metal
+    /// callers plug in their own.
+    spawner: S,
     /// Phantom data to represent the generic message definitions
     phantom: std::marker::PhantomData<PayloadDefinitions>,
 }
 
-impl<PayloadDefinitions: PayloadWireFormat> std::fmt::Debug for Inner<PayloadDefinitions> {
+impl<P: PayloadWireFormat, S: Spawner> std::fmt::Debug for Inner<P, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inner")
             .field("interface", &self.interface)
@@ -346,88 +351,10 @@ impl<PayloadDefinitions: PayloadWireFormat> std::fmt::Debug for Inner<PayloadDef
     }
 }
 
-/// Process one received SD datagram: feed every service-instance entry to the
-/// reboot [`SessionTracker`] under `transport`, refresh the service registry,
-/// and emit `SenderRebooted` / `DiscoveryUpdated`. Shared by the multicast and
-/// unicast discovery receive arms so each transport's SD session counter is
-/// tracked on its own key — without this split the sensor's interleaved
-/// multicast/unicast session counters look like perpetual reboots.
-fn process_discovery<P>(
-    source: SocketAddr,
-    transport: TransportKind,
-    someip_header: protocol::Header,
-    sd_header: <P as PayloadWireFormat>::SdHeader,
-    session_tracker: &mut SessionTracker,
-    service_registry: &mut ServiceRegistry,
-    update_sender: &mpsc::UnboundedSender<ClientUpdate<P>>,
-) where
-    P: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
-{
-    // Session ID from the SOME/IP request_id (lower 16 bits).
-    let session_id = (someip_header.request_id() & 0xFFFF) as u16;
-    let sd_payload = P::new_sd_payload(&sd_header);
-    let reboot_flag = sd_payload.sd_flags().map_or(
-        crate::protocol::sd::RebootFlag::Continuous,
-        crate::protocol::sd::Flags::reboot,
-    );
-
-    // Track sender session/reboot state for every SD entry that identifies a
-    // service instance, keyed per transport so multicast and unicast domains
-    // don't collide.
-    let mut rebooted = false;
-    for (svc_id, inst_id) in sd_payload.service_instances() {
-        let verdict =
-            session_tracker.check(source, transport, svc_id, inst_id, session_id, reboot_flag);
-        if verdict == SessionVerdict::Reboot {
-            rebooted = true;
-        }
-    }
-
-    // Auto-populate the service registry from offer / stop-offer entries.
-    for ep in sd_payload.offered_endpoints() {
-        let id = ServiceInstanceId {
-            service_id: ep.service_id,
-            instance_id: ep.instance_id,
-        };
-        if ep.is_offer {
-            if let Some(addr) = ep.addr {
-                service_registry.insert(
-                    id,
-                    ServiceEndpointInfo {
-                        addr,
-                        local_port: 0,
-                        major_version: ep.major_version,
-                        minor_version: ep.minor_version,
-                    },
-                );
-                trace!(
-                    "Registry: added 0x{:04X}.0x{:04X} -> {}",
-                    ep.service_id, ep.instance_id, addr,
-                );
-            }
-        } else {
-            service_registry.remove(id);
-            trace!(
-                "Registry: removed 0x{:04X}.0x{:04X}",
-                ep.service_id, ep.instance_id,
-            );
-        }
-    }
-
-    if rebooted {
-        let _ = update_sender.send(ClientUpdate::SenderRebooted(source));
-    }
-    let discovery_msg = DiscoveryMessage {
-        source,
-        someip_header,
-        sd_header,
-    };
-    let _ = update_sender.send(ClientUpdate::DiscoveryUpdated(discovery_msg));
-}
-
-impl<PayloadDefinitions> Inner<PayloadDefinitions>
+impl<PayloadDefinitions, S> Inner<PayloadDefinitions, S>
 where
     PayloadDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
+    S: Spawner + Send + Sync + 'static,
 {
     /// Construct an `Inner` and return the control/update channels plus
     /// the run-loop future. The caller must drive the future on a Tokio
@@ -443,6 +370,7 @@ where
         interface: Ipv4Addr,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
         multicast_loopback: bool,
+        spawner: S,
     ) -> (
         Sender<ControlMessage<PayloadDefinitions>>,
         mpsc::UnboundedReceiver<ClientUpdate<PayloadDefinitions>>,
@@ -468,6 +396,7 @@ where
             sd_session_has_wrapped: false,
             e2e_registry,
             multicast_loopback,
+            spawner,
             phantom: std::marker::PhantomData,
         };
         (control_sender, update_receiver, inner.run_future())
@@ -477,7 +406,9 @@ where
         if self.discovery_socket.is_some() {
             Ok(())
         } else {
-            let socket = SocketManager::bind_discovery_seeded(
+            let socket = SocketManager::bind_discovery_seeded_with_transport(
+                &TokioTransport,
+                &self.spawner,
                 self.interface,
                 Arc::clone(&self.e2e_registry),
                 self.sd_session_id,
@@ -534,7 +465,13 @@ where
             );
             return Err(Error::Capacity("unicast_sockets"));
         }
-        let unicast_socket = SocketManager::bind(port, Arc::clone(&self.e2e_registry)).await?;
+        let unicast_socket = SocketManager::bind_with_transport(
+            &TokioTransport,
+            &self.spawner,
+            port,
+            Arc::clone(&self.e2e_registry),
+        )
+        .await?;
         let bound_port = unicast_socket.port();
         // Capacity was checked above, so insert cannot report "full" here.
         // A defensive check guards against a future refactor that changes
@@ -1046,8 +983,8 @@ where
                     let sleep_fut = TokioTimer
                         .sleep(std::time::Duration::from_millis(125))
                         .fuse();
-                    let discovery_fut = Inner::receive_discovery(discovery_socket).fuse();
-                    let unicast_fut = Inner::receive_any_unicast(unicast_sockets).fuse();
+                    let discovery_fut = Self::receive_discovery(discovery_socket).fuse();
+                    let unicast_fut = Self::receive_any_unicast(unicast_sockets).fuse();
                     pin_mut!(control_fut, sleep_fut, discovery_fut, unicast_fut);
 
                     // `select!` (not `select_biased!`) randomizes the
@@ -1352,6 +1289,7 @@ mod tests {
             sd_session_has_wrapped: false,
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             multicast_loopback: false,
+            spawner: TokioSpawner,
             phantom: std::marker::PhantomData,
         }
     }
@@ -1524,12 +1462,89 @@ mod tests {
         );
     }
 
+    /// Sibling to `client_new_with_spawner_routes_socket_spawns_through_it`
+    /// in `mod.rs`, which covers the `bind_discovery` path. This one
+    /// covers `bind_unicast`: each successful ephemeral unicast bind
+    /// must submit exactly one future through the injected `Spawner`.
+    /// Without this test, a future refactor could silently revert the
+    /// unicast bind path to direct `tokio::spawn` and only the
+    /// discovery path's test would fail to catch it.
+    #[tokio::test]
+    async fn bind_unicast_routes_through_injected_spawner() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct CountingSpawner {
+            count: Arc<AtomicUsize>,
+        }
+
+        impl Spawner for CountingSpawner {
+            fn spawn(&self, future: impl core::future::Future<Output = ()> + Send + 'static) {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                // Delegate so the socket loop actually runs — matters
+                // if the caller later issues a send that awaits the
+                // loop's oneshot ack. For the pure-spawn-count
+                // assertion below it would also work to drop the
+                // future; we delegate to keep the Inner in a healthy
+                // state in case assertion ordering changes.
+                drop(tokio::spawn(future));
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let spawner = CountingSpawner {
+            count: Arc::clone(&count),
+        };
+
+        // Build Inner directly with the counting spawner — same pattern
+        // as `make_inner_for_test`, but parameterized on S.
+        let (_control_sender, control_receiver) = mpsc::channel(4);
+        let (update_sender, _update_receiver) = mpsc::unbounded_channel();
+        let mut inner: Inner<TestPayload, CountingSpawner> = Inner {
+            control_receiver,
+            request_queue: Deque::new(),
+            pending_responses: FnvIndexMap::new(),
+            update_sender,
+            interface: Ipv4Addr::LOCALHOST,
+            discovery_socket: None,
+            unicast_sockets: FnvIndexMap::new(),
+            session_tracker: SessionTracker::default(),
+            service_registry: ServiceRegistry::default(),
+            run: true,
+            client_id: 0x1234,
+            session_counter: 1,
+            sd_session_id: 1,
+            sd_session_has_wrapped: false,
+            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            multicast_loopback: false,
+            spawner,
+            phantom: std::marker::PhantomData,
+        };
+
+        // Three ephemeral binds → three distinct socket loops spawned.
+        for i in 0..3 {
+            let bound = inner
+                .bind_unicast(0)
+                .await
+                .expect("ephemeral bind should succeed");
+            assert_ne!(bound, 0, "iteration {i}: OS should assign a port");
+        }
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            3,
+            "expected exactly three spawns (one per bind_unicast call), got {}",
+            count.load(Ordering::SeqCst)
+        );
+    }
+
     #[tokio::test]
     async fn test_inner_build_and_shutdown() {
         let (control_sender, mut update_receiver, run_fut) = Inner::<TestPayload>::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
         // Drop control sender to trigger loop exit
@@ -1565,6 +1580,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1582,6 +1598,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1599,6 +1616,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1618,6 +1636,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1648,6 +1667,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1719,6 +1739,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1737,6 +1758,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1754,6 +1776,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1781,6 +1804,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             true,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1796,6 +1820,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1816,6 +1841,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1837,6 +1863,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1862,6 +1889,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1893,6 +1921,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1918,6 +1947,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1937,6 +1967,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1972,6 +2003,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -1990,6 +2022,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -2015,6 +2048,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -2046,6 +2080,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 
@@ -2093,6 +2128,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioSpawner,
         );
         let _ = tokio::spawn(run_fut);
 

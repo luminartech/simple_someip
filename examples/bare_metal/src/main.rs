@@ -36,21 +36,52 @@
 //!
 //! # Known gaps in the bare-metal story (independent of this example)
 //!
-//! `SocketManager::bind*` today still pins `F::Socket = TokioSocket`,
-//! so the trait impls below — while correct — cannot be plugged into
-//! the crate's `Client` / `Server` event loops yet. Two upstream
-//! blockers must land first:
+//! The example exercises the **trait layer** (`TransportSocket`,
+//! `TransportFactory`, `Timer`, `Spawner`) — and that is all. It does
+//! NOT demonstrate a no_alloc integration with
+//! `simple_someip::Client` / `simple_someip::Server`, because those
+//! are not yet no_alloc-compatible. Phase 9 landed `Spawner`, which
+//! abstracts ONE runtime primitive (task submission). Four others
+//! remain before a no_alloc consumer can use `Client`:
 //!
-//! 1. Relax the `F::Socket = TokioSocket` bound to
-//!    `F::Socket: TransportSocket` (requires stable Return-Type
-//!    Notation or a GAT-based parallel trait).
-//! 2. Extract a `Spawner` trait so `SocketManager::bind*` can submit
-//!    per-socket loops to the user's executor instead of calling
-//!    `tokio::spawn` directly. See phase 9 in the refactor plan.
+//! 1. **`tokio::sync::mpsc` channels** inside `SocketManager`
+//!    (capacities 4 and 16 per socket): heap-allocated AND
+//!    tokio-runtime-coupled (the `Waker` plumbing only works on a
+//!    tokio task).
+//! 2. **`tokio::sync::oneshot`** used for send-ack round-trips: same
+//!    allocation + runtime-coupling issue.
+//! 3. **`Arc<Mutex<E2ERegistry>>`** shared between the client's
+//!    control path and every per-socket loop: requires `alloc` +
+//!    `std::sync`.
+//! 4. **`F::Socket = TokioSocket`** bound on `bind_*`: a phase-5
+//!    compromise because stable Rust Return-Type Notation is still
+//!    nightly.
 //!
-//! Until (1) and (2) land, bare-metal users CAN implement the traits
-//! below, but they CANNOT route their implementations through
-//! `Client` / `Server`.
+//! Closing those four is additional phased work (roughly the same
+//! scope again as phases 1–9 combined). Until then, `feature = "client"`
+//! / `feature = "server"` pull in `std + tokio + socket2`.
+//!
+//! # Recommendation for no_alloc consumers today
+//!
+//! Do NOT route through `Client::new_with_spawner_and_loopback`.
+//! Instead, depend on `simple-someip` with `default-features = false,
+//! features = ["bare_metal"]` and consume the already-portable layers
+//! directly:
+//!
+//! - `simple_someip::protocol` — wire format (headers, messages, SD
+//!   entries/options); zero-copy views for parsing.
+//! - `simple_someip::e2e` — CRC-32 / CRC-16 protection profiles; owned
+//!   per-payload, no `Arc<Mutex<_>>` required.
+//! - `simple_someip::transport` — the four traits exercised below.
+//!
+//! Then write a small SOME/IP orchestrator that owns its socket, a
+//! stack-allocated request-map (e.g.
+//! `heapless::FnvIndexMap<RequestId, _, N>`), and drives SD + r/r +
+//! event subscription using `futures::select!` over
+//! `TransportSocket::recv_from` / `Timer::sleep` directly. That is
+//! the shape the trait layer was designed for; the `Client` /
+//! `Server` types are a std+tokio convenience layer on top that
+//! happens not to suit no_alloc targets yet.
 
 use core::future::Future;
 use core::net::{Ipv4Addr, SocketAddrV4};
@@ -197,6 +228,21 @@ impl Timer for MockTimer {
     }
 }
 
+/// Phase 9 `Spawner` impl. A real bare-metal `Spawner` wraps the
+/// executor's task-submission primitive — `embassy_executor::Spawner`,
+/// smoltcp's task pool, or a hand-rolled single-core polling loop.
+/// This mock drops every future it receives (equivalent to "never run
+/// it"), which is fine for the demo because nothing in the trait-layer
+/// round-trip below actually requires a spawned task. A production
+/// impl must poll the future to completion.
+struct MockSpawner;
+
+impl simple_someip::transport::Spawner for MockSpawner {
+    fn spawn(&self, _future: impl Future<Output = ()> + Send + 'static) {
+        // DEMO-ONLY: real impls submit `_future` to their task pool.
+    }
+}
+
 /// Single-step `block_on` for the demo.
 ///
 /// **ANTI-PATTERN — DO NOT USE IN PRODUCTION.** `Waker::noop()` means
@@ -275,6 +321,11 @@ fn main() {
     let timer = MockTimer;
     block_on(timer.sleep(Duration::from_millis(1)));
 
+    // Demonstrate the Spawner trait compiles against a MockSpawner.
+    // (The mock drops the future — a real spawner polls it.)
+    let spawner = MockSpawner;
+    simple_someip::transport::Spawner::spawn(&spawner, async {});
+
     println!(
         "bare-metal example: sent {} bytes from {} to {}, received cleanly.",
         datagram.bytes_received,
@@ -282,7 +333,12 @@ fn main() {
         sock_b.local_addr().unwrap(),
     );
     println!(
-        "note: this only exercises the trait layer — see source comments \
-         for the Client/Server + Spawner gap (phase 9 work)."
+        "note: trait layer (TransportSocket + TransportFactory + Timer + \
+         Spawner) exercised end-to-end. For a no_alloc SOME/IP client \
+         today, build your own orchestrator on `protocol` + `e2e` + these \
+         traits — do NOT route through `Client::new_with_spawner_and_loopback`: \
+         the Client internals still depend on tokio::sync::mpsc/oneshot, \
+         Arc<Mutex<E2ERegistry>>, and an F::Socket=TokioSocket bound (RTN). \
+         See top-of-file docblock for the full blocker list."
     );
 }
