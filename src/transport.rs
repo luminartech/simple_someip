@@ -122,7 +122,7 @@
 //!         &self,
 //!         addr: SocketAddrV4,
 //!         _options: &SocketOptions,
-//!     ) -> impl Future<Output = Result<Self::Socket, TransportError>> {
+//!     ) -> impl Future<Output = Result<Self::Socket, TransportError>> + Send {
 //!         async move {
 //!             let inner = tokio::net::UdpSocket::bind(addr)
 //!                 .await
@@ -203,7 +203,7 @@
 //!
 //! struct TokioTimer;
 //! impl Timer for TokioTimer {
-//!     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
+//!     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send {
 //!         tokio::time::sleep(duration)
 //!     }
 //! }
@@ -522,11 +522,18 @@ pub trait TransportFactory {
     /// Returns [`TransportError::AddressInUse`] if the requested address
     /// and port pair is already bound (and `reuse_*` was not enabled).
     /// Other backend-level failures surface as [`TransportError::Io`].
+    /// The returned future is required to be `Send` so callers spawning
+    /// the bind on a multithreaded executor (e.g. `tokio::spawn` of a
+    /// run-loop that internally awaits `bind`) compile cleanly. All
+    /// in-tree impls (`TokioTransport`, the bare-metal `MockFactory`,
+    /// the embassy adapter) satisfy this; an impl that holds `!Send`
+    /// state across a yield in `bind` would need to either lift that
+    /// state out or use a `LocalSet`-based spawner.
     fn bind(
         &self,
         addr: SocketAddrV4,
         options: &SocketOptions,
-    ) -> impl Future<Output = Result<Self::Socket, TransportError>>;
+    ) -> impl Future<Output = Result<Self::Socket, TransportError>> + Send;
 }
 
 /// Executor-agnostic sleep primitive.
@@ -539,7 +546,14 @@ pub trait TransportFactory {
 pub trait Timer {
     /// Wait for at least `duration` before resolving. Implementations MAY
     /// overshoot but MUST NOT undershoot.
-    fn sleep(&self, duration: Duration) -> impl Future<Output = ()>;
+    ///
+    /// The returned future is required to be `Send` so callers spawning
+    /// the sleep on a multithreaded executor (e.g. a `tokio::spawn`-driven
+    /// run-loop) compile cleanly. Single-task bare-metal callers whose
+    /// `Timer` impl holds `!Send` state across the yield can wrap their
+    /// future in a `Send`-compatible adapter or use a `LocalSet`-based
+    /// spawner.
+    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send;
 }
 
 /// Executor-agnostic task-spawning primitive.
@@ -758,8 +772,8 @@ mod std_handle_impls {
 // `ChannelFactory` and its associated sender / receiver traits abstract over
 // the channel primitive used by the client. `TokioChannels` (in
 // `tokio_transport`) is the default for `std + tokio` builds;
-// `EmbassySyncChannels` (in `tokio_transport`, gated behind `bare_metal`)
-// is the alternative for no-tokio / no_std builds.
+// `EmbassySyncChannels` (in `crate::embassy_channels`, gated behind
+// `bare_metal`) is the alternative for no-tokio / no_std builds.
 
 /// Returned by [`OneshotRecv::recv`] when the sender was dropped before
 /// sending a value.

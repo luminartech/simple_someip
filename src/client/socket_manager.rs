@@ -168,10 +168,12 @@ where
     ///
     /// Currently `#[cfg(test)]`-gated: production callers reach the
     /// socket through the `_with_transport` variant so the `Spawner`
-    /// trait can be exercised end-to-end. The enclosing `socket_manager`
-    /// module is itself gated to `feature = "client-tokio"`, so this
-    /// method is implicitly client-tokio-only.
-    #[cfg(test)]
+    /// trait can be exercised end-to-end. Additionally requires the
+    /// `client-tokio` feature because the convenience defaults
+    /// (`TokioTransport`, `TokioSpawner`) live behind it; under
+    /// `--features client` the `socket_manager` module is compiled
+    /// but this convenience method is not.
+    #[cfg(all(test, feature = "client-tokio"))]
     pub async fn bind_discovery_seeded<R: E2ERegistryHandle>(
         interface: Ipv4Addr,
         e2e_registry: R,
@@ -288,8 +290,10 @@ where
     ///
     /// Currently `#[cfg(test)]`-gated: production callers reach the
     /// socket through the `_with_transport` variant so the `Spawner`
-    /// trait can be exercised end-to-end.
-    #[cfg(test)]
+    /// trait can be exercised end-to-end. Additionally requires the
+    /// `client-tokio` feature because the convenience defaults live
+    /// behind it.
+    #[cfg(all(test, feature = "client-tokio"))]
     pub async fn bind<R: E2ERegistryHandle>(port: u16, e2e_registry: R) -> Result<Self, Error> {
         use crate::tokio_transport::{TokioSpawner, TokioTransport};
         Self::bind_with_transport(&TokioTransport, &TokioSpawner, port, e2e_registry).await

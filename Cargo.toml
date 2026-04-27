@@ -44,7 +44,12 @@ tokio = { version = "1", default-features = false, features = [
 tracing = { version = "0.1", default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread"] }
+# `critical-section/std` provides a host-platform impl so integration
+# tests that exercise `EmbassySyncChannels` (which depends on
+# `embassy-sync`'s critical-section calls) can link on host. This is
+# test-only; firmware builds supply their own platform impl.
+critical-section = { version = "1", features = ["std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing-subscriber = "0.3"
 
 [features]
@@ -92,3 +97,7 @@ bare_metal = ["dep:embassy-sync"]
 [[test]]
 name = "client_server"
 required-features = ["client-tokio", "server"]
+
+[[test]]
+name = "bare_metal_client"
+required-features = ["client", "bare_metal"]

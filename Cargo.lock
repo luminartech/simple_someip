@@ -291,6 +291,7 @@ name = "simple-someip"
 version = "0.7.0"
 dependencies = [
  "crc",
+ "critical-section",
  "embassy-sync",
  "embedded-io 0.7.1",
  "futures",

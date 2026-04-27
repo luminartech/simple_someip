@@ -29,36 +29,28 @@
 //! (either a `static` or a heap allocator); the capacity constants plus
 //! [`crate::UDP_BUFFER_SIZE`] are the knobs for trimming this footprint.
 mod error;
-#[cfg(feature = "client-tokio")]
 mod inner;
-#[cfg(feature = "client-tokio")]
 mod service_registry;
-#[cfg(feature = "client-tokio")]
 mod session;
-#[cfg(feature = "client-tokio")]
 mod socket_manager;
 
 pub use error::Error;
 
-#[cfg(feature = "client-tokio")]
 use crate::Timer;
-use crate::e2e::E2ECheckStatus;
+use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "client-tokio")]
-use crate::e2e::{E2EKey, E2EProfile, E2ERegistry};
+use crate::e2e::E2ERegistry;
 #[cfg(feature = "client-tokio")]
 use crate::tokio_transport::{TokioChannels, TokioSpawner, TokioTimer};
-use crate::transport::{ChannelFactory, OneshotRecv, UnboundedRecv};
-#[cfg(feature = "client-tokio")]
-use crate::transport::{E2ERegistryHandle, InterfaceHandle, MpscSend, Spawner};
+use crate::transport::{
+    ChannelFactory, E2ERegistryHandle, InterfaceHandle, MpscSend, OneshotRecv, Spawner,
+    TransportFactory, TransportSocket, UnboundedRecv,
+};
 use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
-#[cfg(feature = "client-tokio")]
+use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use inner::{ControlMessage, Inner};
-use std::net::SocketAddr;
-#[cfg(feature = "client-tokio")]
-use std::net::{Ipv4Addr, SocketAddrV4};
 #[cfg(feature = "client-tokio")]
 use std::sync::{Arc, Mutex, RwLock};
-#[cfg(feature = "client-tokio")]
 use tracing::info;
 
 /// Handle to a pending SOME/IP request-response transaction.
@@ -178,6 +170,36 @@ impl<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory> ClientU
     }
 }
 
+/// Bundle of dependencies passed to [`Client::new_with_deps`]. Bundling
+/// the five pluggable infrastructure types (`TransportFactory`,
+/// `Spawner`, `Timer`, `E2ERegistryHandle`, `InterfaceHandle`) into a
+/// single struct keeps the constructor's argument list manageable
+/// (consumers see one named field per dependency rather than positional
+/// args six deep).
+///
+/// All five fields are public so callers can construct the struct
+/// inline; there's no builder ceremony beyond the field assignments.
+pub struct ClientDeps<F, S, Tm, R, I>
+where
+    F: TransportFactory,
+    S: Spawner,
+    Tm: Timer,
+    R: E2ERegistryHandle,
+    I: InterfaceHandle,
+{
+    /// Transport factory used by `bind_*` to construct sockets.
+    pub factory: F,
+    /// Task-spawner used by `bind_*` to drive per-socket I/O loops.
+    pub spawner: S,
+    /// Async sleep primitive used by the run-loop's idle tick.
+    pub timer: Tm,
+    /// Shared E2E registry handle for runtime E2E configuration.
+    pub e2e_registry: R,
+    /// Shared interface-address handle. The run-loop reads its current
+    /// value when `bind_*` is invoked.
+    pub interface: I,
+}
+
 /// A SOME/IP client that handles service discovery and message exchange.
 ///
 /// `Client` is cheaply [`Clone`]-able. All clones share the same underlying
@@ -190,7 +212,6 @@ impl<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory> ClientU
 /// (`Arc<Mutex<E2ERegistry>>` and `Arc<RwLock<Ipv4Addr>>`) are used by the
 /// standard constructors [`Self::new`] / [`Self::new_with_loopback`] /
 /// [`Self::new_with_spawner_and_loopback`].
-#[cfg(feature = "client-tokio")]
 #[derive(Clone)]
 pub struct Client<
     MessageDefinitions: PayloadWireFormat + Send + 'static,
@@ -203,7 +224,6 @@ pub struct Client<
     e2e_registry: R,
 }
 
-#[cfg(feature = "client-tokio")]
 impl<MessageDefinitions, R, I, C> std::fmt::Debug for Client<MessageDefinitions, R, I, C>
 where
     MessageDefinitions: PayloadWireFormat + Send + 'static,
@@ -345,27 +365,20 @@ where
     where
         S: Spawner + Send + Sync + 'static,
     {
-        let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
-        let (control_sender, update_receiver, run_future) =
-            Inner::<MessageDefinitions, S, _, TokioChannels>::build(
-                interface,
-                Arc::clone(&e2e_registry),
-                multicast_loopback,
+        Self::new_with_deps(
+            ClientDeps {
+                factory: crate::tokio_transport::TokioTransport,
                 spawner,
-            );
-
-        let client = Self {
-            interface: Arc::new(RwLock::new(interface)),
-            control_sender,
-            e2e_registry,
-        };
-        let updates = ClientUpdates { update_receiver };
-        (client, updates, run_future)
+                timer: TokioTimer,
+                e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+                interface: Arc::new(RwLock::new(interface)),
+            },
+            multicast_loopback,
+        )
     }
 }
 
 /// Methods available on all `Client<M, R, I, C>` regardless of handle types.
-#[cfg(feature = "client-tokio")]
 impl<MessageDefinitions, R, I, C> Client<MessageDefinitions, R, I, C>
 where
     MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
@@ -373,6 +386,76 @@ where
     I: InterfaceHandle,
     C: ChannelFactory,
 {
+    /// Bare-metal-friendly constructor that takes every dependency
+    /// explicitly via a [`ClientDeps`] bundle: a [`TransportFactory`], a
+    /// [`Spawner`], a [`Timer`], an [`E2ERegistryHandle`], and an
+    /// [`InterfaceHandle`].
+    ///
+    /// This is the no-tokio entry point. The `client-tokio` convenience
+    /// constructors ([`Self::new`], [`Self::new_with_loopback`],
+    /// [`Self::new_with_spawner_and_loopback`]) ultimately delegate
+    /// here, supplying `TokioTransport` / `TokioTimer` / `TokioSpawner`
+    /// / `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<Ipv4Addr>>` for the
+    /// generic parameters. Bare-metal callers supply their own.
+    ///
+    /// `deps.interface` is consumed as an [`InterfaceHandle`]; the
+    /// run-loop reads its current value when `bind_*` is invoked, so
+    /// callers can share the handle with their own task and update it
+    /// through [`InterfaceHandle::set`] without going through the
+    /// control channel.
+    ///
+    /// # Bounds
+    ///
+    /// All five infrastructure parameters require `Send + Sync + 'static`
+    /// because the run-loop future is itself `Send + 'static` (so it can
+    /// be spawned on a multithreaded executor). Single-task / `LocalSet`
+    /// callers whose deps are `!Send` would need a `!Send` variant of
+    /// this constructor; that variant is planned alongside the
+    /// `LocalSet`-style spawner shim.
+    #[allow(clippy::type_complexity)]
+    #[must_use = "the returned run-loop future must be spawned (e.g. via the Spawner) for the client to make progress"]
+    pub fn new_with_deps<F, S, Tm>(
+        deps: ClientDeps<F, S, Tm, R, I>,
+        multicast_loopback: bool,
+    ) -> (
+        Self,
+        ClientUpdates<MessageDefinitions, C>,
+        impl core::future::Future<Output = ()> + Send + 'static,
+    )
+    where
+        F: TransportFactory + Send + Sync + 'static,
+        F::Socket: Send + Sync + 'static,
+        for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
+        for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
+        S: Spawner + Send + Sync + 'static,
+        Tm: Timer + Send + Sync + 'static,
+    {
+        let ClientDeps {
+            factory,
+            spawner,
+            timer,
+            e2e_registry,
+            interface,
+        } = deps;
+        let initial_addr = interface.get();
+        let (control_sender, update_receiver, run_future) =
+            Inner::<MessageDefinitions, F, S, Tm, R, C>::build(
+                initial_addr,
+                e2e_registry.clone(),
+                multicast_loopback,
+                factory,
+                spawner,
+                timer,
+            );
+        let client = Self {
+            interface,
+            control_sender,
+            e2e_registry,
+        };
+        let updates = ClientUpdates { update_receiver };
+        (client, updates, run_future)
+    }
+
     /// Returns the current network interface address.
     #[must_use]
     pub fn interface(&self) -> Ipv4Addr {
@@ -562,7 +645,7 @@ where
     /// can observe post-wrap behavior without sending 65k SD messages.
     /// Mirrors the public `Client` API: returns `Err(Error::Shutdown)` on
     /// closed channels rather than panicking.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "client-tokio"))]
     pub(crate) async fn force_sd_session_wrapped_for_test(
         &self,
         wrapped: bool,
