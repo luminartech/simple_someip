@@ -19,13 +19,14 @@ use crate::{
     },
     e2e::E2ERegistry,
     protocol::{self, Message},
-    tokio_transport::{TokioChannels, TokioSpawner, TokioTimer, TokioTransport},
     traits::PayloadWireFormat,
     transport::{
         ChannelFactory, E2ERegistryHandle, MpscRecv, OneshotSend, Spawner,
         UnboundedSend,
     },
 };
+#[cfg(feature = "client-tokio")]
+use crate::tokio_transport::{TokioChannels, TokioSpawner, TokioTimer, TokioTransport};
 
 use super::error::Error;
 
@@ -42,7 +43,7 @@ const PENDING_RESPONSES_CAP: usize = 64;
 /// two.
 const UNICAST_SOCKETS_CAP: usize = 8;
 
-pub(super) enum ControlMessage<P: PayloadWireFormat + 'static, C: ChannelFactory = TokioChannels> {
+pub(super) enum ControlMessage<P: PayloadWireFormat + 'static, C: ChannelFactory> {
     SetInterface(Ipv4Addr, C::OneshotSender<Result<(), Error>>),
     BindDiscovery(C::OneshotSender<Result<(), Error>>),
     UnbindDiscovery(C::OneshotSender<Result<(), Error>>),
@@ -308,9 +309,9 @@ pub(super) struct Inner<
     /// Target interface for sockets
     interface: Ipv4Addr,
     /// Socket manager for service discovery if bound
-    discovery_socket: Option<SocketManager<PayloadDefinitions>>,
+    discovery_socket: Option<SocketManager<PayloadDefinitions, C>>,
     /// Socket managers for unicast messages, keyed by local port
-    unicast_sockets: FnvIndexMap<u16, SocketManager<PayloadDefinitions>, UNICAST_SOCKETS_CAP>,
+    unicast_sockets: FnvIndexMap<u16, SocketManager<PayloadDefinitions, C>, UNICAST_SOCKETS_CAP>,
     /// Per-sender SD session state for reboot detection
     session_tracker: SessionTracker,
     /// Registry of known service endpoints (auto-populated from SD + manual)
@@ -528,7 +529,7 @@ where
     }
 
     async fn receive_discovery(
-        socket_manager: &mut Option<SocketManager<PayloadDefinitions>>,
+        socket_manager: &mut Option<SocketManager<PayloadDefinitions, C>>,
     ) -> Result<
         (
             SocketAddr,
@@ -563,7 +564,7 @@ where
     async fn receive_any_unicast(
         unicast_sockets: &mut FnvIndexMap<
             u16,
-            SocketManager<PayloadDefinitions>,
+            SocketManager<PayloadDefinitions, C>,
             UNICAST_SOCKETS_CAP,
         >,
     ) -> Result<ReceivedMessage<PayloadDefinitions>, Error> {
@@ -1135,7 +1136,7 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
     use tokio::sync::mpsc::Sender;
 
-    type TestControl = ControlMessage<TestPayload>;
+    type TestControl = ControlMessage<TestPayload, TokioChannels>;
 
     #[test]
     fn test_control_message_constructors() {
