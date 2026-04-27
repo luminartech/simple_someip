@@ -1,12 +1,11 @@
+use core::future;
+use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use core::task::Poll;
 use futures::{FutureExt, pin_mut, select};
 use heapless::{Deque, index_map::FnvIndexMap};
-use std::{
-    borrow::ToOwned,
-    future,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::{Arc, Mutex},
-    task::Poll,
-};
+use std::borrow::ToOwned;
+#[cfg(all(test, feature = "client-tokio"))]
+use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
@@ -17,15 +16,16 @@ use crate::{
         session::{SessionTracker, SessionVerdict, TransportKind},
         socket_manager::{ReceivedMessage, SocketManager},
     },
-    e2e::E2ERegistry,
     protocol::{self, Message},
     traits::PayloadWireFormat,
     transport::{
-        ChannelFactory, E2ERegistryHandle, MpscRecv, OneshotSend, Spawner,
-        UnboundedSend,
+        ChannelFactory, E2ERegistryHandle, MpscRecv, OneshotSend, Spawner, TransportFactory,
+        TransportSocket, UnboundedSend,
     },
 };
-#[cfg(feature = "client-tokio")]
+#[cfg(all(test, feature = "client-tokio"))]
+use crate::e2e::E2ERegistry;
+#[cfg(all(test, feature = "client-tokio"))]
 use crate::tokio_transport::{TokioChannels, TokioSpawner, TokioTimer, TokioTransport};
 
 use super::error::Error;
@@ -83,7 +83,7 @@ pub(super) enum ControlMessage<P: PayloadWireFormat + 'static, C: ChannelFactory
     /// long-running client reaches after its SD session counter wraps past
     /// `0xFFFF`, without actually sending 65k SD messages. Fires the
     /// accompanying oneshot once the mutation is applied.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "client-tokio"))]
     ForceSdSessionWrappedForTest(bool, C::OneshotSender<Result<(), Error>>),
 }
 
@@ -131,7 +131,7 @@ impl<P: PayloadWireFormat + 'static, C: ChannelFactory> std::fmt::Debug for Cont
                 .field("event_group_id", event_group_id)
                 .finish_non_exhaustive(),
             Self::QueryRebootFlag(_) => f.write_str("QueryRebootFlag"),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "client-tokio"))]
             Self::ForceSdSessionWrappedForTest(b, _) => f
                 .debug_tuple("ForceSdSessionWrappedForTest")
                 .field(b)
@@ -241,7 +241,7 @@ impl<P: PayloadWireFormat + 'static, C: ChannelFactory> ControlMessage<P, C> {
         (receiver, Self::QueryRebootFlag(sender))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "client-tokio"))]
     pub fn force_sd_session_wrapped_for_test(
         wrapped: bool,
     ) -> (C::OneshotReceiver<Result<(), Error>>, Self) {
@@ -282,7 +282,7 @@ impl<P: PayloadWireFormat + 'static, C: ChannelFactory> ControlMessage<P, C> {
             Self::QueryRebootFlag(response) => {
                 let _ = response.send(Err(Error::Capacity(structure_name)));
             }
-            #[cfg(test)]
+            #[cfg(all(test, feature = "client-tokio"))]
             Self::ForceSdSessionWrappedForTest(_, response) => {
                 let _ = response.send(Err(Error::Capacity(structure_name)));
             }
@@ -292,9 +292,11 @@ impl<P: PayloadWireFormat + 'static, C: ChannelFactory> ControlMessage<P, C> {
 
 pub(super) struct Inner<
     PayloadDefinitions: PayloadWireFormat + 'static,
-    S: Spawner = TokioSpawner,
-    R: E2ERegistryHandle = Arc<Mutex<E2ERegistry>>,
-    C: ChannelFactory = TokioChannels,
+    F: TransportFactory,
+    S: Spawner,
+    Tm: Timer,
+    R: E2ERegistryHandle,
+    C: ChannelFactory,
 > {
     /// MPSC Receiver used to receive control messages from outer client
     control_receiver: C::BoundedReceiver<ControlMessage<PayloadDefinitions, C>>,
@@ -330,16 +332,30 @@ pub(super) struct Inner<
     e2e_registry: R,
     /// Enable multicast loopback on SD sockets for same-host testing
     multicast_loopback: bool,
+    /// Transport factory used by `bind_*` to construct sockets. The
+    /// `client-tokio` convenience constructors pass in `TokioTransport`;
+    /// bare-metal callers supply their own [`TransportFactory`] impl.
+    factory: F,
     /// Task-spawner used by `bind_*` to drive per-socket I/O loops.
-    /// Default [`TokioSpawner`] wraps `tokio::spawn`; bare-metal
-    /// callers plug in their own.
+    /// On `client-tokio` builds this is [`TokioSpawner`] (which wraps
+    /// `tokio::spawn`); bare-metal callers plug in their own.
     spawner: S,
+    /// Async sleep primitive used by the run-loop's idle tick and any
+    /// future periodic-emission paths. On `client-tokio` builds this is
+    /// [`TokioTimer`] (which wraps `tokio::time::sleep`).
+    timer: Tm,
     /// Phantom data to represent the generic message definitions
-    phantom: std::marker::PhantomData<PayloadDefinitions>,
+    phantom: core::marker::PhantomData<PayloadDefinitions>,
 }
 
-impl<P: PayloadWireFormat, S: Spawner, R: E2ERegistryHandle, C: ChannelFactory> std::fmt::Debug
-    for Inner<P, S, R, C>
+impl<
+    P: PayloadWireFormat,
+    F: TransportFactory,
+    S: Spawner,
+    Tm: Timer,
+    R: E2ERegistryHandle,
+    C: ChannelFactory,
+> std::fmt::Debug for Inner<P, F, S, Tm, R, C>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inner")
@@ -352,29 +368,35 @@ impl<P: PayloadWireFormat, S: Spawner, R: E2ERegistryHandle, C: ChannelFactory> 
     }
 }
 
-impl<PayloadDefinitions, S, R, C> Inner<PayloadDefinitions, S, R, C>
+impl<PayloadDefinitions, F, S, Tm, R, C> Inner<PayloadDefinitions, F, S, Tm, R, C>
 where
     PayloadDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
+    F: TransportFactory + Send + Sync + 'static,
+    F::Socket: Send + Sync + 'static,
+    for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
+    for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
     S: Spawner + Send + Sync + 'static,
+    Tm: Timer + Send + Sync + 'static,
     R: E2ERegistryHandle,
     C: ChannelFactory,
 {
     /// Construct an `Inner` and return the control/update channels plus
-    /// the run-loop future. The caller must drive the future on a Tokio
-    /// runtime (e.g. via `tokio::spawn`).
+    /// the run-loop future. The caller drives the future on its
+    /// executor (typically `tokio::spawn` on `client-tokio` builds, or
+    /// a custom [`Spawner`] on bare-metal).
     ///
-    /// The future is bounded `Send + 'static` because every in-repo
-    /// consumer spawns it on a multithreaded Tokio runtime and because the
-    /// concrete captured state (tokio mpsc, `TokioSocket`, E2E registry)
-    /// is already Send. A bare-metal consumer whose transport produces
-    /// `!Send` state needs a cfg-gated alternative constructor; none
-    /// exists yet — it's planned alongside the bare-metal port.
+    /// The future is bounded `Send + 'static` so it can be spawned on
+    /// multithreaded executors. Bare-metal consumers whose transport
+    /// produces `!Send` state will get a cfg-gated `!Send` alternative
+    /// alongside a future single-task port.
     #[allow(clippy::type_complexity)]
     pub fn build(
         interface: Ipv4Addr,
         e2e_registry: R,
         multicast_loopback: bool,
+        factory: F,
         spawner: S,
+        timer: Tm,
     ) -> (
         C::BoundedSender<ControlMessage<PayloadDefinitions, C>>,
         C::UnboundedReceiver<ClientUpdate<PayloadDefinitions>>,
@@ -400,8 +422,10 @@ where
             sd_session_has_wrapped: false,
             e2e_registry,
             multicast_loopback,
+            factory,
             spawner,
-            phantom: std::marker::PhantomData,
+            timer,
+            phantom: core::marker::PhantomData,
         };
         (control_sender, update_receiver, inner.run_future())
     }
@@ -411,7 +435,7 @@ where
             Ok(())
         } else {
             let socket = SocketManager::bind_discovery_seeded_with_transport(
-                &TokioTransport,
+                &self.factory,
                 &self.spawner,
                 self.interface,
                 self.e2e_registry.clone(),
@@ -470,7 +494,7 @@ where
             return Err(Error::Capacity("unicast_sockets"));
         }
         let unicast_socket = SocketManager::bind_with_transport(
-            &TokioTransport,
+            &self.factory,
             &self.spawner,
             port,
             self.e2e_registry.clone(),
@@ -725,7 +749,7 @@ where
                     local_port,
                     response,
                 ) => {
-                    self.service_registry.insert(
+                    let insert_result = self.service_registry.insert(
                         ServiceInstanceId {
                             service_id,
                             instance_id,
@@ -737,11 +761,22 @@ where
                             minor_version: 0xFFFF_FFFF,
                         },
                     );
-                    debug!(
-                        "Added endpoint for service 0x{:04X}.0x{:04X} -> {}",
-                        service_id, instance_id, addr,
-                    );
-                    if response.send(Ok(())).is_err() {
+                    let outcome = if insert_result.is_ok() {
+                        debug!(
+                            "Added endpoint for service 0x{:04X}.0x{:04X} -> {}",
+                            service_id, instance_id, addr,
+                        );
+                        Ok(())
+                    } else {
+                        warn!(
+                            "service_registry at capacity ({}); cannot add 0x{:04X}.0x{:04X}",
+                            crate::client::service_registry::SERVICE_REGISTRY_CAP,
+                            service_id,
+                            instance_id,
+                        );
+                        Err(Error::Capacity("service_registry"))
+                    };
+                    if response.send(outcome).is_err() {
                         debug!("AddEndpoint: caller dropped the response receiver");
                     }
                 }
@@ -824,7 +859,7 @@ where
                         }
                     }
                 }
-                #[cfg(test)]
+                #[cfg(all(test, feature = "client-tokio"))]
                 ControlMessage::ForceSdSessionWrappedForTest(wrapped, response) => {
                     self.sd_session_has_wrapped = wrapped;
                     let _ = response.send(Ok(()));
@@ -976,6 +1011,7 @@ where
                     session_tracker,
                     service_registry,
                     run,
+                    timer,
                     ..
                 } = &mut self;
                 // Build fresh per-iteration futures and fuse them for
@@ -985,14 +1021,13 @@ where
                 // future likewise. Stack-pinning via `pin_mut!`
                 // satisfies both.
                 //
-                // The 125ms idle tick goes through the `Timer` trait
-                // rather than `tokio::time::sleep` directly so a
-                // bare-metal swap to `embassy_time` (or any other
-                // `Timer` impl) is a one-line change here. Today it
-                // resolves to `TokioTimer`.
+                // The 125ms idle tick goes through the caller-supplied
+                // `Timer` impl. On `client-tokio` builds this is
+                // `TokioTimer` (wrapping `tokio::time::sleep`); bare-metal
+                // builds plug in their own (e.g. an `embassy_time` shim).
                 let control_fut = control_receiver.recv().fuse();
-                let sleep_fut = TokioTimer
-                    .sleep(std::time::Duration::from_millis(125))
+                let sleep_fut = timer
+                    .sleep(core::time::Duration::from_millis(125))
                     .fuse();
                 let discovery_fut = Self::receive_discovery(discovery_socket).fuse();
                 let unicast_fut = Self::receive_any_unicast(unicast_sockets).fuse();
@@ -1070,19 +1105,28 @@ where
                                 };
                                 if ep.is_offer {
                                     if let Some(addr) = ep.addr {
-                                        service_registry.insert(
-                                            id,
-                                            ServiceEndpointInfo {
-                                                addr,
-                                                local_port: 0,
-                                                major_version: ep.major_version,
-                                                minor_version: ep.minor_version,
-                                            },
-                                        );
-                                        trace!(
-                                            "Registry: added 0x{:04X}.0x{:04X} -> {}",
-                                            ep.service_id, ep.instance_id, addr,
-                                        );
+                                        if service_registry
+                                            .insert(
+                                                id,
+                                                ServiceEndpointInfo {
+                                                    addr,
+                                                    local_port: 0,
+                                                    major_version: ep.major_version,
+                                                    minor_version: ep.minor_version,
+                                                },
+                                            )
+                                            .is_ok()
+                                        {
+                                            trace!(
+                                                "Registry: added 0x{:04X}.0x{:04X} -> {}",
+                                                ep.service_id, ep.instance_id, addr,
+                                            );
+                                        } else {
+                                            warn!(
+                                                "Registry full; dropped offer for 0x{:04X}.0x{:04X}",
+                                                ep.service_id, ep.instance_id,
+                                            );
+                                        }
                                     }
                                 } else {
                                     service_registry.remove(id);
@@ -1141,7 +1185,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "client-tokio"))]
 mod tests {
     use super::*;
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
@@ -1151,6 +1195,17 @@ mod tests {
     use tokio::sync::mpsc::Sender;
 
     type TestControl = ControlMessage<TestPayload, TokioChannels>;
+    /// Type alias for the fully-spelled `Inner` flavor used throughout
+    /// these tests: tokio everything, default `Arc<Mutex<E2ERegistry>>`
+    /// and `Arc<RwLock<Ipv4Addr>>` handles.
+    type TestInner = Inner<
+        TestPayload,
+        crate::tokio_transport::TokioTransport,
+        TokioSpawner,
+        crate::tokio_transport::TokioTimer,
+        Arc<Mutex<E2ERegistry>>,
+        TokioChannels,
+    >;
 
     #[test]
     fn test_control_message_constructors() {
@@ -1292,7 +1347,7 @@ mod tests {
 
     /// Build an [`Inner`] without spawning the run loop, for direct
     /// unit-testing of state-mutating methods.
-    fn make_inner_for_test() -> Inner<TestPayload> {
+    fn make_inner_for_test() -> TestInner {
         let (_control_sender, control_receiver) =
             TokioChannels::bounded::<ControlMessage<TestPayload, TokioChannels>, 4>();
         let (update_sender, _update_receiver) =
@@ -1314,8 +1369,10 @@ mod tests {
             sd_session_has_wrapped: false,
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             multicast_loopback: false,
+            factory: TokioTransport,
             spawner: TokioSpawner,
-            phantom: std::marker::PhantomData,
+            timer: TokioTimer,
+            phantom: core::marker::PhantomData,
         }
     }
 
@@ -1525,7 +1582,14 @@ mod tests {
         // as `make_inner_for_test`, but parameterized on S.
         let (_control_sender, control_receiver) = mpsc::channel(4);
         let (update_sender, _update_receiver) = mpsc::unbounded_channel();
-        let mut inner: Inner<TestPayload, CountingSpawner> = Inner {
+        let mut inner: Inner<
+            TestPayload,
+            TokioTransport,
+            CountingSpawner,
+            TokioTimer,
+            Arc<Mutex<E2ERegistry>>,
+            TokioChannels,
+        > = Inner {
             control_receiver,
             request_queue: Deque::new(),
             pending_responses: FnvIndexMap::new(),
@@ -1542,8 +1606,10 @@ mod tests {
             sd_session_has_wrapped: false,
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             multicast_loopback: false,
+            factory: TokioTransport,
             spawner,
-            phantom: std::marker::PhantomData,
+            timer: TokioTimer,
+            phantom: core::marker::PhantomData,
         };
 
         // Three ephemeral binds → three distinct socket loops spawned.
@@ -1565,11 +1631,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_inner_build_and_shutdown() {
-        let (control_sender, mut update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, mut update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
         // Drop control sender to trigger loop exit
@@ -1601,11 +1669,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_bind_discovery_continues() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -1619,11 +1689,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_unbind_discovery_continues() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -1637,11 +1709,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_set_interface_continues() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -1657,11 +1731,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_send_sd_continues() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -1688,11 +1764,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_queued_messages_all_complete() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -1760,11 +1838,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_add_endpoint_continues() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -1779,11 +1859,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_remove_endpoint_continues() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -1797,11 +1879,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_receiver_send_to_service_send_complete_continues() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -1825,11 +1909,13 @@ mod tests {
     async fn test_bind_discovery_with_loopback() {
         // Spawn inner with multicast_loopback=true so bind_discovery exercises
         // the loopback-enabled branch of SocketManager::bind_discovery.
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             true,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -1841,11 +1927,13 @@ mod tests {
     #[tokio::test]
     async fn test_bind_discovery_idempotent() {
         // Binding discovery twice should succeed (early return on already-bound)
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -1862,11 +1950,13 @@ mod tests {
     #[tokio::test]
     async fn test_send_sd_auto_binds_discovery() {
         // SendSD without a bound discovery socket should auto-bind and succeed
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -1884,11 +1974,13 @@ mod tests {
     #[tokio::test]
     async fn test_send_to_service_auto_binds_unicast() {
         // SendToService with no unicast sockets should auto-bind ephemeral
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -1910,11 +2002,13 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_with_endpoint_sends_sd() {
         // Subscribe with a known endpoint and bound discovery should send the SD message
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -1942,11 +2036,13 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_auto_binds_discovery() {
         // Subscribe without discovery bound should auto-bind and succeed
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -1968,11 +2064,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_unknown_service_returns_error() {
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -1988,11 +2086,13 @@ mod tests {
     #[tokio::test]
     async fn test_send_to_service_reuses_existing_unicast_socket() {
         // When a unicast socket already exists, SendToService should reuse it
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -2024,11 +2124,13 @@ mod tests {
     #[tokio::test]
     async fn test_dropped_receiver_subscribe_service_not_found_continues() {
         // Subscribe with no endpoint → ServiceNotFound response is dropped
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -2043,11 +2145,13 @@ mod tests {
     #[tokio::test]
     async fn test_set_interface_changes_interface() {
         // SetInterface to a different address exercises the interface!=current path
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -2069,11 +2173,13 @@ mod tests {
     #[tokio::test]
     async fn test_set_interface_with_discovery_bound_changes_interface() {
         // SetInterface when discovery is already bound: unbind → change → rebind
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -2101,11 +2207,13 @@ mod tests {
     async fn test_subscribe_specific_port_reuse() {
         // Subscribe twice with the same specific client_port exercises the
         // bind_unicast port-reuse path (port != 0 && already bound).
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 
@@ -2149,11 +2257,13 @@ mod tests {
         use std::vec;
         use tokio::net::UdpSocket;
 
-        let (control_sender, _update_receiver, run_fut) = Inner::<TestPayload>::build(
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
+            TokioTransport,
             TokioSpawner,
+            TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
 

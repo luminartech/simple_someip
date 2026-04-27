@@ -106,6 +106,13 @@
 #[cfg(feature = "std")]
 extern crate std;
 
+// `bare_metal` builds need `alloc` for `EmbassySyncChannels`'s
+// `Arc<Channel<...>>` storage (the heap-backed bare-metal channel
+// primitive). A future no_alloc port stores the channel in a `static`
+// and drops this `extern crate alloc;`.
+#[cfg(feature = "bare_metal")]
+extern crate alloc;
+
 /// Maximum size, in bytes, of UDP payloads for `client` / `server` send
 /// paths that serialize into a fixed-size buffer of this size.
 ///
@@ -153,6 +160,12 @@ pub mod server;
 /// transitively until phase 14 retargets it to the trait surface.)
 #[cfg(any(feature = "client-tokio", feature = "server"))]
 pub mod tokio_transport;
+
+/// `embassy-sync`-backed implementation of [`transport::ChannelFactory`].
+/// Available whenever the `bare_metal` feature is enabled, independent
+/// of any tokio dependency.
+#[cfg(feature = "bare_metal")]
+pub mod embassy_channels;
 mod traits;
 /// Executor-agnostic UDP transport abstraction used by the client and
 /// server modules. `no_std`-compatible; a default `std + tokio` backend
@@ -168,9 +181,9 @@ pub use traits::OfferedEndpoint;
 pub use traits::{PayloadWireFormat, WireFormat};
 
 #[cfg(feature = "client")]
-pub use client::{ClientUpdate, ClientUpdates, DiscoveryMessage, PendingResponse};
-#[cfg(feature = "client-tokio")]
-pub use client::Client;
+pub use client::{
+    Client, ClientDeps, ClientUpdate, ClientUpdates, DiscoveryMessage, PendingResponse,
+};
 pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
 pub use server::Server;
