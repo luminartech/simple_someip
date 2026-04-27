@@ -45,29 +45,29 @@
 //!
 //! The example exercises the **trait layer** (`TransportSocket`,
 //! `TransportFactory`, `Timer`, `Spawner`, `ChannelFactory`) — and
-//! that is all. It does NOT demonstrate a no_alloc integration with
+//! that is all. It does NOT demonstrate a `no_alloc` integration with
 //! `simple_someip::Client` / `simple_someip::Server`, because those
-//! are not yet no_alloc-compatible.
+//! are not yet `no_alloc`-compatible.
 //!
 //! **Completed abstractions:**
 //! - Phase 9: `Spawner` trait (task submission)
 //! - Phase 10: `E2ERegistryHandle` / `InterfaceHandle` (lock handles)
 //! - Phase 11: `ChannelFactory` trait with `TokioChannels` (std) and
-//!   `EmbassySyncChannels` (bare_metal) backends — replaces direct
+//!   `EmbassySyncChannels` (`bare_metal`) backends — replaces direct
 //!   `tokio::sync::mpsc` / `oneshot` usage
+//! - Phase 12: `TransportSocket` GATs — `SendFuture` / `RecvFuture`
+//!   express `Send` bounds without RTN; `Socket = TokioSocket` pin
+//!   removed from `bind_*` functions
 //!
 //! **Remaining gaps:**
-//! 1. **`F::Socket = TokioSocket`** bound on `bind_*`: a phase-5
-//!    compromise because stable Rust Return-Type Notation is still
-//!    nightly. Phase 12 relaxes this via GATs.
-//! 2. **Feature-flag split** (Phase 13): `client` / `server` still
+//! 1. **Feature-flag split** (Phase 13): `client` / `server` still
 //!    pull in tokio + socket2. A future split (`client` vs
-//!    `client-tokio`) will make the core types no_std-compatible.
+//!    `client-tokio`) will make the core types `no_std`-compatible.
 //!
 //! Until those are closed, `feature = "client"` / `feature = "server"`
 //! pull in `std + tokio + socket2`.
 //!
-//! # Recommendation for no_alloc consumers today
+//! # Recommendation for `no_alloc` consumers today
 //!
 //! Do NOT route through `Client::new_with_spawner_and_loopback`.
 //! Instead, depend on `simple-someip` with `default-features = false,
@@ -87,7 +87,7 @@
 //! `TransportSocket::recv_from` / `Timer::sleep` directly. That is
 //! the shape the trait layer was designed for; the `Client` /
 //! `Server` types are a std+tokio convenience layer on top that
-//! happens not to suit no_alloc targets yet.
+//! happens not to suit `no_alloc` targets yet.
 
 use core::future::Future;
 use core::net::{Ipv4Addr, SocketAddrV4};
@@ -140,49 +140,81 @@ impl TransportFactory for MockFactory {
     }
 }
 
-impl TransportSocket for MockSocket {
-    fn send_to(
-        &self,
-        buf: &[u8],
-        target: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), TransportError>> {
-        let bytes = buf.to_vec();
-        let pipe = Arc::clone(&self.pipe);
-        async move {
-            pipe.send_queue.lock().unwrap().push_back((bytes, target));
-            Ok(())
-        }
-    }
+/// Future returned by [`MockSocket::send_to`]. Defers the queue push
+/// to poll-time so the side effect happens when the future is awaited,
+/// not when `send_to` is called — matching what a real bare-metal
+/// `TransportSocket` impl would do (the network driver only sees the
+/// datagram when the executor polls the future).
+struct MockSendFut {
+    pipe: Arc<MockPipe>,
+    bytes: Option<Vec<u8>>,
+    target: SocketAddrV4,
+}
 
-    fn recv_from(
-        &self,
-        buf: &mut [u8],
-    ) -> impl Future<Output = Result<ReceivedDatagram, TransportError>> {
-        // Read synchronously before the async block so we don't have to
-        // capture `buf` across the `.await` boundary. If the queue is
-        // empty, return a ready `Err(TimedOut)` rather than a pending
-        // future. A production bare-metal impl would instead register
-        // the `Context`'s `Waker` on the network driver's RX-ready
-        // signal and return `Poll::Pending` so the executor can park
-        // the task — see e.g. `embassy_net::UdpSocket` or smoltcp's
-        // socket polling model. In this single-threaded example we
-        // always send first then recv, so the timeout branch is
-        // unreachable here.
-        let result = {
-            let mut q = self.pipe.recv_queue.lock().unwrap();
-            q.pop_front()
-        };
-        match result {
+impl Future for MockSendFut {
+    type Output = Result<(), TransportError>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        if let Some(bytes) = me.bytes.take() {
+            me.pipe.send_queue.lock().unwrap().push_back((bytes, me.target));
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Future returned by [`MockSocket::recv_from`]. Reads from the queue
+/// on poll. A production bare-metal impl would instead register the
+/// `Context`'s `Waker` on the network driver's RX-ready signal and
+/// return `Poll::Pending` when the queue is empty — see e.g.
+/// `embassy_net::UdpSocket` or smoltcp's socket polling model. This
+/// mock returns `Err(TimedOut)` on empty for simplicity; the demo
+/// always sends before recv-ing so the empty branch is unreachable.
+struct MockRecvFut<'a> {
+    pipe: Arc<MockPipe>,
+    buf: &'a mut [u8],
+}
+
+impl Future for MockRecvFut<'_> {
+    type Output = Result<ReceivedDatagram, TransportError>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        let entry = me.pipe.recv_queue.lock().unwrap().pop_front();
+        Poll::Ready(match entry {
             Some((bytes, source)) => {
-                let n = bytes.len().min(buf.len());
-                buf[..n].copy_from_slice(&bytes[..n]);
-                core::future::ready(Ok(ReceivedDatagram {
+                let n = bytes.len().min(me.buf.len());
+                me.buf[..n].copy_from_slice(&bytes[..n]);
+                Ok(ReceivedDatagram {
                     bytes_received: n,
                     source,
                     truncated: n < bytes.len(),
-                }))
+                })
             }
-            None => core::future::ready(Err(TransportError::Io(IoErrorKind::TimedOut))),
+            None => Err(TransportError::Io(IoErrorKind::TimedOut)),
+        })
+    }
+}
+
+impl TransportSocket for MockSocket {
+    type SendFuture<'a> = MockSendFut;
+    type RecvFuture<'a> = MockRecvFut<'a>;
+
+    fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddrV4) -> Self::SendFuture<'a> {
+        // `buf` cannot be borrowed past this call (its lifetime is
+        // bounded by the borrow checker, not the future), so we copy
+        // here. The push to the shared queue is deferred to `poll`.
+        MockSendFut {
+            pipe: Arc::clone(&self.pipe),
+            bytes: Some(buf.to_vec()),
+            target,
+        }
+    }
+
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+        MockRecvFut {
+            pipe: Arc::clone(&self.pipe),
+            buf,
         }
     }
 
@@ -278,7 +310,7 @@ impl simple_someip::transport::Spawner for WorkingSpawner {
 /// interrupts; this helper exists only to drive the demo's
 /// synchronous mock futures (which resolve on the first poll).
 ///
-/// For a real no_alloc `block_on`, see e.g. `embassy_executor::block_on`,
+/// For a real `no_alloc` `block_on`, see e.g. `embassy_executor::block_on`,
 /// the `cassette` crate, or roll your own around a hardware-timer-driven
 /// `Waker`. The `Future::poll` loop body below is the part that stays
 /// the same; only the `Waker` plumbing and yield strategy change.
@@ -374,11 +406,8 @@ fn main() {
     );
     println!(
         "note: trait layer (TransportSocket + TransportFactory + Timer + \
-         Spawner) exercised end-to-end. For a no_alloc SOME/IP client \
-         today, build your own orchestrator on `protocol` + `e2e` + these \
-         traits — do NOT route through `Client::new_with_spawner_and_loopback`: \
-         the Client internals still depend on tokio::sync::mpsc/oneshot, \
-         Arc<Mutex<E2ERegistry>>, and an F::Socket=TokioSocket bound (RTN). \
-         See top-of-file docblock for the full blocker list."
+         Spawner + ChannelFactory) exercised end-to-end. Phases 9-12 \
+         complete. Remaining gap: client/server feature flags still pull \
+         in tokio + socket2 (Phase 13). See top-of-file docblock."
     );
 }
