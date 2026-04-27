@@ -170,10 +170,11 @@ pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
 pub use server::Server;
 #[cfg(any(feature = "client", feature = "server"))]
-pub use tokio_transport::{TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
+pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
 pub use transport::{
-    E2ERegistryHandle, InterfaceHandle, IoErrorKind, ReceivedDatagram, SocketOptions, Spawner,
-    Timer, TransportError, TransportFactory, TransportSocket,
+    ChannelFactory, E2ERegistryHandle, InterfaceHandle, IoErrorKind, MpscRecv, MpscSend,
+    OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram, SocketOptions, Spawner, Timer,
+    TransportError, TransportFactory, TransportSocket, UnboundedRecv, UnboundedSend,
 };
 #[cfg(feature = "server")]
 pub use server::SubscriptionHandle;

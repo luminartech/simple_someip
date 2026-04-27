@@ -16,6 +16,12 @@ repository = "https://github.com/luminartech/simple_someip"
 
 [dependencies]
 crc = "3.4"
+# embassy-sync provides no_std-compatible bounded channels used as the
+# channel backend when the `bare_metal` feature is active. The
+# `critical-section` and `portable-atomic` deps ship with embassy-sync and
+# are satisfiable on the Infineon AURIX TriCore target (HighTec toolchain)
+# per the bare_metal_plan_v2 TriCore delta.
+embassy-sync = { version = "0.6", optional = true }
 embedded-io = { version = "0.7" }
 # `futures` pulls in `futures-util` which provides the executor-agnostic
 # `select!` macro and `FutureExt::fuse` / `pin_mut!` helpers — used by
@@ -60,7 +66,11 @@ server = ["std", "dep:tokio", "dep:socket2", "dep:futures"]
 # bare-metal-complete: the `client` and `server` feature paths still
 # spawn per-socket I/O loops on `tokio::spawn`, and a fully tokio-free
 # build additionally needs a user-provided `Spawner` impl (phase 9).
-bare_metal = []
+# `bare_metal` activates embassy-sync as the channel backend. The feature
+# is a prerequisite for the Phase 11 channel-handle abstraction: with
+# `bare_metal` enabled, `EmbassySyncChannels` is available as the
+# `ChannelFactory` impl that does not depend on tokio.
+bare_metal = ["dep:embassy-sync"]
 
 [[test]]
 name = "client_server"
