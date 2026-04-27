@@ -67,9 +67,7 @@ impl TokioSocket {
     /// Returns [`TransportError`] if the backend cannot read the flag.
     #[allow(dead_code)] // used in tests; kept available for field debugging.
     pub(crate) fn multicast_loop_v4(&self) -> Result<bool, TransportError> {
-        self.inner
-            .multicast_loop_v4()
-            .map_err(|e| map_io_error(&e))
+        self.inner.multicast_loop_v4().map_err(|e| map_io_error(&e))
     }
 }
 
@@ -88,9 +86,10 @@ pub struct TokioTimer;
 /// [`crate::transport::Spawner`] impl that routes submitted futures
 /// to `tokio::spawn`.
 ///
-/// Zero-size unit struct; every `Inner<P, TokioSpawner>` / `Client<P,
-/// TokioSpawner>` pays nothing for the abstraction. Bare-metal
-/// consumers substitute their own `Spawner` via the
+/// Zero-size unit struct; every `Inner<P, TokioSpawner>` / `Client<P>`
+/// pays nothing for the abstraction (the `Inner` carries the spawner
+/// generic; `Client<P>` is a thin handle that forwards to it).
+/// Bare-metal consumers substitute their own `Spawner` via the
 /// `crate::Client::new_with_spawner_and_loopback` constructor.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TokioSpawner;
@@ -111,11 +110,7 @@ impl TransportFactory for TokioTransport {
 }
 
 impl TransportSocket for TokioSocket {
-    async fn send_to(
-        &self,
-        buf: &[u8],
-        target: SocketAddrV4,
-    ) -> Result<(), TransportError> {
+    async fn send_to(&self, buf: &[u8], target: SocketAddrV4) -> Result<(), TransportError> {
         self.inner
             .send_to(buf, target)
             .await
@@ -123,10 +118,7 @@ impl TransportSocket for TokioSocket {
             .map_err(|e| map_io_error(&e))
     }
 
-    async fn recv_from(
-        &self,
-        buf: &mut [u8],
-    ) -> Result<ReceivedDatagram, TransportError> {
+    async fn recv_from(&self, buf: &mut [u8]) -> Result<ReceivedDatagram, TransportError> {
         let (n, src) = self
             .inner
             .recv_from(buf)
@@ -165,21 +157,13 @@ impl TransportSocket for TokioSocket {
         }
     }
 
-    fn join_multicast_v4(
-        &self,
-        group: Ipv4Addr,
-        iface: Ipv4Addr,
-    ) -> Result<(), TransportError> {
+    fn join_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> Result<(), TransportError> {
         self.inner
             .join_multicast_v4(group, iface)
             .map_err(|e| map_io_error(&e))
     }
 
-    fn leave_multicast_v4(
-        &self,
-        group: Ipv4Addr,
-        iface: Ipv4Addr,
-    ) -> Result<(), TransportError> {
+    fn leave_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> Result<(), TransportError> {
         self.inner
             .leave_multicast_v4(group, iface)
             .map_err(|e| map_io_error(&e))
@@ -205,8 +189,10 @@ impl crate::transport::Spawner for TokioSpawner {
 
 /// Synchronously create and configure a UDP socket via `socket2`, then
 /// hand it to tokio. Mirrors the existing bind paths in
-/// [`crate::client::socket_manager`] and [`crate::server`] so behavior is
-/// identical.
+/// `crate::client::socket_manager` and `crate::server` (rendered as
+/// code literals because both are feature-gated and would break
+/// default-feature rustdoc builds via broken intra-doc links) so
+/// behavior is identical.
 fn bind_with_options(addr: SocketAddrV4, options: SocketOptions) -> std::io::Result<TokioSocket> {
     let raw = socket2::Socket::new(
         socket2::Domain::IPV4,

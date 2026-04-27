@@ -241,7 +241,7 @@ impl Options {
     ///
     /// # Panics
     ///
-    /// Panics if the option size minus [`OPTION_LENGTH_SIZE_DELTA`] exceeds `u16::MAX`
+    /// Panics if the option size minus `OPTION_LENGTH_SIZE_DELTA` exceeds `u16::MAX`
     /// (unreachable in practice).
     pub fn write<T: embedded_io::Write>(
         &self,
@@ -353,7 +353,7 @@ impl<'a> OptionView<'a> {
         OptionType::try_from(self.0[OPTION_TYPE_OFFSET])
     }
 
-    /// Total wire size of this option (length field value + [`OPTION_LENGTH_SIZE_DELTA`]).
+    /// Total wire size of this option (length field value + `OPTION_LENGTH_SIZE_DELTA`).
     #[must_use]
     pub fn wire_size(&self) -> usize {
         let length = u16::from_be_bytes([self.0[0], self.0[1]]);

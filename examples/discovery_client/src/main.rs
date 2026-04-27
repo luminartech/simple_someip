@@ -288,7 +288,7 @@ async fn main() -> Result<(), Error> {
     info!("Starting discovery client on interface {interface}");
 
     let (client, mut updates, run_fut) = simple_someip::Client::<Payload>::new(interface);
-    tokio::spawn(run_fut);
+    let _run_handle = tokio::spawn(run_fut);
     client.bind_discovery().await.unwrap();
 
     let mut state = DiscoveryState::new();

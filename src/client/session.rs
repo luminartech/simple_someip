@@ -35,8 +35,9 @@ struct SessionState {
 pub enum SessionVerdict {
     /// Session is valid (normal increment or first message with matching state).
     Ok,
-    /// Sender has rebooted (reboot flag 0→1 transition, or session ID decreased
-    /// while reboot flag remains 1 within the same service instance stream).
+    /// Sender has rebooted (reboot flag transitioned `Continuous → RecentlyRebooted`,
+    /// or session ID decreased while the reboot flag remains `RecentlyRebooted`
+    /// within the same service instance stream).
     Reboot,
     /// First message ever seen from this service instance on this transport.
     Initial,
@@ -46,8 +47,8 @@ pub enum SessionVerdict {
 ///
 /// A reboot is detected when, for a given `(sender, transport, service_id,
 /// instance_id)` tuple:
-/// - The reboot flag transitions from 0 to 1, **or**
-/// - The session ID decreases while the reboot flag remains 1
+/// - The reboot flag transitions from `Continuous` to `RecentlyRebooted`, **or**
+/// - The session ID decreases while the reboot flag remains `RecentlyRebooted`
 ///
 /// Tracking per service instance (rather than per sender) avoids false
 /// positives when a sensor interleaves SD offers for multiple services

@@ -65,7 +65,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::sync::mpsc;
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 /// A received message together with the source address it came from.
 ///
@@ -307,14 +307,32 @@ where
         target_addr: SocketAddrV4,
         message: Message<MessageDefinitions>,
     ) -> Result<(), Error> {
+        // Pre-encode size check: fail fast with `Error::Capacity("udp_buffer")`
+        // for messages that exceed `UDP_BUFFER_SIZE`. Mirrors the analogous
+        // check in `server::EventPublisher` so callers see a uniform
+        // overload signal regardless of which path produced the oversize
+        // message. Without this, an oversize encode would surface as a
+        // protocol-level I/O error from inside the socket loop.
+        let required = message.required_size();
+        if required > UDP_BUFFER_SIZE {
+            warn!(
+                "outgoing message size {required} exceeds UDP_BUFFER_SIZE ({UDP_BUFFER_SIZE}); rejecting with Capacity(\"udp_buffer\")"
+            );
+            return Err(Error::Capacity("udp_buffer"));
+        }
         let (result_channel, message) = SendMessage::new(target_addr, message);
         self.sender.send(message).await.map_err(|e| {
             error!("Socket error: {e} when attempting to send message");
             Error::SocketClosedUnexpectedly
         })?;
-        result_channel
-            .await
-            .expect("Socket manager must always return result of send before dropping channel")?;
+        // The socket loop's response sender can be dropped without sending
+        // (executor cancellation, bare-metal `Spawner` that drops futures,
+        // or a panic in the loop). Surface that as a typed error rather
+        // than `.expect`-panicking the caller.
+        result_channel.await.map_err(|_| {
+            debug!("send result channel dropped (socket loop gone)");
+            Error::SocketClosedUnexpectedly
+        })??;
         if self.session_id == u16::MAX {
             self.session_id = 1;
             self.session_has_wrapped = true;
@@ -382,6 +400,15 @@ where
         mut tx_rx: mpsc::Receiver<SendMessage<MessageDefinitions>>,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
     ) {
+        // Maximum number of consecutive `recv_from` errors tolerated before
+        // the socket loop gives up. A single failure (transient I/O, peer
+        // RST, ICMP port-unreachable amplified into `ConnectionRefused`)
+        // is normal and should not tear down the socket. A persistent
+        // failure (e.g. `EBADF` after the kernel closed the fd, or a
+        // platform-level network-stack collapse) used to pin a CPU on a
+        // tight `error!` log loop with no exit; this counter caps that.
+        const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 16;
+        let mut consecutive_recv_errors: u32 = 0;
         let mut buf = [0u8; UDP_BUFFER_SIZE];
 
         loop {
@@ -506,6 +533,7 @@ where
                     source,
                     truncated,
                 })) => {
+                    consecutive_recv_errors = 0;
                     if truncated {
                         // A truncated datagram cannot be parsed reliably;
                         // the length field in the SOME/IP header will not
@@ -553,7 +581,23 @@ where
                     }
                 }
                 Outcome::Recv(Err(recv_err)) => {
-                    error!("Transport recv failed: {:?}", recv_err);
+                    // `tokio_transport::map_io_error` already logs the
+                    // underlying `std::io::Error` (debug for transient
+                    // kinds, warn for unusual ones) — keep this
+                    // call-site at debug to avoid duplicating the same
+                    // failure on the operator's screen.
+                    consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
+                    debug!(
+                        "socket recv_from error ({}/{}): {:?}",
+                        consecutive_recv_errors, MAX_CONSECUTIVE_RECV_ERRORS, recv_err,
+                    );
+                    if consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                        error!(
+                            "socket recv_from failed {} times consecutively; closing socket loop",
+                            consecutive_recv_errors,
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -764,13 +808,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_id_wraps_to_one_and_clears_reboot_flag() {
+        use crate::protocol::sd::RebootFlag;
         let mut sm = bind_ephemeral_spawned().await;
         let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target =
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_socket.local_addr().unwrap().port());
         let msg = || Message::<TestPayload>::new_sd(1, &empty_sd_header());
 
-        use crate::protocol::sd::RebootFlag;
         // Set session_id to one before the wrap point
         sm.session_id = u16::MAX - 1;
         assert_eq!(
@@ -813,6 +857,15 @@ mod tests {
         use crate::e2e::{E2EProfile, Profile4Config};
         use crate::protocol::{Header, MessageId, MessageType, MessageTypeField, ReturnCode};
 
+        // Craft a message whose raw-encoded size fits UDP_BUFFER_SIZE (16-byte
+        // SOME/IP header + payload <= cap) but whose E2E-protected size
+        // does not — Profile 4 adds `PROFILE4_HEADER_SIZE = 12` bytes,
+        // so a payload of `UDP_BUFFER_SIZE - 16 - 4` exactly fits raw and
+        // overflows by 8 once protected. Derive both fixture sizes from
+        // `UDP_BUFFER_SIZE` so this stays correct if the constant moves.
+        const SOMEIP_HEADER_SIZE: usize = 16;
+        const PAYLOAD_LEN: usize = UDP_BUFFER_SIZE - SOMEIP_HEADER_SIZE - 4;
+
         // Register an E2E profile so the protect branch runs.
         let message_id = MessageId::new_from_service_and_method(0x1234, 0x5678);
         let key = E2EKey::from_message_id(message_id);
@@ -824,11 +877,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Craft a message whose raw-encoded size fits UDP_BUFFER_SIZE (16-byte
-        // header + 1480-byte payload = 1496 bytes) but whose E2E-protected
-        // size does not (payload grows by PROFILE4_HEADER_SIZE = 12, pushing
-        // the total to 1508 bytes, 8 over MTU).
-        let payload_bytes = [0u8; 1480];
+        let payload_bytes = [0u8; PAYLOAD_LEN];
         let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
         let header = Header::new(
             message_id,
@@ -949,7 +998,7 @@ mod tests {
             .await
             .expect("send_to via custom-factory-built socket");
 
-        let mut buf = [0u8; 1500];
+        let mut buf = [0u8; UDP_BUFFER_SIZE];
         let (len, from) =
             tokio::time::timeout(std::time::Duration::from_secs(2), recv.recv_from(&mut buf))
                 .await

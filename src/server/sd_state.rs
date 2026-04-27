@@ -53,11 +53,23 @@ impl SdStateManager {
     }
 
     /// Advance the counter and return the next SOME/IP-SD session ID
-    /// (`client_id = 0`, session ID in the low 16 bits). Skips 0 on wrap,
+    /// (`client_id = 0`, session ID in the low 16 bits) together with the
+    /// reboot flag that *belongs to this same emission*. Skips 0 on wrap,
     /// and latches [`Self::has_wrapped`] the first time the counter crosses
     /// the `0xFFFF → 0x0001` boundary so the reboot flag flips to
     /// [`RebootFlag::Continuous`] permanently.
-    pub(super) fn next_session_id(&self) -> u32 {
+    ///
+    /// Returns `(session_id, reboot_flag)` as a tuple to avoid a TOCTOU
+    /// race around the wrap boundary: a separate `next_session_id() +
+    /// reboot_flag()` call pair could see thread A's pre-wrap session
+    /// ID and thread B's post-wrap latched flag (or the inverse), and
+    /// thus advertise `Continuous` with `session_id=0xFFFF` (or
+    /// `RecentlyRebooted` with `session_id=0x0001`) — both violations
+    /// of AUTOSAR SOME/IP-SD's stated semantics that the wrap message
+    /// itself carries `Continuous`. By computing both inside the same
+    /// `fetch_update` closure, the pair is consistent for every
+    /// individual emission.
+    pub(super) fn next_session_id_with_reboot_flag(&self) -> (u32, RebootFlag) {
         let prev = self
             .session_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -66,25 +78,48 @@ impl SdStateManager {
             })
             .unwrap();
         // The only value whose successor wraps through 0 is 0xFFFF; latch
-        // the flag exactly on that transition.
+        // the flag exactly on that transition. We then read the flag for
+        // this emission AFTER the latch, so the wrap message itself
+        // advertises `Continuous`.
         if prev == u16::MAX {
             self.has_wrapped.store(true, Ordering::Relaxed);
         }
         let next = prev.wrapping_add(1);
-        u32::from(if next == 0 { 1 } else { next })
+        let session_id = u32::from(if next == 0 { 1 } else { next });
+        let reboot_flag = if self.has_wrapped.load(Ordering::Relaxed) {
+            RebootFlag::Continuous
+        } else {
+            RebootFlag::RecentlyRebooted
+        };
+        (session_id, reboot_flag)
+    }
+
+    /// Convenience: advance the counter and return only the session id.
+    /// Use [`Self::next_session_id_with_reboot_flag`] when the same
+    /// emission also needs the reboot flag — calling these two methods
+    /// separately races around the wrap boundary. Only used by unit
+    /// tests; production paths take the atomic pair.
+    #[cfg(test)]
+    pub(super) fn next_session_id(&self) -> u32 {
+        self.next_session_id_with_reboot_flag().0
     }
 
     /// Current SD reboot flag for this server.
     ///
     /// Returns [`RebootFlag::RecentlyRebooted`] until the session counter
     /// has wrapped past `0xFFFF` at least once, then
-    /// [`RebootFlag::Continuous`] permanently. Every server-side SD
-    /// emission path ([`Self::send_offer_service`], plus the unicast
-    /// offer / `SubscribeAck` / `SubscribeNack` paths in
-    /// [`crate::server::Server`]) calls this so the flag on the wire
-    /// reflects a single tracked state.
+    /// [`RebootFlag::Continuous`] permanently. Production emission paths
+    /// must use [`Self::next_session_id_with_reboot_flag`] instead to
+    /// avoid a TOCTOU race around the wrap boundary; this accessor is
+    /// `#[cfg(test)]`-only so future code cannot accidentally reach for
+    /// the racy pair.
+    #[cfg(test)]
     pub(super) fn reboot_flag(&self) -> RebootFlag {
-        RebootFlag::from(!self.has_wrapped.load(Ordering::Relaxed))
+        if self.has_wrapped.load(Ordering::Relaxed) {
+            RebootFlag::Continuous
+        } else {
+            RebootFlag::RecentlyRebooted
+        }
     }
 
     /// Send a multicast `OfferService` announcement for the given config.
@@ -115,15 +150,12 @@ impl SdStateManager {
 
         let entries = [entry];
         let options = [option];
-        // Advance the session counter FIRST so `has_wrapped` latches on
-        // the wrap transition, then derive the reboot flag for this
-        // same message. Without this ordering the message carrying
-        // session_id=0x0001 after a wrap would still advertise
-        // `RebootFlag::RecentlyRebooted`, and the flip would only land
-        // on the NEXT emission — violating AUTOSAR SOME/IP-SD semantics
-        // (the wrap message itself should carry `Continuous`).
-        let sid = self.next_session_id();
-        let sd_payload = sd::Header::new(Flags::new_sd(self.reboot_flag()), &entries, &options);
+        // Atomic (sid, reboot_flag) pair so that concurrent emissions
+        // around the wrap boundary cannot disagree about whether this
+        // very message advertises `RecentlyRebooted` or `Continuous`.
+        // See `next_session_id_with_reboot_flag` docs for the race.
+        let (sid, reboot_flag) = self.next_session_id_with_reboot_flag();
+        let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &options);
 
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;

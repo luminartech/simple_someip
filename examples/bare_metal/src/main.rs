@@ -7,15 +7,22 @@
 //! hand-rolled mock backend. The `Cargo.toml` in this directory
 //! depends on `simple-someip` with
 //! `default-features = false, features = ["bare_metal"]`, so building
-//! or running this example proves **that the trait surface compiles
-//! under exactly the feature set a firmware consumer would use** —
-//! no `std`-feature paths from `simple-someip`, no tokio, no socket2.
-//! `cargo build --workspace` catches any regression that breaks this
-//! surface even without running the binary.
+//! or running this package in isolation proves **that the trait
+//! surface compiles under exactly the feature set a firmware consumer
+//! would use** — no `std`-feature paths from `simple-someip`, no
+//! tokio, no socket2.
+//!
+//! Use `cargo build -p bare_metal` (or `cargo run -p bare_metal`) as
+//! the source of truth for that check; `cargo build --workspace` can
+//! unify features across workspace members and may therefore mask
+//! regressions in this minimal configuration. CI should run
+//! `cargo build -p bare_metal` (and `cargo clippy -p bare_metal`) as a
+//! dedicated step.
 //!
 //! # How to run
 //!
 //! ```text
+//! cargo build -p bare_metal
 //! cargo run -p bare_metal
 //! ```
 //!
@@ -85,6 +92,7 @@
 
 use core::future::Future;
 use core::net::{Ipv4Addr, SocketAddrV4};
+use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
@@ -135,7 +143,7 @@ impl TransportFactory for MockFactory {
 
 impl TransportSocket for MockSocket {
     fn send_to(
-        &mut self,
+        &self,
         buf: &[u8],
         target: SocketAddrV4,
     ) -> impl Future<Output = Result<(), TransportError>> {
@@ -148,25 +156,21 @@ impl TransportSocket for MockSocket {
     }
 
     fn recv_from(
-        &mut self,
+        &self,
         buf: &mut [u8],
     ) -> impl Future<Output = Result<ReceivedDatagram, TransportError>> {
-        let pipe = Arc::clone(&self.pipe);
-        // Copy directly into `buf` by stealing its slice lifetime out
-        // of the async block via a raw-pointer round-trip would be
-        // unsafe; instead, poll the queue on first call and fill buf
-        // synchronously if a datagram is ready. If the queue is empty,
-        // this mock returns a ready
-        // `Err(TransportError::Io(IoErrorKind::TimedOut))` rather than
-        // a pending future. In this single-threaded example we always
-        // send first then recv, so the timeout branch is unreachable
-        // here.
-        //
-        // The mock borrow-dance is awkward compared to a real UDP
-        // socket's recv_from; a production bare-metal impl would copy
-        // bytes out of its driver's receive slab directly into `buf`.
+        // Read synchronously before the async block so we don't have to
+        // capture `buf` across the `.await` boundary. If the queue is
+        // empty, return a ready `Err(TimedOut)` rather than a pending
+        // future. A production bare-metal impl would instead register
+        // the `Context`'s `Waker` on the network driver's RX-ready
+        // signal and return `Poll::Pending` so the executor can park
+        // the task — see e.g. `embassy_net::UdpSocket` or smoltcp's
+        // socket polling model. In this single-threaded example we
+        // always send first then recv, so the timeout branch is
+        // unreachable here.
         let result = {
-            let mut q = pipe.recv_queue.lock().unwrap();
+            let mut q = self.pipe.recv_queue.lock().unwrap();
             q.pop_front()
         };
         match result {
@@ -187,21 +191,13 @@ impl TransportSocket for MockSocket {
         Ok(self.local_addr)
     }
 
-    fn join_multicast_v4(
-        &mut self,
-        _group: Ipv4Addr,
-        _iface: Ipv4Addr,
-    ) -> Result<(), TransportError> {
+    fn join_multicast_v4(&self, _group: Ipv4Addr, _iface: Ipv4Addr) -> Result<(), TransportError> {
         // Bare-metal stacks without multicast would return
         // Unsupported; our mock is happy to no-op.
         Ok(())
     }
 
-    fn leave_multicast_v4(
-        &mut self,
-        _group: Ipv4Addr,
-        _iface: Ipv4Addr,
-    ) -> Result<(), TransportError> {
+    fn leave_multicast_v4(&self, _group: Ipv4Addr, _iface: Ipv4Addr) -> Result<(), TransportError> {
         Ok(())
     }
 }
@@ -228,18 +224,47 @@ impl Timer for MockTimer {
     }
 }
 
-/// Phase 9 `Spawner` impl. A real bare-metal `Spawner` wraps the
-/// executor's task-submission primitive — `embassy_executor::Spawner`,
-/// smoltcp's task pool, or a hand-rolled single-core polling loop.
-/// This mock drops every future it receives (equivalent to "never run
-/// it"), which is fine for the demo because nothing in the trait-layer
-/// round-trip below actually requires a spawned task. A production
-/// impl must poll the future to completion.
-struct MockSpawner;
+/// Phase 9 `Spawner` impl that demonstrates the *correct* contract:
+/// every submitted future is queued and later polled to completion.
+///
+/// Why a working impl rather than a one-line "drop the future" mock:
+/// the `Spawner` trait's docstring explicitly forbids dropping the
+/// future without polling, because `Client::send`'s internal oneshot
+/// round-trip needs the per-socket loop to make progress. A canary
+/// that violates the contract isn't validating the contract.
+///
+/// A real bare-metal `Spawner` wraps the executor's task-submission
+/// primitive — `embassy_executor::Spawner`, smoltcp's task pool, or a
+/// hand-rolled single-core polling loop. Here we keep submissions in
+/// an in-memory queue and the demo's `main()` drains it at the end via
+/// [`WorkingSpawner::drain`]. That mirrors the shape of a single-core
+/// cooperative executor closely enough to prove the trait surface
+/// works.
+struct WorkingSpawner {
+    queue: Mutex<Vec<Pin<Box<dyn Future<Output = ()> + Send>>>>,
+}
 
-impl simple_someip::transport::Spawner for MockSpawner {
-    fn spawn(&self, _future: impl Future<Output = ()> + Send + 'static) {
-        // DEMO-ONLY: real impls submit `_future` to their task pool.
+impl WorkingSpawner {
+    fn new() -> Self {
+        Self {
+            queue: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Block-on every queued future to completion, in submission order.
+    /// A real cooperative executor would interleave polls; the demo's
+    /// futures resolve on the first poll so order doesn't matter.
+    fn drain(&self) {
+        let queued = std::mem::take(&mut *self.queue.lock().unwrap());
+        for fut in queued {
+            block_on(fut);
+        }
+    }
+}
+
+impl simple_someip::transport::Spawner for WorkingSpawner {
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+        self.queue.lock().unwrap().push(Box::pin(future));
     }
 }
 
@@ -248,14 +273,19 @@ impl simple_someip::transport::Spawner for MockSpawner {
 /// **ANTI-PATTERN — DO NOT USE IN PRODUCTION.** `Waker::noop()` means
 /// no wake-up signal is ever registered; a future that yields
 /// `Pending` waiting on real I/O would never get polled again. The
-/// loop-and-`spin_loop()` fallback here masks that by busy-spinning,
-/// which is worse than useless on bare metal. Production executors
-/// use proper `Waker` plumbing + a task queue driven by hardware
-/// interrupts. This helper exists only to drive the demo's
+/// loop-and-`spin_loop()` fallback masks that by busy-spinning, which
+/// is worse than useless on bare metal. Production executors use
+/// proper `Waker` plumbing + a task queue driven by hardware
+/// interrupts; this helper exists only to drive the demo's
 /// synchronous mock futures (which resolve on the first poll).
+///
+/// For a real no_alloc `block_on`, see e.g. `embassy_executor::block_on`,
+/// the `cassette` crate, or roll your own around a hardware-timer-driven
+/// `Waker`. The `Future::poll` loop body below is the part that stays
+/// the same; only the `Waker` plumbing and yield strategy change.
 fn block_on<F: Future>(fut: F) -> F::Output {
     let waker = Waker::noop();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(waker);
     let mut fut = Box::pin(fut);
     loop {
         match fut.as_mut().poll(&mut cx) {
@@ -287,8 +317,8 @@ fn main() {
     };
     let options = SocketOptions::new();
 
-    let mut sock_a = block_on(factory_a.bind(factory_a.local_addr, &options)).expect("bind A");
-    let mut sock_b = block_on(factory_b.bind(factory_b.local_addr, &options)).expect("bind B");
+    let sock_a = block_on(factory_a.bind(factory_a.local_addr, &options)).expect("bind A");
+    let sock_b = block_on(factory_b.bind(factory_b.local_addr, &options)).expect("bind B");
 
     let payload = b"hello bare-metal";
     block_on(sock_a.send_to(payload, sock_b.local_addr().unwrap())).expect("send_to");
@@ -321,10 +351,21 @@ fn main() {
     let timer = MockTimer;
     block_on(timer.sleep(Duration::from_millis(1)));
 
-    // Demonstrate the Spawner trait compiles against a MockSpawner.
-    // (The mock drops the future — a real spawner polls it.)
-    let spawner = MockSpawner;
-    simple_someip::transport::Spawner::spawn(&spawner, async {});
+    // Demonstrate the Spawner trait by submitting a future and then
+    // draining the queue (proving the future was actually polled). A
+    // real bare-metal Spawner would dispatch into its executor's task
+    // pool and the executor would drain it on its own schedule.
+    let spawner = WorkingSpawner::new();
+    let polled = Arc::new(Mutex::new(false));
+    let polled_for_task = Arc::clone(&polled);
+    simple_someip::transport::Spawner::spawn(&spawner, async move {
+        *polled_for_task.lock().unwrap() = true;
+    });
+    spawner.drain();
+    assert!(
+        *polled.lock().unwrap(),
+        "WorkingSpawner must poll submitted futures to completion (Spawner trait contract)",
+    );
 
     println!(
         "bare-metal example: sent {} bytes from {} to {}, received cleanly.",

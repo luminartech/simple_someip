@@ -91,7 +91,7 @@ The server periodically sends **OfferService** messages to the multicast group `
 
 ```
 SD Message Structure:
-├─ Flags: Reboot=true, Unicast=false
+├─ Flags: Reboot=Recently/Continuous (per session-counter wrap), Unicast=true
 ├─ Entry: OfferService
 │  ├─ Service ID
 │  ├─ Instance ID
@@ -171,6 +171,11 @@ Publishes events to subscribers:
 - `publish_raw_event(service_id, instance_id, event_group_id, event_id, session_id, protocol_version, interface_version, payload) -> Result<usize>`
   - Low-level event publishing using raw bytes
   - Returns number of subscribers that received the event
+- `register_subscriber(service_id, instance_id, event_group_id, subscriber_addr) -> Result<(), SubscribeError>`
+  - Manually register a subscriber (advanced use; the built-in SD loop calls this for you)
+  - Capacity-rejects with `SubscribeError::*` so external dispatchers can emit a `SubscribeNack`
+- `remove_subscriber(service_id, instance_id, event_group_id, subscriber_addr)`
+  - Manually remove a subscriber
 - `has_subscribers(service_id, instance_id, event_group_id) -> bool`
   - Check if any subscribers exist for an event group
 - `subscriber_count(service_id, instance_id, event_group_id) -> usize`
@@ -180,9 +185,11 @@ Publishes events to subscribers:
 
 Manages event group subscriptions:
 
-- `subscribe(service_id, instance_id, event_group_id, subscriber_addr)` - Add subscriber (deduplicates automatically)
+- `subscribe(service_id, instance_id, event_group_id, subscriber_addr) -> Result<(), SubscribeError>` - Add subscriber (deduplicates automatically); returns `Err` when a fixed-capacity bound (`SUBSCRIBERS_PER_GROUP` or `EVENT_GROUPS_CAP`) is exhausted
 - `unsubscribe(service_id, instance_id, event_group_id, subscriber_addr)` - Remove subscriber
 - `get_subscribers(service_id, instance_id, event_group_id) -> Vec<Subscriber>` - Get all subscribers
+
+External dispatchers (those calling `EventPublisher::register_subscriber` directly) must NACK on `Err(SubscribeError::*)`; the server's built-in SD loop already does this automatically.
 
 ## Troubleshooting
 

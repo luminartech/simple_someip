@@ -273,6 +273,10 @@ impl<T: embedded_io::Write> WriteBytesExt for T {
 }
 
 #[cfg(test)]
+// Strict float equality is correct here: these tests verify byte-level
+// round-tripping of `to_be_bytes` / `read_f*_be`, where the result must
+// be bitwise-identical to the input.
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
