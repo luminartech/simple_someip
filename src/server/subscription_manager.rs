@@ -1,8 +1,10 @@
 //! Manages event group subscriptions
 
 use super::service_info::Subscriber;
+use core::future::Future;
 use heapless::{Vec as HeaplessVec, index_map::FnvIndexMap};
-use std::{net::SocketAddrV4, vec::Vec};
+use std::{net::SocketAddrV4, sync::Arc, vec::Vec};
+use tokio::sync::RwLock;
 
 /// Max number of distinct `(service_id, instance_id, event_group_id)` event
 /// groups with active subscribers. Must be a power of two.
@@ -251,6 +253,96 @@ impl SubscriptionManager {
 impl Default for SubscriptionManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Shared handle to the server's subscription table.
+///
+/// Abstracts over `Arc<RwLock<SubscriptionManager>>` on `std` and over
+/// critical-section-backed equivalents on bare metal. All methods return
+/// futures so the implementation can block on an async read/write lock
+/// without holding a guard across an `await` point visible to callers.
+///
+/// Both `Server` and `EventPublisher` clone the same handle at construction
+/// time; the underlying subscription state is shared between them.
+pub trait SubscriptionHandle: Clone + Send + Sync + 'static {
+    /// Add a subscriber to an event group.
+    ///
+    /// Idempotent: if the subscriber is already present, this is a no-op
+    /// returning `Ok(())`. Returns `Err(SubscribeError)` if a capacity
+    /// limit would be exceeded.
+    fn subscribe(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+        subscriber_addr: SocketAddrV4,
+    ) -> impl Future<Output = Result<(), SubscribeError>> + Send + '_;
+
+    /// Remove a subscriber from an event group.
+    fn unsubscribe(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+        subscriber_addr: SocketAddrV4,
+    ) -> impl Future<Output = ()> + Send + '_;
+
+    /// Returns a snapshot of all subscribers for the given event group.
+    ///
+    /// The snapshot is owned — the caller may iterate over it after this
+    /// future resolves without holding any lock.
+    fn get_subscribers(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+    ) -> impl Future<Output = Vec<Subscriber>> + Send + '_;
+}
+
+impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
+    fn subscribe(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+        subscriber_addr: SocketAddrV4,
+    ) -> impl Future<Output = Result<(), SubscribeError>> + Send + '_ {
+        let this = self.clone();
+        async move {
+            this.write()
+                .await
+                .subscribe(service_id, instance_id, event_group_id, subscriber_addr)
+        }
+    }
+
+    fn unsubscribe(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+        subscriber_addr: SocketAddrV4,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let this = self.clone();
+        async move {
+            this.write()
+                .await
+                .unsubscribe(service_id, instance_id, event_group_id, subscriber_addr);
+        }
+    }
+
+    fn get_subscribers(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+    ) -> impl Future<Output = Vec<Subscriber>> + Send + '_ {
+        let this = self.clone();
+        async move {
+            this.read()
+                .await
+                .get_subscribers(service_id, instance_id, event_group_id)
+        }
     }
 }
 

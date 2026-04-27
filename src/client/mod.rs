@@ -39,7 +39,7 @@ pub use error::Error;
 use crate::Timer;
 use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry};
 use crate::tokio_transport::{TokioSpawner, TokioTimer};
-use crate::transport::Spawner;
+use crate::transport::{E2ERegistryHandle, InterfaceHandle, Spawner};
 use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
 use inner::{ControlMessage, Inner};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -166,25 +166,40 @@ impl<MessageDefinitions: PayloadWireFormat> ClientUpdates<MessageDefinitions> {
 ///
 /// `Client` is cheaply [`Clone`]-able. All clones share the same underlying
 /// event loop and can be used concurrently from different tasks.
+///
+/// The optional type parameters `R` and `I` let callers substitute their own
+/// [`E2ERegistryHandle`] and [`InterfaceHandle`] implementations (for example,
+/// bare-metal handles backed by a critical-section mutex rather than
+/// `Arc<Mutex<_>>`). On `std + tokio`, the defaults
+/// (`Arc<Mutex<E2ERegistry>>` and `Arc<RwLock<Ipv4Addr>>`) are used by the
+/// standard constructors [`Self::new`] / [`Self::new_with_loopback`] /
+/// [`Self::new_with_spawner_and_loopback`].
 #[derive(Clone)]
-pub struct Client<MessageDefinitions: PayloadWireFormat> {
-    interface: Arc<RwLock<Ipv4Addr>>,
+pub struct Client<
+    MessageDefinitions: PayloadWireFormat,
+    R: E2ERegistryHandle = Arc<Mutex<E2ERegistry>>,
+    I: InterfaceHandle = Arc<RwLock<Ipv4Addr>>,
+> {
+    interface: I,
     control_sender: mpsc::Sender<inner::ControlMessage<MessageDefinitions>>,
-    e2e_registry: Arc<Mutex<E2ERegistry>>,
+    e2e_registry: R,
 }
 
-impl<MessageDefinitions: PayloadWireFormat> std::fmt::Debug for Client<MessageDefinitions> {
+impl<MessageDefinitions, R, I> std::fmt::Debug for Client<MessageDefinitions, R, I>
+where
+    MessageDefinitions: PayloadWireFormat,
+    R: E2ERegistryHandle,
+    I: InterfaceHandle,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
-            .field(
-                "interface",
-                &*self.interface.read().expect("interface lock poisoned"),
-            )
+            .field("interface", &self.interface.get())
             .finish_non_exhaustive()
     }
 }
 
-impl<MessageDefinitions> Client<MessageDefinitions>
+/// Constructors that create the default `Arc`-backed handles for `std + tokio`.
+impl<MessageDefinitions> Client<MessageDefinitions, Arc<Mutex<E2ERegistry>>, Arc<RwLock<Ipv4Addr>>>
 where
     MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
 {
@@ -319,15 +334,19 @@ where
         let updates = ClientUpdates { update_receiver };
         (client, updates, run_future)
     }
+}
 
+/// Methods available on all `Client<M, R, I>` regardless of handle types.
+impl<MessageDefinitions, R, I> Client<MessageDefinitions, R, I>
+where
+    MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
+    R: E2ERegistryHandle,
+    I: InterfaceHandle,
+{
     /// Returns the current network interface address.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the interface lock is poisoned.
     #[must_use]
     pub fn interface(&self) -> Ipv4Addr {
-        *self.interface.read().expect("interface lock poisoned")
+        self.interface.get()
     }
 
     /// Changes the network interface and rebinds sockets.
@@ -339,11 +358,6 @@ where
     /// Returns [`Error::Shutdown`] if the client's run-loop future has
     /// exited before this call — the control-channel send cannot
     /// complete without its receiver.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the interface lock is poisoned (indicates prior panic
-    /// while the lock was held).
     pub async fn set_interface(&self, interface: Ipv4Addr) -> Result<(), Error> {
         let (response, message) = ControlMessage::set_interface(interface);
         self.control_sender
@@ -351,7 +365,7 @@ where
             .await
             .map_err(|_| Error::Shutdown)?;
         response.await.map_err(|_| Error::Shutdown)??;
-        *self.interface.write().expect("interface lock poisoned") = interface;
+        self.interface.set(interface);
         Ok(())
     }
 
@@ -860,22 +874,12 @@ where
     ///
     /// Panics if the E2E registry mutex is poisoned.
     pub fn register_e2e(&self, key: E2EKey, profile: E2EProfile) {
-        self.e2e_registry
-            .lock()
-            .expect("e2e registry lock poisoned")
-            .register(key, profile);
+        self.e2e_registry.register(key, profile);
     }
 
     /// Remove E2E configuration for the given key.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the E2E registry mutex is poisoned.
     pub fn unregister_e2e(&self, key: &E2EKey) {
-        self.e2e_registry
-            .lock()
-            .expect("e2e registry lock poisoned")
-            .unregister(key);
+        self.e2e_registry.unregister(key);
     }
 
     /// Shuts down the client by dropping the control channel.
@@ -895,7 +899,7 @@ mod tests {
     use crate::traits::WireFormat;
     use std::format;
 
-    type TestClient = Client<TestPayload>;
+    type TestClient = Client<TestPayload, Arc<Mutex<E2ERegistry>>, Arc<RwLock<Ipv4Addr>>>;
 
     #[tokio::test]
     async fn test_client_new_and_interface() {

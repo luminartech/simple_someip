@@ -172,6 +172,8 @@ pub use server::Server;
 #[cfg(any(feature = "client", feature = "server"))]
 pub use tokio_transport::{TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
 pub use transport::{
-    IoErrorKind, ReceivedDatagram, SocketOptions, Spawner, Timer, TransportError, TransportFactory,
-    TransportSocket,
+    E2ERegistryHandle, InterfaceHandle, IoErrorKind, ReceivedDatagram, SocketOptions, Spawner,
+    Timer, TransportError, TransportFactory, TransportSocket,
 };
+#[cfg(feature = "server")]
+pub use server::SubscriptionHandle;
