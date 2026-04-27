@@ -7,10 +7,6 @@ use std::{
     sync::{Arc, Mutex},
     task::Poll,
 };
-use tokio::sync::{
-    mpsc::{self, Receiver, Sender},
-    oneshot,
-};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
@@ -23,9 +19,12 @@ use crate::{
     },
     e2e::E2ERegistry,
     protocol::{self, Message},
-    tokio_transport::{TokioSpawner, TokioTimer, TokioTransport},
+    tokio_transport::{TokioChannels, TokioSpawner, TokioTimer, TokioTransport},
     traits::PayloadWireFormat,
-    transport::{E2ERegistryHandle, Spawner},
+    transport::{
+        ChannelFactory, E2ERegistryHandle, MpscRecv, OneshotSend, Spawner,
+        UnboundedSend,
+    },
 };
 
 use super::error::Error;
@@ -43,31 +42,31 @@ const PENDING_RESPONSES_CAP: usize = 64;
 /// two.
 const UNICAST_SOCKETS_CAP: usize = 8;
 
-pub(super) enum ControlMessage<P: PayloadWireFormat> {
-    SetInterface(Ipv4Addr, oneshot::Sender<Result<(), Error>>),
-    BindDiscovery(oneshot::Sender<Result<(), Error>>),
-    UnbindDiscovery(oneshot::Sender<Result<(), Error>>),
+pub(super) enum ControlMessage<P: PayloadWireFormat + 'static, C: ChannelFactory = TokioChannels> {
+    SetInterface(Ipv4Addr, C::OneshotSender<Result<(), Error>>),
+    BindDiscovery(C::OneshotSender<Result<(), Error>>),
+    UnbindDiscovery(C::OneshotSender<Result<(), Error>>),
     SendSD(
         SocketAddrV4,
         P::SdHeader,
-        oneshot::Sender<Result<(), Error>>,
+        C::OneshotSender<Result<(), Error>>,
     ),
     AddEndpoint(
         u16,
         u16,
         SocketAddrV4,
         u16,
-        oneshot::Sender<Result<(), Error>>,
+        C::OneshotSender<Result<(), Error>>,
     ),
-    RemoveEndpoint(u16, u16, oneshot::Sender<Result<(), Error>>),
+    RemoveEndpoint(u16, u16, C::OneshotSender<Result<(), Error>>),
     SendToService {
         service_id: u16,
         instance_id: u16,
         message: Message<P>,
         /// Fires when the UDP send completes (or errors on lookup/bind).
-        send_complete: oneshot::Sender<Result<(), Error>>,
+        send_complete: C::OneshotSender<Result<(), Error>>,
         /// Fires when a matching unicast response arrives.
-        response: oneshot::Sender<Result<P, Error>>,
+        response: C::OneshotSender<Result<P, Error>>,
     },
     Subscribe {
         service_id: u16,
@@ -76,18 +75,18 @@ pub(super) enum ControlMessage<P: PayloadWireFormat> {
         ttl: u32,
         event_group_id: u16,
         client_port: u16,
-        response: oneshot::Sender<Result<(), Error>>,
+        response: C::OneshotSender<Result<(), Error>>,
     },
-    QueryRebootFlag(oneshot::Sender<Result<crate::protocol::sd::RebootFlag, Error>>),
+    QueryRebootFlag(C::OneshotSender<Result<crate::protocol::sd::RebootFlag, Error>>),
     /// Test-only: force `sd_session_has_wrapped` to simulate the state a
     /// long-running client reaches after its SD session counter wraps past
     /// `0xFFFF`, without actually sending 65k SD messages. Fires the
     /// accompanying oneshot once the mutation is applied.
     #[cfg(test)]
-    ForceSdSessionWrappedForTest(bool, oneshot::Sender<Result<(), Error>>),
+    ForceSdSessionWrappedForTest(bool, C::OneshotSender<Result<(), Error>>),
 }
 
-impl<P: PayloadWireFormat> std::fmt::Debug for ControlMessage<P> {
+impl<P: PayloadWireFormat + 'static, C: ChannelFactory> std::fmt::Debug for ControlMessage<P, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SetInterface(addr, _) => f.debug_tuple("SetInterface").field(addr).finish(),
@@ -140,25 +139,25 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ControlMessage<P> {
     }
 }
 
-impl<P: PayloadWireFormat> ControlMessage<P> {
-    pub fn set_interface(interface: Ipv4Addr) -> (oneshot::Receiver<Result<(), Error>>, Self) {
-        let (sender, receiver) = oneshot::channel();
+impl<P: PayloadWireFormat + 'static, C: ChannelFactory> ControlMessage<P, C> {
+    pub fn set_interface(interface: Ipv4Addr) -> (C::OneshotReceiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = C::oneshot();
         (receiver, Self::SetInterface(interface, sender))
     }
-    pub fn bind_discovery() -> (oneshot::Receiver<Result<(), Error>>, Self) {
-        let (sender, receiver) = oneshot::channel();
+    pub fn bind_discovery() -> (C::OneshotReceiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = C::oneshot();
         (receiver, Self::BindDiscovery(sender))
     }
-    pub fn unbind_discovery() -> (oneshot::Receiver<Result<(), Error>>, Self) {
-        let (sender, receiver) = oneshot::channel();
+    pub fn unbind_discovery() -> (C::OneshotReceiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = C::oneshot();
         (receiver, Self::UnbindDiscovery(sender))
     }
 
     pub fn send_sd(
         socket_addr: SocketAddrV4,
         header: P::SdHeader,
-    ) -> (oneshot::Receiver<Result<(), Error>>, Self) {
-        let (sender, receiver) = oneshot::channel();
+    ) -> (C::OneshotReceiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = C::oneshot();
         (receiver, Self::SendSD(socket_addr, header, sender))
     }
     pub fn add_endpoint(
@@ -166,8 +165,8 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
         instance_id: u16,
         addr: SocketAddrV4,
         local_port: u16,
-    ) -> (oneshot::Receiver<Result<(), Error>>, Self) {
-        let (sender, receiver) = oneshot::channel();
+    ) -> (C::OneshotReceiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = C::oneshot();
         (
             receiver,
             Self::AddEndpoint(service_id, instance_id, addr, local_port, sender),
@@ -177,8 +176,8 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
     pub fn remove_endpoint(
         service_id: u16,
         instance_id: u16,
-    ) -> (oneshot::Receiver<Result<(), Error>>, Self) {
-        let (sender, receiver) = oneshot::channel();
+    ) -> (C::OneshotReceiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = C::oneshot();
         (
             receiver,
             Self::RemoveEndpoint(service_id, instance_id, sender),
@@ -191,12 +190,12 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
         instance_id: u16,
         message: Message<P>,
     ) -> (
-        oneshot::Receiver<Result<(), Error>>,
-        oneshot::Receiver<Result<P, Error>>,
+        C::OneshotReceiver<Result<(), Error>>,
+        C::OneshotReceiver<Result<P, Error>>,
         Self,
     ) {
-        let (send_complete_tx, send_complete_rx) = oneshot::channel();
-        let (response_tx, response_rx) = oneshot::channel();
+        let (send_complete_tx, send_complete_rx) = C::oneshot();
+        let (response_tx, response_rx) = C::oneshot();
         (
             send_complete_rx,
             response_rx,
@@ -217,8 +216,8 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
         ttl: u32,
         event_group_id: u16,
         client_port: u16,
-    ) -> (oneshot::Receiver<Result<(), Error>>, Self) {
-        let (sender, receiver) = oneshot::channel();
+    ) -> (C::OneshotReceiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = C::oneshot();
         (
             receiver,
             Self::Subscribe {
@@ -234,18 +233,18 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
     }
 
     pub fn query_reboot_flag() -> (
-        oneshot::Receiver<Result<crate::protocol::sd::RebootFlag, Error>>,
+        C::OneshotReceiver<Result<crate::protocol::sd::RebootFlag, Error>>,
         Self,
     ) {
-        let (sender, receiver) = oneshot::channel();
+        let (sender, receiver) = C::oneshot();
         (receiver, Self::QueryRebootFlag(sender))
     }
 
     #[cfg(test)]
     pub fn force_sd_session_wrapped_for_test(
         wrapped: bool,
-    ) -> (oneshot::Receiver<Result<(), Error>>, Self) {
-        let (sender, receiver) = oneshot::channel();
+    ) -> (C::OneshotReceiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = C::oneshot();
         (
             receiver,
             Self::ForceSdSessionWrappedForTest(wrapped, sender),
@@ -291,20 +290,21 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
 }
 
 pub(super) struct Inner<
-    PayloadDefinitions: PayloadWireFormat,
+    PayloadDefinitions: PayloadWireFormat + 'static,
     S: Spawner = TokioSpawner,
     R: E2ERegistryHandle = Arc<Mutex<E2ERegistry>>,
+    C: ChannelFactory = TokioChannels,
 > {
     /// MPSC Receiver used to receive control messages from outer client
-    control_receiver: Receiver<ControlMessage<PayloadDefinitions>>,
+    control_receiver: C::BoundedReceiver<ControlMessage<PayloadDefinitions, C>>,
     /// Queue of pending control messages to process
-    request_queue: Deque<ControlMessage<PayloadDefinitions>, REQUEST_QUEUE_CAP>,
+    request_queue: Deque<ControlMessage<PayloadDefinitions, C>, REQUEST_QUEUE_CAP>,
     /// Pending request-responses keyed by `request_id` (`client_id` << 16 | `session_counter`).
     /// Set by `SendToService`, cleared when a matching unicast arrives.
     pending_responses:
-        FnvIndexMap<u32, oneshot::Sender<Result<PayloadDefinitions, Error>>, PENDING_RESPONSES_CAP>,
+        FnvIndexMap<u32, C::OneshotSender<Result<PayloadDefinitions, Error>>, PENDING_RESPONSES_CAP>,
     /// Unbounded sender used to send updates to outer client
-    update_sender: mpsc::UnboundedSender<ClientUpdate<PayloadDefinitions>>,
+    update_sender: C::UnboundedSender<ClientUpdate<PayloadDefinitions>>,
     /// Target interface for sockets
     interface: Ipv4Addr,
     /// Socket manager for service discovery if bound (multicast: `INADDR_ANY`
@@ -343,7 +343,9 @@ pub(super) struct Inner<
     phantom: std::marker::PhantomData<PayloadDefinitions>,
 }
 
-impl<P: PayloadWireFormat, S: Spawner, R: E2ERegistryHandle> std::fmt::Debug for Inner<P, S, R> {
+impl<P: PayloadWireFormat, S: Spawner, R: E2ERegistryHandle, C: ChannelFactory> std::fmt::Debug
+    for Inner<P, S, R, C>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inner")
             .field("interface", &self.interface)
@@ -355,11 +357,12 @@ impl<P: PayloadWireFormat, S: Spawner, R: E2ERegistryHandle> std::fmt::Debug for
     }
 }
 
-impl<PayloadDefinitions, S, R> Inner<PayloadDefinitions, S, R>
+impl<PayloadDefinitions, S, R, C> Inner<PayloadDefinitions, S, R, C>
 where
     PayloadDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
     S: Spawner + Send + Sync + 'static,
     R: E2ERegistryHandle,
+    C: ChannelFactory,
 {
     /// Construct an `Inner` and return the control/update channels plus
     /// the run-loop future. The caller must drive the future on a Tokio
@@ -371,19 +374,20 @@ where
     /// is already Send. A bare-metal consumer whose transport produces
     /// `!Send` state needs a cfg-gated alternative constructor; none
     /// exists yet — it's planned alongside the bare-metal port.
+    #[allow(clippy::type_complexity)]
     pub fn build(
         interface: Ipv4Addr,
         e2e_registry: R,
         multicast_loopback: bool,
         spawner: S,
     ) -> (
-        Sender<ControlMessage<PayloadDefinitions>>,
-        mpsc::UnboundedReceiver<ClientUpdate<PayloadDefinitions>>,
+        C::BoundedSender<ControlMessage<PayloadDefinitions, C>>,
+        C::UnboundedReceiver<ClientUpdate<PayloadDefinitions>>,
         impl core::future::Future<Output = ()> + Send + 'static,
     ) {
         info!("Initializing SOME/IP Client");
-        let (control_sender, control_receiver) = mpsc::channel(4);
-        let (update_sender, update_receiver) = mpsc::unbounded_channel();
+        let (control_sender, control_receiver) = C::bounded::<_, 4>();
+        let (update_sender, update_receiver) = C::unbounded();
         let inner = Self {
             control_receiver,
             request_queue: Deque::new(),
@@ -514,7 +518,7 @@ where
     fn track_or_reject_pending_response(
         &mut self,
         request_id: u32,
-        response: oneshot::Sender<Result<PayloadDefinitions, Error>>,
+        response: C::OneshotSender<Result<PayloadDefinitions, Error>>,
     ) {
         match self.pending_responses.insert(request_id, response) {
             Ok(None) => {}
@@ -1095,7 +1099,7 @@ where
                             }
 
                             if rebooted {
-                                let _ = update_sender.send(ClientUpdate::SenderRebooted(source));
+                                let _ = update_sender.send_now(ClientUpdate::SenderRebooted(source));
                             }
 
                             let discovery_msg = DiscoveryMessage {
@@ -1103,11 +1107,11 @@ where
                                 someip_header,
                                 sd_header,
                             };
-                            let _ = update_sender.send(ClientUpdate::DiscoveryUpdated(discovery_msg));
+                            let _ = update_sender.send_now(ClientUpdate::DiscoveryUpdated(discovery_msg));
                         }
                         Err(err) => {
                             error!("Error receiving discovery message: {:?}", err);
-                            let _ = update_sender.send(ClientUpdate::Error(err));
+                            let _ = update_sender.send_now(ClientUpdate::Error(err));
                         }
                     }
                  }
@@ -1123,10 +1127,10 @@ where
                                  continue;
                              }
                              // Not a response — forward as ClientUpdate::Unicast
-                             let _ = update_sender.send(ClientUpdate::Unicast { message: received_message, e2e_status });
+                             let _ = update_sender.send_now(ClientUpdate::Unicast { message: received_message, e2e_status });
                          }
                          Err(err) => {
-                             let _ = update_sender.send(ClientUpdate::Error(err));
+                             let _ = update_sender.send_now(ClientUpdate::Error(err));
                          }
                      }
                  }
@@ -1146,7 +1150,10 @@ where
 mod tests {
     use super::*;
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
+    use crate::transport::{OneshotRecv, UnboundedRecv};
     use std::format;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::mpsc::Sender;
 
     type TestControl = ControlMessage<TestPayload>;
 
@@ -1190,55 +1197,62 @@ mod tests {
     /// the resulting `RecvError`, which is exactly what Copilot flagged.
     #[test]
     fn reject_with_capacity_notifies_every_sender() {
-        fn expect_capacity<T: std::fmt::Debug>(
-            rx: &mut oneshot::Receiver<Result<T, Error>>,
-            label: &str,
-        ) {
-            match rx.try_recv() {
-                Ok(Err(Error::Capacity(s))) => assert_eq!(s, "request_queue", "{label}"),
-                other => panic!("{label}: expected Err(Capacity), got {other:?}"),
+        use futures::FutureExt;
+        use crate::transport::OneshotCancelled;
+
+        fn expect_capacity<F>(rx: F, label: &str)
+        where
+            F: core::future::Future<Output = Result<Result<(), Error>, OneshotCancelled>>,
+        {
+            match rx.now_or_never() {
+                Some(Ok(Err(Error::Capacity(s)))) => assert_eq!(s, "request_queue", "{label}"),
+                other => panic!("{label}: expected Some(Ok(Err(Capacity))), got {other:?}"),
             }
         }
 
         // Variants carrying a single Result<(), Error> response sender.
-        let (mut rx, msg) = TestControl::set_interface(Ipv4Addr::LOCALHOST);
+        let (rx, msg) = TestControl::set_interface(Ipv4Addr::LOCALHOST);
         msg.reject_with_capacity("request_queue");
-        expect_capacity(&mut rx, "SetInterface");
+        expect_capacity(rx.recv(), "SetInterface");
 
-        let (mut rx, msg) = TestControl::bind_discovery();
+        let (rx, msg) = TestControl::bind_discovery();
         msg.reject_with_capacity("request_queue");
-        expect_capacity(&mut rx, "BindDiscovery");
+        expect_capacity(rx.recv(), "BindDiscovery");
 
-        let (mut rx, msg) = TestControl::unbind_discovery();
+        let (rx, msg) = TestControl::unbind_discovery();
         msg.reject_with_capacity("request_queue");
-        expect_capacity(&mut rx, "UnbindDiscovery");
+        expect_capacity(rx.recv(), "UnbindDiscovery");
 
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
-        let (mut rx, msg) = TestControl::send_sd(target, empty_sd_header());
+        let (rx, msg) = TestControl::send_sd(target, empty_sd_header());
         msg.reject_with_capacity("request_queue");
-        expect_capacity(&mut rx, "SendSD");
+        expect_capacity(rx.recv(), "SendSD");
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
-        let (mut rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
+        let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         msg.reject_with_capacity("request_queue");
-        expect_capacity(&mut rx, "AddEndpoint");
+        expect_capacity(rx.recv(), "AddEndpoint");
 
-        let (mut rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
+        let (rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001);
         msg.reject_with_capacity("request_queue");
-        expect_capacity(&mut rx, "RemoveEndpoint");
+        expect_capacity(rx.recv(), "RemoveEndpoint");
 
-        let (mut rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
+        let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
         msg.reject_with_capacity("request_queue");
-        expect_capacity(&mut rx, "Subscribe");
+        expect_capacity(rx.recv(), "Subscribe");
 
         // SendToService carries two senders — both must be notified so that
-        // neither `send_rx.await.unwrap()?` nor `PendingResponse::response()`
+        // neither `send_rx.recv().await.unwrap()?` nor `PendingResponse::response()`
         // panics.
         let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
-        let (mut send_rx, mut resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
+        let (send_rx, resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
         msg.reject_with_capacity("request_queue");
-        expect_capacity(&mut send_rx, "SendToService.send_complete");
-        expect_capacity(&mut resp_rx, "SendToService.response");
+        expect_capacity(send_rx.recv(), "SendToService.send_complete");
+        // resp_rx has type Result<TestPayload, Error> — check it separately
+        match resp_rx.recv().now_or_never() {
+            Some(Ok(Err(Error::Capacity(s)))) => assert_eq!(s, "request_queue", "SendToService.response"),
+            other => panic!("SendToService.response: expected Some(Ok(Err(Capacity))), got {other:?}"),
+        }
     }
 
     #[test]
@@ -1284,8 +1298,10 @@ mod tests {
     /// Build an [`Inner`] without spawning the run loop, for direct
     /// unit-testing of state-mutating methods.
     fn make_inner_for_test() -> Inner<TestPayload> {
-        let (_control_sender, control_receiver) = mpsc::channel(4);
-        let (update_sender, _update_receiver) = mpsc::unbounded_channel();
+        let (_control_sender, control_receiver) =
+            TokioChannels::bounded::<ControlMessage<TestPayload, TokioChannels>, 4>();
+        let (update_sender, _update_receiver) =
+            TokioChannels::unbounded::<ClientUpdate<TestPayload>>();
         Inner {
             control_receiver,
             request_queue: Deque::new(),
@@ -1346,8 +1362,9 @@ mod tests {
     /// alive so a future unicast reply can resolve it.
     #[tokio::test]
     async fn track_or_reject_pending_response_inserts_when_room_available() {
+        use futures::FutureExt;
         let mut inner = make_inner_for_test();
-        let (tx, mut rx) = oneshot::channel::<Result<TestPayload, Error>>();
+        let (tx, rx) = oneshot::channel::<Result<TestPayload, Error>>();
 
         inner.track_or_reject_pending_response(0xDEAD_BEEF, tx);
 
@@ -1359,7 +1376,7 @@ mod tests {
         // Receiver is still waiting — helper did NOT pre-emptively
         // resolve it with a capacity error on the happy path.
         assert!(
-            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            rx.now_or_never().is_none(),
             "receiver must still be pending when the insert succeeds",
         );
     }
@@ -1439,6 +1456,8 @@ mod tests {
     /// caller gets a clean `Result` instead of a panicking `RecvError`.
     #[tokio::test]
     async fn track_or_reject_pending_response_completes_displaced_sender() {
+        use futures::FutureExt;
+
         let mut inner = make_inner_for_test();
         let key: u32 = 0xCAFE_F00D;
 
@@ -1448,7 +1467,7 @@ mod tests {
         assert_eq!(inner.pending_responses.len(), 1);
 
         // Second tracking with the same key: displaces the first sender.
-        let (second_tx, mut second_rx) = oneshot::channel::<Result<TestPayload, Error>>();
+        let (second_tx, second_rx) = oneshot::channel::<Result<TestPayload, Error>>();
         inner.track_or_reject_pending_response(key, second_tx);
 
         // Map still has one entry — the second one replaced the first.
@@ -1463,15 +1482,12 @@ mod tests {
         );
         match displaced_result {
             Err(Error::Capacity(tag)) => assert_eq!(tag, "pending_responses"),
-            other => panic!("expected Err(Error::Capacity(\"pending_responses\")), got {other:?}"),
+            other => panic!("expected Err(Error::Capacity(\\\"pending_responses\\\")), got {other:?}"),
         }
 
         // The new sender is still live and pending.
         assert!(
-            matches!(
-                second_rx.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ),
+            second_rx.now_or_never().is_none(),
             "replacement sender must still be pending in the map",
         );
     }
@@ -1565,18 +1581,18 @@ mod tests {
         drop(control_sender);
         // The update receiver should eventually return None when the inner loop exits
         let result =
-            tokio::time::timeout(std::time::Duration::from_secs(2), update_receiver.recv()).await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), UnboundedRecv::recv(&mut update_receiver)).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
 
     /// Helper: verify inner loop is still alive by sending an `AddEndpoint` and
     /// checking that a response arrives within 2 seconds.
-    async fn assert_inner_alive(control_sender: &Sender<ControlMessage<TestPayload>>) {
+    async fn assert_inner_alive(control_sender: &Sender<ControlMessage<TestPayload, TokioChannels>>) {
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
         let (rx, msg) = TestControl::add_endpoint(0xFFFE, 0xFFFE, addr, 0);
         control_sender.send(msg).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("Timed out — inner loop appears dead")
             .expect("Oneshot closed — inner loop appears dead");
@@ -1657,7 +1673,7 @@ mod tests {
         // Bind discovery first so the SendSD path has a socket to use
         let (rx, msg) = TestControl::bind_discovery();
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         // Send SD with a dropped receiver
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30490);
@@ -1690,7 +1706,7 @@ mod tests {
         // iteration 2: interface matches, bind discovery, send response
         let (rx, msg) = TestControl::bind_discovery();
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         // Queue both messages into the channel buffer before the inner loop
         // processes either. mpsc sends on a non-full buffer complete without
@@ -1705,13 +1721,13 @@ mod tests {
         control_sender.send(msg_add).await.unwrap();
 
         // Both should complete successfully
-        let set_result = tokio::time::timeout(std::time::Duration::from_secs(3), rx_set)
+        let set_result = tokio::time::timeout(std::time::Duration::from_secs(3), rx_set.recv())
             .await
             .expect("Timed out waiting for SetInterface")
             .expect("SetInterface oneshot closed");
         assert!(set_result.is_ok());
 
-        let add_result = tokio::time::timeout(std::time::Duration::from_secs(3), rx_add)
+        let add_result = tokio::time::timeout(std::time::Duration::from_secs(3), rx_add.recv())
             .await
             .expect("Timed out waiting for AddEndpoint")
             .expect("AddEndpoint oneshot closed");
@@ -1721,8 +1737,8 @@ mod tests {
         assert_inner_alive(&control_sender).await;
     }
 
-    #[test]
-    fn test_send_to_service_constructor_returns_two_receivers() {
+    #[tokio::test]
+    async fn test_send_to_service_constructor_returns_two_receivers() {
         let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
         let (send_rx, resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
 
@@ -1735,13 +1751,13 @@ mod tests {
         {
             // Both channels are independent — sending on one doesn't affect the other
             send_complete.send(Ok(())).unwrap();
-            assert!(send_rx.blocking_recv().unwrap().is_ok());
+            assert!(send_rx.recv().await.unwrap().is_ok());
 
             let payload = TestPayload {
                 header: empty_sd_header(),
             };
             response.send(Ok(payload.clone())).unwrap();
-            assert_eq!(resp_rx.blocking_recv().unwrap().unwrap(), payload);
+            assert_eq!(resp_rx.recv().await.unwrap().unwrap(), payload);
         } else {
             panic!("expected SendToService variant");
         }
@@ -1798,7 +1814,7 @@ mod tests {
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         // Send SendToService with the send_complete receiver dropped
         let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
@@ -1824,7 +1840,7 @@ mod tests {
 
         let (rx, msg) = TestControl::bind_discovery();
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -1840,12 +1856,12 @@ mod tests {
 
         let (rx, msg) = TestControl::bind_discovery();
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         // Second bind should also succeed (idempotent path)
         let (rx, msg) = TestControl::bind_discovery();
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -1863,7 +1879,7 @@ mod tests {
         let sd_header = empty_sd_header();
         let (rx, msg) = TestControl::send_sd(target, sd_header);
         control_sender.send(msg).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("Timed out waiting for SendSD")
             .expect("SendSD oneshot closed");
@@ -1884,12 +1900,12 @@ mod tests {
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
         let (send_rx, _resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
         control_sender.send(msg).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), send_rx)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), send_rx.recv())
             .await
             .expect("Timed out waiting for SendToService")
             .expect("SendToService oneshot closed");
@@ -1910,18 +1926,18 @@ mod tests {
         // Bind discovery first
         let (rx, msg) = TestControl::bind_discovery();
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         // Add endpoint
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         // Subscribe
         let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
         control_sender.send(msg).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("Timed out waiting for Subscribe")
             .expect("Subscribe oneshot closed");
@@ -1943,12 +1959,12 @@ mod tests {
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         // Subscribe should auto-bind discovery
         let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 0);
         control_sender.send(msg).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("Timed out waiting for Subscribe")
             .expect("Subscribe oneshot closed");
@@ -1967,7 +1983,7 @@ mod tests {
 
         let (rx, msg) = TestControl::subscribe(0xFFFF, 0xFFFF, 1, 3, 0x01, 0);
         control_sender.send(msg).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("Timed out")
             .expect("oneshot closed");
@@ -1988,19 +2004,19 @@ mod tests {
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         // First send auto-binds unicast
         let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
         let (send_rx, _resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
         control_sender.send(msg).await.unwrap();
-        send_rx.await.unwrap().unwrap();
+        send_rx.recv().await.unwrap().unwrap();
 
         // Second send reuses the existing socket (no auto-bind needed)
         let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
         let (send_rx, _resp_rx, msg) = TestControl::send_to_service(0x1234, 0x0001, message);
         control_sender.send(msg).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), send_rx)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), send_rx.recv())
             .await
             .expect("Timed out")
             .expect("oneshot closed");
@@ -2044,7 +2060,7 @@ mod tests {
         // Binding discovery on 127.0.0.2 should succeed on most systems.
         let (rx, msg) = TestControl::set_interface(Ipv4Addr::new(127, 0, 0, 2));
         control_sender.send(msg).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), rx)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
             .await
             .expect("Timed out waiting for SetInterface")
             .expect("SetInterface oneshot closed");
@@ -2069,7 +2085,7 @@ mod tests {
         // Bind discovery on LOCALHOST first
         let (rx, msg) = TestControl::bind_discovery();
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         // Change to 127.0.0.2 — this takes the multi-step path:
         // 1. unbind discovery, re-queue
@@ -2077,7 +2093,7 @@ mod tests {
         // 3. interface == 127.0.0.2, bind discovery
         let (rx, msg) = TestControl::set_interface(Ipv4Addr::new(127, 0, 0, 2));
         control_sender.send(msg).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), rx)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
             .await
             .expect("Timed out waiting for SetInterface")
             .expect("SetInterface oneshot closed");
@@ -2101,17 +2117,17 @@ mod tests {
         // Add endpoint and bind discovery
         let (rx, msg) = TestControl::bind_discovery();
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let (rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         // First subscribe with specific port — binds the port
         let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x01, 44444);
         control_sender.send(msg).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("Timed out")
             .expect("oneshot closed");
@@ -2120,7 +2136,7 @@ mod tests {
         // Second subscribe with the same port — reuses the existing socket
         let (rx, msg) = TestControl::subscribe(0x1234, 0x0001, 1, 3, 0x02, 44444);
         control_sender.send(msg).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("Timed out")
             .expect("oneshot closed");
@@ -2152,11 +2168,11 @@ mod tests {
         // Bind and send one SD message to advance the session counter.
         let (rx, msg) = TestControl::bind_discovery();
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         let (rx, msg) = TestControl::send_sd(target, empty_sd_header());
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         let mut buf = vec![0u8; 1400];
         let (len, _) =
@@ -2172,16 +2188,16 @@ mod tests {
         // Unbind, then rebind.
         let (rx, msg) = TestControl::unbind_discovery();
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         let (rx, msg) = TestControl::bind_discovery();
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         // Send a second SD message and verify both session counter and reboot flag persisted.
         let (rx, msg) = TestControl::send_sd(target, empty_sd_header());
         control_sender.send(msg).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.recv().await.unwrap().unwrap();
 
         let (len, _) =
             tokio::time::timeout(std::time::Duration::from_secs(2), raw.recv_from(&mut buf))

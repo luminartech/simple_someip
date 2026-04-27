@@ -660,6 +660,130 @@ pub trait InterfaceHandle: Clone + Send + Sync + 'static {
     fn set(&self, addr: Ipv4Addr);
 }
 
+// ── Channel-handle abstraction (Phase 11) ─────────────────────────────────
+//
+// `ChannelFactory` and its associated sender / receiver traits replace direct
+// use of `tokio::sync::mpsc` and `tokio::sync::oneshot` in the client.
+// `TokioChannels` (in `tokio_transport`) is the default for `std + tokio`
+// builds; `EmbassySyncChannels` (in `tokio_transport`, gated behind
+// `bare_metal`) is the alternative for no-tokio / no_std builds.
+
+/// Returned by [`OneshotRecv::recv`] when the sender was dropped before
+/// sending a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OneshotCancelled;
+
+impl core::fmt::Display for OneshotCancelled {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("oneshot sender dropped before sending a value")
+    }
+}
+
+/// The send half of a oneshot channel. Consuming: a value can be sent exactly
+/// once.
+pub trait OneshotSend<T: Send + 'static>: Send + 'static {
+    /// Send `value` through the channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(value)` if the receiver was already dropped.
+    fn send(self, value: T) -> Result<(), T>;
+}
+
+/// The receive half of a oneshot channel. Resolves once the sender delivers a
+/// value, or returns [`OneshotCancelled`] if the sender is dropped first.
+pub trait OneshotRecv<T: Send + 'static>: Send + 'static {
+    /// Await the value. Consumes self — a oneshot receiver can only be awaited
+    /// once.
+    fn recv(self) -> impl core::future::Future<Output = Result<T, OneshotCancelled>> + Send;
+}
+
+/// The send half of a bounded MPSC channel.
+///
+/// Implementations must be [`Clone`] so that multiple producers can share the
+/// same channel (e.g. the `Client` handle is `Clone` and every clone must be
+/// able to send control messages to `Inner`).
+pub trait MpscSend<T: Send + 'static>: Clone + Send + 'static {
+    /// Send `value`, waiting if the channel is full. Returns `Err(())` if the
+    /// receiver was dropped.
+    fn send(&self, value: T) -> impl core::future::Future<Output = Result<(), ()>> + Send + '_;
+}
+
+/// The receive half of a bounded MPSC channel.
+pub trait MpscRecv<T: Send + 'static>: Send + 'static {
+    /// Receive the next value, waiting if the channel is empty. Returns `None`
+    /// if all senders were dropped and the channel is empty.
+    fn recv(&mut self) -> impl core::future::Future<Output = Option<T>> + Send + '_;
+
+    /// Poll the channel without blocking. Used by `receive_any_unicast` to
+    /// multiplex across several socket channels in a single `poll_fn` pass.
+    fn poll_recv(
+        &mut self,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Option<T>>;
+}
+
+/// The send half of an unbounded MPSC channel.
+///
+/// Unlike [`MpscSend`], sending never blocks — the implementation must buffer
+/// arbitrarily many values (or, for embassy-sync, use a large finite capacity
+/// that is treated as effectively unbounded).
+pub trait UnboundedSend<T: Send + 'static>: Clone + Send + 'static {
+    /// Send `value` without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(value)` if the receiver was dropped.
+    fn send_now(&self, value: T) -> Result<(), T>;
+}
+
+/// The receive half of an unbounded MPSC channel.
+pub trait UnboundedRecv<T: Send + 'static>: Send + 'static {
+    /// Receive the next value, waiting if the channel is empty. Returns `None`
+    /// if all senders were dropped and the channel is empty.
+    fn recv(&mut self) -> impl core::future::Future<Output = Option<T>> + Send + '_;
+}
+
+/// A zero-sized factory that creates channel pairs used by the client's
+/// internal transport.
+///
+/// Abstracting over both `tokio::sync::mpsc` / `oneshot` (std path) and
+/// `embassy-sync::channel::Channel` (bare-metal path) behind a single trait
+/// lets `Client` / `Inner` / `SocketManager` compile without a tokio
+/// dependency when `bare_metal` is active and `tokio` is not.
+///
+/// The three channel families:
+/// - **oneshot** — single-shot rendezvous, capacity 1. Used for command
+///   completion callbacks inside [`ControlMessage`](crate::client).
+/// - **bounded** — finite-capacity MPSC queue. Used for the control channel
+///   and per-socket send / receive queues.
+/// - **unbounded** — notionally unbounded MPSC queue (embassy-sync
+///   implementations use a large-capacity channel). Used for the
+///   `ClientUpdate` stream from `Inner` to `Client`.
+pub trait ChannelFactory: Clone + Send + Sync + 'static {
+    /// Oneshot sender type.
+    type OneshotSender<T: Send + 'static>: OneshotSend<T>;
+    /// Oneshot receiver type.
+    type OneshotReceiver<T: Send + 'static>: OneshotRecv<T>;
+    /// Create a oneshot channel pair.
+    fn oneshot<T: Send + 'static>() -> (Self::OneshotSender<T>, Self::OneshotReceiver<T>);
+
+    /// Bounded-channel sender type.
+    type BoundedSender<T: Send + 'static>: MpscSend<T>;
+    /// Bounded-channel receiver type.
+    type BoundedReceiver<T: Send + 'static>: MpscRecv<T>;
+    /// Create a bounded channel with capacity `N`.
+    fn bounded<T: Send + 'static, const N: usize>(
+    ) -> (Self::BoundedSender<T>, Self::BoundedReceiver<T>);
+
+    /// Unbounded-channel sender type.
+    type UnboundedSender<T: Send + 'static>: UnboundedSend<T>;
+    /// Unbounded-channel receiver type.
+    type UnboundedReceiver<T: Send + 'static>: UnboundedRecv<T>;
+    /// Create an unbounded channel.
+    fn unbounded<T: Send + 'static>() -> (Self::UnboundedSender<T>, Self::UnboundedReceiver<T>);
+}
+
 #[cfg(test)]
 mod tests {
     //! The traits are pure interfaces — these tests only verify that

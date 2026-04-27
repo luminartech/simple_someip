@@ -44,29 +44,28 @@
 //! # Known gaps in the bare-metal story (independent of this example)
 //!
 //! The example exercises the **trait layer** (`TransportSocket`,
-//! `TransportFactory`, `Timer`, `Spawner`) — and that is all. It does
-//! NOT demonstrate a no_alloc integration with
+//! `TransportFactory`, `Timer`, `Spawner`, `ChannelFactory`) — and
+//! that is all. It does NOT demonstrate a no_alloc integration with
 //! `simple_someip::Client` / `simple_someip::Server`, because those
-//! are not yet no_alloc-compatible. Phase 9 landed `Spawner`, which
-//! abstracts ONE runtime primitive (task submission). Four others
-//! remain before a no_alloc consumer can use `Client`:
+//! are not yet no_alloc-compatible.
 //!
-//! 1. **`tokio::sync::mpsc` channels** inside `SocketManager`
-//!    (capacities 4 and 16 per socket): heap-allocated AND
-//!    tokio-runtime-coupled (the `Waker` plumbing only works on a
-//!    tokio task).
-//! 2. **`tokio::sync::oneshot`** used for send-ack round-trips: same
-//!    allocation + runtime-coupling issue.
-//! 3. **`Arc<Mutex<E2ERegistry>>`** shared between the client's
-//!    control path and every per-socket loop: requires `alloc` +
-//!    `std::sync`.
-//! 4. **`F::Socket = TokioSocket`** bound on `bind_*`: a phase-5
+//! **Completed abstractions:**
+//! - Phase 9: `Spawner` trait (task submission)
+//! - Phase 10: `E2ERegistryHandle` / `InterfaceHandle` (lock handles)
+//! - Phase 11: `ChannelFactory` trait with `TokioChannels` (std) and
+//!   `EmbassySyncChannels` (bare_metal) backends — replaces direct
+//!   `tokio::sync::mpsc` / `oneshot` usage
+//!
+//! **Remaining gaps:**
+//! 1. **`F::Socket = TokioSocket`** bound on `bind_*`: a phase-5
 //!    compromise because stable Rust Return-Type Notation is still
-//!    nightly.
+//!    nightly. Phase 12 relaxes this via GATs.
+//! 2. **Feature-flag split** (Phase 13): `client` / `server` still
+//!    pull in tokio + socket2. A future split (`client` vs
+//!    `client-tokio`) will make the core types no_std-compatible.
 //!
-//! Closing those four is additional phased work (roughly the same
-//! scope again as phases 1–9 combined). Until then, `feature = "client"`
-//! / `feature = "server"` pull in `std + tokio + socket2`.
+//! Until those are closed, `feature = "client"` / `feature = "server"`
+//! pull in `std + tokio + socket2`.
 //!
 //! # Recommendation for no_alloc consumers today
 //!
