@@ -99,7 +99,7 @@
 //! # Minimal adapter sketch
 //!
 //! ```
-//! # #[cfg(feature = "client")]
+//! # #[cfg(feature = "client-tokio")]
 //! # fn wrapper() {
 //! use core::future::Future;
 //! use core::net::{Ipv4Addr, SocketAddrV4};
@@ -693,13 +693,73 @@ pub trait InterfaceHandle: Clone + Send + Sync + 'static {
     fn set(&self, addr: Ipv4Addr);
 }
 
-// ── Channel-handle abstraction (Phase 11) ─────────────────────────────────
+/// Default `std`-flavoured impls of [`E2ERegistryHandle`] and
+/// [`InterfaceHandle`] backed by `std::sync::{Arc, Mutex, RwLock}`. Pure
+/// std — no tokio dependency — so they live in the executor-agnostic
+/// transport module rather than the tokio backend.
+#[cfg(feature = "std")]
+mod std_handle_impls {
+    use super::{E2ERegistryHandle, InterfaceHandle};
+    use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry};
+    use crate::e2e::Error as E2EError;
+    use core::net::Ipv4Addr;
+    use std::sync::{Arc, Mutex, RwLock};
+
+    impl E2ERegistryHandle for Arc<Mutex<E2ERegistry>> {
+        fn register(&self, key: E2EKey, profile: E2EProfile) {
+            self.lock().expect("e2e registry lock poisoned").register(key, profile);
+        }
+
+        fn unregister(&self, key: &E2EKey) {
+            self.lock().expect("e2e registry lock poisoned").unregister(key);
+        }
+
+        fn contains_key(&self, key: &E2EKey) -> bool {
+            self.lock().expect("e2e registry lock poisoned").contains_key(key)
+        }
+
+        fn protect(
+            &self,
+            key: E2EKey,
+            payload: &[u8],
+            upper_header: [u8; 8],
+            output: &mut [u8],
+        ) -> Option<Result<usize, E2EError>> {
+            self.lock()
+                .expect("e2e registry lock poisoned")
+                .protect(key, payload, upper_header, output)
+        }
+
+        fn check<'a>(
+            &self,
+            key: E2EKey,
+            payload: &'a [u8],
+            upper_header: [u8; 8],
+        ) -> Option<(E2ECheckStatus, &'a [u8])> {
+            self.lock()
+                .expect("e2e registry lock poisoned")
+                .check(key, payload, upper_header)
+        }
+    }
+
+    impl InterfaceHandle for Arc<RwLock<Ipv4Addr>> {
+        fn get(&self) -> Ipv4Addr {
+            *self.read().expect("interface lock poisoned")
+        }
+
+        fn set(&self, addr: Ipv4Addr) {
+            *self.write().expect("interface lock poisoned") = addr;
+        }
+    }
+}
+
+// ── Channel-handle abstraction ────────────────────────────────────────────
 //
-// `ChannelFactory` and its associated sender / receiver traits replace direct
-// use of `tokio::sync::mpsc` and `tokio::sync::oneshot` in the client.
-// `TokioChannels` (in `tokio_transport`) is the default for `std + tokio`
-// builds; `EmbassySyncChannels` (in `tokio_transport`, gated behind
-// `bare_metal`) is the alternative for no-tokio / no_std builds.
+// `ChannelFactory` and its associated sender / receiver traits abstract over
+// the channel primitive used by the client. `TokioChannels` (in
+// `tokio_transport`) is the default for `std + tokio` builds;
+// `EmbassySyncChannels` (in `tokio_transport`, gated behind `bare_metal`)
+// is the alternative for no-tokio / no_std builds.
 
 /// Returned by [`OneshotRecv::recv`] when the sender was dropped before
 /// sending a value.

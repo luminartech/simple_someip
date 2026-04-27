@@ -29,30 +29,42 @@
 //! (either a `static` or a heap allocator); the capacity constants plus
 //! [`crate::UDP_BUFFER_SIZE`] are the knobs for trimming this footprint.
 mod error;
+#[cfg(feature = "client-tokio")]
 mod inner;
+#[cfg(feature = "client-tokio")]
 mod service_registry;
+#[cfg(feature = "client-tokio")]
 mod session;
+#[cfg(feature = "client-tokio")]
 mod socket_manager;
 
 pub use error::Error;
 
+#[cfg(feature = "client-tokio")]
 use crate::Timer;
-use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry};
+use crate::e2e::E2ECheckStatus;
+#[cfg(feature = "client-tokio")]
+use crate::e2e::{E2EKey, E2EProfile, E2ERegistry};
+#[cfg(feature = "client-tokio")]
 use crate::tokio_transport::{TokioChannels, TokioSpawner, TokioTimer};
-use crate::transport::{
-    ChannelFactory, E2ERegistryHandle, InterfaceHandle, MpscSend, OneshotRecv, Spawner,
-    UnboundedRecv,
-};
+use crate::transport::{ChannelFactory, OneshotRecv, UnboundedRecv};
+#[cfg(feature = "client-tokio")]
+use crate::transport::{E2ERegistryHandle, InterfaceHandle, MpscSend, Spawner};
 use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
+#[cfg(feature = "client-tokio")]
 use inner::{ControlMessage, Inner};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
+#[cfg(feature = "client-tokio")]
+use std::net::{Ipv4Addr, SocketAddrV4};
+#[cfg(feature = "client-tokio")]
 use std::sync::{Arc, Mutex, RwLock};
+#[cfg(feature = "client-tokio")]
 use tracing::info;
 
 /// Handle to a pending SOME/IP request-response transaction.
 /// Resolves when the inner loop receives a matching unicast reply.
 /// Does not borrow `Client`.
-pub struct PendingResponse<P: Send + 'static, C: ChannelFactory = TokioChannels> {
+pub struct PendingResponse<P: Send + 'static, C: ChannelFactory> {
     receiver: C::OneshotReceiver<Result<P, Error>>,
 }
 
@@ -144,7 +156,7 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ClientUpdate<P> {
 ///
 /// Returned by [`Client::new`]. Call [`recv`](Self::recv) to receive
 /// discovery, unicast, and error updates.
-pub struct ClientUpdates<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory = TokioChannels> {
+pub struct ClientUpdates<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory> {
     update_receiver: C::UnboundedReceiver<ClientUpdate<MessageDefinitions>>,
 }
 
@@ -178,18 +190,20 @@ impl<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory> ClientU
 /// (`Arc<Mutex<E2ERegistry>>` and `Arc<RwLock<Ipv4Addr>>`) are used by the
 /// standard constructors [`Self::new`] / [`Self::new_with_loopback`] /
 /// [`Self::new_with_spawner_and_loopback`].
+#[cfg(feature = "client-tokio")]
 #[derive(Clone)]
 pub struct Client<
     MessageDefinitions: PayloadWireFormat + Send + 'static,
-    R: E2ERegistryHandle = Arc<Mutex<E2ERegistry>>,
-    I: InterfaceHandle = Arc<RwLock<Ipv4Addr>>,
-    C: ChannelFactory = TokioChannels,
+    R: E2ERegistryHandle,
+    I: InterfaceHandle,
+    C: ChannelFactory,
 > {
     interface: I,
     control_sender: C::BoundedSender<inner::ControlMessage<MessageDefinitions, C>>,
     e2e_registry: R,
 }
 
+#[cfg(feature = "client-tokio")]
 impl<MessageDefinitions, R, I, C> std::fmt::Debug for Client<MessageDefinitions, R, I, C>
 where
     MessageDefinitions: PayloadWireFormat + Send + 'static,
@@ -204,7 +218,13 @@ where
     }
 }
 
-/// Constructors that create the default `Arc`-backed handles for `std + tokio`.
+/// Convenience constructors that default to `Arc<Mutex<_>>` / `Arc<RwLock<_>>`
+/// handles, the `TokioChannels` channel factory, and the `TokioSpawner` task
+/// submitter. Available under the `client-tokio` feature, which pulls in
+/// `tokio` + `socket2`. Bare-metal callers use
+/// [`Self::new_with_spawner_and_loopback`] (always available under `client`)
+/// and supply their own channel factory + spawner.
+#[cfg(feature = "client-tokio")]
 impl<MessageDefinitions>
     Client<MessageDefinitions, Arc<Mutex<E2ERegistry>>, Arc<RwLock<Ipv4Addr>>, TokioChannels>
 where
@@ -228,7 +248,7 @@ where
     /// # use simple_someip::{Client, RawPayload};
     /// # use std::net::Ipv4Addr;
     /// # async fn demo() {
-    /// let (client, mut updates, run) = Client::<RawPayload>::new(Ipv4Addr::LOCALHOST);
+    /// let (client, mut updates, run) = Client::<RawPayload, _, _, _>::new(Ipv4Addr::LOCALHOST);
     /// let _run_task = tokio::spawn(run);
     /// // ...interact with `client` and `updates`...
     /// # let _ = (client, updates);
@@ -239,7 +259,7 @@ where
         interface: Ipv4Addr,
     ) -> (
         Self,
-        ClientUpdates<MessageDefinitions>,
+        ClientUpdates<MessageDefinitions, TokioChannels>,
         impl core::future::Future<Output = ()> + Send + 'static,
     ) {
         Self::new_with_loopback(interface, false)
@@ -274,7 +294,7 @@ where
         multicast_loopback: bool,
     ) -> (
         Self,
-        ClientUpdates<MessageDefinitions>,
+        ClientUpdates<MessageDefinitions, TokioChannels>,
         impl core::future::Future<Output = ()> + Send + 'static,
     ) {
         Self::new_with_spawner_and_loopback(interface, multicast_loopback, TokioSpawner)
@@ -293,7 +313,7 @@ where
     /// #   fn spawn(&self, _: impl core::future::Future<Output = ()> + Send + 'static) {}
     /// # }
     /// let (client, mut updates, run) =
-    ///     Client::<RawPayload>::new_with_spawner_and_loopback(
+    ///     Client::<RawPayload, _, _, _>::new_with_spawner_and_loopback(
     ///         Ipv4Addr::LOCALHOST,
     ///         false,
     ///         MySpawner,
@@ -345,6 +365,7 @@ where
 }
 
 /// Methods available on all `Client<M, R, I, C>` regardless of handle types.
+#[cfg(feature = "client-tokio")]
 impl<MessageDefinitions, R, I, C> Client<MessageDefinitions, R, I, C>
 where
     MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
@@ -737,6 +758,7 @@ where
 /// because it requires `tokio::sync::mpsc::Sender::downgrade()` for the
 /// weak-sender shutdown pattern. A bare-metal alternative would need a
 /// different lifecycle mechanism (phase-future).
+#[cfg(feature = "client-tokio")]
 impl<MessageDefinitions, R, I> Client<MessageDefinitions, R, I, TokioChannels>
 where
     MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
@@ -769,9 +791,18 @@ where
     /// (via `shut_down()` or going out of scope).
     ///
     /// ```no_run
-    /// # use simple_someip::{Client, RawPayload, VecSdHeader};
+    /// # use simple_someip::{Client, RawPayload, TokioChannels, VecSdHeader};
     /// # use simple_someip::protocol::sd::{self, RebootFlag, Flags};
-    /// # async fn demo(client: Client<RawPayload>) {
+    /// # use std::sync::{Arc, Mutex, RwLock};
+    /// # use std::net::Ipv4Addr;
+    /// # async fn demo(
+    /// #     client: Client<
+    /// #         RawPayload,
+    /// #         Arc<Mutex<simple_someip::e2e::E2ERegistry>>,
+    /// #         Arc<RwLock<Ipv4Addr>>,
+    /// #         TokioChannels,
+    /// #     >,
+    /// # ) {
     /// let header = VecSdHeader {
     ///     flags: Flags::new_sd(RebootFlag::RecentlyRebooted),
     ///     entries: vec![],
@@ -877,14 +908,15 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "client-tokio"))]
 mod tests {
     use super::*;
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
     use crate::traits::WireFormat;
     use std::format;
 
-    type TestClient = Client<TestPayload, Arc<Mutex<E2ERegistry>>, Arc<RwLock<Ipv4Addr>>>;
+    type TestClient =
+        Client<TestPayload, Arc<Mutex<E2ERegistry>>, Arc<RwLock<Ipv4Addr>>, TokioChannels>;
 
     #[tokio::test]
     async fn test_client_new_and_interface() {
