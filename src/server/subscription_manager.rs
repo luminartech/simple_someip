@@ -12,16 +12,29 @@ const EVENT_GROUPS_CAP: usize = 32;
 /// with a `warn!` log rather than silently.
 const SUBSCRIBERS_PER_GROUP: usize = 16;
 
+// Compile-time invariants. Trip these at `cargo build` so that retuning
+// the constants above can't quietly produce a `subscribe` impl that
+// panics on first push (zero `SUBSCRIBERS_PER_GROUP`) or that fails the
+// `heapless::FnvIndexMap` build (non-power-of-two `EVENT_GROUPS_CAP`).
+const _: () = assert!(
+    SUBSCRIBERS_PER_GROUP >= 1,
+    "SUBSCRIBERS_PER_GROUP must be >= 1: a value of 0 would crash subscribe() on first push"
+);
+const _: () = assert!(
+    EVENT_GROUPS_CAP.is_power_of_two(),
+    "EVENT_GROUPS_CAP must be a power of two for heapless::FnvIndexMap"
+);
+
 /// Why a call to [`SubscriptionManager::subscribe`] failed to record a new
 /// subscriber. Callers (typically the server's `Subscribe` handler) should
 /// use this to emit a `SubscribeNack` instead of a misleading `SubscribeAck`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscribeError {
     /// The per-event-group subscriber list is already full
-    /// ([`SUBSCRIBERS_PER_GROUP`] entries). The caller's request was not
+    /// (`SUBSCRIBERS_PER_GROUP` entries). The caller's request was not
     /// recorded.
     SubscribersPerGroupFull,
-    /// The outer event-group map is already full ([`EVENT_GROUPS_CAP`]
+    /// The outer event-group map is already full (`EVENT_GROUPS_CAP`
     /// distinct `(service_id, instance_id, event_group_id)` keys). The
     /// caller's request was not recorded.
     EventGroupsFull,
@@ -45,8 +58,8 @@ type SubscribersList = HeaplessVec<Subscriber, SUBSCRIBERS_PER_GROUP>;
 
 /// Manages subscriptions to event groups.
 ///
-/// Capacity is bounded at compile time: up to [`EVENT_GROUPS_CAP`] distinct
-/// event groups, each with up to [`SUBSCRIBERS_PER_GROUP`] subscribers.
+/// Capacity is bounded at compile time: up to `EVENT_GROUPS_CAP` distinct
+/// event groups, each with up to `SUBSCRIBERS_PER_GROUP` subscribers.
 #[derive(Debug)]
 pub struct SubscriptionManager {
     /// Map of (`service_id`, `instance_id`, `event_group_id`) -> list of subscribers
@@ -76,6 +89,17 @@ impl SubscriptionManager {
     /// recorded because a bounded capacity was hit — the caller
     /// (typically the server's `Subscribe` handler) should send a
     /// `SubscribeNack` on `Err`, not a `SubscribeAck`.
+    ///
+    /// # Errors
+    ///
+    /// Returns:
+    /// - `SubscribeError::SubscribersPerGroupFull` when an existing event
+    ///   group already has `SUBSCRIBERS_PER_GROUP` subscribers and this
+    ///   call would push a new one.
+    /// - `SubscribeError::EventGroupsFull` when this is the first
+    ///   subscriber for a previously-unseen `(service_id, instance_id,
+    ///   event_group_id)` triple but the outer event-group map is full
+    ///   (`EVENT_GROUPS_CAP` distinct groups).
     ///
     /// # Panics
     ///

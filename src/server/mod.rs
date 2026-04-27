@@ -364,16 +364,11 @@ impl Server {
 
         let entries = [entry];
         let options = [option];
-        // See the ordering note on `SdStateManager::send_offer_service`:
-        // advance the session counter first so `has_wrapped` latches,
-        // then read the reboot flag so the wrap message itself carries
-        // `Continuous`.
-        let sid = self.sd_state.next_session_id();
-        let sd_payload = sd::Header::new(
-            Flags::new_sd(self.sd_state.reboot_flag()),
-            &entries,
-            &options,
-        );
+        // Atomic (sid, reboot_flag) pair so concurrent emissions cannot
+        // race around the wrap boundary — see
+        // `SdStateManager::next_session_id_with_reboot_flag` docs.
+        let (sid, reboot_flag) = self.sd_state.next_session_id_with_reboot_flag();
+        let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &options);
 
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
@@ -472,6 +467,15 @@ impl Server {
             )));
         }
 
+        // Incoming-peer buffers sized to the IP datagram limit (64 KiB - 1).
+        // Do NOT shrink to `UDP_BUFFER_SIZE` (1500): peer SD messages are
+        // bounded by the link MTU but `recv_from` here is a server-side
+        // sink for any peer datagram landing on the SD/unicast port, and
+        // larger-than-MTU peer messages must surface (or be cleanly
+        // truncated by the kernel) rather than being silently capped at
+        // 1500 by an undersized buffer. Out-going `EventPublisher` paths
+        // do use the smaller `UDP_BUFFER_SIZE` because we control the
+        // wire size of what we emit; that asymmetry is intentional.
         let mut unicast_buf = vec![0u8; 65535];
         let mut sd_buf = vec![0u8; 65535];
 
@@ -480,6 +484,16 @@ impl Server {
             // across ready arms each poll — matches the prior
             // `tokio::select!` behavior and avoids starving either the
             // unicast or SD-multicast arm under sustained one-sided load.
+            //
+            // SAFETY: both arms are `tokio::net::UdpSocket::recv_from`,
+            // which is cancel-safe per tokio docs — a non-selected arm
+            // can be dropped without losing in-flight kernel state. A
+            // future contributor adding a non-cancel-safe `FusedFuture`
+            // arm here (e.g. a custom state machine that holds
+            // partially-read bytes) would silently lose that state when
+            // the arm is dropped on a select win. Both futures must
+            // therefore stay `Send + FusedFuture + Unpin` *and*
+            // cancel-safe.
             //
             // Fresh futures are constructed each iteration so the borrows
             // of `unicast_buf` / `sd_buf` / the sockets end when the
@@ -558,6 +572,7 @@ impl Server {
     }
 
     /// Handle a Service Discovery message
+    #[allow(clippy::too_many_lines)]
     async fn handle_sd_message(
         &mut self,
         sd_view: &sd::SdHeaderView<'_>,
@@ -584,7 +599,7 @@ impl Server {
                             self.config.service_id,
                             entry_view.service_id()
                         );
-                        self.send_subscribe_nack_from_view(&entry_view, sender, "Wrong service ID")
+                        self.send_subscribe_nack_from_view(&entry_view, sender, "wrong_service_id")
                             .await?;
                     } else if entry_view.instance_id() != self.config.instance_id {
                         tracing::warn!(
@@ -595,7 +610,26 @@ impl Server {
                         self.send_subscribe_nack_from_view(
                             &entry_view,
                             sender,
-                            "Wrong instance ID",
+                            "wrong_instance_id",
+                        )
+                        .await?;
+                    } else if entry_view.major_version() != self.config.major_version {
+                        // Per AUTOSAR SOME/IP-SD: a Subscribe whose
+                        // major_version disagrees with the server's
+                        // configured major must be NACKed (TTL=0). Without
+                        // this arm a client probing for a v2 service
+                        // against a v1 server would get an Ack and start
+                        // sending traffic that the application stack
+                        // would silently mis-decode.
+                        tracing::warn!(
+                            "Subscribe for wrong major_version: expected {}, got {}",
+                            self.config.major_version,
+                            entry_view.major_version()
+                        );
+                        self.send_subscribe_nack_from_view(
+                            &entry_view,
+                            sender,
+                            "wrong_major_version",
                         )
                         .await?;
                     } else {
@@ -651,12 +685,8 @@ impl Server {
                                         SubscribeError::EventGroupsFull => "event_groups_full",
                                     };
                                     tracing::debug!("Subscription rejected: {reason}");
-                                    self.send_subscribe_nack_from_view(
-                                        &entry_view,
-                                        sender,
-                                        reason,
-                                    )
-                                    .await?;
+                                    self.send_subscribe_nack_from_view(&entry_view, sender, reason)
+                                        .await?;
                                 }
                             }
                         } else {
@@ -664,7 +694,7 @@ impl Server {
                             self.send_subscribe_nack_from_view(
                                 &entry_view,
                                 sender,
-                                "No endpoint in options",
+                                "no_endpoint_in_options",
                             )
                             .await?;
                         }
@@ -806,11 +836,10 @@ impl Server {
         });
 
         let entries = [ack_entry];
-        // Ordering: advance the session id first so `has_wrapped` latches
-        // on the wrap boundary, then read `reboot_flag()` for this
-        // message — see `SdStateManager::send_offer_service`.
-        let sid = self.sd_state.next_session_id();
-        let sd_payload = sd::Header::new(Flags::new_sd(self.sd_state.reboot_flag()), &entries, &[]);
+        // Atomic (sid, reboot_flag) pair — see
+        // `SdStateManager::next_session_id_with_reboot_flag`.
+        let (sid, reboot_flag) = self.sd_state.next_session_id_with_reboot_flag();
+        let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &[]);
 
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
@@ -855,10 +884,10 @@ impl Server {
         });
 
         let entries = [nack_entry];
-        // Ordering: advance first so `has_wrapped` latches, then read
-        // reboot flag — see `SdStateManager::send_offer_service`.
-        let sid = self.sd_state.next_session_id();
-        let sd_payload = sd::Header::new(Flags::new_sd(self.sd_state.reboot_flag()), &entries, &[]);
+        // Atomic (sid, reboot_flag) pair — see
+        // `SdStateManager::next_session_id_with_reboot_flag`.
+        let (sid, reboot_flag) = self.sd_state.next_session_id_with_reboot_flag();
+        let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &[]);
 
         let mut sd_data = Vec::new();
         sd_payload.encode(&mut sd_data)?;
@@ -893,7 +922,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_creation() {
-        let config = ServerConfig::new(Ipv4Addr::new(127, 0, 0, 1), 30682, 0x5B, 1);
+        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30682, 0x5B, 1);
 
         let server: Result<Server, _> = Server::new(config).await;
         assert!(server.is_ok());
@@ -905,7 +934,7 @@ mod tests {
         // when the test binary runs tests in parallel. The SD socket binds
         // the SD multicast port (30490) and relies on SO_REUSEPORT, the same
         // as `test_server_creation`.
-        let config = ServerConfig::new(Ipv4Addr::new(127, 0, 0, 1), 30683, 0x5C, 1);
+        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30683, 0x5C, 1);
 
         let server = Server::new_with_loopback(config, true)
             .await
@@ -953,17 +982,18 @@ mod tests {
     /// Helper: create a server on an ephemeral port and return (Server, port)
     async fn create_test_server(service_id: u16, instance_id: u16) -> (Server, u16) {
         // Use port 0 to get an ephemeral port
-        let config = ServerConfig::new(Ipv4Addr::new(127, 0, 0, 1), 0, service_id, instance_id);
+        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, service_id, instance_id);
         let mut server = Server::new(config).await.expect("Failed to create server");
         let port = match server.unicast_local_addr().unwrap() {
             std::net::SocketAddr::V4(addr) => addr.port(),
-            _ => panic!("Expected IPv4 address"),
+            std::net::SocketAddr::V6(_) => panic!("expected IPv4 address"),
         };
         // Update config to reflect actual bound port
         server.set_local_port(port);
         (server, port)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn make_subscription_header(
         service_id: u16,
         instance_id: u16,
@@ -1009,14 +1039,14 @@ mod tests {
             1,
             3,
             0x01,
-            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::LOCALHOST,
             sd::TransportProtocol::Udp,
             server_port,
         );
 
         // Send to the server
         client_socket
-            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .send_to(&message, format!("127.0.0.1:{server_port}"))
             .await
             .unwrap();
 
@@ -1047,7 +1077,7 @@ mod tests {
         .unwrap();
 
         let ttl = parse_subscribe_ack_ttl(&resp_buf[..resp_len]);
-        assert!(ttl > 0, "Expected ACK (TTL > 0), got TTL={}", ttl);
+        assert!(ttl > 0, "Expected ACK (TTL > 0), got TTL={ttl}");
 
         server_handle.await.unwrap();
     }
@@ -1063,12 +1093,12 @@ mod tests {
             1,
             3,
             0x01,
-            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::LOCALHOST,
             sd::TransportProtocol::Udp,
             server_port,
         );
         client_socket
-            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .send_to(&message, format!("127.0.0.1:{server_port}"))
             .await
             .unwrap();
 
@@ -1097,7 +1127,7 @@ mod tests {
         .unwrap();
 
         let ttl = parse_subscribe_ack_ttl(&resp_buf[..resp_len]);
-        assert_eq!(ttl, 0, "Expected NACK (TTL=0), got TTL={}", ttl);
+        assert_eq!(ttl, 0, "Expected NACK (TTL=0), got TTL={ttl}");
 
         server_handle.await.unwrap();
     }
@@ -1113,12 +1143,12 @@ mod tests {
             1,
             3,
             0x01,
-            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::LOCALHOST,
             sd::TransportProtocol::Udp,
             server_port,
         );
         client_socket
-            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .send_to(&message, format!("127.0.0.1:{server_port}"))
             .await
             .unwrap();
 
@@ -1144,7 +1174,7 @@ mod tests {
         .unwrap();
 
         let ttl = parse_subscribe_ack_ttl(&resp_buf[..resp_len]);
-        assert_eq!(ttl, 0, "Expected NACK (TTL=0), got TTL={}", ttl);
+        assert_eq!(ttl, 0, "Expected NACK (TTL=0), got TTL={ttl}");
 
         server_handle.await.unwrap();
     }
@@ -1164,7 +1194,7 @@ mod tests {
         );
         let message = build_sd_message(&sd_header);
         client_socket
-            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .send_to(&message, format!("127.0.0.1:{server_port}"))
             .await
             .unwrap();
 
@@ -1215,7 +1245,7 @@ mod tests {
         );
         let message = build_sd_message(&sd_header);
         client_socket
-            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .send_to(&message, format!("127.0.0.1:{server_port}"))
             .await
             .unwrap();
 
@@ -1262,7 +1292,7 @@ mod tests {
         );
         let message = build_sd_message(&sd_header);
         client_socket
-            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .send_to(&message, format!("127.0.0.1:{server_port}"))
             .await
             .unwrap();
 
@@ -1302,7 +1332,7 @@ mod tests {
         let message = build_sd_message(&sd_header);
 
         client_socket
-            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .send_to(&message, format!("127.0.0.1:{server_port}"))
             .await
             .unwrap();
 
@@ -1330,7 +1360,7 @@ mod tests {
         .unwrap();
 
         let ttl = parse_subscribe_ack_ttl(&resp_buf[..resp_len]);
-        assert_eq!(ttl, 0, "Expected NACK (TTL=0), got TTL={}", ttl);
+        assert_eq!(ttl, 0, "Expected NACK (TTL=0), got TTL={ttl}");
 
         server_handle.await.unwrap();
     }
@@ -1388,7 +1418,7 @@ mod tests {
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_port = match client_socket.local_addr().unwrap() {
             std::net::SocketAddr::V4(a) => a.port(),
-            _ => panic!("expected v4"),
+            std::net::SocketAddr::V6(_) => panic!("expected v4 source address"),
         };
 
         let subscriptions = Arc::clone(&server.subscriptions);
@@ -1410,7 +1440,7 @@ mod tests {
         let mut non_sd_buf = Vec::new();
         non_sd_header.encode(&mut non_sd_buf).unwrap();
         client_socket
-            .send_to(&non_sd_buf, format!("127.0.0.1:{}", server_port))
+            .send_to(&non_sd_buf, format!("127.0.0.1:{server_port}"))
             .await
             .unwrap();
 
@@ -1422,12 +1452,12 @@ mod tests {
             1,
             3,
             0x01,
-            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::LOCALHOST,
             sd::TransportProtocol::Udp,
             client_port,
         );
         client_socket
-            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .send_to(&message, format!("127.0.0.1:{server_port}"))
             .await
             .unwrap();
 
@@ -1442,7 +1472,7 @@ mod tests {
         .unwrap();
 
         let ttl = parse_subscribe_ack_ttl(&resp_buf[..resp_len]);
-        assert!(ttl > 0, "Expected ACK (TTL > 0), got TTL={}", ttl);
+        assert!(ttl > 0, "Expected ACK (TTL > 0), got TTL={ttl}");
 
         // Verify subscription was added (non-SD message was ignored)
         let subs = subscriptions.read().await;
@@ -1457,7 +1487,7 @@ mod tests {
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_port = match client_socket.local_addr().unwrap() {
             std::net::SocketAddr::V4(a) => a.port(),
-            _ => panic!("expected v4"),
+            std::net::SocketAddr::V6(_) => panic!("expected v4 source address"),
         };
 
         let subscriptions = Arc::clone(&server.subscriptions);
@@ -1468,7 +1498,7 @@ mod tests {
 
         // Send garbage bytes
         client_socket
-            .send_to(&[0xFF, 0xFE, 0xFD], format!("127.0.0.1:{}", server_port))
+            .send_to(&[0xFF, 0xFE, 0xFD], format!("127.0.0.1:{server_port}"))
             .await
             .unwrap();
 
@@ -1480,12 +1510,12 @@ mod tests {
             1,
             3,
             0x01,
-            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::LOCALHOST,
             sd::TransportProtocol::Udp,
             client_port,
         );
         client_socket
-            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .send_to(&message, format!("127.0.0.1:{server_port}"))
             .await
             .unwrap();
 
@@ -1500,7 +1530,7 @@ mod tests {
         .unwrap();
 
         let ttl = parse_subscribe_ack_ttl(&resp_buf[..resp_len]);
-        assert!(ttl > 0, "Expected ACK (TTL > 0), got TTL={}", ttl);
+        assert!(ttl > 0, "Expected ACK (TTL > 0), got TTL={ttl}");
 
         let subs = subscriptions.read().await;
         assert_eq!(subs.subscription_count(), 1);
@@ -1549,12 +1579,12 @@ mod tests {
             1,
             3,
             0x01,
-            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::LOCALHOST,
             sd::TransportProtocol::Udp,
             server_port.wrapping_add(1), // Subscriber's port, different from server
         );
         client_socket
-            .send_to(&message, format!("127.0.0.1:{}", server_port))
+            .send_to(&message, format!("127.0.0.1:{server_port}"))
             .await
             .unwrap();
 
@@ -1581,7 +1611,7 @@ mod tests {
         .unwrap();
 
         let ttl = parse_subscribe_ack_ttl(&resp_buf[..resp_len]);
-        assert!(ttl > 0, "Expected ACK (TTL > 0), got TTL={}", ttl);
+        assert!(ttl > 0, "Expected ACK (TTL > 0), got TTL={ttl}");
 
         server_handle.await.unwrap();
     }
@@ -2262,18 +2292,18 @@ mod tests {
         });
     }
 
-    /// Smoke test for [`Server::start_announcing`]: a loopback server with
-    /// `multicast_loop` enabled should emit at least one `OfferService` on
-    /// the SD multicast group within a couple of seconds.
+    /// Smoke test for [`Server::announcement_loop`]: a loopback server
+    /// with `multicast_loop` enabled should emit at least one
+    /// `OfferService` on the SD multicast group within a couple of
+    /// seconds.
     ///
     /// `#[ignore]`d for the same reason as the `sd_state` tests — hosts
     /// without the MULTICAST flag on `lo` drop the packet silently. The
-    /// spawned announcer task keeps running until runtime teardown; that
-    /// is intentional (there is no stop API on `Server`) and harmless in
-    /// a `#[tokio::test]`.
+    /// announcer task is captured and aborted at the end of the test so
+    /// it does not leak multicast traffic into other parallel tests.
     #[ignore = "requires loopback multicast support (MULTICAST on lo)"]
     #[tokio::test]
-    async fn start_announcing_emits_first_offer_within_timeout() {
+    async fn announcement_loop_emits_first_offer_within_timeout() {
         use crate::protocol::MessageView;
         use crate::protocol::sd::EntryType;
 
@@ -2307,7 +2337,7 @@ mod tests {
         let announce_fut = server
             .announcement_loop()
             .expect("announcement_loop should build on a non-passive server");
-        tokio::spawn(announce_fut);
+        let announce_handle = tokio::spawn(announce_fut);
 
         // Scan the multicast group for our OfferService. The first tick
         // happens immediately; 2s is ample headroom for scheduler jitter.
@@ -2337,6 +2367,8 @@ mod tests {
         };
         tokio::time::timeout(std::time::Duration::from_secs(2), recv_loop)
             .await
-            .expect("start_announcing should emit at least one OfferService within 2s");
+            .expect("announcement_loop should emit at least one OfferService within 2s");
+        announce_handle.abort();
+        let _ = announce_handle.await;
     }
 }

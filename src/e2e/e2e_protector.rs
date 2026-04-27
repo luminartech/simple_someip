@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_protect_profile4_header_format() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut state = Profile4State::new();
 
         let payload = b"test";
@@ -217,7 +217,7 @@ mod tests {
 
         // Check data_id field (bytes 4-7)
         let data_id = u32::from_be_bytes([protected[4], protected[5], protected[6], protected[7]]);
-        assert_eq!(data_id, 0x12345678);
+        assert_eq!(data_id, 0x1234_5678);
 
         // Check payload at end
         assert_eq!(&protected[12..], b"test");
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_protect_profile4_counter_increment() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut state = Profile4State::new();
 
         let payload = b"test";
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_protect_profile4_counter_wraps() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut state = Profile4State::with_initial_counter(u16::MAX);
 
         let payload = b"test";
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_protect_profile4_buffer_too_small() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut state = Profile4State::new();
 
         let payload = b"test";
@@ -458,7 +458,7 @@ mod tests {
     #[test]
     #[cfg(feature = "std")]
     fn test_protect_profile4_length_overflow() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut state = Profile4State::new();
 
         // payload of 65536 bytes => total = 12 + 65536 = 65548 > u16::MAX
@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_protect_profile4_empty_payload() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut state = Profile4State::new();
 
         let mut buf = [0u8; 256];

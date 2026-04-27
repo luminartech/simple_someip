@@ -10,9 +10,10 @@ The library supports both `std` and `no_std` environments, making it suitable fo
 
 ## Features
 
-- **`no_std` compatible** — the `protocol`, `traits`, and `e2e` modules work without the standard library
+- **`no_std` compatible** — `protocol`, `traits`, `transport`, and `e2e` modules work without the standard library
 - **Service Discovery** — SD entry/option encoding and decoding via fixed-capacity `heapless` collections (no heap allocation)
 - **End-to-End protection** — Profile 4 (CRC-32) and Profile 5 (CRC-16) with zero-allocation APIs
+- **Executor-agnostic transport traits** — `TransportSocket`, `TransportFactory`, `Timer`, `Spawner` (default `tokio` impls behind feature gates)
 - **Async client and server** — tokio-based, gated behind optional feature flags
 - **`embedded-io`** traits for serialization — abstracts over `std::io::Read`/`Write`
 
@@ -20,7 +21,9 @@ The library supports both `std` and `no_std` environments, making it suitable fo
 
 - `protocol` — Wire format layer: SOME/IP header, `MessageId`, `MessageType`, `ReturnCode`, SD entries/options
 - `traits` — `WireFormat` and `PayloadWireFormat` traits for custom message types
+- `transport` — Executor-agnostic UDP socket / factory / timer / spawner traits (no_std-compatible)
 - `e2e` — End-to-End protection profiles (always available, no heap allocation)
+- `tokio_transport` — Default `std + tokio` impls of the transport traits (requires `feature = "client"` or `feature = "server"`)
 - `client` — High-level async tokio client (requires `feature = "client"`)
 - `server` — Async tokio server with SD announcements and event publishing (requires `feature = "server"`)
 
@@ -31,19 +34,19 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 # Default — includes std, thiserror, and tracing
-simple-someip = "0.5"
+simple-someip = "0.7"
 
-# no_std only (protocol/E2E/traits, no heap allocation)
-simple-someip = { version = "0.5", default-features = false }
+# no_std only (protocol/transport/E2E/traits, no heap allocation)
+simple-someip = { version = "0.7", default-features = false }
 
 # Client only
-simple-someip = { version = "0.5", features = ["client"] }
+simple-someip = { version = "0.7", features = ["client"] }
 
 # Server only
-simple-someip = { version = "0.5", features = ["server"] }
+simple-someip = { version = "0.7", features = ["server"] }
 
 # Both client and server
-simple-someip = { version = "0.5", features = ["client", "server"] }
+simple-someip = { version = "0.7", features = ["client", "server"] }
 ```
 
 ### Feature flags
@@ -53,8 +56,9 @@ simple-someip = { version = "0.5", features = ["client", "server"] }
 | `std` | **yes** | Enables `thiserror`, `tracing`, and `embedded-io/std` |
 | `client` | no | Async tokio client; implies `std` + tokio + socket2 |
 | `server` | no | Async tokio server; implies `std` + tokio + socket2 |
+| `bare_metal` | no | Pure marker — reserved for future no_std helpers. The real bare-metal canary is the `examples/bare_metal` workspace member; verify it with `cargo build -p bare_metal` (NOT `cargo build --workspace`, which can unify features). |
 
-By default the crate enables `std`. To use in a `no_std` environment (e.g., embedded targets), disable default features with `default-features = false`. In that mode only the `protocol`, `traits`, and `e2e` modules are available, and the crate compiles in `no_std` mode. Most applications only need one of `client` or `server`.
+By default the crate enables `std`. To use in a `no_std` environment (e.g., embedded targets), disable default features with `default-features = false`. In that mode the `protocol`, `traits`, `transport`, and `e2e` modules are available; `client` / `server` (and their `tokio_transport` backend) are not. Most applications only need one of `client` or `server`.
 
 ## Quick Start
 
@@ -108,7 +112,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let publisher = server.publisher();
     let run_handle = tokio::spawn(async move { server.run().await });
 
-    // Publish events to subscribers...
+    // Publish events to subscribers, e.g.:
+    // publisher.publish_event(0x1234, 1, 0x01, &message).await?;
 
     tokio::select! {
         res = announce_handle => eprintln!("announcement loop exited unexpectedly: {res:?}"),

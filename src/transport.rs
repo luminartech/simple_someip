@@ -17,11 +17,19 @@
 //!
 //! Three explicit design choices:
 //!
-//! 1. **Executor-agnostic.** Methods return `impl Future`, not `async fn`,
-//!    and the traits make no statement about `Send` or `'static` bounds on
-//!    the returned futures. Callers that need those bounds (e.g. to
-//!    `tokio::spawn`) require them at the consumer site. Bare-metal callers
-//!    driving the future on a single executor task pay no `Send` tax.
+//! 1. **Executor-agnostic for socket / timer I/O.** [`TransportSocket`]
+//!    and [`Timer`] methods return `impl Future`, not `async fn`, and
+//!    those traits make no statement about `Send` or `'static` bounds on
+//!    their returned futures. Callers that need those bounds (e.g. to
+//!    `tokio::spawn`) require them at the consumer site. Bare-metal
+//!    callers driving the future on a single executor task pay no `Send`
+//!    tax for socket I/O. **[`Spawner::spawn`] is the deliberate
+//!    exception:** it is a multi-task abstraction by definition, so it
+//!    requires `Send + 'static` on its argument. Single-core executors
+//!    that need a `!Send` variant (embassy with `task_arena_size = 0`,
+//!    `LocalSet`-style models) need either a future `spawn_local` shim
+//!    or a hand-rolled adapter; the `Send + 'static` bound is documented
+//!    on the trait method itself.
 //! 2. **IPv4-only address type.** This transport abstraction currently
 //!    uses [`core::net::SocketAddrV4`] directly rather than `SocketAddr`,
 //!    matching the crate's present transport-layer reach for unicast and
@@ -309,11 +317,19 @@ impl Default for SocketOptions {
 /// The result of a successful [`TransportSocket::recv_from`].
 ///
 /// `truncated` is set if the backend delivered only a prefix of the
-/// incoming datagram because it did not fit in the caller's buffer.
-/// On backends that size `buf` at least as large as the link MTU (the
-/// expected configuration — see [`crate::UDP_BUFFER_SIZE`]), truncation
-/// should not occur in practice; the field exists so backends that cannot
-/// guarantee this can surface it explicitly instead of silently dropping.
+/// incoming datagram because it did not fit in the caller's buffer. If
+/// callers use a buffer sized to [`crate::UDP_BUFFER_SIZE`], truncation is
+/// generally not expected on backends whose delivered datagrams are
+/// bounded by that configured application-level cap. Backends that may
+/// deliver larger datagrams should surface this explicitly instead of
+/// silently dropping the fact that data was discarded.
+///
+/// Note: the default Tokio backend currently always reports
+/// `truncated: false` because `tokio::net::UdpSocket::recv_from` does not
+/// expose `MSG_TRUNC` (or equivalent). Reliable truncation detection
+/// requires a backend that does — e.g. a `recvmsg`-based backend, or a
+/// `no_std` stack like smoltcp / embassy-net that surfaces the original
+/// datagram length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceivedDatagram {
     /// Number of bytes written to the caller's buffer.
@@ -321,15 +337,20 @@ pub struct ReceivedDatagram {
     /// Source address of the datagram.
     pub source: SocketAddrV4,
     /// `true` if the incoming datagram was larger than the caller's
-    /// buffer and the tail was discarded.
+    /// buffer and the tail was discarded. See the type-level docs for
+    /// the default Tokio backend's caveat.
     pub truncated: bool,
 }
 
 /// A bound, configured UDP socket usable for SOME/IP message exchange.
 ///
-/// Implementations are obtained via [`TransportFactory::bind`]. All I/O
-/// methods return `impl Future` so the trait is executor-agnostic; the
-/// caller awaits them on whatever runtime it owns.
+/// Implementations are obtained via [`TransportFactory::bind`]. The
+/// send/receive methods return `impl Future` so the trait is
+/// executor-agnostic; the caller awaits them on whatever runtime it
+/// owns. The smaller socket-level queries ([`Self::local_addr`],
+/// [`Self::join_multicast_v4`], [`Self::leave_multicast_v4`]) are
+/// synchronous because they are typically O(1) lookups on a backend's
+/// internal handle and do not benefit from yielding to the executor.
 ///
 /// Multicast group membership is joined *after* bind via
 /// [`TransportSocket::join_multicast_v4`]; the bind-time
@@ -413,8 +434,7 @@ pub trait TransportSocket {
     /// Returns [`TransportError::Unsupported`] if the backend has no
     /// multicast support; otherwise [`TransportError::Io`] with an
     /// appropriate kind.
-    fn join_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr)
-    -> Result<(), TransportError>;
+    fn join_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> Result<(), TransportError>;
 
     /// Leave IPv4 multicast group `group` on interface `iface`. Symmetric
     /// to [`Self::join_multicast_v4`]. Most backends implicitly leave on
@@ -426,15 +446,14 @@ pub trait TransportSocket {
     /// Returns [`TransportError::Unsupported`] if the backend has no
     /// multicast support; otherwise [`TransportError::Io`] with an
     /// appropriate kind.
-    fn leave_multicast_v4(
-        &self,
-        group: Ipv4Addr,
-        iface: Ipv4Addr,
-    ) -> Result<(), TransportError>;
+    fn leave_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> Result<(), TransportError>;
 
     /// Upper bound, in bytes, on datagrams this socket will successfully
     /// accept in `send_to` or return via `recv_from`. The default returns
-    /// [`crate::UDP_BUFFER_SIZE`] (1500), matching standard Ethernet MTU.
+    /// [`crate::UDP_BUFFER_SIZE`], the crate's default application-level
+    /// UDP payload cap (currently 1500 bytes — note that this is *not*
+    /// MTU-safe; see [`crate::UDP_BUFFER_SIZE`]'s own docs for the
+    /// IPv4/IPv6 header overhead).
     ///
     /// Backends with a smaller effective MTU (for example, some
     /// resource-constrained embedded stacks) should override this to
@@ -485,6 +504,93 @@ pub trait Timer {
     /// Wait for at least `duration` before resolving. Implementations MAY
     /// overshoot but MUST NOT undershoot.
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()>;
+}
+
+/// Executor-agnostic task-spawning primitive.
+///
+/// `simple-someip`'s per-socket I/O loops need to run concurrently with
+/// the client's main event loop — otherwise `SocketManager::send`'s
+/// internal oneshot wait deadlocks (the send future parks the main
+/// loop, which is the only thing that would drive the socket loop to
+/// produce its response). Phase 8 hit this and deferred the spawn to
+/// a user-provided `Spawner` here, letting std+tokio callers pass a
+/// one-line `TokioSpawner` and bare-metal callers wrap their own
+/// executor's task-spawning primitive.
+///
+/// # Why this reverses the phase-4 "no executor adapter" rule
+///
+/// Phase 4 deliberately avoided wrapping spawn to prevent "reinventing
+/// embassy" and trait-object dispatch in the hot path. Concrete
+/// evidence from phase 8 showed that without a spawn abstraction,
+/// `Inner::bind_*` has to call `tokio::spawn` directly — making the
+/// whole crate tokio-only. The revised rule: spawn DOES need a trait,
+/// but we avoid the phase-4 concerns by (1) keeping the trait generic
+/// (monomorphized, no `dyn Spawner`) and (2) scoping it narrowly —
+/// just spawn, not select/sleep which have other solutions.
+///
+/// # Usage
+///
+/// On `std + tokio`, use `crate::tokio_transport::TokioSpawner`
+/// (available when the `client` or `server` feature is enabled) —
+/// a zero-size unit struct whose `spawn` is a thin wrapper around
+/// `tokio::spawn`. The path is rendered as a code literal rather
+/// than an intra-doc link because the target module is feature-gated
+/// and would break default-feature rustdoc builds. On embedded:
+///
+/// ```ignore
+/// struct EmbassySpawner(embassy_executor::Spawner);
+/// impl simple_someip::Spawner for EmbassySpawner {
+///     fn spawn(&self, fut: impl core::future::Future<Output = ()> + Send + 'static) {
+///         // embassy's Spawner has its own task-registration model;
+///         // the adapter layer depends on how the user defined their tasks
+///         todo!("call self.0.spawn(...)");
+///     }
+/// }
+/// ```
+pub trait Spawner {
+    /// Submit `future` to the executor. Must not block; must arrange
+    /// for the future to be polled to completion on some task.
+    ///
+    /// # Correctness requirement
+    ///
+    /// Implementations MUST poll the submitted future. Dropping it
+    /// without polling — or holding it in a queue that never drains —
+    /// will deadlock `crate::client::Client` (available when the
+    /// `client` feature is enabled): `SocketManager::send`
+    /// `await`s an internal mpsc→oneshot round-trip whose only driver
+    /// is the per-socket loop future submitted here. No poll, no
+    /// progress, no oneshot resolution; the caller's `send` hangs
+    /// forever.
+    ///
+    /// The `MockSpawner` in `examples/bare_metal/` deliberately
+    /// demonstrates the wrong pattern (drops the future) and annotates
+    /// it as DEMO-ONLY for exactly this reason.
+    ///
+    /// # Fire-and-forget by design
+    ///
+    /// `spawn` returns `()`, not a join-handle. The rest of the crate
+    /// observes `tokio::JoinHandle`s wherever it spawns work directly
+    /// (commit `d92c5a3`); this trait is the deliberate exception. The
+    /// per-socket loops have no observable result — they run forever and
+    /// only exit when their owning `SocketManager` drops its channel
+    /// ends — so a join-handle would just be storage with no callers.
+    /// A future revision MAY add an associated `Handle` type if a
+    /// concrete shutdown / cancellation use case appears; today there is
+    /// none.
+    ///
+    /// # Bound rationale
+    ///
+    /// The `Send + 'static` bound matches multi-threaded executors like
+    /// tokio, async-std, and smol — the captured per-socket loop is
+    /// already `Send + 'static` because its underlying `TokioSocket` is.
+    /// Embassy and other `no_alloc` / single-core executors typically need
+    /// additional adapter scaffolding (a typed `SpawnToken`, a static
+    /// task arena, hardware-specific waker plumbing) to satisfy
+    /// `Send + 'static`; the example at the top of this docstring has a
+    /// `todo!()` precisely because the adapter is not one-line. A future
+    /// release MAY add a `spawn_local`-style variant gated on a cargo
+    /// feature for those targets.
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static);
 }
 
 #[cfg(test)]

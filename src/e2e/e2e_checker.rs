@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn test_check_profile4_valid() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -267,8 +267,8 @@ mod tests {
 
     #[test]
     fn test_check_profile4_wrong_data_id() {
-        let config1 = Profile4Config::new(0x12345678, 15);
-        let config2 = Profile4Config::new(0xDEADBEEF, 15);
+        let config1 = Profile4Config::new(0x1234_5678, 15);
+        let config2 = Profile4Config::new(0xDEAD_BEEF, 15);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_check_profile4_corrupted_crc() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn test_check_profile4_corrupted_payload() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn test_check_profile4_wrong_length() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn test_check_profile4_too_short() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut check_state = Profile4State::new();
 
         let short = [0u8; 11]; // Less than 12-byte header
@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn test_sequence_repeated() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_sequence_consecutive() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn test_sequence_some_lost() {
-        let config = Profile4Config::new(0x12345678, 10);
+        let config = Profile4Config::new(0x1234_5678, 10);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_sequence_wrong_sequence() {
-        let config = Profile4Config::new(0x12345678, 3);
+        let config = Profile4Config::new(0x1234_5678, 3);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn test_sequence_wraparound() {
-        let config = Profile4Config::new(0x12345678, 5);
+        let config = Profile4Config::new(0x1234_5678, 5);
         let mut protect_state = Profile4State::with_initial_counter(u16::MAX - 2);
         let mut check_state = Profile4State::new();
 
@@ -533,7 +533,7 @@ mod tests {
 
         assert_eq!(result.status, E2ECheckStatus::Ok);
         assert_eq!(result.counter, Some(0));
-        assert_eq!(result.payload.as_deref(), Some(payload.as_slice()));
+        assert_eq!(result.payload, Some(payload.as_slice()));
     }
 
     #[test]

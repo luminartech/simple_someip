@@ -234,7 +234,7 @@ mod tests {
             service_id: 0x1234,
             instance_id: 0x0001,
             major_version: 1,
-            ttl: 0xFFFFFF,
+            ttl: 0xFF_FFFF,
             index_first_options_run: 0,
             index_second_options_run: 0,
             options_count: OptionsCount::new(1, 0),
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn subscribe_ack_round_trips() {
         let entry = Entry::SubscribeAckEventGroup(EventGroupEntry::new(
-            0xAAAA, 0x0001, 1, 0xFFFFFF, 0x0010,
+            0xAAAA, 0x0001, 1, 0xFF_FFFF, 0x0010,
         ));
         let entries = [entry];
         let h = Header::new(Flags::new_sd(RebootFlag::RecentlyRebooted), &entries, &[]);
@@ -281,7 +281,7 @@ mod tests {
             service_id: 0x1234,
             instance_id: 0x0001,
             major_version: 1,
-            ttl: 0xFFFFFF,
+            ttl: 0xFF_FFFF,
             index_first_options_run: 0,
             index_second_options_run: 0,
             options_count: OptionsCount::new(1, 0),

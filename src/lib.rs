@@ -19,8 +19,8 @@
 //! | [`protocol`] | Yes | Wire format: headers, messages, message types, return codes, and service discovery (SD) entries/options |
 //! | [`e2e`] | Yes | End-to-End protection — Profile 4 (CRC-32) and Profile 5 (CRC-16) |
 //! | [`WireFormat`] / [`PayloadWireFormat`] | Yes | Traits for serializing messages and defining custom payload types |
-//! | [`client`] | No | Async tokio client — service discovery, subscriptions, and request/response (feature `client`) |
-//! | [`server`] | No | Async tokio server — service offering, event publishing, and subscription management (feature `server`) |
+//! | `client` | No | Async tokio client — service discovery, subscriptions, and request/response (feature `client`) |
+//! | `server` | No | Async tokio server — service offering, event publishing, and subscription management (feature `server`) |
 //!
 //! ## Feature Flags
 //!
@@ -29,7 +29,7 @@
 //! | `std` | yes | Enables std-dependent helpers (`RawPayload`, `VecSdHeader`, `OfferedEndpoint`) |
 //! | `client` | no | Async tokio client; implies `std` + tokio + socket2 + futures |
 //! | `server` | no | Async tokio server; implies `std` + tokio + socket2 + futures |
-//! | `bare_metal` | no | Pure marker feature — enables no crate code. Reserved for future phases to gate `no_std` helper types. To exercise the bare-metal trait surface today, use the `examples/bare_metal` workspace member (`cargo run -p bare_metal`). **Does not make the crate fully bare-metal-complete**: the `client`/`server` feature paths still rely on `tokio::spawn` to drive per-socket I/O loops. A fully tokio-free build additionally requires a user-provided `Spawner` impl, planned as a trait alongside `TransportSocket` and `Timer`. |
+//! | `bare_metal` | no | Pure marker — does not enable any crate code. See `examples/bare_metal/` (the trait-surface canary) for the full bare-metal-readiness story. |
 //!
 //! The default feature set is `["std"]`, which links `std` and enables
 //! the `RawPayload` / `VecSdHeader` helpers. For a minimal build with
@@ -37,7 +37,10 @@
 //! `e2e` modules only — pass `--no-default-features`. The
 //! trait-surface canary at `examples/bare_metal/` depends on the crate
 //! with `default-features = false, features = ["bare_metal"]` and
-//! proves the no-default-features build compiles.
+//! validates that configuration when the `bare_metal` workspace member
+//! is built in isolation (`cargo build -p bare_metal` or
+//! `cargo run -p bare_metal`), rather than as part of a workspace-wide
+//! build where features may be unified across members.
 //!
 //! ## Examples
 //!
@@ -150,7 +153,10 @@ pub mod tokio_transport;
 mod traits;
 /// Executor-agnostic UDP transport abstraction used by the client and
 /// server modules. `no_std`-compatible; a default `std + tokio` backend
-/// ships in [`tokio_transport`] under the `client` / `server` features.
+/// ships in `tokio_transport` (available under the `client` / `server`
+/// features) — the link is rendered as a code literal because the target
+/// module is feature-gated and would break default-feature rustdoc
+/// builds.
 pub mod transport;
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
@@ -164,8 +170,8 @@ pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
 pub use server::Server;
 #[cfg(any(feature = "client", feature = "server"))]
-pub use tokio_transport::{TokioSocket, TokioTimer, TokioTransport};
+pub use tokio_transport::{TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
 pub use transport::{
-    IoErrorKind, ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory,
+    IoErrorKind, ReceivedDatagram, SocketOptions, Spawner, Timer, TransportError, TransportFactory,
     TransportSocket,
 };

@@ -7,7 +7,7 @@ use thiserror::Error;
 /// This enum is **not** marked `#[non_exhaustive]`, so downstream crates
 /// may currently match it exhaustively. That convenience comes with a
 /// real cost: **any new variant added here is a breaking change** and
-/// must be flagged in the changelog and reflected in the next SemVer
+/// must be flagged in the changelog and reflected in the next `SemVer`
 /// bump (pre-1.0, a minor bump is sufficient, but it still requires a
 /// release-notes entry). The same is true of renaming or restructuring
 /// existing variants.
@@ -46,6 +46,9 @@ pub enum Error {
     /// - `"unicast_sockets"` → `UNICAST_SOCKETS_CAP`
     /// - `"udp_buffer"` → `crate::UDP_BUFFER_SIZE`
     /// - `"pending_responses"` → `PENDING_RESPONSES_CAP`
+    /// - `"request_queue"` → `REQUEST_QUEUE_CAP` (returned when the
+    ///   client's internal control-message queue is saturated, surfacing
+    ///   on every public `Client` method that enqueues a control)
     #[error("internal capacity exceeded: {0}")]
     Capacity(&'static str),
     /// An error surfaced by the pluggable transport backend (see

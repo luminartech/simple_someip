@@ -1,13 +1,15 @@
 //! Client-side UDP socket management.
 //!
 //! Each bound socket is backed by a `TokioSocket` (concrete, phase-5
-//! compromise) with its I/O loop running on a `tokio::spawn`'d task.
-//! That spawn is the last `tokio::spawn` call inside the library
-//! critical path — every other spawn was hoisted out to the caller in
-//! phase 6 / 7. This one can't be hoisted until a `Spawner` trait is
-//! introduced (planned for phase 9).
+//! compromise — see the `bind_discovery_seeded_with_transport`
+//! docstring for the RTN-gap analysis) with its I/O loop running on a
+//! caller-supplied [`crate::transport::Spawner`]. Phase 9 introduced
+//! the `Spawner` trait specifically to make this submission point
+//! pluggable; on `std + tokio` consumers pass
+//! [`crate::tokio_transport::TokioSpawner`] and the behavior matches
+//! the previous `tokio::spawn` path exactly.
 //!
-//! # Why the `tokio::spawn` in `bind_*` is still there
+//! # Why `Inner` can't drive per-socket futures itself
 //!
 //! Briefly experimented with having `Inner` drive per-socket futures
 //! via `FuturesUnordered` (phase 8 attempt, reverted). That deadlocks:
@@ -15,23 +17,44 @@
 //! which internally awaits an mpsc→oneshot round-trip that requires
 //! the socket loop to make progress. But `Inner::run_future` is
 //! parked inside the handler, so nothing polls the socket loop.
-//! Concurrency between the two is mandatory; on tokio we get it via
-//! `tokio::spawn` giving each socket its own task.
+//! Concurrency between the two is mandatory and cannot come from the
+//! same task — hence the `Spawner` hook.
 //!
-//! The fix is either (a) a `Spawner` trait that `Inner::bind_*` uses
-//! instead of calling `tokio::spawn` directly (small, contradicts the
-//! phase-4 "no `ExecutorAdapter`" decision but warranted given concrete
-//! evidence), or (b) a non-await `SocketManager::send` that defers
-//! completion to a later `select!` iteration (invasive). Phase 9
-//! picks (a).
+//! # What phase 9's `Spawner` does NOT remove from the critical path
+//!
+//! `Spawner` abstracts task submission, not runtime primitives. The
+//! socket loop still `.await`s on runtime-coupled types every
+//! iteration. `no_alloc` bare-metal consumers are still blocked by:
+//!
+//! 1. **`tokio::sync::mpsc` channels** (per-socket: discovery uses
+//!    16/16, unicast uses 4/4): heap-allocated + tokio-`Waker`-
+//!    specific. A `no_alloc` replacement needs a bounded inline-backed
+//!    channel with executor-agnostic waker registration (e.g.
+//!    `heapless::mpmc` + a hand-rolled `WakerRegistration`, or
+//!    `embassy-sync::Channel`).
+//! 2. **`tokio::sync::oneshot` for send-acks** (see `SendMessage`
+//!    below): same problem at smaller scale; ownership restructure
+//!    is harder than the mpsc swap.
+//! 3. **`Arc<Mutex<E2ERegistry>>`** shared between `Inner` and every
+//!    socket loop: requires `alloc` + `std::sync`. Collapses to
+//!    `&RefCell<E2ERegistry>` on a single-task executor, but the
+//!    type change cascades through every call site.
+//! 4. **`F::Socket = TokioSocket`** bound on `bind_*` (this module):
+//!    RTN-gap, see `bind_discovery_seeded_with_transport` docstring.
+//!
+//! Until all four are addressed, enabling `feature = "client"` pulls
+//! in `std + tokio + socket2`. The `bare_metal` feature flag is a
+//! marker today; it does not make this module `no_alloc`. For `no_alloc`
+//! SOME/IP usage today, consume `protocol`, `e2e`, and the `transport`
+//! trait layer directly — the `bare_metal` example workspace member
+//! demonstrates that surface.
 
 use crate::{
     UDP_BUFFER_SIZE,
     e2e::{E2ECheckStatus, E2EKey, E2ERegistry},
     protocol::{Message, MessageView, sd},
-    tokio_transport::TokioTransport,
     traits::{PayloadWireFormat, WireFormat},
-    transport::{ReceivedDatagram, SocketOptions, TransportFactory, TransportSocket},
+    transport::{ReceivedDatagram, SocketOptions, Spawner, TransportFactory, TransportSocket},
 };
 
 use super::error::Error;
@@ -42,7 +65,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::sync::mpsc;
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 /// A received message together with the source address it came from.
 ///
@@ -115,9 +138,19 @@ where
     /// reboot signal (`reboot_flag=1`) to peers after
     /// `unbind_discovery` + `bind_discovery`.
     ///
-    /// Uses the default [`TokioTransport`] backend. For tests or alternate
-    /// bind logic (e.g. an interceptor factory around `TokioTransport`),
-    /// use [`Self::bind_discovery_seeded_with_transport`].
+    /// Uses the default `crate::tokio_transport::TokioTransport` and
+    /// `crate::tokio_transport::TokioSpawner` backends (rendered as
+    /// code literals because `tokio_transport` is only compiled with
+    /// the `client`/`server` features and an intra-doc link would
+    /// break default-feature rustdoc builds).
+    /// For tests or alternate bind logic (e.g. an interceptor factory
+    /// around `TokioTransport`), use
+    /// [`Self::bind_discovery_seeded_with_transport`].
+    ///
+    /// Currently `#[cfg(test)]`-gated: production callers reach the
+    /// socket through the `_with_transport` variant so the `Spawner`
+    /// trait can be exercised end-to-end.
+    #[cfg(test)]
     pub async fn bind_discovery_seeded(
         interface: Ipv4Addr,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
@@ -125,8 +158,10 @@ where
         session_has_wrapped: bool,
         multicast_loopback: bool,
     ) -> Result<Self, Error> {
+        use crate::tokio_transport::{TokioSpawner, TokioTransport};
         Self::bind_discovery_seeded_with_transport(
             &TokioTransport,
+            &TokioSpawner,
             interface,
             e2e_registry,
             session_id,
@@ -137,15 +172,37 @@ where
     }
 
     /// Variant of [`Self::bind_discovery_seeded`] that constructs the
-    /// underlying socket through a caller-supplied [`TransportFactory`].
+    /// underlying socket through a caller-supplied [`TransportFactory`]
+    /// and submits the socket's I/O loop through a caller-supplied
+    /// [`Spawner`].
+    ///
+    /// # Why `F::Socket` is still pinned to `TokioSocket`
+    ///
     /// The factory must still produce a
-    /// [`TokioSocket`](crate::tokio_transport::TokioSocket) because the
-    /// spawned I/O loop is currently tokio-specific; the bound will be
-    /// relaxed to any `TransportSocket` once the `tokio::spawn` that
-    /// drives `socket_loop_future` is hoisted out of `bind_discovery_*`
-    /// (tracked separately; phase 9+ spawner-trait work).
-    pub async fn bind_discovery_seeded_with_transport<F>(
+    /// [`TokioSocket`](crate::tokio_transport::TokioSocket). Generalizing
+    /// to any `TransportSocket` requires stable-Rust Return-Type Notation
+    /// (RFC 3654) to express `Send` bounds on the trait's RPITIT methods
+    /// at this call site. RTN is nightly-only as of this writing; the
+    /// alternatives (GATs on `TransportSocket`, or boxed-future
+    /// type-erasure) each carry costs bigger than waiting — see the
+    /// module docstring for the full analysis.
+    ///
+    /// # Why relaxing this bound alone does NOT unblock `no_alloc` callers
+    ///
+    /// Even with a custom `F::Socket`, this function internally
+    /// allocates two `tokio::sync::mpsc` channels (capacities 16 and 16)
+    /// and constructs `tokio::sync::oneshot` instances per send. Both
+    /// are heap-backed AND tokio-runtime-coupled (their `Waker`
+    /// plumbing only works inside a tokio reactor task). A `no_alloc`
+    /// bare-metal consumer cannot use this entry point today regardless
+    /// of the `F::Socket` bound. The recommended path for `no_alloc`
+    /// consumers is to bypass `SocketManager` / `Client` entirely and
+    /// build a small orchestrator directly on top of `protocol`, `e2e`,
+    /// and the `transport` traits — the `bare_metal` example workspace
+    /// member demonstrates the trait layer in isolation.
+    pub async fn bind_discovery_seeded_with_transport<F, S>(
         factory: &F,
+        spawner: &S,
         interface: Ipv4Addr,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
         session_id: u16,
@@ -154,6 +211,7 @@ where
     ) -> Result<Self, Error>
     where
         F: TransportFactory<Socket = crate::tokio_transport::TokioSocket>,
+        S: Spawner,
     {
         let (rx_tx, rx_rx) = mpsc::channel(16);
         let (tx_tx, tx_rx) = mpsc::channel(16);
@@ -180,7 +238,7 @@ where
         socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
 
         let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
-        tokio::spawn(fut);
+        spawner.spawn(fut);
         Ok(Self {
             receiver: rx_rx,
             sender: tx_tx,
@@ -190,21 +248,36 @@ where
         })
     }
 
+    /// Bind a unicast SOME/IP socket on `port` using the default
+    /// `crate::tokio_transport::TokioTransport` and
+    /// `crate::tokio_transport::TokioSpawner` backends (rendered as
+    /// code literals for the same rustdoc-feature-gating reason
+    /// described on [`Self::bind_discovery_seeded`]). See
+    /// [`Self::bind_with_transport`] for the generic variant.
+    ///
+    /// Currently `#[cfg(test)]`-gated: production callers reach the
+    /// socket through the `_with_transport` variant so the `Spawner`
+    /// trait can be exercised end-to-end.
+    #[cfg(test)]
     pub async fn bind(port: u16, e2e_registry: Arc<Mutex<E2ERegistry>>) -> Result<Self, Error> {
-        Self::bind_with_transport(&TokioTransport, port, e2e_registry).await
+        use crate::tokio_transport::{TokioSpawner, TokioTransport};
+        Self::bind_with_transport(&TokioTransport, &TokioSpawner, port, e2e_registry).await
     }
 
     /// Variant of [`Self::bind`] that constructs the underlying socket
-    /// through a caller-supplied [`TransportFactory`]. See
+    /// through a caller-supplied [`TransportFactory`] and submits the
+    /// socket's I/O loop through a caller-supplied [`Spawner`]. See
     /// [`Self::bind_discovery_seeded_with_transport`] for the factory
     /// bound rationale.
-    pub async fn bind_with_transport<F>(
+    pub async fn bind_with_transport<F, S>(
         factory: &F,
+        spawner: &S,
         port: u16,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
     ) -> Result<Self, Error>
     where
         F: TransportFactory<Socket = crate::tokio_transport::TokioSocket>,
+        S: Spawner,
     {
         let (rx_tx, rx_rx) = mpsc::channel(4);
         let (tx_tx, tx_rx) = mpsc::channel(4);
@@ -219,7 +292,7 @@ where
         let socket = factory.bind(bind_addr, &options).await?;
         let port = socket.local_addr()?.port();
         let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
-        tokio::spawn(fut);
+        spawner.spawn(fut);
         Ok(Self {
             receiver: rx_rx,
             sender: tx_tx,
@@ -234,14 +307,32 @@ where
         target_addr: SocketAddrV4,
         message: Message<MessageDefinitions>,
     ) -> Result<(), Error> {
+        // Pre-encode size check: fail fast with `Error::Capacity("udp_buffer")`
+        // for messages that exceed `UDP_BUFFER_SIZE`. Mirrors the analogous
+        // check in `server::EventPublisher` so callers see a uniform
+        // overload signal regardless of which path produced the oversize
+        // message. Without this, an oversize encode would surface as a
+        // protocol-level I/O error from inside the socket loop.
+        let required = message.required_size();
+        if required > UDP_BUFFER_SIZE {
+            warn!(
+                "outgoing message size {required} exceeds UDP_BUFFER_SIZE ({UDP_BUFFER_SIZE}); rejecting with Capacity(\"udp_buffer\")"
+            );
+            return Err(Error::Capacity("udp_buffer"));
+        }
         let (result_channel, message) = SendMessage::new(target_addr, message);
         self.sender.send(message).await.map_err(|e| {
             error!("Socket error: {e} when attempting to send message");
             Error::SocketClosedUnexpectedly
         })?;
-        result_channel
-            .await
-            .expect("Socket manager must always return result of send before dropping channel")?;
+        // The socket loop's response sender can be dropped without sending
+        // (executor cancellation, bare-metal `Spawner` that drops futures,
+        // or a panic in the loop). Surface that as a typed error rather
+        // than `.expect`-panicking the caller.
+        result_channel.await.map_err(|_| {
+            debug!("send result channel dropped (socket loop gone)");
+            Error::SocketClosedUnexpectedly
+        })??;
         if self.session_id == u16::MAX {
             self.session_id = 1;
             self.session_has_wrapped = true;
@@ -309,6 +400,15 @@ where
         mut tx_rx: mpsc::Receiver<SendMessage<MessageDefinitions>>,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
     ) {
+        // Maximum number of consecutive `recv_from` errors tolerated before
+        // the socket loop gives up. A single failure (transient I/O, peer
+        // RST, ICMP port-unreachable amplified into `ConnectionRefused`)
+        // is normal and should not tear down the socket. A persistent
+        // failure (e.g. `EBADF` after the kernel closed the fd, or a
+        // platform-level network-stack collapse) used to pin a CPU on a
+        // tight `error!` log loop with no exit; this counter caps that.
+        const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 16;
+        let mut consecutive_recv_errors: u32 = 0;
         let mut buf = [0u8; UDP_BUFFER_SIZE];
 
         loop {
@@ -433,6 +533,7 @@ where
                     source,
                     truncated,
                 })) => {
+                    consecutive_recv_errors = 0;
                     if truncated {
                         // A truncated datagram cannot be parsed reliably;
                         // the length field in the SOME/IP header will not
@@ -480,7 +581,23 @@ where
                     }
                 }
                 Outcome::Recv(Err(recv_err)) => {
-                    error!("Transport recv failed: {:?}", recv_err);
+                    // `tokio_transport::map_io_error` already logs the
+                    // underlying `std::io::Error` (debug for transient
+                    // kinds, warn for unusual ones) — keep this
+                    // call-site at debug to avoid duplicating the same
+                    // failure on the operator's screen.
+                    consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
+                    debug!(
+                        "socket recv_from error ({}/{}): {:?}",
+                        consecutive_recv_errors, MAX_CONSECUTIVE_RECV_ERRORS, recv_err,
+                    );
+                    if consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                        error!(
+                            "socket recv_from failed {} times consecutively; closing socket loop",
+                            consecutive_recv_errors,
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -491,6 +608,7 @@ where
 mod tests {
     use super::*;
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
+    use crate::tokio_transport::TokioSpawner;
     use std::format;
     use std::vec;
     // Tests build ad-hoc UDP peers via tokio directly; this is not part of
@@ -690,13 +808,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_id_wraps_to_one_and_clears_reboot_flag() {
+        use crate::protocol::sd::RebootFlag;
         let mut sm = bind_ephemeral_spawned().await;
         let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target =
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_socket.local_addr().unwrap().port());
         let msg = || Message::<TestPayload>::new_sd(1, &empty_sd_header());
 
-        use crate::protocol::sd::RebootFlag;
         // Set session_id to one before the wrap point
         sm.session_id = u16::MAX - 1;
         assert_eq!(
@@ -739,6 +857,15 @@ mod tests {
         use crate::e2e::{E2EProfile, Profile4Config};
         use crate::protocol::{Header, MessageId, MessageType, MessageTypeField, ReturnCode};
 
+        // Craft a message whose raw-encoded size fits UDP_BUFFER_SIZE (16-byte
+        // SOME/IP header + payload <= cap) but whose E2E-protected size
+        // does not — Profile 4 adds `PROFILE4_HEADER_SIZE = 12` bytes,
+        // so a payload of `UDP_BUFFER_SIZE - 16 - 4` exactly fits raw and
+        // overflows by 8 once protected. Derive both fixture sizes from
+        // `UDP_BUFFER_SIZE` so this stays correct if the constant moves.
+        const SOMEIP_HEADER_SIZE: usize = 16;
+        const PAYLOAD_LEN: usize = UDP_BUFFER_SIZE - SOMEIP_HEADER_SIZE - 4;
+
         // Register an E2E profile so the protect branch runs.
         let message_id = MessageId::new_from_service_and_method(0x1234, 0x5678);
         let key = E2EKey::from_message_id(message_id);
@@ -750,11 +877,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Craft a message whose raw-encoded size fits UDP_BUFFER_SIZE (16-byte
-        // header + 1480-byte payload = 1496 bytes) but whose E2E-protected
-        // size does not (payload grows by PROFILE4_HEADER_SIZE = 12, pushing
-        // the total to 1508 bytes, 8 over MTU).
-        let payload_bytes = [0u8; 1480];
+        let payload_bytes = [0u8; PAYLOAD_LEN];
         let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
         let header = Header::new(
             message_id,
@@ -816,9 +939,10 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
 
-        let sm = TestSocketManager::bind_with_transport(&factory, 0, test_registry())
-            .await
-            .expect("bind via custom factory");
+        let sm =
+            TestSocketManager::bind_with_transport(&factory, &TokioSpawner, 0, test_registry())
+                .await
+                .expect("bind via custom factory");
         assert_eq!(
             factory.calls.load(Ordering::SeqCst),
             1,
@@ -858,6 +982,7 @@ mod tests {
 
         let mut sm = SocketManager::<TestPayload>::bind_with_transport(
             &ForceReuseFactory,
+            &TokioSpawner,
             0,
             test_registry(),
         )
@@ -873,7 +998,7 @@ mod tests {
             .await
             .expect("send_to via custom-factory-built socket");
 
-        let mut buf = [0u8; 1500];
+        let mut buf = [0u8; UDP_BUFFER_SIZE];
         let (len, from) =
             tokio::time::timeout(std::time::Duration::from_secs(2), recv.recv_from(&mut buf))
                 .await
@@ -916,9 +1041,14 @@ mod tests {
             }
         }
 
-        let err = TestSocketManager::bind_with_transport(&AlwaysBusyFactory, 0, test_registry())
-            .await
-            .expect_err("factory returned Err, bind must surface it");
+        let err = TestSocketManager::bind_with_transport(
+            &AlwaysBusyFactory,
+            &TokioSpawner,
+            0,
+            test_registry(),
+        )
+        .await
+        .expect_err("factory returned Err, bind must surface it");
         match err {
             Error::Transport(TransportError::AddressInUse) => {}
             other => {

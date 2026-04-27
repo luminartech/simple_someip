@@ -38,7 +38,8 @@ pub use error::Error;
 
 use crate::Timer;
 use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry};
-use crate::tokio_transport::TokioTimer;
+use crate::tokio_transport::{TokioSpawner, TokioTimer};
+use crate::transport::Spawner;
 use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
 use inner::{ControlMessage, Inner};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -254,9 +255,61 @@ where
         ClientUpdates<MessageDefinitions>,
         impl core::future::Future<Output = ()> + Send + 'static,
     ) {
+        Self::new_with_spawner_and_loopback(interface, multicast_loopback, TokioSpawner)
+    }
+
+    /// Like [`Self::new_with_loopback`], but with a caller-provided
+    /// [`Spawner`]. Per-socket I/O loops are submitted through this
+    /// spawner instead of the default [`TokioSpawner`] / `tokio::spawn`.
+    ///
+    /// ```no_run
+    /// # use simple_someip::{Client, RawPayload, Spawner};
+    /// # use std::net::Ipv4Addr;
+    /// # async fn demo() {
+    /// struct MySpawner; // ...your executor's task-submission type.
+    /// # impl Spawner for MySpawner {
+    /// #   fn spawn(&self, _: impl core::future::Future<Output = ()> + Send + 'static) {}
+    /// # }
+    /// let (client, mut updates, run) =
+    ///     Client::<RawPayload>::new_with_spawner_and_loopback(
+    ///         Ipv4Addr::LOCALHOST,
+    ///         false,
+    ///         MySpawner,
+    ///     );
+    /// let _run_task = tokio::spawn(run);
+    /// # let _ = (client, updates);
+    /// # }
+    /// ```
+    ///
+    /// # Bounds
+    ///
+    /// `S: Spawner + Send + Sync + 'static` — the spawner is stored in
+    /// the run-loop future, which is `Send + 'static`, so the spawner
+    /// must match those bounds. `Sync` is required because `&self.spawner`
+    /// is held across `.await` points inside
+    /// `SocketManager::bind_with_transport` and
+    /// `bind_discovery_seeded_with_transport`, both of which execute on
+    /// the driven run-loop task (not on the user's call site).
+    #[must_use = "the returned run-loop future must be spawned (e.g. via the Spawner) for the client to make progress"]
+    pub fn new_with_spawner_and_loopback<S>(
+        interface: Ipv4Addr,
+        multicast_loopback: bool,
+        spawner: S,
+    ) -> (
+        Self,
+        ClientUpdates<MessageDefinitions>,
+        impl core::future::Future<Output = ()> + Send + 'static,
+    )
+    where
+        S: Spawner + Send + Sync + 'static,
+    {
         let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
-        let (control_sender, update_receiver, run_future) =
-            Inner::build(interface, Arc::clone(&e2e_registry), multicast_loopback);
+        let (control_sender, update_receiver, run_future) = Inner::build(
+            interface,
+            Arc::clone(&e2e_registry),
+            multicast_loopback,
+            spawner,
+        );
 
         let client = Self {
             interface: Arc::new(RwLock::new(interface)),
@@ -374,25 +427,30 @@ where
     /// Like [`subscribe`](Self::subscribe) but does not wait for the
     /// subscription result.
     ///
+    /// Returns `()`: if the run-loop has exited the request is silently
+    /// lost — there is no error surface and no panic. Use
+    /// [`subscribe`](Self::subscribe) when you need to detect dispatch
+    /// failures.
+    ///
     /// This still awaits enqueueing the control message on the internal
-    /// channel, so it may block if that bounded channel is full. Useful for
-    /// periodic renewals where waiting for subscription processing is
+    /// channel, so it may block if that bounded channel is full. Useful
+    /// for periodic renewals where waiting for subscription processing is
     /// unnecessary.
     ///
     /// The response oneshot is simply dropped at the end of this call.
     /// The inner loop's send-to-dropped-receiver path is not logged at
-    /// `warn!`; at most it is logged at `debug!`, so fire-and-forget usage
-    /// remains low-noise.
+    /// `warn!`; at most it is logged at `debug!`, so fire-and-forget
+    /// usage remains low-noise.
     ///
     /// # Silent drop on a closed channel
     ///
-    /// Unlike the other `Client` methods (which `.unwrap()` the `send`
-    /// result and therefore panic if the run-loop has exited and closed
-    /// the receiver), `subscribe_no_wait` deliberately discards the
-    /// `send` result. If the client run-loop has exited, the request is
-    /// silently dropped — there is no error surface and no panic. This
-    /// matches the fire-and-forget contract: callers that need to know
-    /// whether the subscription was actually dispatched should use
+    /// Unlike the other `Client` methods (which return
+    /// `Err(Error::Shutdown)` if the run-loop has exited and closed the
+    /// receiver), `subscribe_no_wait` deliberately discards the `send`
+    /// result. If the run-loop has exited, the request is silently
+    /// dropped — no error surface, no panic. This matches the
+    /// fire-and-forget contract: callers that need to know whether the
+    /// subscription was actually dispatched should use
     /// [`subscribe`](Self::subscribe) instead.
     pub async fn subscribe_no_wait(
         &self,
@@ -438,22 +496,39 @@ where
     /// Headers passed to [`sd_announcements_loop`](Self::sd_announcements_loop)
     /// are refreshed automatically per-tick and do not need this call.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the internal control channel is closed.
-    pub async fn reboot_flag(&self) -> protocol::sd::RebootFlag {
+    /// Returns [`Error::Shutdown`] if the client's run-loop future has
+    /// exited before this call (dropped, cancelled, or otherwise gone)
+    /// — the `Client` handle has outlived its driver and further
+    /// control-channel sends cannot make progress.
+    ///
+    /// Returns [`Error::Capacity`] (with tag `"request_queue"`) if the
+    /// run loop's bounded control queue is saturated under load.
+    pub async fn reboot_flag(&self) -> Result<protocol::sd::RebootFlag, Error> {
         let (response, message) = ControlMessage::query_reboot_flag();
-        self.control_sender.send(message).await.unwrap();
-        response.await.unwrap()
+        self.control_sender
+            .send(message)
+            .await
+            .map_err(|_| Error::Shutdown)?;
+        response.await.map_err(|_| Error::Shutdown)?
     }
 
     /// Test-only: force the inner loop's `sd_session_has_wrapped` so tests
     /// can observe post-wrap behavior without sending 65k SD messages.
+    /// Mirrors the public `Client` API: returns `Err(Error::Shutdown)` on
+    /// closed channels rather than panicking.
     #[cfg(test)]
-    pub(crate) async fn force_sd_session_wrapped_for_test(&self, wrapped: bool) {
+    pub(crate) async fn force_sd_session_wrapped_for_test(
+        &self,
+        wrapped: bool,
+    ) -> Result<(), Error> {
         let (response, message) = ControlMessage::force_sd_session_wrapped_for_test(wrapped);
-        self.control_sender.send(message).await.unwrap();
-        response.await.unwrap();
+        self.control_sender
+            .send(message)
+            .await
+            .map_err(|_| Error::Shutdown)?;
+        response.await.map_err(|_| Error::Shutdown)?
     }
 
     /// Sends an SD message to a specific target address.
@@ -565,9 +640,20 @@ where
                 // so long-running announcers transition from RecentlyRebooted
                 // to Continuous once the session counter wraps. The weak
                 // sender is upgraded, used to enqueue a single control
-                // message, then dropped before we await — keeping the strong
-                // sender alive across awaits would defeat the weak-sender
-                // shutdown path.
+                // message, then dropped before we await — keeping the
+                // strong sender alive across awaits would defeat the
+                // weak-sender shutdown path.
+                //
+                // Note: this iteration upgrades the weak sender twice (once
+                // for `query_reboot_flag`, once for `send_sd`). The user
+                // could call `shut_down` between them, in which case the
+                // first upgrade succeeds, the reboot flag arrives, then
+                // the second upgrade fails — emitting "Client shut down"
+                // partway through what was logically a single tick. The
+                // alternative (holding the strong sender across the
+                // `flag_rx.await`) would defeat the weak-sender shutdown
+                // path. The mid-tick log is harmless and not worth a
+                // refactor.
                 let (flag_rx, flag_msg) = ControlMessage::query_reboot_flag();
                 let Some(sender) = weak_sender.upgrade() else {
                     tracing::info!("Client shut down, stopping SD announcements");
@@ -579,9 +665,23 @@ where
                     tracing::warn!("SD announcement channel closed, stopping");
                     break;
                 }
-                let Ok(reboot) = flag_rx.await else {
-                    tracing::warn!("SD announcement reboot-flag query dropped, stopping");
-                    break;
+                let reboot = match flag_rx.await {
+                    Ok(Ok(flag)) => flag,
+                    Ok(Err(e)) => {
+                        // Run loop returned a typed error (e.g.
+                        // `Error::Capacity("request_queue")`). Skip this
+                        // tick and try again next interval — capacity
+                        // pressure is transient.
+                        tracing::warn!(
+                            "SD announcement reboot-flag query returned error ({:?}), skipping tick",
+                            e
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        tracing::warn!("SD announcement reboot-flag query dropped, stopping");
+                        break;
+                    }
                 };
                 let mut header = sd_header.clone();
                 MessageDefinitions::set_reboot_flag(&mut header, reboot);
@@ -800,7 +900,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_new_and_interface() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         assert_eq!(client.interface(), Ipv4Addr::LOCALHOST);
         client.shut_down();
     }
@@ -808,7 +908,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_debug() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         let debug_str = format!("{client:?}");
         assert!(debug_str.contains("Client"));
         assert!(debug_str.contains("127.0.0.1"));
@@ -855,7 +955,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_unknown_service_returns_error() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         let result = client.subscribe(0xFFFF, 0xFFFF, 1, 3, 0x01, 0).await;
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),
@@ -867,7 +967,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_no_wait_unknown_service_does_not_panic() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         // subscribe_no_wait is fire-and-forget — it should not panic even
         // when the service is unknown (the inner loop sends ServiceNotFound
         // on the dropped response channel, which is harmless).
@@ -889,7 +989,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_no_wait_fire_and_forget_stress() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
 
         // Unknown service so the inner loop's ServiceNotFound branch
         // fires on every iteration — that's the path where the
@@ -920,7 +1020,7 @@ mod tests {
     #[tokio::test]
     async fn test_bind_discovery_and_unbind() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         client.bind_discovery().await.unwrap();
         client.unbind_discovery().await.unwrap();
         client.shut_down();
@@ -929,7 +1029,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_interface() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         let new_addr = Ipv4Addr::LOCALHOST;
         client.set_interface(new_addr).await.unwrap();
         assert_eq!(client.interface(), new_addr);
@@ -939,7 +1039,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_endpoint_succeeds() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 30000);
         client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
         client.shut_down();
@@ -948,7 +1048,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_to_service_unknown_returns_error() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         let result = client.send_to_service(0xFFFF, 0xFFFF, msg).await;
         assert!(
@@ -961,7 +1061,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_endpoint_succeeds() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 30000);
         client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
         client.remove_endpoint(0x1234, 0x0001).await.unwrap();
@@ -1003,7 +1103,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_sd_message() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         // Bind discovery first so the send path uses the existing socket
         client.bind_discovery().await.unwrap();
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30490);
@@ -1015,7 +1115,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_to_service_success_returns_pending_response() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30000);
         client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
@@ -1028,7 +1128,7 @@ mod tests {
     #[tokio::test]
     async fn test_recv_returns_none_after_shutdown() {
         let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         client.shut_down();
         // Now the inner loop should exit; recv() should return None
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv()).await;
@@ -1039,7 +1139,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_and_unregister_e2e() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         let key = E2EKey {
             service_id: 0x1234,
             method_or_event_id: 0x0001,
@@ -1053,7 +1153,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_is_clone() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         let client2 = client.clone();
         assert_eq!(client.interface(), client2.interface());
         client.shut_down();
@@ -1062,7 +1162,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_updates_debug() {
         let (_client, updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         let debug_str = format!("{updates:?}");
         assert!(debug_str.contains("ClientUpdates"));
     }
@@ -1070,7 +1170,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_unknown_service_returns_error() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         let result = client.request(0xFFFF, 0xFFFF, msg).await;
         assert!(
@@ -1083,7 +1183,7 @@ mod tests {
     #[tokio::test]
     async fn test_sd_announcements_loop_does_not_panic() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         client.bind_discovery().await.unwrap();
 
         let sd_header = empty_sd_header();
@@ -1108,7 +1208,7 @@ mod tests {
     #[tokio::test]
     async fn test_sd_announcements_loop_without_discovery_bound() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         // Don't bind discovery — the task should handle the error gracefully.
         let sd_header = empty_sd_header();
         let handle = tokio::spawn(
@@ -1131,7 +1231,7 @@ mod tests {
     #[tokio::test]
     async fn test_sd_announcements_loop_abort_stops_task() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _ = tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         client.bind_discovery().await.unwrap();
 
         let sd_header = empty_sd_header();
@@ -1160,7 +1260,7 @@ mod tests {
         // than using the stale caller-supplied value.
         let (client, mut updates, run_fut) =
             TestClient::new_with_loopback(Ipv4Addr::LOCALHOST, true);
-        tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         client.bind_discovery().await.unwrap();
 
         // Caller bakes in Continuous — the announcer must override this.
@@ -1173,8 +1273,10 @@ mod tests {
         );
 
         // Loopback delivers our own SD announcements back as DiscoveryUpdated.
-        // Drain updates until we see one (tokio::time::interval skips the
-        // first immediate tick, so the first real send lands at ~100-200ms).
+        // Drain updates until we see one. `sd_announcements_loop` uses
+        // `Timer::sleep` repeatedly (not `tokio::time::interval`), so the
+        // first send lands ~one interval after the loop is polled, i.e.
+        // ~100ms here.
         let received = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 match updates.recv().await {
@@ -1211,20 +1313,23 @@ mod tests {
         // `reboot_flag()` call after unbind — falsely advertising a reboot
         // to peers on the next manually-built SD header.
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
 
         // No discovery bound. Fallback should reflect persisted state.
         // Default (unwrapped) → RecentlyRebooted.
         assert_eq!(
-            client.reboot_flag().await,
+            client.reboot_flag().await.expect("reboot_flag"),
             crate::protocol::sd::RebootFlag::RecentlyRebooted
         );
 
         // Simulate post-wrap state (normally set by `unbind_discovery`
         // reading the departing socket's `reboot_flag`).
-        client.force_sd_session_wrapped_for_test(true).await;
+        client
+            .force_sd_session_wrapped_for_test(true)
+            .await
+            .expect("force_sd_session_wrapped_for_test");
         assert_eq!(
-            client.reboot_flag().await,
+            client.reboot_flag().await.expect("reboot_flag"),
             crate::protocol::sd::RebootFlag::Continuous,
             "reboot_flag must report Continuous from persisted state while \
              discovery is unbound"
@@ -1234,7 +1339,7 @@ mod tests {
         // `bind_discovery_seeded`, so the live flag agrees.
         client.bind_discovery().await.unwrap();
         assert_eq!(
-            client.reboot_flag().await,
+            client.reboot_flag().await.expect("reboot_flag"),
             crate::protocol::sd::RebootFlag::Continuous,
             "seeded socket must report Continuous after wrapped rebind"
         );
@@ -1245,25 +1350,44 @@ mod tests {
     #[tokio::test]
     async fn test_reboot_flag_defaults_to_recently_rebooted() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         // Discovery not bound — should fall back to RecentlyRebooted.
         assert_eq!(
-            client.reboot_flag().await,
+            client.reboot_flag().await.expect("reboot_flag"),
             crate::protocol::sd::RebootFlag::RecentlyRebooted
         );
         client.bind_discovery().await.unwrap();
         // Freshly bound socket also reports RecentlyRebooted (session has not wrapped).
         assert_eq!(
-            client.reboot_flag().await,
+            client.reboot_flag().await.expect("reboot_flag"),
             crate::protocol::sd::RebootFlag::RecentlyRebooted
         );
         client.shut_down();
     }
 
     #[tokio::test]
+    async fn reboot_flag_returns_shutdown_error_when_run_loop_dropped() {
+        // Regression for the migration of `reboot_flag` from `.unwrap()`
+        // panics to `Result<RebootFlag, Error>` (matches every other
+        // public Client method's Shutdown semantics). Dropping the run
+        // future closes the control channel; calling `reboot_flag` must
+        // surface `Err(Error::Shutdown)` rather than panicking.
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        drop(run_fut);
+        let err = client
+            .reboot_flag()
+            .await
+            .expect_err("reboot_flag must return an error after run loop is dropped");
+        assert!(
+            matches!(err, Error::Shutdown),
+            "expected Shutdown, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_sd_announcements_loop_stops_on_shutdown() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         client.bind_discovery().await.unwrap();
 
         let sd_header = empty_sd_header();
@@ -1388,7 +1512,7 @@ mod tests {
         };
 
         let (client, _updates, run_fut) = TestClient::new_with_loopback(iface, true);
-        tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         client.bind_discovery().await.unwrap();
 
         let interval = std::time::Duration::from_millis(100);
@@ -1457,7 +1581,7 @@ mod tests {
         };
 
         let (client, _updates, run_fut) = TestClient::new_with_loopback(iface, true);
-        tokio::spawn(run_fut);
+        let _run_handle = tokio::spawn(run_fut);
         client.bind_discovery().await.unwrap();
 
         let interval = std::time::Duration::from_millis(100);
@@ -1499,5 +1623,60 @@ mod tests {
         let (_client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let handle = std::thread::spawn(move || drop(run_fut));
         handle.join().unwrap();
+    }
+
+    /// Proves `Client::new_with_spawner_and_loopback` actually routes
+    /// per-socket spawns through the user-provided `Spawner`. The
+    /// `CountingSpawner` below increments a shared counter on every
+    /// `spawn` call AND delegates to `tokio::spawn` so the spawned
+    /// futures still run. Calling `bind_discovery` should cause
+    /// exactly one spawn (the SD socket's I/O loop); calling
+    /// `bind_discovery` again is a no-op (socket already bound) so
+    /// the count stays at 1.
+    #[tokio::test]
+    async fn client_new_with_spawner_routes_socket_spawns_through_it() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct CountingSpawner {
+            count: Arc<AtomicUsize>,
+        }
+
+        impl Spawner for CountingSpawner {
+            fn spawn(&self, future: impl core::future::Future<Output = ()> + Send + 'static) {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                let _run_handle = tokio::spawn(future);
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let spawner = CountingSpawner {
+            count: Arc::clone(&count),
+        };
+
+        let (client, _updates, run_fut) =
+            TestClient::new_with_spawner_and_loopback(Ipv4Addr::LOCALHOST, false, spawner);
+        let _run_handle = tokio::spawn(run_fut);
+
+        client
+            .bind_discovery()
+            .await
+            .expect("bind_discovery must succeed");
+        // Idempotent second call; must NOT spawn again.
+        client
+            .bind_discovery()
+            .await
+            .expect("second bind_discovery is idempotent");
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "expected exactly one spawn for the SD socket loop, \
+             got {}",
+            count.load(Ordering::SeqCst)
+        );
+
+        client.shut_down();
     }
 }

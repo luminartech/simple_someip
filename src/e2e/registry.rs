@@ -85,7 +85,7 @@ mod tests {
     fn register_and_check_profile4() {
         let mut reg = E2ERegistry::new();
         let key = make_key();
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         reg.register(key, E2EProfile::Profile4(config.clone()));
         assert!(reg.contains_key(&key));
 
