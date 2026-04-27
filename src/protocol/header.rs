@@ -321,6 +321,23 @@ impl<'a> HeaderView<'a> {
     }
 }
 
+impl WireFormat for Header {
+    fn required_size(&self) -> usize {
+        16
+    }
+
+    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
+        writer.write_u32_be(self.message_id.message_id())?;
+        writer.write_u32_be(self.length)?;
+        writer.write_u32_be(self.request_id)?;
+        writer.write_u8(self.protocol_version)?;
+        writer.write_u8(self.interface_version)?;
+        writer.write_u8(u8::from(self.message_type))?;
+        writer.write_u8(u8::from(self.return_code))?;
+        Ok(16)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,22 +606,5 @@ mod tests {
         assert_eq!(buf.len(), 16);
         let (view, _) = HeaderView::parse(&buf).unwrap();
         assert_eq!(view.to_owned(), h);
-    }
-}
-
-impl WireFormat for Header {
-    fn required_size(&self) -> usize {
-        16
-    }
-
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
-        writer.write_u32_be(self.message_id.message_id())?;
-        writer.write_u32_be(self.length)?;
-        writer.write_u32_be(self.request_id)?;
-        writer.write_u8(self.protocol_version)?;
-        writer.write_u8(self.interface_version)?;
-        writer.write_u8(u8::from(self.message_type))?;
-        writer.write_u8(u8::from(self.return_code))?;
-        Ok(16)
     }
 }

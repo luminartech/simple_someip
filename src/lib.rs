@@ -29,7 +29,7 @@
 //! | `std` | yes | Enables std-dependent helpers (`RawPayload`, `VecSdHeader`, `OfferedEndpoint`) |
 //! | `client` | no | Async tokio client; implies `std` + tokio + socket2 + futures |
 //! | `server` | no | Async tokio server; implies `std` + tokio + socket2 + futures |
-//! | `bare_metal` | no | Pure marker feature — enables no crate code. Reserved for future phases to gate no_std helper types. To exercise the bare-metal trait surface today, use the `examples/bare_metal` workspace member (`cargo run -p bare_metal`). **Does not make `client` / `server` bare-metal-usable.** The `Spawner` trait (phase 9) makes task submission pluggable, but the `client` / `server` feature paths still depend on: (1) `tokio::sync::mpsc` channels (heap + tokio-waker-coupled) for intra-module message passing, (2) `tokio::sync::oneshot` for send-acks, (3) `Arc<Mutex<E2ERegistry>>` for shared registry state (requires `alloc` + `std::sync`), and (4) an `F::Socket = TokioSocket` bound on `SocketManager::bind_*` that needs stable Rust Return-Type Notation to relax. Until all four are resolved, `feature = "client"` / `feature = "server"` remain `std`+tokio-only. `no_alloc` consumers today should build their own orchestrator on `protocol`, `e2e`, and the `transport` traits directly — those layers ARE fully `no_std` / `no_alloc`. |
+//! | `bare_metal` | no | Pure marker — does not enable any crate code. See `examples/bare_metal/` (the trait-surface canary) for the full bare-metal-readiness story. |
 //!
 //! The default feature set is `["std"]`, which links `std` and enables
 //! the `RawPayload` / `VecSdHeader` helpers. For a minimal build with
@@ -37,7 +37,10 @@
 //! `e2e` modules only — pass `--no-default-features`. The
 //! trait-surface canary at `examples/bare_metal/` depends on the crate
 //! with `default-features = false, features = ["bare_metal"]` and
-//! proves the no-default-features build compiles.
+//! validates that configuration when the `bare_metal` workspace member
+//! is built in isolation (`cargo build -p bare_metal` or
+//! `cargo run -p bare_metal`), rather than as part of a workspace-wide
+//! build where features may be unified across members.
 //!
 //! ## Examples
 //!
@@ -150,7 +153,10 @@ pub mod tokio_transport;
 mod traits;
 /// Executor-agnostic UDP transport abstraction used by the client and
 /// server modules. `no_std`-compatible; a default `std + tokio` backend
-/// ships in [`tokio_transport`] under the `client` / `server` features.
+/// ships in `tokio_transport` (available under the `client` / `server`
+/// features) — the link is rendered as a code literal because the target
+/// module is feature-gated and would break default-feature rustdoc
+/// builds.
 pub mod transport;
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};

@@ -127,7 +127,15 @@ impl EventPublisher {
                         message_length = 16 + protected_len;
                     }
                     Some(Err(e)) => {
-                        tracing::error!("E2E protect error: {:?}", e);
+                        // Surface protect failures as `Err(Error::E2e(_))`
+                        // rather than logging-and-falling-through, which
+                        // would silently send the UNPROTECTED payload
+                        // claiming an E2E-protected channel and break the
+                        // receiver's CRC/counter checks. Counter
+                        // exhaustion, key-lookup races, and similar
+                        // backend errors all funnel here.
+                        tracing::error!("E2E protect error: {:?}; dropping publish", e);
+                        return Err(Error::E2e(e));
                     }
                     None => unreachable!("contains_key was true"),
                 }
@@ -197,6 +205,22 @@ impl EventPublisher {
             return Ok(0);
         }
 
+        // Pre-build size check. Fail fast with `Error::Capacity` BEFORE
+        // calling `Header::new_event`, which `assert!`s on payloads
+        // larger than `u32::MAX as usize - 8`. The earlier
+        // `checked_add(header_len, payload.len())` guard below was dead
+        // for that reason; keeping it for defence-in-depth on platforms
+        // where `Header::SIZE + payload` could overflow `usize`. The
+        // `16` here is the SOME/IP header size in bytes.
+        if payload.len() > UDP_BUFFER_SIZE.saturating_sub(16) {
+            tracing::error!(
+                "raw event payload ({} bytes) + 16-byte header exceeds UDP_BUFFER_SIZE ({}); dropping publish",
+                payload.len(),
+                UDP_BUFFER_SIZE
+            );
+            return Err(Error::Capacity("udp_buffer"));
+        }
+
         // Build SOME/IP header
         let header = Header::new_event(
             service_id,
@@ -219,6 +243,10 @@ impl EventPublisher {
             );
             return Err(Error::Capacity("udp_buffer"));
         };
+        // Defence-in-depth: the pre-build guard above already rejects
+        // oversize payloads, but a future caller adding optional
+        // post-encode tail bytes (e.g. another protect profile) would
+        // need this branch. Cheap to keep.
         if total_len > UDP_BUFFER_SIZE {
             tracing::error!(
                 "raw event ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping publish",
@@ -408,9 +436,8 @@ mod tests {
 
         // Create a receiver socket to act as subscriber
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let recv_addr = match receiver.local_addr().unwrap() {
-            std::net::SocketAddr::V4(a) => a,
-            _ => panic!("expected v4"),
+        let std::net::SocketAddr::V4(recv_addr) = receiver.local_addr().unwrap() else {
+            panic!("expected v4 source address");
         };
 
         // Add subscriber
@@ -496,9 +523,8 @@ mod tests {
         // test stays correct if the constant is retuned. Mirrors the
         // client-side oversize fixture in
         // `send_raw_message_exceeding_udp_buffer_returns_capacity_error`.
-        const SOMEIP_HEADER_SIZE: usize = 16;
         let message_id = MessageId::new_from_service_and_method(0x1234, 0x5678);
-        let payload_len = UDP_BUFFER_SIZE - SOMEIP_HEADER_SIZE + 1;
+        let payload_len = UDP_BUFFER_SIZE - 16 + 1  /* SOME/IP header is 16 bytes */;
         let payload_bytes = vec![0u8; payload_len];
         let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
         let header = Header::new(
@@ -548,7 +574,8 @@ mod tests {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
         {
             let mut mgr = subscriptions.write().await;
-            mgr.subscribe(0x5B, 1, 0x01, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999)).unwrap();
+            mgr.subscribe(0x5B, 1, 0x01, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999))
+                .unwrap();
         }
 
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -559,8 +586,7 @@ mod tests {
         // protection to push the encoded message over the limit and
         // exercise the post-protect guard — regardless of how
         // `UDP_BUFFER_SIZE` is retuned.
-        const SOMEIP_HEADER_SIZE: usize = 16;
-        let payload_len = UDP_BUFFER_SIZE - SOMEIP_HEADER_SIZE; // raw total == UDP_BUFFER_SIZE
+        let payload_len = UDP_BUFFER_SIZE - 16; // raw total == UDP_BUFFER_SIZE; SOME/IP header = 16
         let payload_bytes = vec![0u8; payload_len];
         let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
         let header = Header::new_event(
@@ -593,9 +619,8 @@ mod tests {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
 
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let recv_addr = match receiver.local_addr().unwrap() {
-            std::net::SocketAddr::V4(a) => a,
-            _ => panic!("expected v4"),
+        let std::net::SocketAddr::V4(recv_addr) = receiver.local_addr().unwrap() else {
+            panic!("expected v4 source address");
         };
 
         {
@@ -629,8 +654,8 @@ mod tests {
     #[tokio::test]
     async fn test_subscriber_count() {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
-        let addr1 = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 9001);
-        let addr2 = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 9002);
+        let addr1 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9001);
+        let addr2 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9002);
 
         {
             let mut mgr = subscriptions.write().await;
@@ -651,13 +676,8 @@ mod tests {
 
         {
             let mut mgr = subscriptions.write().await;
-            mgr.subscribe(
-                0x5B,
-                1,
-                0x01,
-                SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 9001),
-            )
-            .unwrap();
+            mgr.subscribe(0x5B, 1, 0x01, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9001))
+                .unwrap();
         }
 
         assert!(publisher.has_subscribers(0x5B, 1, 0x01).await);
@@ -679,7 +699,10 @@ mod tests {
         let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
 
         assert!(!publisher.has_subscribers(0x5B, 1, 0x01).await);
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
+        publisher
+            .register_subscriber(0x5B, 1, 0x01, ADDR_A)
+            .await
+            .unwrap();
         assert!(publisher.has_subscribers(0x5B, 1, 0x01).await);
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
     }
@@ -691,9 +714,18 @@ mod tests {
 
         // Simulate TTL refreshes — the same (tuple, addr) called repeatedly
         // must not grow the subscriber list.
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
+        publisher
+            .register_subscriber(0x5B, 1, 0x01, ADDR_A)
+            .await
+            .unwrap();
+        publisher
+            .register_subscriber(0x5B, 1, 0x01, ADDR_A)
+            .await
+            .unwrap();
+        publisher
+            .register_subscriber(0x5B, 1, 0x01, ADDR_A)
+            .await
+            .unwrap();
 
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
     }
@@ -703,8 +735,14 @@ mod tests {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
         let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
 
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
-        publisher.register_subscriber(0x5B, 1, 0x02, ADDR_A).await.unwrap();
+        publisher
+            .register_subscriber(0x5B, 1, 0x01, ADDR_A)
+            .await
+            .unwrap();
+        publisher
+            .register_subscriber(0x5B, 1, 0x02, ADDR_A)
+            .await
+            .unwrap();
 
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x02).await, 1);
@@ -717,7 +755,10 @@ mod tests {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
         let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
 
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
+        publisher
+            .register_subscriber(0x5B, 1, 0x01, ADDR_A)
+            .await
+            .unwrap();
         assert!(publisher.has_subscribers(0x5B, 1, 0x01).await);
 
         publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_A).await;
@@ -730,9 +771,18 @@ mod tests {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
         let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
 
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_B).await.unwrap();
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_C).await.unwrap();
+        publisher
+            .register_subscriber(0x5B, 1, 0x01, ADDR_A)
+            .await
+            .unwrap();
+        publisher
+            .register_subscriber(0x5B, 1, 0x01, ADDR_B)
+            .await
+            .unwrap();
+        publisher
+            .register_subscriber(0x5B, 1, 0x01, ADDR_C)
+            .await
+            .unwrap();
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 3);
 
         publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_B).await;
@@ -757,7 +807,10 @@ mod tests {
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 0);
 
         // Register one subscriber, then remove a different address.
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
+        publisher
+            .register_subscriber(0x5B, 1, 0x01, ADDR_A)
+            .await
+            .unwrap();
         publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_B).await;
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
 
@@ -771,8 +824,14 @@ mod tests {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
         let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
 
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_B).await.unwrap();
+        publisher
+            .register_subscriber(0x5B, 1, 0x01, ADDR_A)
+            .await
+            .unwrap();
+        publisher
+            .register_subscriber(0x5B, 1, 0x01, ADDR_B)
+            .await
+            .unwrap();
         assert!(publisher.has_subscribers(0x5B, 1, 0x01).await);
 
         publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_A).await;
@@ -789,9 +848,15 @@ mod tests {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
         let (publisher, _) = make_publisher(Arc::clone(&subscriptions)).await;
 
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
+        publisher
+            .register_subscriber(0x5B, 1, 0x01, ADDR_A)
+            .await
+            .unwrap();
         publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_A).await;
-        publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A).await.unwrap();
+        publisher
+            .register_subscriber(0x5B, 1, 0x01, ADDR_A)
+            .await
+            .unwrap();
 
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
     }

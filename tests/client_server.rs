@@ -1,4 +1,30 @@
 //! Integration tests exercising the Client and Server together on localhost.
+//!
+//! # Parallel execution caveat
+//!
+//! These tests share `sd::MULTICAST_PORT` (30490) and bind it via
+//! `SO_REUSEPORT`. Linux's reuseport hashing then load-balances incoming
+//! Subscribe / SD multicast traffic across whichever sockets are
+//! currently bound, which means one test's Subscribe message can be
+//! delivered to a *different* test's server. Each test verifies its own
+//! `EventPublisher::has_subscribers` (per-server `SubscriptionManager`
+//! state, not a shared one), so the cross-routing produces flaky
+//! failures when the suite runs with cargo's default parallelism.
+//!
+//! Until we can give each test its own SD port (which would require
+//! widening the protocol layer's `MULTICAST_PORT` constant to a runtime
+//! config) or its own network namespace, **run this binary with
+//! `--test-threads=1`** to serialise the SD-port contention:
+//!
+//! ```text
+//! cargo test --test client_server -- --test-threads=1
+//! ```
+//!
+//! `cargo test --workspace` (parallel default) is expected to flake on
+//! ~half of the tests in this file. The unit-test suite under
+//! `cargo test --lib` does not have this issue and runs reliably in
+//! parallel. The fix is tracked alongside the phase 10+ bare-metal
+//! refactor (which will need to abstract the port anyway).
 
 use simple_someip::e2e::{E2ECheckStatus, E2EKey, E2EProfile, Profile4Config};
 use simple_someip::protocol::{Header, Message, MessageId, sd};
@@ -7,6 +33,16 @@ use simple_someip::{
     Client, ClientUpdate, ClientUpdates, PayloadWireFormat, RawPayload, Server, VecSdHeader,
 };
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::atomic::{AtomicU16, Ordering};
+
+/// Allocate a unique service ID per test invocation. Multiple
+/// integration tests in this file run in parallel (cargo's default) and
+/// would otherwise collide on the SD multicast group + a shared service
+/// ID, causing cross-test SubscribeAck bleed-through.
+fn next_service_id() -> u16 {
+    static NEXT: AtomicU16 = AtomicU16::new(0x5B);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 fn empty_sd_header() -> VecSdHeader {
     VecSdHeader {
@@ -84,19 +120,26 @@ async fn recv_unicast(updates: &mut ClientUpdates<RawPayload>) -> ClientUpdate<R
 #[tokio::test]
 async fn test_client_server_subscribe_and_receive_event() {
     // Start server on ephemeral port
-    let (mut server, server_port) = create_server(0x5B, 1).await;
+    let service_id = next_service_id();
+    let (mut server, server_port) = create_server(service_id, 1).await;
     let publisher = server.publisher();
     let server_handle = tokio::spawn(async move { server.run().await });
 
     // Create client and subscribe to the server's event group
     let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    let _ = tokio::spawn(run_fut);
+    let _run_handle = tokio::spawn(run_fut);
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
-    client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
-    client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
+    client
+        .add_endpoint(service_id, 1, server_addr, 0)
+        .await
+        .unwrap();
+    client
+        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .await
+        .unwrap();
 
     assert!(
-        wait_for_subscribers(&publisher, 0x5B, 1, 0x01).await,
+        wait_for_subscribers(&publisher, service_id, 1, 0x01).await,
         "server should have registered the subscriber"
     );
 
@@ -106,7 +149,7 @@ async fn test_client_server_subscribe_and_receive_event() {
     // Publish an event from the server to the client's unicast port
     let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
     let sent = publisher
-        .publish_event(0x5B, 1, 0x01, &event_msg)
+        .publish_event(service_id, 1, 0x01, &event_msg)
         .await
         .expect("publish_event failed");
     assert_eq!(sent, 1);
@@ -123,18 +166,19 @@ async fn test_client_server_subscribe_and_receive_event() {
 #[tokio::test]
 async fn test_client_send_sd_auto_binds_discovery() {
     // Create server so there is something to send to
-    let (mut server, server_port) = create_server(0x5B, 1).await;
+    let service_id = next_service_id();
+    let (mut server, server_port) = create_server(service_id, 1).await;
     let server_handle = tokio::spawn(async move { server.run().await });
 
     // Create client — NO bind_discovery
     let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    let _ = tokio::spawn(run_fut);
+    let _run_handle = tokio::spawn(run_fut);
 
     // send_sd_message should auto-bind discovery and succeed
     let sd_header = VecSdHeader {
         flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
         entries: vec![sd::Entry::SubscribeEventGroup(sd::EventGroupEntry::new(
-            0x5B, 1, 1, 3, 0x01,
+            service_id, 1, 1, 3, 0x01,
         ))],
         options: vec![sd::Options::IpV4Endpoint {
             ip: Ipv4Addr::LOCALHOST,
@@ -156,17 +200,24 @@ async fn test_client_send_sd_auto_binds_discovery() {
 /// while an SD message round-trip is in flight.
 #[tokio::test]
 async fn test_client_bind_unbind_lifecycle_with_server() {
-    let (mut server, server_port) = create_server(0x5B, 1).await;
+    let service_id = next_service_id();
+    let (mut server, server_port) = create_server(service_id, 1).await;
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    let _ = tokio::spawn(run_fut);
+    let _run_handle = tokio::spawn(run_fut);
 
     // Bind discovery, subscribe, then unbind and rebind
     client.bind_discovery().await.unwrap();
-    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
-    client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
-    client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
+    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    client
+        .add_endpoint(service_id, 1, server_addr, 0)
+        .await
+        .unwrap();
+    client
+        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .await
+        .unwrap();
 
     // Unbind and rebind discovery — covers unbind_discovery + re-bind path
     client.unbind_discovery().await.unwrap();
@@ -184,24 +235,31 @@ async fn test_client_bind_unbind_lifecycle_with_server() {
 /// registry, auto-binds unicast, sends the request, and receives a response.
 #[tokio::test]
 async fn test_add_endpoint_and_send_to_service() {
-    let (mut server, server_port) = create_server(0x5B, 1).await;
+    let service_id = next_service_id();
+    let (mut server, server_port) = create_server(service_id, 1).await;
     let publisher = server.publisher();
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    let _ = tokio::spawn(run_fut);
+    let _run_handle = tokio::spawn(run_fut);
     client.bind_discovery().await.unwrap();
 
     // Register the server's endpoint manually (simulating non-broadcasting service)
-    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
-    client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
+    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    client
+        .add_endpoint(service_id, 1, server_addr, 0)
+        .await
+        .unwrap();
 
     // Subscribe to server's event group (auto-binds unicast internally)
-    client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
+    client
+        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .await
+        .unwrap();
 
     // Wait for the server to process the subscription
     assert!(
-        wait_for_subscribers(&publisher, 0x5B, 1, 0x01).await,
+        wait_for_subscribers(&publisher, service_id, 1, 0x01).await,
         "server should have registered the subscriber"
     );
 
@@ -211,7 +269,7 @@ async fn test_add_endpoint_and_send_to_service() {
     // Publish an event from the server
     let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
     let sent = publisher
-        .publish_event(0x5B, 1, 0x01, &event_msg)
+        .publish_event(service_id, 1, 0x01, &event_msg)
         .await
         .expect("publish_event failed");
     assert_eq!(sent, 1);
@@ -220,9 +278,9 @@ async fn test_add_endpoint_and_send_to_service() {
     recv_unicast(&mut updates).await;
 
     // Remove the endpoint and verify send_to_service returns ServiceNotFound
-    client.remove_endpoint(0x5B, 1).await.unwrap();
+    client.remove_endpoint(service_id, 1).await.unwrap();
     let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
-    let result = client.send_to_service(0x5B, 1, msg).await;
+    let result = client.send_to_service(service_id, 1, msg).await;
     assert!(
         matches!(result, Err(simple_someip::client::Error::ServiceNotFound)),
         "expected ServiceNotFound after remove, got {result:?}"
@@ -238,20 +296,27 @@ async fn test_add_endpoint_and_send_to_service() {
 /// Exercises the Subscribe auto-bind discovery path in inner.rs.
 #[tokio::test]
 async fn test_subscribe_auto_binds_discovery() {
-    let (mut server, server_port) = create_server(0x5B, 1).await;
+    let service_id = next_service_id();
+    let (mut server, server_port) = create_server(service_id, 1).await;
     let publisher = server.publisher();
     let server_handle = tokio::spawn(async move { server.run().await });
 
     // Create client — do NOT bind discovery manually
     let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    let _ = tokio::spawn(run_fut);
+    let _run_handle = tokio::spawn(run_fut);
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
-    client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
+    client
+        .add_endpoint(service_id, 1, server_addr, 0)
+        .await
+        .unwrap();
     // Subscribe should auto-bind discovery internally
-    client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
+    client
+        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .await
+        .unwrap();
 
     assert!(
-        wait_for_subscribers(&publisher, 0x5B, 1, 0x01).await,
+        wait_for_subscribers(&publisher, service_id, 1, 0x01).await,
         "server should have registered the subscriber"
     );
 
@@ -261,7 +326,7 @@ async fn test_subscribe_auto_binds_discovery() {
     // Publish an event and verify the client can receive it
     let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
     let sent = publisher
-        .publish_event(0x5B, 1, 0x01, &event_msg)
+        .publish_event(service_id, 1, 0x01, &event_msg)
         .await
         .expect("publish_event failed");
     assert_eq!(sent, 1);
@@ -276,18 +341,25 @@ async fn test_subscribe_auto_binds_discovery() {
 /// Exercises the pending_responses HashMap matching path in inner.rs.
 #[tokio::test]
 async fn test_client_request_resolves_via_unicast_reply() {
-    let (mut server, server_port) = create_server(0x5B, 1).await;
+    let service_id = next_service_id();
+    let (mut server, server_port) = create_server(service_id, 1).await;
     let publisher = server.publisher();
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    let _ = tokio::spawn(run_fut);
+    let _run_handle = tokio::spawn(run_fut);
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
-    client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
-    client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
+    client
+        .add_endpoint(service_id, 1, server_addr, 0)
+        .await
+        .unwrap();
+    client
+        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .await
+        .unwrap();
 
     assert!(
-        wait_for_subscribers(&publisher, 0x5B, 1, 0x01).await,
+        wait_for_subscribers(&publisher, service_id, 1, 0x01).await,
         "server should have registered the subscriber"
     );
 
@@ -298,14 +370,14 @@ async fn test_client_request_resolves_via_unicast_reply() {
     // which has a matching request_id, resolving it.
     let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
     let pending = client
-        .send_to_service(0x5B, 1, msg)
+        .send_to_service(service_id, 1, msg)
         .await
         .expect("send_to_service failed");
 
     // Publish an event that the client unicast socket will receive
     let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
     publisher
-        .publish_event(0x5B, 1, 0x01, &event_msg)
+        .publish_event(service_id, 1, 0x01, &event_msg)
         .await
         .expect("publish_event failed");
 
@@ -329,12 +401,13 @@ async fn test_client_request_resolves_via_unicast_reply() {
 /// Exercises E2E protect in event_publisher.rs and E2E check in socket_manager.rs.
 #[tokio::test]
 async fn test_e2e_protect_on_publish_and_check_on_receive() {
-    let (mut server, server_port) = create_server(0x5B, 1).await;
+    let service_id = next_service_id();
+    let (mut server, server_port) = create_server(service_id, 1).await;
     let publisher = server.publisher();
 
     // Register E2E profile on server for the event message ID
     let key = E2EKey {
-        service_id: 0x5B,
+        service_id,
         method_or_event_id: 0x0001,
     };
     let profile = E2EProfile::Profile4(Profile4Config::new(0x12345678, 15));
@@ -343,17 +416,23 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    let _ = tokio::spawn(run_fut);
+    let _run_handle = tokio::spawn(run_fut);
 
     // Register matching E2E profile on client
     client.register_e2e(key, profile);
 
-    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
-    client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
-    client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
+    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    client
+        .add_endpoint(service_id, 1, server_addr, 0)
+        .await
+        .unwrap();
+    client
+        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .await
+        .unwrap();
 
     assert!(
-        wait_for_subscribers(&publisher, 0x5B, 1, 0x01).await,
+        wait_for_subscribers(&publisher, service_id, 1, 0x01).await,
         "server should have registered the subscriber"
     );
 
@@ -361,14 +440,14 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
     let _ = tokio::time::timeout(std::time::Duration::from_millis(250), updates.recv()).await;
 
     // Publish an event — server will E2E-protect it
-    // Construct a non-SD message with service_id=0x5B, method/event_id=0x0001
+    // Construct a non-SD message with service_id=service_id, method/event_id=0x0001
     let payload_bytes = [0xAA, 0xBB];
-    let msg_id = MessageId::new_from_service_and_method(0x5B, 0x0001);
+    let msg_id = MessageId::new_from_service_and_method(service_id, 0x0001);
     let raw_payload = RawPayload::from_payload_bytes(msg_id, &payload_bytes).unwrap();
-    let header = Header::new_event(0x5B, 0x0001, 0, 0x01, 0x01, payload_bytes.len());
+    let header = Header::new_event(service_id, 0x0001, 0, 0x01, 0x01, payload_bytes.len());
     let event_msg = Message::new(header, raw_payload);
     let sent = publisher
-        .publish_event(0x5B, 1, 0x01, &event_msg)
+        .publish_event(service_id, 1, 0x01, &event_msg)
         .await
         .expect("publish_event failed");
     assert_eq!(sent, 1);
@@ -397,7 +476,8 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
 /// Exercises multi-subscriber path in event_publisher.rs.
 #[tokio::test]
 async fn test_multiple_subscribers_receive_events() {
-    let (mut server, server_port) = create_server(0x5B, 1).await;
+    let service_id = next_service_id();
+    let (mut server, server_port) = create_server(service_id, 1).await;
     let publisher = server.publisher();
     let server_handle = tokio::spawn(async move { server.run().await });
 
@@ -406,24 +486,36 @@ async fn test_multiple_subscribers_receive_events() {
     // Client 1
     let (client1, mut updates1, run_fut1) = TestClient::new(Ipv4Addr::LOCALHOST);
     tokio::spawn(run_fut1);
-    client1.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
-    client1.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
+    client1
+        .add_endpoint(service_id, 1, server_addr, 0)
+        .await
+        .unwrap();
+    client1
+        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .await
+        .unwrap();
 
     // Client 2
     let (client2, mut updates2, run_fut2) = TestClient::new(Ipv4Addr::LOCALHOST);
     tokio::spawn(run_fut2);
-    client2.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
-    client2.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
+    client2
+        .add_endpoint(service_id, 1, server_addr, 0)
+        .await
+        .unwrap();
+    client2
+        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .await
+        .unwrap();
 
     // Wait for both subscribers
     for _ in 0..40 {
-        if publisher.subscriber_count(0x5B, 1, 0x01).await >= 2 {
+        if publisher.subscriber_count(service_id, 1, 0x01).await >= 2 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(
-        publisher.subscriber_count(0x5B, 1, 0x01).await >= 2,
+        publisher.subscriber_count(service_id, 1, 0x01).await >= 2,
         "expected at least 2 subscribers"
     );
 
@@ -434,7 +526,7 @@ async fn test_multiple_subscribers_receive_events() {
     // Publish event
     let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
     let sent = publisher
-        .publish_event(0x5B, 1, 0x01, &event_msg)
+        .publish_event(service_id, 1, 0x01, &event_msg)
         .await
         .expect("publish_event failed");
     assert!(sent >= 2, "expected sent >= 2, got {sent}");
@@ -452,7 +544,7 @@ async fn test_multiple_subscribers_receive_events() {
 #[tokio::test]
 async fn test_updates_drain_after_shutdown() {
     let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    let _ = tokio::spawn(run_fut);
+    let _run_handle = tokio::spawn(run_fut);
     client.shut_down();
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv())
@@ -464,17 +556,24 @@ async fn test_updates_drain_after_shutdown() {
 /// Verify that cloned client handles work independently.
 #[tokio::test]
 async fn test_cloned_client_works() {
-    let (mut server, server_port) = create_server(0x5B, 1).await;
+    let service_id = next_service_id();
+    let (mut server, server_port) = create_server(service_id, 1).await;
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    let _ = tokio::spawn(run_fut);
+    let _run_handle = tokio::spawn(run_fut);
     let client2 = client.clone();
 
     // Both clones can send commands
-    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
-    client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
-    client2.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
+    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    client
+        .add_endpoint(service_id, 1, server_addr, 0)
+        .await
+        .unwrap();
+    client2
+        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .await
+        .unwrap();
 
     client.shut_down();
     // client2 is also dropped
@@ -485,23 +584,27 @@ async fn test_cloned_client_works() {
 /// Exercises the port-reuse path in Subscribe handling.
 #[tokio::test]
 async fn test_subscribe_specific_port_reuse() {
-    let (mut server, server_port) = create_server(0x5B, 1).await;
+    let service_id = next_service_id();
+    let (mut server, server_port) = create_server(service_id, 1).await;
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    let _ = tokio::spawn(run_fut);
+    let _run_handle = tokio::spawn(run_fut);
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
-    client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
+    client
+        .add_endpoint(service_id, 1, server_addr, 0)
+        .await
+        .unwrap();
 
     // Use specific port
     let specific_port = 44444;
     client
-        .subscribe(0x5B, 1, 1, 3, 0x01, specific_port)
+        .subscribe(service_id, 1, 1, 3, 0x01, specific_port)
         .await
         .unwrap();
     // Second subscribe reuses the port
     client
-        .subscribe(0x5B, 1, 1, 3, 0x02, specific_port)
+        .subscribe(service_id, 1, 1, 3, 0x02, specific_port)
         .await
         .unwrap();
 

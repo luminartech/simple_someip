@@ -12,7 +12,7 @@
 //!     E2ECheckStatus,
 //! };
 //!
-//! let config = Profile4Config::new(0x12345678, 15);
+//! let config = Profile4Config::new(0x1234_5678, 15);
 //! let mut protect_state = Profile4State::new();
 //! let mut check_state = Profile4State::new();
 //!
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_profile4_roundtrip() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_profile4_sequence_detection() {
-        let config = Profile4Config::new(0x12345678, 5);
+        let config = Profile4Config::new(0x1234_5678, 5);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_profile4_some_lost_detection() {
-        let config = Profile4Config::new(0x12345678, 5);
+        let config = Profile4Config::new(0x1234_5678, 5);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_profile4_wrong_sequence_detection() {
-        let config = Profile4Config::new(0x12345678, 2);
+        let config = Profile4Config::new(0x1234_5678, 2);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn test_profile4_crc_error() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_profile4_bad_argument_short_message() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut check_state = Profile4State::new();
 
         // Message too short (less than 12-byte header)
