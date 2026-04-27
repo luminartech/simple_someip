@@ -15,7 +15,7 @@ mod subscription_manager;
 pub use error::Error;
 pub use event_publisher::EventPublisher;
 pub use service_info::{EventGroupInfo, ServiceInfo};
-pub use subscription_manager::{SubscribeError, SubscriptionManager};
+pub use subscription_manager::{SubscribeError, SubscriptionHandle, SubscriptionManager};
 
 use sd_state::SdStateManager;
 
@@ -23,6 +23,7 @@ use crate::Timer;
 use crate::e2e::{E2EKey, E2EProfile, E2ERegistry};
 use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
 use crate::tokio_transport::TokioTimer;
+use crate::transport::E2ERegistryHandle;
 use futures::{FutureExt, pin_mut, select};
 use std::{
     format,
@@ -69,20 +70,23 @@ impl ServerConfig {
 }
 
 /// SOME/IP Server that can offer services and publish events
-pub struct Server {
+pub struct Server<
+    R: E2ERegistryHandle = Arc<Mutex<E2ERegistry>>,
+    S: SubscriptionHandle = Arc<RwLock<SubscriptionManager>>,
+> {
     config: ServerConfig,
     /// Socket for receiving subscription requests
     unicast_socket: Arc<UdpSocket>,
     /// Socket for sending SD announcements
     sd_socket: Arc<UdpSocket>,
     /// Subscription manager
-    subscriptions: Arc<RwLock<SubscriptionManager>>,
+    subscriptions: S,
     /// Event publisher
-    publisher: Arc<EventPublisher>,
+    publisher: Arc<EventPublisher<R, S>>,
     /// SD session-ID counter and announcement emitter
     sd_state: Arc<SdStateManager>,
     /// Shared E2E registry for runtime E2E configuration
-    e2e_registry: Arc<Mutex<E2ERegistry>>,
+    e2e_registry: R,
     /// `true` if this server was constructed via [`Server::new_passive`].
     /// Passive servers have no real SD socket bound to port 30490; their
     /// SD handling is managed externally. Calling [`Self::announcement_loop`]
@@ -177,12 +181,13 @@ impl Server {
             );
         }
 
-        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
-        let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
+        let subscriptions: Arc<RwLock<SubscriptionManager>> =
+            Arc::new(RwLock::new(SubscriptionManager::new()));
+        let e2e_registry: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
         let publisher = Arc::new(EventPublisher::new(
-            Arc::clone(&subscriptions),
+            subscriptions.clone(),
             Arc::clone(&unicast_socket),
-            Arc::clone(&e2e_registry),
+            e2e_registry.clone(),
         ));
 
         Ok(Self {
@@ -246,12 +251,13 @@ impl Server {
             sd_socket.local_addr()
         );
 
-        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
-        let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
+        let subscriptions: Arc<RwLock<SubscriptionManager>> =
+            Arc::new(RwLock::new(SubscriptionManager::new()));
+        let e2e_registry: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
         let publisher = Arc::new(EventPublisher::new(
-            Arc::clone(&subscriptions),
+            subscriptions.clone(),
             Arc::clone(&unicast_socket),
-            Arc::clone(&e2e_registry),
+            e2e_registry.clone(),
         ));
 
         Ok(Self {
@@ -265,7 +271,9 @@ impl Server {
             is_passive: true,
         })
     }
+}
 
+impl<R: E2ERegistryHandle, S: SubscriptionHandle> Server<R, S> {
     /// Build the periodic-SD-announcement future.
     ///
     /// Returns a future that sends an `OfferService` message to the SD
@@ -391,7 +399,7 @@ impl Server {
 
     /// Get the event publisher for sending events
     #[must_use]
-    pub fn publisher(&self) -> Arc<EventPublisher> {
+    pub fn publisher(&self) -> Arc<EventPublisher<R, S>> {
         Arc::clone(&self.publisher)
     }
 
@@ -413,27 +421,13 @@ impl Server {
     ///
     /// Once registered, outgoing events published via [`EventPublisher::publish_event`]
     /// will have E2E protection applied automatically.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the E2E registry mutex is poisoned.
     pub fn register_e2e(&self, key: E2EKey, profile: E2EProfile) {
-        self.e2e_registry
-            .lock()
-            .expect("e2e registry lock poisoned")
-            .register(key, profile);
+        self.e2e_registry.register(key, profile);
     }
 
     /// Remove E2E configuration for the given key.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the E2E registry mutex is poisoned.
     pub fn unregister_e2e(&self, key: &E2EKey) {
-        self.e2e_registry
-            .lock()
-            .expect("e2e registry lock poisoned")
-            .unregister(key);
+        self.e2e_registry.unregister(key);
     }
 
     /// Run the server event loop
@@ -643,24 +637,22 @@ impl Server {
                         let first_count = entry_view.options_count().first_options_count as usize;
                         let second_index = entry_view.index_second_options_run() as usize;
                         let second_count = entry_view.options_count().second_options_count as usize;
-                        if let Some(endpoint_addr) = Self::extract_subscriber_endpoint(
+                        if let Some(endpoint_addr) = extract_subscriber_endpoint(
                             &sd_view.options(),
                             first_index,
                             first_count,
                             second_index,
                             second_count,
                         ) {
-                            let mut subs = self.subscriptions.write().await;
-                            let subscribe_result = subs.subscribe(
-                                entry_view.service_id(),
-                                entry_view.instance_id(),
-                                entry_view.event_group_id(),
-                                endpoint_addr,
-                            );
-                            // Release the write lock before any await on the
-                            // SD socket (keeps this arm off the lock while we
-                            // emit the response).
-                            drop(subs);
+                            let subscribe_result = self
+                                .subscriptions
+                                .subscribe(
+                                    entry_view.service_id(),
+                                    entry_view.instance_id(),
+                                    entry_view.event_group_id(),
+                                    endpoint_addr,
+                                )
+                                .await;
 
                             match subscribe_result {
                                 Ok(()) => {
@@ -726,94 +718,75 @@ impl Server {
 
         Ok(())
     }
+}
 
-    /// Extract a single subscriber endpoint from the options runs
-    /// associated with an SD entry.
-    ///
-    /// Each SD entry owns up to two options runs. A run is a contiguous
-    /// slice of the options array starting at `index_*_options_run` with
-    /// `*_options_count` entries. This helper walks both runs, collects
-    /// every `IpV4Endpoint` option it finds, returns the first, and logs
-    /// a `warn!` if more than one endpoint is present (we do not yet
-    /// support multi-endpoint subscribers — e.g. TCP+UDP — and will pick
-    /// an arbitrary one).
-    ///
-    /// Returns `None` if no `IpV4Endpoint` is found in either run.
-    fn extract_subscriber_endpoint(
-        options: &sd::OptionIter<'_>,
-        first_index: usize,
-        first_count: usize,
-        second_index: usize,
-        second_count: usize,
-    ) -> Option<SocketAddrV4> {
-        // Walk each run by cloning the iterator — `OptionIter` is a
-        // cheap view over borrowed bytes so `clone` is free. Taking
-        // `options` by reference lets the caller keep ownership and
-        // keeps the clippy `needless_pass_by_value` lint quiet.
-        //
-        // We only ever return the first `IpV4Endpoint` found, so rather
-        // than collect into a `Vec` (heap alloc on every Subscribe) we
-        // track the first hit in an `Option` and keep a count so the
-        // multi-endpoint warn path still reports how many additional
-        // endpoints were present. This keeps the SD receive loop
-        // allocation-free on the happy path.
-        let mut first_endpoint: Option<SocketAddrV4> = None;
-        let mut endpoint_count: usize = 0;
-        let mut ignored_other: usize = 0;
+/// Extract a single subscriber endpoint from the options runs associated with
+/// an SD entry. Walks both option runs, returns the first `IpV4Endpoint`
+/// found, and logs a `warn!` if more than one is present.
+fn extract_subscriber_endpoint(
+    options: &sd::OptionIter<'_>,
+    first_index: usize,
+    first_count: usize,
+    second_index: usize,
+    second_count: usize,
+) -> Option<SocketAddrV4> {
+    let mut first_endpoint: Option<SocketAddrV4> = None;
+    let mut endpoint_count: usize = 0;
+    let mut ignored_other: usize = 0;
 
-        let mut walk_run = |index: usize, count: usize| {
-            if count == 0 {
-                return;
-            }
-            for option_view in options.clone().skip(index).take(count) {
-                match option_view.option_type() {
-                    Ok(sd::OptionType::IpV4Endpoint) => {
-                        if let Ok((ip, _, port)) = option_view.as_ipv4() {
-                            endpoint_count += 1;
-                            if first_endpoint.is_none() {
-                                first_endpoint = Some(SocketAddrV4::new(ip, port));
-                            }
+    let mut walk_run = |index: usize, count: usize| {
+        if count == 0 {
+            return;
+        }
+        for option_view in options.clone().skip(index).take(count) {
+            match option_view.option_type() {
+                Ok(sd::OptionType::IpV4Endpoint) => {
+                    if let Ok((ip, _, port)) = option_view.as_ipv4() {
+                        endpoint_count += 1;
+                        if first_endpoint.is_none() {
+                            first_endpoint = Some(SocketAddrV4::new(ip, port));
                         }
                     }
-                    Ok(_) | Err(_) => ignored_other += 1,
                 }
-            }
-        };
-
-        walk_run(first_index, first_count);
-        walk_run(second_index, second_count);
-
-        match endpoint_count {
-            0 => {
-                tracing::warn!(
-                    "No IPv4 endpoint in options runs \
-                     (first: idx={first_index}, count={first_count}; \
-                     second: idx={second_index}, count={second_count}; \
-                     ignored={ignored_other})"
-                );
-                None
-            }
-            1 => {
-                // Unwrap is safe: count == 1 implies we set `first_endpoint`.
-                let ep = first_endpoint.expect("endpoint_count=1 implies first_endpoint is Some");
-                tracing::trace!("Found IPv4 endpoint {}", ep);
-                Some(ep)
-            }
-            n => {
-                let ep = first_endpoint.expect("endpoint_count>=1 implies first_endpoint is Some");
-                tracing::warn!(
-                    "{} IPv4 endpoints found in subscribe options runs; \
-                     using first ({}) and ignoring {} additional. \
-                     Multi-endpoint (e.g. TCP+UDP) subscribers are not yet supported.",
-                    n,
-                    ep,
-                    n - 1
-                );
-                Some(ep)
+                Ok(_) | Err(_) => ignored_other += 1,
             }
         }
-    }
+    };
 
+    walk_run(first_index, first_count);
+    walk_run(second_index, second_count);
+
+    match endpoint_count {
+        0 => {
+            tracing::warn!(
+                "No IPv4 endpoint in options runs \
+                 (first: idx={first_index}, count={first_count}; \
+                 second: idx={second_index}, count={second_count}; \
+                 ignored={ignored_other})"
+            );
+            None
+        }
+        1 => {
+            let ep = first_endpoint.expect("endpoint_count=1 implies first_endpoint is Some");
+            tracing::trace!("Found IPv4 endpoint {}", ep);
+            Some(ep)
+        }
+        n => {
+            let ep = first_endpoint.expect("endpoint_count>=1 implies first_endpoint is Some");
+            tracing::warn!(
+                "{} IPv4 endpoints found in subscribe options runs; \
+                 using first ({}) and ignoring {} additional. \
+                 Multi-endpoint (e.g. TCP+UDP) subscribers are not yet supported.",
+                n,
+                ep,
+                n - 1
+            );
+            Some(ep)
+        }
+    }
+}
+
+impl<R: E2ERegistryHandle, S: SubscriptionHandle> Server<R, S> {
     /// Send `SubscribeAck` from an entry view
     async fn send_subscribe_ack_from_view(
         &self,
@@ -1667,7 +1640,7 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 1, 30000);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        let got = Server::extract_subscriber_endpoint(&iter, 0, 1, 0, 0);
+        let got = extract_subscriber_endpoint(&iter, 0, 1, 0, 0);
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30000))
@@ -1677,7 +1650,7 @@ mod tests {
     #[test]
     fn extract_endpoint_zero_options_in_both_runs_returns_none() {
         let iter = sd::OptionIter::new(&[]);
-        assert_eq!(Server::extract_subscriber_endpoint(&iter, 0, 0, 0, 0), None);
+        assert_eq!(extract_subscriber_endpoint(&iter, 0, 0, 0, 0), None);
     }
 
     #[test]
@@ -1689,7 +1662,7 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 2, 30100);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        assert_eq!(Server::extract_subscriber_endpoint(&iter, 1, 0, 0, 0), None);
+        assert_eq!(extract_subscriber_endpoint(&iter, 1, 0, 0, 0), None);
     }
 
     #[test]
@@ -1701,7 +1674,7 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 2, 30200);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        let got = Server::extract_subscriber_endpoint(&iter, 0, 2, 0, 0);
+        let got = extract_subscriber_endpoint(&iter, 0, 2, 0, 0);
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30200))
@@ -1720,7 +1693,7 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 3, 30300);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        let got = Server::extract_subscriber_endpoint(&iter, 0, 1, 2, 1);
+        let got = extract_subscriber_endpoint(&iter, 0, 1, 2, 1);
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30300))
@@ -1735,7 +1708,7 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 4, 30400);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        let got = Server::extract_subscriber_endpoint(&iter, 2, 1, 0, 0);
+        let got = extract_subscriber_endpoint(&iter, 2, 1, 0, 0);
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30402))
@@ -1751,7 +1724,7 @@ mod tests {
         let iter = sd::OptionIter::new(&buf[..total]);
 
         // Take only 1 option starting at index 1 -> port 30501.
-        let got = Server::extract_subscriber_endpoint(&iter, 1, 1, 0, 0);
+        let got = extract_subscriber_endpoint(&iter, 1, 1, 0, 0);
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30501))
@@ -1775,7 +1748,7 @@ mod tests {
         offset += write_load_balancing_option(&mut buf[offset..], 3, 4);
         let iter = sd::OptionIter::new(&buf[..offset]);
 
-        let got = Server::extract_subscriber_endpoint(&iter, 0, 3, 0, 0);
+        let got = extract_subscriber_endpoint(&iter, 0, 3, 0, 0);
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30600))
@@ -1790,7 +1763,7 @@ mod tests {
         offset += write_load_balancing_option(&mut buf[offset..], 3, 4);
         let iter = sd::OptionIter::new(&buf[..offset]);
 
-        assert_eq!(Server::extract_subscriber_endpoint(&iter, 0, 2, 0, 0), None);
+        assert_eq!(extract_subscriber_endpoint(&iter, 0, 2, 0, 0), None);
     }
 
     #[test]
@@ -1801,7 +1774,7 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 2, 30700);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        let got = Server::extract_subscriber_endpoint(&iter, 0, 0, 1, 1);
+        let got = extract_subscriber_endpoint(&iter, 0, 0, 1, 1);
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30701))
@@ -2262,7 +2235,7 @@ mod tests {
             // 0 endpoints → warn! "No IPv4 endpoint" branch.
             let iter_empty = sd::OptionIter::new(&[]);
             assert_eq!(
-                Server::extract_subscriber_endpoint(&iter_empty, 0, 0, 0, 0),
+                extract_subscriber_endpoint(&iter_empty, 0, 0, 0, 0),
                 None
             );
 
@@ -2271,7 +2244,7 @@ mod tests {
             let len_one = fill_ipv4_endpoints(&mut buf_one, 1, 31000);
             let iter_one = sd::OptionIter::new(&buf_one[..len_one]);
             assert_eq!(
-                Server::extract_subscriber_endpoint(&iter_one, 0, 1, 0, 0),
+                extract_subscriber_endpoint(&iter_one, 0, 1, 0, 0),
                 Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 31000))
             );
 
@@ -2280,7 +2253,7 @@ mod tests {
             let len_many = fill_ipv4_endpoints(&mut buf_many, 3, 31100);
             let iter_many = sd::OptionIter::new(&buf_many[..len_many]);
             assert_eq!(
-                Server::extract_subscriber_endpoint(&iter_many, 0, 3, 0, 0),
+                extract_subscriber_endpoint(&iter_many, 0, 3, 0, 0),
                 Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 31100))
             );
         });

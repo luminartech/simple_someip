@@ -1,29 +1,29 @@
 //! Event publishing functionality
 
 use super::Error;
-use super::subscription_manager::SubscriptionManager;
+use super::subscription_manager::{SubscriptionHandle, SubscriptionManager};
 use crate::UDP_BUFFER_SIZE;
 use crate::e2e::{E2EKey, E2ERegistry};
 use crate::protocol::{Header, Message};
 use crate::traits::{PayloadWireFormat, WireFormat};
+use crate::transport::E2ERegistryHandle;
 use std::sync::{Arc, Mutex};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
 /// Publishes events to subscribers
-pub struct EventPublisher {
-    subscriptions: Arc<RwLock<SubscriptionManager>>,
+pub struct EventPublisher<
+    R: E2ERegistryHandle = Arc<Mutex<E2ERegistry>>,
+    S: SubscriptionHandle = Arc<RwLock<SubscriptionManager>>,
+> {
+    subscriptions: S,
     socket: Arc<UdpSocket>,
-    e2e_registry: Arc<Mutex<E2ERegistry>>,
+    e2e_registry: R,
 }
 
-impl EventPublisher {
+impl<R: E2ERegistryHandle, S: SubscriptionHandle> EventPublisher<R, S> {
     /// Create a new event publisher
-    pub fn new(
-        subscriptions: Arc<RwLock<SubscriptionManager>>,
-        socket: Arc<UdpSocket>,
-        e2e_registry: Arc<Mutex<E2ERegistry>>,
-    ) -> Self {
+    pub fn new(subscriptions: S, socket: Arc<UdpSocket>, e2e_registry: R) -> Self {
         Self {
             subscriptions,
             socket,
@@ -54,10 +54,10 @@ impl EventPublisher {
         message: &Message<P>,
     ) -> Result<usize, Error> {
         // Get subscribers
-        let subscribers = {
-            let mgr = self.subscriptions.read().await;
-            mgr.get_subscribers(service_id, instance_id, event_group_id)
-        };
+        let subscribers = self
+            .subscriptions
+            .get_subscribers(service_id, instance_id, event_group_id)
+            .await;
 
         if subscribers.is_empty() {
             tracing::trace!(
@@ -96,14 +96,10 @@ impl EventPublisher {
         // directly out of `buffer[16..]` without a separate copy.
         {
             let key = E2EKey::from_message_id(message.header().message_id());
-            let mut registry = self
-                .e2e_registry
-                .lock()
-                .expect("e2e registry lock poisoned");
-            if registry.contains_key(&key) {
+            if self.e2e_registry.contains_key(&key) {
                 let upper_header: [u8; 8] = buffer[8..16].try_into().expect("upper header slice");
                 let mut protected = [0u8; UDP_BUFFER_SIZE];
-                let result = registry.protect(
+                let result = self.e2e_registry.protect(
                     key,
                     &buffer[16..message_length],
                     upper_header,
@@ -196,10 +192,10 @@ impl EventPublisher {
         payload: &[u8],
     ) -> Result<usize, Error> {
         // Get subscribers
-        let subscribers = {
-            let mgr = self.subscriptions.read().await;
-            mgr.get_subscribers(service_id, instance_id, event_group_id)
-        };
+        let subscribers = self
+            .subscriptions
+            .get_subscribers(service_id, instance_id, event_group_id)
+            .await;
 
         if subscribers.is_empty() {
             return Ok(0);
@@ -293,8 +289,10 @@ impl EventPublisher {
         instance_id: u16,
         event_group_id: u16,
     ) -> bool {
-        let mgr = self.subscriptions.read().await;
-        !mgr.get_subscribers(service_id, instance_id, event_group_id)
+        !self
+            .subscriptions
+            .get_subscribers(service_id, instance_id, event_group_id)
+            .await
             .is_empty()
     }
 
@@ -346,8 +344,9 @@ impl EventPublisher {
         event_group_id: u16,
         subscriber_addr: std::net::SocketAddrV4,
     ) -> Result<(), crate::server::SubscribeError> {
-        let mut mgr = self.subscriptions.write().await;
-        mgr.subscribe(service_id, instance_id, event_group_id, subscriber_addr)
+        self.subscriptions
+            .subscribe(service_id, instance_id, event_group_id, subscriber_addr)
+            .await
     }
 
     /// Remove a previously-registered subscriber from an event group.
@@ -367,8 +366,9 @@ impl EventPublisher {
         event_group_id: u16,
         subscriber_addr: std::net::SocketAddrV4,
     ) {
-        let mut mgr = self.subscriptions.write().await;
-        mgr.unsubscribe(service_id, instance_id, event_group_id, subscriber_addr);
+        self.subscriptions
+            .unsubscribe(service_id, instance_id, event_group_id, subscriber_addr)
+            .await;
     }
 
     /// Get the current number of subscribers for a specific event group
@@ -378,8 +378,9 @@ impl EventPublisher {
         instance_id: u16,
         event_group_id: u16,
     ) -> usize {
-        let mgr = self.subscriptions.read().await;
-        mgr.get_subscribers(service_id, instance_id, event_group_id)
+        self.subscriptions
+            .get_subscribers(service_id, instance_id, event_group_id)
+            .await
             .len()
     }
 }
