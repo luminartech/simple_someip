@@ -20,43 +20,37 @@
 //! Concurrency between the two is mandatory and cannot come from the
 //! same task — hence the `Spawner` hook.
 //!
-//! # What phase 9's `Spawner` does NOT remove from the critical path
+//! # Bare-metal readiness status
 //!
-//! `Spawner` abstracts task submission, not runtime primitives. The
-//! socket loop still `.await`s on runtime-coupled types every
-//! iteration. `no_alloc` bare-metal consumers are still blocked by:
+//! **Completed abstractions (Phases 9-11):**
+//! - `Spawner` trait (Phase 9): task submission is pluggable.
+//! - `E2ERegistryHandle` / `InterfaceHandle` (Phase 10): lock handles
+//!   abstracted away from `Arc<Mutex<_>>` / `Arc<RwLock<_>>`.
+//! - `ChannelFactory` (Phase 11): channel primitives abstracted via
+//!   `TokioChannels` (std) and `EmbassySyncChannels` (bare_metal).
 //!
-//! 1. **`tokio::sync::mpsc` channels** (per-socket: discovery uses
-//!    16/16, unicast uses 4/4): heap-allocated + tokio-`Waker`-
-//!    specific. A `no_alloc` replacement needs a bounded inline-backed
-//!    channel with executor-agnostic waker registration (e.g.
-//!    `heapless::mpmc` + a hand-rolled `WakerRegistration`, or
-//!    `embassy-sync::Channel`).
-//! 2. **`tokio::sync::oneshot` for send-acks** (see `SendMessage`
-//!    below): same problem at smaller scale; ownership restructure
-//!    is harder than the mpsc swap.
-//! 3. **`Arc<Mutex<E2ERegistry>>`** shared between `Inner` and every
-//!    socket loop: requires `alloc` + `std::sync`. Collapses to
-//!    `&RefCell<E2ERegistry>` on a single-task executor, but the
-//!    type change cascades through every call site.
-//! 4. **`F::Socket = TokioSocket`** bound on `bind_*` (this module):
-//!    RTN-gap, see `bind_discovery_seeded_with_transport` docstring.
+//! **Remaining gaps:**
+//! - **`F::Socket = TokioSocket`** bound on `bind_*` (Phase 12):
+//!   RTN-gap, see `bind_discovery_seeded_with_transport` docstring.
+//! - **Feature-flag split** (Phase 13): `client` / `server` still
+//!   pull in tokio + socket2 dependencies.
 //!
-//! Until all four are addressed, enabling `feature = "client"` pulls
-//! in `std + tokio + socket2`. The `bare_metal` feature flag is a
-//! marker today; it does not make this module `no_alloc`. For `no_alloc`
-//! SOME/IP usage today, consume `protocol`, `e2e`, and the `transport`
-//! trait layer directly — the `bare_metal` example workspace member
-//! demonstrates that surface.
+//! Until Phase 13 completes, enabling `feature = "client"` pulls
+//! in `std + tokio + socket2`. The `bare_metal` feature flag activates
+//! `EmbassySyncChannels` but does not make this module `no_alloc` on
+//! its own. For `no_alloc` SOME/IP usage today, consume `protocol`,
+//! `e2e`, and the `transport` trait layer directly — the `bare_metal`
+//! example workspace member demonstrates that surface.
 
 use crate::{
     UDP_BUFFER_SIZE,
     e2e::{E2ECheckStatus, E2EKey},
     protocol::{Message, MessageView, sd},
+    tokio_transport::TokioChannels,
     traits::{PayloadWireFormat, WireFormat},
     transport::{
-        E2ERegistryHandle, ReceivedDatagram, SocketOptions, Spawner, TransportFactory,
-        TransportSocket,
+        ChannelFactory, E2ERegistryHandle, MpscRecv, MpscSend, OneshotRecv, OneshotSend,
+        ReceivedDatagram, SocketOptions, Spawner, TransportFactory, TransportSocket,
     },
 };
 
@@ -66,7 +60,6 @@ use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     task::{Context, Poll},
 };
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
 /// A received message together with the source address it came from.
@@ -85,28 +78,38 @@ pub struct ReceivedMessage<P> {
 }
 
 /// Structure representing a request to send a message
-#[derive(Debug)]
-pub struct SendMessage<PayloadDefinitions> {
+pub struct SendMessage<PayloadDefinitions: Send + 'static, C: ChannelFactory = TokioChannels> {
     pub target_addr: SocketAddrV4,
     pub message: Message<PayloadDefinitions>,
-    response: tokio::sync::oneshot::Sender<Result<(), Error>>,
+    response: C::OneshotSender<Result<(), Error>>,
+}
+
+impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> std::fmt::Debug for SendMessage<P, C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendMessage")
+            .field("target_addr", &self.target_addr)
+            .field("message", &self.message)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One iteration's select-outcome in `socket_loop_future`. The inner
 /// block returns this scalar so the pinned per-iteration `send_fut` /
 /// `recv_fut` futures drop before the processing body — releasing their
 /// `&mut buf` / `&mut socket` borrows.
-enum Outcome<P: PayloadWireFormat> {
-    Send(Option<SendMessage<P>>),
+enum Outcome<P: PayloadWireFormat + Send + 'static, C: ChannelFactory = TokioChannels> {
+    Send(Option<SendMessage<P, C>>),
     Recv(Result<ReceivedDatagram, crate::transport::TransportError>),
 }
 
-impl<PayloadDefinitions: PayloadWireFormat + 'static> SendMessage<PayloadDefinitions> {
+impl<PayloadDefinitions: PayloadWireFormat + Send + 'static, C: ChannelFactory>
+    SendMessage<PayloadDefinitions, C>
+{
     pub fn new(
         target_addr: SocketAddrV4,
         message: Message<PayloadDefinitions>,
-    ) -> (tokio::sync::oneshot::Receiver<Result<(), Error>>, Self) {
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    ) -> (C::OneshotReceiver<Result<(), Error>>, Self) {
+        let (response_tx, response_rx) = C::oneshot();
         (
             response_rx,
             Self {
@@ -118,10 +121,9 @@ impl<PayloadDefinitions: PayloadWireFormat + 'static> SendMessage<PayloadDefinit
     }
 }
 
-#[derive(Debug)]
-pub struct SocketManager<PayloadDefinitions> {
-    receiver: mpsc::Receiver<Result<ReceivedMessage<PayloadDefinitions>, Error>>,
-    sender: mpsc::Sender<SendMessage<PayloadDefinitions>>,
+pub struct SocketManager<PayloadDefinitions: Send + 'static, C: ChannelFactory = TokioChannels> {
+    receiver: C::BoundedReceiver<Result<ReceivedMessage<PayloadDefinitions>, Error>>,
+    sender: C::BoundedSender<SendMessage<PayloadDefinitions, C>>,
     local_port: u16,
     session_id: u16,
     /// Set to true once `session_id` has wrapped from 0xFFFF → 1.
@@ -130,9 +132,19 @@ pub struct SocketManager<PayloadDefinitions> {
     session_has_wrapped: bool,
 }
 
-impl<MessageDefinitions> SocketManager<MessageDefinitions>
+impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> std::fmt::Debug for SocketManager<P, C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SocketManager")
+            .field("local_port", &self.local_port)
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<MessageDefinitions, C> SocketManager<MessageDefinitions, C>
 where
-    MessageDefinitions: PayloadWireFormat + 'static,
+    MessageDefinitions: PayloadWireFormat + Send + 'static,
+    C: ChannelFactory,
 {
     /// Bind the SD multicast socket, seeding the session counter and wrap
     /// state from a previous socket when rebinding. Pass `(1, false)` for a
@@ -189,19 +201,16 @@ where
     /// type-erasure) each carry costs bigger than waiting — see the
     /// module docstring for the full analysis.
     ///
-    /// # Why relaxing this bound alone does NOT unblock `no_alloc` callers
+    /// # Bare-metal path
     ///
-    /// Even with a custom `F::Socket`, this function internally
-    /// allocates two `tokio::sync::mpsc` channels (capacities 16 and 16)
-    /// and constructs `tokio::sync::oneshot` instances per send. Both
-    /// are heap-backed AND tokio-runtime-coupled (their `Waker`
-    /// plumbing only works inside a tokio reactor task). A `no_alloc`
-    /// bare-metal consumer cannot use this entry point today regardless
-    /// of the `F::Socket` bound. The recommended path for `no_alloc`
-    /// consumers is to bypass `SocketManager` / `Client` entirely and
-    /// build a small orchestrator directly on top of `protocol`, `e2e`,
-    /// and the `transport` traits — the `bare_metal` example workspace
-    /// member demonstrates the trait layer in isolation.
+    /// Phase 11 abstracted the channel primitives behind
+    /// [`ChannelFactory`](crate::transport::ChannelFactory). The
+    /// `bare_metal` feature activates `EmbassySyncChannels` as an
+    /// alternative to `TokioChannels`. However, this function still
+    /// requires the `F::Socket = TokioSocket` bound (Phase 12 gap).
+    /// Once Phase 12 relaxes that bound via GATs and Phase 13 splits
+    /// the feature flags, a bare-metal consumer can use
+    /// `SocketManager` directly with a custom socket backend.
     pub async fn bind_discovery_seeded_with_transport<F, S, R>(
         factory: &F,
         spawner: &S,
@@ -216,8 +225,9 @@ where
         S: Spawner,
         R: E2ERegistryHandle,
     {
-        let (rx_tx, rx_rx) = mpsc::channel(16);
-        let (tx_tx, tx_rx) = mpsc::channel(16);
+        let (rx_tx, rx_rx) =
+            C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
+        let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
 
         // Control whether multicast packets sent by this socket are looped
         // back to sockets on the same host — INCLUDING this socket itself.
@@ -283,8 +293,9 @@ where
         S: Spawner,
         R: E2ERegistryHandle,
     {
-        let (rx_tx, rx_rx) = mpsc::channel(4);
-        let (tx_tx, tx_rx) = mpsc::channel(4);
+        let (rx_tx, rx_rx) =
+            C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 4>();
+        let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 4>();
 
         let options = {
             let mut o = SocketOptions::new();
@@ -324,16 +335,16 @@ where
             );
             return Err(Error::Capacity("udp_buffer"));
         }
-        let (result_channel, message) = SendMessage::new(target_addr, message);
-        self.sender.send(message).await.map_err(|e| {
-            error!("Socket error: {e} when attempting to send message");
+        let (result_channel, message) = SendMessage::<MessageDefinitions, C>::new(target_addr, message);
+        self.sender.send(message).await.map_err(|()| {
+            error!("Socket error when attempting to send message");
             Error::SocketClosedUnexpectedly
         })?;
         // The socket loop's response sender can be dropped without sending
         // (executor cancellation, bare-metal `Spawner` that drops futures,
         // or a panic in the loop). Surface that as a typed error rather
         // than `.expect`-panicking the caller.
-        result_channel.await.map_err(|_| {
+        result_channel.recv().await.map_err(|_| {
             debug!("send result channel dropped (socket loop gone)");
             Error::SocketClosedUnexpectedly
         })??;
@@ -356,7 +367,7 @@ where
     }
 
     pub async fn receive(&mut self) -> Option<Result<ReceivedMessage<MessageDefinitions>, Error>> {
-        self.receiver.recv().await
+        MpscRecv::recv(&mut self.receiver).await
     }
 
     /// Poll the receiver for a message without blocking.
@@ -383,7 +394,7 @@ where
             ..
         } = self;
         drop(sender);
-        _ = receiver.recv().await;
+        _ = MpscRecv::recv(&mut receiver).await;
     }
 
     /// Build the I/O loop over a concrete [`TokioSocket`] as a future.
@@ -400,8 +411,8 @@ where
     #[allow(clippy::too_many_lines)]
     async fn socket_loop_future<R: E2ERegistryHandle>(
         socket: crate::tokio_transport::TokioSocket,
-        rx_tx: mpsc::Sender<Result<ReceivedMessage<MessageDefinitions>, Error>>,
-        mut tx_rx: mpsc::Receiver<SendMessage<MessageDefinitions>>,
+        rx_tx: C::BoundedSender<Result<ReceivedMessage<MessageDefinitions>, Error>>,
+        mut tx_rx: C::BoundedReceiver<SendMessage<MessageDefinitions, C>>,
         e2e_registry: R,
     ) {
         // Maximum number of consecutive `recv_from` errors tolerated before
@@ -427,8 +438,8 @@ where
             // drops both pinned futures — and their `&mut buf` /
             // `&mut socket` borrows — before the processing body
             // below runs, so the body can re-borrow `buf` freely.
-            let outcome: Outcome<MessageDefinitions> = {
-                let send_fut = tx_rx.recv().fuse();
+            let outcome: Outcome<MessageDefinitions, C> = {
+                let send_fut = MpscRecv::recv(&mut tx_rx).fuse();
                 let recv_fut = socket.recv_from(&mut buf).fuse();
                 pin_mut!(send_fut, recv_fut);
                 select! {
@@ -573,7 +584,7 @@ where
                             })
                         })
                         .map_err(Error::from);
-                    if let Ok(()) = rx_tx.send(parse_result).await {
+                    if rx_tx.send(parse_result).await.is_ok() {
                     } else {
                         info!("Socket Dropping");
                         // The receiver has been dropped, so we should exit
@@ -637,13 +648,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_message_new() {
+        use crate::transport::OneshotRecv;
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
         let msg = Message::new_sd(1, &empty_sd_header());
         let (rx, send_msg) = SendMessage::<TestPayload>::new(target, msg);
         assert_eq!(send_msg.target_addr, target);
         // Verify the oneshot channel works
         send_msg.response.send(Ok(())).unwrap();
-        assert!(rx.await.unwrap().is_ok());
+        assert!(rx.recv().await.unwrap().is_ok());
     }
 
     #[tokio::test]

@@ -38,29 +38,31 @@ pub use error::Error;
 
 use crate::Timer;
 use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry};
-use crate::tokio_transport::{TokioSpawner, TokioTimer};
-use crate::transport::{E2ERegistryHandle, InterfaceHandle, Spawner};
+use crate::tokio_transport::{TokioChannels, TokioSpawner, TokioTimer};
+use crate::transport::{
+    ChannelFactory, E2ERegistryHandle, InterfaceHandle, MpscSend, OneshotRecv, Spawner,
+    UnboundedRecv,
+};
 use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
 use inner::{ControlMessage, Inner};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex, RwLock};
-use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
 /// Handle to a pending SOME/IP request-response transaction.
 /// Resolves when the inner loop receives a matching unicast reply.
 /// Does not borrow `Client`.
-pub struct PendingResponse<P> {
-    receiver: oneshot::Receiver<Result<P, Error>>,
+pub struct PendingResponse<P: Send + 'static, C: ChannelFactory = TokioChannels> {
+    receiver: C::OneshotReceiver<Result<P, Error>>,
 }
 
-impl<P> std::fmt::Debug for PendingResponse<P> {
+impl<P: Send + 'static, C: ChannelFactory> std::fmt::Debug for PendingResponse<P, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingResponse").finish_non_exhaustive()
     }
 }
 
-impl<P> PendingResponse<P> {
+impl<P: Send + 'static, C: ChannelFactory> PendingResponse<P, C> {
     /// Await the response payload.
     ///
     /// # Errors
@@ -75,7 +77,7 @@ impl<P> PendingResponse<P> {
     /// `PendingResponse` handle outlived its driver. Reserving `Shutdown`
     /// for actual lifecycle failure keeps `RecvError` unambiguous.
     pub async fn response(self) -> Result<P, Error> {
-        self.receiver.await.map_err(|_| Error::Shutdown)?
+        self.receiver.recv().await.map_err(|_| Error::Shutdown)?
     }
 }
 
@@ -142,23 +144,25 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ClientUpdate<P> {
 ///
 /// Returned by [`Client::new`]. Call [`recv`](Self::recv) to receive
 /// discovery, unicast, and error updates.
-pub struct ClientUpdates<MessageDefinitions: PayloadWireFormat> {
-    update_receiver: mpsc::UnboundedReceiver<ClientUpdate<MessageDefinitions>>,
+pub struct ClientUpdates<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory = TokioChannels> {
+    update_receiver: C::UnboundedReceiver<ClientUpdate<MessageDefinitions>>,
 }
 
-impl<MessageDefinitions: PayloadWireFormat> std::fmt::Debug for ClientUpdates<MessageDefinitions> {
+impl<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory> std::fmt::Debug
+    for ClientUpdates<MessageDefinitions, C>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientUpdates").finish_non_exhaustive()
     }
 }
 
-impl<MessageDefinitions: PayloadWireFormat> ClientUpdates<MessageDefinitions> {
+impl<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory> ClientUpdates<MessageDefinitions, C> {
     /// Waits for the next update from the client event loop.
     ///
     /// Returns `None` when the inner loop has exited (all `Client` handles
     /// dropped and the event loop finished draining).
     pub async fn recv(&mut self) -> Option<ClientUpdate<MessageDefinitions>> {
-        self.update_receiver.recv().await
+        UnboundedRecv::recv(&mut self.update_receiver).await
     }
 }
 
@@ -176,20 +180,22 @@ impl<MessageDefinitions: PayloadWireFormat> ClientUpdates<MessageDefinitions> {
 /// [`Self::new_with_spawner_and_loopback`].
 #[derive(Clone)]
 pub struct Client<
-    MessageDefinitions: PayloadWireFormat,
+    MessageDefinitions: PayloadWireFormat + Send + 'static,
     R: E2ERegistryHandle = Arc<Mutex<E2ERegistry>>,
     I: InterfaceHandle = Arc<RwLock<Ipv4Addr>>,
+    C: ChannelFactory = TokioChannels,
 > {
     interface: I,
-    control_sender: mpsc::Sender<inner::ControlMessage<MessageDefinitions>>,
+    control_sender: C::BoundedSender<inner::ControlMessage<MessageDefinitions, C>>,
     e2e_registry: R,
 }
 
-impl<MessageDefinitions, R, I> std::fmt::Debug for Client<MessageDefinitions, R, I>
+impl<MessageDefinitions, R, I, C> std::fmt::Debug for Client<MessageDefinitions, R, I, C>
 where
-    MessageDefinitions: PayloadWireFormat,
+    MessageDefinitions: PayloadWireFormat + Send + 'static,
     R: E2ERegistryHandle,
     I: InterfaceHandle,
+    C: ChannelFactory,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
@@ -199,7 +205,8 @@ where
 }
 
 /// Constructors that create the default `Arc`-backed handles for `std + tokio`.
-impl<MessageDefinitions> Client<MessageDefinitions, Arc<Mutex<E2ERegistry>>, Arc<RwLock<Ipv4Addr>>>
+impl<MessageDefinitions>
+    Client<MessageDefinitions, Arc<Mutex<E2ERegistry>>, Arc<RwLock<Ipv4Addr>>, TokioChannels>
 where
     MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
 {
@@ -312,19 +319,20 @@ where
         spawner: S,
     ) -> (
         Self,
-        ClientUpdates<MessageDefinitions>,
+        ClientUpdates<MessageDefinitions, TokioChannels>,
         impl core::future::Future<Output = ()> + Send + 'static,
     )
     where
         S: Spawner + Send + Sync + 'static,
     {
         let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
-        let (control_sender, update_receiver, run_future) = Inner::build(
-            interface,
-            Arc::clone(&e2e_registry),
-            multicast_loopback,
-            spawner,
-        );
+        let (control_sender, update_receiver, run_future) =
+            Inner::<MessageDefinitions, S, _, TokioChannels>::build(
+                interface,
+                Arc::clone(&e2e_registry),
+                multicast_loopback,
+                spawner,
+            );
 
         let client = Self {
             interface: Arc::new(RwLock::new(interface)),
@@ -336,12 +344,13 @@ where
     }
 }
 
-/// Methods available on all `Client<M, R, I>` regardless of handle types.
-impl<MessageDefinitions, R, I> Client<MessageDefinitions, R, I>
+/// Methods available on all `Client<M, R, I, C>` regardless of handle types.
+impl<MessageDefinitions, R, I, C> Client<MessageDefinitions, R, I, C>
 where
     MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
     R: E2ERegistryHandle,
     I: InterfaceHandle,
+    C: ChannelFactory,
 {
     /// Returns the current network interface address.
     #[must_use]
@@ -363,8 +372,8 @@ where
         self.control_sender
             .send(message)
             .await
-            .map_err(|_| Error::Shutdown)?;
-        response.await.map_err(|_| Error::Shutdown)??;
+            .map_err(|()| Error::Shutdown)?;
+        response.recv().await.map_err(|_| Error::Shutdown)??;
         self.interface.set(interface);
         Ok(())
     }
@@ -383,8 +392,8 @@ where
         self.control_sender
             .send(message)
             .await
-            .map_err(|_| Error::Shutdown)?;
-        response.await.map_err(|_| Error::Shutdown)?
+            .map_err(|()| Error::Shutdown)?;
+        response.recv().await.map_err(|_| Error::Shutdown)?
     }
 
     /// Unbinds the SD multicast discovery socket.
@@ -401,8 +410,8 @@ where
         self.control_sender
             .send(message)
             .await
-            .map_err(|_| Error::Shutdown)?;
-        response.await.map_err(|_| Error::Shutdown)?
+            .map_err(|()| Error::Shutdown)?;
+        response.recv().await.map_err(|_| Error::Shutdown)?
     }
 
     /// Subscribes to an event group on a known service.
@@ -434,8 +443,8 @@ where
         self.control_sender
             .send(message)
             .await
-            .map_err(|_| Error::Shutdown)?;
-        response.await.map_err(|_| Error::Shutdown)?
+            .map_err(|()| Error::Shutdown)?;
+        response.recv().await.map_err(|_| Error::Shutdown)?
     }
 
     /// Like [`subscribe`](Self::subscribe) but does not wait for the
@@ -524,8 +533,8 @@ where
         self.control_sender
             .send(message)
             .await
-            .map_err(|_| Error::Shutdown)?;
-        response.await.map_err(|_| Error::Shutdown)?
+            .map_err(|()| Error::Shutdown)?;
+        response.recv().await.map_err(|_| Error::Shutdown)?
     }
 
     /// Test-only: force the inner loop's `sd_session_has_wrapped` so tests
@@ -541,8 +550,8 @@ where
         self.control_sender
             .send(message)
             .await
-            .map_err(|_| Error::Shutdown)?;
-        response.await.map_err(|_| Error::Shutdown)?
+            .map_err(|()| Error::Shutdown)?;
+        response.recv().await.map_err(|_| Error::Shutdown)?
     }
 
     /// Sends an SD message to a specific target address.
@@ -563,10 +572,177 @@ where
         self.control_sender
             .send(message)
             .await
-            .map_err(|_| Error::Shutdown)?;
-        response.await.map_err(|_| Error::Shutdown)?
+            .map_err(|()| Error::Shutdown)?;
+        response.recv().await.map_err(|_| Error::Shutdown)?
     }
 
+    /// Registers a service endpoint in the client's endpoint registry.
+    ///
+    /// `local_port` controls which source port is used when sending to this
+    /// endpoint via [`send_to_service`](Self::send_to_service). Pass `0` to
+    /// use an ephemeral (OS-assigned) port.
+    ///
+    /// Service-discovery (SD) automatically populates endpoints with
+    /// `local_port = 0`. If your configuration requires a specific source
+    /// port, you must call `add_endpoint` explicitly — even if SD has already
+    /// registered the service — so that the correct `local_port` is stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if registering the endpoint fails.
+    /// Returns [`Error::Shutdown`] if the client's run-loop future has
+    /// exited before this call (dropped, cancelled, or otherwise gone)
+    /// — the `Client` handle has outlived its driver and further
+    /// control-channel sends cannot make progress.
+    pub async fn add_endpoint(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        addr: SocketAddrV4,
+        local_port: u16,
+    ) -> Result<(), Error> {
+        let (response, message) =
+            ControlMessage::add_endpoint(service_id, instance_id, addr, local_port);
+        self.control_sender
+            .send(message)
+            .await
+            .map_err(|()| Error::Shutdown)?;
+        response.recv().await.map_err(|_| Error::Shutdown)?
+    }
+
+    /// Removes a service endpoint from the client's endpoint registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if removing the endpoint fails.
+    /// Returns [`Error::Shutdown`] if the client's run-loop future has
+    /// exited before this call (dropped, cancelled, or otherwise gone)
+    /// — the `Client` handle has outlived its driver and further
+    /// control-channel sends cannot make progress.
+    pub async fn remove_endpoint(&self, service_id: u16, instance_id: u16) -> Result<(), Error> {
+        let (response, message) = ControlMessage::remove_endpoint(service_id, instance_id);
+        self.control_sender
+            .send(message)
+            .await
+            .map_err(|()| Error::Shutdown)?;
+        response.recv().await.map_err(|_| Error::Shutdown)?
+    }
+
+    /// Sends a message to a service and returns a handle to await the response.
+    ///
+    /// Call `.response()` on the returned handle to await the reply payload.
+    ///
+    /// # Saturation behavior
+    ///
+    /// Response tracking uses a fixed-capacity internal map. If it is
+    /// saturated at the moment the reply-tracking slot would be installed,
+    /// this method still returns `Ok(PendingResponse)` — the UDP send has
+    /// already happened — but the returned `PendingResponse` will resolve to
+    /// `Err(Error::Capacity("pending_responses"))`. Any reply that later
+    /// arrives for that `request_id` is delivered as
+    /// [`ClientUpdate::Unicast`] on the update stream instead of through the
+    /// `PendingResponse`. Treat this error as "reply lost to saturation",
+    /// not "send failed". A `warn!`-level log accompanies the drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service is not found, unicast binding fails,
+    /// or the UDP send fails.
+    /// Returns [`Error::Shutdown`] if the client's run-loop future has
+    /// exited before this call (dropped, cancelled, or otherwise gone)
+    /// — the `Client` handle has outlived its driver and further
+    /// control-channel sends cannot make progress.
+    pub async fn send_to_service(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        message: crate::protocol::Message<MessageDefinitions>,
+    ) -> Result<PendingResponse<MessageDefinitions, C>, Error> {
+        let (send_rx, response_rx, ctrl_msg) =
+            ControlMessage::send_to_service(service_id, instance_id, message);
+        self.control_sender
+            .send(ctrl_msg)
+            .await
+            .map_err(|()| Error::Shutdown)?;
+        send_rx.recv().await.map_err(|_| Error::Shutdown)??;
+        Ok(PendingResponse {
+            receiver: response_rx,
+        })
+    }
+
+    /// Sends a request to a service and awaits the response in one call.
+    ///
+    /// Unlike [`send_to_service`](Self::send_to_service), this method does not
+    /// require manually driving [`ClientUpdates::recv`] — the inner event loop
+    /// resolves the response independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service is not found, unicast binding fails,
+    /// the UDP send fails, or the response payload fails to deserialize.
+    /// Returns [`Error::Capacity`] with tag `"pending_responses"` if the
+    /// inner loop's response-tracking map was full when this request was
+    /// sent — the UDP send still went out, but the reply cannot be
+    /// routed back to this caller's oneshot (it arrives on
+    /// [`ClientUpdates`] instead).
+    /// Returns [`Error::Shutdown`] only if the client's run-loop future
+    /// has exited before this call (dropped, cancelled, or otherwise
+    /// gone) — the `Client` handle has outlived its driver and further
+    /// control-channel sends cannot make progress.
+    pub async fn request(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        message: crate::protocol::Message<MessageDefinitions>,
+    ) -> Result<MessageDefinitions, Error> {
+        let (send_rx, response_rx, ctrl_msg) =
+            ControlMessage::send_to_service(service_id, instance_id, message);
+        self.control_sender
+            .send(ctrl_msg)
+            .await
+            .map_err(|()| Error::Shutdown)?;
+        send_rx.recv().await.map_err(|_| Error::Shutdown)??;
+        response_rx.recv().await.map_err(|_| Error::Shutdown)?
+    }
+
+    /// Register an E2E profile for the given key.
+    ///
+    /// Once registered, incoming messages matching `key` will have their E2E
+    /// header checked and stripped, and outgoing messages will have E2E
+    /// protection applied automatically.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the E2E registry mutex is poisoned.
+    pub fn register_e2e(&self, key: E2EKey, profile: E2EProfile) {
+        self.e2e_registry.register(key, profile);
+    }
+
+    /// Remove E2E configuration for the given key.
+    pub fn unregister_e2e(&self, key: &E2EKey) {
+        self.e2e_registry.unregister(key);
+    }
+
+    /// Shuts down the client by dropping the control channel.
+    ///
+    /// The inner event loop will exit once all `Client` clones are dropped.
+    /// Remaining updates can be drained via [`ClientUpdates::recv`].
+    pub fn shut_down(self) {
+        drop(self.control_sender);
+        info!("Shutting Down SOME/IP client");
+    }
+}
+
+/// `sd_announcements_loop` is only available with the `TokioChannels` backend
+/// because it requires `tokio::sync::mpsc::Sender::downgrade()` for the
+/// weak-sender shutdown pattern. A bare-metal alternative would need a
+/// different lifecycle mechanism (phase-future).
+impl<MessageDefinitions, R, I> Client<MessageDefinitions, R, I, TokioChannels>
+where
+    MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
+    R: E2ERegistryHandle,
+    I: InterfaceHandle,
+{
     /// Start periodic SD announcements on the client's discovery socket.
     ///
     /// Spawns a background task that sends the given SD header to the
@@ -622,6 +798,7 @@ where
         <MessageDefinitions as PayloadWireFormat>::SdHeader: Send + 'static,
     {
         use crate::protocol::sd;
+        use crate::transport::OneshotRecv;
 
         // Use a WeakSender so this future does NOT keep the control channel
         // alive. When all strong Client handles are dropped (shut_down),
@@ -631,44 +808,12 @@ where
         let interval = interval.max(std::time::Duration::from_millis(100));
 
         async move {
-            // Sleep goes through the `Timer` trait so bare-metal
-            // consumers can swap in `embassy_time` or similar; today it
-            // resolves to `TokioTimer`. Note: we use `Timer::sleep`
-            // repeatedly instead of `tokio::time::interval` because the
-            // trait has no equivalent of `interval`. The resulting
-            // cadence is "interval + body time" rather than "interval
-            // aligned to wall clock"; for SD announcements (a
-            // best-effort periodic heartbeat) this difference is
-            // immaterial. A regression test pins the cadence at
-            // approximately `interval` tolerance.
-            //
-            // The first iteration's `sleep` also serves as the initial
-            // delay so the caller has a chance to finish setup (e.g.
-            // subscribing) before the first announcement goes out.
             let timer = TokioTimer;
             let mut count = 0u64;
             loop {
                 timer.sleep(interval).await;
 
-                // Refresh the reboot flag from the client's tracked state
-                // so long-running announcers transition from RecentlyRebooted
-                // to Continuous once the session counter wraps. The weak
-                // sender is upgraded, used to enqueue a single control
-                // message, then dropped before we await — keeping the
-                // strong sender alive across awaits would defeat the
-                // weak-sender shutdown path.
-                //
-                // Note: this iteration upgrades the weak sender twice (once
-                // for `query_reboot_flag`, once for `send_sd`). The user
-                // could call `shut_down` between them, in which case the
-                // first upgrade succeeds, the reboot flag arrives, then
-                // the second upgrade fails — emitting "Client shut down"
-                // partway through what was logically a single tick. The
-                // alternative (holding the strong sender across the
-                // `flag_rx.await`) would defeat the weak-sender shutdown
-                // path. The mid-tick log is harmless and not worth a
-                // refactor.
-                let (flag_rx, flag_msg) = ControlMessage::query_reboot_flag();
+                let (flag_rx, flag_msg) = ControlMessage::<MessageDefinitions, TokioChannels>::query_reboot_flag();
                 let Some(sender) = weak_sender.upgrade() else {
                     tracing::info!("Client shut down, stopping SD announcements");
                     break;
@@ -679,13 +824,9 @@ where
                     tracing::warn!("SD announcement channel closed, stopping");
                     break;
                 }
-                let reboot = match flag_rx.await {
+                let reboot = match flag_rx.recv().await {
                     Ok(Ok(flag)) => flag,
                     Ok(Err(e)) => {
-                        // Run loop returned a typed error (e.g.
-                        // `Error::Capacity("request_queue")`). Skip this
-                        // tick and try again next interval — capacity
-                        // pressure is transient.
                         tracing::warn!(
                             "SD announcement reboot-flag query returned error ({:?}), skipping tick",
                             e
@@ -700,7 +841,7 @@ where
                 let mut header = sd_header.clone();
                 MessageDefinitions::set_reboot_flag(&mut header, reboot);
 
-                let (response, message) = ControlMessage::send_sd(target, header);
+                let (response, message) = ControlMessage::<MessageDefinitions, TokioChannels>::send_sd(target, header);
 
                 let Some(sender) = weak_sender.upgrade() else {
                     tracing::info!("Client shut down, stopping SD announcements");
@@ -714,7 +855,7 @@ where
                     break;
                 }
 
-                match response.await {
+                match response.recv().await {
                     Ok(Ok(())) => {
                         count += 1;
                         if count == 1 {
@@ -733,162 +874,6 @@ where
                 }
             }
         }
-    }
-
-    /// Registers a service endpoint in the client's endpoint registry.
-    ///
-    /// `local_port` controls which source port is used when sending to this
-    /// endpoint via [`send_to_service`](Self::send_to_service). Pass `0` to
-    /// use an ephemeral (OS-assigned) port.
-    ///
-    /// Service-discovery (SD) automatically populates endpoints with
-    /// `local_port = 0`. If your configuration requires a specific source
-    /// port, you must call `add_endpoint` explicitly — even if SD has already
-    /// registered the service — so that the correct `local_port` is stored.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if registering the endpoint fails.
-    /// Returns [`Error::Shutdown`] if the client's run-loop future has
-    /// exited before this call (dropped, cancelled, or otherwise gone)
-    /// — the `Client` handle has outlived its driver and further
-    /// control-channel sends cannot make progress.
-    pub async fn add_endpoint(
-        &self,
-        service_id: u16,
-        instance_id: u16,
-        addr: SocketAddrV4,
-        local_port: u16,
-    ) -> Result<(), Error> {
-        let (response, message) =
-            ControlMessage::add_endpoint(service_id, instance_id, addr, local_port);
-        self.control_sender
-            .send(message)
-            .await
-            .map_err(|_| Error::Shutdown)?;
-        response.await.map_err(|_| Error::Shutdown)?
-    }
-
-    /// Removes a service endpoint from the client's endpoint registry.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if removing the endpoint fails.
-    /// Returns [`Error::Shutdown`] if the client's run-loop future has
-    /// exited before this call (dropped, cancelled, or otherwise gone)
-    /// — the `Client` handle has outlived its driver and further
-    /// control-channel sends cannot make progress.
-    pub async fn remove_endpoint(&self, service_id: u16, instance_id: u16) -> Result<(), Error> {
-        let (response, message) = ControlMessage::remove_endpoint(service_id, instance_id);
-        self.control_sender
-            .send(message)
-            .await
-            .map_err(|_| Error::Shutdown)?;
-        response.await.map_err(|_| Error::Shutdown)?
-    }
-
-    /// Sends a message to a service and returns a handle to await the response.
-    ///
-    /// Call `.response()` on the returned handle to await the reply payload.
-    ///
-    /// # Saturation behavior
-    ///
-    /// Response tracking uses a fixed-capacity internal map. If it is
-    /// saturated at the moment the reply-tracking slot would be installed,
-    /// this method still returns `Ok(PendingResponse)` — the UDP send has
-    /// already happened — but the returned `PendingResponse` will resolve to
-    /// `Err(Error::Capacity("pending_responses"))`. Any reply that later
-    /// arrives for that `request_id` is delivered as
-    /// [`ClientUpdate::Unicast`] on the update stream instead of through the
-    /// `PendingResponse`. Treat this error as "reply lost to saturation",
-    /// not "send failed". A `warn!`-level log accompanies the drop.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the service is not found, unicast binding fails,
-    /// or the UDP send fails.
-    /// Returns [`Error::Shutdown`] if the client's run-loop future has
-    /// exited before this call (dropped, cancelled, or otherwise gone)
-    /// — the `Client` handle has outlived its driver and further
-    /// control-channel sends cannot make progress.
-    pub async fn send_to_service(
-        &self,
-        service_id: u16,
-        instance_id: u16,
-        message: crate::protocol::Message<MessageDefinitions>,
-    ) -> Result<PendingResponse<MessageDefinitions>, Error> {
-        let (send_rx, response_rx, ctrl_msg) =
-            ControlMessage::send_to_service(service_id, instance_id, message);
-        self.control_sender
-            .send(ctrl_msg)
-            .await
-            .map_err(|_| Error::Shutdown)?;
-        send_rx.await.map_err(|_| Error::Shutdown)??;
-        Ok(PendingResponse {
-            receiver: response_rx,
-        })
-    }
-
-    /// Sends a request to a service and awaits the response in one call.
-    ///
-    /// Unlike [`send_to_service`](Self::send_to_service), this method does not
-    /// require manually driving [`ClientUpdates::recv`] — the inner event loop
-    /// resolves the response independently.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the service is not found, unicast binding fails,
-    /// the UDP send fails, or the response payload fails to deserialize.
-    /// Returns [`Error::Capacity`] with tag `"pending_responses"` if the
-    /// inner loop's response-tracking map was full when this request was
-    /// sent — the UDP send still went out, but the reply cannot be
-    /// routed back to this caller's oneshot (it arrives on
-    /// [`ClientUpdates`] instead).
-    /// Returns [`Error::Shutdown`] only if the client's run-loop future
-    /// has exited before this call (dropped, cancelled, or otherwise
-    /// gone) — the `Client` handle has outlived its driver and further
-    /// control-channel sends cannot make progress.
-    pub async fn request(
-        &self,
-        service_id: u16,
-        instance_id: u16,
-        message: crate::protocol::Message<MessageDefinitions>,
-    ) -> Result<MessageDefinitions, Error> {
-        let (send_rx, response_rx, ctrl_msg) =
-            ControlMessage::send_to_service(service_id, instance_id, message);
-        self.control_sender
-            .send(ctrl_msg)
-            .await
-            .map_err(|_| Error::Shutdown)?;
-        send_rx.await.map_err(|_| Error::Shutdown)??;
-        response_rx.await.map_err(|_| Error::Shutdown)?
-    }
-
-    /// Register an E2E profile for the given key.
-    ///
-    /// Once registered, incoming messages matching `key` will have their E2E
-    /// header checked and stripped, and outgoing messages will have E2E
-    /// protection applied automatically.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the E2E registry mutex is poisoned.
-    pub fn register_e2e(&self, key: E2EKey, profile: E2EProfile) {
-        self.e2e_registry.register(key, profile);
-    }
-
-    /// Remove E2E configuration for the given key.
-    pub fn unregister_e2e(&self, key: &E2EKey) {
-        self.e2e_registry.unregister(key);
-    }
-
-    /// Shuts down the client by dropping the control channel.
-    ///
-    /// The inner event loop will exit once all `Client` clones are dropped.
-    /// Remaining updates can be drained via [`ClientUpdates::recv`].
-    pub fn shut_down(self) {
-        drop(self.control_sender);
-        info!("Shutting Down SOME/IP client");
     }
 }
 
@@ -1074,16 +1059,16 @@ mod tests {
 
     #[test]
     fn test_pending_response_debug() {
-        let (_tx, rx) = oneshot::channel::<Result<TestPayload, Error>>();
-        let pending = PendingResponse { receiver: rx };
+        let (_tx, rx) = TokioChannels::oneshot::<Result<TestPayload, Error>>();
+        let pending: PendingResponse<TestPayload, TokioChannels> = PendingResponse { receiver: rx };
         let s = format!("{pending:?}");
         assert!(s.contains("PendingResponse"));
     }
 
     #[tokio::test]
     async fn test_pending_response_resolves_ok() {
-        let (tx, rx) = oneshot::channel::<Result<TestPayload, Error>>();
-        let pending = PendingResponse { receiver: rx };
+        let (tx, rx) = TokioChannels::oneshot::<Result<TestPayload, Error>>();
+        let pending: PendingResponse<TestPayload, TokioChannels> = PendingResponse { receiver: rx };
         let payload = TestPayload {
             header: empty_sd_header(),
         };
@@ -1094,8 +1079,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_pending_response_resolves_err() {
-        let (tx, rx) = oneshot::channel::<Result<TestPayload, Error>>();
-        let pending = PendingResponse { receiver: rx };
+        let (tx, rx) = TokioChannels::oneshot::<Result<TestPayload, Error>>();
+        let pending: PendingResponse<TestPayload, TokioChannels> = PendingResponse { receiver: rx };
         tx.send(Err(Error::ServiceNotFound)).unwrap();
         let result = pending.response().await;
         assert!(

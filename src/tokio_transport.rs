@@ -43,8 +43,9 @@ use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 use crate::e2e::Error as E2EError;
 use crate::e2e::E2ERegistry;
 use crate::transport::{
-    E2ERegistryHandle, InterfaceHandle, IoErrorKind, ReceivedDatagram, SocketOptions, Timer,
-    TransportError, TransportFactory, TransportSocket,
+    ChannelFactory, E2ERegistryHandle, InterfaceHandle, IoErrorKind, MpscRecv, MpscSend,
+    OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram, SocketOptions, Timer,
+    TransportError, TransportFactory, TransportSocket, UnboundedRecv, UnboundedSend,
 };
 
 /// Factory that binds [`TokioSocket`]s configured via `socket2`.
@@ -323,6 +324,268 @@ fn map_io_error(e: &std::io::Error) -> TransportError {
         }
     }
     mapped
+}
+
+// ── TokioChannels ─────────────────────────────────────────────────────────
+
+/// [`ChannelFactory`] implementation backed by `tokio::sync::mpsc` and
+/// `tokio::sync::oneshot`. This is the default channel backend for `std +
+/// tokio` builds (active when the `client` or `server` feature is enabled).
+#[derive(Clone, Copy)]
+pub struct TokioChannels;
+
+// Newtype wrappers are needed because Rust does not allow implementing a
+// foreign trait on a foreign type (orphan rule). Wrapping the tokio receiver
+// types lets us impl OneshotRecv / UnboundedRecv on them.
+
+/// Newtype wrapping `tokio::sync::oneshot::Receiver<T>` to implement
+/// [`OneshotRecv`].
+pub struct TokioOneshotReceiver<T>(pub(crate) tokio::sync::oneshot::Receiver<T>);
+
+/// Newtype wrapping `tokio::sync::mpsc::UnboundedReceiver<T>` to implement
+/// [`UnboundedRecv`].
+pub struct TokioUnboundedReceiver<T>(pub(crate) tokio::sync::mpsc::UnboundedReceiver<T>);
+
+impl<T: Send + 'static> OneshotSend<T> for tokio::sync::oneshot::Sender<T> {
+    fn send(self, value: T) -> Result<(), T> {
+        tokio::sync::oneshot::Sender::send(self, value)
+    }
+}
+
+impl<T: Send + 'static> OneshotRecv<T> for TokioOneshotReceiver<T> {
+    async fn recv(self) -> Result<T, OneshotCancelled> {
+        self.0.await.map_err(|_| OneshotCancelled)
+    }
+}
+
+impl<T: Send + 'static> MpscSend<T> for tokio::sync::mpsc::Sender<T> {
+    async fn send(&self, value: T) -> Result<(), ()> {
+        tokio::sync::mpsc::Sender::send(self, value).await.map_err(|_| ())
+    }
+}
+
+impl<T: Send + 'static> MpscRecv<T> for tokio::sync::mpsc::Receiver<T> {
+    fn recv(&mut self) -> impl Future<Output = Option<T>> + Send + '_ {
+        self.recv()
+    }
+
+    fn poll_recv(&mut self, cx: &mut core::task::Context<'_>) -> core::task::Poll<Option<T>> {
+        self.poll_recv(cx)
+    }
+}
+
+impl<T: Send + 'static> UnboundedSend<T> for tokio::sync::mpsc::UnboundedSender<T> {
+    fn send_now(&self, value: T) -> Result<(), T> {
+        self.send(value).map_err(|e| e.0)
+    }
+}
+
+impl<T: Send + 'static> UnboundedRecv<T> for TokioUnboundedReceiver<T> {
+    fn recv(&mut self) -> impl Future<Output = Option<T>> + Send + '_ {
+        self.0.recv()
+    }
+}
+
+impl ChannelFactory for TokioChannels {
+    type OneshotSender<T: Send + 'static> = tokio::sync::oneshot::Sender<T>;
+    type OneshotReceiver<T: Send + 'static> = TokioOneshotReceiver<T>;
+    fn oneshot<T: Send + 'static>() -> (Self::OneshotSender<T>, Self::OneshotReceiver<T>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (tx, TokioOneshotReceiver(rx))
+    }
+
+    type BoundedSender<T: Send + 'static> = tokio::sync::mpsc::Sender<T>;
+    type BoundedReceiver<T: Send + 'static> = tokio::sync::mpsc::Receiver<T>;
+    fn bounded<T: Send + 'static, const N: usize>(
+    ) -> (Self::BoundedSender<T>, Self::BoundedReceiver<T>) {
+        tokio::sync::mpsc::channel(N)
+    }
+
+    type UnboundedSender<T: Send + 'static> = tokio::sync::mpsc::UnboundedSender<T>;
+    type UnboundedReceiver<T: Send + 'static> = TokioUnboundedReceiver<T>;
+    fn unbounded<T: Send + 'static>() -> (Self::UnboundedSender<T>, Self::UnboundedReceiver<T>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (tx, TokioUnboundedReceiver(rx))
+    }
+}
+
+// ── EmbassySyncChannels ───────────────────────────────────────────────────
+//
+// [`ChannelFactory`] backed by `embassy-sync::channel::Channel`. Active when
+// the `bare_metal` feature is enabled. Both sender and receiver hold an
+// `Arc<Channel<M, T, N>>` so the channel state lives on the heap — this is
+// the `std + alloc` path. A future no_alloc port (Phase 16) would store
+// the channel in a `static` and use borrowed `Sender` / `Receiver` handles
+// with `'static` lifetimes instead.
+
+#[cfg(feature = "bare_metal")]
+pub use embassy_channels::{
+    EmbassySyncBoundedReceiver, EmbassySyncBoundedSender, EmbassySyncChannels,
+    EmbassySyncOneshotReceiver, EmbassySyncOneshotSender, EmbassySyncUnboundedReceiver,
+    EmbassySyncUnboundedSender,
+};
+
+#[cfg(feature = "bare_metal")]
+mod embassy_channels {
+    use super::*;
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use embassy_sync::channel::Channel;
+    use std::sync::Arc;
+
+    // ── Oneshot (capacity-1 Channel) ──────────────────────────────────────
+
+    pub struct EmbassySyncOneshotSender<T: Send + 'static>(
+        Arc<Channel<CriticalSectionRawMutex, T, 1>>,
+    );
+
+    pub struct EmbassySyncOneshotReceiver<T: Send + 'static>(
+        Arc<Channel<CriticalSectionRawMutex, T, 1>>,
+    );
+
+    impl<T: Send + 'static> OneshotSend<T> for EmbassySyncOneshotSender<T> {
+        fn send(self, value: T) -> Result<(), T> {
+            self.0.try_send(value).map_err(|e| match e {
+                embassy_sync::channel::TrySendError::Full(v) => v,
+            })
+        }
+    }
+
+    impl<T: Send + 'static> OneshotRecv<T> for EmbassySyncOneshotReceiver<T> {
+        fn recv(self) -> impl Future<Output = Result<T, OneshotCancelled>> + Send {
+            let chan = self.0;
+            async move { Ok(chan.receive().await) }
+        }
+    }
+
+    // ── Bounded MPSC ──────────────────────────────────────────────────────
+
+    pub struct EmbassySyncBoundedSender<T: Send + 'static, const N: usize>(
+        Arc<Channel<CriticalSectionRawMutex, T, N>>,
+    );
+
+    pub struct EmbassySyncBoundedReceiver<T: Send + 'static, const N: usize>(
+        Arc<Channel<CriticalSectionRawMutex, T, N>>,
+    );
+
+    impl<T: Send + 'static, const N: usize> Clone for EmbassySyncBoundedSender<T, N> {
+        fn clone(&self) -> Self {
+            Self(self.0.clone())
+        }
+    }
+
+    impl<T: Send + 'static, const N: usize> MpscSend<T> for EmbassySyncBoundedSender<T, N> {
+        fn send(&self, value: T) -> impl Future<Output = Result<(), ()>> + Send + '_ {
+            let chan = self.0.clone();
+            async move {
+                chan.send(value).await;
+                Ok(())
+            }
+        }
+    }
+
+    impl<T: Send + 'static, const N: usize> MpscRecv<T> for EmbassySyncBoundedReceiver<T, N> {
+        fn recv(&mut self) -> impl Future<Output = Option<T>> + Send + '_ {
+            let chan = self.0.clone();
+            async move { Some(chan.receive().await) }
+        }
+
+        fn poll_recv(
+            &mut self,
+            cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<Option<T>> {
+            use core::pin::Pin;
+            // Try non-blocking receive first.
+            if let Ok(val) = self.0.try_receive() {
+                return core::task::Poll::Ready(Some(val));
+            }
+            // Channel is empty. Poll a ReceiveFuture to register the waker.
+            // SAFETY: `fut` is created, pinned (stack-only), polled once, then
+            // dropped immediately. No references to `fut` escape this scope.
+            let mut fut = self.0.receive();
+            // SAFETY: ReceiveFuture borrows self.0 (via Arc) — not self — and
+            // is not moved after this pin. The Arc ensures the channel outlives
+            // the future.
+            let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+            match pinned.poll(cx) {
+                core::task::Poll::Ready(val) => core::task::Poll::Ready(Some(val)),
+                core::task::Poll::Pending => core::task::Poll::Pending,
+            }
+        }
+    }
+
+    // ── Unbounded (large-capacity) MPSC ──────────────────────────────────
+
+    // Embassy-sync has no truly unbounded channel; we use a large capacity
+    // (128) as a practical substitute for the client's update channel.
+    const UNBOUNDED_CAP: usize = 128;
+
+    pub struct EmbassySyncUnboundedSender<T: Send + 'static>(
+        Arc<Channel<CriticalSectionRawMutex, T, UNBOUNDED_CAP>>,
+    );
+
+    pub struct EmbassySyncUnboundedReceiver<T: Send + 'static>(
+        Arc<Channel<CriticalSectionRawMutex, T, UNBOUNDED_CAP>>,
+    );
+
+    impl<T: Send + 'static> Clone for EmbassySyncUnboundedSender<T> {
+        fn clone(&self) -> Self {
+            Self(self.0.clone())
+        }
+    }
+
+    impl<T: Send + 'static> UnboundedSend<T> for EmbassySyncUnboundedSender<T> {
+        fn send_now(&self, value: T) -> Result<(), T> {
+            self.0.try_send(value).map_err(|e| match e {
+                embassy_sync::channel::TrySendError::Full(v) => v,
+            })
+        }
+    }
+
+    impl<T: Send + 'static> UnboundedRecv<T> for EmbassySyncUnboundedReceiver<T> {
+        fn recv(&mut self) -> impl Future<Output = Option<T>> + Send + '_ {
+            let chan = self.0.clone();
+            async move { Some(chan.receive().await) }
+        }
+    }
+
+    // ── ChannelFactory impl ───────────────────────────────────────────────
+
+    /// [`ChannelFactory`] backed by `embassy-sync::channel::Channel`.
+    ///
+    /// The `Arc<Channel<M, T, N>>` allocation makes this suitable for
+    /// `std + alloc` bare-metal builds. A future no_alloc port stores the
+    /// channel in a `static` and works with borrowed handles.
+    #[derive(Clone, Copy)]
+    pub struct EmbassySyncChannels;
+
+    impl ChannelFactory for EmbassySyncChannels {
+        type OneshotSender<T: Send + 'static> = EmbassySyncOneshotSender<T>;
+        type OneshotReceiver<T: Send + 'static> = EmbassySyncOneshotReceiver<T>;
+        fn oneshot<T: Send + 'static>() -> (Self::OneshotSender<T>, Self::OneshotReceiver<T>) {
+            let chan = Arc::new(Channel::new());
+            (EmbassySyncOneshotSender(chan.clone()), EmbassySyncOneshotReceiver(chan))
+        }
+
+        type BoundedSender<T: Send + 'static> = EmbassySyncBoundedSender<T, 16>;
+        type BoundedReceiver<T: Send + 'static> = EmbassySyncBoundedReceiver<T, 16>;
+        fn bounded<T: Send + 'static, const N: usize>(
+        ) -> (Self::BoundedSender<T>, Self::BoundedReceiver<T>) {
+            // The const N from the trait call site is ignored here — embassy-sync
+            // requires the capacity to be known at the impl level, not the call
+            // site. All bounded channels use capacity 16, which covers the
+            // worst case (discovery socket, which uses 16).
+            let chan: Arc<Channel<CriticalSectionRawMutex, T, 16>> = Arc::new(Channel::new());
+            (EmbassySyncBoundedSender(chan.clone()), EmbassySyncBoundedReceiver(chan))
+        }
+
+        type UnboundedSender<T: Send + 'static> = EmbassySyncUnboundedSender<T>;
+        type UnboundedReceiver<T: Send + 'static> = EmbassySyncUnboundedReceiver<T>;
+        fn unbounded<T: Send + 'static>(
+        ) -> (Self::UnboundedSender<T>, Self::UnboundedReceiver<T>) {
+            let chan = Arc::new(Channel::new());
+            (EmbassySyncUnboundedSender(chan.clone()), EmbassySyncUnboundedReceiver(chan))
+        }
+    }
 }
 
 #[cfg(test)]
