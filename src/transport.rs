@@ -104,6 +104,7 @@
 //! use core::future::Future;
 //! use core::net::{Ipv4Addr, SocketAddrV4};
 //! use core::time::Duration;
+//! use futures::future::BoxFuture;
 //! use simple_someip::transport::{
 //!     IoErrorKind, ReceivedDatagram, SocketOptions, Timer, TransportError,
 //!     TransportFactory, TransportSocket,
@@ -132,24 +133,31 @@
 //! }
 //!
 //! impl TransportSocket for TokioSocket {
-//!     fn send_to(
-//!         &self,
-//!         buf: &[u8],
+//!     // `BoxFuture` keeps this sketch short. The real `TokioSocket`
+//!     // shipped under the `client` / `server` features uses named
+//!     // future structs that wrap `poll_send_to` / `poll_recv_from`
+//!     // for zero-allocation per datagram — see `tokio_transport.rs`.
+//!     type SendFuture<'a> = BoxFuture<'a, Result<(), TransportError>>;
+//!     type RecvFuture<'a> = BoxFuture<'a, Result<ReceivedDatagram, TransportError>>;
+//!
+//!     fn send_to<'a>(
+//!         &'a self,
+//!         buf: &'a [u8],
 //!         target: SocketAddrV4,
-//!     ) -> impl Future<Output = Result<(), TransportError>> {
-//!         async move {
+//!     ) -> Self::SendFuture<'a> {
+//!         Box::pin(async move {
 //!             self.inner
 //!                 .send_to(buf, target)
 //!                 .await
 //!                 .map(|_| ())
 //!                 .map_err(|_| TransportError::Io(IoErrorKind::Other))
-//!         }
+//!         })
 //!     }
-//!     fn recv_from(
-//!         &self,
-//!         buf: &mut [u8],
-//!     ) -> impl Future<Output = Result<ReceivedDatagram, TransportError>> {
-//!         async move {
+//!     fn recv_from<'a>(
+//!         &'a self,
+//!         buf: &'a mut [u8],
+//!     ) -> Self::RecvFuture<'a> {
+//!         Box::pin(async move {
 //!             let (n, src) = self
 //!                 .inner
 //!                 .recv_from(buf)
@@ -164,7 +172,7 @@
 //!                 source,
 //!                 truncated: false,
 //!             })
-//!         }
+//!         })
 //!     }
 //!     fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
 //!         match self.inner.local_addr() {
@@ -348,9 +356,9 @@ pub struct ReceivedDatagram {
 /// A bound, configured UDP socket usable for SOME/IP message exchange.
 ///
 /// Implementations are obtained via [`TransportFactory::bind`]. The
-/// send/receive methods return `impl Future` so the trait is
-/// executor-agnostic; the caller awaits them on whatever runtime it
-/// owns. The smaller socket-level queries ([`Self::local_addr`],
+/// send/receive methods return associated future types so callers can
+/// require `Send` bounds when spawning socket loops on multithreaded
+/// executors. The smaller socket-level queries ([`Self::local_addr`],
 /// [`Self::join_multicast_v4`], [`Self::leave_multicast_v4`]) are
 /// synchronous because they are typically O(1) lookups on a backend's
 /// internal handle and do not benefit from yielding to the executor.
@@ -359,7 +367,39 @@ pub struct ReceivedDatagram {
 /// [`TransportSocket::join_multicast_v4`]; the bind-time
 /// [`SocketOptions::multicast_if_v4`] only selects the *outbound*
 /// multicast interface.
+///
+/// # Associated future types (Phase 12)
+///
+/// The [`SendFuture`](Self::SendFuture) and [`RecvFuture`](Self::RecvFuture)
+/// associated types let consumers express `Send` bounds on the futures
+/// returned by `send_to` and `recv_from` without requiring nightly-only
+/// Return-Type Notation (RTN, RFC 3654). This enables:
+///
+/// ```ignore
+/// fn spawn_loop<T: TransportSocket>(sock: T, spawner: impl Spawner)
+/// where
+///     T: Send + Sync + 'static,
+///     for<'a> T::SendFuture<'a>: Send,
+///     for<'a> T::RecvFuture<'a>: Send,
+/// {
+///     spawner.spawn(async move { /* use sock */ });
+/// }
+/// ```
+///
+/// `TokioSocket` implements these with `Send` futures; bare-metal
+/// implementations must do the same if they want to be used with
+/// multithreaded spawners.
 pub trait TransportSocket {
+    /// Future returned by [`Self::send_to`].
+    type SendFuture<'a>: Future<Output = Result<(), TransportError>>
+    where
+        Self: 'a;
+
+    /// Future returned by [`Self::recv_from`].
+    type RecvFuture<'a>: Future<Output = Result<ReceivedDatagram, TransportError>>
+    where
+        Self: 'a;
+
     /// Send `buf` to `target`. UDP is atomic — either the whole datagram
     /// is transmitted or an error is returned; there is no short-write
     /// case, which is why this method returns `()` on success rather than
@@ -385,11 +425,7 @@ pub trait TransportSocket {
     /// - [`TransportError::Unsupported`] if `target` is not representable
     ///   on a backend that only speaks a subset of IPv4 (rare; most
     ///   backends surface addressing issues as [`TransportError::Io`]).
-    fn send_to(
-        &self,
-        buf: &[u8],
-        target: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), TransportError>>;
+    fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddrV4) -> Self::SendFuture<'a>;
 
     /// Receive the next datagram into `buf`, returning a
     /// [`ReceivedDatagram`] carrying byte count, source, and a truncation
@@ -413,10 +449,7 @@ pub trait TransportSocket {
     /// A datagram whose payload exceeds `buf` is **not** an error; it is
     /// returned with [`ReceivedDatagram::truncated`] set to `true`. The
     /// caller decides whether to treat truncation as fatal.
-    fn recv_from(
-        &self,
-        buf: &mut [u8],
-    ) -> impl Future<Output = Result<ReceivedDatagram, TransportError>>;
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> Self::RecvFuture<'a>;
 
     /// Return the local address this socket is bound to. Useful for
     /// discovering the ephemeral port chosen by `bind(port: 0, ..)`.
@@ -836,18 +869,14 @@ mod tests {
     }
 
     impl TransportSocket for NullSocket {
-        fn send_to(
-            &self,
-            _buf: &[u8],
-            _target: SocketAddrV4,
-        ) -> impl Future<Output = Result<(), TransportError>> {
+        type SendFuture<'a> = core::future::Ready<Result<(), TransportError>>;
+        type RecvFuture<'a> = core::future::Ready<Result<ReceivedDatagram, TransportError>>;
+
+        fn send_to<'a>(&'a self, _buf: &'a [u8], _target: SocketAddrV4) -> Self::SendFuture<'a> {
             core::future::ready(Err(TransportError::Unsupported))
         }
 
-        fn recv_from(
-            &self,
-            _buf: &mut [u8],
-        ) -> impl Future<Output = Result<ReceivedDatagram, TransportError>> {
+        fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
             core::future::ready(Err(TransportError::Unsupported))
         }
 

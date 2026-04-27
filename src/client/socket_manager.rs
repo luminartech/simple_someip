@@ -22,16 +22,17 @@
 //!
 //! # Bare-metal readiness status
 //!
-//! **Completed abstractions (Phases 9-11):**
+//! **Completed abstractions (Phases 9-12):**
 //! - `Spawner` trait (Phase 9): task submission is pluggable.
 //! - `E2ERegistryHandle` / `InterfaceHandle` (Phase 10): lock handles
 //!   abstracted away from `Arc<Mutex<_>>` / `Arc<RwLock<_>>`.
 //! - `ChannelFactory` (Phase 11): channel primitives abstracted via
-//!   `TokioChannels` (std) and `EmbassySyncChannels` (bare_metal).
+//!   `TokioChannels` (std) and `EmbassySyncChannels` (`bare_metal`).
+//! - `TransportSocket` GATs (Phase 12): `Socket = TokioSocket` pin
+//!   removed; `SendFuture` / `RecvFuture` associated types express
+//!   `Send` bounds for spawnable socket loops.
 //!
 //! **Remaining gaps:**
-//! - **`F::Socket = TokioSocket`** bound on `bind_*` (Phase 12):
-//!   RTN-gap, see `bind_discovery_seeded_with_transport` docstring.
 //! - **Feature-flag split** (Phase 13): `client` / `server` still
 //!   pull in tokio + socket2 dependencies.
 //!
@@ -190,27 +191,35 @@ where
     /// and submits the socket's I/O loop through a caller-supplied
     /// [`Spawner`].
     ///
-    /// # Why `F::Socket` is still pinned to `TokioSocket`
+    /// # Socket bounds
     ///
-    /// The factory must still produce a
-    /// [`TokioSocket`](crate::tokio_transport::TokioSocket). Generalizing
-    /// to any `TransportSocket` requires stable-Rust Return-Type Notation
-    /// (RFC 3654) to express `Send` bounds on the trait's RPITIT methods
-    /// at this call site. RTN is nightly-only as of this writing; the
-    /// alternatives (GATs on `TransportSocket`, or boxed-future
-    /// type-erasure) each carry costs bigger than waiting — see the
-    /// module docstring for the full analysis.
+    /// Phase 12 relaxed the previous `F::Socket = TokioSocket` pin by
+    /// switching [`TransportSocket`] to GATs. The factory's socket type
+    /// must now satisfy:
+    ///
+    /// - `Send + Sync + 'static` — so the socket loop future can be
+    ///   spawned on a multithreaded executor and outlive its owner.
+    /// - `for<'a> SendFuture<'a>: Send` and `for<'a> RecvFuture<'a>: Send`
+    ///   — the named GAT futures must themselves be `Send` so the
+    ///   spawned loop crosses thread boundaries cleanly. The `for<'a>`
+    ///   higher-ranked bound expresses "for any borrow lifetime" without
+    ///   needing nightly-only Return-Type Notation (RFC 3654).
+    ///
+    /// Stable Rust cannot express `Send` bounds on the anonymous future
+    /// types of `async fn` trait methods at use sites, which is why
+    /// Phase 12 chose named associated types over RPITIT. See
+    /// [`TransportSocket::SendFuture`](crate::transport::TransportSocket::SendFuture).
     ///
     /// # Bare-metal path
     ///
     /// Phase 11 abstracted the channel primitives behind
     /// [`ChannelFactory`](crate::transport::ChannelFactory). The
     /// `bare_metal` feature activates `EmbassySyncChannels` as an
-    /// alternative to `TokioChannels`. However, this function still
-    /// requires the `F::Socket = TokioSocket` bound (Phase 12 gap).
-    /// Once Phase 12 relaxes that bound via GATs and Phase 13 splits
-    /// the feature flags, a bare-metal consumer can use
-    /// `SocketManager` directly with a custom socket backend.
+    /// alternative to `TokioChannels`. With Phase 12's relaxed socket
+    /// bound, a bare-metal consumer can now supply their own
+    /// `TransportSocket` impl (e.g. wrapping `embassy_net::udp::UdpSocket`)
+    /// as long as it is `Send + Sync + 'static` and its `SendFuture` /
+    /// `RecvFuture` GAT projections are `Send` for every borrow lifetime.
     pub async fn bind_discovery_seeded_with_transport<F, S, R>(
         factory: &F,
         spawner: &S,
@@ -221,7 +230,10 @@ where
         multicast_loopback: bool,
     ) -> Result<Self, Error>
     where
-        F: TransportFactory<Socket = crate::tokio_transport::TokioSocket>,
+        F: TransportFactory,
+        F::Socket: Send + Sync + 'static,
+        for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
+        for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
         S: Spawner,
         R: E2ERegistryHandle,
     {
@@ -279,9 +291,15 @@ where
 
     /// Variant of [`Self::bind`] that constructs the underlying socket
     /// through a caller-supplied [`TransportFactory`] and submits the
-    /// socket's I/O loop through a caller-supplied [`Spawner`]. See
-    /// [`Self::bind_discovery_seeded_with_transport`] for the factory
-    /// bound rationale.
+    /// socket's I/O loop through a caller-supplied [`Spawner`].
+    ///
+    /// # Generic bounds
+    ///
+    /// The factory's socket must be `Send + Sync + 'static` and its async
+    /// methods must return `Send` futures so the socket loop can be
+    /// spawned onto a multithreaded executor. See
+    /// [`TransportSocket::SendFuture`](crate::transport::TransportSocket::SendFuture)
+    /// for background on the GAT approach.
     pub async fn bind_with_transport<F, S, R>(
         factory: &F,
         spawner: &S,
@@ -289,7 +307,10 @@ where
         e2e_registry: R,
     ) -> Result<Self, Error>
     where
-        F: TransportFactory<Socket = crate::tokio_transport::TokioSocket>,
+        F: TransportFactory,
+        F::Socket: Send + Sync + 'static,
+        for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
+        for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
         S: Spawner,
         R: E2ERegistryHandle,
     {
@@ -397,24 +418,40 @@ where
         _ = MpscRecv::recv(&mut receiver).await;
     }
 
-    /// Build the I/O loop over a concrete [`TokioSocket`] as a future.
-    /// Callers are expected to `tokio::spawn` this future alongside
-    /// [`Self`]; the socket loop runs concurrently with its owner so
+    /// Build the I/O loop over any [`TransportSocket`] as a future.
+    /// Callers are expected to spawn this future alongside [`Self`];
+    /// the socket loop runs concurrently with its owner so
     /// `SocketManager::send`'s internal oneshot wait can complete.
     /// The reasoning for why the spawn hasn't been hoisted is in the
     /// module-level docs.
     ///
-    /// The function remains tied to `TokioSocket` concretely because
-    /// generalizing it to `T: TransportSocket` needs stable-Rust
-    /// return-type notation to express `Send` bounds on the trait's
-    /// RPITIT methods — still nightly as of this writing.
+    /// # `Send` bounds
+    ///
+    /// The returned future must be `Send + 'static` for `Spawner::spawn`.
+    /// This works on stable Rust (no RTN required) because:
+    /// - `T: Send + Sync + 'static` makes the captured socket `Send`.
+    /// - The HRTBs `for<'a> T::SendFuture<'a>: Send` and
+    ///   `for<'a> T::RecvFuture<'a>: Send` make the GAT-projected futures
+    ///   `Send` for every borrow lifetime, which is what propagates
+    ///   `Send` to the enclosing `async` block.
+    /// - All other captured state (`buf`, channels, registry) is `Send`.
+    ///
+    /// Bare-metal `TransportSocket` impls must ensure their `SendFuture`
+    /// and `RecvFuture` associated types are `Send` (e.g. by avoiding
+    /// `Rc` / `RefCell` in the future state) for this to compile.
     #[allow(clippy::too_many_lines)]
-    async fn socket_loop_future<R: E2ERegistryHandle>(
-        socket: crate::tokio_transport::TokioSocket,
+    async fn socket_loop_future<T, R>(
+        socket: T,
         rx_tx: C::BoundedSender<Result<ReceivedMessage<MessageDefinitions>, Error>>,
         mut tx_rx: C::BoundedReceiver<SendMessage<MessageDefinitions, C>>,
         e2e_registry: R,
-    ) {
+    )
+    where
+        T: TransportSocket + Send + Sync + 'static,
+        for<'a> T::SendFuture<'a>: Send,
+        for<'a> T::RecvFuture<'a>: Send,
+        R: E2ERegistryHandle,
+    {
         // Maximum number of consecutive `recv_from` errors tolerated before
         // the socket loop gives up. A single failure (transient I/O, peer
         // RST, ICMP port-unreachable amplified into `ConnectionRefused`)
@@ -1030,6 +1067,115 @@ mod tests {
         // Parse and confirm it's a SOME/IP-SD message, not garbage.
         let view = MessageView::parse(&buf[..len]).unwrap();
         assert_eq!(view.header().message_id(), crate::protocol::MessageId::SD);
+    }
+
+    /// Phase 12 witness: proves `bind_with_transport` accepts a factory
+    /// whose `Socket` type is **not** `TokioSocket`. The Phase 12 gate
+    /// (no `F::Socket = TokioSocket` pin) is a type-system claim, and
+    /// without this test the trait surface could regress to a Tokio
+    /// pin in a future phase without any test catching it. The
+    /// existing `bind_with_transport_*` tests both hardcode
+    /// `type Socket = TokioSocket`, which only covers the previous
+    /// pinned-bound shape.
+    ///
+    /// `WrappedSocket` is a transparent newtype around `TokioSocket`
+    /// with its own `TransportSocket` impl — the *type identity* is
+    /// what matters for this test, not the behavior. The end-to-end
+    /// send-and-verify confirms the spawned I/O loop also carries
+    /// through the wrapper, not just the bind call.
+    #[tokio::test]
+    async fn bind_with_transport_accepts_non_tokio_socket_type() {
+        use crate::tokio_transport::{TokioSocket, TokioTransport};
+        use crate::transport::TransportError;
+        use core::future::Future;
+
+        struct WrappedSocket(TokioSocket);
+
+        impl TransportSocket for WrappedSocket {
+            // Borrow the inner socket's named GAT futures; this keeps
+            // the wrapper zero-overhead while still exercising a
+            // distinct `Self::Socket` type at the bind call site.
+            type SendFuture<'a> = <TokioSocket as TransportSocket>::SendFuture<'a>;
+            type RecvFuture<'a> = <TokioSocket as TransportSocket>::RecvFuture<'a>;
+
+            fn send_to<'a>(
+                &'a self,
+                buf: &'a [u8],
+                target: SocketAddrV4,
+            ) -> Self::SendFuture<'a> {
+                self.0.send_to(buf, target)
+            }
+            fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+                self.0.recv_from(buf)
+            }
+            fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
+                self.0.local_addr()
+            }
+            fn join_multicast_v4(
+                &self,
+                group: Ipv4Addr,
+                iface: Ipv4Addr,
+            ) -> Result<(), TransportError> {
+                self.0.join_multicast_v4(group, iface)
+            }
+            fn leave_multicast_v4(
+                &self,
+                group: Ipv4Addr,
+                iface: Ipv4Addr,
+            ) -> Result<(), TransportError> {
+                self.0.leave_multicast_v4(group, iface)
+            }
+        }
+
+        struct WrappingFactory;
+        impl TransportFactory for WrappingFactory {
+            type Socket = WrappedSocket;
+            fn bind(
+                &self,
+                addr: SocketAddrV4,
+                options: &SocketOptions,
+            ) -> impl Future<Output = Result<Self::Socket, TransportError>> {
+                let opts = *options;
+                async move {
+                    let inner = TokioTransport.bind(addr, &opts).await?;
+                    Ok(WrappedSocket(inner))
+                }
+            }
+        }
+
+        // Compile-time witness: this `let` binding only typechecks if
+        // `bind_with_transport` accepts `F::Socket = WrappedSocket` —
+        // i.e. the previous `F::Socket = TokioSocket` pin is gone.
+        let mut sm = SocketManager::<TestPayload>::bind_with_transport(
+            &WrappingFactory,
+            &TokioSpawner,
+            0,
+            test_registry(),
+        )
+        .await
+        .expect("bind via wrapping factory");
+        let sm_port = sm.port();
+
+        // Runtime witness: traffic flows through the wrapper's
+        // `send_to` and the spawned I/O loop's `recv_from`.
+        let recv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_port = recv.local_addr().unwrap().port();
+
+        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        sm.send(SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port), msg)
+            .await
+            .expect("send via wrapping factory");
+
+        let mut buf = [0u8; UDP_BUFFER_SIZE];
+        let (len, _from) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), recv.recv_from(&mut buf))
+                .await
+                .expect("timed out waiting for datagram")
+                .expect("recv failed");
+        assert!(len > 0, "empty datagram");
+        let view = MessageView::parse(&buf[..len]).unwrap();
+        assert_eq!(view.header().message_id(), crate::protocol::MessageId::SD);
+        let _ = sm_port;
     }
 
     /// Negative test: a factory that returns
