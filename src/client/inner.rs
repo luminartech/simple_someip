@@ -25,7 +25,7 @@ use crate::{
     protocol::{self, Message},
     tokio_transport::{TokioSpawner, TokioTimer, TokioTransport},
     traits::PayloadWireFormat,
-    transport::Spawner,
+    transport::{E2ERegistryHandle, Spawner},
 };
 
 use super::error::Error;
@@ -290,7 +290,11 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
     }
 }
 
-pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat, S: Spawner = TokioSpawner> {
+pub(super) struct Inner<
+    PayloadDefinitions: PayloadWireFormat,
+    S: Spawner = TokioSpawner,
+    R: E2ERegistryHandle = Arc<Mutex<E2ERegistry>>,
+> {
     /// MPSC Receiver used to receive control messages from outer client
     control_receiver: Receiver<ControlMessage<PayloadDefinitions>>,
     /// Queue of pending control messages to process
@@ -322,7 +326,7 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat, S: Spawner = Toki
     sd_session_id: u16,
     sd_session_has_wrapped: bool,
     /// Shared E2E registry for runtime E2E configuration
-    e2e_registry: Arc<Mutex<E2ERegistry>>,
+    e2e_registry: R,
     /// Enable multicast loopback on SD sockets for same-host testing
     multicast_loopback: bool,
     /// Task-spawner used by `bind_*` to drive per-socket I/O loops.
@@ -333,7 +337,7 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat, S: Spawner = Toki
     phantom: std::marker::PhantomData<PayloadDefinitions>,
 }
 
-impl<P: PayloadWireFormat, S: Spawner> std::fmt::Debug for Inner<P, S> {
+impl<P: PayloadWireFormat, S: Spawner, R: E2ERegistryHandle> std::fmt::Debug for Inner<P, S, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inner")
             .field("interface", &self.interface)
@@ -345,10 +349,11 @@ impl<P: PayloadWireFormat, S: Spawner> std::fmt::Debug for Inner<P, S> {
     }
 }
 
-impl<PayloadDefinitions, S> Inner<PayloadDefinitions, S>
+impl<PayloadDefinitions, S, R> Inner<PayloadDefinitions, S, R>
 where
     PayloadDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
     S: Spawner + Send + Sync + 'static,
+    R: E2ERegistryHandle,
 {
     /// Construct an `Inner` and return the control/update channels plus
     /// the run-loop future. The caller must drive the future on a Tokio
@@ -362,7 +367,7 @@ where
     /// exists yet — it's planned alongside the bare-metal port.
     pub fn build(
         interface: Ipv4Addr,
-        e2e_registry: Arc<Mutex<E2ERegistry>>,
+        e2e_registry: R,
         multicast_loopback: bool,
         spawner: S,
     ) -> (
@@ -404,7 +409,7 @@ where
                 &TokioTransport,
                 &self.spawner,
                 self.interface,
-                Arc::clone(&self.e2e_registry),
+                self.e2e_registry.clone(),
                 self.sd_session_id,
                 self.sd_session_has_wrapped,
                 self.multicast_loopback,
@@ -449,7 +454,7 @@ where
             &TokioTransport,
             &self.spawner,
             port,
-            Arc::clone(&self.e2e_registry),
+            self.e2e_registry.clone(),
         )
         .await?;
         let bound_port = unicast_socket.port();

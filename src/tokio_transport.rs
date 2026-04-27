@@ -36,11 +36,15 @@ use core::future::Future;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::time::Duration;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::UdpSocket;
 
+use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile};
+use crate::e2e::Error as E2EError;
+use crate::e2e::E2ERegistry;
 use crate::transport::{
-    IoErrorKind, ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory,
-    TransportSocket,
+    E2ERegistryHandle, InterfaceHandle, IoErrorKind, ReceivedDatagram, SocketOptions, Timer,
+    TransportError, TransportFactory, TransportSocket,
 };
 
 /// Factory that binds [`TokioSocket`]s configured via `socket2`.
@@ -184,6 +188,53 @@ impl crate::transport::Spawner for TokioSpawner {
         // want cancel-on-abort semantics should spawn at their own
         // call site; this trait is intentionally minimal.
         drop(tokio::spawn(future));
+    }
+}
+
+impl E2ERegistryHandle for Arc<Mutex<E2ERegistry>> {
+    fn register(&self, key: E2EKey, profile: E2EProfile) {
+        self.lock().expect("e2e registry lock poisoned").register(key, profile);
+    }
+
+    fn unregister(&self, key: &E2EKey) {
+        self.lock().expect("e2e registry lock poisoned").unregister(key);
+    }
+
+    fn contains_key(&self, key: &E2EKey) -> bool {
+        self.lock().expect("e2e registry lock poisoned").contains_key(key)
+    }
+
+    fn protect(
+        &self,
+        key: E2EKey,
+        payload: &[u8],
+        upper_header: [u8; 8],
+        output: &mut [u8],
+    ) -> Option<Result<usize, E2EError>> {
+        self.lock()
+            .expect("e2e registry lock poisoned")
+            .protect(key, payload, upper_header, output)
+    }
+
+    fn check<'a>(
+        &self,
+        key: E2EKey,
+        payload: &'a [u8],
+        upper_header: [u8; 8],
+    ) -> Option<(E2ECheckStatus, &'a [u8])> {
+        self.lock()
+            .expect("e2e registry lock poisoned")
+            .check(key, payload, upper_header)
+    }
+}
+
+impl InterfaceHandle for Arc<RwLock<Ipv4Addr>> {
+    fn get(&self) -> Ipv4Addr {
+        *self.read().expect("interface lock poisoned")
+    }
+
+    fn set(&self, addr: Ipv4Addr) {
+        *self.write().expect("interface lock poisoned") = addr;
     }
 }
 

@@ -214,6 +214,9 @@ use core::future::Future;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::time::Duration;
 
+use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile};
+use crate::e2e::Error as E2EError;
+
 /// Portable I/O error kinds surfaced by transport implementations.
 ///
 /// This is a deliberately small vocabulary — anything that does not fit
@@ -593,6 +596,70 @@ pub trait Spawner {
     fn spawn(&self, future: impl Future<Output = ()> + Send + 'static);
 }
 
+/// Shared handle to the runtime E2E configuration registry.
+///
+/// Abstracts over `Arc<Mutex<E2ERegistry>>` on `std` and over
+/// critical-section-backed primitives (e.g. `embassy_sync::blocking_mutex`)
+/// on bare metal. All methods take `&self` and provide interior-mutable
+/// access. Implementations are required to be `Clone` so the handle can be
+/// cheaply shared between the `Client` (or `Server`) handle and its inner
+/// event loop.
+pub trait E2ERegistryHandle: Clone + Send + Sync + 'static {
+    /// Register an E2E profile for the given key, replacing any prior entry.
+    fn register(&self, key: E2EKey, profile: E2EProfile);
+
+    /// Remove the E2E configuration for the given key. No-op if absent.
+    fn unregister(&self, key: &E2EKey);
+
+    /// Returns `true` if a profile is registered for `key`.
+    fn contains_key(&self, key: &E2EKey) -> bool;
+
+    /// Run E2E protect for `key` if configured, writing to `output`.
+    ///
+    /// Returns `None` if no profile is registered for `key`.
+    /// Returns `Some(Err(_))` if protection fails (e.g. buffer too small).
+    /// Returns `Some(Ok(len))` on success; `len` is the number of bytes
+    /// written to `output`.
+    fn protect(
+        &self,
+        key: E2EKey,
+        payload: &[u8],
+        upper_header: [u8; 8],
+        output: &mut [u8],
+    ) -> Option<Result<usize, E2EError>>;
+
+    /// Run E2E check for `key` if configured.
+    ///
+    /// Returns `None` if no profile is registered for `key`. Otherwise
+    /// returns the check status and the effective payload slice — the
+    /// E2E header is stripped on success; the original bytes are returned
+    /// on check failure so the caller can decide how to handle it.
+    ///
+    /// The returned slice borrows from `payload`, not from this handle.
+    fn check<'a>(
+        &self,
+        key: E2EKey,
+        payload: &'a [u8],
+        upper_header: [u8; 8],
+    ) -> Option<(E2ECheckStatus, &'a [u8])>;
+}
+
+/// Shared handle to the local interface address.
+///
+/// Abstracts over `Arc<RwLock<Ipv4Addr>>` on `std`. All clones of a
+/// `Client` share the same handle, so writes from one clone (e.g.
+/// `Client::set_interface`) are visible to all others.
+///
+/// On bare metal, where `Client` is not `Clone`, a trivial implementation
+/// wrapping a `core::cell::Cell<Ipv4Addr>` suffices.
+pub trait InterfaceHandle: Clone + Send + Sync + 'static {
+    /// Returns the current interface address.
+    fn get(&self) -> Ipv4Addr;
+
+    /// Updates the stored interface address.
+    fn set(&self, addr: Ipv4Addr);
+}
+
 #[cfg(test)]
 mod tests {
     //! The traits are pure interfaces — these tests only verify that
@@ -754,5 +821,64 @@ mod tests {
         let e = TransportError::Io(IoErrorKind::TimedOut);
         assert_eq!(e, TransportError::Io(IoErrorKind::TimedOut));
         assert_ne!(e, TransportError::AddressInUse);
+    }
+
+    // Minimal no-op implementations to verify that E2ERegistryHandle and
+    // InterfaceHandle are implementable without any executor machinery.
+    #[derive(Clone)]
+    struct NullE2ERegistry;
+
+    impl E2ERegistryHandle for NullE2ERegistry {
+        fn register(&self, _key: E2EKey, _profile: E2EProfile) {}
+        fn unregister(&self, _key: &E2EKey) {}
+        fn contains_key(&self, _key: &E2EKey) -> bool {
+            false
+        }
+        fn protect(
+            &self,
+            _key: E2EKey,
+            _payload: &[u8],
+            _upper_header: [u8; 8],
+            _output: &mut [u8],
+        ) -> Option<Result<usize, E2EError>> {
+            None
+        }
+        fn check<'a>(
+            &self,
+            _key: E2EKey,
+            _payload: &'a [u8],
+            _upper_header: [u8; 8],
+        ) -> Option<(E2ECheckStatus, &'a [u8])> {
+            None
+        }
+    }
+
+    #[derive(Clone)]
+    struct NullInterface(Ipv4Addr);
+
+    impl InterfaceHandle for NullInterface {
+        fn get(&self) -> Ipv4Addr {
+            self.0
+        }
+        fn set(&self, _addr: Ipv4Addr) {}
+    }
+
+    #[test]
+    fn null_e2e_registry_compiles() {
+        let r = NullE2ERegistry;
+        let key = E2EKey::new(0, 0);
+        r.register(key, crate::e2e::E2EProfile::Profile4(
+            crate::e2e::Profile4Config::new(0, 8),
+        ));
+        assert!(!r.contains_key(&key));
+        assert!(r.check(key, b"hello", [0; 8]).is_none());
+    }
+
+    #[test]
+    fn null_interface_get_set() {
+        let h = NullInterface(Ipv4Addr::LOCALHOST);
+        assert_eq!(h.get(), Ipv4Addr::LOCALHOST);
+        h.set(Ipv4Addr::UNSPECIFIED); // no-op in null impl
+        assert_eq!(h.get(), Ipv4Addr::LOCALHOST); // unchanged
     }
 }
