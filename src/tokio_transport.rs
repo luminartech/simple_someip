@@ -34,9 +34,12 @@
 
 use core::future::Future;
 use core::net::{Ipv4Addr, SocketAddrV4};
+use core::pin::Pin;
+use core::task::{Context, Poll};
 use core::time::Duration;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
+use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
 use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile};
@@ -114,45 +117,97 @@ impl TransportFactory for TokioTransport {
     }
 }
 
+/// Named future returned by [`TokioSocket::send_to`].
+///
+/// Drives [`tokio::net::UdpSocket::poll_send_to`] directly so the GAT
+/// associated type ([`TransportSocket::SendFuture`]) can be named on
+/// stable Rust without heap-allocating a [`futures::future::BoxFuture`]
+/// per datagram. Auto-derives `Send`.
+pub struct SendTo<'a> {
+    socket: &'a UdpSocket,
+    buf: &'a [u8],
+    target: SocketAddr,
+}
+
+impl Future for SendTo<'_> {
+    type Output = Result<(), TransportError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.socket.poll_send_to(cx, self.buf, self.target) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(_n)) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(map_io_error(&e))),
+        }
+    }
+}
+
+/// Named future returned by [`TokioSocket::recv_from`].
+///
+/// Drives [`tokio::net::UdpSocket::poll_recv_from`] directly so the GAT
+/// associated type ([`TransportSocket::RecvFuture`]) can be named on
+/// stable Rust without heap-allocating a [`futures::future::BoxFuture`]
+/// per datagram. Auto-derives `Send`.
+pub struct RecvFrom<'a> {
+    socket: &'a UdpSocket,
+    buf: &'a mut [u8],
+}
+
+impl Future for RecvFrom<'_> {
+    type Output = Result<ReceivedDatagram, TransportError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // No self-references; safe to project to &mut Self.
+        let me = self.get_mut();
+        let mut read_buf = ReadBuf::new(me.buf);
+        match me.socket.poll_recv_from(cx, &mut read_buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(map_io_error(&e))),
+            Poll::Ready(Ok(src)) => {
+                let n = read_buf.filled().len();
+                let source = match src {
+                    SocketAddr::V4(v4) => v4,
+                    // SOME/IP is IPv4-only; an IPv6 source on our socket is
+                    // either impossible (v4 bind) or a misconfiguration.
+                    SocketAddr::V6(_) => return Poll::Ready(Err(TransportError::Unsupported)),
+                };
+                // Caveat: `tokio::net::UdpSocket::poll_recv_from` silently
+                // truncates when the caller's `buf` is smaller than the
+                // datagram and returns only the bytes that fit — it does
+                // NOT expose a truncation flag. Surfacing a reliable
+                // `truncated: bool` here would require a platform-specific
+                // `recvmsg`/MSG_TRUNC path (libc + unsafe), which is
+                // deferred to the phase 10+ bare-metal refactor. Until
+                // then, this field is always `false` for the Tokio
+                // backend; callers must not rely on it for truncation
+                // detection. This is documented on
+                // `ReceivedDatagram::truncated`'s field doc.
+                Poll::Ready(Ok(ReceivedDatagram {
+                    bytes_received: n,
+                    source,
+                    truncated: false,
+                }))
+            }
+        }
+    }
+}
+
 impl TransportSocket for TokioSocket {
-    async fn send_to(&self, buf: &[u8], target: SocketAddrV4) -> Result<(), TransportError> {
-        self.inner
-            .send_to(buf, target)
-            .await
-            .map(|_| ())
-            .map_err(|e| map_io_error(&e))
+    type SendFuture<'a> = SendTo<'a>;
+    type RecvFuture<'a> = RecvFrom<'a>;
+
+    fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddrV4) -> Self::SendFuture<'a> {
+        SendTo {
+            socket: &self.inner,
+            buf,
+            target: SocketAddr::V4(target),
+        }
     }
 
-    async fn recv_from(&self, buf: &mut [u8]) -> Result<ReceivedDatagram, TransportError> {
-        let (n, src) = self
-            .inner
-            .recv_from(buf)
-            .await
-            .map_err(|e| map_io_error(&e))?;
-        let source = match src {
-            SocketAddr::V4(v4) => v4,
-            SocketAddr::V6(_) => {
-                // SOME/IP is IPv4-only; an IPv6 source on our socket is
-                // either impossible (v4 bind) or a misconfiguration.
-                return Err(TransportError::Unsupported);
-            }
-        };
-        // Caveat: `tokio::net::UdpSocket::recv_from` silently
-        // truncates when the caller's `buf` is smaller than the
-        // datagram and returns only the bytes that fit — it does
-        // NOT expose a truncation flag. Surfacing a reliable
-        // `truncated: bool` here would require a platform-specific
-        // `recvmsg`/MSG_TRUNC path (libc + unsafe), which is
-        // deferred to the phase 10+ bare-metal refactor. Until
-        // then, this field is always `false` for the Tokio
-        // backend; callers must not rely on it for truncation
-        // detection. This is documented on
-        // `ReceivedDatagram::truncated`'s field doc.
-        Ok(ReceivedDatagram {
-            bytes_received: n,
-            source,
-            truncated: false,
-        })
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+        RecvFrom {
+            socket: &self.inner,
+            buf,
+        }
     }
 
     fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
@@ -427,10 +482,14 @@ pub use embassy_channels::{
 
 #[cfg(feature = "bare_metal")]
 mod embassy_channels {
-    use super::*;
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::channel::Channel;
     use std::sync::Arc;
+    use core::future::Future;
+    use crate::transport::{
+        ChannelFactory, MpscRecv, MpscSend, OneshotCancelled, OneshotRecv, OneshotSend,
+        UnboundedRecv, UnboundedSend,
+    };
 
     // ── Oneshot (capacity-1 Channel) ──────────────────────────────────────
 
@@ -553,7 +612,7 @@ mod embassy_channels {
     /// [`ChannelFactory`] backed by `embassy-sync::channel::Channel`.
     ///
     /// The `Arc<Channel<M, T, N>>` allocation makes this suitable for
-    /// `std + alloc` bare-metal builds. A future no_alloc port stores the
+    /// `std + alloc` bare-metal builds. A future `no_alloc` port stores the
     /// channel in a `static` and works with borrowed handles.
     #[derive(Clone, Copy)]
     pub struct EmbassySyncChannels;
