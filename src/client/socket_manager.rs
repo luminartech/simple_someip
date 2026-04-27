@@ -32,22 +32,26 @@
 //!   removed; `SendFuture` / `RecvFuture` associated types express
 //!   `Send` bounds for spawnable socket loops.
 //!
-//! **Remaining gaps:**
-//! - **Feature-flag split** (Phase 13): `client` / `server` still
-//!   pull in tokio + socket2 dependencies.
+//! **Phase 13 (client half) complete:** the `client` feature no longer
+//! pulls tokio or socket2. The full `Client` / `Inner` / `SocketManager`
+//! types — including the `bind` / `bind_discovery_seeded` convenience
+//! constructors that default to `TokioTransport` + `TokioSpawner` — are
+//! gated behind the new `client-tokio` feature, which layers tokio +
+//! socket2 on top of `client`.
 //!
-//! Until Phase 13 completes, enabling `feature = "client"` pulls
-//! in `std + tokio + socket2`. The `bare_metal` feature flag activates
-//! `EmbassySyncChannels` but does not make this module `no_alloc` on
-//! its own. For `no_alloc` SOME/IP usage today, consume `protocol`,
-//! `e2e`, and the `transport` trait layer directly — the `bare_metal`
-//! example workspace member demonstrates that surface.
+//! **Remaining gaps:**
+//! - **Server-side split** (deferred to Phase 14): `feature = "server"`
+//!   still pulls tokio + socket2 because `server::sd_state` /
+//!   `server::subscription_manager` reference tokio types directly.
+//!
+//! For `no_alloc` SOME/IP usage today, consume `protocol`, `e2e`, and
+//! the `transport` trait layer directly — the `bare_metal` example
+//! workspace member demonstrates that surface.
 
 use crate::{
     UDP_BUFFER_SIZE,
     e2e::{E2ECheckStatus, E2EKey},
     protocol::{Message, MessageView, sd},
-    tokio_transport::TokioChannels,
     traits::{PayloadWireFormat, WireFormat},
     transport::{
         ChannelFactory, E2ERegistryHandle, MpscRecv, MpscSend, OneshotRecv, OneshotSend,
@@ -79,7 +83,7 @@ pub struct ReceivedMessage<P> {
 }
 
 /// Structure representing a request to send a message
-pub struct SendMessage<PayloadDefinitions: Send + 'static, C: ChannelFactory = TokioChannels> {
+pub struct SendMessage<PayloadDefinitions: Send + 'static, C: ChannelFactory> {
     pub target_addr: SocketAddrV4,
     pub message: Message<PayloadDefinitions>,
     response: C::OneshotSender<Result<(), Error>>,
@@ -98,7 +102,7 @@ impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> std::fmt::Debug f
 /// block returns this scalar so the pinned per-iteration `send_fut` /
 /// `recv_fut` futures drop before the processing body — releasing their
 /// `&mut buf` / `&mut socket` borrows.
-enum Outcome<P: PayloadWireFormat + Send + 'static, C: ChannelFactory = TokioChannels> {
+enum Outcome<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> {
     Send(Option<SendMessage<P, C>>),
     Recv(Result<ReceivedDatagram, crate::transport::TransportError>),
 }
@@ -122,7 +126,7 @@ impl<PayloadDefinitions: PayloadWireFormat + Send + 'static, C: ChannelFactory>
     }
 }
 
-pub struct SocketManager<PayloadDefinitions: Send + 'static, C: ChannelFactory = TokioChannels> {
+pub struct SocketManager<PayloadDefinitions: Send + 'static, C: ChannelFactory> {
     receiver: C::BoundedReceiver<Result<ReceivedMessage<PayloadDefinitions>, Error>>,
     sender: C::BoundedSender<SendMessage<PayloadDefinitions, C>>,
     local_port: u16,
@@ -164,7 +168,9 @@ where
     ///
     /// Currently `#[cfg(test)]`-gated: production callers reach the
     /// socket through the `_with_transport` variant so the `Spawner`
-    /// trait can be exercised end-to-end.
+    /// trait can be exercised end-to-end. The enclosing `socket_manager`
+    /// module is itself gated to `feature = "client-tokio"`, so this
+    /// method is implicitly client-tokio-only.
     #[cfg(test)]
     pub async fn bind_discovery_seeded<R: E2ERegistryHandle>(
         interface: Ipv4Addr,
@@ -652,12 +658,12 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "client-tokio"))]
 mod tests {
     use super::*;
     use crate::e2e::E2ERegistry;
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
-    use crate::tokio_transport::TokioSpawner;
+    use crate::tokio_transport::{TokioChannels, TokioSpawner};
     use std::format;
     use std::sync::{Arc, Mutex};
     use std::vec;
@@ -666,7 +672,7 @@ mod tests {
     // abstraction via `TokioTransport`.
     use tokio::net::UdpSocket;
 
-    type TestSocketManager = SocketManager<TestPayload>;
+    type TestSocketManager = SocketManager<TestPayload, TokioChannels>;
 
     fn test_registry() -> Arc<Mutex<E2ERegistry>> {
         Arc::new(Mutex::new(E2ERegistry::new()))
@@ -688,7 +694,7 @@ mod tests {
         use crate::transport::OneshotRecv;
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
         let msg = Message::new_sd(1, &empty_sd_header());
-        let (rx, send_msg) = SendMessage::<TestPayload>::new(target, msg);
+        let (rx, send_msg) = SendMessage::<TestPayload, TokioChannels>::new(target, msg);
         assert_eq!(send_msg.target_addr, target);
         // Verify the oneshot channel works
         send_msg.response.send(Ok(())).unwrap();
@@ -798,7 +804,7 @@ mod tests {
     async fn test_send_message_debug() {
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
         let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
-        let (_rx, send_msg) = SendMessage::<TestPayload>::new(target, msg);
+        let (_rx, send_msg) = SendMessage::<TestPayload, TokioChannels>::new(target, msg);
         let s = format!("{send_msg:?}");
         assert!(s.contains("SendMessage"));
     }
@@ -924,7 +930,7 @@ mod tests {
         reg.register(key, E2EProfile::Profile4(Profile4Config::new(0, 15)));
         let e2e_registry = Arc::new(Mutex::new(reg));
 
-        let mut sm = SocketManager::<RawPayload>::bind(0, e2e_registry)
+        let mut sm = SocketManager::<RawPayload, TokioChannels>::bind(0, e2e_registry)
             .await
             .unwrap();
 
@@ -1031,7 +1037,7 @@ mod tests {
             }
         }
 
-        let mut sm = SocketManager::<TestPayload>::bind_with_transport(
+        let mut sm = SocketManager::<TestPayload, TokioChannels>::bind_with_transport(
             &ForceReuseFactory,
             &TokioSpawner,
             0,
@@ -1146,7 +1152,7 @@ mod tests {
         // Compile-time witness: this `let` binding only typechecks if
         // `bind_with_transport` accepts `F::Socket = WrappedSocket` —
         // i.e. the previous `F::Socket = TokioSocket` pin is gone.
-        let mut sm = SocketManager::<TestPayload>::bind_with_transport(
+        let mut sm = SocketManager::<TestPayload, TokioChannels>::bind_with_transport(
             &WrappingFactory,
             &TokioSpawner,
             0,

@@ -58,14 +58,20 @@
 //! - Phase 12: `TransportSocket` GATs — `SendFuture` / `RecvFuture`
 //!   express `Send` bounds without RTN; `Socket = TokioSocket` pin
 //!   removed from `bind_*` functions
+//! - Phase 13 (partial): client-side feature-flag split. `client` no
+//!   longer pulls tokio + socket2; the tokio convenience defaults
+//!   (`Client::new`, `TokioSpawner`, etc.) live behind a new
+//!   `client-tokio` feature.
 //!
 //! **Remaining gaps:**
-//! 1. **Feature-flag split** (Phase 13): `client` / `server` still
-//!    pull in tokio + socket2. A future split (`client` vs
-//!    `client-tokio`) will make the core types `no_std`-compatible.
-//!
-//! Until those are closed, `feature = "client"` / `feature = "server"`
-//! pull in `std + tokio + socket2`.
+//! 1. **Server-side feature-flag split** (Phase 13 server half,
+//!    deferred to Phase 14): `feature = "server"` still pulls in
+//!    tokio + socket2 because `server::sd_state` and
+//!    `server::subscription_manager` reference `tokio::net::UdpSocket`
+//!    / `tokio::sync::RwLock` / `socket2::Socket` directly. Phase 14
+//!    (server parallel) is the phase that retargets the server to the
+//!    trait surface; once that lands, `server` will gain the same
+//!    `server` + `server-tokio` split.
 //!
 //! # Recommendation for `no_alloc` consumers today
 //!
@@ -407,7 +413,8 @@ fn main() {
     println!(
         "note: trait layer (TransportSocket + TransportFactory + Timer + \
          Spawner + ChannelFactory) exercised end-to-end. Phases 9-12 \
-         complete. Remaining gap: client/server feature flags still pull \
-         in tokio + socket2 (Phase 13). See top-of-file docblock."
+         complete; phase 13 (client half) complete. Remaining: phase 14 \
+         server-trait retargeting + server-side `server-tokio` split. \
+         See top-of-file docblock."
     );
 }

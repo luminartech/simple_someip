@@ -30,7 +30,7 @@ use simple_someip::e2e::{E2ECheckStatus, E2EKey, E2EProfile, Profile4Config};
 use simple_someip::protocol::{Header, Message, MessageId, sd};
 use simple_someip::server::ServerConfig;
 use simple_someip::{
-    Client, ClientUpdate, ClientUpdates, PayloadWireFormat, RawPayload, Server, VecSdHeader,
+    Client, ClientUpdate, PayloadWireFormat, RawPayload, Server, TokioChannels, VecSdHeader,
 };
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -52,7 +52,12 @@ fn empty_sd_header() -> VecSdHeader {
     }
 }
 
-type TestClient = Client<RawPayload>;
+type TestClient = Client<
+    RawPayload,
+    std::sync::Arc<std::sync::Mutex<simple_someip::e2e::E2ERegistry>>,
+    std::sync::Arc<std::sync::RwLock<Ipv4Addr>>,
+    TokioChannels,
+>;
 
 /// The full `Server` binds the SD port (30490) on its interface. Keep it on a
 /// distinct loopback IP from the client (which stays on `127.0.0.1`) so the
@@ -286,7 +291,7 @@ async fn test_add_endpoint_and_send_to_service() {
         "expected ServiceNotFound after remove, got {result:?}"
     );
     // Verify that PendingResponse is importable from the crate root
-    let _: fn() -> Option<simple_someip::PendingResponse<RawPayload>> = || None;
+    let _: fn() -> Option<simple_someip::PendingResponse<RawPayload, TokioChannels>> = || None;
 
     client.shut_down();
     server_handle.abort();
