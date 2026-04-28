@@ -2234,10 +2234,7 @@ mod tests {
         with_default(subscriber, || {
             // 0 endpoints → warn! "No IPv4 endpoint" branch.
             let iter_empty = sd::OptionIter::new(&[]);
-            assert_eq!(
-                extract_subscriber_endpoint(&iter_empty, 0, 0, 0, 0),
-                None
-            );
+            assert_eq!(extract_subscriber_endpoint(&iter_empty, 0, 0, 0, 0), None);
 
             // 1 endpoint → trace! "Found IPv4 endpoint" branch.
             let mut buf_one = [0u8; 32];

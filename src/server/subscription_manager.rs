@@ -325,9 +325,12 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
     ) -> impl Future<Output = ()> + Send + '_ {
         let this = self.clone();
         async move {
-            this.write()
-                .await
-                .unsubscribe(service_id, instance_id, event_group_id, subscriber_addr);
+            this.write().await.unsubscribe(
+                service_id,
+                instance_id,
+                event_group_id,
+                subscriber_addr,
+            );
         }
     }
 

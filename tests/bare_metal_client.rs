@@ -132,11 +132,7 @@ impl TransportSocket for MockSocket {
     type SendFuture<'a> = MockSendFut;
     type RecvFuture<'a> = MockRecvFut<'a>;
 
-    fn send_to<'a>(
-        &'a self,
-        buf: &'a [u8],
-        target: SocketAddrV4,
-    ) -> Self::SendFuture<'a> {
+    fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddrV4) -> Self::SendFuture<'a> {
         MockSendFut {
             pipe: Arc::clone(&self.pipe),
             bytes: Some(buf.to_vec()),
@@ -155,19 +151,11 @@ impl TransportSocket for MockSocket {
         Ok(self.local)
     }
 
-    fn join_multicast_v4(
-        &self,
-        _group: Ipv4Addr,
-        _iface: Ipv4Addr,
-    ) -> Result<(), TransportError> {
+    fn join_multicast_v4(&self, _group: Ipv4Addr, _iface: Ipv4Addr) -> Result<(), TransportError> {
         Ok(())
     }
 
-    fn leave_multicast_v4(
-        &self,
-        _group: Ipv4Addr,
-        _iface: Ipv4Addr,
-    ) -> Result<(), TransportError> {
+    fn leave_multicast_v4(&self, _group: Ipv4Addr, _iface: Ipv4Addr) -> Result<(), TransportError> {
         Ok(())
     }
 }

@@ -364,7 +364,9 @@ impl<T: Send + 'static> OneshotRecv<T> for TokioOneshotReceiver<T> {
 
 impl<T: Send + 'static> MpscSend<T> for tokio::sync::mpsc::Sender<T> {
     async fn send(&self, value: T) -> Result<(), ()> {
-        tokio::sync::mpsc::Sender::send(self, value).await.map_err(|_| ())
+        tokio::sync::mpsc::Sender::send(self, value)
+            .await
+            .map_err(|_| ())
     }
 }
 
@@ -393,10 +395,6 @@ impl<T: Send + 'static> UnboundedRecv<T> for TokioUnboundedReceiver<T> {
 impl ChannelFactory for TokioChannels {
     type OneshotSender<T: Send + 'static> = tokio::sync::oneshot::Sender<T>;
     type OneshotReceiver<T: Send + 'static> = TokioOneshotReceiver<T>;
-    fn oneshot<T: Send + 'static>() -> (Self::OneshotSender<T>, Self::OneshotReceiver<T>) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        (tx, TokioOneshotReceiver(rx))
-    }
 
     // Tokio's `mpsc` channels store capacity at runtime, so the
     // const-generic `N` is informational only — it does not affect
@@ -404,14 +402,44 @@ impl ChannelFactory for TokioChannels {
     // `embassy_channels`).
     type BoundedSender<T: Send + 'static, const N: usize> = tokio::sync::mpsc::Sender<T>;
     type BoundedReceiver<T: Send + 'static, const N: usize> = tokio::sync::mpsc::Receiver<T>;
-    fn bounded<T: Send + 'static, const N: usize>(
-    ) -> (Self::BoundedSender<T, N>, Self::BoundedReceiver<T, N>) {
-        tokio::sync::mpsc::channel(N)
-    }
 
     type UnboundedSender<T: Send + 'static> = tokio::sync::mpsc::UnboundedSender<T>;
     type UnboundedReceiver<T: Send + 'static> = TokioUnboundedReceiver<T>;
-    fn unbounded<T: Send + 'static>() -> (Self::UnboundedSender<T>, Self::UnboundedReceiver<T>) {
+
+    // The three constructor methods (`oneshot`, `bounded`, `unbounded`)
+    // use the trait's default bodies, which delegate to the per-`T`
+    // `*Pooled<TokioChannels>` blanket impls below. Tokio has a single
+    // shared allocator, so every `T: Send + 'static` is poolable; the
+    // blanket impls capture that.
+}
+
+// Blanket `*Pooled` impls for every `T: Send + 'static` against
+// `TokioChannels`. Tokio has a single shared allocator and so does not
+// need per-`T` storage — each call constructs a fresh channel.
+impl<T: Send + 'static> crate::transport::OneshotPooled<TokioChannels> for T {
+    fn oneshot_pair() -> (
+        <TokioChannels as ChannelFactory>::OneshotSender<T>,
+        <TokioChannels as ChannelFactory>::OneshotReceiver<T>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (tx, TokioOneshotReceiver(rx))
+    }
+}
+
+impl<T: Send + 'static, const N: usize> crate::transport::BoundedPooled<TokioChannels, N> for T {
+    fn bounded_pair() -> (
+        <TokioChannels as ChannelFactory>::BoundedSender<T, N>,
+        <TokioChannels as ChannelFactory>::BoundedReceiver<T, N>,
+    ) {
+        tokio::sync::mpsc::channel(N)
+    }
+}
+
+impl<T: Send + 'static> crate::transport::UnboundedPooled<TokioChannels> for T {
+    fn unbounded_pair() -> (
+        <TokioChannels as ChannelFactory>::UnboundedSender<T>,
+        <TokioChannels as ChannelFactory>::UnboundedReceiver<T>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (tx, TokioUnboundedReceiver(rx))
     }
@@ -425,7 +453,6 @@ impl ChannelFactory for TokioChannels {
 // without tokio could no longer reach `EmbassySyncChannels`. The impl
 // has been moved to `crate::embassy_channels` (gated only by
 // `feature = "bare_metal"`) so it is reachable from any client build.
-
 
 #[cfg(test)]
 mod tests {
