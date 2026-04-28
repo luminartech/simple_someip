@@ -31,7 +31,7 @@
 //! | `client-tokio` | no | Adds the `Client::new` / `TokioSpawner` / `TokioTransport` convenience defaults; implies `client` + tokio + socket2 |
 //! | `server` | no | Trait-surface server; implies `std` + futures (no tokio) |
 //! | `server-tokio` | no | Adds the `Server::new` / `TokioTransport` / `TokioTimer` convenience defaults; implies `server` + tokio + socket2 |
-//! | `bare_metal` | no | Pure marker — does not enable any crate code. See `examples/bare_metal/` (the trait-surface canary) for the full bare-metal-readiness story. |
+//! | `bare_metal` | no | Pure marker — does not enable any crate code. See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable bare-metal integration examples. |
 //!
 //! The default feature set is `["std"]`, which links `std` and enables
 //! the `RawPayload` / `VecSdHeader` helpers. For a minimal build with
@@ -39,9 +39,9 @@
 //! `e2e` modules only — pass `--no-default-features`. The
 //! trait-surface canary at `examples/bare_metal/` depends on the crate
 //! with `default-features = false, features = ["bare_metal"]` and
-//! validates that configuration when the `bare_metal` workspace member
-//! is built in isolation (`cargo build -p bare_metal` or
-//! `cargo run -p bare_metal`), rather than as part of a workspace-wide
+//! validates that configuration when the bare-metal workspace members are
+//! built in isolation (`cargo build -p bare_metal_client` /
+//! `cargo build -p bare_metal_server`), rather than as part of a workspace-wide
 //! build where features may be unified across members.
 //!
 //! ## Examples
