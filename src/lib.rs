@@ -205,9 +205,9 @@ pub use server::{Server, ServerDeps, SubscriptionHandle};
 #[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
 pub use transport::{
-    ChannelFactory, E2ERegistryHandle, InterfaceHandle, IoErrorKind, MpscRecv, MpscSend,
-    OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram, SocketOptions, Spawner, Timer,
-    TransportError, TransportFactory, TransportSocket, UnboundedRecv, UnboundedSend,
+    ChannelFactory, E2ERegistryHandle, InterfaceHandle, IoErrorKind, LocalSpawner, MpscRecv,
+    MpscSend, OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram, SocketOptions, Spawner,
+    Timer, TransportError, TransportFactory, TransportSocket, UnboundedRecv, UnboundedSend,
 };
 #[cfg(feature = "bare_metal")]
 pub use transport::{AtomicInterfaceHandle, StaticE2EHandle, StaticE2EStorage};

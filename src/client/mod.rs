@@ -28,6 +28,7 @@
 //! port (future), whoever drives the futures must arrange storage for them
 //! (either a `static` or a heap allocator); the capacity constants plus
 //! [`crate::UDP_BUFFER_SIZE`] are the knobs for trimming this footprint.
+mod bind_dispatch;
 mod error;
 mod inner;
 mod service_registry;
@@ -216,7 +217,6 @@ impl<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory>
 pub struct ClientDeps<F, S, Tm, R, I>
 where
     F: TransportFactory,
-    S: Spawner,
     Tm: Timer,
     R: E2ERegistryHandle,
     I: InterfaceHandle,
@@ -479,15 +479,79 @@ where
             interface,
         } = deps;
         let initial_addr = interface.get();
-        let (control_sender, update_receiver, run_future) =
-            Inner::<MessageDefinitions, F, S, Tm, R, C>::build(
-                initial_addr,
-                e2e_registry.clone(),
-                multicast_loopback,
-                factory,
-                spawner,
-                timer,
-            );
+        let dispatch = bind_dispatch::SpawnerDispatch { factory, spawner };
+        let (control_sender, update_receiver, run_future) = Inner::<
+            MessageDefinitions,
+            Tm,
+            R,
+            C,
+            bind_dispatch::SpawnerDispatch<F, S>,
+        >::build(
+            initial_addr,
+            e2e_registry.clone(),
+            multicast_loopback,
+            dispatch,
+            timer,
+        );
+        let client = Self {
+            interface,
+            control_sender,
+            e2e_registry,
+        };
+        let updates = ClientUpdates { update_receiver };
+        (client, updates, run_future)
+    }
+
+    /// `!Send` counterpart to [`Self::new_with_deps`].
+    ///
+    /// Constructs a `Client` whose run-loop and per-socket loops are
+    /// submitted through a [`LocalSpawner`](crate::transport::LocalSpawner)
+    /// (single-threaded executor) rather than a
+    /// [`Spawner`](crate::transport::Spawner). The factory's socket type
+    /// and its GAT futures are not required to be `Send`. The returned
+    /// run-loop future is `'static` but `!Send`.
+    ///
+    /// Use this constructor on embassy with `task-arena = 0`, on
+    /// tokio's `LocalSet`, on async-std's `LocalExecutor`, etc., where
+    /// the executor pins futures to a single thread.
+    #[allow(clippy::type_complexity)]
+    #[must_use = "the returned run-loop future must be spawned (e.g. via the LocalSpawner) for the client to make progress"]
+    pub fn new_with_deps_local<F, S, Tm>(
+        deps: ClientDeps<F, S, Tm, R, I>,
+        multicast_loopback: bool,
+    ) -> (
+        Self,
+        ClientUpdates<MessageDefinitions, C>,
+        impl core::future::Future<Output = ()> + 'static,
+    )
+    where
+        F: TransportFactory + 'static,
+        F::Socket: 'static,
+        S: crate::transport::LocalSpawner + 'static,
+        Tm: Timer + 'static,
+    {
+        let ClientDeps {
+            factory,
+            spawner,
+            timer,
+            e2e_registry,
+            interface,
+        } = deps;
+        let initial_addr = interface.get();
+        let dispatch = bind_dispatch::LocalSpawnerDispatch { factory, spawner };
+        let (control_sender, update_receiver, run_future) = Inner::<
+            MessageDefinitions,
+            Tm,
+            R,
+            C,
+            bind_dispatch::LocalSpawnerDispatch<F, S>,
+        >::build(
+            initial_addr,
+            e2e_registry.clone(),
+            multicast_loopback,
+            dispatch,
+            timer,
+        );
         let client = Self {
             interface,
             control_sender,

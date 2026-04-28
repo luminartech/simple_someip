@@ -60,7 +60,7 @@ use crate::{
     traits::{PayloadWireFormat, WireFormat},
     transport::{
         ChannelFactory, E2ERegistryHandle, MpscRecv, MpscSend, OneshotRecv, OneshotSend,
-        ReceivedDatagram, SocketOptions, Spawner, TransportFactory, TransportSocket,
+        LocalSpawner, ReceivedDatagram, SocketOptions, Spawner, TransportFactory, TransportSocket,
     },
 };
 
@@ -295,6 +295,53 @@ where
         })
     }
 
+    /// `!Send` counterpart to [`Self::bind_discovery_seeded_with_transport`].
+    ///
+    /// See [`Self::bind_with_transport_local`] for the rationale.
+    ///
+    /// Currently a foundation API: no in-crate caller wires it through
+    /// to a `Client::new_with_deps_local`. Downstream embassy-style
+    /// integrations can compose it directly with [`LocalSpawner`].
+    #[allow(dead_code)]
+    pub async fn bind_discovery_seeded_with_transport_local<F, S, R>(
+        factory: &F,
+        spawner: &S,
+        interface: Ipv4Addr,
+        e2e_registry: R,
+        session_id: u16,
+        session_has_wrapped: bool,
+        multicast_loopback: bool,
+    ) -> Result<Self, Error>
+    where
+        F: TransportFactory,
+        F::Socket: 'static,
+        S: LocalSpawner,
+        R: E2ERegistryHandle,
+    {
+        let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
+        let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
+        let options = {
+            let mut o = SocketOptions::new();
+            o.reuse_address = true;
+            o.reuse_port = true;
+            o.multicast_if_v4 = Some(interface);
+            o.multicast_loop_v4 = multicast_loopback;
+            o
+        };
+        let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, sd::MULTICAST_PORT);
+        let socket = factory.bind(bind_addr, &options).await?;
+        socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
+        spawner.spawn_local(fut);
+        Ok(Self {
+            receiver: rx_rx,
+            sender: tx_tx,
+            local_port: sd::MULTICAST_PORT,
+            session_id: session_id.max(1),
+            session_has_wrapped,
+        })
+    }
+
     /// Bind a unicast SOME/IP socket on `port` using the default
     /// `crate::tokio_transport::TokioTransport` and
     /// `crate::tokio_transport::TokioSpawner` backends (rendered as
@@ -360,6 +407,47 @@ where
         let port = socket.local_addr()?.port();
         let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
         spawner.spawn(fut);
+        Ok(Self {
+            receiver: rx_rx,
+            sender: tx_tx,
+            local_port: port,
+            session_id: 1,
+            session_has_wrapped: false,
+        })
+    }
+
+    /// `!Send` counterpart to [`Self::bind_with_transport`].
+    ///
+    /// Identical to the Send variant except: the factory's socket and
+    /// its GAT futures are not required to be `Send`, and the per-socket
+    /// I/O loop is submitted through a [`LocalSpawner`] (single-threaded
+    /// executor) rather than a [`Spawner`] (multi-threaded). Use this
+    /// path when the underlying transport (e.g. embassy-net) produces
+    /// non-`Send` socket state.
+    pub async fn bind_with_transport_local<F, S, R>(
+        factory: &F,
+        spawner: &S,
+        port: u16,
+        e2e_registry: R,
+    ) -> Result<Self, Error>
+    where
+        F: TransportFactory,
+        F::Socket: 'static,
+        S: LocalSpawner,
+        R: E2ERegistryHandle,
+    {
+        let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
+        let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
+        let options = {
+            let mut o = SocketOptions::new();
+            o.reuse_address = true;
+            o
+        };
+        let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+        let socket = factory.bind(bind_addr, &options).await?;
+        let port = socket.local_addr()?.port();
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
+        spawner.spawn_local(fut);
         Ok(Self {
             receiver: rx_rx,
             sender: tx_tx,
@@ -478,9 +566,7 @@ where
         mut tx_rx: C::BoundedReceiver<SendMessage<MessageDefinitions, C>, 16>,
         e2e_registry: R,
     ) where
-        T: TransportSocket + Send + Sync + 'static,
-        for<'a> T::SendFuture<'a>: Send,
-        for<'a> T::RecvFuture<'a>: Send,
+        T: TransportSocket + 'static,
         R: E2ERegistryHandle,
     {
         // Maximum number of consecutive `recv_from` errors tolerated before

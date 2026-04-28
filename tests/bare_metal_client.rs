@@ -45,8 +45,8 @@ use simple_someip::define_static_channels;
 use simple_someip::e2e::E2ERegistry;
 use simple_someip::protocol::sd::RebootFlag;
 use simple_someip::transport::{
-    ReceivedDatagram, SocketOptions, Spawner, Timer, TransportError, TransportFactory,
-    TransportSocket,
+    LocalSpawner, ReceivedDatagram, SocketOptions, Spawner, Timer, TransportError,
+    TransportFactory, TransportSocket,
 };
 use simple_someip::{Client, ClientDeps, RawPayload};
 
@@ -63,12 +63,17 @@ define_static_channels! {
         (Result<RebootFlag, ClientError>, 4),
     ],
     bounded: [
-        ((ControlMessage<RawPayload, TestStaticChannels>, 4), 1),
+        // Pool size 4 so the witness tests in this file can claim
+        // ControlMessage channels in parallel without colliding —
+        // cargo test runs tests on multiple threads by default, the
+        // pool is process-global, and slot release happens
+        // asynchronously (after the spawned run-loop task drops).
+        ((ControlMessage<RawPayload, TestStaticChannels>, 4), 4),
         ((SendMessage<RawPayload, TestStaticChannels>, 16), 4),
         ((Result<ReceivedMessage<RawPayload>, ClientError>, 16), 4),
     ],
     unbounded: [
-        (ClientUpdate<RawPayload>, 1),
+        (ClientUpdate<RawPayload>, 4),
     ],
 }
 
@@ -218,6 +223,17 @@ impl Spawner for TokioBackedSpawner {
     }
 }
 
+/// LocalSpawner shim for the `!Send` Client construction witness.
+/// Uses tokio's `LocalSet` semantics via `tokio::task::spawn_local`,
+/// which the `#[tokio::test(flavor = "current_thread")]` runtime sets
+/// up for us implicitly via `LocalSet::run_until`.
+struct LocalTokioSpawner;
+impl LocalSpawner for LocalTokioSpawner {
+    fn spawn_local(&self, future: impl Future<Output = ()> + 'static) {
+        drop(tokio::task::spawn_local(future));
+    }
+}
+
 // ── Test ──────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -270,4 +286,48 @@ async fn client_constructible_without_client_tokio_feature() {
     drop(client);
 
     tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+/// Witnesses that `Client::new_with_deps_local` accepts a
+/// [`LocalSpawner`] and returns a (possibly `!Send`) run-loop future.
+/// Runs inside a `LocalSet` so `tokio::task::spawn_local` is available.
+#[tokio::test]
+async fn client_constructible_with_local_spawner() {
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let pipe = Arc::new(MockPipe::default());
+            let factory = MockFactory {
+                pipe: Arc::clone(&pipe),
+                local_port: Arc::new(Mutex::new(0)),
+            };
+
+            let interface_handle: Arc<std::sync::RwLock<Ipv4Addr>> =
+                Arc::new(std::sync::RwLock::new(Ipv4Addr::LOCALHOST));
+            let e2e_handle: Arc<Mutex<E2ERegistry>> =
+                Arc::new(Mutex::new(E2ERegistry::new()));
+
+            let (client, _updates, run_fut) = Client::<
+                RawPayload,
+                Arc<Mutex<E2ERegistry>>,
+                Arc<std::sync::RwLock<Ipv4Addr>>,
+                TestStaticChannels,
+            >::new_with_deps_local(
+                ClientDeps {
+                    factory,
+                    spawner: LocalTokioSpawner,
+                    timer: MockTimer,
+                    e2e_registry: e2e_handle,
+                    interface: interface_handle,
+                },
+                false,
+            );
+
+            let run_handle = tokio::task::spawn_local(run_fut);
+            assert_eq!(client.interface(), Ipv4Addr::LOCALHOST);
+
+            run_handle.abort();
+            drop(client);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        })
+        .await;
 }
