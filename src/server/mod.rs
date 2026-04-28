@@ -29,8 +29,9 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
     vec,
-    vec::Vec,
 };
+#[cfg(test)]
+use std::vec::Vec;
 
 #[cfg(feature = "server-tokio")]
 use crate::e2e::E2ERegistry;
@@ -516,17 +517,14 @@ where
         let (sid, reboot_flag) = self.sd_state.next_session_id_with_reboot_flag();
         let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &options);
 
-        let mut sd_data = Vec::new();
-        sd_payload.encode(&mut sd_data)?;
-
-        let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
-
-        let mut buffer = Vec::new();
-        someip_header.encode(&mut buffer)?;
-        buffer.extend_from_slice(&sd_data);
+        let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
+        let sd_data_len = sd_payload.encode_to_slice(&mut buffer[16..])?;
+        let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
+        someip_header.encode_to_slice(&mut buffer[..16])?;
+        let total_len = 16 + sd_data_len;
 
         let target_v4 = socket_addr_v4(target)?;
-        self.sd_socket.send_to(&buffer, target_v4).await?;
+        self.sd_socket.send_to(&buffer[..total_len], target_v4).await?;
         tracing::debug!(
             "Sent unicast OfferService to {} for service 0x{:04X}",
             target,
@@ -994,16 +992,14 @@ where
         let (sid, reboot_flag) = self.sd_state.next_session_id_with_reboot_flag();
         let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &[]);
 
-        let mut sd_data = Vec::new();
-        sd_payload.encode(&mut sd_data)?;
-        let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
-
-        let mut buffer = Vec::new();
-        someip_header.encode(&mut buffer)?;
-        buffer.extend_from_slice(&sd_data);
+        let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
+        let sd_data_len = sd_payload.encode_to_slice(&mut buffer[16..])?;
+        let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
+        someip_header.encode_to_slice(&mut buffer[..16])?;
+        let total_len = 16 + sd_data_len;
 
         let subscriber_v4 = socket_addr_v4(subscriber)?;
-        self.sd_socket.send_to(&buffer, subscriber_v4).await?;
+        self.sd_socket.send_to(&buffer[..total_len], subscriber_v4).await?;
 
         tracing::debug!(
             "Sent SubscribeAck to {} for service 0x{:04X}, eventgroup 0x{:04X}",
@@ -1043,16 +1039,14 @@ where
         let (sid, reboot_flag) = self.sd_state.next_session_id_with_reboot_flag();
         let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &[]);
 
-        let mut sd_data = Vec::new();
-        sd_payload.encode(&mut sd_data)?;
-        let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
-
-        let mut buffer = Vec::new();
-        someip_header.encode(&mut buffer)?;
-        buffer.extend_from_slice(&sd_data);
+        let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
+        let sd_data_len = sd_payload.encode_to_slice(&mut buffer[16..])?;
+        let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
+        someip_header.encode_to_slice(&mut buffer[..16])?;
+        let total_len = 16 + sd_data_len;
 
         let subscriber_v4 = socket_addr_v4(subscriber)?;
-        self.sd_socket.send_to(&buffer, subscriber_v4).await?;
+        self.sd_socket.send_to(&buffer[..total_len], subscriber_v4).await?;
 
         tracing::warn!(
             "Sent SubscribeNack to {} for service 0x{:04X}, eventgroup 0x{:04X} (reason: {})",

@@ -7,7 +7,16 @@ use crate::e2e::E2EKey;
 use crate::protocol::{Header, Message};
 use crate::traits::{PayloadWireFormat, WireFormat};
 use crate::transport::{E2ERegistryHandle, TransportSocket};
+use core::net::SocketAddrV4;
+use heapless::Vec as HeaplessVec;
 use std::sync::Arc;
+
+/// Maximum subscribers visited per `publish_event` / `publish_raw_event`
+/// call. Matches the per-event-group capacity in
+/// [`super::subscription_manager`]. Used to size the stack-allocated
+/// snapshot buffer that lets us release the subscription read lock
+/// before dispatching sends.
+const MAX_FANOUT: usize = 16;
 
 /// Publishes events to subscribers.
 ///
@@ -62,11 +71,28 @@ where
         event_group_id: u16,
         message: &Message<P>,
     ) -> Result<usize, Error> {
-        // Get subscribers
-        let subscribers = self
+        // Snapshot subscriber addresses into a stack-allocated buffer so
+        // we can release the subscription read lock before doing async
+        // sends. This avoids a per-event heap allocation that the old
+        // `get_subscribers -> Vec<Subscriber>` API forced.
+        let mut subscribers: HeaplessVec<SocketAddrV4, MAX_FANOUT> = HeaplessVec::new();
+        let mut overflow = false;
+        let total = self
             .subscriptions
-            .get_subscribers(service_id, instance_id, event_group_id)
+            .for_each_subscriber(service_id, instance_id, event_group_id, |sub| {
+                if subscribers.push(sub.address).is_err() {
+                    overflow = true;
+                }
+            })
             .await;
+        if overflow {
+            tracing::warn!(
+                "publish_event truncated subscriber list to {} for service 0x{:04X} (had {} total)",
+                MAX_FANOUT,
+                service_id,
+                total,
+            );
+        }
 
         if subscribers.is_empty() {
             tracing::trace!(
@@ -149,23 +175,22 @@ where
 
         let datagram = &buffer[..message_length];
 
-        // Send to all subscribers
+        // Send to all snapshotted subscribers
         let mut sent_count = 0;
-        for subscriber in &subscribers {
-            match self.socket.send_to(datagram, subscriber.address).await {
+        for addr in &subscribers {
+            match self.socket.send_to(datagram, *addr).await {
                 Ok(()) => {
                     sent_count += 1;
                     tracing::trace!(
                         "Sent event to subscriber {} ({} bytes)",
-                        subscriber.address,
+                        addr,
                         message_length
                     );
                 }
                 Err(e) => {
                     tracing::error!(
                         "Failed to send event to subscriber {}: {:?}",
-                        subscriber.address,
-                        e
+                        addr, e
                     );
                 }
             }
@@ -200,11 +225,26 @@ where
         interface_version: u8,
         payload: &[u8],
     ) -> Result<usize, Error> {
-        // Get subscribers
-        let subscribers = self
+        // Snapshot subscriber addresses into a stack buffer (see
+        // publish_event for rationale).
+        let mut subscribers: HeaplessVec<SocketAddrV4, MAX_FANOUT> = HeaplessVec::new();
+        let mut overflow = false;
+        let total = self
             .subscriptions
-            .get_subscribers(service_id, instance_id, event_group_id)
+            .for_each_subscriber(service_id, instance_id, event_group_id, |sub| {
+                if subscribers.push(sub.address).is_err() {
+                    overflow = true;
+                }
+            })
             .await;
+        if overflow {
+            tracing::warn!(
+                "publish_raw_event truncated subscriber list to {} for service 0x{:04X} (had {} total)",
+                MAX_FANOUT,
+                service_id,
+                total,
+            );
+        }
 
         if subscribers.is_empty() {
             return Ok(0);
@@ -263,19 +303,15 @@ where
         buffer[header_len..total_len].copy_from_slice(payload);
         let datagram = &buffer[..total_len];
 
-        // Send to all subscribers
+        // Send to all snapshotted subscribers
         let mut sent_count = 0;
-        for subscriber in &subscribers {
-            match self.socket.send_to(datagram, subscriber.address).await {
+        for addr in &subscribers {
+            match self.socket.send_to(datagram, *addr).await {
                 Ok(()) => {
                     sent_count += 1;
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "Failed to send raw event to {}: {:?}",
-                        subscriber.address,
-                        e
-                    );
+                    tracing::error!("Failed to send raw event to {}: {:?}", addr, e);
                 }
             }
         }
@@ -298,11 +334,10 @@ where
         instance_id: u16,
         event_group_id: u16,
     ) -> bool {
-        !self
-            .subscriptions
-            .get_subscribers(service_id, instance_id, event_group_id)
+        self.subscriptions
+            .for_each_subscriber(service_id, instance_id, event_group_id, |_| {})
             .await
-            .is_empty()
+            > 0
     }
 
     /// Register a subscriber for an event group.
@@ -388,9 +423,8 @@ where
         event_group_id: u16,
     ) -> usize {
         self.subscriptions
-            .get_subscribers(service_id, instance_id, event_group_id)
+            .for_each_subscriber(service_id, instance_id, event_group_id, |_| {})
             .await
-            .len()
     }
 }
 

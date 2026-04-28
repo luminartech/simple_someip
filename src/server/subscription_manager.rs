@@ -262,13 +262,14 @@ impl Default for SubscriptionManager {
 /// Shared handle to the server's subscription table.
 ///
 /// Abstracts over `Arc<RwLock<SubscriptionManager>>` on `std` and over
-/// critical-section-backed equivalents on bare metal. All methods return
-/// futures so the implementation can block on an async read/write lock
-/// without holding a guard across an `await` point visible to callers.
+/// critical-section-backed equivalents on bare metal. The futures
+/// returned by the methods are not required to be `Send`, allowing
+/// single-threaded executors (embassy-style) to satisfy the trait
+/// without an `Arc<RwLock>`-style shared state.
 ///
 /// Both `Server` and `EventPublisher` clone the same handle at construction
 /// time; the underlying subscription state is shared between them.
-pub trait SubscriptionHandle: Clone + Send + Sync + 'static {
+pub trait SubscriptionHandle: Clone + 'static {
     /// Add a subscriber to an event group.
     ///
     /// Idempotent: if the subscriber is already present, this is a no-op
@@ -280,7 +281,7 @@ pub trait SubscriptionHandle: Clone + Send + Sync + 'static {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), SubscribeError>> + Send + '_;
+    ) -> impl Future<Output = Result<(), SubscribeError>> + '_;
 
     /// Remove a subscriber from an event group.
     fn unsubscribe(
@@ -289,18 +290,29 @@ pub trait SubscriptionHandle: Clone + Send + Sync + 'static {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = ()> + Send + '_;
+    ) -> impl Future<Output = ()> + '_;
 
-    /// Returns a snapshot of all subscribers for the given event group.
+    /// Visit each subscriber for the given event group with `f`.
     ///
-    /// The snapshot is owned — the caller may iterate over it after this
-    /// future resolves without holding any lock.
-    fn get_subscribers(
-        &self,
+    /// The implementation typically holds an internal read lock for the
+    /// duration of the visit; `f` is a synchronous `FnMut` callback —
+    /// the caller MUST NOT yield inside it. A common pattern is to copy
+    /// the subscriber addresses into a stack-allocated buffer here, then
+    /// release the lock and dispatch sends in a second phase.
+    ///
+    /// Returns the total number of subscribers visited. Replaces the
+    /// previous `get_subscribers -> Vec<Subscriber>` API; the visitor
+    /// pattern lets `EventPublisher::publish_event` avoid a per-event
+    /// heap allocation.
+    fn for_each_subscriber<'a, F>(
+        &'a self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-    ) -> impl Future<Output = Vec<Subscriber>> + Send + '_;
+        f: F,
+    ) -> impl Future<Output = usize> + 'a
+    where
+        F: FnMut(&Subscriber) + 'a;
 }
 
 #[cfg(feature = "server-tokio")]
@@ -311,7 +323,7 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), SubscribeError>> + Send + '_ {
+    ) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
         let this = self.clone();
         async move {
             this.write()
@@ -326,7 +338,7 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = ()> + Send + '_ {
+    ) -> impl Future<Output = ()> + '_ {
         let this = self.clone();
         async move {
             this.write().await.unsubscribe(
@@ -338,17 +350,29 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
         }
     }
 
-    fn get_subscribers(
-        &self,
+    fn for_each_subscriber<'a, F>(
+        &'a self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-    ) -> impl Future<Output = Vec<Subscriber>> + Send + '_ {
+        mut f: F,
+    ) -> impl Future<Output = usize> + 'a
+    where
+        F: FnMut(&Subscriber) + 'a,
+    {
         let this = self.clone();
         async move {
-            this.read()
-                .await
-                .get_subscribers(service_id, instance_id, event_group_id)
+            let guard = this.read().await;
+            let key = (service_id, instance_id, event_group_id);
+            match guard.subscriptions.get(&key) {
+                Some(list) => {
+                    for sub in list.iter() {
+                        f(sub);
+                    }
+                    list.len()
+                }
+                None => 0,
+            }
         }
     }
 }

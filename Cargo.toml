@@ -103,6 +103,10 @@ name = "bare_metal_client"
 required-features = ["client", "bare_metal"]
 
 [[test]]
+name = "bare_metal_client_local"
+required-features = ["client", "bare_metal"]
+
+[[test]]
 name = "static_channels_alloc_witness"
 required-features = ["client", "bare_metal"]
 
