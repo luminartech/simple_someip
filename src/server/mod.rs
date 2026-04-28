@@ -1198,6 +1198,181 @@ mod tests {
         assert!(server.is_ok());
     }
 
+    /// Regression for H5: `ServerConfig::accepts_event_group` must
+    /// accept any group when `event_group_ids` is empty (back-compat:
+    /// servers that have not enumerated their groups must keep
+    /// working) and validate strictly when populated.
+    #[test]
+    fn server_config_accepts_event_group_empty_means_any() {
+        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30490, 0x5B, 1);
+        assert!(config.event_group_ids.is_empty());
+        // Empty list: every group accepted.
+        assert!(config.accepts_event_group(0x0001));
+        assert!(config.accepts_event_group(0xBEEF));
+        assert!(config.accepts_event_group(0xFFFF));
+    }
+
+    #[test]
+    fn server_config_accepts_event_group_populated_validates() {
+        let mut config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30490, 0x5B, 1);
+        config.event_group_ids.push(0x0001).unwrap();
+        config.event_group_ids.push(0x0042).unwrap();
+        assert!(config.accepts_event_group(0x0001));
+        assert!(config.accepts_event_group(0x0042));
+        assert!(!config.accepts_event_group(0x0002));
+        assert!(!config.accepts_event_group(0xBEEF));
+    }
+
+    /// Regression for H3: when `subscribe` succeeds but the
+    /// `SubscribeAck` send fails (transient transport error), the
+    /// just-committed subscription must be rolled back so the
+    /// manager isn't left holding a slot for a peer that never
+    /// received its ACK. `handle_sd_message` must also NOT propagate
+    /// the error via `?` — a single SD-socket hiccup tearing down
+    /// `run()` was the original bug.
+    #[tokio::test]
+    async fn handle_sd_message_rolls_back_subscription_on_failed_ack_send() {
+        use crate::transport::{IoErrorKind, ReceivedDatagram, TransportError};
+        use core::future::{Future, Ready, ready};
+        use core::pin::Pin;
+        use core::task::{Context, Poll};
+        use std::pin::Pin as StdPin;
+
+        // Socket whose `send_to` always fails. `recv_from` is never
+        // called by this test (we drive `handle_sd_message` directly).
+        struct FailingSocket {
+            local: SocketAddrV4,
+        }
+        struct FailingSend;
+        impl Future for FailingSend {
+            type Output = Result<(), TransportError>;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(Err(TransportError::Io(IoErrorKind::NetworkUnreachable)))
+            }
+        }
+        impl TransportSocket for FailingSocket {
+            type SendFuture<'a> = FailingSend;
+            type RecvFuture<'a> = Ready<Result<ReceivedDatagram, TransportError>>;
+            fn send_to<'a>(&'a self, _b: &'a [u8], _t: SocketAddrV4) -> Self::SendFuture<'a> {
+                FailingSend
+            }
+            fn recv_from<'a>(&'a self, _b: &'a mut [u8]) -> Self::RecvFuture<'a> {
+                ready(Err(TransportError::Unsupported))
+            }
+            fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
+                Ok(self.local)
+            }
+            fn join_multicast_v4(&self, _g: Ipv4Addr, _i: Ipv4Addr) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn leave_multicast_v4(&self, _g: Ipv4Addr, _i: Ipv4Addr) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        struct FailingFactory {
+            next_port: Arc<Mutex<u16>>,
+        }
+        impl TransportFactory for FailingFactory {
+            type Socket = FailingSocket;
+            type BindFuture<'a> = StdPin<
+                std::boxed::Box<
+                    dyn Future<Output = Result<Self::Socket, TransportError>> + Send + 'a,
+                >,
+            >;
+            fn bind<'a>(
+                &'a self,
+                addr: SocketAddrV4,
+                _options: &'a SocketOptions,
+            ) -> Self::BindFuture<'a> {
+                let port = if addr.port() == 0 {
+                    let mut p = self.next_port.lock().unwrap();
+                    *p = p.saturating_add(1);
+                    50000u16.saturating_add(*p)
+                } else {
+                    addr.port()
+                };
+                let local = SocketAddrV4::new(*addr.ip(), port);
+                std::boxed::Box::pin(async move { Ok(FailingSocket { local }) })
+            }
+        }
+
+        let factory = FailingFactory {
+            next_port: Arc::new(Mutex::new(0)),
+        };
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let deps = ServerDeps {
+            factory,
+            timer: TokioTimer,
+            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            subscriptions: subscriptions.clone(),
+        };
+        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0x5B, 1);
+        let mut server = Server::new_with_deps(deps, config, false)
+            .await
+            .expect("create failing-socket server");
+
+        // Build a valid Subscribe; our service id/instance/major
+        // match the config's defaults, so the only failure point
+        // will be the ACK send.
+        let bytes = make_subscription_header(
+            0x5B,
+            1,
+            1,
+            3,
+            0x01,
+            Ipv4Addr::LOCALHOST,
+            sd::TransportProtocol::Udp,
+            45000,
+        );
+        let view = MessageView::parse(&bytes).expect("parse Subscribe");
+        let sd_view = view.sd_header().expect("Subscribe has SD header");
+        let sender = std::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 45000));
+
+        // The H3 fix: handle_sd_message must NOT bubble the ACK send
+        // failure as Err — it logs and continues.
+        let result = server.handle_sd_message(&sd_view, sender).await;
+        assert!(
+            result.is_ok(),
+            "handle_sd_message must not propagate transient SD-socket I/O errors; got {result:?}"
+        );
+
+        // The H3 fix: a committed-but-unacked subscription must be
+        // rolled back, so the manager has 0 entries.
+        let subs = subscriptions.read().await;
+        assert_eq!(
+            subs.subscription_count(),
+            0,
+            "subscription must be rolled back after failed ACK send"
+        );
+    }
+
+    /// Regression for H4: `announcement_loop` must be idempotent.
+    /// Calling it a second time returns `Err(Error::Io(InvalidInput))`
+    /// so two announcement futures cannot race on the same SD socket
+    /// and session counter.
+    #[tokio::test]
+    async fn announcement_loop_second_call_returns_invalid_input() {
+        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30683, 0x5BB4, 1);
+        let server = TestServer::new(config).await.expect("create server");
+        let _first = server
+            .announcement_loop()
+            .expect("first announcement_loop call must succeed");
+        let second = server.announcement_loop();
+        match second {
+            Err(Error::Io(io_err)) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidInput);
+                let msg = format!("{io_err}");
+                assert!(
+                    msg.contains("already started"),
+                    "expected the diagnostic to say 'already started', got: {msg}"
+                );
+            }
+            Ok(_) => panic!("second announcement_loop must error, got Ok"),
+            Err(other) => panic!("expected Error::Io(InvalidInput), got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_server_creation_with_loopback_enabled() {
         // Use a unicast port distinct from other tests to avoid EADDRINUSE
