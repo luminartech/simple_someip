@@ -14,25 +14,30 @@ mod subscription_manager;
 
 pub use error::Error;
 pub use event_publisher::EventPublisher;
-pub use service_info::{EventGroupInfo, ServiceInfo};
+pub use service_info::{EventGroupInfo, ServiceInfo, Subscriber};
 pub use subscription_manager::{SubscribeError, SubscriptionHandle, SubscriptionManager};
 
 use sd_state::SdStateManager;
 
 use crate::Timer;
-use crate::e2e::{E2EKey, E2EProfile, E2ERegistry};
+use crate::e2e::{E2EKey, E2EProfile};
 use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
-use crate::tokio_transport::TokioTimer;
-use crate::transport::E2ERegistryHandle;
+use crate::transport::{E2ERegistryHandle, SocketOptions, TransportFactory, TransportSocket};
 use futures::{FutureExt, pin_mut, select};
 use std::{
     format,
-    net::{IpAddr, Ipv4Addr, SocketAddrV4},
-    sync::{Arc, Mutex},
+    net::{Ipv4Addr, SocketAddrV4},
+    sync::Arc,
     vec,
     vec::Vec,
 };
-use tokio::{net::UdpSocket, sync::RwLock};
+
+#[cfg(feature = "server-tokio")]
+use crate::e2e::E2ERegistry;
+#[cfg(feature = "server-tokio")]
+use std::sync::Mutex;
+#[cfg(feature = "server-tokio")]
+use tokio::sync::RwLock;
 
 /// Configuration for a SOME/IP service provider
 #[derive(Debug, Clone)]
@@ -69,24 +74,79 @@ impl ServerConfig {
     }
 }
 
-/// SOME/IP Server that can offer services and publish events
-pub struct Server<
-    R: E2ERegistryHandle = Arc<Mutex<E2ERegistry>>,
-    S: SubscriptionHandle = Arc<RwLock<SubscriptionManager>>,
-> {
+/// Bundle of pluggable infrastructure passed to [`Server::new_with_deps`].
+/// Mirrors [`crate::ClientDeps`] but with the server's smaller surface
+/// — no `Spawner` (server has no internal task spawning), no
+/// `InterfaceHandle` (interface lives in [`ServerConfig`]).
+///
+/// All four fields are public so callers can construct the struct
+/// inline.
+pub struct ServerDeps<F, Tm, R, S>
+where
+    F: TransportFactory,
+    Tm: Timer,
+    R: E2ERegistryHandle,
+    S: SubscriptionHandle,
+{
+    /// Transport factory used to bind the unicast and SD sockets.
+    pub factory: F,
+    /// Async sleep primitive used by the announcement loop's 1-second tick.
+    pub timer: Tm,
+    /// Shared E2E registry handle for runtime E2E configuration.
+    pub e2e_registry: R,
+    /// Shared subscription manager handle. The convenience constructor
+    /// [`Server::new`] (under `server-tokio`) builds an
+    /// `Arc<RwLock<SubscriptionManager>>` for this; bare-metal callers
+    /// supply their own [`SubscriptionHandle`] impl.
+    pub subscriptions: S,
+}
+
+/// SOME/IP Server that can offer services and publish events.
+///
+/// Generic over the four pluggable infrastructure types bundled in
+/// [`ServerDeps`]:
+/// - `R: E2ERegistryHandle` — runtime E2E configuration registry
+/// - `S: SubscriptionHandle` — event-group subscription state
+/// - `F: TransportFactory` — socket primitive (carried as a stored
+///   unit-struct in the tokio path; bare-metal impls may carry state)
+/// - `Tm: Timer` — async sleep used by the announcement loop
+///
+/// The convenience constructors [`Self::new`] / [`Self::new_with_loopback`]
+/// / [`Self::new_passive`] (under the `server-tokio` feature) instantiate
+/// these as `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>`
+/// / `TokioTransport` / `TokioTimer`. Bare-metal callers use
+/// [`Self::new_with_deps`] (under `server`) and supply their own.
+pub struct Server<R, S, F, Tm>
+where
+    R: E2ERegistryHandle,
+    S: SubscriptionHandle,
+    F: TransportFactory + Send + Sync + 'static,
+    F::Socket: Send + Sync + 'static,
+    Tm: Timer + Clone + Send + Sync + 'static,
+{
     config: ServerConfig,
     /// Socket for receiving subscription requests
-    unicast_socket: Arc<UdpSocket>,
+    unicast_socket: Arc<F::Socket>,
     /// Socket for sending SD announcements
-    sd_socket: Arc<UdpSocket>,
+    sd_socket: Arc<F::Socket>,
     /// Subscription manager
     subscriptions: S,
     /// Event publisher
-    publisher: Arc<EventPublisher<R, S>>,
+    publisher: Arc<EventPublisher<R, S, F::Socket>>,
     /// SD session-ID counter and announcement emitter
     sd_state: Arc<SdStateManager>,
     /// Shared E2E registry for runtime E2E configuration
     e2e_registry: R,
+    /// Transport factory. Used at construction time to bind sockets;
+    /// retained on the struct so bare-metal factories that carry state
+    /// (e.g. an embassy-net `Stack` handle) survive the constructor.
+    /// On `server-tokio` builds this is a zero-sized `TokioTransport`.
+    #[allow(dead_code)]
+    factory: F,
+    /// Async sleep primitive used by [`Self::announcement_loop`]'s
+    /// 1-second tick. On `server-tokio` builds this is `TokioTimer`
+    /// (wrapping `tokio::time::sleep`).
+    timer: Tm,
     /// `true` if this server was constructed via [`Server::new_passive`].
     /// Passive servers have no real SD socket bound to port 30490; their
     /// SD handling is managed externally. Calling [`Self::announcement_loop`]
@@ -95,7 +155,15 @@ pub struct Server<
     is_passive: bool,
 }
 
-impl Server {
+#[cfg(feature = "server-tokio")]
+impl
+    Server<
+        Arc<Mutex<E2ERegistry>>,
+        Arc<RwLock<SubscriptionManager>>,
+        crate::tokio_transport::TokioTransport,
+        crate::tokio_transport::TokioTimer,
+    >
+{
     /// Create a new SOME/IP server
     ///
     /// # Errors
@@ -134,72 +202,13 @@ impl Server {
         config: ServerConfig,
         multicast_loopback: bool,
     ) -> Result<Self, Error> {
-        // Bind unicast socket for receiving subscriptions
-        let unicast_addr = SocketAddrV4::new(config.interface, config.local_port);
-        let unicast_socket = Arc::new(UdpSocket::bind(unicast_addr).await?);
-        tracing::info!(
-            "Server bound to {} for service 0x{:04X}",
-            unicast_addr,
-            config.service_id
-        );
-
-        // Bind SD socket for sending/receiving SD messages (must use SD port 30490)
-        let expected_sd_port = sd::MULTICAST_PORT;
-        let sd_bind_addr =
-            std::net::SocketAddr::new(IpAddr::V4(config.interface), expected_sd_port);
-        let sd_raw_socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )?;
-        sd_raw_socket.set_reuse_address(true)?;
-        #[cfg(unix)]
-        sd_raw_socket.set_reuse_port(true)?;
-        sd_raw_socket.set_multicast_if_v4(&config.interface)?;
-        sd_raw_socket.set_multicast_loop_v4(multicast_loopback)?;
-        sd_raw_socket.bind(&sd_bind_addr.into())?;
-        sd_raw_socket.set_nonblocking(true)?;
-        let sd_std_socket: std::net::UdpSocket = sd_raw_socket.into();
-        let sd_socket = UdpSocket::from_std(sd_std_socket)?;
-
-        // Join SD multicast group to receive FindService and SubscribeEventGroup
-        sd_socket.join_multicast_v4(sd::MULTICAST_IP, config.interface)?;
-        let actual_sd_addr = sd_socket.local_addr()?;
-        tracing::info!(
-            "Server SD socket bound to {} (expected port {}), joined multicast {}",
-            actual_sd_addr,
-            expected_sd_port,
-            sd::MULTICAST_IP
-        );
-        if let std::net::SocketAddr::V4(v4) = actual_sd_addr
-            && v4.port() != expected_sd_port
-        {
-            tracing::error!(
-                "SD socket port mismatch! Expected {}, got {}. Offers will use wrong source port.",
-                expected_sd_port,
-                v4.port()
-            );
-        }
-
-        let subscriptions: Arc<RwLock<SubscriptionManager>> =
-            Arc::new(RwLock::new(SubscriptionManager::new()));
-        let e2e_registry: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
-        let publisher = Arc::new(EventPublisher::new(
-            subscriptions.clone(),
-            Arc::clone(&unicast_socket),
-            e2e_registry.clone(),
-        ));
-
-        Ok(Self {
-            config,
-            unicast_socket,
-            sd_socket: Arc::new(sd_socket),
-            subscriptions,
-            publisher,
-            sd_state: Arc::new(SdStateManager::new()),
-            e2e_registry,
-            is_passive: false,
-        })
+        let deps = ServerDeps {
+            factory: crate::tokio_transport::TokioTransport,
+            timer: crate::tokio_transport::TokioTimer,
+            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
+        };
+        Self::new_with_deps(deps, config, multicast_loopback).await
     }
 
     /// Create a passive SOME/IP server.
@@ -224,36 +233,74 @@ impl Server {
     ///
     /// Returns an error if binding either socket fails.
     pub async fn new_passive(config: ServerConfig) -> Result<Self, Error> {
-        // Bind unicast socket at the configured local_port — the passive
-        // server still needs a real source port so published events appear
-        // to come from the endpoint advertised in the external OfferService.
+        let deps = ServerDeps {
+            factory: crate::tokio_transport::TokioTransport,
+            timer: crate::tokio_transport::TokioTimer,
+            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
+        };
+        Self::new_passive_with_deps(deps, config).await
+    }
+}
+
+impl<R, S, F, Tm> Server<R, S, F, Tm>
+where
+    R: E2ERegistryHandle,
+    S: SubscriptionHandle,
+    F: TransportFactory + Send + Sync + 'static,
+    F::Socket: Send + Sync + 'static,
+    for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
+    for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
+    Tm: Timer + Clone + Send + Sync + 'static,
+{
+    /// Bare-metal-friendly constructor that takes every dependency
+    /// explicitly via a [`ServerDeps`] bundle. The `server-tokio`
+    /// convenience constructors ([`Self::new`], [`Self::new_with_loopback`],
+    /// [`Self::new_passive`]) ultimately delegate here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding the unicast or SD socket via
+    /// [`TransportFactory::bind`] fails, or if joining the SD multicast
+    /// group fails.
+    pub async fn new_with_deps(
+        deps: ServerDeps<F, Tm, R, S>,
+        config: ServerConfig,
+        multicast_loopback: bool,
+    ) -> Result<Self, Error> {
+        let ServerDeps {
+            factory,
+            timer,
+            e2e_registry,
+            subscriptions,
+        } = deps;
+
+        // Bind unicast socket for receiving subscriptions.
         let unicast_addr = SocketAddrV4::new(config.interface, config.local_port);
-        let unicast_socket = Arc::new(UdpSocket::bind(unicast_addr).await?);
+        let unicast_socket = Arc::new(factory.bind(unicast_addr, &SocketOptions::new()).await?);
         tracing::info!(
-            "Passive server bound to {} for service 0x{:04X}",
+            "Server bound to {} for service 0x{:04X}",
             unicast_addr,
             config.service_id
         );
 
-        // Bind a placeholder SD socket on an ephemeral port. Nothing will
-        // route to it (neither multicast nor unicast on 30490), and neither
-        // `announcement_loop` nor `run` should be called for a passive
-        // server. We still allocate it so the `Server` struct shape is
-        // identical to the full-server path.
-        let sd_placeholder_addr = std::net::SocketAddr::new(IpAddr::V4(config.interface), 0);
-        let sd_socket = UdpSocket::bind(sd_placeholder_addr).await?;
-        // Log the bound address using `Debug` on the `Result<SocketAddr>`
-        // so a hypothetical `local_addr` failure does not propagate as a
-        // construction error and we do not introduce an unreachable Err
-        // arm purely for defensive logging.
+        // Bind SD socket for sending/receiving SD messages (must use SD port 30490).
+        let mut sd_opts = SocketOptions::new();
+        sd_opts.reuse_address = true;
+        sd_opts.reuse_port = true;
+        sd_opts.multicast_if_v4 = Some(config.interface);
+        sd_opts.multicast_loop_v4 = multicast_loopback;
+        let sd_addr = SocketAddrV4::new(config.interface, sd::MULTICAST_PORT);
+        let sd_socket = factory.bind(sd_addr, &sd_opts).await?;
+        sd_socket.join_multicast_v4(sd::MULTICAST_IP, config.interface)?;
+        let sd_socket = Arc::new(sd_socket);
         tracing::info!(
-            "Passive server SD placeholder socket bound to {:?} (not in SD reuseport group)",
-            sd_socket.local_addr()
+            "Server SD socket bound to {} (expected port {}), joined multicast {}",
+            sd_addr,
+            sd::MULTICAST_PORT,
+            sd::MULTICAST_IP
         );
 
-        let subscriptions: Arc<RwLock<SubscriptionManager>> =
-            Arc::new(RwLock::new(SubscriptionManager::new()));
-        let e2e_registry: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
         let publisher = Arc::new(EventPublisher::new(
             subscriptions.clone(),
             Arc::clone(&unicast_socket),
@@ -263,17 +310,92 @@ impl Server {
         Ok(Self {
             config,
             unicast_socket,
-            sd_socket: Arc::new(sd_socket),
+            sd_socket,
             subscriptions,
             publisher,
             sd_state: Arc::new(SdStateManager::new()),
             e2e_registry,
+            factory,
+            timer,
+            is_passive: false,
+        })
+    }
+
+    /// Bare-metal-friendly passive-server constructor.
+    ///
+    /// Passive servers bind a unicast socket as usual but bind their SD
+    /// socket to an ephemeral port (port 0) instead of the SOME/IP SD
+    /// port — see [`Server::new_passive`] under `server-tokio` for the
+    /// full explanation. Calling [`Self::announcement_loop`] or
+    /// [`Self::run`] on the result is a programming error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding either socket fails.
+    pub async fn new_passive_with_deps(
+        deps: ServerDeps<F, Tm, R, S>,
+        config: ServerConfig,
+    ) -> Result<Self, Error> {
+        let ServerDeps {
+            factory,
+            timer,
+            e2e_registry,
+            subscriptions,
+        } = deps;
+
+        // Bind unicast socket at the configured local_port.
+        let unicast_addr = SocketAddrV4::new(config.interface, config.local_port);
+        let unicast_socket = Arc::new(factory.bind(unicast_addr, &SocketOptions::new()).await?);
+        tracing::info!(
+            "Passive server bound to {} for service 0x{:04X}",
+            unicast_addr,
+            config.service_id
+        );
+
+        // Placeholder SD socket on an ephemeral port — no multicast options,
+        // no group join. Nothing should route to it.
+        let sd_placeholder_addr = SocketAddrV4::new(config.interface, 0);
+        let sd_socket = Arc::new(
+            factory
+                .bind(sd_placeholder_addr, &SocketOptions::new())
+                .await?,
+        );
+        tracing::info!(
+            "Passive server SD placeholder socket bound near {} (not in SD reuseport group)",
+            sd_placeholder_addr
+        );
+
+        let publisher = Arc::new(EventPublisher::new(
+            subscriptions.clone(),
+            Arc::clone(&unicast_socket),
+            e2e_registry.clone(),
+        ));
+
+        Ok(Self {
+            config,
+            unicast_socket,
+            sd_socket,
+            subscriptions,
+            publisher,
+            sd_state: Arc::new(SdStateManager::new()),
+            e2e_registry,
+            factory,
+            timer,
             is_passive: true,
         })
     }
 }
 
-impl<R: E2ERegistryHandle, S: SubscriptionHandle> Server<R, S> {
+impl<R, S, F, Tm> Server<R, S, F, Tm>
+where
+    R: E2ERegistryHandle,
+    S: SubscriptionHandle,
+    F: TransportFactory + Send + Sync + 'static,
+    F::Socket: Send + Sync + 'static,
+    for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
+    for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
+    Tm: Timer + Clone + Send + Sync + 'static,
+{
     /// Build the periodic-SD-announcement future.
     ///
     /// Returns a future that sends an `OfferService` message to the SD
@@ -282,11 +404,16 @@ impl<R: E2ERegistryHandle, S: SubscriptionHandle> Server<R, S> {
     /// function does no work on its own.
     ///
     /// ```no_run
-    /// # use simple_someip::server::Server;
-    /// # async fn demo(server: Server) -> Result<(), simple_someip::server::Error> {
+    /// # #[cfg(feature = "server-tokio")] {
+    /// # use simple_someip::server::{Server, ServerConfig};
+    /// # use std::net::Ipv4Addr;
+    /// # async fn demo() -> Result<(), simple_someip::server::Error> {
+    /// # let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30490, 0, 0);
+    /// # let server = Server::new(config).await?;
     /// let announce_fut = server.announcement_loop()?;
     /// tokio::spawn(announce_fut);
     /// # Ok(())
+    /// # }
     /// # }
     /// ```
     ///
@@ -314,11 +441,12 @@ impl<R: E2ERegistryHandle, S: SubscriptionHandle> Server<R, S> {
         let config = self.config.clone();
         let sd_socket = Arc::clone(&self.sd_socket);
         let sd_state = Arc::clone(&self.sd_state);
+        let timer = self.timer.clone();
 
         Ok(async move {
             let mut announcement_count = 0u32;
             loop {
-                match sd_state.send_offer_service(&config, &sd_socket).await {
+                match sd_state.send_offer_service(&config, &*sd_socket).await {
                     Ok(()) => {
                         announcement_count += 1;
                         if announcement_count == 1 {
@@ -342,8 +470,8 @@ impl<R: E2ERegistryHandle, S: SubscriptionHandle> Server<R, S> {
                 // Send announcements every 1 second. Sleep goes through
                 // the `Timer` trait so bare-metal consumers can swap in
                 // a different timer impl; today it resolves to
-                // `TokioTimer`.
-                TokioTimer.sleep(std::time::Duration::from_secs(1)).await;
+                // `TokioTimer` under the `server-tokio` feature.
+                timer.sleep(core::time::Duration::from_secs(1)).await;
             }
         })
     }
@@ -387,7 +515,8 @@ impl<R: E2ERegistryHandle, S: SubscriptionHandle> Server<R, S> {
         someip_header.encode(&mut buffer)?;
         buffer.extend_from_slice(&sd_data);
 
-        self.sd_socket.send_to(&buffer, target).await?;
+        let target_v4 = socket_addr_v4(target)?;
+        self.sd_socket.send_to(&buffer, target_v4).await?;
         tracing::debug!(
             "Sent unicast OfferService to {} for service 0x{:04X}",
             target,
@@ -399,7 +528,7 @@ impl<R: E2ERegistryHandle, S: SubscriptionHandle> Server<R, S> {
 
     /// Get the event publisher for sending events
     #[must_use]
-    pub fn publisher(&self) -> Arc<EventPublisher<R, S>> {
+    pub fn publisher(&self) -> Arc<EventPublisher<R, S, F::Socket>> {
         Arc::clone(&self.publisher)
     }
 
@@ -409,7 +538,12 @@ impl<R: E2ERegistryHandle, S: SubscriptionHandle> Server<R, S> {
     ///
     /// Returns an error if the socket's local address cannot be retrieved.
     pub fn unicast_local_addr(&self) -> Result<std::net::SocketAddr, std::io::Error> {
-        self.unicast_socket.local_addr()
+        match self.unicast_socket.local_addr() {
+            Ok(v4) => Ok(std::net::SocketAddr::V4(v4)),
+            Err(_) => Err(std::io::Error::other(
+                "transport: failed to read local_addr",
+            )),
+        }
     }
 
     /// Update the configured local port (useful after binding to ephemeral port 0).
@@ -499,12 +633,22 @@ impl<R: E2ERegistryHandle, S: SubscriptionHandle> Server<R, S> {
                 pin_mut!(unicast_fut, sd_fut);
                 select! {
                     result = unicast_fut => {
-                        let (len, addr) = result?;
-                        (len, addr, "unicast", true)
+                        let datagram = result?;
+                        (
+                            datagram.bytes_received,
+                            std::net::SocketAddr::V4(datagram.source),
+                            "unicast",
+                            true,
+                        )
                     }
                     result = sd_fut => {
-                        let (len, addr) = result?;
-                        (len, addr, "sd-multicast", false)
+                        let datagram = result?;
+                        (
+                            datagram.bytes_received,
+                            std::net::SocketAddr::V4(datagram.source),
+                            "sd-multicast",
+                            false,
+                        )
                     }
                 }
             };
@@ -720,6 +864,23 @@ impl<R: E2ERegistryHandle, S: SubscriptionHandle> Server<R, S> {
     }
 }
 
+/// Convert a [`std::net::SocketAddr`] into a [`SocketAddrV4`] for the
+/// transport layer. SOME/IP-SD is IPv4-only at this layer; if a V6
+/// address ever surfaces here it indicates a misconfiguration upstream
+/// (a V6 socket binding the SD port, or a V6 source address surfaced
+/// by a transport that should not produce one). Returns
+/// [`std::io::ErrorKind::Unsupported`] in that case so the caller can
+/// log and drop the message instead of panicking.
+fn socket_addr_v4(addr: std::net::SocketAddr) -> Result<SocketAddrV4, Error> {
+    match addr {
+        std::net::SocketAddr::V4(v4) => Ok(v4),
+        std::net::SocketAddr::V6(_) => Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "IPv6 SD address is not supported",
+        ))),
+    }
+}
+
 /// Extract a single subscriber endpoint from the options runs associated with
 /// an SD entry. Walks both option runs, returns the first `IpV4Endpoint`
 /// found, and logs a `warn!` if more than one is present.
@@ -786,7 +947,16 @@ fn extract_subscriber_endpoint(
     }
 }
 
-impl<R: E2ERegistryHandle, S: SubscriptionHandle> Server<R, S> {
+impl<R, S, F, Tm> Server<R, S, F, Tm>
+where
+    R: E2ERegistryHandle,
+    S: SubscriptionHandle,
+    F: TransportFactory + Send + Sync + 'static,
+    F::Socket: Send + Sync + 'static,
+    for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
+    for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
+    Tm: Timer + Clone + Send + Sync + 'static,
+{
     /// Send `SubscribeAck` from an entry view
     async fn send_subscribe_ack_from_view(
         &self,
@@ -822,7 +992,8 @@ impl<R: E2ERegistryHandle, S: SubscriptionHandle> Server<R, S> {
         someip_header.encode(&mut buffer)?;
         buffer.extend_from_slice(&sd_data);
 
-        self.sd_socket.send_to(&buffer, subscriber).await?;
+        let subscriber_v4 = socket_addr_v4(subscriber)?;
+        self.sd_socket.send_to(&buffer, subscriber_v4).await?;
 
         tracing::debug!(
             "Sent SubscribeAck to {} for service 0x{:04X}, eventgroup 0x{:04X}",
@@ -870,7 +1041,8 @@ impl<R: E2ERegistryHandle, S: SubscriptionHandle> Server<R, S> {
         someip_header.encode(&mut buffer)?;
         buffer.extend_from_slice(&sd_data);
 
-        self.sd_socket.send_to(&buffer, subscriber).await?;
+        let subscriber_v4 = socket_addr_v4(subscriber)?;
+        self.sd_socket.send_to(&buffer, subscriber_v4).await?;
 
         tracing::warn!(
             "Sent SubscribeNack to {} for service 0x{:04X}, eventgroup 0x{:04X} (reason: {})",
@@ -884,20 +1056,34 @@ impl<R: E2ERegistryHandle, S: SubscriptionHandle> Server<R, S> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server-tokio"))]
 mod tests {
     use super::*;
     use crate::protocol::{
         Header as SomeIpHeader, MessageType, MessageTypeField, MessageView, ReturnCode,
     };
+    use crate::tokio_transport::{TokioTimer, TokioTransport};
     use crate::traits::WireFormat;
     use std::format;
+    use std::net::IpAddr;
+    use tokio::net::UdpSocket;
+
+    /// Type alias bringing the tokio-flavor concrete type parameters back
+    /// into scope so tests can spell `TestServer::new(...)` without
+    /// chasing the four-type-parameter signature on every call site.
+    /// Mirrors the `TestClient` pattern from `tests/client_server.rs`.
+    type TestServer = Server<
+        Arc<Mutex<E2ERegistry>>,
+        Arc<RwLock<SubscriptionManager>>,
+        TokioTransport,
+        TokioTimer,
+    >;
 
     #[tokio::test]
     async fn test_server_creation() {
         let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30682, 0x5B, 1);
 
-        let server: Result<Server, _> = Server::new(config).await;
+        let server: Result<TestServer, _> = TestServer::new(config).await;
         assert!(server.is_ok());
     }
 
@@ -909,16 +1095,16 @@ mod tests {
         // as `test_server_creation`.
         let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30683, 0x5C, 1);
 
-        let server = Server::new_with_loopback(config, true)
+        let server = TestServer::new_with_loopback(config, true)
             .await
             .expect("new_with_loopback(true) should succeed on localhost");
 
         // Confirm the SD socket was actually configured with IP_MULTICAST_LOOP
         // enabled — this is the behavior the new code path is supposed to
         // produce and is what makes same-host testing possible.
-        let sock_ref = socket2::SockRef::from(&*server.sd_socket);
         assert!(
-            sock_ref
+            server
+                .sd_socket
                 .multicast_loop_v4()
                 .expect("multicast_loop_v4 getter should succeed"),
             "multicast loopback should be enabled on the SD socket",
@@ -953,10 +1139,10 @@ mod tests {
     }
 
     /// Helper: create a server on an ephemeral port and return (Server, port)
-    async fn create_test_server(service_id: u16, instance_id: u16) -> (Server, u16) {
+    async fn create_test_server(service_id: u16, instance_id: u16) -> (TestServer, u16) {
         // Use port 0 to get an ephemeral port
         let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, service_id, instance_id);
-        let mut server = Server::new(config).await.expect("Failed to create server");
+        let mut server = TestServer::new(config).await.expect("Failed to create server");
         let port = match server.unicast_local_addr().unwrap() {
             std::net::SocketAddr::V4(addr) => addr.port(),
             std::net::SocketAddr::V6(_) => panic!("expected IPv4 address"),
@@ -1026,7 +1212,7 @@ mod tests {
         // Run server to process one message (with a timeout)
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1078,7 +1264,7 @@ mod tests {
         // Process the message
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1127,7 +1313,7 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1174,7 +1360,7 @@ mod tests {
         // Process the message on the unicast socket
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1224,7 +1410,7 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1271,7 +1457,7 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1311,7 +1497,7 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1563,7 +1749,7 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let (len, addr) = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1849,20 +2035,19 @@ mod tests {
         // datagram. We drive `handle_sd_message` directly rather than
         // `server.run()` so we can assert state after the call.
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let sd_addr = match server.sd_socket.local_addr().unwrap() {
-            std::net::SocketAddr::V4(v4) => v4,
-            std::net::SocketAddr::V6(_) => panic!("expected v4 sd socket"),
-        };
+        let sd_addr = server.sd_socket.local_addr().unwrap();
         client_socket.send_to(&message, sd_addr).await.unwrap();
 
         let mut buf = vec![0u8; 65_535];
-        let (len, sender) = tokio::time::timeout(
+        let datagram = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             server.sd_socket.recv_from(&mut buf),
         )
         .await
         .expect("timeout receiving combined SD packet")
         .unwrap();
+        let len = datagram.bytes_received;
+        let sender = std::net::SocketAddr::V4(datagram.source);
         let view = MessageView::parse(&buf[..len]).unwrap();
         let sd_view = view.sd_header().unwrap();
         server.handle_sd_message(&sd_view, sender).await.unwrap();
@@ -1900,9 +2085,9 @@ mod tests {
 
     /// Construct a passive server on loopback with an ephemeral unicast
     /// port. Tests use this as a standard fixture.
-    async fn make_passive_server(service_id: u16, instance_id: u16) -> Server {
+    async fn make_passive_server(service_id: u16, instance_id: u16) -> TestServer {
         let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, service_id, instance_id);
-        Server::new_passive(config)
+        TestServer::new_passive(config)
             .await
             .expect("new_passive should succeed")
     }
@@ -1931,16 +2116,11 @@ mod tests {
         // the same module.
         let server = make_passive_server(0x005C, 0x0001).await;
         let sd_addr = server.sd_socket.local_addr().unwrap();
-        match sd_addr {
-            std::net::SocketAddr::V4(v4) => {
-                assert_ne!(
-                    v4.port(),
-                    30490,
-                    "passive SD socket must not bind the SOME/IP SD port"
-                );
-            }
-            std::net::SocketAddr::V6(_) => panic!("expected IPv4 SD address"),
-        }
+        assert_ne!(
+            sd_addr.port(),
+            30490,
+            "passive SD socket must not bind the SOME/IP SD port"
+        );
     }
 
     #[tokio::test]
@@ -2075,7 +2255,7 @@ mod tests {
         };
 
         let config = ServerConfig::new(iface, 30501, SID, IID);
-        let server = Server::new_with_loopback(config, true).await.unwrap();
+        let server = TestServer::new_with_loopback(config, true).await.unwrap();
         let fut = server.announcement_loop().expect("build loop");
         let handle = tokio::spawn(fut);
 
@@ -2142,12 +2322,8 @@ mod tests {
         // Different placeholder ports.
         assert_ne!(addr_a, addr_b);
         // And neither is 30490.
-        if let std::net::SocketAddr::V4(v4) = addr_a {
-            assert_ne!(v4.port(), 30490);
-        }
-        if let std::net::SocketAddr::V4(v4) = addr_b {
-            assert_ne!(v4.port(), 30490);
-        }
+        assert_ne!(addr_a.port(), 30490);
+        assert_ne!(addr_b.port(), 30490);
     }
 
     #[tokio::test]
@@ -2164,11 +2340,17 @@ mod tests {
         };
 
         let config = ServerConfig::new(Ipv4Addr::LOCALHOST, blocker_port, 0x005C, 0x0001);
-        let result = Server::new_passive(config).await;
+        let result = TestServer::new_passive(config).await;
         let Err(err) = result else {
             panic!("new_passive must fail when the unicast port is taken");
         };
         match err {
+            // Phase 14b: the bind path now goes through the
+            // `TransportFactory` trait, so port collisions surface as
+            // `Error::Transport(TransportError::AddressInUse)` instead
+            // of `Error::Io`. Both variants are accepted to keep the
+            // test stable across future transport-error refactors.
+            Error::Transport(crate::transport::TransportError::AddressInUse) => {}
             Error::Io(io_err) => {
                 assert!(
                     matches!(
@@ -2179,7 +2361,7 @@ mod tests {
                     io_err.kind()
                 );
             }
-            other => panic!("expected Error::Io, got {other:?}"),
+            other => panic!("expected Error::Io or Error::Transport(AddressInUse), got {other:?}"),
         }
         drop(blocker);
     }
@@ -2301,7 +2483,7 @@ mod tests {
         let rx: UdpSocket = UdpSocket::from_std(raw_rx.into()).unwrap();
         rx.join_multicast_v4(sd::MULTICAST_IP, interface).unwrap();
 
-        let server = Server::new_with_loopback(config, true)
+        let server = TestServer::new_with_loopback(config, true)
             .await
             .expect("server must bind with loopback enabled");
         let announce_fut = server

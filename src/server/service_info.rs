@@ -52,6 +52,7 @@ pub struct Subscriber {
 
 impl Subscriber {
     /// Create a new subscriber
+    #[must_use]
     pub fn new(
         address: SocketAddrV4,
         service_id: u16,

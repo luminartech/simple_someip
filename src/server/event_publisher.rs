@@ -1,29 +1,38 @@
 //! Event publishing functionality
 
 use super::Error;
-use super::subscription_manager::{SubscriptionHandle, SubscriptionManager};
+use super::subscription_manager::SubscriptionHandle;
 use crate::UDP_BUFFER_SIZE;
-use crate::e2e::{E2EKey, E2ERegistry};
+use crate::e2e::E2EKey;
 use crate::protocol::{Header, Message};
 use crate::traits::{PayloadWireFormat, WireFormat};
-use crate::transport::E2ERegistryHandle;
-use std::sync::{Arc, Mutex};
-use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
+use crate::transport::{E2ERegistryHandle, TransportSocket};
+use std::sync::Arc;
 
-/// Publishes events to subscribers
-pub struct EventPublisher<
-    R: E2ERegistryHandle = Arc<Mutex<E2ERegistry>>,
-    S: SubscriptionHandle = Arc<RwLock<SubscriptionManager>>,
-> {
+/// Publishes events to subscribers.
+///
+/// Generic over `T: TransportSocket` (the socket primitive — `TokioSocket`
+/// in the std/tokio path, a bare-metal embassy / smoltcp wrapper on
+/// firmware), `R: E2ERegistryHandle`, and `S: SubscriptionHandle`.
+pub struct EventPublisher<R, S, T>
+where
+    R: E2ERegistryHandle,
+    S: SubscriptionHandle,
+    T: TransportSocket + Send + Sync + 'static,
+{
     subscriptions: S,
-    socket: Arc<UdpSocket>,
+    socket: Arc<T>,
     e2e_registry: R,
 }
 
-impl<R: E2ERegistryHandle, S: SubscriptionHandle> EventPublisher<R, S> {
+impl<R, S, T> EventPublisher<R, S, T>
+where
+    R: E2ERegistryHandle,
+    S: SubscriptionHandle,
+    T: TransportSocket + Send + Sync + 'static,
+{
     /// Create a new event publisher
-    pub fn new(subscriptions: S, socket: Arc<UdpSocket>, e2e_registry: R) -> Self {
+    pub fn new(subscriptions: S, socket: Arc<T>, e2e_registry: R) -> Self {
         Self {
             subscriptions,
             socket,
@@ -144,7 +153,7 @@ impl<R: E2ERegistryHandle, S: SubscriptionHandle> EventPublisher<R, S> {
         let mut sent_count = 0;
         for subscriber in &subscribers {
             match self.socket.send_to(datagram, subscriber.address).await {
-                Ok(_) => {
+                Ok(()) => {
                     sent_count += 1;
                     tracing::trace!(
                         "Sent event to subscriber {} ({} bytes)",
@@ -258,7 +267,7 @@ impl<R: E2ERegistryHandle, S: SubscriptionHandle> EventPublisher<R, S> {
         let mut sent_count = 0;
         for subscriber in &subscribers {
             match self.socket.send_to(datagram, subscriber.address).await {
-                Ok(_) => {
+                Ok(()) => {
                     sent_count += 1;
                 }
                 Err(e) => {
@@ -385,22 +394,55 @@ impl<R: E2ERegistryHandle, S: SubscriptionHandle> EventPublisher<R, S> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server-tokio"))]
 mod tests {
     use super::*;
+    use crate::e2e::E2ERegistry;
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
+    use crate::server::SubscriptionManager;
+    use crate::tokio_transport::TokioSocket;
     use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::Mutex;
     use std::vec;
     use std::vec::Vec;
+    use tokio::net::UdpSocket;
+    use tokio::sync::RwLock;
+
+    /// Type alias bringing the tokio-flavor concrete type parameters back
+    /// into scope so tests can spell `TestEventPublisher` without
+    /// chasing the three-type-parameter signature on every call site.
+    type TestEventPublisher = EventPublisher<
+        Arc<Mutex<E2ERegistry>>,
+        Arc<RwLock<SubscriptionManager>>,
+        TokioSocket,
+    >;
 
     fn test_registry() -> Arc<Mutex<E2ERegistry>> {
         Arc::new(Mutex::new(E2ERegistry::new()))
     }
 
+    /// Bind a `TokioSocket` for tests. The publisher path under
+    /// `server-tokio` already depends on `tokio_transport`, so we use it
+    /// directly rather than constructing a `tokio::net::UdpSocket` and
+    /// adapting it.
+    async fn bind_tokio_socket() -> Arc<TokioSocket> {
+        use crate::transport::{SocketOptions, TransportFactory};
+        let factory = crate::tokio_transport::TokioTransport;
+        Arc::new(
+            factory
+                .bind(
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+                    &SocketOptions::new(),
+                )
+                .await
+                .expect("bind tokio socket for test"),
+        )
+    }
+
     async fn make_publisher(
         subscriptions: Arc<RwLock<SubscriptionManager>>,
-    ) -> (EventPublisher, Arc<UdpSocket>) {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    ) -> (TestEventPublisher, Arc<TokioSocket>) {
+        let socket = bind_tokio_socket().await;
         let publisher = EventPublisher::new(subscriptions, Arc::clone(&socket), test_registry());
         (publisher, socket)
     }
@@ -412,11 +454,7 @@ mod tests {
     #[tokio::test]
     async fn test_event_publisher_creation() {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
-        let socket = Arc::new(
-            UdpSocket::bind("127.0.0.1:0")
-                .await
-                .expect("Failed to bind socket"),
-        );
+        let socket = bind_tokio_socket().await;
 
         let publisher = EventPublisher::new(subscriptions, socket, test_registry());
         assert!(std::mem::size_of_val(&publisher) > 0);
@@ -579,7 +617,7 @@ mod tests {
                 .unwrap();
         }
 
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = bind_tokio_socket().await;
         let publisher = EventPublisher::new(subscriptions, socket, e2e_registry);
 
         // Size the payload from `UDP_BUFFER_SIZE` and `PROFILE4_HEADER_SIZE`

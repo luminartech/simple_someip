@@ -59,10 +59,30 @@ type TestClient = Client<
     TokioChannels,
 >;
 
+/// Type alias bringing the tokio-flavor concrete type parameters back into
+/// scope so callers can spell `TestServer::new(...)` without chasing the
+/// four-type-parameter signature on every call site.
+type TestServer = Server<
+    std::sync::Arc<std::sync::Mutex<simple_someip::e2e::E2ERegistry>>,
+    std::sync::Arc<tokio::sync::RwLock<simple_someip::server::SubscriptionManager>>,
+    simple_someip::TokioTransport,
+    simple_someip::TokioTimer,
+>;
+
+/// Type alias for the event publisher concrete type used by `TestServer`'s
+/// publisher. Same shape rationale as [`TestServer`].
+type TestEventPublisher = simple_someip::server::EventPublisher<
+    std::sync::Arc<std::sync::Mutex<simple_someip::e2e::E2ERegistry>>,
+    std::sync::Arc<tokio::sync::RwLock<simple_someip::server::SubscriptionManager>>,
+    simple_someip::TokioSocket,
+>;
+
 /// Create a server on an ephemeral unicast port, returning (Server, actual_port).
-async fn create_server(service_id: u16, instance_id: u16) -> (Server, u16) {
+async fn create_server(service_id: u16, instance_id: u16) -> (TestServer, u16) {
     let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, service_id, instance_id);
-    let mut server: Server = Server::new(config).await.expect("Server::new failed");
+    let mut server: TestServer = TestServer::new(config)
+        .await
+        .expect("Server::new failed");
     let port = match server.unicast_local_addr().expect("local_addr failed") {
         std::net::SocketAddr::V4(a) => a.port(),
         _ => panic!("expected IPv4"),
@@ -74,7 +94,7 @@ async fn create_server(service_id: u16, instance_id: u16) -> (Server, u16) {
 /// Poll `has_subscribers` with retries until the server has processed the
 /// subscription. Returns true if subscribers appeared within the deadline.
 async fn wait_for_subscribers(
-    publisher: &simple_someip::server::EventPublisher,
+    publisher: &TestEventPublisher,
     service_id: u16,
     instance_id: u16,
     event_group_id: u16,
