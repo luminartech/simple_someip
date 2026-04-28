@@ -78,6 +78,25 @@ define_static_channels! {
 struct MockPipe {
     sent: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
     inbound: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
+    /// Waker registered by the most recent pending `MockRecvFut::poll`.
+    /// Woken by `deliver_inbound` (if any test pushes inbound traffic).
+    /// Default `None` is fine: tests that never inject inbound just
+    /// stay parked.
+    inbound_waker: Mutex<Option<core::task::Waker>>,
+}
+
+#[allow(dead_code)]
+impl MockPipe {
+    /// Push a datagram to the inbound queue and wake any pending
+    /// `MockRecvFut`. Tests that drive ingress through the mock should
+    /// use this rather than locking the queue directly so the
+    /// receiver actually wakes.
+    fn deliver_inbound(&self, bytes: Vec<u8>, source: SocketAddrV4) {
+        self.inbound.lock().unwrap().push_back((bytes, source));
+        if let Some(waker) = self.inbound_waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -152,10 +171,23 @@ impl Future for MockRecvFut<'_> {
                 }))
             }
             None => {
-                // No data: return Pending and wake immediately to keep
-                // the run-loop ticking. Real bare-metal impls park the
-                // task on an interrupt-driven waker.
-                cx.waker().wake_by_ref();
+                // Park on the pipe's waker. Wake fires when a test
+                // calls `MockPipe::deliver_inbound`. Real bare-metal
+                // impls park the task on an interrupt-driven waker;
+                // wake_by_ref-on-empty would CPU-peg the test runtime.
+                *me.pipe.inbound_waker.lock().unwrap() = Some(cx.waker().clone());
+                // Re-check after registering to close the lost-wakeup
+                // window between the pop_front above and the waker
+                // store here.
+                if let Some((bytes, source)) = me.pipe.inbound.lock().unwrap().pop_front() {
+                    let n = bytes.len().min(me.buf.len());
+                    me.buf[..n].copy_from_slice(&bytes[..n]);
+                    return Poll::Ready(Ok(ReceivedDatagram {
+                        bytes_received: n,
+                        source,
+                        truncated: n < bytes.len(),
+                    }));
+                }
                 Poll::Pending
             }
         }
@@ -198,14 +230,14 @@ impl TransportSocket for MockSocket {
 
 struct MockTimer;
 impl Timer for MockTimer {
-    async fn sleep(&self, _duration: Duration) {
-        // The witness here is "the *crate* doesn't pull tokio under
-        // `--features client,bare_metal`," not "the test runs without
-        // tokio at all." The test runtime itself is `#[tokio::test]`
-        // (tokio is a `dev-dependency`), so using `tokio::task::yield_now`
-        // inside this mock is fine — it only proves the production
-        // crate's no-tokio path compiles.
-        tokio::task::yield_now().await;
+    async fn sleep(&self, duration: Duration) {
+        // Honor `duration` — the `Timer` trait's contract is that
+        // implementations MAY overshoot but MUST NOT undershoot. The
+        // test runtime is `#[tokio::test]` (tokio is a `dev-dependency`),
+        // so using `tokio::time::sleep` is fine — it only proves the
+        // production crate's no-tokio path compiles. A real bare-metal
+        // impl would replace this with `embassy_time::Timer::after`.
+        tokio::time::sleep(duration).await;
     }
 }
 

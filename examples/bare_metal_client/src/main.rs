@@ -25,7 +25,7 @@
 //! |---------|-------------|----------------------|
 //! | Channel factory | `BareMetalChannels` via `define_static_channels!` | same macro, sized to your HWM |
 //! | Transport | `MockFactory` / `MockSocket` | `embassy_net`, smoltcp, custom Ethernet ISR |
-//! | Timer | `MockTimer` using `tokio::task::yield_now` | `embassy_time::Timer::after` |
+//! | Timer | `MockTimer` using `tokio::time::sleep` | `embassy_time::Timer::after` |
 //! | Task spawner | `TokioBackedSpawner` | `embassy_executor::Spawner` |
 //! | Lock handles | `Arc<Mutex<_>>` / `Arc<RwLock<_>>` | stack-allocated handles (see below) |
 //!
@@ -91,6 +91,17 @@ define_static_channels! {
 struct MockPipe {
     sent: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
     inbound: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
+    inbound_waker: Mutex<Option<core::task::Waker>>,
+}
+
+#[allow(dead_code)]
+impl MockPipe {
+    fn deliver_inbound(&self, bytes: Vec<u8>, source: SocketAddrV4) {
+        self.inbound.lock().unwrap().push_back((bytes, source));
+        if let Some(waker) = self.inbound_waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -163,11 +174,21 @@ impl Future for MockRecvFut<'_> {
                     truncated: n < bytes.len(),
                 }))
             }
-            // No datagram — wake immediately and yield. A real bare-metal
-            // impl registers the waker on the network driver's RX-ready
-            // interrupt instead of busy-waking.
+            // No datagram — register the waker on the pipe and park.
+            // `MockPipe::deliver_inbound` wakes us when a test drives
+            // ingress traffic. A real bare-metal impl registers the
+            // waker on the network driver's RX-ready interrupt instead.
             None => {
-                cx.waker().wake_by_ref();
+                *me.pipe.inbound_waker.lock().unwrap() = Some(cx.waker().clone());
+                if let Some((bytes, source)) = me.pipe.inbound.lock().unwrap().pop_front() {
+                    let n = bytes.len().min(me.buf.len());
+                    me.buf[..n].copy_from_slice(&bytes[..n]);
+                    return Poll::Ready(Ok(ReceivedDatagram {
+                        bytes_received: n,
+                        source,
+                        truncated: n < bytes.len(),
+                    }));
+                }
                 Poll::Pending
             }
         }
@@ -205,14 +226,15 @@ impl TransportSocket for MockSocket {
 
 // ── Mock Timer ────────────────────────────────────────────────────────
 //
-// Uses tokio's yield_now to keep the example executor happy. Real
-// firmware replaces this with e.g. `embassy_time::Timer::after(d).await`.
+// Honors `duration` per the `Timer` trait contract (MAY overshoot, MUST
+// NOT undershoot). Real firmware replaces this with e.g.
+// `embassy_time::Timer::after(d).await`.
 
 struct MockTimer;
 
 impl Timer for MockTimer {
-    async fn sleep(&self, _duration: Duration) {
-        tokio::task::yield_now().await;
+    async fn sleep(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
     }
 }
 
