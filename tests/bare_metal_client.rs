@@ -1,25 +1,34 @@
-//! Phase-13.5 witness test: prove that `Client` can be constructed and
-//! driven without the `client-tokio` feature, using only the trait
-//! surface (`TransportFactory`, `Spawner`, `Timer`, `ChannelFactory`,
-//! `E2ERegistryHandle`, `InterfaceHandle`).
+//! Phase-13.6 witness test: prove that `Client` can be constructed and
+//! driven without the `client-tokio` feature, using a static-pool
+//! [`ChannelFactory`] declared via [`define_static_channels!`] — the
+//! production-bound bare-metal path (no per-call heap allocation for
+//! channel storage).
+//!
+//! [`ChannelFactory`]: simple_someip::transport::ChannelFactory
+//! [`define_static_channels!`]: simple_someip::define_static_channels
+//!
+//! Originally a phase-13.5 witness using `EmbassySyncChannels` (which
+//! still heap-allocates an `Arc<Channel<...>>` per call). Phase 13.6c
+//! shipped the `static_channels` module; phase 13.6d shipped the
+//! `define_static_channels!` macro; this test now exercises that
+//! macro end-to-end against `Client::new_with_deps`.
 //!
 //! `simple-someip` is compiled with `default-features = false,
 //! features = ["client", "bare_metal"]` per the `required-features`
-//! gate below — i.e. NO tokio, NO socket2 pulled in via the crate
-//! itself. The test still uses the host's tokio runtime as a generic
-//! executor (tokio is a `dev-dependency`), but every type fed to
-//! `simple-someip::Client::new_with_factory_spawner_timer_and_loopback`
-//! comes from the no-tokio side: a hand-rolled mock `TransportFactory`,
-//! a hand-rolled `Timer`, the bare-metal `EmbassySyncChannels`, and
-//! a `Spawner` that wraps `tokio::spawn` purely as the test-side
-//! executor.
+//! gate below — NO tokio, NO socket2 pulled in via the crate itself.
+//! The test runtime still uses the host's tokio (a `dev-dependency`)
+//! for `#[tokio::test]` execution, but every type fed to
+//! `Client::new_with_deps` is from the no-tokio side: a hand-rolled
+//! mock `TransportFactory`, a hand-rolled `Timer`, the
+//! macro-declared static-pool channels, and a `Spawner` that wraps
+//! `tokio::spawn` purely as the test executor.
 //!
-//! This is the gate witness for the phase-13.5 claim that `Client`
-//! is reachable on a no-tokio build. Compile-witness alone (Cargo
-//! `required-features` proving the test crate compiles without
-//! `client-tokio`) is the load-bearing assertion; the runtime
-//! send/recv at the end is a sanity check that the wired-up generics
-//! actually drive a working pipeline.
+//! Compile-witness alone (Cargo `required-features` proving the test
+//! crate compiles without `client-tokio`) is the load-bearing
+//! assertion; the runtime send/recv at the end is a sanity check
+//! that the wired-up generics actually drive a working pipeline.
+//! Per-call heap-allocation absence is verified separately in
+//! `tests/static_channels_alloc_witness.rs`.
 #![cfg(all(feature = "client", feature = "bare_metal"))]
 
 use core::future::Future;
@@ -30,13 +39,38 @@ use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use simple_someip::client::Error as ClientError;
+use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
+use simple_someip::define_static_channels;
 use simple_someip::e2e::E2ERegistry;
-use simple_someip::embassy_channels::EmbassySyncChannels;
+use simple_someip::protocol::sd::RebootFlag;
 use simple_someip::transport::{
     ReceivedDatagram, SocketOptions, Spawner, Timer, TransportError, TransportFactory,
     TransportSocket,
 };
-use simple_someip::{Client, ClientDeps};
+use simple_someip::{Client, ClientDeps, RawPayload};
+
+// ── Static-pool channel factory declared via the macro ────────────────
+//
+// One pool per channeled `T`. Pool sizes here are deliberately small
+// for a witness test; production firmware would size pools to the
+// workload's high-water mark.
+define_static_channels! {
+    name: TestStaticChannels,
+    oneshot: [
+        (Result<(), ClientError>, 8),
+        (Result<RawPayload, ClientError>, 4),
+        (Result<RebootFlag, ClientError>, 4),
+    ],
+    bounded: [
+        ((ControlMessage<RawPayload, TestStaticChannels>, 4), 1),
+        ((SendMessage<RawPayload, TestStaticChannels>, 16), 4),
+        ((Result<ReceivedMessage<RawPayload>, ClientError>, 16), 4),
+    ],
+    unbounded: [
+        (ClientUpdate<RawPayload>, 1),
+    ],
+}
 
 // ── Mock transport ─────────────────────────────────────────────────────
 
@@ -202,10 +236,10 @@ async fn client_constructible_without_client_tokio_feature() {
     let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
 
     let (client, _updates, run_fut) = Client::<
-        simple_someip::RawPayload,
+        RawPayload,
         Arc<Mutex<E2ERegistry>>,
         Arc<std::sync::RwLock<Ipv4Addr>>,
-        EmbassySyncChannels,
+        TestStaticChannels,
     >::new_with_deps(
         ClientDeps {
             factory,
@@ -217,27 +251,23 @@ async fn client_constructible_without_client_tokio_feature() {
         false,
     );
 
-    // Spawn the run loop on an abortable handle so we can stop it
-    // cleanly at the end of the test. Note: `EmbassySyncChannels` does
-    // not surface a "all senders dropped" close signal, so dropping
-    // `client` does not gracefully shut the run loop down — that's
-    // intentional for embassy-sync, which is designed for static
-    // SPSC/MPSC patterns. The witness goal here is purely
-    // compile-time: the constructor accepts no-tokio types, returns
-    // a `Client` + updates triple, and the run-loop future is
-    // `Send + 'static` (proven by the `tokio::spawn` below).
+    // Compile-time witness: the constructor accepts no-tokio types,
+    // returns a `Client` + updates triple, and the run-loop future
+    // is `Send + 'static` (proven by the `tokio::spawn` below).
     let run_handle = tokio::spawn(run_fut);
 
     // Verify the Client handle is usable: read its interface address.
     assert_eq!(client.interface(), Ipv4Addr::LOCALHOST);
 
-    // Tear down: abort the run-loop task and drop the Client. We do
-    // not await drain of `updates` because EmbassySyncChannels has
-    // no close-on-sender-drop semantics (would require a tracking
-    // wrapper, which is out of scope for the witness).
+    // Tear down. `TestStaticChannels`'s bounded sender Drop sets the
+    // slot's `closed` flag and wakes the receiver, so dropping all
+    // `Client` clones lets the run loop's control-channel `recv`
+    // resolve to `None` and the loop exits naturally — but it's
+    // simpler to abort the spawned task directly here. The witness
+    // goal is the compile + start-up sanity check, not graceful
+    // shutdown semantics.
     run_handle.abort();
     drop(client);
 
-    // Yield once so the abort takes effect before the test exits.
     tokio::time::sleep(Duration::from_millis(50)).await;
 }

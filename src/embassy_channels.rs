@@ -12,20 +12,28 @@
 //! constructs a oneshot via this factory, so each such method
 //! triggers one `Arc` allocation.
 //!
-//! This violates the strategic bare-metal goal "zero heap after
-//! `Client::new` returns." The fix is a static-pool `ChannelFactory`
-//! impl (planned as `StaticChannels<const POOL_SIZE: usize>`) that
-//! hands out indices into a pre-allocated `static` array of
-//! `Channel`s; that work is its own phase because it may require a
-//! `ChannelFactory` trait-shape adjustment to permit `&'static Sender`
-//! / `&'static Receiver` ownership. Until that lands, this impl is
-//! useful for two cases:
+//! # Use [`crate::static_channels`] for the no-alloc bare-metal path
 //!
-//! 1. Bringing up a bare-metal port end-to-end on `std + alloc`
-//!    targets, validating the trait surface before the no-alloc
-//!    push.
+//! Phase 13.6c shipped [`crate::static_channels`] — a no-alloc
+//! `ChannelFactory` whose senders and receivers carry `&'static`
+//! references into pre-allocated `OneshotPool` / `MpscPool` storage.
+//! Phase 13.6d shipped the [`crate::define_static_channels`] macro
+//! that generates the per-`T` `*Pooled<MyChannels>` impls + a
+//! [`ChannelFactory`] impl on a unit struct.
+//!
+//! `EmbassySyncChannels` remains useful for two cases:
+//!
+//! 1. Bringing up a bare-metal port on `std + alloc` targets where
+//!    you want the trait-surface integration validated before
+//!    declaring static pool sizes.
 //! 2. Demonstrating the `ChannelFactory` integration shape for
-//!    consumers writing their own no-alloc impl.
+//!    consumers writing their own backend.
+//!
+//! For production firmware targeting "zero heap after
+//! `Client::new` returns", switch to the macro-declared static
+//! pools. See `tests/bare_metal_client.rs` for the integration
+//! pattern and `tests/static_channels_alloc_witness.rs` for the
+//! per-call no-alloc verification.
 //!
 //! [`bounded`]: ChannelFactory::bounded
 //! [`unbounded`]: ChannelFactory::unbounded
