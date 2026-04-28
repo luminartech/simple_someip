@@ -304,7 +304,7 @@ pub struct SocketOptions {
     /// (`IP_MULTICAST_LOOP`). Required when running a SOME/IP server and
     /// client on the same machine for testing.
     ///
-    /// Honoured whenever it is set to `true` OR [`Self::multicast_if_v4`]
+    /// Honored whenever it is set to `true` OR [`Self::multicast_if_v4`]
     /// is `Some`. The default (`false`) is only suppressed when there is
     /// no multicast interface configured — in that case the flag has no
     /// effect anyway.
