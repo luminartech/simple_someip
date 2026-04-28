@@ -11,8 +11,23 @@ leak-timeout = "1s"
 filter = 'test(server::tests::) | binary(client_server)'
 test-group = 'serial-sd-port'
 
+# bare_metal_e2e tests share static channel pools declared via
+# `define_static_channels!` — pool slots are not reclaimed until the
+# process exits, so parallel tests exhaust the pools. Run serially.
+[[profile.default.overrides]]
+filter = 'binary(bare_metal_e2e)'
+test-group = 'serial-static-pools'
+
+# static_channels_alloc_witness tests share a counting global allocator
+# and static channel pools. The internal MEASURE_LOCK serializes allocation
+# measurement, but pool exhaustion still requires serial execution.
+[[profile.default.overrides]]
+filter = 'binary(static_channels_alloc_witness)'
+test-group = 'serial-static-pools'
+
 [test-groups]
 serial-sd-port = { max-threads = 1 }
+serial-static-pools = { max-threads = 1 }
 
 [profile.default.junit]  # Output the junit coverage for tools
 path = "junit.xml"

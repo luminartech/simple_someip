@@ -314,6 +314,21 @@ fn witness_static_channels_oneshot_recv() {
 // ── Entry point ───────────────────────────────────────────────────────────
 
 fn main() {
+    // cargo-nextest runs `--list --format terse` for test discovery. A
+    // `harness = false` binary must print each test name followed by
+    // `: test` or `: benchmark`. We expose a single pseudo-test named
+    // `no_alloc_witness` so nextest can schedule us.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--list") {
+        // nextest calls --list twice: once for normal tests and once with
+        // --ignored. Print nothing for the --ignored pass so nextest does
+        // not classify this test as ignored and skip it by default.
+        if !args.iter().any(|a| a == "--ignored") {
+            println!("no_alloc_witness: test");
+        }
+        return;
+    }
+
     println!("no-alloc witness:");
 
     witness_atomic_interface_handle();
