@@ -209,3 +209,5 @@ pub use transport::{
     OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram, SocketOptions, Spawner, Timer,
     TransportError, TransportFactory, TransportSocket, UnboundedRecv, UnboundedSend,
 };
+#[cfg(feature = "bare_metal")]
+pub use transport::{AtomicInterfaceHandle, StaticE2EHandle, StaticE2EStorage};
