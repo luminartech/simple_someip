@@ -574,6 +574,134 @@ mod tests {
         }
     }
 
+    /// Regression for H12: when there ARE subscribers but every
+    /// `send_to` fails, `publish_event` must surface the underlying
+    /// transport error instead of masking the failure as `Ok(0)` —
+    /// which is indistinguishable from "no subscribers" to the caller.
+    ///
+    /// Uses a mock `TransportSocket` whose `send_to` always returns
+    /// `Err(TransportError::Io(IoErrorKind::NetworkUnreachable))`.
+    #[tokio::test]
+    async fn publish_event_returns_err_when_every_send_fails() {
+        use crate::transport::{IoErrorKind, ReceivedDatagram, TransportError, TransportSocket};
+        use core::future::{Future, Ready, ready};
+        use core::pin::Pin;
+        use core::task::{Context, Poll};
+
+        struct AlwaysFailSocket;
+
+        struct AlwaysFailSend;
+        impl Future for AlwaysFailSend {
+            type Output = Result<(), TransportError>;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(Err(TransportError::Io(IoErrorKind::NetworkUnreachable)))
+            }
+        }
+
+        impl TransportSocket for AlwaysFailSocket {
+            type SendFuture<'a> = AlwaysFailSend;
+            type RecvFuture<'a> = Ready<Result<ReceivedDatagram, TransportError>>;
+
+            fn send_to<'a>(&'a self, _buf: &'a [u8], _t: SocketAddrV4) -> Self::SendFuture<'a> {
+                AlwaysFailSend
+            }
+            fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+                ready(Err(TransportError::Unsupported))
+            }
+            fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
+                Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            }
+            fn join_multicast_v4(&self, _g: Ipv4Addr, _i: Ipv4Addr) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn leave_multicast_v4(&self, _g: Ipv4Addr, _i: Ipv4Addr) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
+        {
+            let mut mgr = subscriptions.write().await;
+            mgr.subscribe(0x5B, 1, 0x01, addr).unwrap();
+        }
+        let publisher: EventPublisher<
+            Arc<Mutex<E2ERegistry>>,
+            Arc<RwLock<SubscriptionManager>>,
+            AlwaysFailSocket,
+        > = EventPublisher::new(subscriptions, Arc::new(AlwaysFailSocket), test_registry());
+
+        let msg = make_test_message();
+        let err = publisher
+            .publish_event(0x5B, 1, 0x01, &msg)
+            .await
+            .expect_err("total-failure path must surface Err, not Ok(0)");
+        match err {
+            Error::Transport(TransportError::Io(IoErrorKind::NetworkUnreachable)) => {}
+            other => panic!(
+                "expected Transport(Io(NetworkUnreachable)) from total-failure send, got {other:?}"
+            ),
+        }
+    }
+
+    /// Same H12 path through `publish_raw_event`.
+    #[tokio::test]
+    async fn publish_raw_event_returns_err_when_every_send_fails() {
+        use crate::transport::{IoErrorKind, ReceivedDatagram, TransportError, TransportSocket};
+        use core::future::{Future, Ready, ready};
+        use core::pin::Pin;
+        use core::task::{Context, Poll};
+
+        struct AlwaysFailSocket;
+        struct AlwaysFailSend;
+        impl Future for AlwaysFailSend {
+            type Output = Result<(), TransportError>;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(Err(TransportError::Io(IoErrorKind::ConnectionRefused)))
+            }
+        }
+        impl TransportSocket for AlwaysFailSocket {
+            type SendFuture<'a> = AlwaysFailSend;
+            type RecvFuture<'a> = Ready<Result<ReceivedDatagram, TransportError>>;
+            fn send_to<'a>(&'a self, _buf: &'a [u8], _t: SocketAddrV4) -> Self::SendFuture<'a> {
+                AlwaysFailSend
+            }
+            fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+                ready(Err(TransportError::Unsupported))
+            }
+            fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
+                Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            }
+            fn join_multicast_v4(&self, _g: Ipv4Addr, _i: Ipv4Addr) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn leave_multicast_v4(&self, _g: Ipv4Addr, _i: Ipv4Addr) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
+        {
+            let mut mgr = subscriptions.write().await;
+            mgr.subscribe(0x5B, 1, 0x01, addr).unwrap();
+        }
+        let publisher: EventPublisher<
+            Arc<Mutex<E2ERegistry>>,
+            Arc<RwLock<SubscriptionManager>>,
+            AlwaysFailSocket,
+        > = EventPublisher::new(subscriptions, Arc::new(AlwaysFailSocket), test_registry());
+
+        let err = publisher
+            .publish_raw_event(0x5B, 1, 0x01, 0x8001, 0x0001, 0x01, 0x01, &[0xAA, 0xBB])
+            .await
+            .expect_err("total-failure path must surface Err, not Ok(0)");
+        match err {
+            Error::Transport(TransportError::Io(IoErrorKind::ConnectionRefused)) => {}
+            other => panic!("expected Transport(Io(ConnectionRefused)), got {other:?}"),
+        }
+    }
+
     /// Regression guard against 343da67: without the pre-check, an oversize
     /// message would fail with a less-actionable protocol I/O error from
     /// `encode_to_slice`'s slice writer running out of buffer, rather than

@@ -1241,6 +1241,27 @@ mod tests {
 
     use super::*;
 
+    /// `IoErrorKind::is_transient_recv` must classify the well-known
+    /// transient kinds as `true` (so they do not count toward
+    /// `MAX_CONSECUTIVE_RECV_ERRORS` in the per-socket loop) and
+    /// everything else — including the catch-all `Other` — as `false`.
+    /// Regression for H10: an inbound ICMP storm
+    /// (`ConnectionRefused`) was wrongly counted as fatal and tore
+    /// down healthy sockets after 16 transient blips.
+    #[test]
+    fn io_error_kind_transient_classification() {
+        // Transient kinds — must NOT count toward fatal-error cap.
+        assert!(IoErrorKind::ConnectionRefused.is_transient_recv());
+        assert!(IoErrorKind::NetworkUnreachable.is_transient_recv());
+        assert!(IoErrorKind::WouldBlock.is_transient_recv());
+        assert!(IoErrorKind::Interrupted.is_transient_recv());
+        assert!(IoErrorKind::TimedOut.is_transient_recv());
+
+        // Fatal-class kinds — DO count toward the cap.
+        assert!(!IoErrorKind::PermissionDenied.is_transient_recv());
+        assert!(!IoErrorKind::Other.is_transient_recv());
+    }
+
     /// Drive a Future to completion on the test thread, assuming it never
     /// yields (as with [`core::future::ready`] and its sync-in-disguise
     /// peers). Panics if the future returns `Poll::Pending`.
