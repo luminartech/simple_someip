@@ -11,7 +11,7 @@
 //! migration point for the announcement path.
 
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::{net::SocketAddrV4, vec::Vec};
+use std::net::SocketAddrV4;
 
 use crate::protocol::sd::{
     self, Entry, Flags, OptionsCount, RebootFlag, ServiceEntry, TransportProtocol,
@@ -157,14 +157,14 @@ impl SdStateManager {
         let (sid, reboot_flag) = self.next_session_id_with_reboot_flag();
         let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &options);
 
-        let mut sd_data = Vec::new();
-        sd_payload.encode(&mut sd_data)?;
-
-        let someip_header = SomeIpHeader::new_sd(sid, sd_data.len());
-
-        let mut buffer = Vec::new();
-        someip_header.encode(&mut buffer)?;
-        buffer.extend_from_slice(&sd_data);
+        // Stack-allocated send buffer — alloc-free per-tick path.
+        // 16-byte SOME/IP header + the SD payload, capped at the UDP
+        // datagram limit.
+        let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
+        let sd_data_len = sd_payload.encode_to_slice(&mut buffer[16..])?;
+        let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
+        someip_header.encode_to_slice(&mut buffer[..16])?;
+        let total_len = 16 + sd_data_len;
 
         let multicast_addr = SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT);
 
@@ -173,14 +173,14 @@ impl SdStateManager {
             config.service_id,
             config.instance_id,
             config.local_port,
-            buffer.len()
+            total_len
         );
         tracing::trace!(
             "OfferService data: {:02X?}",
-            &buffer[..buffer.len().min(64)]
+            &buffer[..total_len.min(64)]
         );
 
-        socket.send_to(&buffer, multicast_addr).await?;
+        socket.send_to(&buffer[..total_len], multicast_addr).await?;
         tracing::trace!("Sent to {}", multicast_addr);
 
         Ok(())

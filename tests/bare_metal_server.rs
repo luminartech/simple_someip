@@ -200,7 +200,7 @@ impl SubscriptionHandle for MockSubscriptions {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), SubscribeError>> + Send + '_ {
+    ) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
         let this = self.0.clone();
         async move {
             let mut guard = this.lock().unwrap();
@@ -218,7 +218,7 @@ impl SubscriptionHandle for MockSubscriptions {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = ()> + Send + '_ {
+    ) -> impl Future<Output = ()> + '_ {
         let this = self.0.clone();
         async move {
             let mut guard = this.lock().unwrap();
@@ -228,20 +228,28 @@ impl SubscriptionHandle for MockSubscriptions {
         }
     }
 
-    fn get_subscribers(
-        &self,
+    fn for_each_subscriber<'a, F>(
+        &'a self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-    ) -> impl Future<Output = Vec<Subscriber>> + Send + '_ {
+        mut f: F,
+    ) -> impl Future<Output = usize> + 'a
+    where
+        F: FnMut(&Subscriber) + 'a,
+    {
         let this = self.0.clone();
         async move {
             let guard = this.lock().unwrap();
-            guard
-                .iter()
-                .filter(|(s, i, e, _)| *s == service_id && *i == instance_id && *e == event_group_id)
-                .map(|(s, i, e, addr)| Subscriber::new(*addr, *s, *i, *e))
-                .collect()
+            let mut count = 0;
+            for (s, i, e, addr) in guard.iter() {
+                if *s == service_id && *i == instance_id && *e == event_group_id {
+                    let sub = Subscriber::new(*addr, *s, *i, *e);
+                    f(&sub);
+                    count += 1;
+                }
+            }
+            count
         }
     }
 }
