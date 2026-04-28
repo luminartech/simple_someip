@@ -36,7 +36,8 @@ where
     MD: PayloadWireFormat + Clone + core::fmt::Debug + Send + 'static,
     C: ChannelFactory,
     R: E2ERegistryHandle,
-    Result<super::socket_manager::ReceivedMessage<MD>, Error>: crate::transport::BoundedPooled<C, 16>,
+    Result<super::socket_manager::ReceivedMessage<MD>, Error>:
+        crate::transport::BoundedPooled<C, 16>,
     super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
     Result<(), Error>: crate::transport::OneshotPooled<C>,
 {
@@ -77,7 +78,8 @@ where
     for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
     for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
     S: Spawner + Send + Sync + 'static,
-    Result<super::socket_manager::ReceivedMessage<MD>, Error>: crate::transport::BoundedPooled<C, 16>,
+    Result<super::socket_manager::ReceivedMessage<MD>, Error>:
+        crate::transport::BoundedPooled<C, 16>,
     super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
     Result<(), Error>: crate::transport::OneshotPooled<C>,
 {
@@ -105,7 +107,12 @@ where
         port: u16,
         e2e_registry: R,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
-        SocketManager::<MD, C>::bind_with_transport(&self.factory, &self.spawner, port, e2e_registry)
+        SocketManager::<MD, C>::bind_with_transport(
+            &self.factory,
+            &self.spawner,
+            port,
+            e2e_registry,
+        )
     }
 }
 
@@ -125,7 +132,8 @@ where
     F: TransportFactory + 'static,
     F::Socket: 'static,
     S: LocalSpawner + 'static,
-    Result<super::socket_manager::ReceivedMessage<MD>, Error>: crate::transport::BoundedPooled<C, 16>,
+    Result<super::socket_manager::ReceivedMessage<MD>, Error>:
+        crate::transport::BoundedPooled<C, 16>,
     super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
     Result<(), Error>: crate::transport::OneshotPooled<C>,
 {

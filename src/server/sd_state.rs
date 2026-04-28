@@ -175,10 +175,7 @@ impl SdStateManager {
             config.local_port,
             total_len
         );
-        tracing::trace!(
-            "OfferService data: {:02X?}",
-            &buffer[..total_len.min(64)]
-        );
+        tracing::trace!("OfferService data: {:02X?}", &buffer[..total_len.min(64)]);
 
         socket.send_to(&buffer[..total_len], multicast_addr).await?;
         tracing::trace!("Sent to {}", multicast_addr);
@@ -335,7 +332,9 @@ mod tests {
     /// resulting socket implements [`crate::transport::TransportSocket`]
     /// — which is what the now-generic
     /// [`SdStateManager::send_offer_service`] requires.
-    async fn build_mcast_sender(interface: Ipv4Addr) -> Result<TokioSocket, crate::transport::TransportError> {
+    async fn build_mcast_sender(
+        interface: Ipv4Addr,
+    ) -> Result<TokioSocket, crate::transport::TransportError> {
         let mut opts = SocketOptions::new();
         opts.reuse_address = true;
         opts.reuse_port = true;

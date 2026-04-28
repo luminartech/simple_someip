@@ -203,8 +203,7 @@ async fn client_constructible_with_local_spawner() {
 
             let interface_handle: Arc<std::sync::RwLock<Ipv4Addr>> =
                 Arc::new(std::sync::RwLock::new(Ipv4Addr::LOCALHOST));
-            let e2e_handle: Arc<Mutex<E2ERegistry>> =
-                Arc::new(Mutex::new(E2ERegistry::new()));
+            let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
 
             let (client, _updates, run_fut) = Client::<
                 RawPayload,

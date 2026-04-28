@@ -24,14 +24,14 @@ use crate::e2e::{E2EKey, E2EProfile};
 use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
 use crate::transport::{E2ERegistryHandle, SocketOptions, TransportFactory, TransportSocket};
 use futures::{FutureExt, pin_mut, select};
+#[cfg(test)]
+use std::vec::Vec;
 use std::{
     format,
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
     vec,
 };
-#[cfg(test)]
-use std::vec::Vec;
 
 #[cfg(feature = "server-tokio")]
 use crate::e2e::E2ERegistry;
@@ -524,7 +524,9 @@ where
         let total_len = 16 + sd_data_len;
 
         let target_v4 = socket_addr_v4(target)?;
-        self.sd_socket.send_to(&buffer[..total_len], target_v4).await?;
+        self.sd_socket
+            .send_to(&buffer[..total_len], target_v4)
+            .await?;
         tracing::debug!(
             "Sent unicast OfferService to {} for service 0x{:04X}",
             target,
@@ -545,12 +547,10 @@ where
     /// # Errors
     ///
     /// Returns an error if the socket's local address cannot be retrieved.
-    pub fn unicast_local_addr(&self) -> Result<std::net::SocketAddr, std::io::Error> {
+    pub fn unicast_local_addr(&self) -> Result<std::net::SocketAddr, Error> {
         match self.unicast_socket.local_addr() {
             Ok(v4) => Ok(std::net::SocketAddr::V4(v4)),
-            Err(_) => Err(std::io::Error::other(
-                "transport: failed to read local_addr",
-            )),
+            Err(e) => Err(Error::Transport(e)),
         }
     }
 
@@ -621,14 +621,14 @@ where
             // `tokio::select!` behavior and avoids starving either the
             // unicast or SD-multicast arm under sustained one-sided load.
             //
-            // SAFETY: both arms are `tokio::net::UdpSocket::recv_from`,
-            // which is cancel-safe per tokio docs — a non-selected arm
-            // can be dropped without losing in-flight kernel state. A
-            // future contributor adding a non-cancel-safe `FusedFuture`
-            // arm here (e.g. a custom state machine that holds
-            // partially-read bytes) would silently lose that state when
-            // the arm is dropped on a select win. Both futures must
-            // therefore stay `Send + FusedFuture + Unpin` *and*
+            // SAFETY: both arms call `TransportSocket::recv_from`. The
+            // `TokioSocket` backend is cancel-safe per tokio docs — a
+            // non-selected arm can be dropped without losing in-flight
+            // kernel state. Custom transport backends MUST provide the
+            // same guarantee. A future contributor adding a
+            // non-cancel-safe `FusedFuture` arm here would silently lose
+            // state when the arm is dropped on a select win. Both futures
+            // must therefore stay `Send + FusedFuture + Unpin` *and*
             // cancel-safe.
             //
             // Fresh futures are constructed each iteration so the borrows
@@ -877,15 +877,14 @@ where
 /// address ever surfaces here it indicates a misconfiguration upstream
 /// (a V6 socket binding the SD port, or a V6 source address surfaced
 /// by a transport that should not produce one). Returns
-/// [`std::io::ErrorKind::Unsupported`] in that case so the caller can
-/// log and drop the message instead of panicking.
+/// [`TransportError::Unsupported`](crate::transport::TransportError::Unsupported)
+/// in that case so the caller can log and drop the message instead of panicking.
 fn socket_addr_v4(addr: std::net::SocketAddr) -> Result<SocketAddrV4, Error> {
     match addr {
         std::net::SocketAddr::V4(v4) => Ok(v4),
-        std::net::SocketAddr::V6(_) => Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "IPv6 SD address is not supported",
-        ))),
+        std::net::SocketAddr::V6(_) => Err(Error::Transport(
+            crate::transport::TransportError::Unsupported,
+        )),
     }
 }
 
@@ -999,7 +998,9 @@ where
         let total_len = 16 + sd_data_len;
 
         let subscriber_v4 = socket_addr_v4(subscriber)?;
-        self.sd_socket.send_to(&buffer[..total_len], subscriber_v4).await?;
+        self.sd_socket
+            .send_to(&buffer[..total_len], subscriber_v4)
+            .await?;
 
         tracing::debug!(
             "Sent SubscribeAck to {} for service 0x{:04X}, eventgroup 0x{:04X}",
@@ -1046,7 +1047,9 @@ where
         let total_len = 16 + sd_data_len;
 
         let subscriber_v4 = socket_addr_v4(subscriber)?;
-        self.sd_socket.send_to(&buffer[..total_len], subscriber_v4).await?;
+        self.sd_socket
+            .send_to(&buffer[..total_len], subscriber_v4)
+            .await?;
 
         tracing::warn!(
             "Sent SubscribeNack to {} for service 0x{:04X}, eventgroup 0x{:04X} (reason: {})",
@@ -1146,7 +1149,9 @@ mod tests {
     async fn create_test_server(service_id: u16, instance_id: u16) -> (TestServer, u16) {
         // Use port 0 to get an ephemeral port
         let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, service_id, instance_id);
-        let mut server = TestServer::new(config).await.expect("Failed to create server");
+        let mut server = TestServer::new(config)
+            .await
+            .expect("Failed to create server");
         let port = match server.unicast_local_addr().unwrap() {
             std::net::SocketAddr::V4(addr) => addr.port(),
             std::net::SocketAddr::V6(_) => panic!("expected IPv4 address"),
@@ -1216,7 +1221,9 @@ mod tests {
         // Run server to process one message (with a timeout)
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let len = datagram.bytes_received;
+            let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1268,7 +1275,9 @@ mod tests {
         // Process the message
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let len = datagram.bytes_received;
+            let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1317,7 +1326,9 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let len = datagram.bytes_received;
+            let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1364,7 +1375,9 @@ mod tests {
         // Process the message on the unicast socket
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let len = datagram.bytes_received;
+            let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1414,7 +1427,9 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let len = datagram.bytes_received;
+            let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1461,7 +1476,9 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let len = datagram.bytes_received;
+            let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1501,7 +1518,9 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let len = datagram.bytes_received;
+            let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1753,7 +1772,9 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap(); let len = datagram.bytes_received; let addr = std::net::SocketAddr::V4(datagram.source);
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let len = datagram.bytes_received;
+            let addr = std::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -2349,8 +2370,8 @@ mod tests {
             panic!("new_passive must fail when the unicast port is taken");
         };
         match err {
-            // Phase 14b: the bind path now goes through the
-            // `TransportFactory` trait, so port collisions surface as
+            // The bind path goes through the `TransportFactory` trait,
+            // so port collisions surface as
             // `Error::Transport(TransportError::AddressInUse)` instead
             // of `Error::Io`. Both variants are accepted to keep the
             // test stable across future transport-error refactors.

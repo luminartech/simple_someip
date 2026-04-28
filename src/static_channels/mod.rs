@@ -9,21 +9,22 @@
 //!
 //! This module hands out `&'static` references into pre-allocated
 //! `static` pools instead. The user declares pools (typically via
-//! the `static_channels!` macro in phase 13.6d) sized to their
-//! workload's high-water mark; once seeded, no further allocation
-//! occurs.
+//! the [`define_static_channels!`](crate::define_static_channels) macro)
+//! sized to their workload's high-water mark; once seeded, no further
+//! allocation occurs.
 //!
 //! # Per-`T` `*Pooled<MyChannels>` impls
 //!
-//! Phase 13.6b reshaped `ChannelFactory` so each constructor method
-//! requires `T: *Pooled<Self>`. Static-pool consumers publish per-`T`
+//! [`ChannelFactory`] requires each constructor method to have
+//! `T: *Pooled<Self>`. Static-pool consumers publish per-`T`
 //! impls that route to the appropriate pool. The
-//! `static_channels!` macro generates them; the primitives in this
-//! module are the runtime they call into.
+//! [`define_static_channels!`](crate::define_static_channels) macro
+//! generates them; the primitives in this module are the runtime they
+//! call into.
 //!
 //! # Pool exhaustion
 //!
-//! If a [`OneshotPool::claim`] / [`MpscPool::claim`] call finds the
+//! If an `OneshotPool::claim()` / `MpscPool::claim_bounded()` call finds the
 //! pool empty it returns `None`. The trait method
 //! `*Pooled::*_pair() -> (Sender, Receiver)` cannot return `None` —
 //! it has no error channel — so generated impls **panic** on
@@ -734,7 +735,8 @@ impl<T: Send + 'static> core::fmt::Debug for StaticOneshotSender<T> {
 
 impl<T: Send + 'static> core::fmt::Debug for StaticOneshotReceiver<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("StaticOneshotReceiver").finish_non_exhaustive()
+        f.debug_struct("StaticOneshotReceiver")
+            .finish_non_exhaustive()
     }
 }
 
@@ -755,32 +757,36 @@ impl<T: Send + 'static, const P: usize, const N: usize> core::fmt::Debug for Mps
 
 impl<T: Send + 'static, const N: usize> core::fmt::Debug for StaticBoundedSender<T, N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("StaticBoundedSender").finish_non_exhaustive()
+        f.debug_struct("StaticBoundedSender")
+            .finish_non_exhaustive()
     }
 }
 
 impl<T: Send + 'static, const N: usize> core::fmt::Debug for StaticBoundedReceiver<T, N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("StaticBoundedReceiver").finish_non_exhaustive()
+        f.debug_struct("StaticBoundedReceiver")
+            .finish_non_exhaustive()
     }
 }
 
 impl<T: Send + 'static, const N: usize> core::fmt::Debug for StaticUnboundedSender<T, N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("StaticUnboundedSender").finish_non_exhaustive()
+        f.debug_struct("StaticUnboundedSender")
+            .finish_non_exhaustive()
     }
 }
 
 impl<T: Send + 'static, const N: usize> core::fmt::Debug for StaticUnboundedReceiver<T, N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("StaticUnboundedReceiver").finish_non_exhaustive()
+        f.debug_struct("StaticUnboundedReceiver")
+            .finish_non_exhaustive()
     }
 }
 
 // ── `define_static_channels!` macro ───────────────────────────────────
 
 /// Default slot capacity for unbounded channels declared via
-/// [`define_static_channels!`]. Matches the value used by the
+/// [`define_static_channels!`](crate::define_static_channels). Matches the value used by the
 /// embassy-sync-backed `EmbassySyncChannels::unbounded`. Each
 /// unbounded `T` declared in the macro gets its own `MpscPool`
 /// sized at `pool_size × UNBOUNDED_DEFAULT_CAP`.
@@ -1131,7 +1137,10 @@ mod tests {
         let mut fut = pin!(rx.recv());
         assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
         tx.send(42u32).unwrap();
-        assert!(flag.0.load(SAtomic::Acquire), "waker must fire when value is sent");
+        assert!(
+            flag.0.load(SAtomic::Acquire),
+            "waker must fire when value is sent"
+        );
         let noop = Waker::noop();
         let mut cx2 = Context::from_waker(noop);
         assert!(matches!(fut.as_mut().poll(&mut cx2), Poll::Ready(Ok(42))));
@@ -1146,10 +1155,16 @@ mod tests {
         let mut fut = pin!(rx.recv());
         assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
         drop(tx);
-        assert!(flag.0.load(SAtomic::Acquire), "waker must fire when sender is dropped (cancel)");
+        assert!(
+            flag.0.load(SAtomic::Acquire),
+            "waker must fire when sender is dropped (cancel)"
+        );
         let noop = Waker::noop();
         let mut cx2 = Context::from_waker(noop);
-        assert!(matches!(fut.as_mut().poll(&mut cx2), Poll::Ready(Err(OneshotCancelled))));
+        assert!(matches!(
+            fut.as_mut().poll(&mut cx2),
+            Poll::Ready(Err(OneshotCancelled))
+        ));
     }
 
     #[test]
@@ -1162,9 +1177,15 @@ mod tests {
         let mut fut = pin!(rx.recv());
         assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
         drop(tx);
-        assert!(!flag.0.load(SAtomic::Acquire), "waker must not fire until last sender drops");
+        assert!(
+            !flag.0.load(SAtomic::Acquire),
+            "waker must not fire until last sender drops"
+        );
         drop(tx2);
-        assert!(flag.0.load(SAtomic::Acquire), "waker must fire when last sender drops");
+        assert!(
+            flag.0.load(SAtomic::Acquire),
+            "waker must fire when last sender drops"
+        );
         let noop = Waker::noop();
         let mut cx2 = Context::from_waker(noop);
         assert!(matches!(fut.as_mut().poll(&mut cx2), Poll::Ready(None)));
@@ -1174,7 +1195,10 @@ mod tests {
     fn mpsc_bounded_pool_exhaustion_returns_none() {
         static POOL: MpscPool<u32, 1, 4> = MpscPool::new();
         let _a = POOL.claim_bounded().expect("pool not empty");
-        assert!(POOL.claim_bounded().is_none(), "second claim must exhaust pool of size 1");
+        assert!(
+            POOL.claim_bounded().is_none(),
+            "second claim must exhaust pool of size 1"
+        );
     }
 
     // ── Sender-side close-semantic tests ──────────────────────────────

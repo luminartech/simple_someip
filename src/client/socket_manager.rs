@@ -1,57 +1,44 @@
 //! Client-side UDP socket management.
 //!
-//! Each bound socket is backed by a `TokioSocket` (concrete, phase-5
-//! compromise — see the `bind_discovery_seeded_with_transport`
-//! docstring for the RTN-gap analysis) with its I/O loop running on a
-//! caller-supplied [`crate::transport::Spawner`]. Phase 9 introduced
-//! the `Spawner` trait specifically to make this submission point
-//! pluggable; on `std + tokio` consumers pass
-//! [`crate::tokio_transport::TokioSpawner`] and the behavior matches
-//! the previous `tokio::spawn` path exactly.
+//! Each bound socket is backed by a transport socket (concrete
+//! `TokioSocket` on `std + tokio`, pluggable via [`TransportFactory`] on
+//! bare-metal — see the `bind_discovery_seeded_with_transport` docstring
+//! for the RTN-gap analysis) with its I/O loop running on a
+//! caller-supplied [`crate::transport::Spawner`]. The `Spawner` trait
+//! makes the task-submission point pluggable; on `std + tokio` consumers
+//! pass [`crate::tokio_transport::TokioSpawner`] and the behavior matches
+//! a direct `tokio::spawn` call.
 //!
 //! # Why `Inner` can't drive per-socket futures itself
 //!
 //! Briefly experimented with having `Inner` drive per-socket futures
-//! via `FuturesUnordered` (phase 8 attempt, reverted). That deadlocks:
-//! `Inner::handle_control_message` awaits `SocketManager::send`,
-//! which internally awaits an mpsc→oneshot round-trip that requires
-//! the socket loop to make progress. But `Inner::run_future` is
-//! parked inside the handler, so nothing polls the socket loop.
-//! Concurrency between the two is mandatory and cannot come from the
-//! same task — hence the `Spawner` hook.
+//! via `FuturesUnordered`. That deadlocks: `Inner::handle_control_message`
+//! awaits `SocketManager::send`, which internally awaits an mpsc→oneshot
+//! round-trip that requires the socket loop to make progress. But
+//! `Inner::run_future` is parked inside the handler, so nothing polls
+//! the socket loop. Concurrency between the two is mandatory and cannot
+//! come from the same task — hence the `Spawner` hook.
 //!
-//! # Bare-metal readiness status
+//! # Bare-metal readiness
 //!
-//! **Completed abstractions (Phases 9-12):**
-//! - `Spawner` trait (Phase 9): task submission is pluggable.
-//! - `E2ERegistryHandle` / `InterfaceHandle` (Phase 10): lock handles
-//!   abstracted away from `Arc<Mutex<_>>` / `Arc<RwLock<_>>`.
-//! - `ChannelFactory` (Phase 11): channel primitives abstracted via
-//!   `TokioChannels` (std) and `EmbassySyncChannels` (`bare_metal`).
-//! - `TransportSocket` GATs (Phase 12): `Socket = TokioSocket` pin
-//!   removed; `SendFuture` / `RecvFuture` associated types express
-//!   `Send` bounds for spawnable socket loops.
+//! The `client` feature exposes the full trait-surface client without
+//! pulling tokio or socket2. The tokio convenience constructors
+//! (`Client::new`, `Client::new_with_loopback`, etc.) that default to
+//! `TokioTransport` + `TokioSpawner` are gated behind `client-tokio`.
 //!
-//! **Phase 13 (client half) complete:** the `client` feature no longer
-//! pulls tokio or socket2. The full `Client` / `Inner` / `SocketManager`
-//! types — including the `bind` / `bind_discovery_seeded` convenience
-//! constructors that default to `TokioTransport` + `TokioSpawner` — are
-//! gated behind the new `client-tokio` feature, which layers tokio +
-//! socket2 on top of `client`.
+//! **Completed abstractions:**
+//! - `Spawner` / `LocalSpawner` traits: task submission is pluggable.
+//! - `E2ERegistryHandle` / `InterfaceHandle`: lock handles abstracted
+//!   away from `Arc<Mutex<_>>` / `Arc<RwLock<_>>`.
+//! - `ChannelFactory`: channel primitives abstracted via `TokioChannels`
+//!   (std) and `EmbassySyncChannels` / `define_static_channels!` (`bare_metal`).
+//! - `TransportSocket` GATs: `Socket = TokioSocket` pin removed;
+//!   `SendFuture` / `RecvFuture` associated types express `Send` bounds
+//!   for spawnable socket loops.
 //!
-//! **Remaining gaps:**
-//! - **Working server without tokio** (Phase 14b): the bare `server`
-//!   feature is currently a topology marker only (Phase 14a, commit
-//!   `b7fc30f`). The actual server engine still requires
-//!   `server-tokio` because `server::sd_state` /
-//!   `server::subscription_manager` reference tokio types directly.
-//!   Phase 14b retargets the engine to the trait surface (mirroring
-//!   phase 13.5 on the client) so a working server lives under just
-//!   `server`.
-//!
-//! For `no_alloc` SOME/IP usage today, consume `protocol`, `e2e`, and
-//! the `transport` trait layer directly — the `bare_metal` example
-//! workspace member demonstrates that surface.
+//! For `no_alloc` SOME/IP usage, consume `protocol`, `e2e`, and the
+//! `transport` trait layer directly — the `bare_metal_client` /
+//! `bare_metal_server` example workspace members demonstrate that surface.
 
 use crate::{
     UDP_BUFFER_SIZE,
@@ -59,8 +46,8 @@ use crate::{
     protocol::{Message, MessageView, sd},
     traits::{PayloadWireFormat, WireFormat},
     transport::{
-        ChannelFactory, E2ERegistryHandle, MpscRecv, MpscSend, OneshotRecv, OneshotSend,
-        LocalSpawner, ReceivedDatagram, SocketOptions, Spawner, TransportFactory, TransportSocket,
+        ChannelFactory, E2ERegistryHandle, LocalSpawner, MpscRecv, MpscSend, OneshotRecv,
+        OneshotSend, ReceivedDatagram, SocketOptions, Spawner, TransportFactory, TransportSocket,
     },
 };
 
@@ -74,12 +61,11 @@ use tracing::{debug, error, info, trace, warn};
 
 /// A received message together with the source address it came from.
 ///
-/// TODO(phase 6): narrow `source` to `SocketAddrV4` to match the
-/// `TransportSocket` trait's IPv4-only contract — today the field is
-/// always a `SocketAddr::V4(_)` wrapping, and the V6 variant is
-/// unreachable. Deferred here because the rename ripples through
-/// `DiscoveryMessage` and `ClientUpdate::Unicast`, which is scope creep
-/// for phase 5.
+/// TODO: narrow `source` to `SocketAddrV4` to match the `TransportSocket`
+/// trait's IPv4-only contract — today the field is always a
+/// `SocketAddr::V4(_)` wrapping, and the V6 variant is unreachable.
+/// Deferred because the rename ripples through `DiscoveryMessage` and
+/// `ClientUpdate::Unicast`.
 #[derive(Clone, Debug)]
 pub struct ReceivedMessage<P> {
     pub message: Message<P>,
@@ -216,9 +202,8 @@ where
     ///
     /// # Socket bounds
     ///
-    /// Phase 12 relaxed the previous `F::Socket = TokioSocket` pin by
-    /// switching [`TransportSocket`] to GATs. The factory's socket type
-    /// must now satisfy:
+    /// [`TransportSocket`] uses GATs so the factory's socket type must
+    /// satisfy:
     ///
     /// - `Send + Sync + 'static` — so the socket loop future can be
     ///   spawned on a multithreaded executor and outlive its owner.
@@ -230,19 +215,19 @@ where
     ///
     /// Stable Rust cannot express `Send` bounds on the anonymous future
     /// types of `async fn` trait methods at use sites, which is why
-    /// Phase 12 chose named associated types over RPITIT. See
+    /// the trait uses named associated types over RPITIT. See
     /// [`TransportSocket::SendFuture`](crate::transport::TransportSocket::SendFuture).
     ///
     /// # Bare-metal path
     ///
-    /// Phase 11 abstracted the channel primitives behind
+    /// The channel primitives are abstracted behind
     /// [`ChannelFactory`](crate::transport::ChannelFactory). The
-    /// `bare_metal` feature activates `EmbassySyncChannels` as an
-    /// alternative to `TokioChannels`. With Phase 12's relaxed socket
-    /// bound, a bare-metal consumer can now supply their own
-    /// `TransportSocket` impl (e.g. wrapping `embassy_net::udp::UdpSocket`)
-    /// as long as it is `Send + Sync + 'static` and its `SendFuture` /
-    /// `RecvFuture` GAT projections are `Send` for every borrow lifetime.
+    /// `bare_metal` feature activates `EmbassySyncChannels` and
+    /// `define_static_channels!` as alternatives to `TokioChannels`.
+    /// Bare-metal consumers can supply their own `TransportSocket` impl
+    /// (e.g. wrapping `embassy_net::udp::UdpSocket`) as long as it is
+    /// `Send + Sync + 'static` and its `SendFuture` / `RecvFuture` GAT
+    /// projections are `Send` for every borrow lifetime.
     pub async fn bind_discovery_seeded_with_transport<F, S, R>(
         factory: &F,
         spawner: &S,
@@ -1192,14 +1177,13 @@ mod tests {
         assert_eq!(view.header().message_id(), crate::protocol::MessageId::SD);
     }
 
-    /// Phase 12 witness: proves `bind_with_transport` accepts a factory
-    /// whose `Socket` type is **not** `TokioSocket`. The Phase 12 gate
-    /// (no `F::Socket = TokioSocket` pin) is a type-system claim, and
-    /// without this test the trait surface could regress to a Tokio
-    /// pin in a future phase without any test catching it. The
-    /// existing `bind_with_transport_*` tests both hardcode
-    /// `type Socket = TokioSocket`, which only covers the previous
-    /// pinned-bound shape.
+    /// Type-witness: proves `bind_with_transport` accepts a factory
+    /// whose `Socket` type is **not** `TokioSocket`. This is a
+    /// type-system claim, and without this test the trait surface could
+    /// regress to a Tokio pin in a future refactor without any test
+    /// catching it. The existing `bind_with_transport_*` tests both
+    /// hardcode `type Socket = TokioSocket`, which only covers the
+    /// tokio-default shape.
     ///
     /// `WrappedSocket` is a transparent newtype around `TokioSocket`
     /// with its own `TransportSocket` impl — the *type identity* is

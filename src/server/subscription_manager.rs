@@ -3,9 +3,9 @@
 use super::service_info::Subscriber;
 use core::future::Future;
 use heapless::{Vec as HeaplessVec, index_map::FnvIndexMap};
-use std::{net::SocketAddrV4, vec::Vec};
 #[cfg(feature = "server-tokio")]
 use std::sync::Arc;
+use std::{net::SocketAddrV4, vec::Vec};
 #[cfg(feature = "server-tokio")]
 use tokio::sync::RwLock;
 
@@ -366,7 +366,7 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
             let key = (service_id, instance_id, event_group_id);
             match guard.subscriptions.get(&key) {
                 Some(list) => {
-                    for sub in list.iter() {
+                    for sub in list {
                         f(sub);
                     }
                     list.len()

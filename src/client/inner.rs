@@ -363,8 +363,8 @@ pub(super) struct Inner<
     phantom: core::marker::PhantomData<PayloadDefinitions>,
 }
 
-impl<P: PayloadWireFormat, Tm: Timer, R: E2ERegistryHandle, C: ChannelFactory, D>
-    std::fmt::Debug for Inner<P, Tm, R, C, D>
+impl<P: PayloadWireFormat, Tm: Timer, R: E2ERegistryHandle, C: ChannelFactory, D> std::fmt::Debug
+    for Inner<P, Tm, R, C, D>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inner")
@@ -1657,7 +1657,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1699,7 +1702,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1718,7 +1724,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1737,7 +1746,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1758,7 +1770,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1790,7 +1805,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1863,7 +1881,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1883,7 +1904,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1902,7 +1926,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1931,7 +1958,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             true,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1948,7 +1978,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1970,7 +2003,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1993,7 +2029,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2020,7 +2059,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2053,7 +2095,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2080,7 +2125,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2101,7 +2149,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2138,7 +2189,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2158,7 +2212,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2185,7 +2242,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2218,7 +2278,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2267,7 +2330,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            crate::client::bind_dispatch::SpawnerDispatch { factory: TokioTransport, spawner: TokioSpawner },
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);

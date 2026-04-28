@@ -1,4 +1,4 @@
-//! Phase-16 no-alloc CI gate: prove that the bare-metal handle types and
+//! No-alloc CI gate: prove that the bare-metal handle types and
 //! static-pool channels do not invoke the global allocator on the hot path.
 //!
 //! # Why `harness = false`
@@ -78,9 +78,7 @@ struct PanicAllocator;
 /// us off the panic-unwind path, whose machinery also allocates.
 fn diagnose_and_abort(kind: &str, size: usize, align_or_new: usize) -> ! {
     ARMED.store(false, Ordering::SeqCst);
-    eprintln!(
-        "no_alloc_witness: forbidden allocation ({kind}): {size} bytes / {align_or_new}",
-    );
+    eprintln!("no_alloc_witness: forbidden allocation ({kind}): {size} bytes / {align_or_new}",);
     process::abort();
 }
 
@@ -170,9 +168,10 @@ fn witness_atomic_interface_handle() {
 fn witness_static_e2e_handle_reads() {
     // Box::leak allocates — that is an accepted construction-time cost.
     let storage: &'static StaticE2EStorage =
-        Box::leak(Box::new(BlockingMutex::<CriticalSectionRawMutex, RefCell<E2ERegistry>>::new(
-            RefCell::new(E2ERegistry::new()),
-        )));
+        Box::leak(Box::new(BlockingMutex::<
+            CriticalSectionRawMutex,
+            RefCell<E2ERegistry>,
+        >::new(RefCell::new(E2ERegistry::new()))));
     let handle = StaticE2EHandle::new(storage);
 
     // register() allocates into the HashMap — also construction-time.
@@ -191,15 +190,20 @@ fn witness_static_e2e_handle_reads() {
     });
 
     assert_no_alloc("StaticE2EHandle::check (absent key → None)", || {
-        assert!(handle.check(E2EKey::new(0xFFFF, 0x0000), b"payload", [0u8; 8]).is_none());
+        assert!(
+            handle
+                .check(E2EKey::new(0xFFFF, 0x0000), b"payload", [0u8; 8])
+                .is_none()
+        );
     });
 }
 
 fn witness_static_e2e_handle_protect_check() {
     let storage: &'static StaticE2EStorage =
-        Box::leak(Box::new(BlockingMutex::<CriticalSectionRawMutex, RefCell<E2ERegistry>>::new(
-            RefCell::new(E2ERegistry::new()),
-        )));
+        Box::leak(Box::new(BlockingMutex::<
+            CriticalSectionRawMutex,
+            RefCell<E2ERegistry>,
+        >::new(RefCell::new(E2ERegistry::new()))));
     let handle = StaticE2EHandle::new(storage);
 
     handle.register(
@@ -220,29 +224,37 @@ fn witness_static_e2e_handle_protect_check() {
     let payload = b"hello";
     let mut protected = [0u8; 64];
 
-    assert_no_alloc("StaticE2EHandle::protect + check round-trip (Profile4)", || {
-        let len = handle
-            .protect(key, payload, [0u8; 8], &mut protected)
-            .expect("profile registered")
-            .expect("protect succeeded");
-        let (status, stripped) =
-            handle.check(key, &protected[..len], [0u8; 8]).expect("profile registered");
-        assert_eq!(status, simple_someip::E2ECheckStatus::Ok);
-        assert_eq!(stripped, payload);
-    });
+    assert_no_alloc(
+        "StaticE2EHandle::protect + check round-trip (Profile4)",
+        || {
+            let len = handle
+                .protect(key, payload, [0u8; 8], &mut protected)
+                .expect("profile registered")
+                .expect("protect succeeded");
+            let (status, stripped) = handle
+                .check(key, &protected[..len], [0u8; 8])
+                .expect("profile registered");
+            assert_eq!(status, simple_someip::E2ECheckStatus::Ok);
+            assert_eq!(stripped, payload);
+        },
+    );
 
     let key5 = E2EKey::new(0x0002, 0x8002);
     let mut protected5 = [0u8; 64];
-    assert_no_alloc("StaticE2EHandle::protect + check round-trip (Profile5)", || {
-        let len = handle
-            .protect(key5, payload, [0u8; 8], &mut protected5)
-            .expect("profile registered")
-            .expect("protect succeeded");
-        let (status, stripped) =
-            handle.check(key5, &protected5[..len], [0u8; 8]).expect("profile registered");
-        assert_eq!(status, simple_someip::E2ECheckStatus::Ok);
-        assert_eq!(stripped, payload);
-    });
+    assert_no_alloc(
+        "StaticE2EHandle::protect + check round-trip (Profile5)",
+        || {
+            let len = handle
+                .protect(key5, payload, [0u8; 8], &mut protected5)
+                .expect("profile registered")
+                .expect("protect succeeded");
+            let (status, stripped) = handle
+                .check(key5, &protected5[..len], [0u8; 8])
+                .expect("profile registered");
+            assert_eq!(status, simple_someip::E2ECheckStatus::Ok);
+            assert_eq!(stripped, payload);
+        },
+    );
 }
 
 fn witness_static_channels_oneshot() {
@@ -280,20 +292,23 @@ fn witness_static_channels_oneshot_recv() {
         tx.send(1u32).ok();
     }
 
-    assert_no_alloc("WitnessChannels::oneshot recv (value already pending)", || {
-        let (tx, rx) = WitnessChannels::oneshot::<u32>();
-        tx.send(123u32).ok();
-        let mut fut = rx.recv();
-        // SAFETY: `fut` is stack-pinned and dropped before this scope ends;
-        // no reference escapes.
-        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
-        match pinned.poll(&mut cx) {
-            core::task::Poll::Ready(Ok(v)) => assert_eq!(v, 123),
-            other => panic!("expected Ready(Ok(123)), got {other:?}"),
-        }
-    });
+    assert_no_alloc(
+        "WitnessChannels::oneshot recv (value already pending)",
+        || {
+            let (tx, rx) = WitnessChannels::oneshot::<u32>();
+            tx.send(123u32).ok();
+            let mut fut = rx.recv();
+            // SAFETY: `fut` is stack-pinned and dropped before this scope ends;
+            // no reference escapes.
+            let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            match pinned.poll(&mut cx) {
+                core::task::Poll::Ready(Ok(v)) => assert_eq!(v, 123),
+                other => panic!("expected Ready(Ok(123)), got {other:?}"),
+            }
+        },
+    );
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────

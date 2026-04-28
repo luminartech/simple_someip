@@ -1,5 +1,5 @@
-//! Phase-13.6 witness test: prove that `Client` can be constructed and
-//! driven without the `client-tokio` feature, using a static-pool
+//! Witness test: prove that `Client` can be constructed and driven
+//! without the `client-tokio` feature, using a static-pool
 //! [`ChannelFactory`] declared via [`define_static_channels!`] — the
 //! production-bound bare-metal path (no per-call heap allocation for
 //! channel storage).
@@ -7,11 +7,11 @@
 //! [`ChannelFactory`]: simple_someip::transport::ChannelFactory
 //! [`define_static_channels!`]: simple_someip::define_static_channels
 //!
-//! Originally a phase-13.5 witness using `EmbassySyncChannels` (which
-//! still heap-allocates an `Arc<Channel<...>>` per call). Phase 13.6c
-//! shipped the `static_channels` module; phase 13.6d shipped the
-//! `define_static_channels!` macro; this test now exercises that
-//! macro end-to-end against `Client::new_with_deps`.
+//! Originally a witness using `EmbassySyncChannels` (which still
+//! heap-allocates an `Arc<Channel<...>>` per call). The `static_channels`
+//! module and `define_static_channels!` macro now provide a truly
+//! heap-free path; this test exercises that macro end-to-end against
+//! `Client::new_with_deps`.
 //!
 //! `simple-someip` is compiled with `default-features = false,
 //! features = ["client", "bare_metal"]` per the `required-features`

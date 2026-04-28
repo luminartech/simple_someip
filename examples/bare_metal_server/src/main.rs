@@ -134,6 +134,7 @@ struct MockRecvFut<'a> {
 impl Future for MockRecvFut<'_> {
     type Output = Result<ReceivedDatagram, TransportError>;
 
+    #[allow(clippy::single_match_else)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         match me.pipe.inbound.lock().unwrap().pop_front() {
@@ -180,7 +181,10 @@ impl TransportSocket for MockSocket {
     }
 
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> MockRecvFut<'a> {
-        MockRecvFut { pipe: Arc::clone(&self.pipe), buf }
+        MockRecvFut {
+            pipe: Arc::clone(&self.pipe),
+            buf,
+        }
     }
 
     fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
@@ -232,7 +236,7 @@ impl SubscriptionHandle for MockSubscriptions {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), SubscribeError>> + Send + '_ {
+    ) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
         let inner = Arc::clone(&self.0);
         async move {
             let mut guard = inner.lock().unwrap();
@@ -250,7 +254,7 @@ impl SubscriptionHandle for MockSubscriptions {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = ()> + Send + '_ {
+    ) -> impl Future<Output = ()> + '_ {
         let inner = Arc::clone(&self.0);
         async move {
             inner
@@ -260,23 +264,28 @@ impl SubscriptionHandle for MockSubscriptions {
         }
     }
 
-    fn get_subscribers(
-        &self,
+    fn for_each_subscriber<'a, F>(
+        &'a self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-    ) -> impl Future<Output = Vec<Subscriber>> + Send + '_ {
+        mut f: F,
+    ) -> impl Future<Output = usize> + 'a
+    where
+        F: FnMut(&Subscriber) + 'a,
+    {
         let inner = Arc::clone(&self.0);
         async move {
-            inner
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(s, i, e, _)| {
-                    *s == service_id && *i == instance_id && *e == event_group_id
-                })
-                .map(|(s, i, e, addr)| Subscriber::new(*addr, *s, *i, *e))
-                .collect()
+            let guard = inner.lock().unwrap();
+            let mut count = 0;
+            for (s, i, e, addr) in guard.iter() {
+                if *s == service_id && *i == instance_id && *e == event_group_id {
+                    let sub = Subscriber::new(*addr, *s, *i, *e);
+                    f(&sub);
+                    count += 1;
+                }
+            }
+            count
         }
     }
 }
@@ -320,7 +329,9 @@ async fn main() {
     // entries so clients on the network can discover this service.
     // It is Send + 'static and can be handed to any executor.
     let announce_handle = tokio::spawn(
-        server.announcement_loop().expect("non-passive server must have an announcement loop"),
+        server
+            .announcement_loop()
+            .expect("non-passive server must have an announcement loop"),
     );
 
     // Yield twice: the announcement loop fires its first SD offer on the
@@ -330,7 +341,10 @@ async fn main() {
 
     // Verify the server actually sent at least one SD announcement.
     let sent = pipe.sent.lock().unwrap().len();
-    assert!(sent > 0, "server should have multicast at least one SD OfferService");
+    assert!(
+        sent > 0,
+        "server should have multicast at least one SD OfferService"
+    );
 
     announce_handle.abort();
     let _ = announce_handle.await;
