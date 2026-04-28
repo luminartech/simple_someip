@@ -40,9 +40,14 @@
 //! socket2 on top of `client`.
 //!
 //! **Remaining gaps:**
-//! - **Server-side split** (deferred to Phase 14): `feature = "server"`
-//!   still pulls tokio + socket2 because `server::sd_state` /
+//! - **Working server without tokio** (Phase 14b): the bare `server`
+//!   feature is currently a topology marker only (Phase 14a, commit
+//!   `b7fc30f`). The actual server engine still requires
+//!   `server-tokio` because `server::sd_state` /
 //!   `server::subscription_manager` reference tokio types directly.
+//!   Phase 14b retargets the engine to the trait surface (mirroring
+//!   phase 13.5 on the client) so a working server lives under just
+//!   `server`.
 //!
 //! For `no_alloc` SOME/IP usage today, consume `protocol`, `e2e`, and
 //! the `transport` trait layer directly — the `bare_metal` example
