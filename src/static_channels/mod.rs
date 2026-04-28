@@ -1,0 +1,771 @@
+//! Static-pool no-alloc backend for [`ChannelFactory`].
+//!
+//! [`crate::embassy_channels::EmbassySyncChannels`] heap-allocates one
+//! `Arc<Channel<...>>` per `oneshot()` / `bounded()` / `unbounded()`
+//! call. On a real bare-metal target that violates the strategic
+//! "zero heap after `Client::new` returns" goal, because
+//! `Client`'s run-loop awaits a oneshot for every request-response
+//! pair.
+//!
+//! This module hands out `&'static` references into pre-allocated
+//! `static` pools instead. The user declares pools (typically via
+//! the `static_channels!` macro in phase 13.6d) sized to their
+//! workload's high-water mark; once seeded, no further allocation
+//! occurs.
+//!
+//! # Per-`T` `*Pooled<MyChannels>` impls
+//!
+//! Phase 13.6b reshaped `ChannelFactory` so each constructor method
+//! requires `T: *Pooled<Self>`. Static-pool consumers publish per-`T`
+//! impls that route to the appropriate pool. The
+//! `static_channels!` macro generates them; the primitives in this
+//! module are the runtime they call into.
+//!
+//! # Pool exhaustion
+//!
+//! If a [`OneshotPool::claim`] / [`MpscPool::claim`] call finds the
+//! pool empty it returns `None`. The trait method
+//! `*Pooled::*_pair() -> (Sender, Receiver)` cannot return `None` —
+//! it has no error channel — so generated impls **panic** on
+//! exhaustion. Sizing the pool to the workload's high-water mark is
+//! the user's responsibility; an exhaustion panic is a config error,
+//! not a runtime error.
+//!
+//! # Cancellation semantics
+//!
+//! - **Sender drop without `send`**: the slot's cancellation flag is
+//!   set; the receiver's pending `recv()` resolves to
+//!   `Err(OneshotCancelled)` (oneshot) or `None` (bounded /
+//!   unbounded mpsc, after the last sender drops).
+//! - **Receiver drop**: any pending value in the slot is dropped when
+//!   the slot is reclaimed. Bounded senders blocked on a full
+//!   channel may deadlock if the receiver disappears — typical
+//!   bare-metal use keeps the receiver alive for the program's
+//!   lifetime, so this is an accepted limitation for v1.
+
+#![allow(clippy::module_name_repetitions)]
+
+use core::cell::Cell;
+use core::future::{Future, poll_fn};
+use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::task::Poll;
+
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use embassy_sync::waitqueue::AtomicWaker;
+
+use crate::transport::{
+    MpscRecv, MpscSend, OneshotCancelled, OneshotRecv, OneshotSend, UnboundedRecv, UnboundedSend,
+};
+
+// ── Oneshot ───────────────────────────────────────────────────────────
+
+const O_SENDER_ALIVE: u8 = 0b001;
+const O_RECEIVER_ALIVE: u8 = 0b010;
+const O_CANCELLED: u8 = 0b100;
+
+/// One slot of a [`OneshotPool`]. Const-constructible so a `static`
+/// array of slots can be initialized in const context.
+pub struct OneshotSlot<T: Send + 'static> {
+    chan: Channel<CriticalSectionRawMutex, T, 1>,
+    /// Woken by the sender's drop when it cancels without sending.
+    /// (The chan's internal waker handles the value-arrival path.)
+    cancel_waker: AtomicWaker,
+    /// `O_SENDER_ALIVE | O_RECEIVER_ALIVE | O_CANCELLED` bitmask.
+    state: AtomicU8,
+    /// Free-list link (1-based pool index; 0 = none).
+    next_free: AtomicUsize,
+}
+
+impl<T: Send + 'static> OneshotSlot<T> {
+    /// Const-constructible empty slot.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            chan: Channel::new(),
+            cancel_waker: AtomicWaker::new(),
+            state: AtomicU8::new(0),
+            next_free: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl<T: Send + 'static> Default for OneshotSlot<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Reclaim hook used by [`StaticOneshotSender`] / [`StaticOneshotReceiver`]
+/// in their `Drop` impls. Erases the pool's `POOL_SIZE` so handles do
+/// not carry it.
+trait OneshotReclaim<T: Send + 'static>: Send + Sync + 'static {
+    fn release(&self, slot: &'static OneshotSlot<T>);
+}
+
+/// A pool of [`OneshotSlot`]s. Place in a `static` and call
+/// [`Self::claim`] to obtain a sender/receiver pair.
+pub struct OneshotPool<T: Send + 'static, const POOL_SIZE: usize> {
+    slots: [OneshotSlot<T>; POOL_SIZE],
+    free_head: BlockingMutex<CriticalSectionRawMutex, Cell<usize>>,
+    seeded: AtomicBool,
+}
+
+impl<T: Send + 'static, const POOL_SIZE: usize> OneshotPool<T, POOL_SIZE> {
+    /// Const-constructible empty pool. Free-list is seeded lazily on
+    /// the first [`Self::claim`].
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            slots: [const { OneshotSlot::new() }; POOL_SIZE],
+            free_head: BlockingMutex::new(Cell::new(0)),
+            seeded: AtomicBool::new(false),
+        }
+    }
+
+    /// Try to obtain a fresh sender/receiver pair. Returns `None` if
+    /// the pool is exhausted.
+    pub fn claim(&'static self) -> Option<(StaticOneshotSender<T>, StaticOneshotReceiver<T>)> {
+        self.ensure_seeded();
+        let slot = self.pop_free()?;
+        slot.state
+            .store(O_SENDER_ALIVE | O_RECEIVER_ALIVE, Ordering::Release);
+        // No stale value should be in the channel (we drained on
+        // release), but be defensive.
+        let _ = slot.chan.try_receive();
+        Some((
+            StaticOneshotSender {
+                slot,
+                pool: self,
+                sent: false,
+            },
+            StaticOneshotReceiver { slot, pool: self },
+        ))
+    }
+
+    fn ensure_seeded(&self) {
+        if self
+            .seeded
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Link slots[0] -> slots[1] -> ... -> slots[N-1] -> 0.
+            for i in 0..POOL_SIZE {
+                let next = if i + 1 < POOL_SIZE { i + 2 } else { 0 };
+                self.slots[i].next_free.store(next, Ordering::Release);
+            }
+            self.free_head.lock(|h| h.set(1));
+        }
+    }
+
+    fn pop_free(&self) -> Option<&OneshotSlot<T>> {
+        self.free_head.lock(|h| {
+            let head = h.get();
+            if head == 0 {
+                return None;
+            }
+            let slot = &self.slots[head - 1];
+            let next = slot.next_free.load(Ordering::Acquire);
+            h.set(next);
+            slot.next_free.store(0, Ordering::Release);
+            Some(slot)
+        })
+    }
+}
+
+impl<T: Send + 'static, const POOL_SIZE: usize> Default for OneshotPool<T, POOL_SIZE> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Send + 'static, const POOL_SIZE: usize> OneshotReclaim<T> for OneshotPool<T, POOL_SIZE> {
+    fn release(&self, slot: &'static OneshotSlot<T>) {
+        let base = self.slots.as_ptr() as usize;
+        let here = core::ptr::from_ref::<OneshotSlot<T>>(slot) as usize;
+        let stride = core::mem::size_of::<OneshotSlot<T>>();
+        debug_assert!(stride > 0, "OneshotSlot must be sized");
+        debug_assert!(here >= base);
+        let idx = (here - base) / stride;
+        debug_assert!(idx < POOL_SIZE, "slot does not belong to this pool");
+        // Drop any stale value still in the channel.
+        let _ = slot.chan.try_receive();
+        slot.state.store(0, Ordering::Release);
+        self.free_head.lock(|h| {
+            slot.next_free.store(h.get(), Ordering::Release);
+            h.set(idx + 1);
+        });
+    }
+}
+
+/// Send half of a static-pool oneshot.
+pub struct StaticOneshotSender<T: Send + 'static> {
+    slot: &'static OneshotSlot<T>,
+    pool: &'static dyn OneshotReclaim<T>,
+    sent: bool,
+}
+
+impl<T: Send + 'static> OneshotSend<T> for StaticOneshotSender<T> {
+    fn send(mut self, value: T) -> Result<(), T> {
+        match self.slot.chan.try_send(value) {
+            Ok(()) => {
+                self.sent = true;
+                // Wake the receiver via cancel_waker too — its poll_fn
+                // re-checks the channel after the chan-internal waker
+                // wakes it, but waking cancel_waker also covers the
+                // case where the receiver registered there last.
+                self.slot.cancel_waker.wake();
+                Ok(())
+            }
+            Err(embassy_sync::channel::TrySendError::Full(v)) => Err(v),
+        }
+    }
+}
+
+impl<T: Send + 'static> Drop for StaticOneshotSender<T> {
+    fn drop(&mut self) {
+        if !self.sent {
+            self.slot.state.fetch_or(O_CANCELLED, Ordering::AcqRel);
+            self.slot.cancel_waker.wake();
+        }
+        let prev = self.slot.state.fetch_and(!O_SENDER_ALIVE, Ordering::AcqRel);
+        let after = prev & !O_SENDER_ALIVE;
+        if (after & O_RECEIVER_ALIVE) == 0 {
+            self.pool.release(self.slot);
+        }
+    }
+}
+
+/// Receive half of a static-pool oneshot.
+pub struct StaticOneshotReceiver<T: Send + 'static> {
+    slot: &'static OneshotSlot<T>,
+    pool: &'static dyn OneshotReclaim<T>,
+}
+
+impl<T: Send + 'static> OneshotRecv<T> for StaticOneshotReceiver<T> {
+    async fn recv(self) -> Result<T, OneshotCancelled> {
+        let slot = self.slot;
+        let result = poll_fn(move |cx| {
+            // 1. Try the channel first.
+            if let Ok(v) = slot.chan.try_receive() {
+                return Poll::Ready(Ok(v));
+            }
+            // 2. Check cancellation.
+            if slot.state.load(Ordering::Acquire) & O_CANCELLED != 0 {
+                return Poll::Ready(Err(OneshotCancelled));
+            }
+            // 3. Register on the cancel waker.
+            slot.cancel_waker.register(cx.waker());
+            // 4. Register on the channel's internal waker by polling
+            //    a transient receive future. embassy-sync registers
+            //    the waker on poll and does not unregister on drop.
+            {
+                let mut fut = slot.chan.receive();
+                // SAFETY: `fut` is stack-pinned, polled exactly
+                // once, then dropped before this scope ends. No
+                // reference to `fut` escapes.
+                let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+                if let Poll::Ready(v) = pinned.poll(cx) {
+                    return Poll::Ready(Ok(v));
+                }
+            }
+            // 5. Final re-check to close the lost-wakeup window
+            //    between the early try_receive and the waker
+            //    registrations.
+            if let Ok(v) = slot.chan.try_receive() {
+                return Poll::Ready(Ok(v));
+            }
+            if slot.state.load(Ordering::Acquire) & O_CANCELLED != 0 {
+                return Poll::Ready(Err(OneshotCancelled));
+            }
+            Poll::Pending
+        })
+        .await;
+        // `self` drops here on return, running receiver-side bookkeeping.
+        drop(self);
+        result
+    }
+}
+
+impl<T: Send + 'static> Drop for StaticOneshotReceiver<T> {
+    fn drop(&mut self) {
+        let prev = self
+            .slot
+            .state
+            .fetch_and(!O_RECEIVER_ALIVE, Ordering::AcqRel);
+        let after = prev & !O_RECEIVER_ALIVE;
+        if (after & O_SENDER_ALIVE) == 0 {
+            self.pool.release(self.slot);
+        }
+    }
+}
+
+// ── Mpsc (bounded + unbounded share the slot/pool machinery) ──────────
+
+/// One slot of an [`MpscPool`]. Const-constructible.
+///
+/// Used by both bounded ([`StaticBoundedSender`] /
+/// [`StaticBoundedReceiver`]) and unbounded ([`StaticUnboundedSender`]
+/// / [`StaticUnboundedReceiver`]) pools — the public sender/receiver
+/// types differ, but the slot machinery is shared.
+pub struct MpscSlot<T: Send + 'static, const SLOT_CAP: usize> {
+    chan: Channel<CriticalSectionRawMutex, T, SLOT_CAP>,
+    /// Wakes the receiver on close.
+    close_waker: AtomicWaker,
+    /// Number of live senders (clones) + 1 if receiver is alive.
+    /// 0 → slot returns to free list.
+    refcount: AtomicUsize,
+    /// Set when the last sender drops while receiver is still alive,
+    /// so the receiver's `recv()` resolves to `None`.
+    closed: AtomicBool,
+    next_free: AtomicUsize,
+}
+
+impl<T: Send + 'static, const SLOT_CAP: usize> MpscSlot<T, SLOT_CAP> {
+    /// Const-constructible empty slot.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            chan: Channel::new(),
+            close_waker: AtomicWaker::new(),
+            refcount: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+            next_free: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl<T: Send + 'static, const SLOT_CAP: usize> Default for MpscSlot<T, SLOT_CAP> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+trait MpscReclaim<T: Send + 'static, const SLOT_CAP: usize>: Send + Sync + 'static {
+    fn release(&self, slot: &'static MpscSlot<T, SLOT_CAP>);
+}
+
+/// A pool of [`MpscSlot`]s. Place in a `static` and call
+/// [`Self::claim_bounded`] or [`Self::claim_unbounded`].
+pub struct MpscPool<T: Send + 'static, const POOL_SIZE: usize, const SLOT_CAP: usize> {
+    slots: [MpscSlot<T, SLOT_CAP>; POOL_SIZE],
+    free_head: BlockingMutex<CriticalSectionRawMutex, Cell<usize>>,
+    seeded: AtomicBool,
+}
+
+impl<T: Send + 'static, const POOL_SIZE: usize, const SLOT_CAP: usize>
+    MpscPool<T, POOL_SIZE, SLOT_CAP>
+{
+    /// Const-constructible empty pool.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            slots: [const { MpscSlot::new() }; POOL_SIZE],
+            free_head: BlockingMutex::new(Cell::new(0)),
+            seeded: AtomicBool::new(false),
+        }
+    }
+
+    /// Claim a slot for use as a bounded MPSC channel.
+    pub fn claim_bounded(
+        &'static self,
+    ) -> Option<(
+        StaticBoundedSender<T, SLOT_CAP>,
+        StaticBoundedReceiver<T, SLOT_CAP>,
+    )> {
+        let slot = self.claim_inner()?;
+        Some((
+            StaticBoundedSender { slot, pool: self },
+            StaticBoundedReceiver { slot, pool: self },
+        ))
+    }
+
+    /// Claim a slot for use as an unbounded MPSC channel. (Embassy-sync
+    /// has no truly unbounded channel; this uses `SLOT_CAP` as the
+    /// effective capacity.)
+    pub fn claim_unbounded(
+        &'static self,
+    ) -> Option<(
+        StaticUnboundedSender<T, SLOT_CAP>,
+        StaticUnboundedReceiver<T, SLOT_CAP>,
+    )> {
+        let slot = self.claim_inner()?;
+        Some((
+            StaticUnboundedSender { slot, pool: self },
+            StaticUnboundedReceiver { slot, pool: self },
+        ))
+    }
+
+    fn claim_inner(&'static self) -> Option<&'static MpscSlot<T, SLOT_CAP>> {
+        self.ensure_seeded();
+        let slot = self.pop_free()?;
+        slot.refcount.store(2, Ordering::Release); // 1 sender + 1 receiver.
+        slot.closed.store(false, Ordering::Release);
+        // Defensive: drain any stale value.
+        while slot.chan.try_receive().is_ok() {}
+        Some(slot)
+    }
+
+    fn ensure_seeded(&self) {
+        if self
+            .seeded
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            for i in 0..POOL_SIZE {
+                let next = if i + 1 < POOL_SIZE { i + 2 } else { 0 };
+                self.slots[i].next_free.store(next, Ordering::Release);
+            }
+            self.free_head.lock(|h| h.set(1));
+        }
+    }
+
+    fn pop_free(&self) -> Option<&MpscSlot<T, SLOT_CAP>> {
+        self.free_head.lock(|h| {
+            let head = h.get();
+            if head == 0 {
+                return None;
+            }
+            let slot = &self.slots[head - 1];
+            let next = slot.next_free.load(Ordering::Acquire);
+            h.set(next);
+            slot.next_free.store(0, Ordering::Release);
+            Some(slot)
+        })
+    }
+}
+
+impl<T: Send + 'static, const POOL_SIZE: usize, const SLOT_CAP: usize> Default
+    for MpscPool<T, POOL_SIZE, SLOT_CAP>
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Send + 'static, const POOL_SIZE: usize, const SLOT_CAP: usize> MpscReclaim<T, SLOT_CAP>
+    for MpscPool<T, POOL_SIZE, SLOT_CAP>
+{
+    fn release(&self, slot: &'static MpscSlot<T, SLOT_CAP>) {
+        let base = self.slots.as_ptr() as usize;
+        let here = core::ptr::from_ref::<MpscSlot<T, SLOT_CAP>>(slot) as usize;
+        let stride = core::mem::size_of::<MpscSlot<T, SLOT_CAP>>();
+        debug_assert!(stride > 0);
+        debug_assert!(here >= base);
+        let idx = (here - base) / stride;
+        debug_assert!(idx < POOL_SIZE);
+        while slot.chan.try_receive().is_ok() {}
+        slot.refcount.store(0, Ordering::Release);
+        slot.closed.store(false, Ordering::Release);
+        self.free_head.lock(|h| {
+            slot.next_free.store(h.get(), Ordering::Release);
+            h.set(idx + 1);
+        });
+    }
+}
+
+// ── Bounded MPSC handles ──────────────────────────────────────────────
+
+/// Bounded sender backed by a [`MpscPool`]. `Clone` increments the
+/// slot's sender refcount; the receiver's `recv()` resolves to `None`
+/// only after every clone (and the original) has been dropped.
+pub struct StaticBoundedSender<T: Send + 'static, const SLOT_CAP: usize> {
+    slot: &'static MpscSlot<T, SLOT_CAP>,
+    pool: &'static dyn MpscReclaim<T, SLOT_CAP>,
+}
+
+impl<T: Send + 'static, const SLOT_CAP: usize> Clone for StaticBoundedSender<T, SLOT_CAP> {
+    fn clone(&self) -> Self {
+        self.slot.refcount.fetch_add(1, Ordering::AcqRel);
+        Self {
+            slot: self.slot,
+            pool: self.pool,
+        }
+    }
+}
+
+impl<T: Send + 'static, const SLOT_CAP: usize> Drop for StaticBoundedSender<T, SLOT_CAP> {
+    fn drop(&mut self) {
+        // If we are the last sender (and receiver is alive — i.e.
+        // refcount goes from 2→1 with the receiver-bit being the
+        // remaining one), set closed + wake.
+        let prev = self.slot.refcount.fetch_sub(1, Ordering::AcqRel);
+        if prev == 2 {
+            // Could be either "last sender, receiver alive" (we want
+            // to close+wake) or "last receiver, sender alive" (no
+            // close/wake — that's the receiver's drop). To
+            // distinguish, set closed before decrementing? Simpler:
+            // set closed unconditionally here. If the receiver was
+            // the one that just dropped, `closed` is meaningless —
+            // the slot will be reclaimed when refcount hits 0.
+            self.slot.closed.store(true, Ordering::Release);
+            self.slot.close_waker.wake();
+        } else if prev == 1 {
+            self.pool.release(self.slot);
+        }
+    }
+}
+
+impl<T: Send + 'static, const SLOT_CAP: usize> MpscSend<T> for StaticBoundedSender<T, SLOT_CAP> {
+    async fn send(&self, value: T) -> Result<(), ()> {
+        self.slot.chan.send(value).await;
+        Ok(())
+    }
+}
+
+/// Bounded receiver backed by a [`MpscPool`].
+pub struct StaticBoundedReceiver<T: Send + 'static, const SLOT_CAP: usize> {
+    slot: &'static MpscSlot<T, SLOT_CAP>,
+    pool: &'static dyn MpscReclaim<T, SLOT_CAP>,
+}
+
+impl<T: Send + 'static, const SLOT_CAP: usize> Drop for StaticBoundedReceiver<T, SLOT_CAP> {
+    fn drop(&mut self) {
+        // Receiver gone — mark closed so any pending send_now in
+        // unbounded variant returns errors. (Bounded send awaits;
+        // sender that's blocked on full chan won't be unblocked by
+        // this — accepted v1 limitation.)
+        self.slot.closed.store(true, Ordering::Release);
+        let prev = self.slot.refcount.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            self.pool.release(self.slot);
+        }
+    }
+}
+
+impl<T: Send + 'static, const SLOT_CAP: usize> MpscRecv<T> for StaticBoundedReceiver<T, SLOT_CAP> {
+    fn recv(&mut self) -> impl Future<Output = Option<T>> + Send + '_ {
+        let slot = self.slot;
+        async move { mpsc_recv_inner(slot).await }
+    }
+
+    fn poll_recv(&mut self, cx: &mut core::task::Context<'_>) -> core::task::Poll<Option<T>> {
+        mpsc_poll_recv(self.slot, cx)
+    }
+}
+
+// ── Unbounded MPSC handles ────────────────────────────────────────────
+
+/// Unbounded sender — `send_now` returns `Err(value)` on a full slot
+/// rather than blocking. Pool sizing must be generous enough that the
+/// fixed-capacity slot is effectively unbounded for the workload; the
+/// crate's existing Tokio path uses 128 as the default.
+pub struct StaticUnboundedSender<T: Send + 'static, const SLOT_CAP: usize> {
+    slot: &'static MpscSlot<T, SLOT_CAP>,
+    pool: &'static dyn MpscReclaim<T, SLOT_CAP>,
+}
+
+impl<T: Send + 'static, const SLOT_CAP: usize> Clone for StaticUnboundedSender<T, SLOT_CAP> {
+    fn clone(&self) -> Self {
+        self.slot.refcount.fetch_add(1, Ordering::AcqRel);
+        Self {
+            slot: self.slot,
+            pool: self.pool,
+        }
+    }
+}
+
+impl<T: Send + 'static, const SLOT_CAP: usize> Drop for StaticUnboundedSender<T, SLOT_CAP> {
+    fn drop(&mut self) {
+        let prev = self.slot.refcount.fetch_sub(1, Ordering::AcqRel);
+        if prev == 2 {
+            self.slot.closed.store(true, Ordering::Release);
+            self.slot.close_waker.wake();
+        } else if prev == 1 {
+            self.pool.release(self.slot);
+        }
+    }
+}
+
+impl<T: Send + 'static, const SLOT_CAP: usize> UnboundedSend<T>
+    for StaticUnboundedSender<T, SLOT_CAP>
+{
+    fn send_now(&self, value: T) -> Result<(), T> {
+        self.slot.chan.try_send(value).map_err(|e| match e {
+            embassy_sync::channel::TrySendError::Full(v) => v,
+        })
+    }
+}
+
+/// Unbounded receiver.
+pub struct StaticUnboundedReceiver<T: Send + 'static, const SLOT_CAP: usize> {
+    slot: &'static MpscSlot<T, SLOT_CAP>,
+    pool: &'static dyn MpscReclaim<T, SLOT_CAP>,
+}
+
+impl<T: Send + 'static, const SLOT_CAP: usize> Drop for StaticUnboundedReceiver<T, SLOT_CAP> {
+    fn drop(&mut self) {
+        self.slot.closed.store(true, Ordering::Release);
+        let prev = self.slot.refcount.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            self.pool.release(self.slot);
+        }
+    }
+}
+
+impl<T: Send + 'static, const SLOT_CAP: usize> UnboundedRecv<T>
+    for StaticUnboundedReceiver<T, SLOT_CAP>
+{
+    fn recv(&mut self) -> impl Future<Output = Option<T>> + Send + '_ {
+        let slot = self.slot;
+        async move { mpsc_recv_inner(slot).await }
+    }
+}
+
+// ── Shared MPSC recv plumbing ─────────────────────────────────────────
+
+async fn mpsc_recv_inner<T: Send + 'static, const SLOT_CAP: usize>(
+    slot: &'static MpscSlot<T, SLOT_CAP>,
+) -> Option<T> {
+    poll_fn(|cx| mpsc_poll_recv(slot, cx)).await
+}
+
+fn mpsc_poll_recv<T: Send + 'static, const SLOT_CAP: usize>(
+    slot: &'static MpscSlot<T, SLOT_CAP>,
+    cx: &mut core::task::Context<'_>,
+) -> core::task::Poll<Option<T>> {
+    if let Ok(v) = slot.chan.try_receive() {
+        return Poll::Ready(Some(v));
+    }
+    if slot.closed.load(Ordering::Acquire) {
+        // Drain race: a sender may have pushed a final value
+        // concurrently with closing.
+        if let Ok(v) = slot.chan.try_receive() {
+            return Poll::Ready(Some(v));
+        }
+        return Poll::Ready(None);
+    }
+    slot.close_waker.register(cx.waker());
+    {
+        let mut fut = slot.chan.receive();
+        // SAFETY: `fut` is stack-pinned, polled once, then dropped.
+        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+        if let Poll::Ready(v) = pinned.poll(cx) {
+            return Poll::Ready(Some(v));
+        }
+    }
+    if let Ok(v) = slot.chan.try_receive() {
+        return Poll::Ready(Some(v));
+    }
+    if slot.closed.load(Ordering::Acquire) {
+        if let Ok(v) = slot.chan.try_receive() {
+            return Poll::Ready(Some(v));
+        }
+        return Poll::Ready(None);
+    }
+    Poll::Pending
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+
+    fn poll_once<F: Future>(f: &mut core::pin::Pin<&mut F>) -> Poll<F::Output> {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        f.as_mut().poll(&mut cx)
+    }
+
+    // ── Oneshot tests ─────────────────────────────────────────────────
+
+    static ONESHOT_POOL_4: OneshotPool<u32, 4> = OneshotPool::new();
+
+    #[test]
+    fn oneshot_send_recv_happy_path() {
+        let (tx, rx) = ONESHOT_POOL_4.claim().expect("pool not empty");
+        tx.send(42).unwrap();
+        let mut fut = pin!(rx.recv());
+        match poll_once(&mut fut) {
+            Poll::Ready(Ok(v)) => assert_eq!(v, 42),
+            other => panic!("expected ready ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oneshot_sender_drop_cancels_receiver() {
+        let (tx, rx) = ONESHOT_POOL_4.claim().expect("pool not empty");
+        drop(tx);
+        let mut fut = pin!(rx.recv());
+        match poll_once(&mut fut) {
+            Poll::Ready(Err(OneshotCancelled)) => {}
+            other => panic!("expected cancelled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oneshot_claim_release_cycles() {
+        static POOL: OneshotPool<u32, 4> = OneshotPool::new();
+        // Claim all 4, verify pool is exhausted, drop, re-claim.
+        let p1 = POOL.claim().unwrap();
+        let p2 = POOL.claim().unwrap();
+        let p3 = POOL.claim().unwrap();
+        let p4 = POOL.claim().unwrap();
+        assert!(POOL.claim().is_none(), "5th claim must exhaust");
+        drop((p1, p2, p3, p4));
+        let p5 = POOL.claim();
+        assert!(p5.is_some(), "post-drop claim must succeed");
+    }
+
+    #[test]
+    fn oneshot_pool_exhaustion_returns_none() {
+        static POOL_2: OneshotPool<u32, 2> = OneshotPool::new();
+        let _a = POOL_2.claim().unwrap();
+        let _b = POOL_2.claim().unwrap();
+        assert!(POOL_2.claim().is_none(), "third claim must exhaust");
+    }
+
+    // ── Bounded MPSC tests ────────────────────────────────────────────
+
+    static MPSC_POOL: MpscPool<u32, 2, 4> = MpscPool::new();
+
+    #[test]
+    fn mpsc_bounded_send_recv() {
+        let (tx, mut rx) = MPSC_POOL.claim_bounded().expect("pool not empty");
+        let mut send_fut = pin!(tx.send(7));
+        assert!(matches!(poll_once(&mut send_fut), Poll::Ready(Ok(()))));
+        let mut recv_fut = pin!(rx.recv());
+        match poll_once(&mut recv_fut) {
+            Poll::Ready(Some(7)) => {}
+            other => panic!("expected ready Some(7), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mpsc_bounded_clone_then_drop_all_closes_receiver() {
+        static POOL: MpscPool<u32, 1, 2> = MpscPool::new();
+        let (tx, mut rx) = POOL.claim_bounded().expect("pool not empty");
+        let tx2 = tx.clone();
+        drop(tx);
+        // One clone still alive — receiver should not be closed yet.
+        {
+            let mut recv_fut = pin!(rx.recv());
+            assert!(matches!(poll_once(&mut recv_fut), Poll::Pending));
+        }
+        drop(tx2);
+        // All senders gone → receiver resolves to None.
+        let mut recv_fut = pin!(rx.recv());
+        match poll_once(&mut recv_fut) {
+            Poll::Ready(None) => {}
+            other => panic!("expected ready None, got {other:?}"),
+        }
+    }
+
+    // ── Unbounded MPSC tests ──────────────────────────────────────────
+
+    #[test]
+    fn unbounded_send_now_returns_full_when_capacity_exhausted() {
+        static POOL: MpscPool<u32, 1, 2> = MpscPool::new();
+        let (tx, _rx) = POOL.claim_unbounded().expect("pool not empty");
+        assert!(tx.send_now(1).is_ok());
+        assert!(tx.send_now(2).is_ok());
+        match tx.send_now(3) {
+            Err(3) => {}
+            other => panic!("expected Err(3), got {other:?}"),
+        }
+    }
+}
