@@ -89,7 +89,9 @@ pub struct SendMessage<PayloadDefinitions: Send + 'static, C: ChannelFactory> {
     response: C::OneshotSender<Result<(), Error>>,
 }
 
-impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> std::fmt::Debug for SendMessage<P, C> {
+impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> std::fmt::Debug
+    for SendMessage<P, C>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SendMessage")
             .field("target_addr", &self.target_addr)
@@ -107,8 +109,11 @@ enum Outcome<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> {
     Recv(Result<ReceivedDatagram, crate::transport::TransportError>),
 }
 
-impl<PayloadDefinitions: PayloadWireFormat + Send + 'static, C: ChannelFactory>
-    SendMessage<PayloadDefinitions, C>
+impl<PayloadDefinitions, C> SendMessage<PayloadDefinitions, C>
+where
+    PayloadDefinitions: PayloadWireFormat + Send + 'static,
+    C: ChannelFactory,
+    Result<(), Error>: crate::transport::OneshotPooled<C>,
 {
     pub fn new(
         target_addr: SocketAddrV4,
@@ -127,8 +132,8 @@ impl<PayloadDefinitions: PayloadWireFormat + Send + 'static, C: ChannelFactory>
 }
 
 pub struct SocketManager<PayloadDefinitions: Send + 'static, C: ChannelFactory> {
-    receiver: C::BoundedReceiver<Result<ReceivedMessage<PayloadDefinitions>, Error>>,
-    sender: C::BoundedSender<SendMessage<PayloadDefinitions, C>>,
+    receiver: C::BoundedReceiver<Result<ReceivedMessage<PayloadDefinitions>, Error>, 16>,
+    sender: C::BoundedSender<SendMessage<PayloadDefinitions, C>, 16>,
     local_port: u16,
     session_id: u16,
     /// Set to true once `session_id` has wrapped from 0xFFFF → 1.
@@ -137,7 +142,9 @@ pub struct SocketManager<PayloadDefinitions: Send + 'static, C: ChannelFactory> 
     session_has_wrapped: bool,
 }
 
-impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> std::fmt::Debug for SocketManager<P, C> {
+impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> std::fmt::Debug
+    for SocketManager<P, C>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SocketManager")
             .field("local_port", &self.local_port)
@@ -150,6 +157,9 @@ impl<MessageDefinitions, C> SocketManager<MessageDefinitions, C>
 where
     MessageDefinitions: PayloadWireFormat + Send + 'static,
     C: ChannelFactory,
+    Result<(), Error>: crate::transport::OneshotPooled<C>,
+    SendMessage<MessageDefinitions, C>: crate::transport::BoundedPooled<C, 16>,
+    Result<ReceivedMessage<MessageDefinitions>, Error>: crate::transport::BoundedPooled<C, 16>,
 {
     /// Bind the SD multicast socket, seeding the session counter and wrap
     /// state from a previous socket when rebinding. Pass `(1, false)` for a
@@ -245,8 +255,7 @@ where
         S: Spawner,
         R: E2ERegistryHandle,
     {
-        let (rx_tx, rx_rx) =
-            C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
+        let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
         let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
 
         // Control whether multicast packets sent by this socket are looped
@@ -324,9 +333,16 @@ where
         S: Spawner,
         R: E2ERegistryHandle,
     {
-        let (rx_tx, rx_rx) =
-            C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 4>();
-        let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 4>();
+        // Standardized to N=16 across both discovery and unicast bind
+        // paths (was N=4 here historically — a tokio-conservative
+        // choice). The trait's const-N now propagates to the GAT, so
+        // the stored receiver/sender types must commit to a single N;
+        // 16 matches what embassy-sync hardcodes and what discovery
+        // already used. Bumping the unicast capacity from 4 to 16 has
+        // no semantic effect — it just lets the channels absorb a
+        // brief burst before backpressure kicks in.
+        let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
+        let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
 
         let options = {
             let mut o = SocketOptions::new();
@@ -366,7 +382,8 @@ where
             );
             return Err(Error::Capacity("udp_buffer"));
         }
-        let (result_channel, message) = SendMessage::<MessageDefinitions, C>::new(target_addr, message);
+        let (result_channel, message) =
+            SendMessage::<MessageDefinitions, C>::new(target_addr, message);
         self.sender.send(message).await.map_err(|()| {
             error!("Socket error when attempting to send message");
             Error::SocketClosedUnexpectedly
@@ -452,11 +469,10 @@ where
     #[allow(clippy::too_many_lines)]
     async fn socket_loop_future<T, R>(
         socket: T,
-        rx_tx: C::BoundedSender<Result<ReceivedMessage<MessageDefinitions>, Error>>,
-        mut tx_rx: C::BoundedReceiver<SendMessage<MessageDefinitions, C>>,
+        rx_tx: C::BoundedSender<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>,
+        mut tx_rx: C::BoundedReceiver<SendMessage<MessageDefinitions, C>, 16>,
         e2e_registry: R,
-    )
-    where
+    ) where
         T: TransportSocket + Send + Sync + 'static,
         for<'a> T::SendFuture<'a>: Send,
         for<'a> T::RecvFuture<'a>: Send,
@@ -1108,11 +1124,7 @@ mod tests {
             type SendFuture<'a> = <TokioSocket as TransportSocket>::SendFuture<'a>;
             type RecvFuture<'a> = <TokioSocket as TransportSocket>::RecvFuture<'a>;
 
-            fn send_to<'a>(
-                &'a self,
-                buf: &'a [u8],
-                target: SocketAddrV4,
-            ) -> Self::SendFuture<'a> {
+            fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddrV4) -> Self::SendFuture<'a> {
                 self.0.send_to(buf, target)
             }
             fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> Self::RecvFuture<'a> {

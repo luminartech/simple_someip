@@ -166,6 +166,12 @@ pub mod tokio_transport;
 /// of any tokio dependency.
 #[cfg(feature = "bare_metal")]
 pub mod embassy_channels;
+/// Static-pool no-alloc primitives for [`transport::ChannelFactory`].
+/// Backs the consumer-declared static `OneshotPool` / `MpscPool`
+/// instances that the upcoming `static_channels!` macro (phase 13.6d)
+/// generates per-`T` `*Pooled<MyChannels>` impls against.
+#[cfg(feature = "bare_metal")]
+pub mod static_channels;
 mod traits;
 /// Executor-agnostic UDP transport abstraction used by the client and
 /// server modules. `no_std`-compatible; a default `std + tokio` backend
@@ -187,6 +193,8 @@ pub use client::{
 pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
 pub use server::Server;
+#[cfg(feature = "server")]
+pub use server::SubscriptionHandle;
 #[cfg(any(feature = "client-tokio", feature = "server"))]
 pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
 pub use transport::{
@@ -194,5 +202,3 @@ pub use transport::{
     OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram, SocketOptions, Spawner, Timer,
     TransportError, TransportFactory, TransportSocket, UnboundedRecv, UnboundedSend,
 };
-#[cfg(feature = "server")]
-pub use server::SubscriptionHandle;
