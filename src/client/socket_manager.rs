@@ -572,7 +572,13 @@ where
                                     message_length = 16 + protected_len;
                                 }
                                 Some(Err(e)) => {
-                                    error!("E2E protect error: {:?}", e);
+                                    error!(
+                                        "E2E protect failed for configured key {:?}: {:?}; \
+                                         refusing to send unprotected datagram",
+                                        key, e
+                                    );
+                                    let _ = send_message.response.send(Err(Error::E2e(e)));
+                                    continue;
                                 }
                                 None => unreachable!("contains_key was true"),
                             }
