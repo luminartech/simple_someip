@@ -107,5 +107,10 @@ name = "static_channels_alloc_witness"
 required-features = ["client", "bare_metal"]
 
 [[test]]
+name = "no_alloc_witness"
+required-features = ["client", "bare_metal"]
+harness = false
+
+[[test]]
 name = "bare_metal_server"
 required-features = ["server", "bare_metal"]

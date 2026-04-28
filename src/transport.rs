@@ -776,6 +776,140 @@ mod std_handle_impls {
     }
 }
 
+/// Bare-metal no-alloc impls of [`E2ERegistryHandle`] and [`InterfaceHandle`].
+///
+/// These types satisfy `Clone + Send + Sync + 'static` without any heap
+/// allocation. The backing storage lives in a caller-owned `static`; the
+/// handles are thin `&'static` pointers that are trivially `Copy`.
+///
+/// # Production pattern
+///
+/// ```ignore
+/// use core::cell::RefCell;
+/// use core::sync::atomic::{AtomicU32, Ordering};
+/// use embassy_sync::blocking_mutex::Mutex;
+/// use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+/// use simple_someip::e2e::E2ERegistry;
+/// use simple_someip::transport::{StaticE2EHandle, AtomicInterfaceHandle};
+///
+/// // Initialize once in main() before spawning tasks.
+/// fn init() -> (StaticE2EHandle, AtomicInterfaceHandle) {
+///     static IFACE_ADDR: AtomicU32 = AtomicU32::new(0);
+///     // E2ERegistry::new() is not const so the storage is heap-placed once.
+///     let registry_storage: &'static _ = Box::leak(Box::new(
+///         Mutex::<CriticalSectionRawMutex, RefCell<E2ERegistry>>::new(
+///             RefCell::new(E2ERegistry::new()),
+///         ),
+///     ));
+///     (StaticE2EHandle::new(registry_storage), AtomicInterfaceHandle::new(&IFACE_ADDR))
+/// }
+/// ```
+#[cfg(feature = "bare_metal")]
+pub mod bare_metal_handle_impls {
+    use super::{E2ERegistryHandle, InterfaceHandle};
+    use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, Error as E2EError};
+    use core::cell::RefCell;
+    use core::net::Ipv4Addr;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use embassy_sync::blocking_mutex::Mutex;
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+
+    /// Convenience type alias for the embassy-sync critical-section mutex
+    /// backing [`StaticE2EHandle`].
+    pub type StaticE2EStorage = Mutex<CriticalSectionRawMutex, RefCell<E2ERegistry>>;
+
+    /// No-alloc [`E2ERegistryHandle`] backed by a `&'static` critical-section
+    /// mutex.
+    ///
+    /// All clones are the same thin pointer. Construct via [`StaticE2EHandle::new`]
+    /// and supply a `&'static StaticE2EStorage` (typically obtained via
+    /// `Box::leak` during system init, since [`E2ERegistry::new`] is not const).
+    #[derive(Clone, Copy)]
+    pub struct StaticE2EHandle(&'static StaticE2EStorage);
+
+    impl StaticE2EHandle {
+        /// Wraps a static reference to the backing mutex.
+        pub const fn new(storage: &'static StaticE2EStorage) -> Self {
+            Self(storage)
+        }
+    }
+
+    // SAFETY: &'static is already Sync; CriticalSectionRawMutex is Send + Sync.
+    unsafe impl Send for StaticE2EHandle {}
+    unsafe impl Sync for StaticE2EHandle {}
+
+    impl E2ERegistryHandle for StaticE2EHandle {
+        fn register(&self, key: E2EKey, profile: E2EProfile) {
+            self.0.lock(|cell| cell.borrow_mut().register(key, profile));
+        }
+
+        fn unregister(&self, key: &E2EKey) {
+            self.0.lock(|cell| cell.borrow_mut().unregister(key));
+        }
+
+        fn contains_key(&self, key: &E2EKey) -> bool {
+            self.0.lock(|cell| cell.borrow().contains_key(key))
+        }
+
+        fn protect(
+            &self,
+            key: E2EKey,
+            payload: &[u8],
+            upper_header: [u8; 8],
+            output: &mut [u8],
+        ) -> Option<Result<usize, E2EError>> {
+            self.0
+                .lock(|cell| cell.borrow_mut().protect(key, payload, upper_header, output))
+        }
+
+        fn check<'a>(
+            &self,
+            key: E2EKey,
+            payload: &'a [u8],
+            upper_header: [u8; 8],
+        ) -> Option<(E2ECheckStatus, &'a [u8])> {
+            self.0.lock(|cell| cell.borrow_mut().check(key, payload, upper_header))
+        }
+    }
+
+    /// No-alloc [`InterfaceHandle`] backed by a `&'static AtomicU32`.
+    ///
+    /// IPv4 addresses are encoded as big-endian `u32` (`Ipv4Addr::into::<u32>`).
+    /// All clones are the same thin pointer. Declare the backing storage in a
+    /// `static`:
+    ///
+    /// ```ignore
+    /// static IFACE_ADDR: AtomicU32 = AtomicU32::new(0);
+    /// let handle = AtomicInterfaceHandle::new(&IFACE_ADDR);
+    /// ```
+    #[derive(Clone, Copy)]
+    pub struct AtomicInterfaceHandle(&'static AtomicU32);
+
+    impl AtomicInterfaceHandle {
+        /// Wraps a static reference to the backing atomic.
+        pub const fn new(addr: &'static AtomicU32) -> Self {
+            Self(addr)
+        }
+    }
+
+    // SAFETY: &'static AtomicU32 is already Send + Sync.
+    unsafe impl Send for AtomicInterfaceHandle {}
+    unsafe impl Sync for AtomicInterfaceHandle {}
+
+    impl InterfaceHandle for AtomicInterfaceHandle {
+        fn get(&self) -> Ipv4Addr {
+            Ipv4Addr::from(self.0.load(Ordering::Relaxed))
+        }
+
+        fn set(&self, addr: Ipv4Addr) {
+            self.0.store(u32::from(addr), Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(feature = "bare_metal")]
+pub use bare_metal_handle_impls::{AtomicInterfaceHandle, StaticE2EHandle, StaticE2EStorage};
+
 // ── Channel-handle abstraction ────────────────────────────────────────────
 //
 // `ChannelFactory` and its associated sender / receiver traits abstract over
