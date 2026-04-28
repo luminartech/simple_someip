@@ -127,8 +127,8 @@ impl<PayloadDefinitions: PayloadWireFormat + Send + 'static, C: ChannelFactory>
 }
 
 pub struct SocketManager<PayloadDefinitions: Send + 'static, C: ChannelFactory> {
-    receiver: C::BoundedReceiver<Result<ReceivedMessage<PayloadDefinitions>, Error>>,
-    sender: C::BoundedSender<SendMessage<PayloadDefinitions, C>>,
+    receiver: C::BoundedReceiver<Result<ReceivedMessage<PayloadDefinitions>, Error>, 16>,
+    sender: C::BoundedSender<SendMessage<PayloadDefinitions, C>, 16>,
     local_port: u16,
     session_id: u16,
     /// Set to true once `session_id` has wrapped from 0xFFFF → 1.
@@ -324,9 +324,17 @@ where
         S: Spawner,
         R: E2ERegistryHandle,
     {
+        // Standardized to N=16 across both discovery and unicast bind
+        // paths (was N=4 here historically — a tokio-conservative
+        // choice). The trait's const-N now propagates to the GAT, so
+        // the stored receiver/sender types must commit to a single N;
+        // 16 matches what embassy-sync hardcodes and what discovery
+        // already used. Bumping the unicast capacity from 4 to 16 has
+        // no semantic effect — it just lets the channels absorb a
+        // brief burst before backpressure kicks in.
         let (rx_tx, rx_rx) =
-            C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 4>();
-        let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 4>();
+            C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
+        let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
 
         let options = {
             let mut o = SocketOptions::new();
@@ -452,8 +460,8 @@ where
     #[allow(clippy::too_many_lines)]
     async fn socket_loop_future<T, R>(
         socket: T,
-        rx_tx: C::BoundedSender<Result<ReceivedMessage<MessageDefinitions>, Error>>,
-        mut tx_rx: C::BoundedReceiver<SendMessage<MessageDefinitions, C>>,
+        rx_tx: C::BoundedSender<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>,
+        mut tx_rx: C::BoundedReceiver<SendMessage<MessageDefinitions, C>, 16>,
         e2e_registry: R,
     )
     where

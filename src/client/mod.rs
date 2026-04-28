@@ -220,7 +220,7 @@ pub struct Client<
     C: ChannelFactory,
 > {
     interface: I,
-    control_sender: C::BoundedSender<inner::ControlMessage<MessageDefinitions, C>>,
+    control_sender: C::BoundedSender<inner::ControlMessage<MessageDefinitions, C>, 4>,
     e2e_registry: R,
 }
 

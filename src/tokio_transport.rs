@@ -398,10 +398,14 @@ impl ChannelFactory for TokioChannels {
         (tx, TokioOneshotReceiver(rx))
     }
 
-    type BoundedSender<T: Send + 'static> = tokio::sync::mpsc::Sender<T>;
-    type BoundedReceiver<T: Send + 'static> = tokio::sync::mpsc::Receiver<T>;
+    // Tokio's `mpsc` channels store capacity at runtime, so the
+    // const-generic `N` is informational only — it does not affect
+    // the stored type. Embassy-sync's impl uses `N` differently (see
+    // `embassy_channels`).
+    type BoundedSender<T: Send + 'static, const N: usize> = tokio::sync::mpsc::Sender<T>;
+    type BoundedReceiver<T: Send + 'static, const N: usize> = tokio::sync::mpsc::Receiver<T>;
     fn bounded<T: Send + 'static, const N: usize>(
-    ) -> (Self::BoundedSender<T>, Self::BoundedReceiver<T>) {
+    ) -> (Self::BoundedSender<T, N>, Self::BoundedReceiver<T, N>) {
         tokio::sync::mpsc::channel(N)
     }
 

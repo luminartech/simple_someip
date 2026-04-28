@@ -173,15 +173,16 @@ impl ChannelFactory for EmbassySyncChannels {
         )
     }
 
-    type BoundedSender<T: Send + 'static> = EmbassySyncBoundedSender<T, 16>;
-    type BoundedReceiver<T: Send + 'static> = EmbassySyncBoundedReceiver<T, 16>;
+    // Phase 13.6: the const-N quirk is fixed. The `N` from the trait
+    // call site now propagates into the embassy `Channel<_, T, N>`
+    // storage, so callers asking for capacity 16 actually get 16, and
+    // callers asking for 4 actually get 4. (Previously this impl
+    // hardcoded 16 regardless of the requested N.)
+    type BoundedSender<T: Send + 'static, const N: usize> = EmbassySyncBoundedSender<T, N>;
+    type BoundedReceiver<T: Send + 'static, const N: usize> = EmbassySyncBoundedReceiver<T, N>;
     fn bounded<T: Send + 'static, const N: usize>(
-    ) -> (Self::BoundedSender<T>, Self::BoundedReceiver<T>) {
-        // The const N from the trait call site is ignored here — embassy-sync
-        // requires the capacity to be known at the impl level, not the call
-        // site. All bounded channels use capacity 16, which covers the
-        // worst case (discovery socket, which uses 16).
-        let chan: Arc<Channel<CriticalSectionRawMutex, T, 16>> = Arc::new(Channel::new());
+    ) -> (Self::BoundedSender<T, N>, Self::BoundedReceiver<T, N>) {
+        let chan: Arc<Channel<CriticalSectionRawMutex, T, N>> = Arc::new(Channel::new());
         (
             EmbassySyncBoundedSender(chan.clone()),
             EmbassySyncBoundedReceiver(chan),

@@ -875,13 +875,18 @@ pub trait ChannelFactory: Clone + Send + Sync + 'static {
     /// Create a oneshot channel pair.
     fn oneshot<T: Send + 'static>() -> (Self::OneshotSender<T>, Self::OneshotReceiver<T>);
 
-    /// Bounded-channel sender type.
-    type BoundedSender<T: Send + 'static>: MpscSend<T>;
-    /// Bounded-channel receiver type.
-    type BoundedReceiver<T: Send + 'static>: MpscRecv<T>;
+    /// Bounded-channel sender type. The `const N: usize` parameter is
+    /// the channel capacity; it must match the `N` passed to
+    /// [`Self::bounded`]. Backends that store the capacity at
+    /// construction time (`tokio::sync::mpsc`) ignore it for storage
+    /// purposes; backends that bake it into the type (`embassy-sync`)
+    /// use it directly.
+    type BoundedSender<T: Send + 'static, const N: usize>: MpscSend<T>;
+    /// Bounded-channel receiver type. See [`Self::BoundedSender`].
+    type BoundedReceiver<T: Send + 'static, const N: usize>: MpscRecv<T>;
     /// Create a bounded channel with capacity `N`.
     fn bounded<T: Send + 'static, const N: usize>(
-    ) -> (Self::BoundedSender<T>, Self::BoundedReceiver<T>);
+    ) -> (Self::BoundedSender<T, N>, Self::BoundedReceiver<T, N>);
 
     /// Unbounded-channel sender type.
     type UnboundedSender<T: Send + 'static>: UnboundedSend<T>;
