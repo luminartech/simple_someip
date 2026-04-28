@@ -3,12 +3,13 @@
 //!
 //! # Why `harness = false`
 //!
-//! The standard `#[test]` harness allocates internally (each test run wraps
-//! the test in an `Arc` for lifecycle tracking). With a panic-on-alloc
-//! `#[global_allocator]` that would fire immediately on test-harness setup,
-//! before any of our code runs. `harness = false` removes the harness: this
-//! file defines its own `main()` that runs the witness functions directly and
-//! exits with a non-zero status (via panic) on any unexpected allocation.
+//! `libtest` allocates during process startup — thread-local storage, a
+//! worker thread pool for parallel test execution, and per-test bookkeeping
+//! (the harness wraps each test in heap-allocated state). With a
+//! panic-on-alloc `#[global_allocator]` that would fire before any of our
+//! code runs. `harness = false` removes the harness: this file defines its
+//! own `main()` that runs the witness functions directly on the main thread
+//! and aborts the process on any unexpected allocation.
 //!
 //! # Strategy
 //!
@@ -27,9 +28,14 @@
 //!    allocate after the registry is configured. Registration itself may
 //!    allocate (the backing [`E2ERegistry`] uses a `HashMap`); that is
 //!    acceptable as a construction-time cost.
-//! 3. [`define_static_channels!`] oneshot `claim` + `send` do not allocate
-//!    after the pool is warmed. The first claim seeds the pool's free-list;
-//!    subsequent warm claims are alloc-free.
+//! 3. [`define_static_channels!`] oneshot first-claim, warm-claim, and
+//!    receiver-poll paths are alloc-free. First-claim is exercised on a
+//!    pool that has never been touched before (the `u64` variant), which
+//!    is the case that runs once at boot on a real bare-metal target.
+//!    `recv()` is polled with [`Waker::noop`] so we measure the channel
+//!    path without an executor.
+//! 4. Both Profile4 and Profile5 protect/check round-trips through
+//!    [`StaticE2EHandle`] are alloc-free.
 //!
 //! # What this does not witness
 //!
@@ -41,15 +47,19 @@
 //! with a stricter panic harness.
 
 use core::cell::RefCell;
+use core::future::Future;
 use core::net::Ipv4Addr;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::task::{Context, Waker};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::process;
 
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
-use simple_someip::e2e::{E2EKey, E2EProfile, E2ERegistry, Profile4Config};
-use simple_someip::transport::{AtomicInterfaceHandle, OneshotSend, StaticE2EHandle};
+use simple_someip::e2e::{E2EKey, E2EProfile, E2ERegistry, Profile4Config, Profile5Config};
+use simple_someip::transport::{AtomicInterfaceHandle, OneshotRecv, OneshotSend, StaticE2EHandle};
 use simple_someip::{
     ChannelFactory, E2ERegistryHandle, InterfaceHandle, StaticE2EStorage, define_static_channels,
 };
@@ -60,14 +70,24 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 
 struct PanicAllocator;
 
+/// Disarm the allocator, print a diagnostic, then abort.
+///
+/// We disarm first so the formatter is allowed to allocate while building
+/// the diagnostic — otherwise the diagnostic would re-trigger the allocator
+/// trap and we'd lose the message. Aborting (rather than panicking) keeps
+/// us off the panic-unwind path, whose machinery also allocates.
+fn diagnose_and_abort(kind: &str, size: usize, align_or_new: usize) -> ! {
+    ARMED.store(false, Ordering::SeqCst);
+    eprintln!(
+        "no_alloc_witness: forbidden allocation ({kind}): {size} bytes / {align_or_new}",
+    );
+    process::abort();
+}
+
 unsafe impl GlobalAlloc for PanicAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if ARMED.load(Ordering::Relaxed) {
-            panic!(
-                "allocation forbidden: {} bytes, align {}",
-                layout.size(),
-                layout.align()
-            );
+            diagnose_and_abort("alloc", layout.size(), layout.align());
         }
         // SAFETY: forwarding to System with caller's layout contract.
         unsafe { System.alloc(layout) }
@@ -80,11 +100,7 @@ unsafe impl GlobalAlloc for PanicAllocator {
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if ARMED.load(Ordering::Relaxed) {
-            panic!(
-                "allocation forbidden (alloc_zeroed): {} bytes, align {}",
-                layout.size(),
-                layout.align()
-            );
+            diagnose_and_abort("alloc_zeroed", layout.size(), layout.align());
         }
         // SAFETY: forwarding to System.
         unsafe { System.alloc_zeroed(layout) }
@@ -92,11 +108,7 @@ unsafe impl GlobalAlloc for PanicAllocator {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if ARMED.load(Ordering::Relaxed) {
-            panic!(
-                "allocation forbidden (realloc): {} → {} bytes",
-                layout.size(),
-                new_size
-            );
+            diagnose_and_abort("realloc", layout.size(), new_size);
         }
         // SAFETY: forwarding to System; invariants upheld by caller.
         unsafe { System.realloc(ptr, layout, new_size) }
@@ -124,6 +136,9 @@ define_static_channels! {
     name: WitnessChannels,
     oneshot: [
         (u32, 8),
+        // A separate type used exclusively by the first-claim witness so
+        // its pool has never been touched before we arm the allocator.
+        (u64, 4),
     ],
     bounded: [
         ((u32, 4), 2),
@@ -191,18 +206,40 @@ fn witness_static_e2e_handle_protect_check() {
         E2EKey::new(0x0001, 0x8001),
         E2EProfile::Profile4(Profile4Config::new(0x1234_5678, 15)),
     );
+    // Register a second profile (Profile5) so the protect/check witness
+    // covers both profile families' hot paths, not just Profile4.
+    handle.register(
+        E2EKey::new(0x0002, 0x8002),
+        // data_length must equal payload length (5 = b"hello".len())
+        // — a mismatch routes through `tracing::warn!`, which is fine in
+        // production but adds noise to a no-alloc witness.
+        E2EProfile::Profile5(Profile5Config::new(0xABCD, 5, 15)),
+    );
 
     let key = E2EKey::new(0x0001, 0x8001);
     let payload = b"hello";
     let mut protected = [0u8; 64];
 
-    assert_no_alloc("StaticE2EHandle::protect + check round-trip", || {
+    assert_no_alloc("StaticE2EHandle::protect + check round-trip (Profile4)", || {
         let len = handle
             .protect(key, payload, [0u8; 8], &mut protected)
             .expect("profile registered")
             .expect("protect succeeded");
         let (status, stripped) =
             handle.check(key, &protected[..len], [0u8; 8]).expect("profile registered");
+        assert_eq!(status, simple_someip::E2ECheckStatus::Ok);
+        assert_eq!(stripped, payload);
+    });
+
+    let key5 = E2EKey::new(0x0002, 0x8002);
+    let mut protected5 = [0u8; 64];
+    assert_no_alloc("StaticE2EHandle::protect + check round-trip (Profile5)", || {
+        let len = handle
+            .protect(key5, payload, [0u8; 8], &mut protected5)
+            .expect("profile registered")
+            .expect("protect succeeded");
+        let (status, stripped) =
+            handle.check(key5, &protected5[..len], [0u8; 8]).expect("profile registered");
         assert_eq!(status, simple_someip::E2ECheckStatus::Ok);
         assert_eq!(stripped, payload);
     });
@@ -222,6 +259,43 @@ fn witness_static_channels_oneshot() {
     });
 }
 
+/// First-claim witness: a freshly declared static pool (the `u64` variant
+/// in [`WitnessChannels`], untouched until this point) must seed its
+/// free-list and hand out the first slot without allocating. This is the
+/// case that runs once at boot on a real bare-metal target.
+fn witness_static_channels_first_claim() {
+    assert_no_alloc("WitnessChannels::oneshot::<u64> FIRST claim + send", || {
+        let (tx, _rx) = WitnessChannels::oneshot::<u64>();
+        tx.send(7u64).ok();
+    });
+}
+
+/// Receiver hot-path witness: polling the recv future once on a slot that
+/// already has a value must not allocate. Uses [`Waker::noop`] so we don't
+/// drag in an executor.
+fn witness_static_channels_oneshot_recv() {
+    // Warm the pool first so this witness measures only the recv path.
+    {
+        let (tx, _rx) = WitnessChannels::oneshot::<u32>();
+        tx.send(1u32).ok();
+    }
+
+    assert_no_alloc("WitnessChannels::oneshot recv (value already pending)", || {
+        let (tx, rx) = WitnessChannels::oneshot::<u32>();
+        tx.send(123u32).ok();
+        let mut fut = rx.recv();
+        // SAFETY: `fut` is stack-pinned and dropped before this scope ends;
+        // no reference escapes.
+        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        match pinned.poll(&mut cx) {
+            core::task::Poll::Ready(Ok(v)) => assert_eq!(v, 123),
+            other => panic!("expected Ready(Ok(123)), got {other:?}"),
+        }
+    });
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 fn main() {
@@ -230,7 +304,9 @@ fn main() {
     witness_atomic_interface_handle();
     witness_static_e2e_handle_reads();
     witness_static_e2e_handle_protect_check();
+    witness_static_channels_first_claim();
     witness_static_channels_oneshot();
+    witness_static_channels_oneshot_recv();
 
     println!("all witnesses passed");
 }
