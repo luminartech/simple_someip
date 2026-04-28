@@ -55,25 +55,26 @@ tracing-subscriber = "0.3"
 [features]
 default = ["std"]
 std = ["embedded-io/std", "thiserror/std", "tracing/std"]
-# Phase 13 split: `client` exposes the protocol/trait-surface client
+# Phase 13a split: `client` exposes the protocol/trait-surface client
 # (no tokio, no socket2); `client-tokio` layers the tokio + socket2
 # convenience defaults on top. Consumers of the bare-metal trait surface
 # enable `client` only (and supply their own `Spawner` / `Timer` /
 # `ChannelFactory` / `TransportFactory` impls). Consumers who want the
 # `Client::new` shortcut (defaulting to `TokioSpawner` / `TokioTimer` /
 # `TokioChannels` / `TokioTransport`) enable `client-tokio`.
-#
-# `server` is **not** split in phase 13 — `src/server/sd_state.rs`,
-# `src/server/subscription_manager.rs`, and `src/server/mod.rs` still
-# reference `tokio::net::UdpSocket`, `tokio::sync::RwLock`, and
-# `socket2::Socket` directly in production code. Phase 14 (server
-# parallel) is the phase that retargets the server to the trait
-# surface; once that lands, `server` will gain the same split into
-# `server` + `server-tokio`. Until then, enabling `server` continues
-# to pull tokio + socket2.
 client = ["std", "dep:futures"]
 client-tokio = ["client", "dep:tokio", "dep:socket2"]
-server = ["std", "dep:tokio", "dep:socket2", "dep:futures"]
+# Phase 14a split: `server` is currently an empty topology marker —
+# the server engine still requires tokio internals (raw `tokio::net::UdpSocket`
+# bind in `sd_state`, `tokio::sync::RwLock` in `subscription_manager`,
+# direct `socket2::Socket` calls in `mod.rs`). Phase 14b retargets the
+# engine to the trait surface (mirroring phases 9–13.5 on the client),
+# at which point the bare `server` feature will expose the trait-surface
+# `Server` and `server-tokio` will provide tokio convenience defaults.
+# Until 14b lands, enabling `server` alone gives only the feature
+# topology; consumers wanting a working server enable `server-tokio`.
+server = ["std"]
+server-tokio = ["server", "dep:tokio", "dep:socket2", "dep:futures"]
 # Marks a build as intended for bare-metal / no_std consumption.
 # Currently a pure marker — enables no crate code on its own. Reserved
 # for future phases to gate no_std-specific helper types.
@@ -96,7 +97,7 @@ bare_metal = ["dep:embassy-sync"]
 
 [[test]]
 name = "client_server"
-required-features = ["client-tokio", "server"]
+required-features = ["client-tokio", "server-tokio"]
 
 [[test]]
 name = "bare_metal_client"
