@@ -658,6 +658,157 @@ fn mpsc_poll_recv<T: Send + 'static, const SLOT_CAP: usize>(
     Poll::Pending
 }
 
+// ── `define_static_channels!` macro ───────────────────────────────────
+
+/// Default slot capacity for unbounded channels declared via
+/// [`define_static_channels!`]. Matches the value used by the
+/// embassy-sync-backed `EmbassySyncChannels::unbounded`. Each
+/// unbounded `T` declared in the macro gets its own `MpscPool`
+/// sized at `pool_size × UNBOUNDED_DEFAULT_CAP`.
+pub const UNBOUNDED_DEFAULT_CAP: usize = 128;
+
+/// Generates a no-alloc [`ChannelFactory`] from a user-authored pool
+/// layout.
+///
+/// [`ChannelFactory`]: crate::transport::ChannelFactory
+///
+/// The macro emits:
+/// - A unit struct `pub struct $name;` implementing
+///   [`ChannelFactory`] with associated types pointing at this
+///   module's [`StaticOneshotSender`] / `StaticBoundedSender` /
+///   `StaticUnboundedSender` (and matching receivers).
+/// - One `impl OneshotPooled<$name> for T` per `oneshot` entry,
+///   wrapping a function-local `static OneshotPool<T, POOL_SIZE>`.
+/// - One `impl BoundedPooled<$name, SLOT_CAP> for T` per `bounded`
+///   entry.
+/// - One `impl UnboundedPooled<$name> for T` per `unbounded` entry,
+///   each backed by an `MpscPool<T, POOL_SIZE,
+///   UNBOUNDED_DEFAULT_CAP>`.
+///
+/// Pool exhaustion in the generated `*_pair()` impls is reported
+/// via `expect()` (see module-level docs).
+///
+/// # Example
+///
+/// ```ignore
+/// use simple_someip::define_static_channels;
+///
+/// define_static_channels! {
+///     name: MyChannels,
+///     oneshot: [
+///         (Result<(), MyError>, 80),
+///         (RebootResponse, 4),
+///     ],
+///     bounded: [
+///         ((ControlMessage<P, MyChannels>, 4), 1),
+///         ((SendMessage<P, MyChannels>, 16), 8),
+///     ],
+///     unbounded: [
+///         (ClientUpdate<P>, 1),
+///     ],
+/// }
+/// ```
+///
+/// All three sections are required; pass an empty `[]` if a family
+/// has no entries. The bounded entry shape is
+/// `((Type, slot_cap), pool_size)` to disambiguate the slot cap
+/// from the pool size in the macro grammar.
+#[macro_export]
+macro_rules! define_static_channels {
+    (
+        name: $name:ident,
+        oneshot: [ $( ($ot:ty, $opool:literal) ),* $(,)? ],
+        bounded: [ $( (($bt:ty, $bcap:literal), $bpool:literal) ),* $(,)? ],
+        unbounded: [ $( ($ut:ty, $upool:literal) ),* $(,)? ] $(,)?
+    ) => {
+        #[derive(Clone, Copy)]
+        pub struct $name;
+
+        impl $crate::transport::ChannelFactory for $name {
+            type OneshotSender<T: ::core::marker::Send + 'static> =
+                $crate::static_channels::StaticOneshotSender<T>;
+            type OneshotReceiver<T: ::core::marker::Send + 'static> =
+                $crate::static_channels::StaticOneshotReceiver<T>;
+            type BoundedSender<T: ::core::marker::Send + 'static, const N: usize> =
+                $crate::static_channels::StaticBoundedSender<T, N>;
+            type BoundedReceiver<T: ::core::marker::Send + 'static, const N: usize> =
+                $crate::static_channels::StaticBoundedReceiver<T, N>;
+            type UnboundedSender<T: ::core::marker::Send + 'static> =
+                $crate::static_channels::StaticUnboundedSender<
+                    T,
+                    { $crate::static_channels::UNBOUNDED_DEFAULT_CAP },
+                >;
+            type UnboundedReceiver<T: ::core::marker::Send + 'static> =
+                $crate::static_channels::StaticUnboundedReceiver<
+                    T,
+                    { $crate::static_channels::UNBOUNDED_DEFAULT_CAP },
+                >;
+        }
+
+        $(
+            impl $crate::transport::OneshotPooled<$name> for $ot {
+                fn oneshot_pair() -> (
+                    <$name as $crate::transport::ChannelFactory>::OneshotSender<Self>,
+                    <$name as $crate::transport::ChannelFactory>::OneshotReceiver<Self>,
+                ) {
+                    static POOL: $crate::static_channels::OneshotPool<$ot, $opool> =
+                        $crate::static_channels::OneshotPool::new();
+                    POOL.claim().expect(::core::concat!(
+                        "OneshotPool<",
+                        ::core::stringify!($ot),
+                        ", ",
+                        ::core::stringify!($opool),
+                        "> exhausted; increase the pool size declared in define_static_channels!"
+                    ))
+                }
+            }
+        )*
+
+        $(
+            impl $crate::transport::BoundedPooled<$name, $bcap> for $bt {
+                fn bounded_pair() -> (
+                    <$name as $crate::transport::ChannelFactory>::BoundedSender<Self, $bcap>,
+                    <$name as $crate::transport::ChannelFactory>::BoundedReceiver<Self, $bcap>,
+                ) {
+                    static POOL: $crate::static_channels::MpscPool<$bt, $bpool, $bcap> =
+                        $crate::static_channels::MpscPool::new();
+                    POOL.claim_bounded().expect(::core::concat!(
+                        "MpscPool<",
+                        ::core::stringify!($bt),
+                        ", pool=",
+                        ::core::stringify!($bpool),
+                        ", slot_cap=",
+                        ::core::stringify!($bcap),
+                        "> exhausted; increase the pool size declared in define_static_channels!"
+                    ))
+                }
+            }
+        )*
+
+        $(
+            impl $crate::transport::UnboundedPooled<$name> for $ut {
+                fn unbounded_pair() -> (
+                    <$name as $crate::transport::ChannelFactory>::UnboundedSender<Self>,
+                    <$name as $crate::transport::ChannelFactory>::UnboundedReceiver<Self>,
+                ) {
+                    static POOL: $crate::static_channels::MpscPool<
+                        $ut,
+                        $upool,
+                        { $crate::static_channels::UNBOUNDED_DEFAULT_CAP },
+                    > = $crate::static_channels::MpscPool::new();
+                    POOL.claim_unbounded().expect(::core::concat!(
+                        "MpscPool<",
+                        ::core::stringify!($ut),
+                        ", pool=",
+                        ::core::stringify!($upool),
+                        ", unbounded> exhausted; increase the pool size declared in define_static_channels!"
+                    ))
+                }
+            }
+        )*
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,5 +918,58 @@ mod tests {
             Err(3) => {}
             other => panic!("expected Err(3), got {other:?}"),
         }
+    }
+
+    // ── define_static_channels! macro ─────────────────────────────────
+
+    // Witness that the macro expands to a `ChannelFactory` with all
+    // three families wired and that the per-`T` `*Pooled` impls
+    // dispatch correctly.
+    crate::define_static_channels! {
+        name: MacroTestChannels,
+        oneshot: [
+            (u32, 4),
+            (Result<i32, ()>, 2),
+        ],
+        bounded: [
+            ((u8, 4), 2),
+        ],
+        unbounded: [
+            (u16, 1),
+        ],
+    }
+
+    #[test]
+    fn macro_oneshot_dispatches_through_factory() {
+        use crate::transport::{ChannelFactory, OneshotSend};
+        let (tx, rx) = MacroTestChannels::oneshot::<u32>();
+        tx.send(99).unwrap();
+        let mut fut = pin!(<_ as crate::transport::OneshotRecv<u32>>::recv(rx));
+        match poll_once(&mut fut) {
+            Poll::Ready(Ok(99)) => {}
+            other => panic!("expected ready Ok(99), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn macro_bounded_dispatches_through_factory() {
+        use crate::transport::{ChannelFactory, MpscRecv, MpscSend};
+        let (tx, mut rx) = MacroTestChannels::bounded::<u8, 4>();
+        {
+            let mut send_fut = pin!(tx.send(7));
+            assert!(matches!(poll_once(&mut send_fut), Poll::Ready(Ok(()))));
+        }
+        let mut recv_fut = pin!(rx.recv());
+        match poll_once(&mut recv_fut) {
+            Poll::Ready(Some(7)) => {}
+            other => panic!("expected ready Some(7), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn macro_unbounded_dispatches_through_factory() {
+        use crate::transport::{ChannelFactory, UnboundedSend};
+        let (tx, _rx) = MacroTestChannels::unbounded::<u16>();
+        assert!(tx.send_now(1234).is_ok());
     }
 }
