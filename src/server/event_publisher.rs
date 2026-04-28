@@ -1,7 +1,7 @@
 //! Event publishing functionality
 
 use super::Error;
-use super::subscription_manager::SubscriptionHandle;
+use super::subscription_manager::{SUBSCRIBERS_PER_GROUP, SubscriptionHandle};
 use crate::UDP_BUFFER_SIZE;
 use crate::e2e::E2EKey;
 use crate::protocol::{Header, Message};
@@ -10,13 +10,6 @@ use crate::transport::{E2ERegistryHandle, TransportSocket};
 use core::net::SocketAddrV4;
 use heapless::Vec as HeaplessVec;
 use std::sync::Arc;
-
-/// Maximum subscribers visited per `publish_event` / `publish_raw_event`
-/// call. Matches the per-event-group capacity in
-/// [`super::subscription_manager`]. Used to size the stack-allocated
-/// snapshot buffer that lets us release the subscription read lock
-/// before dispatching sends.
-const MAX_FANOUT: usize = 16;
 
 /// Publishes events to subscribers.
 ///
@@ -77,7 +70,7 @@ where
         // we can release the subscription read lock before doing async
         // sends. This avoids a per-event heap allocation that the old
         // `get_subscribers -> Vec<Subscriber>` API forced.
-        let mut subscribers: HeaplessVec<SocketAddrV4, MAX_FANOUT> = HeaplessVec::new();
+        let mut subscribers: HeaplessVec<SocketAddrV4, SUBSCRIBERS_PER_GROUP> = HeaplessVec::new();
         let mut overflow = false;
         let total = self
             .subscriptions
@@ -90,7 +83,7 @@ where
         if overflow {
             tracing::warn!(
                 "publish_event truncated subscriber list to {} for service 0x{:04X} (had {} total)",
-                MAX_FANOUT,
+                SUBSCRIBERS_PER_GROUP,
                 service_id,
                 total,
             );
@@ -226,7 +219,7 @@ where
     ) -> Result<usize, Error> {
         // Snapshot subscriber addresses into a stack buffer (see
         // publish_event for rationale).
-        let mut subscribers: HeaplessVec<SocketAddrV4, MAX_FANOUT> = HeaplessVec::new();
+        let mut subscribers: HeaplessVec<SocketAddrV4, SUBSCRIBERS_PER_GROUP> = HeaplessVec::new();
         let mut overflow = false;
         let total = self
             .subscriptions
@@ -239,7 +232,7 @@ where
         if overflow {
             tracing::warn!(
                 "publish_raw_event truncated subscriber list to {} for service 0x{:04X} (had {} total)",
-                MAX_FANOUT,
+                SUBSCRIBERS_PER_GROUP,
                 service_id,
                 total,
             );

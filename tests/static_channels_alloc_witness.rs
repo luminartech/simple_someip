@@ -9,7 +9,7 @@
 //!
 //! 1. `Client::new_with_deps` is allowed to allocate — the std-flavored
 //!    `Arc<Mutex<E2ERegistry>>` and `Arc<RwLock<Ipv4Addr>>` handles
-//!    used here, plus tokio's task-spawning machinery, all heap-back.
+//!    used here, plus tokio's task-spawning machinery, all heap-backed.
 //!    The strategic-goal claim is "zero heap **after** `Client::new`
 //!    returns," not "zero heap, period."
 //! 2. After construction, calling [`Client::interface`] (a pure handle
@@ -128,7 +128,6 @@ struct MockPipe {
     inbound: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
     inbound_waker: Mutex<Option<core::task::Waker>>,
 }
-
 
 #[derive(Clone)]
 struct MockFactory {
