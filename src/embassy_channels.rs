@@ -1,25 +1,32 @@
 //! [`ChannelFactory`] backed by `embassy-sync::channel::Channel`. Active
-//! when the `bare_metal` feature is enabled, independent of the tokio
-//! backend.
+//! when the `embassy_channels` feature is enabled.
 //!
 //! # Heap allocation per call
 //!
 //! Both sender and receiver hold an `Arc<Inner<...>>`, and every
-//! call to [`EmbassySyncChannels::oneshot`], [`bounded`], or
-//! [`unbounded`] heap-allocates a fresh `Arc<Inner<...>>`. The
+//! call to [`EmbassySyncChannels::oneshot()`][of], [`bounded()`][bf], or
+//! [`unbounded()`][uf] heap-allocates a fresh `Arc<Inner<...>>`. The
 //! `Client` run-loop calls these per request-response pair — most
 //! notably, every method on `Client` that awaits a server response
 //! constructs a oneshot via this factory, so each such method
 //! triggers one `Arc` allocation.
 //!
+//! [of]: crate::transport::ChannelFactory::oneshot
+//! [bf]: crate::transport::ChannelFactory::bounded
+//! [uf]: crate::transport::ChannelFactory::unbounded
+//!
 //! # Use [`crate::static_channels`] for the no-alloc bare-metal path
 //!
 //! [`crate::static_channels`] ships a no-alloc `ChannelFactory` whose
 //! senders and receivers carry `&'static` references into pre-allocated
-//! `OneshotPool` / `MpscPool` storage. The
-//! [`crate::define_static_channels`] macro generates the per-`T`
+//! [`OneshotPool`] / [`MpscPool`] storage. The
+//! [`define_static_channels!`][dsc] macro generates the per-`T`
 //! `*Pooled<MyChannels>` impls + a [`ChannelFactory`] impl on a unit
 //! struct.
+//!
+//! [`OneshotPool`]: crate::static_channels::OneshotPool
+//! [`MpscPool`]: crate::static_channels::MpscPool
+//! [dsc]: crate::define_static_channels
 //!
 //! `EmbassySyncChannels` remains useful for two cases:
 //!
@@ -49,14 +56,11 @@
 //!   receiver has dropped.
 //!
 //! Multi-sender contention on a closed bounded channel: the close
-//! signal uses a single [`AtomicWaker`], so only the most-recent
+//! signal uses a single `AtomicWaker`, so only the most-recent
 //! sender to register wakes immediately on receiver drop. Other
 //! awaiting senders will eventually re-poll (e.g. when the embassy
 //! channel's internal waker fires) and observe the closed flag —
 //! convergent but not constant-latency.
-//!
-//! [`bounded`]: ChannelFactory::bounded
-//! [`unbounded`]: ChannelFactory::unbounded
 
 use alloc::sync::Arc;
 use core::future::{Future, poll_fn};
@@ -130,6 +134,9 @@ impl<T: Send + 'static> Drop for EmbassySyncOneshotSender<T> {
 }
 
 impl<T: Send + 'static> OneshotRecv<T> for EmbassySyncOneshotReceiver<T> {
+    // The complex `poll_fn` body with manual pinning requires an explicit
+    // async block rather than `async fn` syntax.
+    #[allow(clippy::manual_async_fn)]
     fn recv(self) -> impl Future<Output = Result<T, OneshotCancelled>> + Send {
         async move {
             let inner = &self.inner;

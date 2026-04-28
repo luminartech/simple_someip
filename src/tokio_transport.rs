@@ -173,10 +173,9 @@ impl Future for RecvFrom<'_> {
                 // NOT expose a truncation flag. Surfacing a reliable
                 // `truncated: bool` here would require a platform-specific
                 // `recvmsg`/MSG_TRUNC path (libc + unsafe), which is
-                // deferred to the phase 10+ bare-metal refactor. Until
-                // then, this field is always `false` for the Tokio
-                // backend; callers must not rely on it for truncation
-                // detection. This is documented on
+                // deferred for now. Until then, this field is always
+                // `false` for the Tokio backend; callers must not rely on
+                // it for truncation detection. This is documented on
                 // `ReceivedDatagram::truncated`'s field doc.
                 Poll::Ready(Ok(ReceivedDatagram {
                     bytes_received: n,
@@ -456,11 +455,11 @@ impl<T: Send + 'static> crate::transport::UnboundedPooled<TokioChannels> for T {
 // ── EmbassySyncChannels (extracted) ──────────────────────────────────────
 //
 // The bare-metal `ChannelFactory` impl previously lived here as a sub-
-// module. After phase 13a the `tokio_transport` module is gated to
-// `client-tokio` / `server`, so a `--features client,bare_metal` build
-// without tokio could no longer reach `EmbassySyncChannels`. The impl
-// has been moved to `crate::embassy_channels` (gated only by
-// `feature = "bare_metal"`) so it is reachable from any client build.
+// module. The `tokio_transport` module is now gated to `client-tokio` /
+// `server-tokio`, so a `--features client,bare_metal` build without tokio
+// could no longer reach `EmbassySyncChannels`. The impl has been moved to
+// `crate::embassy_channels` (gated only by `feature = "bare_metal"`) so
+// it is reachable from any client build.
 
 #[cfg(test)]
 mod tests {
@@ -549,7 +548,7 @@ mod tests {
     async fn multicast_loop_v4_option_propagates_in_both_directions() {
         // Guards against a regression where `multicast_loop_v4` was
         // silently ignored on a multicast bind and the socket kept the
-        // OS default, diverging from the explicit request. Phase 14b:
+        // OS default, diverging from the explicit request.
         // `bind_with_options` only applies `set_multicast_loop_v4` when
         // `multicast_if_v4` is `Some` (a plain-unicast bind has no
         // meaningful multicast-loop setting), so this test always pairs

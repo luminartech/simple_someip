@@ -23,9 +23,9 @@ The library supports both `std` and `no_std` environments, making it suitable fo
 - `traits` — `WireFormat` and `PayloadWireFormat` traits for custom message types
 - `transport` — Executor-agnostic UDP socket / factory / timer / spawner traits (no_std-compatible)
 - `e2e` — End-to-End protection profiles (always available, no heap allocation)
-- `tokio_transport` — Default `std + tokio` impls of the transport traits (requires `feature = "client"` or `feature = "server"`)
-- `client` — High-level async tokio client (requires `feature = "client"`)
-- `server` — Async tokio server with SD announcements and event publishing (requires `feature = "server"`)
+- `tokio_transport` — Default `std + tokio` impls of the transport traits (requires `feature = "client-tokio"` or `feature = "server-tokio"`)
+- `client` — High-level async client trait surface (requires `feature = "client"`; add `client-tokio` for the `Client::new` convenience constructor)
+- `server` — Async server with SD announcements and event publishing (requires `feature = "server"`; add `server-tokio` for the `Server::new` convenience constructor)
 
 ## Usage
 
@@ -39,14 +39,14 @@ simple-someip = "0.7"
 # no_std only (protocol/transport/E2E/traits, no heap allocation)
 simple-someip = { version = "0.7", default-features = false }
 
-# Client only
-simple-someip = { version = "0.7", features = ["client"] }
+# Client only (with tokio convenience constructors)
+simple-someip = { version = "0.7", features = ["client-tokio"] }
 
-# Server only
-simple-someip = { version = "0.7", features = ["server"] }
+# Server only (with tokio convenience constructors)
+simple-someip = { version = "0.7", features = ["server-tokio"] }
 
 # Both client and server
-simple-someip = { version = "0.7", features = ["client", "server"] }
+simple-someip = { version = "0.7", features = ["client-tokio", "server-tokio"] }
 ```
 
 ### Feature flags
@@ -54,13 +54,18 @@ simple-someip = { version = "0.7", features = ["client", "server"] }
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `std` | **yes** | Enables `thiserror`, `tracing`, and `embedded-io/std` |
-| `client` | no | Async tokio client; implies `std` + tokio + socket2 |
-| `server` | no | Async tokio server; implies `std` + tokio + socket2 |
-| `bare_metal` | no | Pure marker — reserved for future no_std helpers. The real bare-metal canary is the `examples/bare_metal` workspace member; verify it with `cargo build -p bare_metal` (NOT `cargo build --workspace`, which can unify features). |
+| `client` | no | Client trait surface; implies `std` + futures (no tokio) |
+| `client-tokio` | no | Adds `Client::new` / `TokioSpawner` / `TokioTransport` defaults; implies `client` + tokio + socket2 |
+| `server` | no | Server trait surface; implies `std` + futures (no tokio) |
+| `server-tokio` | no | Adds `Server::new` / `TokioTimer` / `TokioTransport` defaults; implies `server` + tokio + socket2 |
+| `bare_metal` | no | Activates embassy-sync, no-alloc `static_channels` module, `AtomicInterfaceHandle`, and `StaticE2EHandle`. See `examples/bare_metal_client` and `examples/bare_metal_server`; verify with `cargo build -p bare_metal_client` (NOT `cargo build --workspace`, which can unify features). |
+| `embassy_channels` | no | Heap-backed `EmbassySyncChannels` (implies `bare_metal` + `alloc`). Useful for tests before sizing static pools. |
 
 By default the crate enables `std`. To use in a `no_std` environment (e.g., embedded targets), disable default features with `default-features = false`. In that mode the `protocol`, `traits`, `transport`, and `e2e` modules are available; `client` / `server` (and their `tokio_transport` backend) are not. Most applications only need one of `client` or `server`.
 
 ## Quick Start
+
+These examples require the `client-tokio` and `server-tokio` features respectively.
 
 ### Client
 
@@ -79,7 +84,7 @@ async fn main() {
     // `Error::Shutdown` is returned only once the run-loop future has
     // been dropped or its task cancelled.
     let (client, mut updates, run) =
-        Client::<RawPayload>::new(Ipv4Addr::new(192, 168, 1, 100));
+        Client::<RawPayload, _, _, _>::new(Ipv4Addr::new(192, 168, 1, 100));
     let _run_task = tokio::spawn(run);
 
     // Bind the SD multicast socket to discover services

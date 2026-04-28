@@ -48,8 +48,8 @@ use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::client::Error as ClientError;
+use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::define_static_channels;
 use simple_someip::e2e::E2ERegistry;
 use simple_someip::protocol::sd::RebootFlag;
@@ -162,6 +162,7 @@ struct MockRecvFut<'a> {
 impl Future for MockRecvFut<'_> {
     type Output = Result<ReceivedDatagram, TransportError>;
 
+    #[allow(clippy::single_match_else)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         match me.pipe.inbound.lock().unwrap().pop_front() {
@@ -208,7 +209,10 @@ impl TransportSocket for MockSocket {
     }
 
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> MockRecvFut<'a> {
-        MockRecvFut { pipe: Arc::clone(&self.pipe), buf }
+        MockRecvFut {
+            pipe: Arc::clone(&self.pipe),
+            buf,
+        }
     }
 
     fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {

@@ -373,7 +373,7 @@ pub struct ReceivedDatagram {
 /// [`SocketOptions::multicast_if_v4`] only selects the *outbound*
 /// multicast interface.
 ///
-/// # Associated future types (Phase 12)
+/// # Associated future types
 ///
 /// The [`SendFuture`](Self::SendFuture) and [`RecvFuture`](Self::RecvFuture)
 /// associated types let consumers express `Send` bounds on the futures
@@ -567,21 +567,20 @@ pub trait Timer {
 /// the client's main event loop — otherwise `SocketManager::send`'s
 /// internal oneshot wait deadlocks (the send future parks the main
 /// loop, which is the only thing that would drive the socket loop to
-/// produce its response). Phase 8 hit this and deferred the spawn to
-/// a user-provided `Spawner` here, letting std+tokio callers pass a
-/// one-line `TokioSpawner` and bare-metal callers wrap their own
+/// produce its response). The `Spawner` trait lets std+tokio callers
+/// pass a one-line `TokioSpawner` and bare-metal callers wrap their own
 /// executor's task-spawning primitive.
 ///
-/// # Why this reverses the phase-4 "no executor adapter" rule
+/// # Design rationale
 ///
-/// Phase 4 deliberately avoided wrapping spawn to prevent "reinventing
-/// embassy" and trait-object dispatch in the hot path. Concrete
-/// evidence from phase 8 showed that without a spawn abstraction,
-/// `Inner::bind_*` has to call `tokio::spawn` directly — making the
-/// whole crate tokio-only. The revised rule: spawn DOES need a trait,
-/// but we avoid the phase-4 concerns by (1) keeping the trait generic
-/// (monomorphized, no `dyn Spawner`) and (2) scoping it narrowly —
-/// just spawn, not select/sleep which have other solutions.
+/// The transport-trait design deliberately avoided wrapping spawn to
+/// prevent "reinventing embassy" and trait-object dispatch in the hot
+/// path. However, without a spawn abstraction, `Inner::bind_*` has to
+/// call `tokio::spawn` directly — making the whole crate tokio-only.
+/// The revised rule: spawn DOES need a trait, but we avoid the
+/// concerns by (1) keeping the trait generic (monomorphized, no
+/// `dyn Spawner`) and (2) scoping it narrowly — just spawn, not
+/// select/sleep which have other solutions.
 ///
 /// # Usage
 ///
@@ -611,7 +610,7 @@ pub trait Timer {
 /// `LocalExecutor`, etc. — implement directly.
 ///
 /// The two traits are independent: an executor MAY implement both
-/// (current_thread tokio with `LocalSet`), only [`Spawner`]
+/// (`current_thread` tokio with `LocalSet`), only [`Spawner`]
 /// (multi-threaded tokio default), or only [`LocalSpawner`]
 /// (single-task embassy).
 ///
@@ -644,9 +643,10 @@ pub trait Spawner {
     /// progress, no oneshot resolution; the caller's `send` hangs
     /// forever.
     ///
-    /// The `MockSpawner` in `examples/bare_metal/` deliberately
-    /// demonstrates the wrong pattern (drops the future) and annotates
-    /// it as DEMO-ONLY for exactly this reason.
+    /// The mock spawners in `tests/bare_metal_*.rs` demonstrate
+    /// correct integration patterns; callers that simply drop the
+    /// future will deadlock on any operation that requires a socket
+    /// round-trip.
     ///
     /// # Fire-and-forget by design
     ///
@@ -839,7 +839,7 @@ mod std_handle_impls {
 ///
 /// # No-allocator targets
 ///
-/// The example above uses `Box::leak` because [`E2ERegistry::new`] is not
+/// The example above uses `Box::leak` because [`crate::e2e::E2ERegistry::new()`] is not
 /// currently `const`. On a target with no allocator, swap that for a
 /// `static`-cell pattern (e.g. `static_cell::StaticCell::init`) once the
 /// registry constructor becomes `const`-friendly. The handle layer itself
@@ -899,8 +899,10 @@ pub mod bare_metal_handle_impls {
             upper_header: [u8; 8],
             output: &mut [u8],
         ) -> Option<Result<usize, E2EError>> {
-            self.0
-                .lock(|cell| cell.borrow_mut().protect(key, payload, upper_header, output))
+            self.0.lock(|cell| {
+                cell.borrow_mut()
+                    .protect(key, payload, upper_header, output)
+            })
         }
 
         fn check<'a>(
@@ -909,7 +911,8 @@ pub mod bare_metal_handle_impls {
             payload: &'a [u8],
             upper_header: [u8; 8],
         ) -> Option<(E2ECheckStatus, &'a [u8])> {
-            self.0.lock(|cell| cell.borrow_mut().check(key, payload, upper_header))
+            self.0
+                .lock(|cell| cell.borrow_mut().check(key, payload, upper_header))
         }
     }
 
@@ -964,7 +967,8 @@ pub use bare_metal_handle_impls::{AtomicInterfaceHandle, StaticE2EHandle, Static
 // the channel primitive used by the client. `TokioChannels` (in
 // `tokio_transport`) is the default for `std + tokio` builds;
 // `EmbassySyncChannels` (in `crate::embassy_channels`, gated behind
-// `bare_metal`) is the alternative for no-tokio / no_std builds.
+// `embassy_channels` feature) is a heap-backed alternative for no-tokio builds;
+// `static_channels` (gated behind `bare_metal`) is the no-alloc alternative.
 
 /// Returned by [`OneshotRecv::recv`] when the sender was dropped before
 /// sending a value.
@@ -1056,7 +1060,7 @@ pub trait UnboundedRecv<T: Send + 'static>: Send + 'static {
 ///   implementations use a large-capacity channel). Used for the
 ///   `ClientUpdate` stream from `Inner` to `Client`.
 ///
-/// # Per-`T` opt-in via the `*Pooled<Self>` traits (Phase 13.6b)
+/// # Per-`T` opt-in via the `*Pooled<Self>` traits
 ///
 /// The three constructor methods are generic over the channeled type
 /// `T`, but a heap-free static-pool implementation needs to map each `T`
@@ -1074,7 +1078,7 @@ pub trait UnboundedRecv<T: Send + 'static>: Send + 'static {
 /// publish a blanket `impl<T: Send + 'static> OneshotPooled<Self> for T`
 /// (and its bounded / unbounded peers), so existing user code does not
 /// notice the change. A static-pool backend instead publishes per-`T`
-/// impls (typically generated by a `static_channels!` macro) that wire
+/// impls (typically generated by a [`define_static_channels!`](crate::define_static_channels) macro) that wire
 /// each `T` to its declared pool. Calling `oneshot::<NotDeclared>()`
 /// against such a backend fails at the call site with
 /// `OneshotPooled<MyChannels> is not implemented for NotDeclared`.

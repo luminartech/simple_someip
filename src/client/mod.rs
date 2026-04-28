@@ -41,7 +41,7 @@ pub use error::Error;
 /// declare static channel pools for it via
 /// `crate::transport::BoundedPooled<C, 4>`. End users typically do not
 /// reference this type directly — the
-/// `crate::static_channels::static_channels!` macro names it for them.
+/// [`define_static_channels!`](crate::define_static_channels) macro names it for them.
 pub use inner::ControlMessage;
 /// Per-socket message types exposed for the same reason as
 /// [`ControlMessage`] — see its docstring.
@@ -480,19 +480,14 @@ where
         } = deps;
         let initial_addr = interface.get();
         let dispatch = bind_dispatch::SpawnerDispatch { factory, spawner };
-        let (control_sender, update_receiver, run_future) = Inner::<
-            MessageDefinitions,
-            Tm,
-            R,
-            C,
-            bind_dispatch::SpawnerDispatch<F, S>,
-        >::build(
-            initial_addr,
-            e2e_registry.clone(),
-            multicast_loopback,
-            dispatch,
-            timer,
-        );
+        let (control_sender, update_receiver, run_future) =
+            Inner::<MessageDefinitions, Tm, R, C, bind_dispatch::SpawnerDispatch<F, S>>::build(
+                initial_addr,
+                e2e_registry.clone(),
+                multicast_loopback,
+                dispatch,
+                timer,
+            );
         let client = Self {
             interface,
             control_sender,
@@ -505,15 +500,18 @@ where
     /// `!Send` counterpart to [`Self::new_with_deps`].
     ///
     /// Constructs a `Client` whose run-loop and per-socket loops are
-    /// submitted through a [`LocalSpawner`](crate::transport::LocalSpawner)
+    /// submitted through a [`LocalSpawner`]
     /// (single-threaded executor) rather than a
-    /// [`Spawner`](crate::transport::Spawner). The factory's socket type
+    /// [`Spawner`]. The factory's socket type
     /// and its GAT futures are not required to be `Send`. The returned
     /// run-loop future is `'static` but `!Send`.
     ///
     /// Use this constructor on embassy with `task-arena = 0`, on
     /// tokio's `LocalSet`, on async-std's `LocalExecutor`, etc., where
     /// the executor pins futures to a single thread.
+    ///
+    /// [`LocalSpawner`]: crate::transport::LocalSpawner
+    /// [`Spawner`]: crate::transport::Spawner
     #[allow(clippy::type_complexity)]
     #[must_use = "the returned run-loop future must be spawned (e.g. via the LocalSpawner) for the client to make progress"]
     pub fn new_with_deps_local<F, S, Tm>(
@@ -922,7 +920,10 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if the E2E registry mutex is poisoned.
+    /// May panic if the underlying [`E2ERegistryHandle`]
+    /// implementation panics (e.g., `Arc<Mutex<E2ERegistry>>` on mutex poison).
+    ///
+    /// [`E2ERegistryHandle`]: crate::transport::E2ERegistryHandle
     pub fn register_e2e(&self, key: E2EKey, profile: E2EProfile) {
         self.e2e_registry.register(key, profile);
     }
@@ -1189,7 +1190,7 @@ mod tests {
     }
 
     /// Stress test: 200 back-to-back `subscribe_no_wait` calls, each of
-    /// which drops its response oneshot. Phase 8(a) removed the
+    /// which drops its response oneshot. The code removed the
     /// `tokio::spawn(drain-the-oneshot)` wrapper this function used to
     /// have, and dropped the `warn!("...response receiver dropped")`
     /// sites in the inner loop. Regressions that re-introduce either
@@ -1625,17 +1626,16 @@ mod tests {
     /// subsequent `Client` method calls return [`Error::Shutdown`]
     /// rather than panicking.
     ///
-    /// This is intrinsic to the caller-driven lifecycle introduced in
-    /// phase 6 — the run loop is no longer owned by `Client::new`, so
-    /// failing to spawn it is the caller's responsibility. The test
-    /// pins the behavior deterministically so that any attempt to
-    /// silently "fix" this (e.g. internal spawn fallback) would break
-    /// it and force a review.
+    /// This is intrinsic to the caller-driven lifecycle — the run loop
+    /// is no longer owned by `Client::new`, so failing to spawn it is
+    /// the caller's responsibility. The test pins the behavior
+    /// deterministically so that any attempt to silently "fix" this
+    /// (e.g. internal spawn fallback) would break it and force a review.
     ///
-    /// Prior to the phase-6 API change these call sites panicked on
-    /// `.unwrap()` of the send `Result`; the typed error surfaced here
-    /// lets library consumers observe lifecycle mismatches cleanly
-    /// instead of bringing down the caller's task.
+    /// Prior to the API change these call sites panicked on `.unwrap()`
+    /// of the send `Result`; the typed error surfaced here lets library
+    /// consumers observe lifecycle mismatches cleanly instead of bringing
+    /// down the caller's task.
     #[tokio::test]
     async fn dropping_run_future_without_spawn_returns_shutdown_error() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
@@ -1680,12 +1680,11 @@ mod tests {
     /// announcements land on the `Inner` loop's discovery socket
     /// within a bounded window.
     ///
-    /// Phase 7.5 replaced `tokio::time::interval` (wall-clock aligned,
-    /// catches up after slow bodies) with repeated `Timer::sleep`
-    /// calls (interval + body time, no catch-up). For a healthy event
-    /// loop the body is microseconds, so the observed cadence is very
-    /// close to the requested interval. If a future change regresses
-    /// this to "2 * interval" or worse, this test fires.
+    /// The implementation uses repeated `Timer::sleep` calls (interval +
+    /// body time, no catch-up) rather than wall-clock aligned intervals.
+    /// For a healthy event loop the body is microseconds, so the observed
+    /// cadence is very close to the requested interval. If a future
+    /// change regresses this to "2 * interval" or worse, this test fires.
     ///
     /// The test creates a multicast receiver on the SD port/address
     /// with loopback enabled, then runs a client with

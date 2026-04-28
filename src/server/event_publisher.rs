@@ -63,7 +63,9 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if the E2E registry mutex is poisoned.
+    /// May panic if the underlying [`E2ERegistryHandle`](crate::transport::E2ERegistryHandle)
+    /// implementation panics (e.g., `Arc<Mutex<E2ERegistry>>` on mutex poison).
+    #[allow(clippy::too_many_lines)]
     pub async fn publish_event<P: PayloadWireFormat>(
         &self,
         service_id: u16,
@@ -188,10 +190,7 @@ where
                     );
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "Failed to send event to subscriber {}: {:?}",
-                        addr, e
-                    );
+                    tracing::error!("Failed to send event to subscriber {}: {:?}", addr, e);
                 }
             }
         }
@@ -348,7 +347,7 @@ where
     ///
     /// Calling this method with the same `(service_id, instance_id,
     /// event_group_id, subscriber_addr)` tuple is idempotent — the
-    /// underlying [`SubscriptionManager`] deduplicates — so external
+    /// underlying [`super::SubscriptionManager`] deduplicates — so external
     /// dispatchers can safely call it on every incoming
     /// `SubscribeEventGroup` (including TTL refreshes) without growing
     /// the subscriber list.
@@ -368,7 +367,7 @@ where
     /// # Errors
     ///
     /// Returns [`crate::server::SubscribeError`] when the underlying
-    /// [`SubscriptionManager`] cannot record the subscription because a
+    /// [`super::SubscriptionManager`] cannot record the subscription because a
     /// bounded capacity was hit:
     /// - `SubscribersPerGroupFull` — the per-event-group subscriber list
     ///   is full.
@@ -445,11 +444,8 @@ mod tests {
     /// Type alias bringing the tokio-flavor concrete type parameters back
     /// into scope so tests can spell `TestEventPublisher` without
     /// chasing the three-type-parameter signature on every call site.
-    type TestEventPublisher = EventPublisher<
-        Arc<Mutex<E2ERegistry>>,
-        Arc<RwLock<SubscriptionManager>>,
-        TokioSocket,
-    >;
+    type TestEventPublisher =
+        EventPublisher<Arc<Mutex<E2ERegistry>>, Arc<RwLock<SubscriptionManager>>, TokioSocket>;
 
     fn test_registry() -> Arc<Mutex<E2ERegistry>> {
         Arc::new(Mutex::new(E2ERegistry::new()))
