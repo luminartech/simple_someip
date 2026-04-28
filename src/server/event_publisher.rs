@@ -11,6 +11,15 @@ use core::net::SocketAddrV4;
 use heapless::Vec as HeaplessVec;
 use std::sync::Arc;
 
+/// The publish snapshot buffer is sized to `SUBSCRIBERS_PER_GROUP` so
+/// `for_each_subscriber` can never overflow it. If a future refactor
+/// changes the manager's per-group cap independently, this assert
+/// catches the divergence at compile time.
+const _: () = assert!(
+    SUBSCRIBERS_PER_GROUP >= 1,
+    "SUBSCRIBERS_PER_GROUP must be >= 1 for the publish snapshot to fit any subscribers"
+);
+
 /// Publishes events to subscribers.
 ///
 /// Generic over `T: TransportSocket` (the socket primitive — `TokioSocket`
@@ -70,24 +79,19 @@ where
         // we can release the subscription read lock before doing async
         // sends. This avoids a per-event heap allocation that the old
         // `get_subscribers -> Vec<Subscriber>` API forced.
+        //
+        // The buffer cap matches the manager's per-group cap so push()
+        // is provably infallible — see the `const _` guard below.
         let mut subscribers: HeaplessVec<SocketAddrV4, SUBSCRIBERS_PER_GROUP> = HeaplessVec::new();
-        let mut overflow = false;
-        let total = self
+        let _total = self
             .subscriptions
             .for_each_subscriber(service_id, instance_id, event_group_id, |sub| {
-                if subscribers.push(sub.address).is_err() {
-                    overflow = true;
-                }
+                // push() can never fail here: SUBSCRIBERS_PER_GROUP is
+                // both the manager's per-group cap and this buffer's
+                // cap, so the manager will never feed us more than fits.
+                let _ = subscribers.push(sub.address);
             })
             .await;
-        if overflow {
-            tracing::warn!(
-                "publish_event truncated subscriber list to {} for service 0x{:04X} (had {} total)",
-                SUBSCRIBERS_PER_GROUP,
-                service_id,
-                total,
-            );
-        }
 
         if subscribers.is_empty() {
             tracing::trace!(
@@ -170,8 +174,13 @@ where
 
         let datagram = &buffer[..message_length];
 
-        // Send to all snapshotted subscribers
-        let mut sent_count = 0;
+        // Send to all snapshotted subscribers. Track the last
+        // transport error so we can surface "every send failed" as
+        // `Err(Transport(_))` rather than masking total failure as
+        // `Ok(0)` — which would be indistinguishable from "no
+        // subscribers" to the caller.
+        let mut sent_count = 0usize;
+        let mut last_err: Option<crate::transport::TransportError> = None;
         for addr in &subscribers {
             match self.socket.send_to(datagram, *addr).await {
                 Ok(()) => {
@@ -184,6 +193,7 @@ where
                 }
                 Err(e) => {
                     tracing::error!("Failed to send event to subscriber {}: {:?}", addr, e);
+                    last_err = Some(e);
                 }
             }
         }
@@ -195,6 +205,14 @@ where
             service_id
         );
 
+        if sent_count == 0 {
+            // Every send failed (subscribers was non-empty above, so
+            // last_err is necessarily Some). Surface the most recent
+            // transport error so the caller can react.
+            return Err(Error::Transport(
+                last_err.unwrap_or(crate::transport::TransportError::Unsupported),
+            ));
+        }
         Ok(sent_count)
     }
 
@@ -220,23 +238,12 @@ where
         // Snapshot subscriber addresses into a stack buffer (see
         // publish_event for rationale).
         let mut subscribers: HeaplessVec<SocketAddrV4, SUBSCRIBERS_PER_GROUP> = HeaplessVec::new();
-        let mut overflow = false;
-        let total = self
+        let _total = self
             .subscriptions
             .for_each_subscriber(service_id, instance_id, event_group_id, |sub| {
-                if subscribers.push(sub.address).is_err() {
-                    overflow = true;
-                }
+                let _ = subscribers.push(sub.address);
             })
             .await;
-        if overflow {
-            tracing::warn!(
-                "publish_raw_event truncated subscriber list to {} for service 0x{:04X} (had {} total)",
-                SUBSCRIBERS_PER_GROUP,
-                service_id,
-                total,
-            );
-        }
 
         if subscribers.is_empty() {
             return Ok(0);
@@ -295,8 +302,11 @@ where
         buffer[header_len..total_len].copy_from_slice(payload);
         let datagram = &buffer[..total_len];
 
-        // Send to all snapshotted subscribers
-        let mut sent_count = 0;
+        // Send to all snapshotted subscribers; surface total-failure
+        // as `Err(Transport(_))` rather than `Ok(0)` (see
+        // `publish_event`).
+        let mut sent_count = 0usize;
+        let mut last_err: Option<crate::transport::TransportError> = None;
         for addr in &subscribers {
             match self.socket.send_to(datagram, *addr).await {
                 Ok(()) => {
@@ -304,10 +314,16 @@ where
                 }
                 Err(e) => {
                     tracing::error!("Failed to send raw event to {}: {:?}", addr, e);
+                    last_err = Some(e);
                 }
             }
         }
 
+        if sent_count == 0 {
+            return Err(Error::Transport(
+                last_err.unwrap_or(crate::transport::TransportError::Unsupported),
+            ));
+        }
         Ok(sent_count)
     }
 

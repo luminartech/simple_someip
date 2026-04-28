@@ -99,18 +99,36 @@ pub struct TokioTimer;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TokioSpawner;
 
+/// Named future returned by [`TokioTransport::bind`].
+///
+/// `socket2::Socket::bind` is synchronous, so the body runs to
+/// completion on the first poll; the named struct exists only to
+/// satisfy the [`TransportFactory::BindFuture`] GAT on stable Rust
+/// without TAIT. Auto-derives `Send`.
+pub struct TokioBindFuture {
+    addr: SocketAddrV4,
+    options: SocketOptions,
+}
+
+impl Future for TokioBindFuture {
+    type Output = Result<TokioSocket, TransportError>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let addr = self.addr;
+        let options = self.options;
+        Poll::Ready(bind_with_options(addr, options).map_err(|e| map_io_error(&e)))
+    }
+}
+
 impl TransportFactory for TokioTransport {
     type Socket = TokioSocket;
+    type BindFuture<'a> = TokioBindFuture;
 
-    fn bind(
-        &self,
-        addr: SocketAddrV4,
-        options: &SocketOptions,
-    ) -> impl Future<Output = Result<Self::Socket, TransportError>> + Send {
-        // Capture options by value into the async block so the returned
-        // future does not borrow `self` or `options`.
-        let options = *options;
-        async move { bind_with_options(addr, options).map_err(|e| map_io_error(&e)) }
+    fn bind<'a>(&'a self, addr: SocketAddrV4, options: &'a SocketOptions) -> Self::BindFuture<'a> {
+        TokioBindFuture {
+            addr,
+            options: *options,
+        }
     }
 }
 
@@ -226,9 +244,32 @@ impl TransportSocket for TokioSocket {
     }
 }
 
+/// Named future returned by [`TokioTimer::sleep`].
+///
+/// Wraps `tokio::time::Sleep` so the [`Timer::SleepFuture`] GAT can be
+/// named on stable Rust. Auto-derives `Send`.
+pub struct TokioSleep {
+    inner: tokio::time::Sleep,
+}
+
+impl Future for TokioSleep {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: structural pinning of the `inner` Sleep field. We never
+        // move out of `inner` and we project pin through it consistently.
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.inner) };
+        inner.poll(cx).map(|()| ())
+    }
+}
+
 impl Timer for TokioTimer {
-    async fn sleep(&self, duration: Duration) {
-        tokio::time::sleep(duration).await;
+    type SleepFuture<'a> = TokioSleep;
+
+    fn sleep(&self, duration: Duration) -> Self::SleepFuture<'_> {
+        TokioSleep {
+            inner: tokio::time::sleep(duration),
+        }
     }
 }
 
@@ -236,10 +277,37 @@ impl crate::transport::Spawner for TokioSpawner {
     fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
         // Drop the returned `JoinHandle` — per-socket loops run until
         // their owning `SocketManager` drops its channel ends, at
-        // which point the future completes naturally. Callers that
-        // want cancel-on-abort semantics should spawn at their own
-        // call site; this trait is intentionally minimal.
-        drop(tokio::spawn(future));
+        // which point the future completes naturally.
+        //
+        // Wrap in `catch_unwind` so a panic inside the spawned task is
+        // logged through the `tracing` pipeline that the rest of the
+        // crate uses, instead of being swallowed silently to stderr by
+        // tokio's default panic handler. The caller's
+        // `Error::SocketClosedUnexpectedly` (surfaced when the
+        // panicking task drops its channel ends) then has a
+        // corresponding diagnostic in the operator's logs.
+        use futures::FutureExt;
+        drop(tokio::spawn(async move {
+            let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
+            if let Err(payload) = result {
+                let msg = panic_payload_str(&payload);
+                tracing::error!(
+                    panic_message = msg,
+                    "spawned task panicked; channels will close",
+                );
+            }
+        }));
+    }
+}
+
+/// Best-effort extraction of a printable message from a panic payload.
+fn panic_payload_str(payload: &std::boxed::Box<dyn std::any::Any + Send>) -> &str {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<std::string::String>() {
+        s.as_str()
+    } else {
+        "<non-string panic payload>"
     }
 }
 
@@ -270,8 +338,8 @@ fn bind_with_options(addr: SocketAddrV4, options: SocketOptions) -> std::io::Res
     // loop=true. Skipping the syscall only when both are unset avoids
     // a no-op call on plain-unicast sockets while still honoring an
     // explicit caller request.
-    if options.multicast_if_v4.is_some() || options.multicast_loop_v4 {
-        raw.set_multicast_loop_v4(options.multicast_loop_v4)?;
+    if let Some(loop_v4) = options.multicast_loop_v4 {
+        raw.set_multicast_loop_v4(loop_v4)?;
     }
     let bind_addr = SocketAddr::new(IpAddr::V4(*addr.ip()), addr.port());
     raw.bind(&bind_addr.into())?;
@@ -310,6 +378,7 @@ fn map_io_error(e: &std::io::Error) -> TransportError {
         K::NetworkUnreachable | K::HostUnreachable => {
             TransportError::Io(IoErrorKind::NetworkUnreachable)
         }
+        K::WouldBlock => TransportError::Io(IoErrorKind::WouldBlock),
         _ => TransportError::Io(IoErrorKind::Other),
     };
     // Log at `warn!` for unexpected / misconfiguration-indicating
@@ -556,7 +625,7 @@ mod tests {
         let factory = TokioTransport;
 
         let opts_off = SocketOptions {
-            multicast_loop_v4: false,
+            multicast_loop_v4: Some(false),
             multicast_if_v4: Some(Ipv4Addr::LOCALHOST),
             ..SocketOptions::default()
         };
@@ -570,7 +639,7 @@ mod tests {
         );
 
         let opts_on = SocketOptions {
-            multicast_loop_v4: true,
+            multicast_loop_v4: Some(true),
             multicast_if_v4: Some(Ipv4Addr::LOCALHOST),
             ..SocketOptions::default()
         };

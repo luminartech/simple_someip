@@ -137,11 +137,8 @@ struct MockFactory {
 
 impl TransportFactory for MockFactory {
     type Socket = MockSocket;
-    fn bind(
-        &self,
-        addr: SocketAddrV4,
-        _options: &SocketOptions,
-    ) -> impl Future<Output = Result<Self::Socket, TransportError>> + Send {
+    type BindFuture<'a> = core::future::Ready<Result<Self::Socket, TransportError>>;
+    fn bind<'a>(&'a self, addr: SocketAddrV4, _options: &'a SocketOptions) -> Self::BindFuture<'a> {
         let pipe = Arc::clone(&self.pipe);
         let mut p = self.local_port.lock().unwrap();
         let port = if addr.port() == 0 {
@@ -152,7 +149,7 @@ impl TransportFactory for MockFactory {
             addr.port()
         };
         let local = SocketAddrV4::new(*addr.ip(), port);
-        async move { Ok(MockSocket { pipe, local }) }
+        core::future::ready(Ok(MockSocket { pipe, local }))
     }
 }
 
@@ -248,8 +245,11 @@ impl TransportSocket for MockSocket {
 
 struct MockTimer;
 impl Timer for MockTimer {
-    async fn sleep(&self, duration: Duration) {
-        tokio::time::sleep(duration).await;
+    type SleepFuture<'a> = core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    fn sleep(&self, duration: Duration) -> Self::SleepFuture<'_> {
+        Box::pin(async move {
+            tokio::time::sleep(duration).await;
+        })
     }
 }
 

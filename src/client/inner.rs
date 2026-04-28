@@ -589,29 +589,36 @@ where
         ),
         Error,
     > {
-        if let Some(receiver) = socket_manager {
-            match receiver.receive().await {
-                Some(result) => match result {
-                    Ok(received) => {
-                        let someip_header = received.message.header().clone();
-                        if let Some(sd_header) = received.message.sd_header() {
-                            Ok((received.source, someip_header, sd_header.to_owned()))
-                        } else {
-                            Err(Error::UnexpectedDiscoveryMessage(someip_header))
-                        }
-                    }
-                    Err(err) => Err(err),
-                },
-                None => Err(Error::SocketClosedUnexpectedly),
-            }
+        let Some(socket) = socket_manager else {
+            // If we don't have a receiver, return a future that never resolves
+            return future::pending().await;
+        };
+        let Some(result) = socket.receive().await else {
+            // Socket loop has exited. Evict the dead manager so
+            // subsequent polls don't busy-loop on a closed receiver —
+            // instead they fall through to the `future::pending()`
+            // arm and wait until the user re-binds discovery (e.g.
+            // via SetInterface).
+            *socket_manager = None;
+            return Err(Error::SocketClosedUnexpectedly);
+        };
+        let received = result?;
+        let someip_header = received.message.header().clone();
+        if let Some(sd_header) = received.message.sd_header() {
+            Ok((received.source, someip_header, sd_header.to_owned()))
         } else {
-            // If we don't have a receiver, we should return a future that never resolves
-            future::pending().await
+            Err(Error::UnexpectedDiscoveryMessage(someip_header))
         }
     }
 
     /// Receive from any bound unicast socket. Returns the first message ready
     /// from any socket. If no sockets are bound, returns a future that never resolves.
+    ///
+    /// A unicast socket whose loop has exited (`poll_receive` returns
+    /// `Poll::Ready(None)`) is evicted from the map immediately rather
+    /// than having `Err(SocketClosedUnexpectedly)` returned once per
+    /// poll forever, which would CPU-pin the run-loop and flood the
+    /// update stream.
     async fn receive_any_unicast(
         unicast_sockets: &mut FnvIndexMap<
             u16,
@@ -623,17 +630,45 @@ where
             return future::pending().await;
         }
 
-        // Use poll_fn to manually poll each socket's receiver
         std::future::poll_fn(|cx| {
-            for socket in unicast_sockets.values_mut() {
+            // Collect ports of any sockets that report `Ready(None)`
+            // (loop has exited). Evict them after the iteration so we
+            // do not mutate the map while iterating it.
+            let mut dead_ports: heapless::Vec<u16, UNICAST_SOCKETS_CAP> = heapless::Vec::new();
+            let mut delivered: Option<Result<ReceivedMessage<PayloadDefinitions>, Error>> = None;
+            for (port, socket) in unicast_sockets.iter_mut() {
                 if let Poll::Ready(result) = socket.poll_receive(cx) {
-                    return Poll::Ready(match result {
-                        Some(msg) => msg,
-                        None => Err(Error::SocketClosedUnexpectedly),
-                    });
+                    match result {
+                        Some(msg) => {
+                            delivered = Some(msg);
+                            break;
+                        }
+                        None => {
+                            // Mark for eviction; keep scanning others.
+                            let _ = dead_ports.push(*port);
+                        }
+                    }
                 }
             }
-            Poll::Pending
+            for port in &dead_ports {
+                unicast_sockets.remove(port);
+                tracing::warn!("Unicast socket on port {port} closed; evicted from registry");
+            }
+            if let Some(msg) = delivered {
+                Poll::Ready(msg)
+            } else if unicast_sockets.is_empty() {
+                // The last socket just got evicted; fall through to a
+                // pending state so the next bind triggers a fresh poll.
+                Poll::Pending
+            } else if !dead_ports.is_empty() {
+                // At least one socket got evicted but others remain;
+                // re-poll so the caller observes the next ready event
+                // promptly instead of waiting on a stale waker.
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Pending
+            }
         })
         .await
     }
@@ -676,23 +711,15 @@ where
                         }
                         return;
                     }
-                    info!("Binding to interface: {}", interface);
-                    let bind_result = self.bind_discovery().await;
-                    match &bind_result {
-                        Ok(()) => {
-                            info!("Successfully Bound to interface: {}", interface);
-                        }
-                        Err(e) => {
-                            warn!("Failed to bind to interface: {}. Error: {:?}", interface, e);
-                        }
-                    }
-                    // A dropped receiver is legitimate control flow
-                    // (cancellation, `_no_wait` variants, panic
-                    // recovery). `debug!` instead of `warn!` keeps
-                    // observability for the "this shouldn't happen"
-                    // case without cluttering production warn logs
-                    // when callers deliberately drop.
-                    if response.send(bind_result).is_err() {
+                    // Reaching here: discovery is not bound AND
+                    // `interface == self.interface`. Do nothing — the
+                    // user expressed no change of intent. Previously
+                    // this branch silently called `bind_discovery()`
+                    // as a side effect, which surprised callers
+                    // probing the current interface via
+                    // `client.set_interface(client.interface()).await`.
+                    debug!("SetInterface: no-op (interface unchanged, discovery not bound)");
+                    if response.send(Ok(())).is_err() {
                         debug!("SetInterface: caller dropped the response receiver");
                     }
                 }
@@ -852,18 +879,25 @@ where
                     };
                     let socket = self.unicast_sockets.get_mut(&source_port).unwrap();
 
-                    // Stamp request ID
+                    // Stamp request ID with the CURRENT session counter,
+                    // but only advance it on successful send. A failed
+                    // send should not chew through the 16-bit session
+                    // space — under transient transport failure that
+                    // could wrap toward in-flight pending_responses
+                    // far faster than expected.
                     let request_id =
                         (u32::from(self.client_id) << 16) | u32::from(self.session_counter);
                     message.set_request_id(request_id);
-                    self.session_counter = self.session_counter.wrapping_add(1);
-                    if self.session_counter == 0 {
-                        self.session_counter = 1;
-                    }
 
                     let send_result = socket.send(target, message).await;
                     match send_result {
                         Ok(()) => {
+                            // Advance the counter only after a real
+                            // wire transmission. Skip 0 on wrap.
+                            self.session_counter = self.session_counter.wrapping_add(1);
+                            if self.session_counter == 0 {
+                                self.session_counter = 1;
+                            }
                             let _ = send_complete.send(Ok(()));
                             self.track_or_reject_pending_response(request_id, response);
                         }
@@ -940,7 +974,16 @@ where
                     match &mut self.discovery_socket {
                         None => match self.bind_discovery().await {
                             Ok(()) => {
-                                // See re-enqueue note on SetInterface above.
+                                // Re-enqueue the Subscribe carrying the
+                                // ALREADY-bound `unicast_port` so pass-2
+                                // hits the `bind_unicast` dedupe path
+                                // instead of allocating a second
+                                // ephemeral socket. Carrying the
+                                // original `client_port=0` would
+                                // re-bind ephemerally and leak the
+                                // original socket into
+                                // `unicast_sockets` until the slot cap
+                                // hit.
                                 if let Err(rejected) =
                                     self.request_queue.push_front(ControlMessage::Subscribe {
                                         service_id,
@@ -948,7 +991,7 @@ where
                                         major_version,
                                         ttl,
                                         event_group_id,
-                                        client_port,
+                                        client_port: unicast_port,
                                         response,
                                     })
                                 {

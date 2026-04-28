@@ -40,8 +40,8 @@ pub use error::Error;
 /// the run-loop. Exposed (rather than `pub(super)`) so callers can
 /// declare static channel pools for it via
 /// `crate::transport::BoundedPooled<C, 4>`. End users typically do not
-/// reference this type directly — the
-/// [`define_static_channels!`](crate::define_static_channels) macro names it for them.
+/// reference this type directly — the `define_static_channels!` macro
+/// (under `feature = "bare_metal"`) names it for them.
 pub use inner::ControlMessage;
 /// Per-socket message types exposed for the same reason as
 /// [`ControlMessage`] — see its docstring.
@@ -179,7 +179,9 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ClientUpdate<P> {
 
 /// Stream of updates from the SOME/IP client event loop.
 ///
-/// Returned by [`Client::new`]. Call [`recv`](Self::recv) to receive
+/// Returned by `Client::new` (under `client-tokio`) or
+/// `Client::new_with_deps` / `Client::new_with_deps_local` (under
+/// `client`). Call [`recv`](Self::recv) to receive
 /// discovery, unicast, and error updates.
 pub struct ClientUpdates<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory> {
     update_receiver: C::UnboundedReceiver<ClientUpdate<MessageDefinitions>>,
@@ -244,8 +246,8 @@ where
 /// bare-metal handles backed by a critical-section mutex rather than
 /// `Arc<Mutex<_>>`). On `std + tokio`, the defaults
 /// (`Arc<Mutex<E2ERegistry>>` and `Arc<RwLock<Ipv4Addr>>`) are used by the
-/// standard constructors [`Self::new`] / [`Self::new_with_loopback`] /
-/// [`Self::new_with_spawner_and_loopback`].
+/// standard constructors `Self::new` / `Self::new_with_loopback` /
+/// `Self::new_with_spawner_and_loopback` (all under `client-tokio`).
 #[derive(Clone)]
 pub struct Client<
     MessageDefinitions: PayloadWireFormat + Send + 'static,
@@ -433,8 +435,8 @@ where
     /// [`InterfaceHandle`].
     ///
     /// This is the no-tokio entry point. The `client-tokio` convenience
-    /// constructors ([`Self::new`], [`Self::new_with_loopback`],
-    /// [`Self::new_with_spawner_and_loopback`]) ultimately delegate
+    /// constructors (`Self::new`, `Self::new_with_loopback`,
+    /// `Self::new_with_spawner_and_loopback`) ultimately delegate
     /// here, supplying `TokioTransport` / `TokioTimer` / `TokioSpawner`
     /// / `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<Ipv4Addr>>` for the
     /// generic parameters. Bare-metal callers supply their own.
@@ -466,10 +468,12 @@ where
     where
         F: TransportFactory + Send + Sync + 'static,
         F::Socket: Send + Sync + 'static,
+        for<'a> F::BindFuture<'a>: Send,
         for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
         for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
         S: Spawner + Send + Sync + 'static,
         Tm: Timer + Send + Sync + 'static,
+        for<'a> Tm::SleepFuture<'a>: Send,
     {
         let ClientDeps {
             factory,
@@ -723,7 +727,7 @@ where
     /// Call this before manually building an SD header (e.g. one passed to
     /// [`send_sd_message`](Self::send_sd_message)) so the reboot flag reflects
     /// the current tracked state instead of a stale value baked at call time.
-    /// Headers passed to [`sd_announcements_loop`](Self::sd_announcements_loop)
+    /// Headers passed to `sd_announcements_loop` (under `client-tokio`)
     /// are refreshed automatically per-tick and do not need this call.
     ///
     /// # Errors
@@ -918,6 +922,14 @@ where
     /// header checked and stripped, and outgoing messages will have E2E
     /// protection applied automatically.
     ///
+    /// # Shutdown semantics
+    ///
+    /// Unlike most public `Client` methods, `register_e2e` does NOT go
+    /// through the run-loop control channel — it operates directly on
+    /// the shared [`E2ERegistryHandle`]. Consequently it does not return
+    /// `Err(Error::Shutdown)` after the run-loop has exited; the
+    /// registry is still accessible via any held `Client` clone.
+    ///
     /// # Panics
     ///
     /// May panic if the underlying [`E2ERegistryHandle`]
@@ -929,6 +941,10 @@ where
     }
 
     /// Remove E2E configuration for the given key.
+    ///
+    /// Like [`Self::register_e2e`], this method bypasses the run-loop
+    /// control channel and is therefore not subject to
+    /// `Error::Shutdown`.
     pub fn unregister_e2e(&self, key: &E2EKey) {
         self.e2e_registry.unregister(key);
     }

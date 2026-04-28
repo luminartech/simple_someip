@@ -34,19 +34,19 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 # Default — includes std, thiserror, and tracing
-simple-someip = "0.7"
+simple-someip = "0.8"
 
 # no_std only (protocol/transport/E2E/traits, no heap allocation)
-simple-someip = { version = "0.7", default-features = false }
+simple-someip = { version = "0.8", default-features = false }
 
 # Client only (with tokio convenience constructors)
-simple-someip = { version = "0.7", features = ["client-tokio"] }
+simple-someip = { version = "0.8", features = ["client-tokio"] }
 
 # Server only (with tokio convenience constructors)
-simple-someip = { version = "0.7", features = ["server-tokio"] }
+simple-someip = { version = "0.8", features = ["server-tokio"] }
 
 # Both client and server
-simple-someip = { version = "0.7", features = ["client-tokio", "server-tokio"] }
+simple-someip = { version = "0.8", features = ["client-tokio", "server-tokio"] }
 ```
 
 ### Feature flags

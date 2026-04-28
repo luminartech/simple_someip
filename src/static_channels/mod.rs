@@ -1,6 +1,7 @@
 //! Static-pool no-alloc backend for [`ChannelFactory`].
 //!
-//! [`crate::embassy_channels::EmbassySyncChannels`] heap-allocates one
+//! `crate::embassy_channels::EmbassySyncChannels` (under
+//! `feature = "embassy_channels"`) heap-allocates one
 //! `Arc<Channel<...>>` per `oneshot()` / `bounded()` / `unbounded()`
 //! call. On a real bare-metal target that violates the strategic
 //! "zero heap after `Client::new` returns" goal, because
@@ -39,14 +40,15 @@
 //!   `Err(OneshotCancelled)` (oneshot) or `None` (bounded /
 //!   unbounded mpsc, after the last sender drops).
 //! - **Receiver drop**: any pending value in the slot is dropped when
-//!   the slot is reclaimed. Bounded senders blocked on a full
-//!   channel may deadlock if the receiver disappears — typical
-//!   bare-metal use keeps the receiver alive for the program's
-//!   lifetime, so this is an accepted limitation for v1.
+//!   the slot is reclaimed. Bounded senders blocked on a full channel
+//!   are all woken via the slot's `MultiWakerRegistration` so each
+//!   resolves to `Err(())` on its next poll — including cloned senders
+//!   beyond the registration's static cap, which fall back to the
+//!   "wake-on-next-register" path.
 
 #![allow(clippy::module_name_repetitions)]
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::future::{Future, poll_fn};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -55,7 +57,13 @@ use core::task::Poll;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_sync::waitqueue::AtomicWaker;
+use embassy_sync::waitqueue::{AtomicWaker, MultiWakerRegistration};
+
+/// Maximum number of distinct waiting senders we wake on receiver drop.
+/// More than this and the multi-waker auto-wakes-and-clears on the next
+/// register, so the close path remains correct under any sender count —
+/// it just degrades to "wake on next register" for the overflow case.
+const SEND_WAKER_CAP: usize = 8;
 
 use crate::transport::{
     MpscRecv, MpscSend, OneshotCancelled, OneshotRecv, OneshotSend, UnboundedRecv, UnboundedSend,
@@ -147,18 +155,28 @@ impl<T: Send + 'static, const POOL_SIZE: usize> OneshotPool<T, POOL_SIZE> {
     }
 
     fn ensure_seeded(&self) {
-        if self
-            .seeded
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+        // Seed the free list under the same mutex `pop_free` takes, so a
+        // racing claimer cannot win the mutex between our (won) CAS and
+        // our `free_head.lock(|h| h.set(1))` and observe `head == 0`.
+        // The `seeded` atomic is only an optimisation — once true, we
+        // skip the mutex acquire entirely.
+        if self.seeded.load(Ordering::Acquire) {
+            return;
+        }
+        self.free_head.lock(|h| {
+            // Re-check under the mutex; another claimer may have seeded
+            // while we were contending for it.
+            if self.seeded.load(Ordering::Acquire) {
+                return;
+            }
             // Link slots[0] -> slots[1] -> ... -> slots[N-1] -> 0.
             for i in 0..POOL_SIZE {
                 let next = if i + 1 < POOL_SIZE { i + 2 } else { 0 };
                 self.slots[i].next_free.store(next, Ordering::Release);
             }
-            self.free_head.lock(|h| h.set(1));
-        }
+            h.set(1);
+            self.seeded.store(true, Ordering::Release);
+        });
     }
 
     fn pop_free(&self) -> Option<&OneshotSlot<T>> {
@@ -193,6 +211,12 @@ impl<T: Send + 'static, const POOL_SIZE: usize> OneshotReclaim<T> for OneshotPoo
         debug_assert!(idx < POOL_SIZE, "slot does not belong to this pool");
         // Drop any stale value still in the channel.
         let _ = slot.chan.try_receive();
+        // Overwrite any stale waker still registered by the previous
+        // tenant so the next claim's first registration does not wake
+        // (and potentially poke) a defunct task. `register` overwrites
+        // the previous slot if the new waker would-wake a different
+        // task, so registering the noop waker effectively clears it.
+        slot.cancel_waker.register(core::task::Waker::noop());
         slot.state.store(0, Ordering::Release);
         self.free_head.lock(|h| {
             slot.next_free.store(h.get(), Ordering::Release);
@@ -317,11 +341,12 @@ pub struct MpscSlot<T: Send + 'static, const SLOT_CAP: usize> {
     chan: Channel<CriticalSectionRawMutex, T, SLOT_CAP>,
     /// Wakes the receiver on close.
     close_waker: AtomicWaker,
-    /// Wakes a sender that is `await`ing on a full channel when the
-    /// receiver drops. Single-slot `AtomicWaker` — multi-sender
-    /// contention is best-effort (latest registration wins, others
-    /// re-observe the closed flag on their next poll).
-    send_waker: AtomicWaker,
+    /// Wakes senders that are `await`ing on a full channel when the
+    /// receiver drops. Multi-slot so all cloned senders blocked on a
+    /// full channel are unblocked on close — a single `AtomicWaker`
+    /// would deadlock the non-most-recent senders permanently.
+    send_wakers:
+        BlockingMutex<CriticalSectionRawMutex, RefCell<MultiWakerRegistration<SEND_WAKER_CAP>>>,
     /// Number of live senders (clones) + 1 if receiver is alive.
     /// 0 → slot returns to free list.
     refcount: AtomicUsize,
@@ -339,7 +364,7 @@ impl<T: Send + 'static, const SLOT_CAP: usize> MpscSlot<T, SLOT_CAP> {
         Self {
             chan: Channel::new(),
             close_waker: AtomicWaker::new(),
-            send_waker: AtomicWaker::new(),
+            send_wakers: BlockingMutex::new(RefCell::new(MultiWakerRegistration::new())),
             refcount: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             next_free: AtomicUsize::new(0),
@@ -419,17 +444,24 @@ impl<T: Send + 'static, const POOL_SIZE: usize, const SLOT_CAP: usize>
     }
 
     fn ensure_seeded(&self) {
-        if self
-            .seeded
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+        // See `OneshotPool::ensure_seeded` for the rationale: seeding
+        // must happen under the same mutex `pop_free` takes, otherwise a
+        // racing claimer can win the mutex first and observe an empty
+        // free list.
+        if self.seeded.load(Ordering::Acquire) {
+            return;
+        }
+        self.free_head.lock(|h| {
+            if self.seeded.load(Ordering::Acquire) {
+                return;
+            }
             for i in 0..POOL_SIZE {
                 let next = if i + 1 < POOL_SIZE { i + 2 } else { 0 };
                 self.slots[i].next_free.store(next, Ordering::Release);
             }
-            self.free_head.lock(|h| h.set(1));
-        }
+            h.set(1);
+            self.seeded.store(true, Ordering::Release);
+        });
     }
 
     fn pop_free(&self) -> Option<&MpscSlot<T, SLOT_CAP>> {
@@ -467,6 +499,11 @@ impl<T: Send + 'static, const POOL_SIZE: usize, const SLOT_CAP: usize> MpscRecla
         let idx = (here - base) / stride;
         debug_assert!(idx < POOL_SIZE);
         while slot.chan.try_receive().is_ok() {}
+        // Overwrite any stale wakers still registered by the previous
+        // tenant so the next claim's first registration does not poke
+        // a defunct task.
+        slot.close_waker.register(core::task::Waker::noop());
+        slot.send_wakers.lock(|w| w.borrow_mut().wake());
         slot.refcount.store(0, Ordering::Release);
         slot.closed.store(false, Ordering::Release);
         self.free_head.lock(|h| {
@@ -527,7 +564,7 @@ impl<T: Send + 'static, const SLOT_CAP: usize> MpscSend<T> for StaticBoundedSend
         }
         // Pin the embassy SendFuture on the stack so it survives
         // across yields without losing the captured value. Race it
-        // against the closed flag via send_waker.
+        // against the closed flag via send_wakers.
         let mut send_fut = core::pin::pin!(slot.chan.send(value));
         poll_fn(|cx| {
             // If the receiver is already closed, report Err(()). A
@@ -540,10 +577,12 @@ impl<T: Send + 'static, const SLOT_CAP: usize> MpscSend<T> for StaticBoundedSend
             match send_fut.as_mut().poll(cx) {
                 Poll::Ready(()) => Poll::Ready(Ok(())),
                 Poll::Pending => {
-                    // Register on send_waker so a receiver drop wakes
-                    // us. The embassy SendFuture has already
-                    // registered on the channel's internal waker.
-                    slot.send_waker.register(cx.waker());
+                    // Register on send_wakers so a receiver drop wakes
+                    // *all* awaiting senders, not just the most-recent.
+                    // The embassy SendFuture has separately registered
+                    // on the channel's internal waker.
+                    slot.send_wakers
+                        .lock(|w| w.borrow_mut().register(cx.waker()));
                     // Re-check closed after registering, to close the
                     // lost-wakeup window.
                     if slot.closed.load(Ordering::Acquire) {
@@ -565,13 +604,13 @@ pub struct StaticBoundedReceiver<T: Send + 'static, const SLOT_CAP: usize> {
 
 impl<T: Send + 'static, const SLOT_CAP: usize> Drop for StaticBoundedReceiver<T, SLOT_CAP> {
     fn drop(&mut self) {
-        // Receiver gone — mark closed and wake any pending bounded
-        // sender that's awaiting on a full channel. The send-side
-        // poll_fn races send_waker against the closed flag, so a wake
-        // here re-polls and observes Err. Single AtomicWaker —
-        // multi-sender contention is best-effort.
+        // Receiver gone — mark closed and wake every pending sender
+        // that's awaiting on a full channel. The send-side poll_fn
+        // races the wake against the closed flag and observes Err.
+        // Multi-waker so cloned senders are all woken, not just the
+        // most-recently-registered one.
         self.slot.closed.store(true, Ordering::Release);
-        self.slot.send_waker.wake();
+        self.slot.send_wakers.lock(|w| w.borrow_mut().wake());
         let prev = self.slot.refcount.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             self.pool.release(self.slot);
@@ -627,7 +666,13 @@ impl<T: Send + 'static, const SLOT_CAP: usize> UnboundedSend<T>
     for StaticUnboundedSender<T, SLOT_CAP>
 {
     fn send_now(&self, value: T) -> Result<(), T> {
-        // Refuse to push into a slot whose receiver has dropped.
+        // Refuse to push into a slot whose receiver has dropped, AND
+        // reject `Full` from the underlying channel. The trait's
+        // unified `Result<(), T>` does not distinguish "closed" from
+        // "full" — callers that need to retry on transient fullness
+        // should size `SLOT_CAP` so they do not happen, since the
+        // unbounded sender only differs from the bounded one in its
+        // non-await contract; both can fail with `Err(value)` here.
         if self.slot.closed.load(Ordering::Acquire) {
             return Err(value);
         }
@@ -647,9 +692,9 @@ impl<T: Send + 'static, const SLOT_CAP: usize> Drop for StaticUnboundedReceiver<
     fn drop(&mut self) {
         self.slot.closed.store(true, Ordering::Release);
         // Unbounded send_now never awaits, but we still wake
-        // send_waker so any bounded sender on a slot that was reused
+        // send_wakers so any bounded sender on a slot that was reused
         // for unbounded duty observes the close. Cheap and safe.
-        self.slot.send_waker.wake();
+        self.slot.send_wakers.lock(|w| w.borrow_mut().wake());
         let prev = self.slot.refcount.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             self.pool.release(self.slot);
@@ -949,6 +994,7 @@ mod tests {
     use core::future::Future;
     use core::pin::pin;
     use core::task::{Context, Poll, Waker};
+    use std::boxed::Box;
 
     fn poll_once<F: Future>(f: &mut core::pin::Pin<&mut F>) -> Poll<F::Output> {
         let waker = Waker::noop();
@@ -1002,6 +1048,103 @@ mod tests {
         let _a = POOL_2.claim().unwrap();
         let _b = POOL_2.claim().unwrap();
         assert!(POOL_2.claim().is_none(), "third claim must exhaust");
+    }
+
+    /// Concurrent first-claim: two threads call `claim()` on the same
+    /// freshly-`new()`'d pool simultaneously. Both must succeed (the
+    /// pool has 8 slots). Regression for the seeding race where one
+    /// thread won the CAS and started looping while the other took
+    /// `free_head` first and observed `head == 0`.
+    #[test]
+    fn oneshot_concurrent_first_claim_does_not_panic() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        static POOL: OneshotPool<u32, 8> = OneshotPool::new();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = std::vec::Vec::new();
+        for _ in 0..4 {
+            let s = Arc::clone(&success_count);
+            handles.push(std::thread::spawn(move || {
+                if POOL.claim().is_some() {
+                    s.fetch_add(1, O::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            success_count.load(O::SeqCst),
+            4,
+            "all 4 concurrent claims should have succeeded against an 8-slot pool",
+        );
+    }
+
+    /// Multi-sender close broadcast: when the receiver drops, every
+    /// cloned sender that is awaiting a full-channel `send` must
+    /// resolve to `Err(())`. Regression for the old single-slot
+    /// `AtomicWaker` which only woke the most-recently-registered
+    /// sender.
+    #[test]
+    fn mpsc_bounded_receiver_drop_wakes_all_cloned_senders() {
+        static POOL: MpscPool<u32, 4, 1> = MpscPool::new();
+        let (tx, rx) = POOL.claim_bounded().expect("claim");
+        // Fill the channel so any further send awaits.
+        let mut filler_fut = pin!(tx.send(0));
+        match poll_once(&mut filler_fut) {
+            Poll::Ready(Ok(())) => {}
+            other => panic!("filler send should resolve immediately: {other:?}"),
+        }
+        // Three cloned senders, all awaiting on the full channel.
+        let clones: std::vec::Vec<_> = (0..3).map(|_| tx.clone()).collect();
+        let mut futs: std::vec::Vec<_> = clones
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Box::pin(c.send(u32::try_from(i).unwrap() + 1)))
+            .collect();
+        for f in &mut futs {
+            // Each should park (channel is full).
+            match f.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Pending => {}
+                Poll::Ready(other) => panic!("expected Pending, got Ready({other:?})"),
+            }
+        }
+        drop(rx);
+        // Each cloned sender's pending future must now resolve to Err.
+        for f in &mut futs {
+            match f.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(Err(())) => {}
+                Poll::Ready(Ok(())) => {
+                    panic!("expected Err after receiver drop on cloned sender, got Ok")
+                }
+                Poll::Pending => panic!("expected Err after receiver drop, got Pending"),
+            }
+        }
+    }
+
+    #[test]
+    fn mpsc_concurrent_first_claim_does_not_panic() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        static POOL: MpscPool<u32, 8, 4> = MpscPool::new();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = std::vec::Vec::new();
+        for _ in 0..4 {
+            let s = Arc::clone(&success_count);
+            handles.push(std::thread::spawn(move || {
+                if POOL.claim_bounded().is_some() {
+                    s.fetch_add(1, O::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            success_count.load(O::SeqCst),
+            4,
+            "all 4 concurrent claims should have succeeded against an 8-slot pool",
+        );
     }
 
     // ── Bounded MPSC tests ────────────────────────────────────────────

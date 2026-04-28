@@ -84,7 +84,7 @@ fn diagnose_and_abort(kind: &str, size: usize, align_or_new: usize) -> ! {
 
 unsafe impl GlobalAlloc for PanicAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
+        if ARMED.load(Ordering::Acquire) {
             diagnose_and_abort("alloc", layout.size(), layout.align());
         }
         // SAFETY: forwarding to System with caller's layout contract.
@@ -97,7 +97,7 @@ unsafe impl GlobalAlloc for PanicAllocator {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
+        if ARMED.load(Ordering::Acquire) {
             diagnose_and_abort("alloc_zeroed", layout.size(), layout.align());
         }
         // SAFETY: forwarding to System.
@@ -105,7 +105,7 @@ unsafe impl GlobalAlloc for PanicAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
+        if ARMED.load(Ordering::Acquire) {
             diagnose_and_abort("realloc", layout.size(), new_size);
         }
         // SAFETY: forwarding to System; invariants upheld by caller.

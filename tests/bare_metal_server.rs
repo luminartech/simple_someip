@@ -56,11 +56,9 @@ struct MockFactory {
 
 impl TransportFactory for MockFactory {
     type Socket = MockSocket;
-    fn bind(
-        &self,
-        addr: SocketAddrV4,
-        _options: &SocketOptions,
-    ) -> impl Future<Output = Result<Self::Socket, TransportError>> + Send {
+    type BindFuture<'a> =
+        core::pin::Pin<Box<dyn Future<Output = Result<Self::Socket, TransportError>> + Send + 'a>>;
+    fn bind<'a>(&'a self, addr: SocketAddrV4, _options: &'a SocketOptions) -> Self::BindFuture<'a> {
         let pipe = Arc::clone(&self.pipe);
         // Mock: assign port deterministically. If caller asked for 0,
         // hand out an incrementing fake ephemeral port.
@@ -73,7 +71,7 @@ impl TransportFactory for MockFactory {
             addr.port()
         };
         let local = SocketAddrV4::new(*addr.ip(), port);
-        async move { Ok(MockSocket { pipe, local }) }
+        Box::pin(async move { Ok(MockSocket { pipe, local }) })
     }
 }
 
@@ -176,13 +174,16 @@ impl TransportSocket for MockSocket {
 #[derive(Clone)]
 struct MockTimer;
 impl Timer for MockTimer {
-    async fn sleep(&self, duration: Duration) {
+    type SleepFuture<'a> = core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    fn sleep(&self, duration: Duration) -> Self::SleepFuture<'_> {
         // Honor `duration` per the `Timer` trait contract (MAY
         // overshoot, MUST NOT undershoot). The test runtime is
         // `#[tokio::test]`; this only demonstrates the no-tokio
         // production path compiles. A real bare-metal impl would
         // replace this with `embassy_time::Timer::after`.
-        tokio::time::sleep(duration).await;
+        Box::pin(async move {
+            tokio::time::sleep(duration).await;
+        })
     }
 }
 

@@ -75,6 +75,7 @@ where
     R: E2ERegistryHandle,
     F: TransportFactory + Send + Sync + 'static,
     F::Socket: Send + Sync + 'static,
+    for<'a> F::BindFuture<'a>: Send,
     for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
     for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
     S: Spawner + Send + Sync + 'static,

@@ -261,7 +261,7 @@ where
             o.reuse_address = true;
             o.reuse_port = true;
             o.multicast_if_v4 = Some(interface);
-            o.multicast_loop_v4 = multicast_loopback;
+            o.multicast_loop_v4 = Some(multicast_loopback);
             o
         };
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, sd::MULTICAST_PORT);
@@ -306,7 +306,7 @@ where
             o.reuse_address = true;
             o.reuse_port = true;
             o.multicast_if_v4 = Some(interface);
-            o.multicast_loop_v4 = multicast_loopback;
+            o.multicast_loop_v4 = Some(multicast_loopback);
             o
         };
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, sd::MULTICAST_PORT);
@@ -516,7 +516,14 @@ where
             ..
         } = self;
         drop(sender);
-        _ = MpscRecv::recv(&mut receiver).await;
+        // Drain until the receiver returns `None` — i.e. the socket
+        // loop has dropped its sender. A single `recv()` could
+        // resolve via a buffered `ReceivedMessage` while the loop is
+        // still running and still holding the underlying transport
+        // socket; that would leave the OS-level fd / multicast group
+        // potentially still bound when the next `bind_*` ran. Loop
+        // until close is observed.
+        while MpscRecv::recv(&mut receiver).await.is_some() {}
     }
 
     /// Build the I/O loop over any [`TransportSocket`] as a future.
@@ -733,22 +740,36 @@ where
                     }
                 }
                 Outcome::Recv(Err(recv_err)) => {
-                    // `tokio_transport::map_io_error` already logs the
-                    // underlying `std::io::Error` (debug for transient
-                    // kinds, warn for unusual ones) — keep this
-                    // call-site at debug to avoid duplicating the same
-                    // failure on the operator's screen.
-                    consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
-                    debug!(
-                        "socket recv_from error ({}/{}): {:?}",
-                        consecutive_recv_errors, MAX_CONSECUTIVE_RECV_ERRORS, recv_err,
+                    // Classify by transport kind: transient kinds
+                    // (ConnectionRefused from inbound ICMP
+                    // port-unreachable, WouldBlock, Interrupted,
+                    // TimedOut, NetworkUnreachable) do NOT count
+                    // toward the consecutive-error cap — a peer
+                    // dying after a flurry of our requests easily
+                    // produces 16 ICMP storms in microseconds, and
+                    // tearing down a healthy socket on that signal
+                    // is wrong. Only fatal kinds (e.g. EBADF mapped
+                    // to `Other`) count toward the kill cap.
+                    let transient = matches!(
+                        recv_err,
+                        crate::transport::TransportError::Io(kind) if kind.is_transient_recv()
                     );
-                    if consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
-                        error!(
-                            "socket recv_from failed {} times consecutively; closing socket loop",
-                            consecutive_recv_errors,
+                    if transient {
+                        debug!("socket recv_from transient error: {:?}", recv_err);
+                    } else {
+                        consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
+                        debug!(
+                            "socket recv_from fatal-class error ({}/{}): {:?}",
+                            consecutive_recv_errors, MAX_CONSECUTIVE_RECV_ERRORS, recv_err,
                         );
-                        break;
+                        if consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                            error!(
+                                "socket recv_from failed {} times consecutively with fatal-class \
+                                 errors; closing socket loop",
+                                consecutive_recv_errors,
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -762,6 +783,7 @@ mod tests {
     use crate::e2e::E2ERegistry;
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
     use crate::tokio_transport::{TokioChannels, TokioSpawner};
+    use std::boxed::Box;
     use std::format;
     use std::sync::{Arc, Mutex};
     use std::vec;
@@ -1074,18 +1096,22 @@ mod tests {
 
         impl TransportFactory for CountingFactory {
             type Socket = TokioSocket;
-            fn bind(
-                &self,
+            type BindFuture<'a> = core::pin::Pin<
+                Box<
+                    dyn Future<Output = Result<Self::Socket, crate::transport::TransportError>>
+                        + Send
+                        + 'a,
+                >,
+            >;
+            fn bind<'a>(
+                &'a self,
                 addr: SocketAddrV4,
-                options: &SocketOptions,
-            ) -> impl Future<Output = Result<Self::Socket, crate::transport::TransportError>>
-            {
+                options: &'a SocketOptions,
+            ) -> Self::BindFuture<'a> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                // Clone the options into the async block so no borrow
-                // escapes the returned future.
                 let options = *options;
                 let inner = self.inner;
-                async move { inner.bind(addr, &options).await }
+                Box::pin(async move { inner.bind(addr, &options).await })
             }
         }
 
@@ -1123,15 +1149,21 @@ mod tests {
         struct ForceReuseFactory;
         impl TransportFactory for ForceReuseFactory {
             type Socket = TokioSocket;
-            fn bind(
-                &self,
+            type BindFuture<'a> = core::pin::Pin<
+                Box<
+                    dyn Future<Output = Result<Self::Socket, crate::transport::TransportError>>
+                        + Send
+                        + 'a,
+                >,
+            >;
+            fn bind<'a>(
+                &'a self,
                 addr: SocketAddrV4,
-                options: &SocketOptions,
-            ) -> impl Future<Output = Result<Self::Socket, crate::transport::TransportError>>
-            {
+                options: &'a SocketOptions,
+            ) -> Self::BindFuture<'a> {
                 let mut opts = *options;
                 opts.reuse_address = true;
-                async move { TokioTransport.bind(addr, &opts).await }
+                Box::pin(async move { TokioTransport.bind(addr, &opts).await })
             }
         }
 
@@ -1229,16 +1261,19 @@ mod tests {
         struct WrappingFactory;
         impl TransportFactory for WrappingFactory {
             type Socket = WrappedSocket;
-            fn bind(
-                &self,
+            type BindFuture<'a> = core::pin::Pin<
+                Box<dyn Future<Output = Result<Self::Socket, TransportError>> + Send + 'a>,
+            >;
+            fn bind<'a>(
+                &'a self,
                 addr: SocketAddrV4,
-                options: &SocketOptions,
-            ) -> impl Future<Output = Result<Self::Socket, TransportError>> {
+                options: &'a SocketOptions,
+            ) -> Self::BindFuture<'a> {
                 let opts = *options;
-                async move {
+                Box::pin(async move {
                     let inner = TokioTransport.bind(addr, &opts).await?;
                     Ok(WrappedSocket(inner))
-                }
+                })
             }
         }
 
@@ -1291,12 +1326,15 @@ mod tests {
         struct AlwaysBusyFactory;
         impl TransportFactory for AlwaysBusyFactory {
             type Socket = TokioSocket;
-            async fn bind(
-                &self,
+            type BindFuture<'a> = core::pin::Pin<
+                Box<dyn Future<Output = Result<Self::Socket, TransportError>> + Send + 'a>,
+            >;
+            fn bind<'a>(
+                &'a self,
                 _addr: SocketAddrV4,
-                _options: &SocketOptions,
-            ) -> Result<Self::Socket, TransportError> {
-                Err(TransportError::AddressInUse)
+                _options: &'a SocketOptions,
+            ) -> Self::BindFuture<'a> {
+                Box::pin(async move { Err(TransportError::AddressInUse) })
             }
         }
 
