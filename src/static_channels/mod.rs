@@ -212,11 +212,6 @@ impl<T: Send + 'static> OneshotSend<T> for StaticOneshotSender<T> {
         match self.slot.chan.try_send(value) {
             Ok(()) => {
                 self.sent = true;
-                // Wake the receiver via cancel_waker too — its poll_fn
-                // re-checks the channel after the chan-internal waker
-                // wakes it, but waking cancel_waker also covers the
-                // case where the receiver registered there last.
-                self.slot.cancel_waker.wake();
                 Ok(())
             }
             Err(embassy_sync::channel::TrySendError::Full(v)) => Err(v),
@@ -658,6 +653,75 @@ fn mpsc_poll_recv<T: Send + 'static, const SLOT_CAP: usize>(
     Poll::Pending
 }
 
+// ── Debug impls ───────────────────────────────────────────────────────
+
+impl<T: Send + 'static> core::fmt::Debug for OneshotSlot<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OneshotSlot")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: Send + 'static, const N: usize> core::fmt::Debug for OneshotPool<T, N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OneshotPool").finish_non_exhaustive()
+    }
+}
+
+impl<T: Send + 'static> core::fmt::Debug for StaticOneshotSender<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StaticOneshotSender")
+            .field("sent", &self.sent)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: Send + 'static> core::fmt::Debug for StaticOneshotReceiver<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StaticOneshotReceiver").finish_non_exhaustive()
+    }
+}
+
+impl<T: Send + 'static, const N: usize> core::fmt::Debug for MpscSlot<T, N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MpscSlot")
+            .field("refcount", &self.refcount)
+            .field("closed", &self.closed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: Send + 'static, const P: usize, const N: usize> core::fmt::Debug for MpscPool<T, P, N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MpscPool").finish_non_exhaustive()
+    }
+}
+
+impl<T: Send + 'static, const N: usize> core::fmt::Debug for StaticBoundedSender<T, N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StaticBoundedSender").finish_non_exhaustive()
+    }
+}
+
+impl<T: Send + 'static, const N: usize> core::fmt::Debug for StaticBoundedReceiver<T, N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StaticBoundedReceiver").finish_non_exhaustive()
+    }
+}
+
+impl<T: Send + 'static, const N: usize> core::fmt::Debug for StaticUnboundedSender<T, N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StaticUnboundedSender").finish_non_exhaustive()
+    }
+}
+
+impl<T: Send + 'static, const N: usize> core::fmt::Debug for StaticUnboundedReceiver<T, N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StaticUnboundedReceiver").finish_non_exhaustive()
+    }
+}
+
 // ── `define_static_channels!` macro ───────────────────────────────────
 
 /// Default slot capacity for unbounded channels declared via
@@ -715,14 +779,22 @@ pub const UNBOUNDED_DEFAULT_CAP: usize = 128;
 /// from the pool size in the macro grammar.
 #[macro_export]
 macro_rules! define_static_channels {
+    // Entry point: explicit visibility.
+    ( vis: $vis:vis, name: $name:ident, $($rest:tt)* ) => {
+        $crate::define_static_channels! { @body $vis, $name, $($rest)* }
+    };
+    // Entry point: no visibility token — default to `pub`.
+    ( name: $name:ident, $($rest:tt)* ) => {
+        $crate::define_static_channels! { @body pub, $name, $($rest)* }
+    };
     (
-        name: $name:ident,
+        @body $vis:vis, $name:ident,
         oneshot: [ $( ($ot:ty, $opool:literal) ),* $(,)? ],
         bounded: [ $( (($bt:ty, $bcap:literal), $bpool:literal) ),* $(,)? ],
         unbounded: [ $( ($ut:ty, $upool:literal) ),* $(,)? ] $(,)?
     ) => {
-        #[derive(Clone, Copy)]
-        pub struct $name;
+        #[derive(Clone, Copy, Debug)]
+        $vis struct $name;
 
         impl $crate::transport::ChannelFactory for $name {
             type OneshotSender<T: ::core::marker::Send + 'static> =
@@ -971,5 +1043,82 @@ mod tests {
         use crate::transport::{ChannelFactory, UnboundedSend};
         let (tx, _rx) = MacroTestChannels::unbounded::<u16>();
         assert!(tx.send_now(1234).is_ok());
+    }
+
+    // ── Waker-tracking helper ─────────────────────────────────────────
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as SAtomic};
+
+    struct WakeFlag(AtomicBool);
+    impl std::task::Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, SAtomic::Release);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, SAtomic::Release);
+        }
+    }
+    fn tracking_waker() -> (Arc<WakeFlag>, Waker) {
+        let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = Waker::from(flag.clone());
+        (flag, waker)
+    }
+
+    // ── Waker firing tests ────────────────────────────────────────────
+
+    #[test]
+    fn oneshot_waker_fires_on_send() {
+        static POOL: OneshotPool<u32, 2> = OneshotPool::new();
+        let (tx, rx) = POOL.claim().expect("pool not empty");
+        let (flag, waker) = tracking_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pin!(rx.recv());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        tx.send(42u32).unwrap();
+        assert!(flag.0.load(SAtomic::Acquire), "waker must fire when value is sent");
+        let noop = Waker::noop();
+        let mut cx2 = Context::from_waker(noop);
+        assert!(matches!(fut.as_mut().poll(&mut cx2), Poll::Ready(Ok(42))));
+    }
+
+    #[test]
+    fn oneshot_cancel_waker_fires_on_sender_drop() {
+        static POOL: OneshotPool<u32, 2> = OneshotPool::new();
+        let (tx, rx) = POOL.claim().expect("pool not empty");
+        let (flag, waker) = tracking_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pin!(rx.recv());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        drop(tx);
+        assert!(flag.0.load(SAtomic::Acquire), "waker must fire when sender is dropped (cancel)");
+        let noop = Waker::noop();
+        let mut cx2 = Context::from_waker(noop);
+        assert!(matches!(fut.as_mut().poll(&mut cx2), Poll::Ready(Err(OneshotCancelled))));
+    }
+
+    #[test]
+    fn mpsc_close_waker_fires_on_all_senders_drop() {
+        static POOL: MpscPool<u32, 1, 4> = MpscPool::new();
+        let (tx, mut rx) = POOL.claim_bounded().expect("pool not empty");
+        let tx2 = tx.clone();
+        let (flag, waker) = tracking_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pin!(rx.recv());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        drop(tx);
+        assert!(!flag.0.load(SAtomic::Acquire), "waker must not fire until last sender drops");
+        drop(tx2);
+        assert!(flag.0.load(SAtomic::Acquire), "waker must fire when last sender drops");
+        let noop = Waker::noop();
+        let mut cx2 = Context::from_waker(noop);
+        assert!(matches!(fut.as_mut().poll(&mut cx2), Poll::Ready(None)));
+    }
+
+    #[test]
+    fn mpsc_bounded_pool_exhaustion_returns_none() {
+        static POOL: MpscPool<u32, 1, 4> = MpscPool::new();
+        let _a = POOL.claim_bounded().expect("pool not empty");
+        assert!(POOL.claim_bounded().is_none(), "second claim must exhaust pool of size 1");
     }
 }
