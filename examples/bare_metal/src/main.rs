@@ -78,21 +78,24 @@
 //!   `default-features = false, features = ["bare_metal", "client", "server"]`
 //!   now compiles, though the `server` half is empty until 14b
 //!   retargets the engine.
+//! - Phase 14b: `Server` is now constructible without
+//!   `server-tokio`. The engine carries `F: TransportFactory`,
+//!   `Tm: Timer`, `R: E2ERegistryHandle`, and `S: SubscriptionHandle`
+//!   generics, and the new `Server::new_with_deps` /
+//!   `Server::new_passive_with_deps` constructors take everything
+//!   explicitly via a `ServerDeps` bundle. The tokio convenience
+//!   constructors (`Server::new`, `Server::new_with_loopback`,
+//!   `Server::new_passive`) live behind the `server-tokio` feature
+//!   and delegate to `new_with_deps`. Witness:
+//!   `tests/bare_metal_server.rs` (gated on `server + bare_metal`).
 //!
 //! **Remaining gaps:**
-//! 1. **Server engine retargeting** (Phase 14b): the working server
-//!    still requires `server-tokio` because its bind path uses
-//!    `tokio::net::UdpSocket` directly and `subscription_manager`
-//!    holds `tokio::sync::RwLock`. Phase 14b adds `ServerDeps<F, Tm,
-//!    R, S>` and a generic `Server<R, S, F, Tm>` analogous to
-//!    `ClientDeps` / `Client`, then drops the gates on the bare
-//!    `server` feature to expose the trait-surface server.
-//! 2. **No-alloc Client**: `Client` / `Inner` still depend on
-//!    `alloc` (heapless internals are fine, but `EmbassySyncChannels`
-//!    uses `Arc`, and `e2e_registry` uses `Arc<Mutex<_>>`). Phase
-//!    13.6 (static-pool ChannelFactory) is the engine fix; phase 16
-//!    is the CI verification that lights up an alloc-panicking
-//!    harness.
+//! 1. **No-alloc Client/Server**: `Client` / `Server` engines still
+//!    depend on `alloc` (heapless internals are fine, but
+//!    `EmbassySyncChannels` uses `Arc`, and `e2e_registry` uses
+//!    `Arc<Mutex<_>>`). Phase 13.6 (static-pool ChannelFactory) is
+//!    the engine fix; phase 16 is the CI verification that lights up
+//!    an alloc-panicking harness.
 //!
 //! # Recommendation for `no_alloc` consumers today
 //!
@@ -440,10 +443,12 @@ fn main() {
         "note: trait layer (TransportSocket + TransportFactory + Timer + \
          Spawner + ChannelFactory) exercised end-to-end. Phases 9-12 \
          complete; phases 13a + 13.5 (client + Client engine generic) \
-         complete; phase 14a (server feature topology) complete. \
-         Remaining: phase 14b server-engine retargeting (working \
-         `server` without tokio) + phase 13.6 static-pool \
-         ChannelFactory + phase 16 no-alloc CI verification. See \
-         top-of-file docblock."
+         complete; phase 14a (server feature topology) complete; \
+         phase 14b (Server engine generic over TransportFactory + \
+         Timer + E2ERegistryHandle + SubscriptionHandle, reachable \
+         via Server::new_with_deps under just `server`) complete — see \
+         tests/bare_metal_server.rs for the witness. Remaining: \
+         phase 13.6 static-pool ChannelFactory + phase 16 no-alloc \
+         CI verification. See top-of-file docblock."
     );
 }

@@ -3,7 +3,10 @@
 use super::service_info::Subscriber;
 use core::future::Future;
 use heapless::{Vec as HeaplessVec, index_map::FnvIndexMap};
-use std::{net::SocketAddrV4, sync::Arc, vec::Vec};
+use std::{net::SocketAddrV4, vec::Vec};
+#[cfg(feature = "server-tokio")]
+use std::sync::Arc;
+#[cfg(feature = "server-tokio")]
 use tokio::sync::RwLock;
 
 /// Max number of distinct `(service_id, instance_id, event_group_id)` event
@@ -300,6 +303,7 @@ pub trait SubscriptionHandle: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Vec<Subscriber>> + Send + '_;
 }
 
+#[cfg(feature = "server-tokio")]
 impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
     fn subscribe(
         &self,
