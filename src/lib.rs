@@ -187,6 +187,8 @@ pub use client::{
 pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
 pub use server::Server;
+#[cfg(feature = "server")]
+pub use server::SubscriptionHandle;
 #[cfg(any(feature = "client-tokio", feature = "server"))]
 pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
 pub use transport::{
@@ -194,5 +196,3 @@ pub use transport::{
     OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram, SocketOptions, Spawner, Timer,
     TransportError, TransportFactory, TransportSocket, UnboundedRecv, UnboundedSend,
 };
-#[cfg(feature = "server")]
-pub use server::SubscriptionHandle;

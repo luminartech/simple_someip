@@ -35,23 +35,55 @@ mod session;
 mod socket_manager;
 
 pub use error::Error;
+/// Internal control message exchanged between [`Client`] handles and
+/// the run-loop. Exposed (rather than `pub(super)`) so callers can
+/// declare static channel pools for it via
+/// `crate::transport::BoundedPooled<C, 4>`. End users typically do not
+/// reference this type directly — the
+/// `crate::static_channels::static_channels!` macro names it for them.
+pub use inner::ControlMessage;
+/// Per-socket message types exposed for the same reason as
+/// [`ControlMessage`] — see its docstring.
+pub use socket_manager::{ReceivedMessage, SendMessage};
 
 use crate::Timer;
-use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "client-tokio")]
 use crate::e2e::E2ERegistry;
+use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "client-tokio")]
 use crate::tokio_transport::{TokioChannels, TokioSpawner, TokioTimer};
 use crate::transport::{
-    ChannelFactory, E2ERegistryHandle, InterfaceHandle, MpscSend, OneshotRecv, Spawner,
-    TransportFactory, TransportSocket, UnboundedRecv,
+    BoundedPooled, ChannelFactory, E2ERegistryHandle, InterfaceHandle, MpscSend, OneshotPooled,
+    OneshotRecv, Spawner, TransportFactory, TransportSocket, UnboundedPooled, UnboundedRecv,
 };
 use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use inner::{ControlMessage, Inner};
+use inner::Inner;
 #[cfg(feature = "client-tokio")]
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::info;
+
+// Bound bundle the client's internals demand from any
+// `C: ChannelFactory` they channel through. Stable Rust does not
+// elaborate where-clause bounds on a trait alias, and macros do not
+// expand inside `where` clauses, so the bundle is repeated inline at
+// each impl block that constructs channels. The list is authored once
+// here as documentation and copy-pasted; mismatch surfaces as a
+// trait-bound compile error pointing at the missing `OneshotPooled` /
+// `BoundedPooled` / `UnboundedPooled` impl.
+//
+// ```ignore
+//     Result<(), Error>: OneshotPooled<C>,
+//     Result<P, Error>: OneshotPooled<C>,
+//     Result<protocol::sd::RebootFlag, Error>: OneshotPooled<C>,
+//     ControlMessage<P, C>: BoundedPooled<C, 4>,
+//     SendMessage<P, C>: BoundedPooled<C, 16>,
+//     Result<ReceivedMessage<P>, Error>: BoundedPooled<C, 16>,
+//     ClientUpdate<P>: UnboundedPooled<C>,
+// ```
+//
+// When stable Rust gains implied bounds for trait where-clauses, this
+// collapses back to a single `C: ClientChannels<P>` supertrait.
 
 /// Handle to a pending SOME/IP request-response transaction.
 /// Resolves when the inner loop receives a matching unicast reply.
@@ -160,7 +192,9 @@ impl<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory> std::fm
     }
 }
 
-impl<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory> ClientUpdates<MessageDefinitions, C> {
+impl<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory>
+    ClientUpdates<MessageDefinitions, C>
+{
     /// Waits for the next update from the client event loop.
     ///
     /// Returns `None` when the inner loop has exited (all `Client` handles
@@ -381,10 +415,17 @@ where
 /// Methods available on all `Client<M, R, I, C>` regardless of handle types.
 impl<MessageDefinitions, R, I, C> Client<MessageDefinitions, R, I, C>
 where
-    MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
+    MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + Send + 'static,
     R: E2ERegistryHandle,
     I: InterfaceHandle,
     C: ChannelFactory,
+    Result<(), Error>: OneshotPooled<C>,
+    Result<MessageDefinitions, Error>: OneshotPooled<C>,
+    Result<protocol::sd::RebootFlag, Error>: OneshotPooled<C>,
+    ControlMessage<MessageDefinitions, C>: BoundedPooled<C, 4>,
+    SendMessage<MessageDefinitions, C>: BoundedPooled<C, 16>,
+    Result<ReceivedMessage<MessageDefinitions>, Error>: BoundedPooled<C, 16>,
+    ClientUpdate<MessageDefinitions>: UnboundedPooled<C>,
 {
     /// Bare-metal-friendly constructor that takes every dependency
     /// explicitly via a [`ClientDeps`] bundle: a [`TransportFactory`], a
@@ -927,7 +968,8 @@ where
             loop {
                 timer.sleep(interval).await;
 
-                let (flag_rx, flag_msg) = ControlMessage::<MessageDefinitions, TokioChannels>::query_reboot_flag();
+                let (flag_rx, flag_msg) =
+                    ControlMessage::<MessageDefinitions, TokioChannels>::query_reboot_flag();
                 let Some(sender) = weak_sender.upgrade() else {
                     tracing::info!("Client shut down, stopping SD announcements");
                     break;
@@ -955,7 +997,8 @@ where
                 let mut header = sd_header.clone();
                 MessageDefinitions::set_reboot_flag(&mut header, reboot);
 
-                let (response, message) = ControlMessage::<MessageDefinitions, TokioChannels>::send_sd(target, header);
+                let (response, message) =
+                    ControlMessage::<MessageDefinitions, TokioChannels>::send_sd(target, header);
 
                 let Some(sender) = weak_sender.upgrade() else {
                     tracing::info!("Client shut down, stopping SD announcements");

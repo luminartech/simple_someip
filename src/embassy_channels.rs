@@ -36,15 +36,13 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 
 use crate::transport::{
-    ChannelFactory, MpscRecv, MpscSend, OneshotCancelled, OneshotRecv, OneshotSend, UnboundedRecv,
-    UnboundedSend,
+    BoundedPooled, ChannelFactory, MpscRecv, MpscSend, OneshotCancelled, OneshotPooled,
+    OneshotRecv, OneshotSend, UnboundedPooled, UnboundedRecv, UnboundedSend,
 };
 
 // ── Oneshot (capacity-1 Channel) ──────────────────────────────────────
 
-pub struct EmbassySyncOneshotSender<T: Send + 'static>(
-    Arc<Channel<CriticalSectionRawMutex, T, 1>>,
-);
+pub struct EmbassySyncOneshotSender<T: Send + 'static>(Arc<Channel<CriticalSectionRawMutex, T, 1>>);
 
 pub struct EmbassySyncOneshotReceiver<T: Send + 'static>(
     Arc<Channel<CriticalSectionRawMutex, T, 1>>,
@@ -97,10 +95,7 @@ impl<T: Send + 'static, const N: usize> MpscRecv<T> for EmbassySyncBoundedReceiv
         async move { Some(chan.receive().await) }
     }
 
-    fn poll_recv(
-        &mut self,
-        cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Option<T>> {
+    fn poll_recv(&mut self, cx: &mut core::task::Context<'_>) -> core::task::Poll<Option<T>> {
         use core::pin::Pin;
         // Try non-blocking receive first.
         if let Ok(val) = self.0.try_receive() {
@@ -165,34 +160,60 @@ pub struct EmbassySyncChannels;
 impl ChannelFactory for EmbassySyncChannels {
     type OneshotSender<T: Send + 'static> = EmbassySyncOneshotSender<T>;
     type OneshotReceiver<T: Send + 'static> = EmbassySyncOneshotReceiver<T>;
-    fn oneshot<T: Send + 'static>() -> (Self::OneshotSender<T>, Self::OneshotReceiver<T>) {
+
+    // Phase 13.6a: the const-N quirk is fixed. The `N` from the trait
+    // call site now propagates into the embassy `Channel<_, T, N>`
+    // storage, so callers asking for capacity 16 actually get 16, and
+    // callers asking for 4 actually get 4.
+    type BoundedSender<T: Send + 'static, const N: usize> = EmbassySyncBoundedSender<T, N>;
+    type BoundedReceiver<T: Send + 'static, const N: usize> = EmbassySyncBoundedReceiver<T, N>;
+
+    type UnboundedSender<T: Send + 'static> = EmbassySyncUnboundedSender<T>;
+    type UnboundedReceiver<T: Send + 'static> = EmbassySyncUnboundedReceiver<T>;
+
+    // The three constructor methods use the trait's default bodies,
+    // which delegate to the per-`T` `*Pooled<EmbassySyncChannels>`
+    // blanket impls below. Embassy-sync still allocates per call
+    // (`Arc<Channel<...>>`); the no-alloc story lives in
+    // `crate::static_channels` (phase 13.6c+) which publishes per-`T`
+    // `*Pooled` impls instead of a blanket.
+}
+
+// Blanket `*Pooled` impls. Embassy-sync still heap-allocates per call
+// (one `Arc<Channel<...>>` per pair); the goal of these blanket impls
+// is API parity with `TokioChannels`, not zero-alloc — that's the
+// `static_channels` job.
+impl<T: Send + 'static> OneshotPooled<EmbassySyncChannels> for T {
+    fn oneshot_pair() -> (
+        <EmbassySyncChannels as ChannelFactory>::OneshotSender<T>,
+        <EmbassySyncChannels as ChannelFactory>::OneshotReceiver<T>,
+    ) {
         let chan = Arc::new(Channel::new());
         (
             EmbassySyncOneshotSender(chan.clone()),
             EmbassySyncOneshotReceiver(chan),
         )
     }
+}
 
-    // Phase 13.6: the const-N quirk is fixed. The `N` from the trait
-    // call site now propagates into the embassy `Channel<_, T, N>`
-    // storage, so callers asking for capacity 16 actually get 16, and
-    // callers asking for 4 actually get 4. (Previously this impl
-    // hardcoded 16 regardless of the requested N.)
-    type BoundedSender<T: Send + 'static, const N: usize> = EmbassySyncBoundedSender<T, N>;
-    type BoundedReceiver<T: Send + 'static, const N: usize> = EmbassySyncBoundedReceiver<T, N>;
-    fn bounded<T: Send + 'static, const N: usize>(
-    ) -> (Self::BoundedSender<T, N>, Self::BoundedReceiver<T, N>) {
+impl<T: Send + 'static, const N: usize> BoundedPooled<EmbassySyncChannels, N> for T {
+    fn bounded_pair() -> (
+        <EmbassySyncChannels as ChannelFactory>::BoundedSender<T, N>,
+        <EmbassySyncChannels as ChannelFactory>::BoundedReceiver<T, N>,
+    ) {
         let chan: Arc<Channel<CriticalSectionRawMutex, T, N>> = Arc::new(Channel::new());
         (
             EmbassySyncBoundedSender(chan.clone()),
             EmbassySyncBoundedReceiver(chan),
         )
     }
+}
 
-    type UnboundedSender<T: Send + 'static> = EmbassySyncUnboundedSender<T>;
-    type UnboundedReceiver<T: Send + 'static> = EmbassySyncUnboundedReceiver<T>;
-    fn unbounded<T: Send + 'static>(
-    ) -> (Self::UnboundedSender<T>, Self::UnboundedReceiver<T>) {
+impl<T: Send + 'static> UnboundedPooled<EmbassySyncChannels> for T {
+    fn unbounded_pair() -> (
+        <EmbassySyncChannels as ChannelFactory>::UnboundedSender<T>,
+        <EmbassySyncChannels as ChannelFactory>::UnboundedReceiver<T>,
+    ) {
         let chan = Arc::new(Channel::new());
         (
             EmbassySyncUnboundedSender(chan.clone()),

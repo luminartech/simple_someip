@@ -177,7 +177,11 @@ impl Future for MockSendFut {
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         if let Some(bytes) = me.bytes.take() {
-            me.pipe.send_queue.lock().unwrap().push_back((bytes, me.target));
+            me.pipe
+                .send_queue
+                .lock()
+                .unwrap()
+                .push_back((bytes, me.target));
         }
         Poll::Ready(Ok(()))
     }
