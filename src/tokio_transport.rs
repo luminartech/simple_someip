@@ -6,14 +6,15 @@
 //! [`tokio::net::UdpSocket`] for the async I/O loop. [`TokioTimer`] is a
 //! thin wrapper over `tokio::time::sleep`.
 //!
-//! Gated behind `#[cfg(any(feature = "client", feature = "server"))]` —
-//! the `client` and `server` features are exactly the ones that already
-//! pull in `tokio` and `socket2`, so no new dependency edge is introduced.
+//! Gated behind `#[cfg(any(feature = "client-tokio", feature = "server-tokio"))]` —
+//! the `client-tokio` and `server-tokio` features are exactly the ones
+//! that pull in `tokio` and `socket2`, so no new dependency edge is
+//! introduced.
 //!
 //! # Example
 //!
 //! ```no_run
-//! # #[cfg(any(feature = "client", feature = "server"))]
+//! # #[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 //! # async fn demo() -> Result<(), simple_someip::TransportError> {
 //! use core::net::{Ipv4Addr, SocketAddrV4};
 //! use simple_someip::{SocketOptions, TransportFactory, TransportSocket};
