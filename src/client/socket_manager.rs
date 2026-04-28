@@ -282,12 +282,8 @@ where
 
     /// `!Send` counterpart to [`Self::bind_discovery_seeded_with_transport`].
     ///
-    /// See [`Self::bind_with_transport_local`] for the rationale.
-    ///
-    /// Currently a foundation API: no in-crate caller wires it through
-    /// to a `Client::new_with_deps_local`. Downstream embassy-style
-    /// integrations can compose it directly with [`LocalSpawner`].
-    #[allow(dead_code)]
+    /// Called by [`super::bind_dispatch::LocalSpawnerDispatch`] which is
+    /// wired through [`super::Client::new_with_deps_local`].
     pub async fn bind_discovery_seeded_with_transport_local<F, S, R>(
         factory: &F,
         spawner: &S,

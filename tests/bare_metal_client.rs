@@ -78,26 +78,7 @@ define_static_channels! {
 struct MockPipe {
     sent: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
     inbound: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
-    /// Waker registered by the most recent pending `MockRecvFut::poll`.
-    /// Woken by `deliver_inbound` (if any test pushes inbound traffic).
-    /// Default `None` is fine: tests that never inject inbound just
-    /// stay parked.
     inbound_waker: Mutex<Option<core::task::Waker>>,
-}
-
-#[allow(dead_code)]
-impl MockPipe {
-    /// Push a datagram to the inbound queue and wake any pending
-    /// `MockRecvFut`. Tests that drive ingress through the mock should
-    /// use this rather than locking the queue directly so the
-    /// receiver actually wakes.
-    fn deliver_inbound(&self, bytes: Vec<u8>, source: SocketAddrV4) {
-        self.inbound.lock().unwrap().push_back((bytes, source));
-        let waker = self.inbound_waker.lock().unwrap().take();
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -172,9 +153,8 @@ impl Future for MockRecvFut<'_> {
                 }))
             }
             None => {
-                // Park on the pipe's waker. Wake fires when a test
-                // calls `MockPipe::deliver_inbound`. Real bare-metal
-                // impls park the task on an interrupt-driven waker;
+                // Park on the pipe's waker. Real bare-metal impls park
+                // the task on an interrupt-driven waker;
                 // wake_by_ref-on-empty would CPU-peg the test runtime.
                 *me.pipe.inbound_waker.lock().unwrap() = Some(cx.waker().clone());
                 // Re-check after registering to close the lost-wakeup

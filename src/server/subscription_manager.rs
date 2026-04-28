@@ -481,4 +481,132 @@ mod tests {
         assert_eq!(manager.subscription_count(), EVENT_GROUPS_CAP);
         assert!(manager.get_subscribers(0x5B, 1, overflow_eg).is_empty());
     }
+
+    #[test]
+    fn unsubscribe_one_of_multiple_leaves_group_intact() {
+        let mut manager = SubscriptionManager::new();
+        let a1 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8001);
+        let a2 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 8002);
+
+        manager.subscribe(0x5B, 1, 0x01, a1).unwrap();
+        manager.subscribe(0x5B, 1, 0x01, a2).unwrap();
+        assert_eq!(manager.subscription_count(), 2);
+
+        // Remove just a1 — group must stay with a2 only.
+        manager.unsubscribe(0x5B, 1, 0x01, a1);
+        assert_eq!(manager.subscription_count(), 1);
+        let subs = manager.get_subscribers(0x5B, 1, 0x01);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].address, a2);
+    }
+
+    #[test]
+    fn unsubscribe_address_not_in_existing_group_is_noop() {
+        let mut manager = SubscriptionManager::new();
+        let a1 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8001);
+        let a2 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 8002);
+
+        manager.subscribe(0x5B, 1, 0x01, a1).unwrap();
+        // a2 was never subscribed — unsubscribe must not panic or affect a1.
+        manager.unsubscribe(0x5B, 1, 0x01, a2);
+        assert_eq!(manager.subscription_count(), 1);
+        assert_eq!(manager.get_subscribers(0x5B, 1, 0x01)[0].address, a1);
+    }
+
+    #[test]
+    fn get_subscribers_returns_all_in_group() {
+        let mut manager = SubscriptionManager::new();
+        let addrs: Vec<SocketAddrV4> = (0..4)
+            .map(|i| SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, i + 1), 8000 + u16::from(i)))
+            .collect();
+        for &a in &addrs {
+            manager.subscribe(0x5B, 1, 0x01, a).unwrap();
+        }
+        let subs = manager.get_subscribers(0x5B, 1, 0x01);
+        assert_eq!(subs.len(), 4);
+        for &a in &addrs {
+            assert!(subs.iter().any(|s| s.address == a));
+        }
+    }
+
+    #[test]
+    fn subscription_count_spans_multiple_event_groups() {
+        let mut manager = SubscriptionManager::new();
+        let a = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8000);
+        manager.subscribe(0x5B, 1, 0x01, a).unwrap();
+        manager.subscribe(0x5B, 1, 0x02, a).unwrap();
+        manager.subscribe(0x5C, 1, 0x01, a).unwrap();
+        assert_eq!(manager.subscription_count(), 3);
+    }
+
+    #[test]
+    fn subscribe_error_display() {
+        use std::string::ToString;
+        assert!(
+            SubscribeError::SubscribersPerGroupFull
+                .to_string()
+                .contains("subscribers-per-group"),
+        );
+        assert!(
+            SubscribeError::EventGroupsFull
+                .to_string()
+                .contains("event-group"),
+        );
+    }
+
+    #[cfg(feature = "server-tokio")]
+    mod tokio_handle {
+        use super::*;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        #[tokio::test]
+        async fn for_each_subscriber_visits_all() {
+            let handle: Arc<RwLock<SubscriptionManager>> =
+                Arc::new(RwLock::new(SubscriptionManager::new()));
+            let a1 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8001);
+            let a2 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 8002);
+
+            handle.subscribe(0x5B, 1, 0x01, a1).await.unwrap();
+            handle.subscribe(0x5B, 1, 0x01, a2).await.unwrap();
+
+            let mut visited = Vec::new();
+            let count = handle
+                .for_each_subscriber(0x5B, 1, 0x01, |s| visited.push(s.address))
+                .await;
+
+            assert_eq!(count, 2);
+            assert!(visited.contains(&a1));
+            assert!(visited.contains(&a2));
+        }
+
+        #[tokio::test]
+        async fn for_each_subscriber_empty_group_returns_zero() {
+            let handle: Arc<RwLock<SubscriptionManager>> =
+                Arc::new(RwLock::new(SubscriptionManager::new()));
+            let count = handle
+                .for_each_subscriber(0x5B, 1, 0x01, |_| {})
+                .await;
+            assert_eq!(count, 0);
+        }
+
+        #[tokio::test]
+        async fn for_each_subscriber_reflects_unsubscribe() {
+            let handle: Arc<RwLock<SubscriptionManager>> =
+                Arc::new(RwLock::new(SubscriptionManager::new()));
+            let a1 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8001);
+            let a2 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 8002);
+
+            handle.subscribe(0x5B, 1, 0x01, a1).await.unwrap();
+            handle.subscribe(0x5B, 1, 0x01, a2).await.unwrap();
+            handle.unsubscribe(0x5B, 1, 0x01, a1).await;
+
+            let mut visited = Vec::new();
+            let count = handle
+                .for_each_subscriber(0x5B, 1, 0x01, |s| visited.push(s.address))
+                .await;
+            assert_eq!(count, 1);
+            assert_eq!(visited, [a2]);
+        }
+    }
 }
