@@ -602,6 +602,33 @@ pub trait Timer {
 ///     }
 /// }
 /// ```
+/// Local-executor counterpart to [`Spawner`].
+///
+/// Where [`Spawner::spawn`] requires its future to be `Send + 'static`
+/// (matching multi-threaded executors like tokio), `LocalSpawner::spawn_local`
+/// drops the `Send` bound and is the trait that single-threaded
+/// executors — embassy with `task-arena = 0`, tokio's `LocalSet`, async-std
+/// `LocalExecutor`, etc. — implement directly.
+///
+/// The two traits are independent: an executor MAY implement both
+/// (current_thread tokio with `LocalSet`), only [`Spawner`]
+/// (multi-threaded tokio default), or only [`LocalSpawner`]
+/// (single-task embassy).
+///
+/// Use [`crate::client::Client::new_with_deps_local`] to construct a
+/// Client whose run-loop and per-socket loops are submitted through a
+/// `LocalSpawner` (and whose `TransportFactory::Socket` is therefore
+/// allowed to be `!Send`).
+pub trait LocalSpawner {
+    /// Submit `future` to the local executor. Must not block; must
+    /// arrange for the future to be polled to completion on some
+    /// single-threaded task.
+    ///
+    /// The future is **not** required to be `Send` — it may capture
+    /// `Rc`, `RefCell`, raw `*mut` pointers, etc.
+    fn spawn_local(&self, future: impl Future<Output = ()> + 'static);
+}
+
 pub trait Spawner {
     /// Submit `future` to the executor. Must not block; must arrange
     /// for the future to be polled to completion on some task.
