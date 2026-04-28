@@ -410,7 +410,9 @@ fn map_io_error(e: &std::io::Error) -> TransportError {
 
 /// [`ChannelFactory`] implementation backed by `tokio::sync::mpsc` and
 /// `tokio::sync::oneshot`. This is the default channel backend for `std +
-/// tokio` builds (active when the `client` or `server` feature is enabled).
+/// tokio` builds (active when the `client-tokio` or `server-tokio` feature
+/// is enabled — the bare `client` / `server` features supply the
+/// trait-surface only and require a caller-provided `ChannelFactory`).
 #[derive(Clone, Copy)]
 pub struct TokioChannels;
 

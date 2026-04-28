@@ -78,7 +78,7 @@ struct PanicAllocator;
 /// us off the panic-unwind path, whose machinery also allocates.
 fn diagnose_and_abort(kind: &str, size: usize, align_or_new: usize) -> ! {
     ARMED.store(false, Ordering::SeqCst);
-    eprintln!("no_alloc_witness: forbidden allocation ({kind}): {size} bytes / {align_or_new}",);
+    eprintln!("no_alloc_witness: forbidden allocation ({kind}): {size} bytes / {align_or_new}");
     process::abort();
 }
 
