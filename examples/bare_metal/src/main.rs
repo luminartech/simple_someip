@@ -1,160 +1,102 @@
-//! Host-side canary for the bare-metal trait surface.
+//! Host-side demonstration of [`Client::new_with_deps`] with a
+//! static-pool no-alloc [`ChannelFactory`].
 //!
-//! # What this example actually is
+//! # What this example shows
 //!
-//! A workspace-member binary that exercises `simple-someip`'s
-//! `TransportSocket` / `TransportFactory` / `Timer` traits against a
-//! hand-rolled mock backend. The `Cargo.toml` in this directory
-//! depends on `simple-someip` with
-//! `default-features = false, features = ["bare_metal"]`, so building
-//! or running this package in isolation proves **that the trait
-//! surface compiles under exactly the feature set a firmware consumer
-//! would use** — no `std`-feature paths from `simple-someip`, no
-//! tokio, no socket2.
+//! `simple-someip` is compiled with
+//! `default-features = false, features = ["client", "bare_metal"]` —
+//! no tokio, no socket2 pulled in by *the crate itself*. The example
+//! binary adds tokio only for its own executor and mock driver; real
+//! firmware would use `embassy_executor` (or any bare-metal async
+//! runtime) instead.
 //!
-//! Use `cargo build -p bare_metal` (or `cargo run -p bare_metal`) as
-//! the source of truth for that check; `cargo build --workspace` can
-//! unify features across workspace members and may therefore mask
-//! regressions in this minimal configuration. CI should run
-//! `cargo build -p bare_metal` (and `cargo clippy -p bare_metal`) as a
-//! dedicated step.
-//!
-//! # How to run
+//! Building or running this example in isolation proves that the
+//! bare-metal API compiles under exactly the feature set a firmware
+//! consumer would use:
 //!
 //! ```text
 //! cargo build -p bare_metal
-//! cargo run -p bare_metal
+//! cargo run  -p bare_metal
 //! ```
 //!
-//! # What this is NOT
+//! # Patterns demonstrated
 //!
-//! This is **not** a runtime `no_std` demonstration. The host-side
-//! mock uses `std::collections::VecDeque`, `std::sync::{Arc, Mutex}`,
-//! `std::time::Instant`, and `println!` — all of which an actual
-//! firmware build would replace with embedded equivalents
-//! (`heapless::Deque`, `spin::Mutex`, a platform clock, `defmt!` or
-//! similar). Using `std` in the *host-side driver code* is fine
-//! because the purpose of this example is to verify **the
-//! `simple-someip` crate itself** compiles with `default-features =
-//! false` and exposes a trait surface that embedded consumers can
-//! target. A true runtime-`no_std` example belongs with the phase
-//! 10+ bare-metal refactor, once `Client` / `Server` can consume a
-//! user-supplied transport and spawner without pulling in tokio.
+//! | Pattern | This example | Firmware replacement |
+//! |---------|-------------|----------------------|
+//! | Channel factory | `BareMetalChannels` via `define_static_channels!` | same macro, sized to your HWM |
+//! | Transport | `MockFactory` / `MockSocket` | `embassy_net`, smoltcp, custom Ethernet ISR |
+//! | Timer | `MockTimer` using `tokio::task::yield_now` | `embassy_time::Timer::after` |
+//! | Task spawner | `TokioBackedSpawner` | `embassy_executor::Spawner` |
+//! | Lock handles | `Arc<Mutex<_>>` / `Arc<RwLock<_>>` | stack-allocated handles (see below) |
 //!
-//! # Known gaps in the bare-metal story (independent of this example)
+//! # What is not yet demonstrated
 //!
-//! The example exercises the **trait layer** (`TransportSocket`,
-//! `TransportFactory`, `Timer`, `Spawner`, `ChannelFactory`) — and
-//! that is all. It does NOT demonstrate a `no_alloc` integration with
-//! `simple_someip::Client` / `simple_someip::Server`, because those
-//! are not yet `no_alloc`-compatible.
+//! The `E2ERegistry` and interface handles still use heap-allocated
+//! `Arc<Mutex<_>>` / `Arc<RwLock<_>>` wrappers. A future verification
+//! pass will replace these with stack-allocated alternatives and confirm
+//! zero heap allocation after `Client::new_with_deps` returns.
 //!
-//! **Completed abstractions:**
-//! - Phase 9: `Spawner` trait (task submission)
-//! - Phase 10: `E2ERegistryHandle` / `InterfaceHandle` (lock handles)
-//! - Phase 11: `ChannelFactory` trait with `TokioChannels` (std) and
-//!   `EmbassySyncChannels` (`bare_metal`) backends — replaces direct
-//!   `tokio::sync::mpsc` / `oneshot` usage
-//! - Phase 12: `TransportSocket` GATs — `SendFuture` / `RecvFuture`
-//!   express `Send` bounds without RTN; `Socket = TokioSocket` pin
-//!   removed from `bind_*` functions
-//! - Phase 13a: client-side feature-flag split. `client` no longer
-//!   pulls tokio + socket2; the tokio convenience defaults
-//!   (`Client::new`, `TokioSpawner`, etc.) live behind a new
-//!   `client-tokio` feature.
-//! - Phase 13.5: `Client` is now constructible without
-//!   `client-tokio`. `Inner` carries `F: TransportFactory` and
-//!   `T: Timer` generics, and the new
-//!   `Client::new_with_factory_spawner_timer_and_loopback`
-//!   constructor takes everything explicitly. Witness:
-//!   `tests/bare_metal_client.rs` (gated on `client + bare_metal`).
-//!   `service_registry` swapped its `HashMap` for `heapless::FnvIndexMap`.
-//!   `EmbassySyncChannels` extracted from `tokio_transport` to
-//!   `crate::embassy_channels` so it is reachable from no-tokio builds.
-//!
-//! - Phase 14a (server feature-flag detangle): `server` is now a
-//!   topology marker; `server-tokio` carries the working tokio-backed
-//!   server. The strategic-goal feature combo
-//!   `default-features = false, features = ["bare_metal", "client", "server"]`
-//!   now compiles, though the `server` half is empty until 14b
-//!   retargets the engine.
-//! - Phase 14b: `Server` is now constructible without
-//!   `server-tokio`. The engine carries `F: TransportFactory`,
-//!   `Tm: Timer`, `R: E2ERegistryHandle`, and `S: SubscriptionHandle`
-//!   generics, and the new `Server::new_with_deps` /
-//!   `Server::new_passive_with_deps` constructors take everything
-//!   explicitly via a `ServerDeps` bundle. The tokio convenience
-//!   constructors (`Server::new`, `Server::new_with_loopback`,
-//!   `Server::new_passive`) live behind the `server-tokio` feature
-//!   and delegate to `new_with_deps`. Witness:
-//!   `tests/bare_metal_server.rs` (gated on `server + bare_metal`).
-//!
-//! **Remaining gaps:**
-//! 1. **No-alloc Client/Server**: `Client` / `Server` engines still
-//!    depend on `alloc` (heapless internals are fine, but
-//!    `EmbassySyncChannels` uses `Arc`, and `e2e_registry` uses
-//!    `Arc<Mutex<_>>`). Phase 13.6 (static-pool ChannelFactory) is
-//!    the engine fix; phase 16 is the CI verification that lights up
-//!    an alloc-panicking harness.
-//!
-//! # Recommendation for `no_alloc` consumers today
-//!
-//! Do NOT route through `Client::new_with_factory_spawner_timer_and_loopback`
-//! on a strict `no_alloc` target — the run-loop still uses `Arc` for
-//! the embassy channel state. For now, depend on `simple-someip` with
-//! `default-features = false, features = ["bare_metal"]` and consume
-//! the already-portable layers directly:
-//!
-//! - `simple_someip::protocol` — wire format (headers, messages, SD
-//!   entries/options); zero-copy views for parsing.
-//! - `simple_someip::e2e` — CRC-32 / CRC-16 protection profiles; owned
-//!   per-payload, no `Arc<Mutex<_>>` required.
-//! - `simple_someip::transport` — the four traits exercised below.
-//!
-//! Then write a small SOME/IP orchestrator that owns its socket, a
-//! stack-allocated request-map (e.g.
-//! `heapless::FnvIndexMap<RequestId, _, N>`), and drives SD + r/r +
-//! event subscription using `futures::select!` over
-//! `TransportSocket::recv_from` / `Timer::sleep` directly. That is
-//! the shape the trait layer was designed for; the `Client` /
-//! `Server` types are a std+tokio convenience layer on top that
-//! happens not to suit `no_alloc` targets yet.
+//! [`Client::new_with_deps`]: simple_someip::Client::new_with_deps
+//! [`ChannelFactory`]: simple_someip::transport::ChannelFactory
 
 use core::future::Future;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::pin::Pin;
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 use core::time::Duration;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
+use simple_someip::client::Error as ClientError;
+use simple_someip::define_static_channels;
+use simple_someip::e2e::E2ERegistry;
+use simple_someip::protocol::sd::RebootFlag;
 use simple_someip::transport::{
-    IoErrorKind, ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory,
+    ReceivedDatagram, SocketOptions, Spawner, Timer, TransportError, TransportFactory,
     TransportSocket,
 };
+use simple_someip::{Client, ClientDeps, RawPayload};
 
-/// Shared in-memory pipe. A `MockFactory` built around one of these
-/// hands out sockets whose `send_to` pushes to `send_queue` and whose
-/// `recv_from` pops from `recv_queue`. Two factories swapped queue-
-/// ends give you a bidirectional pipe.
+// ── Static-pool channel factory ───────────────────────────────────────
+//
+// Pool sizes are sized to a modest single-service workload. Production
+// firmware should size each pool to the workload's high-water mark
+// (maximum concurrent in-flight requests / subscriptions).
+
+define_static_channels! {
+    name: BareMetalChannels,
+    oneshot: [
+        (Result<(), ClientError>, 8),
+        (Result<RawPayload, ClientError>, 4),
+        (Result<RebootFlag, ClientError>, 4),
+    ],
+    bounded: [
+        ((ControlMessage<RawPayload, BareMetalChannels>, 4), 1),
+        ((SendMessage<RawPayload, BareMetalChannels>, 16), 4),
+        ((Result<ReceivedMessage<RawPayload>, ClientError>, 16), 4),
+    ],
+    unbounded: [
+        (ClientUpdate<RawPayload>, 1),
+    ],
+}
+
+// ── Mock transport ────────────────────────────────────────────────────
+//
+// Two queues simulate the network. A real firmware transport drives
+// these from a network driver ISR instead of an in-process VecDeque.
+
 #[derive(Default)]
 struct MockPipe {
-    /// `(bytes, dest_addr)` pairs sent by the local socket.
-    send_queue: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
-    /// `(bytes, src_addr)` pairs the local socket will read next.
-    recv_queue: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
+    sent: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
+    inbound: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
 }
 
 #[derive(Clone)]
 struct MockFactory {
     pipe: Arc<MockPipe>,
-    local_addr: SocketAddrV4,
-}
-
-struct MockSocket {
-    pipe: Arc<MockPipe>,
-    local_addr: SocketAddrV4,
+    next_port: Arc<Mutex<u16>>,
 }
 
 impl TransportFactory for MockFactory {
@@ -162,20 +104,27 @@ impl TransportFactory for MockFactory {
 
     fn bind(
         &self,
-        _addr: SocketAddrV4,
+        addr: SocketAddrV4,
         _options: &SocketOptions,
-    ) -> impl Future<Output = Result<Self::Socket, TransportError>> {
+    ) -> impl Future<Output = Result<Self::Socket, TransportError>> + Send {
         let pipe = Arc::clone(&self.pipe);
-        let local_addr = self.local_addr;
-        core::future::ready(Ok(MockSocket { pipe, local_addr }))
+        let port = if addr.port() == 0 {
+            let mut p = self.next_port.lock().unwrap();
+            *p = p.saturating_add(1);
+            30000u16.saturating_add(*p)
+        } else {
+            addr.port()
+        };
+        let local = SocketAddrV4::new(*addr.ip(), port);
+        async move { Ok(MockSocket { pipe, local }) }
     }
 }
 
-/// Future returned by [`MockSocket::send_to`]. Defers the queue push
-/// to poll-time so the side effect happens when the future is awaited,
-/// not when `send_to` is called — matching what a real bare-metal
-/// `TransportSocket` impl would do (the network driver only sees the
-/// datagram when the executor polls the future).
+struct MockSocket {
+    pipe: Arc<MockPipe>,
+    local: SocketAddrV4,
+}
+
 struct MockSendFut {
     pipe: Arc<MockPipe>,
     bytes: Option<Vec<u8>>,
@@ -188,23 +137,12 @@ impl Future for MockSendFut {
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         if let Some(bytes) = me.bytes.take() {
-            me.pipe
-                .send_queue
-                .lock()
-                .unwrap()
-                .push_back((bytes, me.target));
+            me.pipe.sent.lock().unwrap().push_back((bytes, me.target));
         }
         Poll::Ready(Ok(()))
     }
 }
 
-/// Future returned by [`MockSocket::recv_from`]. Reads from the queue
-/// on poll. A production bare-metal impl would instead register the
-/// `Context`'s `Waker` on the network driver's RX-ready signal and
-/// return `Poll::Pending` when the queue is empty — see e.g.
-/// `embassy_net::UdpSocket` or smoltcp's socket polling model. This
-/// mock returns `Err(TimedOut)` on empty for simplicity; the demo
-/// always sends before recv-ing so the empty branch is unreachable.
 struct MockRecvFut<'a> {
     pipe: Arc<MockPipe>,
     buf: &'a mut [u8],
@@ -213,21 +151,26 @@ struct MockRecvFut<'a> {
 impl Future for MockRecvFut<'_> {
     type Output = Result<ReceivedDatagram, TransportError>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
-        let entry = me.pipe.recv_queue.lock().unwrap().pop_front();
-        Poll::Ready(match entry {
+        match me.pipe.inbound.lock().unwrap().pop_front() {
             Some((bytes, source)) => {
                 let n = bytes.len().min(me.buf.len());
                 me.buf[..n].copy_from_slice(&bytes[..n]);
-                Ok(ReceivedDatagram {
+                Poll::Ready(Ok(ReceivedDatagram {
                     bytes_received: n,
                     source,
                     truncated: n < bytes.len(),
-                })
+                }))
             }
-            None => Err(TransportError::Io(IoErrorKind::TimedOut)),
-        })
+            // No datagram — wake immediately and yield. A real bare-metal
+            // impl registers the waker on the network driver's RX-ready
+            // interrupt instead of busy-waking.
+            None => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
     }
 }
 
@@ -235,10 +178,7 @@ impl TransportSocket for MockSocket {
     type SendFuture<'a> = MockSendFut;
     type RecvFuture<'a> = MockRecvFut<'a>;
 
-    fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddrV4) -> Self::SendFuture<'a> {
-        // `buf` cannot be borrowed past this call (its lifetime is
-        // bounded by the borrow checker, not the future), so we copy
-        // here. The push to the shared queue is deferred to `poll`.
+    fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddrV4) -> MockSendFut {
         MockSendFut {
             pipe: Arc::clone(&self.pipe),
             bytes: Some(buf.to_vec()),
@@ -246,20 +186,15 @@ impl TransportSocket for MockSocket {
         }
     }
 
-    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
-        MockRecvFut {
-            pipe: Arc::clone(&self.pipe),
-            buf,
-        }
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> MockRecvFut<'a> {
+        MockRecvFut { pipe: Arc::clone(&self.pipe), buf }
     }
 
     fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
-        Ok(self.local_addr)
+        Ok(self.local)
     }
 
     fn join_multicast_v4(&self, _group: Ipv4Addr, _iface: Ipv4Addr) -> Result<(), TransportError> {
-        // Bare-metal stacks without multicast would return
-        // Unsupported; our mock is happy to no-op.
         Ok(())
     }
 
@@ -268,187 +203,87 @@ impl TransportSocket for MockSocket {
     }
 }
 
-/// Timer that sleeps by busy-waiting on a monotonic clock.
-///
-/// **ANTI-PATTERN — DO NOT USE IN PRODUCTION.** Busy-waiting burns a
-/// core and starves other tasks. A real bare-metal impl would park
-/// the task on its hardware timer ISR (e.g. `embassy_time::Timer::after`,
-/// or a custom `Future` that registers itself with the MCU's timer
-/// peripheral). The `Timer` trait signature is identical; only the
-/// body changes.
+// ── Mock Timer ────────────────────────────────────────────────────────
+//
+// Uses tokio's yield_now to keep the example executor happy. Real
+// firmware replaces this with e.g. `embassy_time::Timer::after(d).await`.
+
 struct MockTimer;
 
 impl Timer for MockTimer {
-    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
-        // ANTI-PATTERN: busy-wait. See struct docstring.
-        let deadline = std::time::Instant::now() + duration;
-        async move {
-            while std::time::Instant::now() < deadline {
-                std::hint::spin_loop();
-            }
-        }
+    async fn sleep(&self, _duration: Duration) {
+        tokio::task::yield_now().await;
     }
 }
 
-/// Phase 9 `Spawner` impl that demonstrates the *correct* contract:
-/// every submitted future is queued and later polled to completion.
-///
-/// Why a working impl rather than a one-line "drop the future" mock:
-/// the `Spawner` trait's docstring explicitly forbids dropping the
-/// future without polling, because `Client::send`'s internal oneshot
-/// round-trip needs the per-socket loop to make progress. A canary
-/// that violates the contract isn't validating the contract.
-///
-/// A real bare-metal `Spawner` wraps the executor's task-submission
-/// primitive — `embassy_executor::Spawner`, smoltcp's task pool, or a
-/// hand-rolled single-core polling loop. Here we keep submissions in
-/// an in-memory queue and the demo's `main()` drains it at the end via
-/// [`WorkingSpawner::drain`]. That mirrors the shape of a single-core
-/// cooperative executor closely enough to prove the trait surface
-/// works.
-struct WorkingSpawner {
-    queue: Mutex<Vec<Pin<Box<dyn Future<Output = ()> + Send>>>>,
-}
+// ── Spawner ───────────────────────────────────────────────────────────
+//
+// Wraps tokio::spawn for this example. Real firmware wraps
+// `embassy_executor::Spawner::spawn` or equivalent. The Spawner trait
+// contract requires submitted futures to be polled to completion —
+// never drop them without polling.
 
-impl WorkingSpawner {
-    fn new() -> Self {
-        Self {
-            queue: Mutex::new(Vec::new()),
-        }
-    }
+struct TokioBackedSpawner;
 
-    /// Block-on every queued future to completion, in submission order.
-    /// A real cooperative executor would interleave polls; the demo's
-    /// futures resolve on the first poll so order doesn't matter.
-    fn drain(&self) {
-        let queued = std::mem::take(&mut *self.queue.lock().unwrap());
-        for fut in queued {
-            block_on(fut);
-        }
-    }
-}
-
-impl simple_someip::transport::Spawner for WorkingSpawner {
+impl Spawner for TokioBackedSpawner {
     fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
-        self.queue.lock().unwrap().push(Box::pin(future));
+        drop(tokio::spawn(future));
     }
 }
 
-/// Single-step `block_on` for the demo.
-///
-/// **ANTI-PATTERN — DO NOT USE IN PRODUCTION.** `Waker::noop()` means
-/// no wake-up signal is ever registered; a future that yields
-/// `Pending` waiting on real I/O would never get polled again. The
-/// loop-and-`spin_loop()` fallback masks that by busy-spinning, which
-/// is worse than useless on bare metal. Production executors use
-/// proper `Waker` plumbing + a task queue driven by hardware
-/// interrupts; this helper exists only to drive the demo's
-/// synchronous mock futures (which resolve on the first poll).
-///
-/// For a real `no_alloc` `block_on`, see e.g. `embassy_executor::block_on`,
-/// the `cassette` crate, or roll your own around a hardware-timer-driven
-/// `Waker`. The `Future::poll` loop body below is the part that stays
-/// the same; only the `Waker` plumbing and yield strategy change.
-fn block_on<F: Future>(fut: F) -> F::Output {
-    let waker = Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    let mut fut = Box::pin(fut);
-    loop {
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            Poll::Pending => {
-                // ANTI-PATTERN: busy-spin. See fn docstring.
-                std::hint::spin_loop();
-            }
-        }
-    }
-}
+// ── Main ──────────────────────────────────────────────────────────────
 
-fn main() {
-    // Each socket owns its own pipe; the "network" is us manually
-    // moving bytes from A's send queue into B's recv queue below. For
-    // a single send/recv demo this is enough; a more realistic mock
-    // would wire the two queues into a cross-connected pair at bind
-    // time.
-    let pipe_a = Arc::new(MockPipe::default());
-    let pipe_b = Arc::new(MockPipe::default());
-
-    let factory_a = MockFactory {
-        pipe: Arc::clone(&pipe_a),
-        local_addr: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30500),
+#[tokio::main]
+async fn main() {
+    let pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        pipe: Arc::clone(&pipe),
+        next_port: Arc::new(Mutex::new(0)),
     };
-    let factory_b = MockFactory {
-        pipe: Arc::clone(&pipe_b),
-        local_addr: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 30500),
-    };
-    let options = SocketOptions::new();
 
-    let sock_a = block_on(factory_a.bind(factory_a.local_addr, &options)).expect("bind A");
-    let sock_b = block_on(factory_b.bind(factory_b.local_addr, &options)).expect("bind B");
+    // std Arc/Mutex/RwLock are sufficient here — they implement the
+    // E2ERegistryHandle / InterfaceHandle lock-handle traits and are
+    // gated by `feature = "std"`, not by `client-tokio`. A future
+    // no-alloc port replaces these with stack-allocated handles.
+    let e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let iface: Arc<std::sync::RwLock<Ipv4Addr>> =
+        Arc::new(std::sync::RwLock::new(Ipv4Addr::LOCALHOST));
 
-    let payload = b"hello bare-metal";
-    block_on(sock_a.send_to(payload, sock_b.local_addr().unwrap())).expect("send_to");
-
-    // DEMO-ONLY: hand-drain A's send queue into B's recv queue to
-    // simulate "the network carried the datagram." A real bare-metal
-    // integration would have its network driver (lwIP, smoltcp, a
-    // custom Ethernet ISR, etc.) write directly into the receiving
-    // socket's recv buffer — no user code touches the queues. This
-    // drain pattern is not a template; it exists to keep the example
-    // self-contained.
-    let sent = std::mem::take(&mut *pipe_a.send_queue.lock().unwrap());
-    for (bytes, _dst) in sent {
-        pipe_b
-            .recv_queue
-            .lock()
-            .unwrap()
-            .push_back((bytes, sock_a.local_addr().unwrap()));
-    }
-
-    let mut buf = [0u8; 64];
-    let datagram = block_on(sock_b.recv_from(&mut buf)).expect("recv_from");
-
-    assert_eq!(datagram.bytes_received, payload.len());
-    assert_eq!(datagram.source, sock_a.local_addr().unwrap());
-    assert!(!datagram.truncated);
-    assert_eq!(&buf[..datagram.bytes_received], payload);
-
-    // Demonstrate the Timer trait briefly.
-    let timer = MockTimer;
-    block_on(timer.sleep(Duration::from_millis(1)));
-
-    // Demonstrate the Spawner trait by submitting a future and then
-    // draining the queue (proving the future was actually polled). A
-    // real bare-metal Spawner would dispatch into its executor's task
-    // pool and the executor would drain it on its own schedule.
-    let spawner = WorkingSpawner::new();
-    let polled = Arc::new(Mutex::new(false));
-    let polled_for_task = Arc::clone(&polled);
-    simple_someip::transport::Spawner::spawn(&spawner, async move {
-        *polled_for_task.lock().unwrap() = true;
-    });
-    spawner.drain();
-    assert!(
-        *polled.lock().unwrap(),
-        "WorkingSpawner must poll submitted futures to completion (Spawner trait contract)",
+    let (client, _updates, run_fut) = Client::<
+        RawPayload,
+        Arc<Mutex<E2ERegistry>>,
+        Arc<std::sync::RwLock<Ipv4Addr>>,
+        BareMetalChannels,
+    >::new_with_deps(
+        ClientDeps {
+            factory,
+            spawner: TokioBackedSpawner,
+            timer: MockTimer,
+            e2e_registry: e2e,
+            interface: iface,
+        },
+        false, // multicast_loopback
     );
+    // `_updates` is a `ClientUpdates` receiver. In production, poll it
+    // for `ClientUpdate` events: discovery changes, unicast replies,
+    // reboot notifications, and errors.
+
+    // The run future is Send + 'static, so it can be handed to any
+    // executor — tokio here, embassy_executor on real firmware.
+    let run_handle = tokio::spawn(run_fut);
+
+    // Client is live. Sanity-check the interface address.
+    assert_eq!(client.interface(), Ipv4Addr::LOCALHOST);
+
+    // Tear down: drop client first (closes the control channel), then
+    // abort and await cancellation.
+    drop(client);
+    run_handle.abort();
+    let _ = run_handle.await;
 
     println!(
-        "bare-metal example: sent {} bytes from {} to {}, received cleanly.",
-        datagram.bytes_received,
-        sock_a.local_addr().unwrap(),
-        sock_b.local_addr().unwrap(),
-    );
-    println!(
-        "note: trait layer (TransportSocket + TransportFactory + Timer + \
-         Spawner + ChannelFactory) exercised end-to-end. Phases 9-12 \
-         complete; phases 13a + 13.5 (client + Client engine generic) \
-         complete; phase 14a (server feature topology) complete; \
-         phase 14b (Server engine generic over TransportFactory + \
-         Timer + E2ERegistryHandle + SubscriptionHandle, reachable \
-         via Server::new_with_deps under just `server`) complete — see \
-         tests/bare_metal_server.rs for the witness. Remaining: \
-         phase 13.6 static-pool ChannelFactory + phase 16 no-alloc \
-         CI verification. See top-of-file docblock."
+        "bare-metal example: Client::new_with_deps with BareMetalChannels (define_static_channels!) \
+         compiled and ran successfully under features=[client, bare_metal] — \
+         no tokio / socket2 from simple-someip itself."
     );
 }
