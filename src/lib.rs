@@ -29,7 +29,8 @@
 //! | `std` | yes | Enables std-dependent helpers (`RawPayload`, `VecSdHeader`, `OfferedEndpoint`) |
 //! | `client` | no | Trait-surface client; implies `std` + futures (no tokio) |
 //! | `client-tokio` | no | Adds the `Client::new` / `TokioSpawner` / `TokioTransport` convenience defaults; implies `client` + tokio + socket2 |
-//! | `server` | no | Async tokio server; implies `std` + tokio + socket2 + futures (server-tokio split deferred to phase 14) |
+//! | `server` | no | Trait-surface server; implies `std` + futures (no tokio) |
+//! | `server-tokio` | no | Adds the `Server::new` / `TokioTransport` / `TokioTimer` convenience defaults; implies `server` + tokio + socket2 |
 //! | `bare_metal` | no | Pure marker — does not enable any crate code. See `examples/bare_metal/` (the trait-surface canary) for the full bare-metal-readiness story. |
 //!
 //! The default feature set is `["std"]`, which links `std` and enables
@@ -151,14 +152,22 @@ pub mod protocol;
 #[cfg(feature = "std")]
 mod raw_payload;
 /// SOME/IP server for offering services and handling incoming requests.
+///
+/// Phase 14b: the engine is generic over [`transport::TransportFactory`] +
+/// [`transport::Timer`] + [`transport::E2ERegistryHandle`] +
+/// [`server::SubscriptionHandle`], so the bare `server` feature exposes the
+/// trait-surface server. The `server-tokio` feature additionally provides
+/// the tokio convenience constructors ([`server::Server::new`],
+/// [`server::Server::new_with_loopback`], [`server::Server::new_passive`])
+/// that default the type parameters to
+/// `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>` /
+/// `TokioTransport` / `TokioTimer`.
 #[cfg(feature = "server")]
 pub mod server;
 /// Tokio + `socket2` implementation of the [`transport`] traits. Provided
 /// as the default `std` backend — available whenever `client-tokio` or
-/// `server` is enabled. (Phase 13: `client` is now no-tokio; the tokio
-/// backend lives behind `client-tokio`. `server` still pulls tokio
-/// transitively until phase 14 retargets it to the trait surface.)
-#[cfg(any(feature = "client-tokio", feature = "server"))]
+/// `server-tokio` is enabled.
+#[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 pub mod tokio_transport;
 
 /// `embassy-sync`-backed implementation of [`transport::ChannelFactory`].
@@ -176,9 +185,9 @@ mod traits;
 /// Executor-agnostic UDP transport abstraction used by the client and
 /// server modules. `no_std`-compatible; a default `std + tokio` backend
 /// ships in `tokio_transport` (available under the `client-tokio` /
-/// `server` features) — the link is rendered as a code literal because
-/// the target module is feature-gated and would break default-feature
-/// rustdoc builds.
+/// `server-tokio` features) — the link is rendered as a code literal
+/// because the target module is feature-gated and would break
+/// default-feature rustdoc builds.
 pub mod transport;
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
@@ -192,10 +201,8 @@ pub use client::{
 };
 pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
-pub use server::Server;
-#[cfg(feature = "server")]
-pub use server::SubscriptionHandle;
-#[cfg(any(feature = "client-tokio", feature = "server"))]
+pub use server::{Server, ServerDeps, SubscriptionHandle};
+#[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
 pub use transport::{
     ChannelFactory, E2ERegistryHandle, InterfaceHandle, IoErrorKind, MpscRecv, MpscSend,

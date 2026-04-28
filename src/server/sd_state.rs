@@ -12,11 +12,11 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::{net::SocketAddrV4, vec::Vec};
-use tokio::net::UdpSocket;
 
 use crate::protocol::sd::{
     self, Entry, Flags, OptionsCount, RebootFlag, ServiceEntry, TransportProtocol,
 };
+use crate::transport::TransportSocket;
 
 use super::{Error, ServerConfig};
 
@@ -123,10 +123,10 @@ impl SdStateManager {
     }
 
     /// Send a multicast `OfferService` announcement for the given config.
-    pub(super) async fn send_offer_service(
+    pub(super) async fn send_offer_service<T: TransportSocket>(
         &self,
         config: &ServerConfig,
-        socket: &UdpSocket,
+        socket: &T,
     ) -> Result<(), Error> {
         use crate::protocol::Header as SomeIpHeader;
         use crate::traits::WireFormat;
@@ -187,12 +187,14 @@ impl SdStateManager {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server-tokio"))]
 mod tests {
     use super::{SdStateManager, ServerConfig};
     use crate::protocol::sd::{self, EntryType, Flags, RebootFlag, TransportProtocol};
     use crate::protocol::{MessageType, MessageView, ReturnCode};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use crate::tokio_transport::TokioSocket;
+    use crate::transport::{SocketOptions, TransportFactory};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::time::Duration;
     use tokio::net::UdpSocket;
 
@@ -326,23 +328,22 @@ mod tests {
         UdpSocket::from_std(raw.into())
     }
 
-    /// Bind a sender socket on an ephemeral port with `multicast_if` pinned
-    /// to the loopback interface so emitted packets loop back to any
-    /// receiver joined to the same group on that interface.
-    fn build_mcast_sender(interface: Ipv4Addr) -> std::io::Result<UdpSocket> {
-        let raw = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )?;
-        raw.set_reuse_address(true)?;
-        #[cfg(unix)]
-        raw.set_reuse_port(true)?;
-        raw.set_multicast_loop_v4(true)?;
-        raw.set_multicast_if_v4(&interface)?;
-        raw.bind(&SocketAddr::new(IpAddr::V4(interface), 0).into())?;
-        raw.set_nonblocking(true)?;
-        UdpSocket::from_std(raw.into())
+    /// Bind a sender [`TokioSocket`] on an ephemeral port with
+    /// `multicast_if` pinned to the loopback interface so emitted
+    /// packets loop back to any receiver joined to the same group on
+    /// that interface. Uses the [`TransportFactory`] surface so the
+    /// resulting socket implements [`crate::transport::TransportSocket`]
+    /// — which is what the now-generic
+    /// [`SdStateManager::send_offer_service`] requires.
+    async fn build_mcast_sender(interface: Ipv4Addr) -> Result<TokioSocket, crate::transport::TransportError> {
+        let mut opts = SocketOptions::new();
+        opts.reuse_address = true;
+        opts.reuse_port = true;
+        opts.multicast_if_v4 = Some(interface);
+        opts.multicast_loop_v4 = true;
+        crate::tokio_transport::TokioTransport
+            .bind(SocketAddrV4::new(interface, 0), &opts)
+            .await
     }
 
     /// Fields extracted from a received SOME/IP-SD `OfferService` packet.
@@ -477,12 +478,12 @@ mod tests {
     }
 
     /// Standard loopback receiver/sender pair used by the send-path tests.
-    fn mcast_rx_tx() -> (UdpSocket, UdpSocket) {
+    async fn mcast_rx_tx() -> (UdpSocket, TokioSocket) {
         let interface = Ipv4Addr::LOCALHOST;
         let rx = build_mcast_receiver(interface).expect("bind receiver");
         rx.join_multicast_v4(sd::MULTICAST_IP, interface)
             .expect("join SD multicast group");
-        let tx = build_mcast_sender(interface).expect("bind sender");
+        let tx = build_mcast_sender(interface).await.expect("bind sender");
         (rx, tx)
     }
 
@@ -497,7 +498,7 @@ mod tests {
             TEST_SERVICE_ID,
             TEST_INSTANCE_ID,
         );
-        let (rx, tx) = mcast_rx_tx();
+        let (rx, tx) = mcast_rx_tx().await;
 
         // Seed with a recognisable value so on-wire session_id is exact.
         let sd_state = SdStateManager::with_initial(0x1233);
@@ -527,7 +528,7 @@ mod tests {
             TEST_SERVICE_ID,
             TEST_INSTANCE_ID,
         );
-        let (rx, tx) = mcast_rx_tx();
+        let (rx, tx) = mcast_rx_tx().await;
 
         let sd_state = SdStateManager::with_initial(0x1233);
         sd_state.send_offer_service(&config, &tx).await.unwrap();
@@ -553,7 +554,7 @@ mod tests {
             TEST_SERVICE_ID,
             TEST_INSTANCE_ID,
         );
-        let (rx, tx) = mcast_rx_tx();
+        let (rx, tx) = mcast_rx_tx().await;
 
         let sd_state = SdStateManager::with_initial(0xFFFE);
         sd_state.send_offer_service(&config, &tx).await.unwrap();
@@ -598,7 +599,7 @@ mod tests {
             TEST_INSTANCE_ID,
         );
         config.ttl = 0;
-        let (rx, tx) = mcast_rx_tx();
+        let (rx, tx) = mcast_rx_tx().await;
 
         let sd_state = SdStateManager::with_initial(0x1233);
         sd_state.send_offer_service(&config, &tx).await.unwrap();

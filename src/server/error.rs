@@ -14,6 +14,10 @@ pub enum Error {
     /// An I/O error from the underlying network transport.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// A transport-layer error from a [`crate::transport::TransportFactory`]
+    /// or [`crate::transport::TransportSocket`] operation.
+    #[error("transport error: {0}")]
+    Transport(#[from] crate::transport::TransportError),
     /// An E2E protection or checking error occurred.
     #[error(transparent)]
     E2e(#[from] crate::e2e::Error),

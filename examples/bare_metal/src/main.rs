@@ -72,19 +72,30 @@
 //!   `EmbassySyncChannels` extracted from `tokio_transport` to
 //!   `crate::embassy_channels` so it is reachable from no-tokio builds.
 //!
+//! - Phase 14a (server feature-flag detangle): `server` is now a
+//!   topology marker; `server-tokio` carries the working tokio-backed
+//!   server. The strategic-goal feature combo
+//!   `default-features = false, features = ["bare_metal", "client", "server"]`
+//!   now compiles, though the `server` half is empty until 14b
+//!   retargets the engine.
+//! - Phase 14b: `Server` is now constructible without
+//!   `server-tokio`. The engine carries `F: TransportFactory`,
+//!   `Tm: Timer`, `R: E2ERegistryHandle`, and `S: SubscriptionHandle`
+//!   generics, and the new `Server::new_with_deps` /
+//!   `Server::new_passive_with_deps` constructors take everything
+//!   explicitly via a `ServerDeps` bundle. The tokio convenience
+//!   constructors (`Server::new`, `Server::new_with_loopback`,
+//!   `Server::new_passive`) live behind the `server-tokio` feature
+//!   and delegate to `new_with_deps`. Witness:
+//!   `tests/bare_metal_server.rs` (gated on `server + bare_metal`).
+//!
 //! **Remaining gaps:**
-//! 1. **Server-side feature-flag split** (deferred to Phase 14):
-//!    `feature = "server"` still pulls in tokio + socket2 because
-//!    `server::sd_state` and `server::subscription_manager` reference
-//!    `tokio::net::UdpSocket` / `tokio::sync::RwLock` /
-//!    `socket2::Socket` directly. Phase 14 retargets the server to
-//!    the trait surface; once that lands, `server` will gain the same
-//!    `server` + `server-tokio` split.
-//! 2. **No-alloc Client**: `Client` / `Inner` still depend on
-//!    `alloc` (heapless internals are fine, but `EmbassySyncChannels`
-//!    uses `Arc`, and `e2e_registry` uses `Arc<Mutex<_>>`). Phase 16
-//!    is the verification phase that lights up an alloc-panicking
-//!    harness; the no-alloc port itself is its own follow-on phase.
+//! 1. **No-alloc Client/Server**: `Client` / `Server` engines still
+//!    depend on `alloc` (heapless internals are fine, but
+//!    `EmbassySyncChannels` uses `Arc`, and `e2e_registry` uses
+//!    `Arc<Mutex<_>>`). Phase 13.6 (static-pool ChannelFactory) is
+//!    the engine fix; phase 16 is the CI verification that lights up
+//!    an alloc-panicking harness.
 //!
 //! # Recommendation for `no_alloc` consumers today
 //!
@@ -432,8 +443,12 @@ fn main() {
         "note: trait layer (TransportSocket + TransportFactory + Timer + \
          Spawner + ChannelFactory) exercised end-to-end. Phases 9-12 \
          complete; phases 13a + 13.5 (client + Client engine generic) \
-         complete. Remaining: phase 14 server-trait retargeting + \
-         server-side `server-tokio` split, then phase 16 no-alloc \
-         verification. See top-of-file docblock."
+         complete; phase 14a (server feature topology) complete; \
+         phase 14b (Server engine generic over TransportFactory + \
+         Timer + E2ERegistryHandle + SubscriptionHandle, reachable \
+         via Server::new_with_deps under just `server`) complete — see \
+         tests/bare_metal_server.rs for the witness. Remaining: \
+         phase 13.6 static-pool ChannelFactory + phase 16 no-alloc \
+         CI verification. See top-of-file docblock."
     );
 }

@@ -6,14 +6,15 @@
 //! [`tokio::net::UdpSocket`] for the async I/O loop. [`TokioTimer`] is a
 //! thin wrapper over `tokio::time::sleep`.
 //!
-//! Gated behind `#[cfg(any(feature = "client", feature = "server"))]` —
-//! the `client` and `server` features are exactly the ones that already
-//! pull in `tokio` and `socket2`, so no new dependency edge is introduced.
+//! Gated behind `#[cfg(any(feature = "client-tokio", feature = "server-tokio"))]` —
+//! the `client-tokio` and `server-tokio` features are exactly the ones
+//! that pull in `tokio` and `socket2`, so no new dependency edge is
+//! introduced.
 //!
 //! # Example
 //!
 //! ```no_run
-//! # #[cfg(any(feature = "client", feature = "server"))]
+//! # #[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 //! # async fn demo() -> Result<(), simple_someip::TransportError> {
 //! use core::net::{Ipv4Addr, SocketAddrV4};
 //! use simple_someip::{SocketOptions, TransportFactory, TransportSocket};
@@ -265,7 +266,15 @@ fn bind_with_options(addr: SocketAddrV4, options: SocketOptions) -> std::io::Res
     if let Some(iface) = options.multicast_if_v4 {
         raw.set_multicast_if_v4(&iface)?;
     }
-    raw.set_multicast_loop_v4(options.multicast_loop_v4)?;
+    // Only set the multicast-loop flag when the caller is doing
+    // multicast (i.e. they configured a multicast interface). Calling
+    // `set_multicast_loop_v4` on a plain-unicast socket on some
+    // backends can return EOPNOTSUPP / EINVAL; even on Linux where it
+    // succeeds, it's a meaningless syscall. Mirrors the behavior of
+    // the `client::SocketManager` discovery-bind path.
+    if options.multicast_if_v4.is_some() {
+        raw.set_multicast_loop_v4(options.multicast_loop_v4)?;
+    }
     let bind_addr = SocketAddr::new(IpAddr::V4(*addr.ip()), addr.port());
     raw.bind(&bind_addr.into())?;
     raw.set_nonblocking(true)?;
@@ -539,13 +548,18 @@ mod tests {
 
     #[tokio::test]
     async fn multicast_loop_v4_option_propagates_in_both_directions() {
-        // Guards against a regression where `multicast_loop_v4: false` was
-        // silently ignored and the socket kept the OS default (often
-        // loopback ENABLED), diverging from the explicit request.
+        // Guards against a regression where `multicast_loop_v4` was
+        // silently ignored on a multicast bind and the socket kept the
+        // OS default, diverging from the explicit request. Phase 14b:
+        // `bind_with_options` only applies `set_multicast_loop_v4` when
+        // `multicast_if_v4` is `Some` (a plain-unicast bind has no
+        // meaningful multicast-loop setting), so this test always pairs
+        // the loop flag with a multicast interface.
         let factory = TokioTransport;
 
         let opts_off = SocketOptions {
             multicast_loop_v4: false,
+            multicast_if_v4: Some(Ipv4Addr::LOCALHOST),
             ..SocketOptions::default()
         };
         let sock_off = factory
@@ -559,6 +573,7 @@ mod tests {
 
         let opts_on = SocketOptions {
             multicast_loop_v4: true,
+            multicast_if_v4: Some(Ipv4Addr::LOCALHOST),
             ..SocketOptions::default()
         };
         let sock_on = factory
