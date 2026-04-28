@@ -116,11 +116,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig {
         interface,
         local_port: MY_SERVER_PORT,
-        service_id: MY_SERVER_SERVICE_ID,
-        instance_id: MY_SERVER_INSTANCE_ID,
         major_version: 1,
         minor_version: 0,
         ttl: 3,
+        ..ServerConfig::new(
+            interface,
+            MY_SERVER_PORT,
+            MY_SERVER_SERVICE_ID,
+            MY_SERVER_INSTANCE_ID,
+        )
     };
 
     let mut server = Server::new(config).await?;
