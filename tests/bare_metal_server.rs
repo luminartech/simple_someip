@@ -48,16 +48,6 @@ struct MockPipe {
     inbound_waker: Mutex<Option<core::task::Waker>>,
 }
 
-#[allow(dead_code)]
-impl MockPipe {
-    fn deliver_inbound(&self, bytes: Vec<u8>, source: SocketAddrV4) {
-        self.inbound.lock().unwrap().push_back((bytes, source));
-        let waker = self.inbound_waker.lock().unwrap().take();
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-}
 
 #[derive(Clone)]
 struct MockFactory {
@@ -131,10 +121,9 @@ impl Future for MockRecvFut<'_> {
                 }))
             }
             None => {
-                // Park on the pipe's waker (woken by `deliver_inbound`).
-                // Real bare-metal impls park the task on an
-                // interrupt-driven waker; wake_by_ref-on-empty would
-                // CPU-peg the test runtime.
+                // Park on the pipe's waker. Real bare-metal impls park
+                // the task on an interrupt-driven waker;
+                // wake_by_ref-on-empty would CPU-peg the test runtime.
                 *me.pipe.inbound_waker.lock().unwrap() = Some(cx.waker().clone());
                 if let Some((bytes, source)) = me.pipe.inbound.lock().unwrap().pop_front() {
                     let n = bytes.len().min(me.buf.len());

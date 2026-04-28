@@ -101,4 +101,36 @@ mod tests {
         assert_eq!(displayed, inner);
         assert_eq!(displayed, "address in use");
     }
+
+    #[test]
+    fn capacity_variant_includes_tag_in_display() {
+        let err = Error::Capacity("request_queue");
+        let displayed = format!("{err}");
+        assert!(
+            displayed.contains("request_queue"),
+            "Capacity display must include the tag: {displayed:?}"
+        );
+    }
+
+    #[test]
+    fn shutdown_variant_display() {
+        let err = Error::Shutdown;
+        let displayed = format!("{err}");
+        assert!(
+            !displayed.is_empty(),
+            "Shutdown must have a non-empty display message"
+        );
+    }
+
+    #[test]
+    fn simple_variants_display_without_panicking() {
+        for err in [
+            Error::SocketClosedUnexpectedly,
+            Error::UnicastSocketNotBound,
+            Error::ServiceNotFound,
+            Error::Shutdown,
+        ] {
+            let _ = format!("{err}");
+        }
+    }
 }

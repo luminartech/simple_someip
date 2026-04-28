@@ -556,4 +556,115 @@ mod tests {
             other => panic!("expected Ready(Err) after receiver drop, got {other:?}"),
         }
     }
+
+    #[test]
+    fn bounded_send_recv_happy_path() {
+        let (tx, mut rx) = <u32 as BoundedPooled<EmbassySyncChannels, 4>>::bounded_pair();
+        {
+            let mut fut = pin!(tx.send(42));
+            assert!(matches!(poll_once(&mut fut), Poll::Ready(Ok(()))));
+        }
+        let mut recv_fut = pin!(rx.recv());
+        match poll_once(&mut recv_fut) {
+            Poll::Ready(Some(42)) => {}
+            other => panic!("expected Ready(Some(42)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_recv_returns_value_and_pending() {
+        let (tx, mut rx) = <u32 as BoundedPooled<EmbassySyncChannels, 4>>::bounded_pair();
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        // Nothing queued yet — must be Pending.
+        assert!(matches!(rx.poll_recv(&mut cx), Poll::Pending));
+
+        // Send a value; next poll_recv must return it.
+        let mut send_fut = pin!(tx.send(7));
+        assert!(matches!(poll_once(&mut send_fut), Poll::Ready(Ok(()))));
+        assert!(matches!(rx.poll_recv(&mut cx), Poll::Ready(Some(7))));
+    }
+
+    #[test]
+    fn bounded_multi_sender_clone_partial_drop_keeps_channel_open() {
+        let (tx1, mut rx) = <u32 as BoundedPooled<EmbassySyncChannels, 4>>::bounded_pair();
+        let tx2 = tx1.clone();
+
+        // Drop the first sender — channel must still be open (tx2 is alive).
+        drop(tx1);
+        {
+            let mut recv_fut = pin!(rx.recv());
+            assert!(
+                matches!(poll_once(&mut recv_fut), Poll::Pending),
+                "channel must remain open while tx2 is alive"
+            );
+        }
+
+        // Send via the surviving sender and receive successfully.
+        {
+            let mut fut = pin!(tx2.send(99));
+            assert!(matches!(poll_once(&mut fut), Poll::Ready(Ok(()))));
+        }
+        let mut recv_fut2 = pin!(rx.recv());
+        assert!(matches!(poll_once(&mut recv_fut2), Poll::Ready(Some(99))));
+    }
+
+    #[test]
+    fn bounded_recv_drains_queued_items_before_returning_none_on_sender_close() {
+        // Items already in the queue when the last sender drops must be
+        // drained before recv() resolves to None — exercising the
+        // closed-but-items-remain branch in mpsc_poll_recv.
+        let (tx, mut rx) = <u32 as BoundedPooled<EmbassySyncChannels, 4>>::bounded_pair();
+        {
+            let mut f1 = pin!(tx.send(1));
+            let mut f2 = pin!(tx.send(2));
+            assert!(matches!(poll_once(&mut f1), Poll::Ready(Ok(()))));
+            assert!(matches!(poll_once(&mut f2), Poll::Ready(Ok(()))));
+        }
+        drop(tx);
+
+        // First item.
+        {
+            let mut r = pin!(rx.recv());
+            assert!(matches!(poll_once(&mut r), Poll::Ready(Some(1))));
+        }
+        // Second item.
+        {
+            let mut r = pin!(rx.recv());
+            assert!(matches!(poll_once(&mut r), Poll::Ready(Some(2))));
+        }
+        // Queue empty and channel closed — must resolve to None.
+        let mut r = pin!(rx.recv());
+        assert!(matches!(poll_once(&mut r), Poll::Ready(None)));
+    }
+
+    #[test]
+    fn unbounded_send_recv_happy_path() {
+        let (tx, mut rx) = <u32 as UnboundedPooled<EmbassySyncChannels>>::unbounded_pair();
+        assert!(tx.send_now(123).is_ok());
+        let mut recv_fut = pin!(rx.recv());
+        match poll_once(&mut recv_fut) {
+            Poll::Ready(Some(123)) => {}
+            other => panic!("expected Ready(Some(123)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unbounded_recv_returns_none_when_last_sender_drops() {
+        let (tx1, mut rx) = <u32 as UnboundedPooled<EmbassySyncChannels>>::unbounded_pair();
+        let tx2 = tx1.clone();
+
+        // Drop one sender — channel must stay open.
+        drop(tx1);
+        {
+            let mut fut = pin!(rx.recv());
+            assert!(matches!(poll_once(&mut fut), Poll::Pending));
+        }
+
+        // Drop last sender — recv must resolve to None.
+        drop(tx2);
+        let mut fut = pin!(rx.recv());
+        assert!(matches!(poll_once(&mut fut), Poll::Ready(None)));
+    }
 }

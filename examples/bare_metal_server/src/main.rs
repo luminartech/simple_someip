@@ -66,16 +66,6 @@ struct MockPipe {
     inbound_waker: Mutex<Option<core::task::Waker>>,
 }
 
-#[allow(dead_code)]
-impl MockPipe {
-    fn deliver_inbound(&self, bytes: Vec<u8>, source: SocketAddrV4) {
-        self.inbound.lock().unwrap().push_back((bytes, source));
-        let waker = self.inbound_waker.lock().unwrap().take();
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-}
 
 #[derive(Clone)]
 struct MockFactory {
@@ -149,9 +139,8 @@ impl Future for MockRecvFut<'_> {
                 }))
             }
             // No datagram — register the waker on the pipe and park.
-            // `MockPipe::deliver_inbound` wakes us when a test drives
-            // ingress traffic. A real bare-metal impl registers the
-            // waker on the network driver's RX-ready interrupt instead.
+            // A real bare-metal impl registers the waker on the network
+            // driver's RX-ready interrupt instead.
             None => {
                 *me.pipe.inbound_waker.lock().unwrap() = Some(cx.waker().clone());
                 if let Some((bytes, source)) = me.pipe.inbound.lock().unwrap().pop_front() {
