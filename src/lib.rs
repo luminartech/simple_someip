@@ -19,19 +19,32 @@
 //! | [`protocol`] | Yes | Wire format: headers, messages, message types, return codes, and service discovery (SD) entries/options |
 //! | [`e2e`] | Yes | End-to-End protection — Profile 4 (CRC-32) and Profile 5 (CRC-16) |
 //! | [`WireFormat`] / [`PayloadWireFormat`] | Yes | Traits for serializing messages and defining custom payload types |
-//! | [`client`] | No | Async tokio client — service discovery, subscriptions, and request/response (feature `client`) |
-//! | [`server`] | No | Async tokio server — service offering, event publishing, and subscription management (feature `server`) |
+//! | `client` | No | Async client trait surface — service discovery, subscriptions, request/response (feature `client`; add `client-tokio` for `Client::new`) |
+//! | `server` | No | Async server trait surface — service offering, event publishing, subscription management (feature `server`; add `server-tokio` for `Server::new`) |
 //!
 //! ## Feature Flags
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `client` | no | Async tokio client; implies `std` + tokio + socket2 |
-//! | `server` | no | Async tokio server; implies `std` + tokio + socket2 |
-//! | `std` | no | Enables std-dependent helpers |
+//! | `std` | yes | Enables std-dependent helpers (`RawPayload`, `VecSdHeader`, `OfferedEndpoint`) |
+//! | `client` | no | Trait-surface client; implies `std` + futures (no tokio) |
+//! | `client-tokio` | no | Adds the `Client::new` / `TokioSpawner` / `TokioTransport` convenience defaults; implies `client` + tokio + socket2 |
+//! | `server` | no | Trait-surface server; implies `std` + futures (no tokio) |
+//! | `server-tokio` | no | Adds the `Server::new` / `TokioTransport` / `TokioTimer` convenience defaults; implies `server` + tokio + socket2 |
+//! | `bare_metal` | no | Activates embassy-sync, the `static_channels` module (no-alloc `ChannelFactory`), and `AtomicInterfaceHandle`. `StaticE2EHandle` additionally requires `std` because the underlying `E2ERegistry` is currently `std`-only. See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable bare-metal integration examples. |
+//! | `embassy_channels` | no | Heap-backed `EmbassySyncChannels` `ChannelFactory`. Implies `bare_metal` and pulls `extern crate alloc;` into the crate; **on `no_std`, downstream consumers must provide a `#[global_allocator]`**. Useful for tests / early prototypes before sizing static pools. |
 //!
-//! By default only the `protocol`, trait, and `e2e` modules are compiled, and the crate
-//! builds in `no_std` mode with no allocator requirement.
+//! The default feature set is `["std"]`, which links `std` and enables
+//! the `RawPayload` / `VecSdHeader` helpers. For a minimal build with
+//! no allocator requirement — the `protocol`, trait, `transport`, and
+//! `e2e` modules only — pass `--no-default-features`. The
+//! trait-surface canary workspace members (`examples/bare_metal_client`,
+//! `examples/bare_metal_server`) depend on the crate with
+//! `default-features = false, features = ["bare_metal", "client"]` /
+//! `["bare_metal", "server"]` and validate that configuration when built
+//! in isolation (`cargo build -p bare_metal_client` /
+//! `cargo build -p bare_metal_server`), rather than as part of a workspace-wide
+//! build where features may be unified across members.
 //!
 //! ## Examples
 //!
@@ -57,17 +70,21 @@
 //! assert_eq!(view.entry_count(), 1);
 //! ```
 //!
-//! ### Async client (requires `feature = "client"`)
+//! ### Async client (requires `feature = "client-tokio"`)
 //!
 //! ```rust,no_run
-//! # #[cfg(feature = "client")]
+//! # #[cfg(feature = "client-tokio")]
 //! # fn wrapper() {
 //! use simple_someip::{Client, ClientUpdate, RawPayload};
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     // Client::new returns a Clone-able handle and an update stream.
-//!     let (client, mut updates) = Client::<RawPayload>::new([192, 168, 1, 100].into());
+//!     // Client::new returns a Clone-able handle, an update stream, and
+//!     // the run-loop future. Spawn the future on the tokio runtime;
+//!     // the returned future depends on `tokio::select!` / `tokio::time`
+//!     // / tokio sockets, so it is not executor-agnostic today.
+//!     let (client, mut updates, run) = Client::<RawPayload, _, _, _>::new([192, 168, 1, 100].into());
+//!     let _run_task = tokio::spawn(run);
 //!     client.bind_discovery().await.unwrap();
 //!
 //!     while let Some(update) = updates.recv().await {
@@ -92,6 +109,40 @@
 #[cfg(feature = "std")]
 extern crate std;
 
+// `embassy_channels` needs `alloc` for `EmbassySyncChannels`'s
+// `Arc<Channel<...>>` storage (the heap-backed bare-metal channel
+// primitive). The `static_channels` module does NOT need alloc — users
+// who only enable `bare_metal` (without `embassy_channels`) get no-alloc.
+#[cfg(feature = "embassy_channels")]
+extern crate alloc;
+
+/// Maximum size, in bytes, of UDP payloads for `client` / `server` send
+/// paths that serialize into a fixed-size buffer of this size.
+///
+/// Paths currently capped by this constant:
+/// - `client::SocketManager::send` (unicast + SD outbound)
+/// - `server::EventPublisher::publish_event`
+/// - `server::EventPublisher::publish_raw_event`
+///
+/// When one of these paths is actually reached and serialization is
+/// attempted, messages larger than this cap fail with
+/// `client::Error::Capacity("udp_buffer")` or
+/// `server::Error::Capacity("udp_buffer")`, depending on the path.
+/// Paths that return early before
+/// attempting serialization (e.g. `publish_event` when there are no
+/// subscribers) are not affected. Other outbound SD paths (announcement
+/// builders, `SubscribeAck` / `SubscribeNack`) currently still use
+/// heap `Vec` buffers and are not capped by this constant — that is a
+/// known gap, planned alongside the bare-metal `no_alloc` refactor.
+///
+/// Note that this is an application-level UDP payload limit, not an
+/// Ethernet-MTU-safe size: a 1500-byte UDP payload exceeds a 1500-byte
+/// L2 MTU once IP/UDP headers are added (IPv4 leaves 1472 bytes of UDP
+/// payload, IPv6 leaves 1452), so sends at this size may fragment or
+/// fail depending on the network stack. Bare-metal ports targeting a
+/// smaller link MTU may want to lower this by forking.
+pub const UDP_BUFFER_SIZE: usize = 1500;
+
 /// SOME/IP client for discovering services and exchanging messages.
 #[cfg(feature = "client")]
 pub mod client;
@@ -103,9 +154,44 @@ pub mod protocol;
 #[cfg(feature = "std")]
 mod raw_payload;
 /// SOME/IP server for offering services and handling incoming requests.
+///
+/// The engine is generic over [`transport::TransportFactory`] +
+/// [`transport::Timer`] + [`transport::E2ERegistryHandle`] +
+/// [`server::SubscriptionHandle`], so the bare `server` feature exposes the
+/// trait-surface server. The `server-tokio` feature additionally provides
+/// the tokio convenience constructors (`server::Server::new`,
+/// `server::Server::new_with_loopback`, `server::Server::new_passive`)
+/// that default the type parameters to
+/// `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>` /
+/// `TokioTransport` / `TokioTimer`.
 #[cfg(feature = "server")]
 pub mod server;
+/// Tokio + `socket2` implementation of the [`transport`] traits. Provided
+/// as the default `std` backend — available whenever `client-tokio` or
+/// `server-tokio` is enabled.
+#[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
+pub mod tokio_transport;
+
+/// `embassy-sync`-backed implementation of [`transport::ChannelFactory`].
+/// Available whenever the `embassy_channels` feature is enabled. Uses
+/// heap allocation (`Arc<Channel<...>>`) — for no-alloc, use
+/// [`static_channels`] instead.
+#[cfg(feature = "embassy_channels")]
+pub mod embassy_channels;
+/// Static-pool no-alloc primitives for [`transport::ChannelFactory`].
+/// Backs the consumer-declared static `OneshotPool` / `MpscPool`
+/// instances that the [`define_static_channels!`] macro
+/// generates per-`T` `*Pooled<MyChannels>` impls against.
+#[cfg(feature = "bare_metal")]
+pub mod static_channels;
 mod traits;
+/// Executor-agnostic UDP transport abstraction used by the client and
+/// server modules. `no_std`-compatible; a default `std + tokio` backend
+/// ships in `tokio_transport` (available under the `client-tokio` /
+/// `server-tokio` features) — the link is rendered as a code literal
+/// because the target module is feature-gated and would break
+/// default-feature rustdoc builds.
+pub mod transport;
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
 #[cfg(feature = "std")]
@@ -113,7 +199,20 @@ pub use traits::OfferedEndpoint;
 pub use traits::{PayloadWireFormat, WireFormat};
 
 #[cfg(feature = "client")]
-pub use client::{Client, ClientUpdate, ClientUpdates, DiscoveryMessage, PendingResponse};
+pub use client::{
+    Client, ClientDeps, ClientUpdate, ClientUpdates, DiscoveryMessage, PendingResponse,
+};
 pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
-pub use server::Server;
+pub use server::{Server, ServerDeps, SubscriptionHandle};
+#[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
+pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
+#[cfg(feature = "bare_metal")]
+pub use transport::AtomicInterfaceHandle;
+pub use transport::{
+    ChannelFactory, E2ERegistryHandle, InterfaceHandle, IoErrorKind, LocalSpawner, MpscRecv,
+    MpscSend, OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram, SocketOptions, Spawner,
+    Timer, TransportError, TransportFactory, TransportSocket, UnboundedRecv, UnboundedSend,
+};
+#[cfg(all(feature = "bare_metal", feature = "std"))]
+pub use transport::{StaticE2EHandle, StaticE2EStorage};

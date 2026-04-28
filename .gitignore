@@ -1,7 +1,6 @@
-.DS_Store
 
-/target
-
+.claude/
 CLAUDE.md
-
+.DS_Store
 lcov.info
+/target
