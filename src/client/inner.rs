@@ -299,7 +299,7 @@ pub(super) struct Inner<
     C: ChannelFactory,
 > {
     /// MPSC Receiver used to receive control messages from outer client
-    control_receiver: C::BoundedReceiver<ControlMessage<PayloadDefinitions, C>>,
+    control_receiver: C::BoundedReceiver<ControlMessage<PayloadDefinitions, C>, 4>,
     /// Queue of pending control messages to process
     request_queue: Deque<ControlMessage<PayloadDefinitions, C>, REQUEST_QUEUE_CAP>,
     /// Pending request-responses keyed by `request_id` (`client_id` << 16 | `session_counter`).
@@ -398,7 +398,7 @@ where
         spawner: S,
         timer: Tm,
     ) -> (
-        C::BoundedSender<ControlMessage<PayloadDefinitions, C>>,
+        C::BoundedSender<ControlMessage<PayloadDefinitions, C>, 4>,
         C::UnboundedReceiver<ClientUpdate<PayloadDefinitions>>,
         impl core::future::Future<Output = ()> + Send + 'static,
     ) {
