@@ -15,7 +15,7 @@ const EVENT_GROUPS_CAP: usize = 32;
 
 /// Max number of subscribers per event group. Excess subscribers are dropped
 /// with a `warn!` log rather than silently.
-const SUBSCRIBERS_PER_GROUP: usize = 16;
+pub(crate) const SUBSCRIBERS_PER_GROUP: usize = 16;
 
 // Compile-time invariants. Trip these at `cargo build` so that retuning
 // the constants above can't quietly produce a `subscribe` impl that
@@ -584,9 +584,7 @@ mod tests {
         async fn for_each_subscriber_empty_group_returns_zero() {
             let handle: Arc<RwLock<SubscriptionManager>> =
                 Arc::new(RwLock::new(SubscriptionManager::new()));
-            let count = handle
-                .for_each_subscriber(0x5B, 1, 0x01, |_| {})
-                .await;
+            let count = handle.for_each_subscriber(0x5B, 1, 0x01, |_| {}).await;
             assert_eq!(count, 0);
         }
 

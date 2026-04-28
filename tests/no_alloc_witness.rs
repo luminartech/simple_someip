@@ -15,8 +15,8 @@
 //!
 //! A [`PanicAllocator`] replaces the global allocator. It is disarmed by
 //! default; [`assert_no_alloc`] arms it around a closure, causing any
-//! allocation inside the closure to panic — turning a latent regression into
-//! a hard CI failure. Because `main()` is single-threaded and all witnessed
+//! allocation inside the closure to call `process::abort()` — turning a
+//! latent regression into a hard CI failure. Because `main()` is single-threaded and all witnessed
 //! operations are synchronous (no yield points), no background allocations
 //! can fire while the allocator is armed.
 //!

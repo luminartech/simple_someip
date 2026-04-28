@@ -94,7 +94,6 @@ struct MockPipe {
     inbound_waker: Mutex<Option<core::task::Waker>>,
 }
 
-
 #[derive(Clone)]
 struct MockFactory {
     pipe: Arc<MockPipe>,

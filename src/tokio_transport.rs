@@ -106,7 +106,7 @@ impl TransportFactory for TokioTransport {
         &self,
         addr: SocketAddrV4,
         options: &SocketOptions,
-    ) -> impl Future<Output = Result<Self::Socket, TransportError>> {
+    ) -> impl Future<Output = Result<Self::Socket, TransportError>> + Send {
         // Capture options by value into the async block so the returned
         // future does not borrow `self` or `options`.
         let options = *options;
@@ -458,7 +458,7 @@ impl<T: Send + 'static> crate::transport::UnboundedPooled<TokioChannels> for T {
 // module. The `tokio_transport` module is now gated to `client-tokio` /
 // `server-tokio`, so a `--features client,bare_metal` build without tokio
 // could no longer reach `EmbassySyncChannels`. The impl has been moved to
-// `crate::embassy_channels` (gated only by `feature = "bare_metal"`) so
+// `crate::embassy_channels` (gated by `feature = "embassy_channels"`) so
 // it is reachable from any client build.
 
 #[cfg(test)]
