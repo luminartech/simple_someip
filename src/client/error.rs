@@ -21,9 +21,6 @@ pub enum Error {
     /// A SOME/IP protocol-level error.
     #[error(transparent)]
     Protocol(#[from] crate::protocol::Error),
-    /// An I/O error from the underlying network transport.
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
     /// Received a discovery message that was not expected.
     #[error("Unexpected discovery message: {0:?}")]
     UnexpectedDiscoveryMessage(crate::protocol::Header),
