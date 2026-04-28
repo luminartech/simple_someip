@@ -46,6 +46,7 @@ pub enum Error {
     /// - `"request_queue"` → `REQUEST_QUEUE_CAP` (returned when the
     ///   client's internal control-message queue is saturated, surfacing
     ///   on every public `Client` method that enqueues a control)
+    /// - `"service_registry"` → the `ServiceRegistry` capacity limit
     #[error("internal capacity exceeded: {0}")]
     Capacity(&'static str),
     /// An error surfaced by the pluggable transport backend (see

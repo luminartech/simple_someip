@@ -93,7 +93,8 @@ impl MockPipe {
     /// receiver actually wakes.
     fn deliver_inbound(&self, bytes: Vec<u8>, source: SocketAddrV4) {
         self.inbound.lock().unwrap().push_back((bytes, source));
-        if let Some(waker) = self.inbound_waker.lock().unwrap().take() {
+        let waker = self.inbound_waker.lock().unwrap().take();
+        if let Some(waker) = waker {
             waker.wake();
         }
     }

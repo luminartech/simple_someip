@@ -77,9 +77,10 @@ struct MockPipe {
 }
 
 impl MockPipe {
-    fn send(&self, bytes: Vec<u8>, target: SocketAddrV4) {
-        self.queue.lock().unwrap().push_back((bytes, target));
-        if let Some(waker) = self.waker.lock().unwrap().take() {
+    fn send(&self, bytes: Vec<u8>, source: SocketAddrV4) {
+        self.queue.lock().unwrap().push_back((bytes, source));
+        let waker = self.waker.lock().unwrap().take();
+        if let Some(waker) = waker {
             waker.wake();
         }
     }
@@ -156,7 +157,7 @@ struct MockSocket {
 struct MockSendFut {
     pipe: Arc<MockPipe>,
     bytes: Option<Vec<u8>>,
-    target: SocketAddrV4,
+    source: SocketAddrV4,
 }
 
 impl Future for MockSendFut {
@@ -164,7 +165,7 @@ impl Future for MockSendFut {
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         if let Some(bytes) = me.bytes.take() {
-            me.pipe.send(bytes, me.target);
+            me.pipe.send(bytes, me.source);
         }
         Poll::Ready(Ok(()))
     }
@@ -207,11 +208,11 @@ impl TransportSocket for MockSocket {
     type SendFuture<'a> = MockSendFut;
     type RecvFuture<'a> = MockRecvFut<'a>;
 
-    fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddrV4) -> Self::SendFuture<'a> {
+    fn send_to<'a>(&'a self, buf: &'a [u8], _target: SocketAddrV4) -> Self::SendFuture<'a> {
         MockSendFut {
             pipe: Arc::clone(&self.tx_pipe),
             bytes: Some(buf.to_vec()),
-            target,
+            source: self.local,
         }
     }
 
@@ -413,10 +414,13 @@ async fn client_receives_server_sd_announcement() {
     run_handle.abort();
 }
 
-/// Proves that the client and server can exchange a SOME/IP request/response
-/// through the mock network using `add_endpoint` + `send_to_service`.
+/// Proves that the client can send a SOME/IP request through the mock network
+/// using `add_endpoint` + `send_to_service`, and the server run-loop stays
+/// stable under load. Response delivery is not verified here because the
+/// server has no registered request handler; see the doc-level test list for
+/// items that remain.
 #[tokio::test]
-async fn client_server_request_response_roundtrip() {
+async fn client_send_request_server_runloop_stable() {
     let network = SharedNetwork::new();
 
     let server_factory = MockFactory {
