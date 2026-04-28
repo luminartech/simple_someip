@@ -10,7 +10,7 @@
 //! parameter on [`SdStateManager::send_offer_service`] becomes the single
 //! migration point for the announcement path.
 
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use std::net::SocketAddrV4;
 
 use crate::protocol::sd::{
@@ -31,11 +31,23 @@ use super::{Error, ServerConfig};
 /// server-side SD emission path reads from a single source of truth.
 #[derive(Debug)]
 pub(super) struct SdStateManager {
-    session_id: AtomicU16,
-    /// `true` once [`Self::next_session_id`] has advanced past `0xFFFF`.
-    /// Monotonic: never transitions back to `false`.
-    has_wrapped: AtomicBool,
+    /// Packed `(has_wrapped, session_id)` state.
+    ///
+    /// - bits 0..16: current session id (1..=0xFFFF, never 0).
+    /// - bit 16: `has_wrapped` flag — once set, never cleared.
+    /// - bits 17..32: reserved, must remain 0.
+    ///
+    /// Packed into a single `AtomicU32` so a single `fetch_update`
+    /// produces a consistent `(session_id, reboot_flag)` pair across
+    /// concurrent emitters around the `0xFFFF → 0x0001` wrap boundary.
+    /// Two separate atomics could be interleaved by another emitter
+    /// between the increment and the wrap-flag latch; with one atomic,
+    /// the pair is computed in one CAS step.
+    session_state: AtomicU32,
 }
+
+const SID_MASK: u32 = 0xFFFF;
+const WRAPPED_BIT: u32 = 1 << 16;
 
 impl SdStateManager {
     pub(super) const fn new() -> Self {
@@ -47,46 +59,54 @@ impl SdStateManager {
     /// [`Self::new`].
     pub(super) const fn with_initial(initial: u16) -> Self {
         Self {
-            session_id: AtomicU16::new(initial),
-            has_wrapped: AtomicBool::new(false),
+            // has_wrapped starts false; session_id starts at `initial`.
+            session_state: AtomicU32::new(initial as u32),
         }
     }
 
     /// Advance the counter and return the next SOME/IP-SD session ID
     /// (`client_id = 0`, session ID in the low 16 bits) together with the
     /// reboot flag that *belongs to this same emission*. Skips 0 on wrap,
-    /// and latches [`Self::has_wrapped`] the first time the counter crosses
-    /// the `0xFFFF → 0x0001` boundary so the reboot flag flips to
-    /// [`RebootFlag::Continuous`] permanently.
+    /// and latches the `has_wrapped` bit the first time the counter
+    /// crosses the `0xFFFF → 0x0001` boundary so the reboot flag flips
+    /// to [`RebootFlag::Continuous`] permanently.
     ///
-    /// Returns `(session_id, reboot_flag)` as a tuple to avoid a TOCTOU
-    /// race around the wrap boundary: a separate `next_session_id() +
-    /// reboot_flag()` call pair could see thread A's pre-wrap session
-    /// ID and thread B's post-wrap latched flag (or the inverse), and
-    /// thus advertise `Continuous` with `session_id=0xFFFF` (or
-    /// `RecentlyRebooted` with `session_id=0x0001`) — both violations
-    /// of AUTOSAR SOME/IP-SD's stated semantics that the wrap message
-    /// itself carries `Continuous`. By computing both inside the same
-    /// `fetch_update` closure, the pair is consistent for every
-    /// individual emission.
+    /// `(session_id, reboot_flag)` is computed atomically inside one
+    /// `fetch_update` so concurrent emitters always agree on the pair.
+    /// A previous implementation used two separate atomics and could
+    /// race around the wrap boundary, advertising
+    /// `(0xFFFF, Continuous)` or `(0x0001, RecentlyRebooted)` — both
+    /// violations of AUTOSAR SOME/IP-SD's stated semantics that the
+    /// wrap message itself carries `Continuous`.
     pub(super) fn next_session_id_with_reboot_flag(&self) -> (u32, RebootFlag) {
-        let prev = self
-            .session_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                let next = v.wrapping_add(1);
-                Some(if next == 0 { 1 } else { next })
+        let prev_state = self
+            .session_state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                let prev_sid = (state & SID_MASK) as u16;
+                let prev_wrapped = (state & WRAPPED_BIT) != 0;
+                let next_sid = match prev_sid.wrapping_add(1) {
+                    0 => 1u16,
+                    n => n,
+                };
+                // Latch wrap on the 0xFFFF → 0x0001 transition.
+                let next_wrapped = prev_wrapped || prev_sid == u16::MAX;
+                let next_state =
+                    (u32::from(next_sid)) | (if next_wrapped { WRAPPED_BIT } else { 0 });
+                Some(next_state)
             })
             .unwrap();
-        // The only value whose successor wraps through 0 is 0xFFFF; latch
-        // the flag exactly on that transition. We then read the flag for
-        // this emission AFTER the latch, so the wrap message itself
-        // advertises `Continuous`.
-        if prev == u16::MAX {
-            self.has_wrapped.store(true, Ordering::Relaxed);
-        }
-        let next = prev.wrapping_add(1);
-        let session_id = u32::from(if next == 0 { 1 } else { next });
-        let reboot_flag = if self.has_wrapped.load(Ordering::Relaxed) {
+        // Re-derive the new state from the prev we observed; this is
+        // the *same* computation the closure performed and produces
+        // exactly the new state we just stored.
+        let prev_sid = (prev_state & SID_MASK) as u16;
+        let prev_wrapped = (prev_state & WRAPPED_BIT) != 0;
+        let next_sid = match prev_sid.wrapping_add(1) {
+            0 => 1u16,
+            n => n,
+        };
+        let next_wrapped = prev_wrapped || prev_sid == u16::MAX;
+        let session_id = u32::from(next_sid);
+        let reboot_flag = if next_wrapped {
             RebootFlag::Continuous
         } else {
             RebootFlag::RecentlyRebooted
@@ -115,7 +135,7 @@ impl SdStateManager {
     /// the racy pair.
     #[cfg(test)]
     pub(super) fn reboot_flag(&self) -> RebootFlag {
-        if self.has_wrapped.load(Ordering::Relaxed) {
+        if (self.session_state.load(Ordering::Acquire) & WRAPPED_BIT) != 0 {
             RebootFlag::Continuous
         } else {
             RebootFlag::RecentlyRebooted
@@ -223,6 +243,55 @@ mod tests {
         let sd = SdStateManager::new();
         // new() seeds at 1; first next_session_id increments to 2
         assert_eq!(sd.next_session_id(), 2);
+    }
+
+    /// Concurrent emitters around the wrap boundary must never produce
+    /// a `(session_id, reboot_flag)` pair where one is pre-wrap and the
+    /// other is post-wrap. Regression for the two-atomic TOCTOU race.
+    ///
+    /// We seed near the wrap and have many threads call
+    /// `next_session_id_with_reboot_flag` concurrently. Every
+    /// `(0xFFFF, _)` must carry `RecentlyRebooted`, every `(0x0001, _)`
+    /// (the wrap message) and beyond must carry `Continuous`.
+    #[test]
+    fn next_session_id_with_reboot_flag_never_mismatches_around_wrap() {
+        use std::sync::Arc;
+        for _trial in 0..20 {
+            let sd = Arc::new(SdStateManager::with_initial(0xFFF0));
+            let mut handles = std::vec::Vec::new();
+            for _ in 0..32 {
+                let s = Arc::clone(&sd);
+                handles.push(std::thread::spawn(move || {
+                    let (sid, flag) = s.next_session_id_with_reboot_flag();
+                    (sid, flag)
+                }));
+            }
+            for h in handles {
+                let (sid, flag) = h.join().unwrap();
+                // sid is u32 in 1..=0xFFFF (never 0).
+                assert!((1..=0xFFFF).contains(&sid), "sid out of range: {sid:#x}");
+                if sid == 0xFFFF {
+                    // The 0xFFFF emission is the LAST pre-wrap.
+                    assert_eq!(
+                        flag,
+                        RebootFlag::RecentlyRebooted,
+                        "sid=0xFFFF must carry RecentlyRebooted"
+                    );
+                } else if sid <= 0xFFEF {
+                    // We seeded at 0xFFF0, so any sid in 1..=0xFFEF
+                    // means the counter wrapped past 0xFFFF. Must be
+                    // Continuous.
+                    assert_eq!(
+                        flag,
+                        RebootFlag::Continuous,
+                        "post-wrap sid={sid:#x} must carry Continuous"
+                    );
+                }
+                // sids in 0xFFF0..=0xFFFE are the pre-wrap window —
+                // both flags are valid depending on whether this trial
+                // wrapped before/after the emission. Don't assert.
+            }
+        }
     }
 
     // ── Reboot-flag tracking ────────────────────────────────────────────
@@ -339,7 +408,7 @@ mod tests {
         opts.reuse_address = true;
         opts.reuse_port = true;
         opts.multicast_if_v4 = Some(interface);
-        opts.multicast_loop_v4 = true;
+        opts.multicast_loop_v4 = Some(true);
         crate::tokio_transport::TokioTransport
             .bind(SocketAddrV4::new(interface, 0), &opts)
             .await

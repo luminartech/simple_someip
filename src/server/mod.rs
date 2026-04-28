@@ -19,6 +19,8 @@ pub use subscription_manager::{SubscribeError, SubscriptionHandle, SubscriptionM
 
 use sd_state::SdStateManager;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::Timer;
 use crate::e2e::{E2EKey, E2EProfile};
 use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
@@ -57,9 +59,21 @@ pub struct ServerConfig {
     pub minor_version: u32,
     /// Service Discovery TTL (time to live)
     pub ttl: u32,
+    /// Event-group IDs the server publishes to. Used by the SD
+    /// `Subscribe` handler to NACK subscriptions for unknown groups
+    /// (per AUTOSAR SOME/IP-SD: an event group must be known before
+    /// subscription is granted). When empty, any event-group ID is
+    /// accepted — preserves back-compat for callers that have not
+    /// enumerated their groups; populate to opt into validation.
+    pub event_group_ids: heapless::Vec<u16, { ServerConfig::EVENT_GROUP_IDS_CAP }>,
 }
 
 impl ServerConfig {
+    /// Maximum number of event-group IDs trackable in
+    /// [`Self::event_group_ids`]. Matches `EVENT_GROUPS_CAP` in the
+    /// subscription manager.
+    pub const EVENT_GROUP_IDS_CAP: usize = 32;
+
     /// Create a new server configuration
     #[must_use]
     pub fn new(interface: Ipv4Addr, local_port: u16, service_id: u16, instance_id: u16) -> Self {
@@ -71,12 +85,21 @@ impl ServerConfig {
             major_version: 1,
             minor_version: 0,
             ttl: 3, // 3 seconds is typical for SOME/IP
+            event_group_ids: heapless::Vec::new(),
         }
+    }
+
+    /// Returns `true` if `event_group_id` is registered, OR
+    /// [`Self::event_group_ids`] is empty (validation disabled).
+    #[must_use]
+    pub fn accepts_event_group(&self, event_group_id: u16) -> bool {
+        self.event_group_ids.is_empty() || self.event_group_ids.contains(&event_group_id)
     }
 }
 
 /// Bundle of pluggable infrastructure passed to [`Server::new_with_deps`].
-/// Mirrors [`crate::ClientDeps`] but with the server's smaller surface
+/// Mirrors `crate::ClientDeps` (under `client`) but with the server's
+/// smaller surface
 /// — no `Spawner` (server has no internal task spawning), no
 /// `InterfaceHandle` (interface lives in [`ServerConfig`]).
 ///
@@ -96,7 +119,7 @@ where
     /// Shared E2E registry handle for runtime E2E configuration.
     pub e2e_registry: R,
     /// Shared subscription manager handle. The convenience constructor
-    /// [`Server::new`] (under `server-tokio`) builds an
+    /// `Server::new` (under `server-tokio`) builds an
     /// `Arc<RwLock<SubscriptionManager>>` for this; bare-metal callers
     /// supply their own [`SubscriptionHandle`] impl.
     pub subscriptions: S,
@@ -112,8 +135,8 @@ where
 ///   unit-struct in the tokio path; bare-metal impls may carry state)
 /// - `Tm: Timer` — async sleep used by the announcement loop
 ///
-/// The convenience constructors [`Self::new`] / [`Self::new_with_loopback`]
-/// / [`Self::new_passive`] (under the `server-tokio` feature) instantiate
+/// The convenience constructors `Self::new` / `Self::new_with_loopback`
+/// / `Self::new_passive` (under the `server-tokio` feature) instantiate
 /// these as `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>`
 /// / `TokioTransport` / `TokioTimer`. Bare-metal callers use
 /// [`Self::new_with_deps`] (under `server`) and supply their own.
@@ -148,12 +171,17 @@ where
     /// 1-second tick. On `server-tokio` builds this is `TokioTimer`
     /// (wrapping `tokio::time::sleep`).
     timer: Tm,
-    /// `true` if this server was constructed via [`Server::new_passive`].
+    /// `true` if this server was constructed via `Server::new_passive`.
     /// Passive servers have no real SD socket bound to port 30490; their
     /// SD handling is managed externally. Calling [`Self::announcement_loop`]
     /// or [`Self::run`] on a passive server is a programming error and
     /// returns an [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`].
     is_passive: bool,
+    /// Set the first time [`Self::announcement_loop`] is called. A
+    /// second call returns `Err(Error::Io(InvalidInput))` so two
+    /// independent futures cannot race on the same SD socket and
+    /// session counter.
+    announcement_loop_started: AtomicBool,
 }
 
 #[cfg(feature = "server-tokio")]
@@ -256,8 +284,8 @@ where
 {
     /// Bare-metal-friendly constructor that takes every dependency
     /// explicitly via a [`ServerDeps`] bundle. The `server-tokio`
-    /// convenience constructors ([`Self::new`], [`Self::new_with_loopback`],
-    /// [`Self::new_passive`]) ultimately delegate here.
+    /// convenience constructors (`Self::new`, `Self::new_with_loopback`,
+    /// `Self::new_passive`) ultimately delegate here.
     ///
     /// # Errors
     ///
@@ -296,7 +324,7 @@ where
         sd_opts.reuse_address = true;
         sd_opts.reuse_port = true;
         sd_opts.multicast_if_v4 = Some(config.interface);
-        sd_opts.multicast_loop_v4 = multicast_loopback;
+        sd_opts.multicast_loop_v4 = Some(multicast_loopback);
         let sd_addr = SocketAddrV4::new(config.interface, sd::MULTICAST_PORT);
         let sd_socket = factory.bind(sd_addr, &sd_opts).await?;
         sd_socket.join_multicast_v4(sd::MULTICAST_IP, config.interface)?;
@@ -325,6 +353,7 @@ where
             factory,
             timer,
             is_passive: false,
+            announcement_loop_started: AtomicBool::new(false),
         })
     }
 
@@ -332,7 +361,7 @@ where
     ///
     /// Passive servers bind a unicast socket as usual but bind their SD
     /// socket to an ephemeral port (port 0) instead of the SOME/IP SD
-    /// port — see [`Server::new_passive`] under `server-tokio` for the
+    /// port — see `Server::new_passive` under `server-tokio` for the
     /// full explanation. Calling [`Self::announcement_loop`] or
     /// [`Self::run`] on the result is a programming error.
     ///
@@ -393,6 +422,7 @@ where
             factory,
             timer,
             is_passive: true,
+            announcement_loop_started: AtomicBool::new(false),
         })
     }
 }
@@ -403,9 +433,11 @@ where
     S: SubscriptionHandle,
     F: TransportFactory + Send + Sync + 'static,
     F::Socket: Send + Sync + 'static,
+    for<'a> F::BindFuture<'a>: Send,
     for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
     for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
     Tm: Timer + Clone + Send + Sync + 'static,
+    for<'a> Tm::SleepFuture<'a>: Send,
 {
     /// Build the periodic-SD-announcement future.
     ///
@@ -430,10 +462,15 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`] if
-    /// called on a server constructed via [`Server::new_passive`] — passive
-    /// servers have no real SD socket bound to port 30490, so any
-    /// announcements would go out with an incorrect source port.
+    /// Returns [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`] if:
+    /// - called on a server constructed via `Server::new_passive` — passive
+    ///   servers have no real SD socket bound to port 30490, so any
+    ///   announcements would go out with an incorrect source port; or
+    /// - called twice on the same server. Two announcement futures
+    ///   driving the same SD socket and session counter would double the
+    ///   announcement rate and race on the wrap-flag latch. Drop the
+    ///   first future to disable announcements before requesting a new
+    ///   one (which currently still requires a fresh `Server`).
     #[must_use = "the returned announcement-loop future must be spawned (e.g. tokio::spawn) or awaited for the server to emit SD announcements; dropping it silently disables announcements"]
     pub fn announcement_loop(
         &self,
@@ -445,6 +482,21 @@ where
                     "announcement_loop called on passive Server for service 0x{:04X}; \
                      announcements must be driven externally (e.g. via \
                      `simple_someip::Client::sd_announcements_loop`)",
+                    self.config.service_id
+                ),
+            )));
+        }
+        if self
+            .announcement_loop_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "announcement_loop already started for service 0x{:04X}; \
+                     two announcement futures cannot share the same SD socket \
+                     and session counter",
                     self.config.service_id
                 ),
             )));
@@ -581,7 +633,7 @@ where
     /// # Errors
     ///
     /// Returns [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`] if
-    /// called on a server constructed via [`Server::new_passive`] — passive
+    /// called on a server constructed via `Server::new_passive` — passive
     /// servers have no real SD socket to read from, so the run loop would
     /// block forever on the ephemeral placeholder socket.
     ///
@@ -772,12 +824,38 @@ where
                             self.config.major_version,
                             entry_view.major_version()
                         );
-                        self.send_subscribe_nack_from_view(
-                            &entry_view,
-                            sender,
-                            "wrong_major_version",
-                        )
-                        .await?;
+                        if let Err(e) = self
+                            .send_subscribe_nack_from_view(
+                                &entry_view,
+                                sender,
+                                "wrong_major_version",
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "SubscribeNack send failed");
+                        }
+                    } else if !self.config.accepts_event_group(entry_view.event_group_id()) {
+                        // Per AUTOSAR SOME/IP-SD, the event group must
+                        // be known to the server before subscription
+                        // can be granted. If `event_group_ids` is
+                        // populated and the request is for an
+                        // unrecognised group, NACK so the client
+                        // doesn't believe it's subscribed.
+                        tracing::warn!(
+                            "Subscribe for unknown event_group_id 0x{:04X} (service 0x{:04X})",
+                            entry_view.event_group_id(),
+                            entry_view.service_id()
+                        );
+                        if let Err(e) = self
+                            .send_subscribe_nack_from_view(
+                                &entry_view,
+                                sender,
+                                "unknown_event_group",
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "SubscribeNack send failed");
+                        }
                     } else {
                         // Extract the subscriber endpoint from the entry's
                         // own options run. Each SD entry describes two runs
@@ -808,20 +886,36 @@ where
 
                             match subscribe_result {
                                 Ok(()) => {
-                                    self.send_subscribe_ack_from_view(&entry_view, sender)
-                                        .await?;
+                                    // ACK the just-committed subscription. If the
+                                    // ACK send fails (transient transport error),
+                                    // roll back the subscription so we don't leak
+                                    // a committed-but-unacked entry — and log
+                                    // rather than propagate, so a single SD-socket
+                                    // hiccup doesn't tear down `run()`.
+                                    if let Err(e) =
+                                        self.send_subscribe_ack_from_view(&entry_view, sender).await
+                                    {
+                                        tracing::warn!(
+                                            error = %e,
+                                            service_id = entry_view.service_id(),
+                                            instance_id = entry_view.instance_id(),
+                                            event_group_id = entry_view.event_group_id(),
+                                            "SubscribeAck send failed; rolling back subscription"
+                                        );
+                                        self.subscriptions
+                                            .unsubscribe(
+                                                entry_view.service_id(),
+                                                entry_view.instance_id(),
+                                                entry_view.event_group_id(),
+                                                endpoint_addr,
+                                            )
+                                            .await;
+                                    }
                                 }
                                 Err(e) => {
                                     // Capacity-rejected subscription: NACK so
                                     // the client doesn't believe it's
-                                    // subscribed. Match on the specific
-                                    // SubscribeError so the NACK log line
-                                    // carries the actual cause (which
-                                    // bounded structure was full) rather
-                                    // than the generic "subscription
-                                    // rejected" string — and pick static
-                                    // reason strings so no allocation has
-                                    // to live across the await.
+                                    // subscribed.
                                     let reason: &'static str = match e {
                                         SubscribeError::SubscribersPerGroupFull => {
                                             "subscribers_per_group_full"
@@ -829,18 +923,26 @@ where
                                         SubscribeError::EventGroupsFull => "event_groups_full",
                                     };
                                     tracing::debug!("Subscription rejected: {reason}");
-                                    self.send_subscribe_nack_from_view(&entry_view, sender, reason)
-                                        .await?;
+                                    if let Err(e) = self
+                                        .send_subscribe_nack_from_view(&entry_view, sender, reason)
+                                        .await
+                                    {
+                                        tracing::warn!(error = %e, "SubscribeNack send failed");
+                                    }
                                 }
                             }
                         } else {
                             tracing::warn!("No endpoint found in Subscribe message options");
-                            self.send_subscribe_nack_from_view(
-                                &entry_view,
-                                sender,
-                                "no_endpoint_in_options",
-                            )
-                            .await?;
+                            if let Err(e) = self
+                                .send_subscribe_nack_from_view(
+                                    &entry_view,
+                                    sender,
+                                    "no_endpoint_in_options",
+                                )
+                                .await
+                            {
+                                tracing::warn!(error = %e, "SubscribeNack send failed");
+                            }
                         }
                     }
                 }
@@ -854,7 +956,9 @@ where
                             find_service_id,
                             self.config.service_id
                         );
-                        self.send_unicast_offer(sender).await?;
+                        if let Err(e) = self.send_unicast_offer(sender).await {
+                            tracing::warn!(error = %e, "Unicast OfferService send failed");
+                        }
                     } else {
                         tracing::trace!(
                             "Ignoring FindService for service 0x{:04X} (not ours)",

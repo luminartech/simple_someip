@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.8.0]
 
 ### Added
 
@@ -46,11 +46,11 @@
 
 ### Notes
 
-- **Crate version bumped to 0.7.0** — reflects the breaking changes above. Downstream `Cargo.toml` snippets in `README.md` were updated accordingly.
+- **Crate version bumped to 0.8.0** — reflects the breaking changes above. Downstream `Cargo.toml` snippets in `README.md` were updated accordingly.
 
-### Known issues
+### Test runner
 
-- `tests/client_server.rs` integration tests share the SD multicast port (30490) via `SO_REUSEPORT` and rely on Linux's reuseport hashing for traffic delivery. Under cargo's default parallel test runner this produces cross-test Subscribe deliveries that flake ~half the tests. Run with `cargo test --test client_server -- --test-threads=1` until each test can be given its own SD port. The `cargo test --lib` unit-test suite is unaffected. (Pre-existing, called out here so consumers do not assume `cargo test --workspace` is green.)
+- `tests/client_server.rs` integration tests share the SD multicast port (30490) via `SO_REUSEPORT` and rely on Linux's reuseport hashing for traffic delivery. Under cargo's default parallel test runner cross-test Subscribe deliveries flake. The crate's `.config/nextest.toml` serializes `client_server` via the `serial-sd-port` test-group, so `cargo nextest run` (used by CI) gives stable results. For the legacy harness, pass `--test-threads=1`: `cargo test --test client_server -- --test-threads=1`.
 
 
 ## [0.6.0](https://github.com/luminartech/simple_someip/compare/v0.5.3...v0.6.0) - 2026-04-20

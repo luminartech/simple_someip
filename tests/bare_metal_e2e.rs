@@ -122,12 +122,10 @@ struct MockFactory {
 
 impl TransportFactory for MockFactory {
     type Socket = MockSocket;
+    type BindFuture<'a> =
+        core::pin::Pin<Box<dyn Future<Output = Result<Self::Socket, TransportError>> + Send + 'a>>;
 
-    fn bind(
-        &self,
-        addr: SocketAddrV4,
-        _options: &SocketOptions,
-    ) -> impl Future<Output = Result<Self::Socket, TransportError>> + Send {
+    fn bind<'a>(&'a self, addr: SocketAddrV4, _options: &'a SocketOptions) -> Self::BindFuture<'a> {
         let tx = Arc::clone(&self.tx_pipe);
         let rx = Arc::clone(&self.rx_pipe);
         let port = if addr.port() == 0 {
@@ -138,13 +136,13 @@ impl TransportFactory for MockFactory {
             addr.port()
         };
         let local = SocketAddrV4::new(*addr.ip(), port);
-        async move {
+        Box::pin(async move {
             Ok(MockSocket {
                 tx_pipe: tx,
                 rx_pipe: rx,
                 local,
             })
-        }
+        })
     }
 }
 
@@ -242,8 +240,11 @@ impl TransportSocket for MockSocket {
 struct MockTimer;
 
 impl Timer for MockTimer {
-    async fn sleep(&self, duration: Duration) {
-        tokio::time::sleep(duration).await;
+    type SleepFuture<'a> = core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    fn sleep(&self, duration: Duration) -> Self::SleepFuture<'_> {
+        Box::pin(async move {
+            tokio::time::sleep(duration).await;
+        })
     }
 }
 

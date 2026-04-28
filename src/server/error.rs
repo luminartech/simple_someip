@@ -2,10 +2,9 @@ use thiserror::Error;
 
 /// Errors that can occur during SOME/IP server operations.
 ///
-/// Not marked `#[non_exhaustive]` today: downstream crates that match on
-/// this enum rely on exhaustiveness, and adding the attribute now would be
-/// a silent breaking change that `cargo-semver-checks` would flag. Revisit
-/// when a breaking release is planned.
+/// Not marked `#[non_exhaustive]`: downstream crates that match on this
+/// enum rely on exhaustiveness. Variant additions are breaking changes
+/// and require a `SemVer` bump.
 #[derive(Error, Debug)]
 pub enum Error {
     /// A SOME/IP protocol-level error.

@@ -56,19 +56,25 @@
 //!   receiver has dropped.
 //!
 //! Multi-sender contention on a closed bounded channel: the close
-//! signal uses a single `AtomicWaker`, so only the most-recent
-//! sender to register wakes immediately on receiver drop. Other
-//! awaiting senders will eventually re-poll (e.g. when the embassy
-//! channel's internal waker fires) and observe the closed flag —
-//! convergent but not constant-latency.
+//! signal uses a `MultiWakerRegistration<8>`, so up to 8 awaiting
+//! senders are woken immediately on receiver drop. Beyond that cap
+//! the multi-waker auto-wakes-and-clears on the next register, so
+//! the close path remains correct under any sender count.
 
 use alloc::sync::Arc;
+use core::cell::RefCell;
 use core::future::{Future, poll_fn};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::Poll;
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_sync::waitqueue::AtomicWaker;
+use embassy_sync::waitqueue::{AtomicWaker, MultiWakerRegistration};
+
+/// Maximum number of distinct waiting senders we wake on receiver drop.
+/// More than this and the multi-waker auto-wakes-and-clears on the next
+/// register, so the close path remains correct under any sender count.
+const SEND_WAKER_CAP: usize = 8;
 
 use crate::transport::{
     BoundedPooled, ChannelFactory, MpscRecv, MpscSend, OneshotCancelled, OneshotPooled,
@@ -190,10 +196,11 @@ struct MpscInner<T: Send + 'static, const N: usize> {
     closed: AtomicBool,
     /// Wakes the receiver when the last sender drops.
     recv_waker: AtomicWaker,
-    /// Wakes a bounded sender awaiting on a full channel when the
-    /// receiver drops. Single-slot — multi-sender contention is
-    /// best-effort.
-    send_waker: AtomicWaker,
+    /// Wakes bounded senders awaiting on a full channel when the
+    /// receiver drops. Multi-slot so cloned senders are all woken,
+    /// not just the most-recently-registered one.
+    send_wakers:
+        BlockingMutex<CriticalSectionRawMutex, RefCell<MultiWakerRegistration<SEND_WAKER_CAP>>>,
 }
 
 impl<T: Send + 'static, const N: usize> MpscInner<T, N> {
@@ -203,7 +210,7 @@ impl<T: Send + 'static, const N: usize> MpscInner<T, N> {
             sender_count: AtomicUsize::new(1),
             closed: AtomicBool::new(false),
             recv_waker: AtomicWaker::new(),
-            send_waker: AtomicWaker::new(),
+            send_wakers: BlockingMutex::new(RefCell::new(MultiWakerRegistration::new())),
         }
     }
 }
@@ -257,7 +264,9 @@ impl<T: Send + 'static, const N: usize> MpscSend<T> for EmbassySyncBoundedSender
                 match send_fut.as_mut().poll(cx) {
                     Poll::Ready(()) => Poll::Ready(Ok(())),
                     Poll::Pending => {
-                        inner.send_waker.register(cx.waker());
+                        inner
+                            .send_wakers
+                            .lock(|w| w.borrow_mut().register(cx.waker()));
                         if inner.closed.load(Ordering::Acquire) {
                             return Poll::Ready(Err(()));
                         }
@@ -272,9 +281,9 @@ impl<T: Send + 'static, const N: usize> MpscSend<T> for EmbassySyncBoundedSender
 
 impl<T: Send + 'static, const N: usize> Drop for EmbassySyncBoundedReceiver<T, N> {
     fn drop(&mut self) {
-        // Receiver gone — mark closed and wake any awaiting sender.
+        // Receiver gone — mark closed and wake every awaiting sender.
         self.inner.closed.store(true, Ordering::Release);
-        self.inner.send_waker.wake();
+        self.inner.send_wakers.lock(|w| w.borrow_mut().wake());
     }
 }
 
@@ -334,7 +343,7 @@ impl<T: Send + 'static> UnboundedSend<T> for EmbassySyncUnboundedSender<T> {
 impl<T: Send + 'static> Drop for EmbassySyncUnboundedReceiver<T> {
     fn drop(&mut self) {
         self.inner.closed.store(true, Ordering::Release);
-        self.inner.send_waker.wake();
+        self.inner.send_wakers.lock(|w| w.borrow_mut().wake());
     }
 }
 

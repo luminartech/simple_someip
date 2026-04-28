@@ -31,8 +31,8 @@
 //! | `client-tokio` | no | Adds the `Client::new` / `TokioSpawner` / `TokioTransport` convenience defaults; implies `client` + tokio + socket2 |
 //! | `server` | no | Trait-surface server; implies `std` + futures (no tokio) |
 //! | `server-tokio` | no | Adds the `Server::new` / `TokioTransport` / `TokioTimer` convenience defaults; implies `server` + tokio + socket2 |
-//! | `bare_metal` | no | Activates embassy-sync, `static_channels` module (no-alloc `ChannelFactory`), `AtomicInterfaceHandle`, and `StaticE2EHandle`. See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable bare-metal integration examples. |
-//! | `embassy_channels` | no | Heap-backed `EmbassySyncChannels` `ChannelFactory` (implies `bare_metal` + `alloc`). Useful for tests before sizing static pools. |
+//! | `bare_metal` | no | Activates embassy-sync, the `static_channels` module (no-alloc `ChannelFactory`), and `AtomicInterfaceHandle`. `StaticE2EHandle` additionally requires `std` because the underlying `E2ERegistry` is currently `std`-only. See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable bare-metal integration examples. |
+//! | `embassy_channels` | no | Heap-backed `EmbassySyncChannels` `ChannelFactory`. Implies `bare_metal` and pulls `extern crate alloc;` into the crate; **on `no_std`, downstream consumers must provide a `#[global_allocator]`**. Useful for tests / early prototypes before sizing static pools. |
 //!
 //! The default feature set is `["std"]`, which links `std` and enables
 //! the `RawPayload` / `VecSdHeader` helpers. For a minimal build with
@@ -159,8 +159,8 @@ mod raw_payload;
 /// [`transport::Timer`] + [`transport::E2ERegistryHandle`] +
 /// [`server::SubscriptionHandle`], so the bare `server` feature exposes the
 /// trait-surface server. The `server-tokio` feature additionally provides
-/// the tokio convenience constructors ([`server::Server::new`],
-/// [`server::Server::new_with_loopback`], [`server::Server::new_passive`])
+/// the tokio convenience constructors (`server::Server::new`,
+/// `server::Server::new_with_loopback`, `server::Server::new_passive`)
 /// that default the type parameters to
 /// `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>` /
 /// `TokioTransport` / `TokioTimer`.
@@ -208,9 +208,11 @@ pub use server::{Server, ServerDeps, SubscriptionHandle};
 #[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
 #[cfg(feature = "bare_metal")]
-pub use transport::{AtomicInterfaceHandle, StaticE2EHandle, StaticE2EStorage};
+pub use transport::AtomicInterfaceHandle;
 pub use transport::{
     ChannelFactory, E2ERegistryHandle, InterfaceHandle, IoErrorKind, LocalSpawner, MpscRecv,
     MpscSend, OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram, SocketOptions, Spawner,
     Timer, TransportError, TransportFactory, TransportSocket, UnboundedRecv, UnboundedSend,
 };
+#[cfg(all(feature = "bare_metal", feature = "std"))]
+pub use transport::{StaticE2EHandle, StaticE2EStorage};
