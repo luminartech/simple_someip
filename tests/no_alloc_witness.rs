@@ -118,8 +118,13 @@ static GLOBAL: PanicAllocator = PanicAllocator;
 
 /// Arm the panic allocator for the duration of `f`, then disarm.
 ///
-/// Any heap allocation inside `f` causes an immediate panic, which exits
-/// the process with a non-zero status code — CI failure.
+/// Any heap allocation inside `f` triggers `diagnose_and_abort`, which
+/// disarms the allocator (so the diagnostic itself can format), prints
+/// the offending kind/size/align to stderr, and then calls
+/// [`std::process::abort`]. The process exits with a non-zero status
+/// without unwinding — CI failure. (Aborting rather than panicking
+/// keeps us off the panic-unwind path, whose machinery would itself
+/// allocate and re-trip the trap.)
 fn assert_no_alloc<T>(label: &str, f: impl FnOnce() -> T) -> T {
     ARMED.store(true, Ordering::SeqCst);
     let result = f();
