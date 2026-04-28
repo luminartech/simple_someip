@@ -265,7 +265,7 @@ where
     /// group fails.
     pub async fn new_with_deps(
         deps: ServerDeps<F, Tm, R, S>,
-        config: ServerConfig,
+        mut config: ServerConfig,
         multicast_loopback: bool,
     ) -> Result<Self, Error> {
         let ServerDeps {
@@ -278,9 +278,15 @@ where
         // Bind unicast socket for receiving subscriptions.
         let unicast_addr = SocketAddrV4::new(config.interface, config.local_port);
         let unicast_socket = Arc::new(factory.bind(unicast_addr, &SocketOptions::new()).await?);
+        // If the caller passed local_port = 0, the kernel picked an
+        // ephemeral port. Back-fill the config so SD offers and event
+        // publishers advertise the actual bound port instead of 0.
+        let bound_port = unicast_socket.local_addr()?.port();
+        config.local_port = bound_port;
         tracing::info!(
-            "Server bound to {} for service 0x{:04X}",
-            unicast_addr,
+            "Server bound to {}:{} for service 0x{:04X}",
+            config.interface,
+            bound_port,
             config.service_id
         );
 
@@ -334,7 +340,7 @@ where
     /// Returns an error if binding either socket fails.
     pub async fn new_passive_with_deps(
         deps: ServerDeps<F, Tm, R, S>,
-        config: ServerConfig,
+        mut config: ServerConfig,
     ) -> Result<Self, Error> {
         let ServerDeps {
             factory,
@@ -346,9 +352,13 @@ where
         // Bind unicast socket at the configured local_port.
         let unicast_addr = SocketAddrV4::new(config.interface, config.local_port);
         let unicast_socket = Arc::new(factory.bind(unicast_addr, &SocketOptions::new()).await?);
+        // Back-fill the actual bound port if the caller passed 0.
+        let bound_port = unicast_socket.local_addr()?.port();
+        config.local_port = bound_port;
         tracing::info!(
-            "Passive server bound to {} for service 0x{:04X}",
-            unicast_addr,
+            "Passive server bound to {}:{} for service 0x{:04X}",
+            config.interface,
+            bound_port,
             config.service_id
         );
 

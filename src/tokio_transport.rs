@@ -266,13 +266,12 @@ fn bind_with_options(addr: SocketAddrV4, options: SocketOptions) -> std::io::Res
     if let Some(iface) = options.multicast_if_v4 {
         raw.set_multicast_if_v4(&iface)?;
     }
-    // Only set the multicast-loop flag when the caller is doing
-    // multicast (i.e. they configured a multicast interface). Calling
-    // `set_multicast_loop_v4` on a plain-unicast socket on some
-    // backends can return EOPNOTSUPP / EINVAL; even on Linux where it
-    // succeeds, it's a meaningless syscall. Mirrors the behavior of
-    // the `client::SocketManager` discovery-bind path.
-    if options.multicast_if_v4.is_some() {
+    // Apply the multicast-loop flag whenever the caller is doing
+    // multicast (interface configured) OR explicitly asked for
+    // loop=true. Skipping the syscall only when both are unset avoids
+    // a no-op call on plain-unicast sockets while still honouring an
+    // explicit caller request.
+    if options.multicast_if_v4.is_some() || options.multicast_loop_v4 {
         raw.set_multicast_loop_v4(options.multicast_loop_v4)?;
     }
     let bind_addr = SocketAddr::new(IpAddr::V4(*addr.ip()), addr.port());

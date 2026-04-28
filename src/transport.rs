@@ -303,6 +303,11 @@ pub struct SocketOptions {
     /// Loop multicast traffic back to sockets on the same host
     /// (`IP_MULTICAST_LOOP`). Required when running a SOME/IP server and
     /// client on the same machine for testing.
+    ///
+    /// Honoured whenever it is set to `true` OR [`Self::multicast_if_v4`]
+    /// is `Some`. The default (`false`) is only suppressed when there is
+    /// no multicast interface configured — in that case the flag has no
+    /// effect anyway.
     pub multicast_loop_v4: bool,
 }
 
