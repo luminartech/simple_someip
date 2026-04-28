@@ -804,6 +804,14 @@ mod std_handle_impls {
 ///     (StaticE2EHandle::new(registry_storage), AtomicInterfaceHandle::new(&IFACE_ADDR))
 /// }
 /// ```
+///
+/// # No-allocator targets
+///
+/// The example above uses `Box::leak` because [`E2ERegistry::new`] is not
+/// currently `const`. On a target with no allocator, swap that for a
+/// `static`-cell pattern (e.g. `static_cell::StaticCell::init`) once the
+/// registry constructor becomes `const`-friendly. The handle layer itself
+/// never allocates — only the one-time storage materialization does.
 #[cfg(feature = "bare_metal")]
 pub mod bare_metal_handle_impls {
     use super::{E2ERegistryHandle, InterfaceHandle};
@@ -834,9 +842,10 @@ pub mod bare_metal_handle_impls {
         }
     }
 
-    // SAFETY: &'static is already Sync; CriticalSectionRawMutex is Send + Sync.
-    unsafe impl Send for StaticE2EHandle {}
-    unsafe impl Sync for StaticE2EHandle {}
+    // Send + Sync are derived automatically: `&'static StaticE2EStorage`
+    // is `Send + Sync` because `BlockingMutex<CriticalSectionRawMutex,
+    // RefCell<E2ERegistry>>` is `Sync` (the embassy-sync mutex serializes
+    // access to the inner `RefCell`, which is itself `Send`).
 
     impl E2ERegistryHandle for StaticE2EHandle {
         fn register(&self, key: E2EKey, profile: E2EProfile) {
@@ -882,6 +891,14 @@ pub mod bare_metal_handle_impls {
     /// static IFACE_ADDR: AtomicU32 = AtomicU32::new(0);
     /// let handle = AtomicInterfaceHandle::new(&IFACE_ADDR);
     /// ```
+    ///
+    /// # Memory ordering
+    ///
+    /// Both `get` and `set` use [`Ordering::Relaxed`]. The address is the
+    /// only synchronized datum — no other memory state is published or
+    /// observed alongside it — so single-location atomicity is sufficient.
+    /// A reader will eventually observe the latest write; there is no
+    /// happens-before relationship to establish with surrounding memory.
     #[derive(Clone, Copy)]
     pub struct AtomicInterfaceHandle(&'static AtomicU32);
 
@@ -892,9 +909,8 @@ pub mod bare_metal_handle_impls {
         }
     }
 
-    // SAFETY: &'static AtomicU32 is already Send + Sync.
-    unsafe impl Send for AtomicInterfaceHandle {}
-    unsafe impl Sync for AtomicInterfaceHandle {}
+    // Send + Sync are derived automatically: `&'static AtomicU32` is
+    // `Send + Sync` because `AtomicU32` is `Sync`.
 
     impl InterfaceHandle for AtomicInterfaceHandle {
         fn get(&self) -> Ipv4Addr {

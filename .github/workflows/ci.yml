@@ -65,6 +65,8 @@ jobs:
         with:
           tool: cargo-llvm-cov, cargo-nextest
       - run: cargo test --no-default-features
+      - name: No-alloc witness (explicit gate)
+        run: cargo test --features client,bare_metal --test no_alloc_witness
       - run: cargo llvm-cov nextest --all-features --lcov --output-path ./target/lcov.info
       - name: Upload Coverage report
         uses: codecov/codecov-action@v5
