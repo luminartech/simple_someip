@@ -1,5 +1,5 @@
-//! Phase-13.6 witness test: prove that `Client` can be constructed and
-//! driven without the `client-tokio` feature, using a static-pool
+//! Witness test: prove that `Client` can be constructed and driven
+//! without the `client-tokio` feature, using a static-pool
 //! [`ChannelFactory`] declared via [`define_static_channels!`] — the
 //! production-bound bare-metal path (no per-call heap allocation for
 //! channel storage).
@@ -7,11 +7,11 @@
 //! [`ChannelFactory`]: simple_someip::transport::ChannelFactory
 //! [`define_static_channels!`]: simple_someip::define_static_channels
 //!
-//! Originally a phase-13.5 witness using `EmbassySyncChannels` (which
-//! still heap-allocates an `Arc<Channel<...>>` per call). Phase 13.6c
-//! shipped the `static_channels` module; phase 13.6d shipped the
-//! `define_static_channels!` macro; this test now exercises that
-//! macro end-to-end against `Client::new_with_deps`.
+//! Originally a witness using `EmbassySyncChannels` (which still
+//! heap-allocates an `Arc<Channel<...>>` per call). The `static_channels`
+//! module and `define_static_channels!` macro now provide a truly
+//! heap-free path; this test exercises that macro end-to-end against
+//! `Client::new_with_deps`.
 //!
 //! `simple-someip` is compiled with `default-features = false,
 //! features = ["client", "bare_metal"]` per the `required-features`
@@ -78,6 +78,7 @@ define_static_channels! {
 struct MockPipe {
     sent: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
     inbound: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
+    inbound_waker: Mutex<Option<core::task::Waker>>,
 }
 
 #[derive(Clone)]
@@ -88,11 +89,9 @@ struct MockFactory {
 
 impl TransportFactory for MockFactory {
     type Socket = MockSocket;
-    fn bind(
-        &self,
-        addr: SocketAddrV4,
-        _options: &SocketOptions,
-    ) -> impl Future<Output = Result<Self::Socket, TransportError>> + Send {
+    type BindFuture<'a> =
+        core::pin::Pin<Box<dyn Future<Output = Result<Self::Socket, TransportError>> + Send + 'a>>;
+    fn bind<'a>(&'a self, addr: SocketAddrV4, _options: &'a SocketOptions) -> Self::BindFuture<'a> {
         let pipe = Arc::clone(&self.pipe);
         let mut p = self.local_port.lock().unwrap();
         // Mock: assign port deterministically. If caller asked for 0,
@@ -105,7 +104,7 @@ impl TransportFactory for MockFactory {
             addr.port()
         };
         let local = SocketAddrV4::new(*addr.ip(), port);
-        async move { Ok(MockSocket { pipe, local }) }
+        Box::pin(async move { Ok(MockSocket { pipe, local }) })
     }
 }
 
@@ -152,10 +151,22 @@ impl Future for MockRecvFut<'_> {
                 }))
             }
             None => {
-                // No data: return Pending and wake immediately to keep
-                // the run-loop ticking. Real bare-metal impls park the
-                // task on an interrupt-driven waker.
-                cx.waker().wake_by_ref();
+                // Park on the pipe's waker. Real bare-metal impls park
+                // the task on an interrupt-driven waker;
+                // wake_by_ref-on-empty would CPU-peg the test runtime.
+                *me.pipe.inbound_waker.lock().unwrap() = Some(cx.waker().clone());
+                // Re-check after registering to close the lost-wakeup
+                // window between the pop_front above and the waker
+                // store here.
+                if let Some((bytes, source)) = me.pipe.inbound.lock().unwrap().pop_front() {
+                    let n = bytes.len().min(me.buf.len());
+                    me.buf[..n].copy_from_slice(&bytes[..n]);
+                    return Poll::Ready(Ok(ReceivedDatagram {
+                        bytes_received: n,
+                        source,
+                        truncated: n < bytes.len(),
+                    }));
+                }
                 Poll::Pending
             }
         }
@@ -198,14 +209,17 @@ impl TransportSocket for MockSocket {
 
 struct MockTimer;
 impl Timer for MockTimer {
-    async fn sleep(&self, _duration: Duration) {
-        // The witness here is "the *crate* doesn't pull tokio under
-        // `--features client,bare_metal`," not "the test runs without
-        // tokio at all." The test runtime itself is `#[tokio::test]`
-        // (tokio is a `dev-dependency`), so using `tokio::task::yield_now`
-        // inside this mock is fine — it only proves the production
-        // crate's no-tokio path compiles.
-        tokio::task::yield_now().await;
+    type SleepFuture<'a> = core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    fn sleep(&self, duration: Duration) -> Self::SleepFuture<'_> {
+        // Honor `duration` — the `Timer` trait's contract is that
+        // implementations MAY overshoot but MUST NOT undershoot. The
+        // test runtime is `#[tokio::test]` (tokio is a `dev-dependency`),
+        // so using `tokio::time::sleep` is fine — it only proves the
+        // production crate's no-tokio path compiles. A real bare-metal
+        // impl would replace this with `embassy_time::Timer::after`.
+        Box::pin(async move {
+            tokio::time::sleep(duration).await;
+        })
     }
 }
 

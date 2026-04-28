@@ -3,9 +3,9 @@
 use super::service_info::Subscriber;
 use core::future::Future;
 use heapless::{Vec as HeaplessVec, index_map::FnvIndexMap};
-use std::{net::SocketAddrV4, vec::Vec};
 #[cfg(feature = "server-tokio")]
 use std::sync::Arc;
+use std::{net::SocketAddrV4, vec::Vec};
 #[cfg(feature = "server-tokio")]
 use tokio::sync::RwLock;
 
@@ -15,7 +15,7 @@ const EVENT_GROUPS_CAP: usize = 32;
 
 /// Max number of subscribers per event group. Excess subscribers are dropped
 /// with a `warn!` log rather than silently.
-const SUBSCRIBERS_PER_GROUP: usize = 16;
+pub(crate) const SUBSCRIBERS_PER_GROUP: usize = 16;
 
 // Compile-time invariants. Trip these at `cargo build` so that retuning
 // the constants above can't quietly produce a `subscribe` impl that
@@ -262,13 +262,14 @@ impl Default for SubscriptionManager {
 /// Shared handle to the server's subscription table.
 ///
 /// Abstracts over `Arc<RwLock<SubscriptionManager>>` on `std` and over
-/// critical-section-backed equivalents on bare metal. All methods return
-/// futures so the implementation can block on an async read/write lock
-/// without holding a guard across an `await` point visible to callers.
+/// critical-section-backed equivalents on bare metal. The futures
+/// returned by the methods are not required to be `Send`, allowing
+/// single-threaded executors (embassy-style) to satisfy the trait
+/// without an `Arc<RwLock>`-style shared state.
 ///
 /// Both `Server` and `EventPublisher` clone the same handle at construction
 /// time; the underlying subscription state is shared between them.
-pub trait SubscriptionHandle: Clone + Send + Sync + 'static {
+pub trait SubscriptionHandle: Clone + 'static {
     /// Add a subscriber to an event group.
     ///
     /// Idempotent: if the subscriber is already present, this is a no-op
@@ -280,7 +281,7 @@ pub trait SubscriptionHandle: Clone + Send + Sync + 'static {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), SubscribeError>> + Send + '_;
+    ) -> impl Future<Output = Result<(), SubscribeError>> + '_;
 
     /// Remove a subscriber from an event group.
     fn unsubscribe(
@@ -289,18 +290,29 @@ pub trait SubscriptionHandle: Clone + Send + Sync + 'static {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = ()> + Send + '_;
+    ) -> impl Future<Output = ()> + '_;
 
-    /// Returns a snapshot of all subscribers for the given event group.
+    /// Visit each subscriber for the given event group with `f`.
     ///
-    /// The snapshot is owned — the caller may iterate over it after this
-    /// future resolves without holding any lock.
-    fn get_subscribers(
-        &self,
+    /// The implementation typically holds an internal read lock for the
+    /// duration of the visit; `f` is a synchronous `FnMut` callback —
+    /// the caller MUST NOT yield inside it. A common pattern is to copy
+    /// the subscriber addresses into a stack-allocated buffer here, then
+    /// release the lock and dispatch sends in a second phase.
+    ///
+    /// Returns the total number of subscribers visited. Replaces the
+    /// previous `get_subscribers -> Vec<Subscriber>` API; the visitor
+    /// pattern lets `EventPublisher::publish_event` avoid a per-event
+    /// heap allocation.
+    fn for_each_subscriber<'a, F>(
+        &'a self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-    ) -> impl Future<Output = Vec<Subscriber>> + Send + '_;
+        f: F,
+    ) -> impl Future<Output = usize> + 'a
+    where
+        F: FnMut(&Subscriber) + 'a;
 }
 
 #[cfg(feature = "server-tokio")]
@@ -311,7 +323,7 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), SubscribeError>> + Send + '_ {
+    ) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
         let this = self.clone();
         async move {
             this.write()
@@ -326,7 +338,7 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = ()> + Send + '_ {
+    ) -> impl Future<Output = ()> + '_ {
         let this = self.clone();
         async move {
             this.write().await.unsubscribe(
@@ -338,17 +350,29 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
         }
     }
 
-    fn get_subscribers(
-        &self,
+    fn for_each_subscriber<'a, F>(
+        &'a self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-    ) -> impl Future<Output = Vec<Subscriber>> + Send + '_ {
+        mut f: F,
+    ) -> impl Future<Output = usize> + 'a
+    where
+        F: FnMut(&Subscriber) + 'a,
+    {
         let this = self.clone();
         async move {
-            this.read()
-                .await
-                .get_subscribers(service_id, instance_id, event_group_id)
+            let guard = this.read().await;
+            let key = (service_id, instance_id, event_group_id);
+            match guard.subscriptions.get(&key) {
+                Some(list) => {
+                    for sub in list {
+                        f(sub);
+                    }
+                    list.len()
+                }
+                None => 0,
+            }
         }
     }
 }
@@ -456,5 +480,131 @@ mod tests {
         );
         assert_eq!(manager.subscription_count(), EVENT_GROUPS_CAP);
         assert!(manager.get_subscribers(0x5B, 1, overflow_eg).is_empty());
+    }
+
+    #[test]
+    fn unsubscribe_one_of_multiple_leaves_group_intact() {
+        let mut manager = SubscriptionManager::new();
+        let a1 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8001);
+        let a2 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 8002);
+
+        manager.subscribe(0x5B, 1, 0x01, a1).unwrap();
+        manager.subscribe(0x5B, 1, 0x01, a2).unwrap();
+        assert_eq!(manager.subscription_count(), 2);
+
+        // Remove just a1 — group must stay with a2 only.
+        manager.unsubscribe(0x5B, 1, 0x01, a1);
+        assert_eq!(manager.subscription_count(), 1);
+        let subs = manager.get_subscribers(0x5B, 1, 0x01);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].address, a2);
+    }
+
+    #[test]
+    fn unsubscribe_address_not_in_existing_group_is_noop() {
+        let mut manager = SubscriptionManager::new();
+        let a1 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8001);
+        let a2 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 8002);
+
+        manager.subscribe(0x5B, 1, 0x01, a1).unwrap();
+        // a2 was never subscribed — unsubscribe must not panic or affect a1.
+        manager.unsubscribe(0x5B, 1, 0x01, a2);
+        assert_eq!(manager.subscription_count(), 1);
+        assert_eq!(manager.get_subscribers(0x5B, 1, 0x01)[0].address, a1);
+    }
+
+    #[test]
+    fn get_subscribers_returns_all_in_group() {
+        let mut manager = SubscriptionManager::new();
+        let addrs: Vec<SocketAddrV4> = (0..4)
+            .map(|i| SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, i + 1), 8000 + u16::from(i)))
+            .collect();
+        for &a in &addrs {
+            manager.subscribe(0x5B, 1, 0x01, a).unwrap();
+        }
+        let subs = manager.get_subscribers(0x5B, 1, 0x01);
+        assert_eq!(subs.len(), 4);
+        for &a in &addrs {
+            assert!(subs.iter().any(|s| s.address == a));
+        }
+    }
+
+    #[test]
+    fn subscription_count_spans_multiple_event_groups() {
+        let mut manager = SubscriptionManager::new();
+        let a = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8000);
+        manager.subscribe(0x5B, 1, 0x01, a).unwrap();
+        manager.subscribe(0x5B, 1, 0x02, a).unwrap();
+        manager.subscribe(0x5C, 1, 0x01, a).unwrap();
+        assert_eq!(manager.subscription_count(), 3);
+    }
+
+    #[test]
+    fn subscribe_error_display() {
+        use std::string::ToString;
+        assert!(
+            SubscribeError::SubscribersPerGroupFull
+                .to_string()
+                .contains("subscribers-per-group"),
+        );
+        assert!(
+            SubscribeError::EventGroupsFull
+                .to_string()
+                .contains("event-group"),
+        );
+    }
+
+    #[cfg(feature = "server-tokio")]
+    mod tokio_handle {
+        use super::*;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        #[tokio::test]
+        async fn for_each_subscriber_visits_all() {
+            let handle: Arc<RwLock<SubscriptionManager>> =
+                Arc::new(RwLock::new(SubscriptionManager::new()));
+            let a1 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8001);
+            let a2 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 8002);
+
+            handle.subscribe(0x5B, 1, 0x01, a1).await.unwrap();
+            handle.subscribe(0x5B, 1, 0x01, a2).await.unwrap();
+
+            let mut visited = Vec::new();
+            let count = handle
+                .for_each_subscriber(0x5B, 1, 0x01, |s| visited.push(s.address))
+                .await;
+
+            assert_eq!(count, 2);
+            assert!(visited.contains(&a1));
+            assert!(visited.contains(&a2));
+        }
+
+        #[tokio::test]
+        async fn for_each_subscriber_empty_group_returns_zero() {
+            let handle: Arc<RwLock<SubscriptionManager>> =
+                Arc::new(RwLock::new(SubscriptionManager::new()));
+            let count = handle.for_each_subscriber(0x5B, 1, 0x01, |_| {}).await;
+            assert_eq!(count, 0);
+        }
+
+        #[tokio::test]
+        async fn for_each_subscriber_reflects_unsubscribe() {
+            let handle: Arc<RwLock<SubscriptionManager>> =
+                Arc::new(RwLock::new(SubscriptionManager::new()));
+            let a1 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8001);
+            let a2 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 8002);
+
+            handle.subscribe(0x5B, 1, 0x01, a1).await.unwrap();
+            handle.subscribe(0x5B, 1, 0x01, a2).await.unwrap();
+            handle.unsubscribe(0x5B, 1, 0x01, a1).await;
+
+            let mut visited = Vec::new();
+            let count = handle
+                .for_each_subscriber(0x5B, 1, 0x01, |s| visited.push(s.address))
+                .await;
+            assert_eq!(count, 1);
+            assert_eq!(visited, [a2]);
+        }
     }
 }

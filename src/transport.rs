@@ -251,9 +251,43 @@ pub enum IoErrorKind {
     /// The network layer rejected the operation (routing, MTU, etc.).
     #[error("network unreachable")]
     NetworkUnreachable,
+    /// A non-blocking call would have blocked. Transient — caller
+    /// should retry or wait for readiness rather than treating as
+    /// fatal.
+    #[error("would block")]
+    WouldBlock,
     /// Any error that does not fit a more specific variant.
     #[error("i/o error")]
     Other,
+}
+
+impl IoErrorKind {
+    /// Returns `true` if a recv-loop error of this kind is a transient
+    /// condition that should not count toward a "kill the loop after N
+    /// consecutive errors" cap. Includes:
+    /// - [`Self::ConnectionRefused`] — a peer's ICMP port-unreachable
+    ///   reply is normal noise on a SOME/IP host that probes services
+    ///   that are not yet available;
+    /// - [`Self::NetworkUnreachable`] — a routing blip during
+    ///   interface migration is recoverable;
+    /// - [`Self::WouldBlock`] — by definition, retry-on-readiness;
+    /// - [`Self::Interrupted`] — a signal interrupted the syscall;
+    /// - [`Self::TimedOut`] — caller-driven timeout, not a socket
+    ///   failure.
+    ///
+    /// All other kinds (including [`Self::Other`]) are treated as
+    /// potentially-fatal and DO count toward the cap.
+    #[must_use]
+    pub fn is_transient_recv(self) -> bool {
+        matches!(
+            self,
+            Self::ConnectionRefused
+                | Self::NetworkUnreachable
+                | Self::WouldBlock
+                | Self::Interrupted
+                | Self::TimedOut,
+        )
+    }
 }
 
 /// Errors returned by [`TransportSocket`] and [`TransportFactory`]
@@ -301,9 +335,19 @@ pub struct SocketOptions {
     /// backend choose.
     pub multicast_if_v4: Option<Ipv4Addr>,
     /// Loop multicast traffic back to sockets on the same host
-    /// (`IP_MULTICAST_LOOP`). Required when running a SOME/IP server and
-    /// client on the same machine for testing.
-    pub multicast_loop_v4: bool,
+    /// (`IP_MULTICAST_LOOP`). Tri-state:
+    /// - `None` — the OS default applies (Linux: enabled by default).
+    ///   Use this when you have no opinion on loopback.
+    /// - `Some(true)` — explicitly enable. Required when running a
+    ///   SOME/IP server and client on the same machine for testing.
+    /// - `Some(false)` — explicitly disable.
+    ///
+    /// Backends call `setsockopt(IP_MULTICAST_LOOP)` only for
+    /// `Some(_)`. A previous bool-typed field caused
+    /// `multicast_if_v4: Some(_), multicast_loop_v4: false` to silently
+    /// turn loopback OFF on hosts where the OS default was ON, even
+    /// when the caller had no opinion on loopback.
+    pub multicast_loop_v4: Option<bool>,
 }
 
 impl SocketOptions {
@@ -314,7 +358,7 @@ impl SocketOptions {
             reuse_address: false,
             reuse_port: false,
             multicast_if_v4: None,
-            multicast_loop_v4: false,
+            multicast_loop_v4: None,
         }
     }
 }
@@ -368,7 +412,7 @@ pub struct ReceivedDatagram {
 /// [`SocketOptions::multicast_if_v4`] only selects the *outbound*
 /// multicast interface.
 ///
-/// # Associated future types (Phase 12)
+/// # Associated future types
 ///
 /// The [`SendFuture`](Self::SendFuture) and [`RecvFuture`](Self::RecvFuture)
 /// associated types let consumers express `Send` bounds on the futures
@@ -511,6 +555,19 @@ pub trait TransportFactory {
     /// The socket type produced by this factory.
     type Socket: TransportSocket;
 
+    /// Future returned by [`Self::bind`].
+    ///
+    /// As an associated GAT (matching [`TransportSocket::SendFuture`] /
+    /// [`TransportSocket::RecvFuture`]), consumers can express a `Send`
+    /// bound at use sites that need it without forcing every backend
+    /// to produce a `Send` bind future. Multi-threaded callers add
+    /// `where for<'a> F::BindFuture<'a>: Send`; single-threaded callers
+    /// (`Client::new_with_deps_local`) drop that bound and accept a
+    /// `!Send` bind future from a backend like embassy-net.
+    type BindFuture<'a>: Future<Output = Result<Self::Socket, TransportError>>
+    where
+        Self: 'a;
+
     /// Bind a new socket to `addr` with the requested `options`.
     ///
     /// `addr.port() == 0` requests an ephemeral port; call
@@ -522,18 +579,7 @@ pub trait TransportFactory {
     /// Returns [`TransportError::AddressInUse`] if the requested address
     /// and port pair is already bound (and `reuse_*` was not enabled).
     /// Other backend-level failures surface as [`TransportError::Io`].
-    /// The returned future is required to be `Send` so callers spawning
-    /// the bind on a multithreaded executor (e.g. `tokio::spawn` of a
-    /// run-loop that internally awaits `bind`) compile cleanly. All
-    /// in-tree impls (`TokioTransport`, the bare-metal `MockFactory`,
-    /// the embassy adapter) satisfy this; an impl that holds `!Send`
-    /// state across a yield in `bind` would need to either lift that
-    /// state out or use a `LocalSet`-based spawner.
-    fn bind(
-        &self,
-        addr: SocketAddrV4,
-        options: &SocketOptions,
-    ) -> impl Future<Output = Result<Self::Socket, TransportError>> + Send;
+    fn bind<'a>(&'a self, addr: SocketAddrV4, options: &'a SocketOptions) -> Self::BindFuture<'a>;
 }
 
 /// Executor-agnostic sleep primitive.
@@ -544,16 +590,21 @@ pub trait TransportFactory {
 /// is a one-line wrapper around `tokio::time::sleep`, on embedded it is a
 /// one-line wrapper around `embassy_time::Timer::after` or similar.
 pub trait Timer {
+    /// Future returned by [`Self::sleep`].
+    ///
+    /// As an associated GAT, consumers can require `Send` at use sites
+    /// (`where for<'a> Tm::SleepFuture<'a>: Send`) without forcing every
+    /// backend's sleep future to be `Send`. Multi-threaded callers
+    /// (`Server::announcement_loop`, the tokio Client) add the bound;
+    /// single-threaded callers do not, accepting a `!Send` future from
+    /// a backend like `embassy_time`.
+    type SleepFuture<'a>: Future<Output = ()>
+    where
+        Self: 'a;
+
     /// Wait for at least `duration` before resolving. Implementations MAY
     /// overshoot but MUST NOT undershoot.
-    ///
-    /// The returned future is required to be `Send` so callers spawning
-    /// the sleep on a multithreaded executor (e.g. a `tokio::spawn`-driven
-    /// run-loop) compile cleanly. Single-task bare-metal callers whose
-    /// `Timer` impl holds `!Send` state across the yield can wrap their
-    /// future in a `Send`-compatible adapter or use a `LocalSet`-based
-    /// spawner.
-    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send;
+    fn sleep(&self, duration: Duration) -> Self::SleepFuture<'_>;
 }
 
 /// Executor-agnostic task-spawning primitive.
@@ -562,21 +613,20 @@ pub trait Timer {
 /// the client's main event loop — otherwise `SocketManager::send`'s
 /// internal oneshot wait deadlocks (the send future parks the main
 /// loop, which is the only thing that would drive the socket loop to
-/// produce its response). Phase 8 hit this and deferred the spawn to
-/// a user-provided `Spawner` here, letting std+tokio callers pass a
-/// one-line `TokioSpawner` and bare-metal callers wrap their own
+/// produce its response). The `Spawner` trait lets std+tokio callers
+/// pass a one-line `TokioSpawner` and bare-metal callers wrap their own
 /// executor's task-spawning primitive.
 ///
-/// # Why this reverses the phase-4 "no executor adapter" rule
+/// # Design rationale
 ///
-/// Phase 4 deliberately avoided wrapping spawn to prevent "reinventing
-/// embassy" and trait-object dispatch in the hot path. Concrete
-/// evidence from phase 8 showed that without a spawn abstraction,
-/// `Inner::bind_*` has to call `tokio::spawn` directly — making the
-/// whole crate tokio-only. The revised rule: spawn DOES need a trait,
-/// but we avoid the phase-4 concerns by (1) keeping the trait generic
-/// (monomorphized, no `dyn Spawner`) and (2) scoping it narrowly —
-/// just spawn, not select/sleep which have other solutions.
+/// The transport-trait design deliberately avoided wrapping spawn to
+/// prevent "reinventing embassy" and trait-object dispatch in the hot
+/// path. However, without a spawn abstraction, `Inner::bind_*` has to
+/// call `tokio::spawn` directly — making the whole crate tokio-only.
+/// The revised rule: spawn DOES need a trait, but we avoid the
+/// concerns by (1) keeping the trait generic (monomorphized, no
+/// `dyn Spawner`) and (2) scoping it narrowly — just spawn, not
+/// select/sleep which have other solutions.
 ///
 /// # Usage
 ///
@@ -597,6 +647,34 @@ pub trait Timer {
 ///     }
 /// }
 /// ```
+/// Local-executor counterpart to [`Spawner`].
+///
+/// Where [`Spawner::spawn`] requires its future to be `Send + 'static`
+/// (matching multi-threaded executors like tokio), `LocalSpawner::spawn_local`
+/// drops the `Send` bound and is the trait that single-threaded
+/// executors — embassy with `task-arena = 0`, tokio's `LocalSet`, async-std
+/// `LocalExecutor`, etc. — implement directly.
+///
+/// The two traits are independent: an executor MAY implement both
+/// (`current_thread` tokio with `LocalSet`), only [`Spawner`]
+/// (multi-threaded tokio default), or only [`LocalSpawner`]
+/// (single-task embassy).
+///
+/// Use `crate::client::Client::new_with_deps_local` (under `client`) to
+/// construct a Client whose run-loop and per-socket loops are submitted
+/// through a
+/// `LocalSpawner` (and whose `TransportFactory::Socket` is therefore
+/// allowed to be `!Send`).
+pub trait LocalSpawner {
+    /// Submit `future` to the local executor. Must not block; must
+    /// arrange for the future to be polled to completion on some
+    /// single-threaded task.
+    ///
+    /// The future is **not** required to be `Send` — it may capture
+    /// `Rc`, `RefCell`, raw `*mut` pointers, etc.
+    fn spawn_local(&self, future: impl Future<Output = ()> + 'static);
+}
+
 pub trait Spawner {
     /// Submit `future` to the executor. Must not block; must arrange
     /// for the future to be polled to completion on some task.
@@ -612,9 +690,10 @@ pub trait Spawner {
     /// progress, no oneshot resolution; the caller's `send` hangs
     /// forever.
     ///
-    /// The `MockSpawner` in `examples/bare_metal/` deliberately
-    /// demonstrates the wrong pattern (drops the future) and annotates
-    /// it as DEMO-ONLY for exactly this reason.
+    /// The mock spawners in `tests/bare_metal_*.rs` demonstrate
+    /// correct integration patterns; callers that simply drop the
+    /// future will deadlock on any operation that requires a socket
+    /// round-trip.
     ///
     /// # Fire-and-forget by design
     ///
@@ -807,18 +886,79 @@ mod std_handle_impls {
 ///
 /// # No-allocator targets
 ///
-/// The example above uses `Box::leak` because [`E2ERegistry::new`] is not
+/// The example above uses `Box::leak` because [`crate::e2e::E2ERegistry::new()`] is not
 /// currently `const`. On a target with no allocator, swap that for a
 /// `static`-cell pattern (e.g. `static_cell::StaticCell::init`) once the
 /// registry constructor becomes `const`-friendly. The handle layer itself
 /// never allocates — only the one-time storage materialization does.
 #[cfg(feature = "bare_metal")]
 pub mod bare_metal_handle_impls {
-    use super::{E2ERegistryHandle, InterfaceHandle};
-    use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, Error as E2EError};
-    use core::cell::RefCell;
+    use super::InterfaceHandle;
     use core::net::Ipv4Addr;
     use core::sync::atomic::{AtomicU32, Ordering};
+
+    // `StaticE2EHandle` wraps `E2ERegistry`, which currently requires
+    // `feature = "std"` because its backing storage is `HashMap`. Ported
+    // separately below so the rest of this module — in particular
+    // `AtomicInterfaceHandle` — is available in pure `no_std` bare-metal
+    // builds.
+
+    /// No-alloc [`InterfaceHandle`] backed by a `&'static AtomicU32`.
+    ///
+    /// IPv4 addresses are encoded as big-endian `u32` (`Ipv4Addr::into::<u32>`).
+    /// All clones are the same thin pointer. Declare the backing storage in a
+    /// `static`:
+    ///
+    /// ```ignore
+    /// static IFACE_ADDR: AtomicU32 = AtomicU32::new(0);
+    /// let handle = AtomicInterfaceHandle::new(&IFACE_ADDR);
+    /// ```
+    ///
+    /// # Memory ordering
+    ///
+    /// `set` uses [`Ordering::Release`] and `get` uses
+    /// [`Ordering::Acquire`] so a reader on a weakly-ordered core sees
+    /// updates promptly. Cheap on x86-TSO (free) and inexpensive on
+    /// aarch64 (one `dmb ish`).
+    #[derive(Clone, Copy)]
+    pub struct AtomicInterfaceHandle(&'static AtomicU32);
+
+    impl AtomicInterfaceHandle {
+        /// Wraps a static reference to the backing atomic.
+        pub const fn new(addr: &'static AtomicU32) -> Self {
+            Self(addr)
+        }
+    }
+
+    // Send + Sync are derived automatically: `&'static AtomicU32` is
+    // `Send + Sync` because `AtomicU32` is `Sync`.
+
+    impl InterfaceHandle for AtomicInterfaceHandle {
+        fn get(&self) -> Ipv4Addr {
+            // `Acquire` ordering pairs with the `Release` store below
+            // so a reader sees the most recent address promptly even
+            // on weakly-ordered hardware. The cost over `Relaxed` is
+            // a `dmb ish` on aarch64; on x86-TSO it is free.
+            Ipv4Addr::from(self.0.load(Ordering::Acquire))
+        }
+
+        fn set(&self, addr: Ipv4Addr) {
+            self.0.store(u32::from(addr), Ordering::Release);
+        }
+    }
+}
+
+/// `StaticE2EHandle` — no-alloc `E2ERegistryHandle` backed by a
+/// `&'static` critical-section mutex. Requires `feature = "std"` because
+/// the underlying [`crate::e2e::E2ERegistry`] currently uses `HashMap`.
+/// On a pure-`no_std` target the registry must be ported (see crate
+/// roadmap); until then, callers wanting bare-metal interface handles
+/// (the more common need) can use [`AtomicInterfaceHandle`] alone.
+#[cfg(all(feature = "bare_metal", feature = "std"))]
+pub mod bare_metal_e2e_impl {
+    use super::E2ERegistryHandle;
+    use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, Error as E2EError};
+    use core::cell::RefCell;
     use embassy_sync::blocking_mutex::Mutex;
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
@@ -842,11 +982,6 @@ pub mod bare_metal_handle_impls {
         }
     }
 
-    // Send + Sync are derived automatically: `&'static StaticE2EStorage`
-    // is `Send + Sync` because `BlockingMutex<CriticalSectionRawMutex,
-    // RefCell<E2ERegistry>>` is `Sync` (the embassy-sync mutex serializes
-    // access to the inner `RefCell`, which is itself `Send`).
-
     impl E2ERegistryHandle for StaticE2EHandle {
         fn register(&self, key: E2EKey, profile: E2EProfile) {
             self.0.lock(|cell| cell.borrow_mut().register(key, profile));
@@ -867,8 +1002,10 @@ pub mod bare_metal_handle_impls {
             upper_header: [u8; 8],
             output: &mut [u8],
         ) -> Option<Result<usize, E2EError>> {
-            self.0
-                .lock(|cell| cell.borrow_mut().protect(key, payload, upper_header, output))
+            self.0.lock(|cell| {
+                cell.borrow_mut()
+                    .protect(key, payload, upper_header, output)
+            })
         }
 
         fn check<'a>(
@@ -877,54 +1014,17 @@ pub mod bare_metal_handle_impls {
             payload: &'a [u8],
             upper_header: [u8; 8],
         ) -> Option<(E2ECheckStatus, &'a [u8])> {
-            self.0.lock(|cell| cell.borrow_mut().check(key, payload, upper_header))
-        }
-    }
-
-    /// No-alloc [`InterfaceHandle`] backed by a `&'static AtomicU32`.
-    ///
-    /// IPv4 addresses are encoded as big-endian `u32` (`Ipv4Addr::into::<u32>`).
-    /// All clones are the same thin pointer. Declare the backing storage in a
-    /// `static`:
-    ///
-    /// ```ignore
-    /// static IFACE_ADDR: AtomicU32 = AtomicU32::new(0);
-    /// let handle = AtomicInterfaceHandle::new(&IFACE_ADDR);
-    /// ```
-    ///
-    /// # Memory ordering
-    ///
-    /// Both `get` and `set` use [`Ordering::Relaxed`]. The address is the
-    /// only synchronized datum — no other memory state is published or
-    /// observed alongside it — so single-location atomicity is sufficient.
-    /// A reader will eventually observe the latest write; there is no
-    /// happens-before relationship to establish with surrounding memory.
-    #[derive(Clone, Copy)]
-    pub struct AtomicInterfaceHandle(&'static AtomicU32);
-
-    impl AtomicInterfaceHandle {
-        /// Wraps a static reference to the backing atomic.
-        pub const fn new(addr: &'static AtomicU32) -> Self {
-            Self(addr)
-        }
-    }
-
-    // Send + Sync are derived automatically: `&'static AtomicU32` is
-    // `Send + Sync` because `AtomicU32` is `Sync`.
-
-    impl InterfaceHandle for AtomicInterfaceHandle {
-        fn get(&self) -> Ipv4Addr {
-            Ipv4Addr::from(self.0.load(Ordering::Relaxed))
-        }
-
-        fn set(&self, addr: Ipv4Addr) {
-            self.0.store(u32::from(addr), Ordering::Relaxed);
+            self.0
+                .lock(|cell| cell.borrow_mut().check(key, payload, upper_header))
         }
     }
 }
 
 #[cfg(feature = "bare_metal")]
-pub use bare_metal_handle_impls::{AtomicInterfaceHandle, StaticE2EHandle, StaticE2EStorage};
+pub use bare_metal_handle_impls::AtomicInterfaceHandle;
+
+#[cfg(all(feature = "bare_metal", feature = "std"))]
+pub use bare_metal_e2e_impl::{StaticE2EHandle, StaticE2EStorage};
 
 // ── Channel-handle abstraction ────────────────────────────────────────────
 //
@@ -932,7 +1032,8 @@ pub use bare_metal_handle_impls::{AtomicInterfaceHandle, StaticE2EHandle, Static
 // the channel primitive used by the client. `TokioChannels` (in
 // `tokio_transport`) is the default for `std + tokio` builds;
 // `EmbassySyncChannels` (in `crate::embassy_channels`, gated behind
-// `bare_metal`) is the alternative for no-tokio / no_std builds.
+// `embassy_channels` feature) is a heap-backed alternative for no-tokio builds;
+// `static_channels` (gated behind `bare_metal`) is the no-alloc alternative.
 
 /// Returned by [`OneshotRecv::recv`] when the sender was dropped before
 /// sending a value.
@@ -1017,14 +1118,14 @@ pub trait UnboundedRecv<T: Send + 'static>: Send + 'static {
 ///
 /// The three channel families:
 /// - **oneshot** — single-shot rendezvous, capacity 1. Used for command
-///   completion callbacks inside [`ControlMessage`](crate::client).
+///   completion callbacks inside `crate::client::ControlMessage`.
 /// - **bounded** — finite-capacity MPSC queue. Used for the control channel
 ///   and per-socket send / receive queues.
 /// - **unbounded** — notionally unbounded MPSC queue (embassy-sync
 ///   implementations use a large-capacity channel). Used for the
 ///   `ClientUpdate` stream from `Inner` to `Client`.
 ///
-/// # Per-`T` opt-in via the `*Pooled<Self>` traits (Phase 13.6b)
+/// # Per-`T` opt-in via the `*Pooled<Self>` traits
 ///
 /// The three constructor methods are generic over the channeled type
 /// `T`, but a heap-free static-pool implementation needs to map each `T`
@@ -1042,7 +1143,7 @@ pub trait UnboundedRecv<T: Send + 'static>: Send + 'static {
 /// publish a blanket `impl<T: Send + 'static> OneshotPooled<Self> for T`
 /// (and its bounded / unbounded peers), so existing user code does not
 /// notice the change. A static-pool backend instead publishes per-`T`
-/// impls (typically generated by a `static_channels!` macro) that wire
+/// impls (typically generated by a `define_static_channels!` macro) that wire
 /// each `T` to its declared pool. Calling `oneshot::<NotDeclared>()`
 /// against such a backend fails at the call site with
 /// `OneshotPooled<MyChannels> is not implemented for NotDeclared`.
@@ -1140,6 +1241,27 @@ mod tests {
 
     use super::*;
 
+    /// `IoErrorKind::is_transient_recv` must classify the well-known
+    /// transient kinds as `true` (so they do not count toward
+    /// `MAX_CONSECUTIVE_RECV_ERRORS` in the per-socket loop) and
+    /// everything else — including the catch-all `Other` — as `false`.
+    /// Regression for H10: an inbound ICMP storm
+    /// (`ConnectionRefused`) was wrongly counted as fatal and tore
+    /// down healthy sockets after 16 transient blips.
+    #[test]
+    fn io_error_kind_transient_classification() {
+        // Transient kinds — must NOT count toward fatal-error cap.
+        assert!(IoErrorKind::ConnectionRefused.is_transient_recv());
+        assert!(IoErrorKind::NetworkUnreachable.is_transient_recv());
+        assert!(IoErrorKind::WouldBlock.is_transient_recv());
+        assert!(IoErrorKind::Interrupted.is_transient_recv());
+        assert!(IoErrorKind::TimedOut.is_transient_recv());
+
+        // Fatal-class kinds — DO count toward the cap.
+        assert!(!IoErrorKind::PermissionDenied.is_transient_recv());
+        assert!(!IoErrorKind::Other.is_transient_recv());
+    }
+
     /// Drive a Future to completion on the test thread, assuming it never
     /// yields (as with [`core::future::ready`] and its sync-in-disguise
     /// peers). Panics if the future returns `Poll::Pending`.
@@ -1161,7 +1283,7 @@ mod tests {
         assert!(!opts.reuse_address);
         assert!(!opts.reuse_port);
         assert!(opts.multicast_if_v4.is_none());
-        assert!(!opts.multicast_loop_v4);
+        assert!(opts.multicast_loop_v4.is_none());
     }
 
     #[test]
@@ -1220,12 +1342,13 @@ mod tests {
 
     impl TransportFactory for NullFactory {
         type Socket = NullSocket;
+        type BindFuture<'a> = core::future::Ready<Result<Self::Socket, TransportError>>;
 
-        fn bind(
-            &self,
+        fn bind<'a>(
+            &'a self,
             addr: SocketAddrV4,
-            _options: &SocketOptions,
-        ) -> impl Future<Output = Result<Self::Socket, TransportError>> {
+            _options: &'a SocketOptions,
+        ) -> Self::BindFuture<'a> {
             core::future::ready(Ok(NullSocket { addr }))
         }
     }
@@ -1233,7 +1356,9 @@ mod tests {
     struct NullTimer;
 
     impl Timer for NullTimer {
-        fn sleep(&self, _duration: Duration) -> impl Future<Output = ()> {
+        type SleepFuture<'a> = core::future::Ready<()>;
+
+        fn sleep(&self, _duration: Duration) -> Self::SleepFuture<'_> {
             core::future::ready(())
         }
     }

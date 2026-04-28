@@ -22,10 +22,7 @@ use crate::{
     },
     protocol::{self, Message},
     traits::PayloadWireFormat,
-    transport::{
-        ChannelFactory, E2ERegistryHandle, MpscRecv, OneshotSend, Spawner, TransportFactory,
-        TransportSocket, UnboundedSend,
-    },
+    transport::{ChannelFactory, E2ERegistryHandle, MpscRecv, OneshotSend, UnboundedSend},
 };
 
 use super::error::Error;
@@ -309,11 +306,10 @@ where
 
 pub(super) struct Inner<
     PayloadDefinitions: PayloadWireFormat + 'static,
-    F: TransportFactory,
-    S: Spawner,
     Tm: Timer,
     R: E2ERegistryHandle,
     C: ChannelFactory,
+    D,
 > {
     /// MPSC Receiver used to receive control messages from outer client
     control_receiver: C::BoundedReceiver<ControlMessage<PayloadDefinitions, C>, 4>,
@@ -352,14 +348,13 @@ pub(super) struct Inner<
     e2e_registry: R,
     /// Enable multicast loopback on SD sockets for same-host testing
     multicast_loopback: bool,
-    /// Transport factory used by `bind_*` to construct sockets. The
-    /// `client-tokio` convenience constructors pass in `TokioTransport`;
-    /// bare-metal callers supply their own [`TransportFactory`] impl.
-    factory: F,
-    /// Task-spawner used by `bind_*` to drive per-socket I/O loops.
-    /// On `client-tokio` builds this is [`TokioSpawner`] (which wraps
-    /// `tokio::spawn`); bare-metal callers plug in their own.
-    spawner: S,
+    /// Bind dispatch — abstracts the bind-and-spawn step over either a
+    /// [`Spawner`](crate::transport::Spawner) (Send-required) or a
+    /// [`LocalSpawner`](crate::transport::LocalSpawner) (single-task)
+    /// path. Holds the [`TransportFactory`](crate::transport::TransportFactory)
+    /// and the spawner internally; see
+    /// [`crate::client::bind_dispatch`] for the two impls.
+    dispatch: D,
     /// Async sleep primitive used by the run-loop's idle tick and any
     /// future periodic-emission paths. On `client-tokio` builds this is
     /// [`TokioTimer`] (which wraps `tokio::time::sleep`).
@@ -368,14 +363,8 @@ pub(super) struct Inner<
     phantom: core::marker::PhantomData<PayloadDefinitions>,
 }
 
-impl<
-    P: PayloadWireFormat,
-    F: TransportFactory,
-    S: Spawner,
-    Tm: Timer,
-    R: E2ERegistryHandle,
-    C: ChannelFactory,
-> std::fmt::Debug for Inner<P, F, S, Tm, R, C>
+impl<P: PayloadWireFormat, Tm: Timer, R: E2ERegistryHandle, C: ChannelFactory, D> std::fmt::Debug
+    for Inner<P, Tm, R, C, D>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inner")
@@ -388,17 +377,13 @@ impl<
     }
 }
 
-impl<PayloadDefinitions, F, S, Tm, R, C> Inner<PayloadDefinitions, F, S, Tm, R, C>
+impl<PayloadDefinitions, Tm, R, C, D> Inner<PayloadDefinitions, Tm, R, C, D>
 where
     PayloadDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + Send + 'static,
-    F: TransportFactory + Send + Sync + 'static,
-    F::Socket: Send + Sync + 'static,
-    for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
-    for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
-    S: Spawner + Send + Sync + 'static,
-    Tm: Timer + Send + Sync + 'static,
+    Tm: Timer + 'static,
     R: E2ERegistryHandle,
     C: ChannelFactory,
+    D: crate::client::bind_dispatch::BindDispatch<PayloadDefinitions, C, R> + 'static,
     // Channel-bound bundle (see comment in `client::mod`).
     Result<(), Error>: crate::transport::OneshotPooled<C>,
     Result<PayloadDefinitions, Error>: crate::transport::OneshotPooled<C>,
@@ -411,26 +396,28 @@ where
     super::ClientUpdate<PayloadDefinitions>: crate::transport::UnboundedPooled<C>,
 {
     /// Construct an `Inner` and return the control/update channels plus
-    /// the run-loop future. The caller drives the future on its
-    /// executor (typically `tokio::spawn` on `client-tokio` builds, or
-    /// a custom [`Spawner`] on bare-metal).
+    /// the run-loop future.
     ///
-    /// The future is bounded `Send + 'static` so it can be spawned on
-    /// multithreaded executors. Bare-metal consumers whose transport
-    /// produces `!Send` state will get a cfg-gated `!Send` alternative
-    /// alongside a future single-task port.
+    /// The dispatch is one of [`SpawnerDispatch`] (Send-required) or
+    /// [`LocalSpawnerDispatch`] (single-task) — the
+    /// `Client::new_with_deps` / `Client::new_with_deps_local` public
+    /// constructors pick the right one. The returned future inherits
+    /// the dispatch's auto-trait set: `Send` if the dispatch is
+    /// Send-aware and all dependencies are `Send`, `!Send` otherwise.
+    ///
+    /// [`SpawnerDispatch`]: super::bind_dispatch::SpawnerDispatch
+    /// [`LocalSpawnerDispatch`]: super::bind_dispatch::LocalSpawnerDispatch
     #[allow(clippy::type_complexity)]
     pub fn build(
         interface: Ipv4Addr,
         e2e_registry: R,
         multicast_loopback: bool,
-        factory: F,
-        spawner: S,
+        dispatch: D,
         timer: Tm,
     ) -> (
         C::BoundedSender<ControlMessage<PayloadDefinitions, C>, 4>,
         C::UnboundedReceiver<ClientUpdate<PayloadDefinitions>>,
-        impl core::future::Future<Output = ()> + Send + 'static,
+        impl core::future::Future<Output = ()> + 'static,
     ) {
         info!("Initializing SOME/IP Client");
         let (control_sender, control_receiver) = C::bounded::<_, 4>();
@@ -452,8 +439,7 @@ where
             sd_session_has_wrapped: false,
             e2e_registry,
             multicast_loopback,
-            factory,
-            spawner,
+            dispatch,
             timer,
             phantom: core::marker::PhantomData,
         };
@@ -464,16 +450,16 @@ where
         if self.discovery_socket.is_some() {
             Ok(())
         } else {
-            let socket = SocketManager::bind_discovery_seeded_with_transport(
-                &self.factory,
-                &self.spawner,
-                self.interface,
-                self.e2e_registry.clone(),
-                self.sd_session_id,
-                self.sd_session_has_wrapped,
-                self.multicast_loopback,
-            )
-            .await?;
+            let socket = self
+                .dispatch
+                .bind_discovery(
+                    self.interface,
+                    self.e2e_registry.clone(),
+                    self.sd_session_id,
+                    self.sd_session_has_wrapped,
+                    self.multicast_loopback,
+                )
+                .await?;
             self.discovery_socket = Some(socket);
             Ok(())
         }
@@ -509,13 +495,10 @@ where
             );
             return Err(Error::Capacity("unicast_sockets"));
         }
-        let unicast_socket = SocketManager::bind_with_transport(
-            &self.factory,
-            &self.spawner,
-            port,
-            self.e2e_registry.clone(),
-        )
-        .await?;
+        let unicast_socket = self
+            .dispatch
+            .bind_unicast(port, self.e2e_registry.clone())
+            .await?;
         let bound_port = unicast_socket.port();
         // Capacity was checked above, so insert cannot report "full" here.
         // A defensive check guards against a future refactor that changes
@@ -592,29 +575,36 @@ where
         ),
         Error,
     > {
-        if let Some(receiver) = socket_manager {
-            match receiver.receive().await {
-                Some(result) => match result {
-                    Ok(received) => {
-                        let someip_header = received.message.header().clone();
-                        if let Some(sd_header) = received.message.sd_header() {
-                            Ok((received.source, someip_header, sd_header.to_owned()))
-                        } else {
-                            Err(Error::UnexpectedDiscoveryMessage(someip_header))
-                        }
-                    }
-                    Err(err) => Err(err),
-                },
-                None => Err(Error::SocketClosedUnexpectedly),
-            }
+        let Some(socket) = socket_manager else {
+            // If we don't have a receiver, return a future that never resolves
+            return future::pending().await;
+        };
+        let Some(result) = socket.receive().await else {
+            // Socket loop has exited. Evict the dead manager so
+            // subsequent polls don't busy-loop on a closed receiver —
+            // instead they fall through to the `future::pending()`
+            // arm and wait until the user re-binds discovery (e.g.
+            // via SetInterface).
+            *socket_manager = None;
+            return Err(Error::SocketClosedUnexpectedly);
+        };
+        let received = result?;
+        let someip_header = received.message.header().clone();
+        if let Some(sd_header) = received.message.sd_header() {
+            Ok((received.source, someip_header, sd_header.to_owned()))
         } else {
-            // If we don't have a receiver, we should return a future that never resolves
-            future::pending().await
+            Err(Error::UnexpectedDiscoveryMessage(someip_header))
         }
     }
 
     /// Receive from any bound unicast socket. Returns the first message ready
     /// from any socket. If no sockets are bound, returns a future that never resolves.
+    ///
+    /// A unicast socket whose loop has exited (`poll_receive` returns
+    /// `Poll::Ready(None)`) is evicted from the map immediately rather
+    /// than having `Err(SocketClosedUnexpectedly)` returned once per
+    /// poll forever, which would CPU-pin the run-loop and flood the
+    /// update stream.
     async fn receive_any_unicast(
         unicast_sockets: &mut FnvIndexMap<
             u16,
@@ -626,17 +616,45 @@ where
             return future::pending().await;
         }
 
-        // Use poll_fn to manually poll each socket's receiver
         std::future::poll_fn(|cx| {
-            for socket in unicast_sockets.values_mut() {
+            // Collect ports of any sockets that report `Ready(None)`
+            // (loop has exited). Evict them after the iteration so we
+            // do not mutate the map while iterating it.
+            let mut dead_ports: heapless::Vec<u16, UNICAST_SOCKETS_CAP> = heapless::Vec::new();
+            let mut delivered: Option<Result<ReceivedMessage<PayloadDefinitions>, Error>> = None;
+            for (port, socket) in unicast_sockets.iter_mut() {
                 if let Poll::Ready(result) = socket.poll_receive(cx) {
-                    return Poll::Ready(match result {
-                        Some(msg) => msg,
-                        None => Err(Error::SocketClosedUnexpectedly),
-                    });
+                    match result {
+                        Some(msg) => {
+                            delivered = Some(msg);
+                            break;
+                        }
+                        None => {
+                            // Mark for eviction; keep scanning others.
+                            let _ = dead_ports.push(*port);
+                        }
+                    }
                 }
             }
-            Poll::Pending
+            for port in &dead_ports {
+                unicast_sockets.remove(port);
+                tracing::warn!("Unicast socket on port {port} closed; evicted from registry");
+            }
+            if let Some(msg) = delivered {
+                Poll::Ready(msg)
+            } else if unicast_sockets.is_empty() {
+                // The last socket just got evicted; fall through to a
+                // pending state so the next bind triggers a fresh poll.
+                Poll::Pending
+            } else if !dead_ports.is_empty() {
+                // At least one socket got evicted but others remain;
+                // re-poll so the caller observes the next ready event
+                // promptly instead of waiting on a stale waker.
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Pending
+            }
         })
         .await
     }
@@ -679,23 +697,15 @@ where
                         }
                         return;
                     }
-                    info!("Binding to interface: {}", interface);
-                    let bind_result = self.bind_discovery().await;
-                    match &bind_result {
-                        Ok(()) => {
-                            info!("Successfully Bound to interface: {}", interface);
-                        }
-                        Err(e) => {
-                            warn!("Failed to bind to interface: {}. Error: {:?}", interface, e);
-                        }
-                    }
-                    // A dropped receiver is legitimate control flow
-                    // (cancellation, `_no_wait` variants, panic
-                    // recovery). `debug!` instead of `warn!` keeps
-                    // observability for the "this shouldn't happen"
-                    // case without cluttering production warn logs
-                    // when callers deliberately drop.
-                    if response.send(bind_result).is_err() {
+                    // Reaching here: discovery is not bound AND
+                    // `interface == self.interface`. Do nothing — the
+                    // user expressed no change of intent. Previously
+                    // this branch silently called `bind_discovery()`
+                    // as a side effect, which surprised callers
+                    // probing the current interface via
+                    // `client.set_interface(client.interface()).await`.
+                    debug!("SetInterface: no-op (interface unchanged, discovery not bound)");
+                    if response.send(Ok(())).is_err() {
                         debug!("SetInterface: caller dropped the response receiver");
                     }
                 }
@@ -855,18 +865,25 @@ where
                     };
                     let socket = self.unicast_sockets.get_mut(&source_port).unwrap();
 
-                    // Stamp request ID
+                    // Stamp request ID with the CURRENT session counter,
+                    // but only advance it on successful send. A failed
+                    // send should not chew through the 16-bit session
+                    // space — under transient transport failure that
+                    // could wrap toward in-flight pending_responses
+                    // far faster than expected.
                     let request_id =
                         (u32::from(self.client_id) << 16) | u32::from(self.session_counter);
                     message.set_request_id(request_id);
-                    self.session_counter = self.session_counter.wrapping_add(1);
-                    if self.session_counter == 0 {
-                        self.session_counter = 1;
-                    }
 
                     let send_result = socket.send(target, message).await;
                     match send_result {
                         Ok(()) => {
+                            // Advance the counter only after a real
+                            // wire transmission. Skip 0 on wrap.
+                            self.session_counter = self.session_counter.wrapping_add(1);
+                            if self.session_counter == 0 {
+                                self.session_counter = 1;
+                            }
                             let _ = send_complete.send(Ok(()));
                             self.track_or_reject_pending_response(request_id, response);
                         }
@@ -943,7 +960,16 @@ where
                     match &mut self.discovery_socket {
                         None => match self.bind_discovery().await {
                             Ok(()) => {
-                                // See re-enqueue note on SetInterface above.
+                                // Re-enqueue the Subscribe carrying the
+                                // ALREADY-bound `unicast_port` so pass-2
+                                // hits the `bind_unicast` dedupe path
+                                // instead of allocating a second
+                                // ephemeral socket. Carrying the
+                                // original `client_port=0` would
+                                // re-bind ephemerally and leak the
+                                // original socket into
+                                // `unicast_sockets` until the slot cap
+                                // hit.
                                 if let Err(rejected) =
                                     self.request_queue.push_front(ControlMessage::Subscribe {
                                         service_id,
@@ -951,7 +977,7 @@ where
                                         major_version,
                                         ttl,
                                         event_group_id,
-                                        client_port,
+                                        client_port: unicast_port,
                                         response,
                                     })
                                 {
@@ -1214,11 +1240,13 @@ mod tests {
     /// and `Arc<RwLock<Ipv4Addr>>` handles.
     type TestInner = Inner<
         TestPayload,
-        crate::tokio_transport::TokioTransport,
-        TokioSpawner,
         crate::tokio_transport::TokioTimer,
         Arc<Mutex<E2ERegistry>>,
         TokioChannels,
+        crate::client::bind_dispatch::SpawnerDispatch<
+            crate::tokio_transport::TokioTransport,
+            TokioSpawner,
+        >,
     >;
 
     #[test]
@@ -1387,8 +1415,10 @@ mod tests {
             sd_session_has_wrapped: false,
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             multicast_loopback: false,
-            factory: TokioTransport,
-            spawner: TokioSpawner,
+            dispatch: crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             timer: TokioTimer,
             phantom: core::marker::PhantomData,
         }
@@ -1580,7 +1610,7 @@ mod tests {
             count: Arc<AtomicUsize>,
         }
 
-        impl Spawner for CountingSpawner {
+        impl crate::transport::Spawner for CountingSpawner {
             fn spawn(&self, future: impl core::future::Future<Output = ()> + Send + 'static) {
                 self.count.fetch_add(1, Ordering::SeqCst);
                 // Delegate so the socket loop actually runs — matters
@@ -1604,11 +1634,10 @@ mod tests {
         let (update_sender, _update_receiver) = mpsc::unbounded_channel();
         let mut inner: Inner<
             TestPayload,
-            TokioTransport,
-            CountingSpawner,
             TokioTimer,
             Arc<Mutex<E2ERegistry>>,
             TokioChannels,
+            crate::client::bind_dispatch::SpawnerDispatch<TokioTransport, CountingSpawner>,
         > = Inner {
             control_receiver,
             request_queue: Deque::new(),
@@ -1626,8 +1655,10 @@ mod tests {
             sd_session_has_wrapped: false,
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             multicast_loopback: false,
-            factory: TokioTransport,
-            spawner,
+            dispatch: crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner,
+            },
             timer: TokioTimer,
             phantom: core::marker::PhantomData,
         };
@@ -1655,8 +1686,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1698,8 +1731,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1718,8 +1753,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1738,8 +1775,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1760,8 +1799,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1793,8 +1834,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1867,8 +1910,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1888,8 +1933,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1908,8 +1955,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1938,8 +1987,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             true,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1956,8 +2007,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -1979,8 +2032,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2003,8 +2058,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2031,8 +2088,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2065,8 +2124,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2093,8 +2154,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2115,8 +2178,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2153,8 +2218,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2174,8 +2241,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2202,8 +2271,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2236,8 +2307,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);
@@ -2286,8 +2359,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Arc::new(Mutex::new(E2ERegistry::new())),
             false,
-            TokioTransport,
-            TokioSpawner,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+            },
             TokioTimer,
         );
         let _run_handle = tokio::spawn(run_fut);

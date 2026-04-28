@@ -15,8 +15,8 @@
 //! consumer would use:
 //!
 //! ```text
-//! cargo build -p bare_metal
-//! cargo run  -p bare_metal
+//! cargo build -p bare_metal_client
+//! cargo run  -p bare_metal_client
 //! ```
 //!
 //! # Patterns demonstrated
@@ -25,7 +25,7 @@
 //! |---------|-------------|----------------------|
 //! | Channel factory | `BareMetalChannels` via `define_static_channels!` | same macro, sized to your HWM |
 //! | Transport | `MockFactory` / `MockSocket` | `embassy_net`, smoltcp, custom Ethernet ISR |
-//! | Timer | `MockTimer` using `tokio::task::yield_now` | `embassy_time::Timer::after` |
+//! | Timer | `MockTimer` using `tokio::time::sleep` | `embassy_time::Timer::after` |
 //! | Task spawner | `TokioBackedSpawner` | `embassy_executor::Spawner` |
 //! | Lock handles | `Arc<Mutex<_>>` / `Arc<RwLock<_>>` | stack-allocated handles (see below) |
 //!
@@ -48,8 +48,8 @@ use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::client::Error as ClientError;
+use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::define_static_channels;
 use simple_someip::e2e::E2ERegistry;
 use simple_someip::protocol::sd::RebootFlag;
@@ -91,6 +91,7 @@ define_static_channels! {
 struct MockPipe {
     sent: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
     inbound: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
+    inbound_waker: Mutex<Option<core::task::Waker>>,
 }
 
 #[derive(Clone)]
@@ -101,12 +102,10 @@ struct MockFactory {
 
 impl TransportFactory for MockFactory {
     type Socket = MockSocket;
+    type BindFuture<'a> =
+        core::pin::Pin<Box<dyn Future<Output = Result<Self::Socket, TransportError>> + Send + 'a>>;
 
-    fn bind(
-        &self,
-        addr: SocketAddrV4,
-        _options: &SocketOptions,
-    ) -> impl Future<Output = Result<Self::Socket, TransportError>> + Send {
+    fn bind<'a>(&'a self, addr: SocketAddrV4, _options: &'a SocketOptions) -> Self::BindFuture<'a> {
         let pipe = Arc::clone(&self.pipe);
         let port = if addr.port() == 0 {
             let mut p = self.next_port.lock().unwrap();
@@ -116,7 +115,7 @@ impl TransportFactory for MockFactory {
             addr.port()
         };
         let local = SocketAddrV4::new(*addr.ip(), port);
-        async move { Ok(MockSocket { pipe, local }) }
+        Box::pin(async move { Ok(MockSocket { pipe, local }) })
     }
 }
 
@@ -151,6 +150,7 @@ struct MockRecvFut<'a> {
 impl Future for MockRecvFut<'_> {
     type Output = Result<ReceivedDatagram, TransportError>;
 
+    #[allow(clippy::single_match_else)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         match me.pipe.inbound.lock().unwrap().pop_front() {
@@ -163,11 +163,20 @@ impl Future for MockRecvFut<'_> {
                     truncated: n < bytes.len(),
                 }))
             }
-            // No datagram — wake immediately and yield. A real bare-metal
-            // impl registers the waker on the network driver's RX-ready
-            // interrupt instead of busy-waking.
+            // No datagram — register the waker on the pipe and park.
+            // A real bare-metal impl registers the waker on the network
+            // driver's RX-ready interrupt instead.
             None => {
-                cx.waker().wake_by_ref();
+                *me.pipe.inbound_waker.lock().unwrap() = Some(cx.waker().clone());
+                if let Some((bytes, source)) = me.pipe.inbound.lock().unwrap().pop_front() {
+                    let n = bytes.len().min(me.buf.len());
+                    me.buf[..n].copy_from_slice(&bytes[..n]);
+                    return Poll::Ready(Ok(ReceivedDatagram {
+                        bytes_received: n,
+                        source,
+                        truncated: n < bytes.len(),
+                    }));
+                }
                 Poll::Pending
             }
         }
@@ -187,7 +196,10 @@ impl TransportSocket for MockSocket {
     }
 
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> MockRecvFut<'a> {
-        MockRecvFut { pipe: Arc::clone(&self.pipe), buf }
+        MockRecvFut {
+            pipe: Arc::clone(&self.pipe),
+            buf,
+        }
     }
 
     fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
@@ -205,14 +217,18 @@ impl TransportSocket for MockSocket {
 
 // ── Mock Timer ────────────────────────────────────────────────────────
 //
-// Uses tokio's yield_now to keep the example executor happy. Real
-// firmware replaces this with e.g. `embassy_time::Timer::after(d).await`.
+// Honors `duration` per the `Timer` trait contract (MAY overshoot, MUST
+// NOT undershoot). Real firmware replaces this with e.g.
+// `embassy_time::Timer::after(d).await`.
 
 struct MockTimer;
 
 impl Timer for MockTimer {
-    async fn sleep(&self, _duration: Duration) {
-        tokio::task::yield_now().await;
+    type SleepFuture<'a> = core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    fn sleep(&self, duration: Duration) -> Self::SleepFuture<'_> {
+        Box::pin(async move {
+            tokio::time::sleep(duration).await;
+        })
     }
 }
 

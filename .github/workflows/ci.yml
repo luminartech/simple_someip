@@ -65,6 +65,20 @@ jobs:
         with:
           tool: cargo-llvm-cov, cargo-nextest
       - run: cargo test --no-default-features
+      - name: Build matrix — partial feature subsets
+        run: |
+          cargo build --no-default-features --features bare_metal
+          cargo build --no-default-features --features embassy_channels
+          cargo build --no-default-features --features client
+          cargo build --no-default-features --features server
+          cargo build --no-default-features --features client,server
+      - name: Doc — partial feature subsets (catch unresolved intra-doc links)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps --no-default-features --features client
+          cargo doc --no-deps --no-default-features --features server,bare_metal
+          cargo doc --no-deps --all-features
       - name: No-alloc witness (explicit gate)
         run: cargo test --features client,bare_metal --test no_alloc_witness
       - run: cargo llvm-cov nextest --all-features --lcov --output-path ./target/lcov.info

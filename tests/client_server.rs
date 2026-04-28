@@ -23,8 +23,8 @@
 //! `cargo test --workspace` (parallel default) is expected to flake on
 //! ~half of the tests in this file. The unit-test suite under
 //! `cargo test --lib` does not have this issue and runs reliably in
-//! parallel. The fix is tracked alongside the phase 10+ bare-metal
-//! refactor (which will need to abstract the port anyway).
+//! parallel. The fix is tracked alongside the bare-metal refactor
+//! (which will need to abstract the port anyway).
 
 use simple_someip::e2e::{E2ECheckStatus, E2EKey, E2EProfile, Profile4Config};
 use simple_someip::protocol::{Header, Message, MessageId, sd};
@@ -80,9 +80,7 @@ type TestEventPublisher = simple_someip::server::EventPublisher<
 /// Create a server on an ephemeral unicast port, returning (Server, actual_port).
 async fn create_server(service_id: u16, instance_id: u16) -> (TestServer, u16) {
     let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, service_id, instance_id);
-    let mut server: TestServer = TestServer::new(config)
-        .await
-        .expect("Server::new failed");
+    let mut server: TestServer = TestServer::new(config).await.expect("Server::new failed");
     let port = match server.unicast_local_addr().expect("local_addr failed") {
         std::net::SocketAddr::V4(a) => a.port(),
         _ => panic!("expected IPv4"),

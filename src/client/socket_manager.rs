@@ -1,57 +1,44 @@
 //! Client-side UDP socket management.
 //!
-//! Each bound socket is backed by a `TokioSocket` (concrete, phase-5
-//! compromise — see the `bind_discovery_seeded_with_transport`
-//! docstring for the RTN-gap analysis) with its I/O loop running on a
-//! caller-supplied [`crate::transport::Spawner`]. Phase 9 introduced
-//! the `Spawner` trait specifically to make this submission point
-//! pluggable; on `std + tokio` consumers pass
-//! [`crate::tokio_transport::TokioSpawner`] and the behavior matches
-//! the previous `tokio::spawn` path exactly.
+//! Each bound socket is backed by a transport socket (concrete
+//! `TokioSocket` on `std + tokio`, pluggable via [`TransportFactory`] on
+//! bare-metal — see the `bind_discovery_seeded_with_transport` docstring
+//! for the RTN-gap analysis) with its I/O loop running on a
+//! caller-supplied [`crate::transport::Spawner`]. The `Spawner` trait
+//! makes the task-submission point pluggable; on `std + tokio` consumers
+//! pass [`crate::tokio_transport::TokioSpawner`] and the behavior matches
+//! a direct `tokio::spawn` call.
 //!
 //! # Why `Inner` can't drive per-socket futures itself
 //!
 //! Briefly experimented with having `Inner` drive per-socket futures
-//! via `FuturesUnordered` (phase 8 attempt, reverted). That deadlocks:
-//! `Inner::handle_control_message` awaits `SocketManager::send`,
-//! which internally awaits an mpsc→oneshot round-trip that requires
-//! the socket loop to make progress. But `Inner::run_future` is
-//! parked inside the handler, so nothing polls the socket loop.
-//! Concurrency between the two is mandatory and cannot come from the
-//! same task — hence the `Spawner` hook.
+//! via `FuturesUnordered`. That deadlocks: `Inner::handle_control_message`
+//! awaits `SocketManager::send`, which internally awaits an mpsc→oneshot
+//! round-trip that requires the socket loop to make progress. But
+//! `Inner::run_future` is parked inside the handler, so nothing polls
+//! the socket loop. Concurrency between the two is mandatory and cannot
+//! come from the same task — hence the `Spawner` hook.
 //!
-//! # Bare-metal readiness status
+//! # Bare-metal readiness
 //!
-//! **Completed abstractions (Phases 9-12):**
-//! - `Spawner` trait (Phase 9): task submission is pluggable.
-//! - `E2ERegistryHandle` / `InterfaceHandle` (Phase 10): lock handles
-//!   abstracted away from `Arc<Mutex<_>>` / `Arc<RwLock<_>>`.
-//! - `ChannelFactory` (Phase 11): channel primitives abstracted via
-//!   `TokioChannels` (std) and `EmbassySyncChannels` (`bare_metal`).
-//! - `TransportSocket` GATs (Phase 12): `Socket = TokioSocket` pin
-//!   removed; `SendFuture` / `RecvFuture` associated types express
-//!   `Send` bounds for spawnable socket loops.
+//! The `client` feature exposes the full trait-surface client without
+//! pulling tokio or socket2. The tokio convenience constructors
+//! (`Client::new`, `Client::new_with_loopback`, etc.) that default to
+//! `TokioTransport` + `TokioSpawner` are gated behind `client-tokio`.
 //!
-//! **Phase 13 (client half) complete:** the `client` feature no longer
-//! pulls tokio or socket2. The full `Client` / `Inner` / `SocketManager`
-//! types — including the `bind` / `bind_discovery_seeded` convenience
-//! constructors that default to `TokioTransport` + `TokioSpawner` — are
-//! gated behind the new `client-tokio` feature, which layers tokio +
-//! socket2 on top of `client`.
+//! **Completed abstractions:**
+//! - `Spawner` / `LocalSpawner` traits: task submission is pluggable.
+//! - `E2ERegistryHandle` / `InterfaceHandle`: lock handles abstracted
+//!   away from `Arc<Mutex<_>>` / `Arc<RwLock<_>>`.
+//! - `ChannelFactory`: channel primitives abstracted via `TokioChannels`
+//!   (std) and `EmbassySyncChannels` / `define_static_channels!` (`bare_metal`).
+//! - `TransportSocket` GATs: `Socket = TokioSocket` pin removed;
+//!   `SendFuture` / `RecvFuture` associated types express `Send` bounds
+//!   for spawnable socket loops.
 //!
-//! **Remaining gaps:**
-//! - **Working server without tokio** (Phase 14b): the bare `server`
-//!   feature is currently a topology marker only (Phase 14a, commit
-//!   `b7fc30f`). The actual server engine still requires
-//!   `server-tokio` because `server::sd_state` /
-//!   `server::subscription_manager` reference tokio types directly.
-//!   Phase 14b retargets the engine to the trait surface (mirroring
-//!   phase 13.5 on the client) so a working server lives under just
-//!   `server`.
-//!
-//! For `no_alloc` SOME/IP usage today, consume `protocol`, `e2e`, and
-//! the `transport` trait layer directly — the `bare_metal` example
-//! workspace member demonstrates that surface.
+//! For `no_alloc` SOME/IP usage, consume `protocol`, `e2e`, and the
+//! `transport` trait layer directly — the `bare_metal_client` /
+//! `bare_metal_server` example workspace members demonstrate that surface.
 
 use crate::{
     UDP_BUFFER_SIZE,
@@ -59,8 +46,8 @@ use crate::{
     protocol::{Message, MessageView, sd},
     traits::{PayloadWireFormat, WireFormat},
     transport::{
-        ChannelFactory, E2ERegistryHandle, MpscRecv, MpscSend, OneshotRecv, OneshotSend,
-        ReceivedDatagram, SocketOptions, Spawner, TransportFactory, TransportSocket,
+        ChannelFactory, E2ERegistryHandle, LocalSpawner, MpscRecv, MpscSend, OneshotRecv,
+        OneshotSend, ReceivedDatagram, SocketOptions, Spawner, TransportFactory, TransportSocket,
     },
 };
 
@@ -74,12 +61,11 @@ use tracing::{debug, error, info, trace, warn};
 
 /// A received message together with the source address it came from.
 ///
-/// TODO(phase 6): narrow `source` to `SocketAddrV4` to match the
-/// `TransportSocket` trait's IPv4-only contract — today the field is
-/// always a `SocketAddr::V4(_)` wrapping, and the V6 variant is
-/// unreachable. Deferred here because the rename ripples through
-/// `DiscoveryMessage` and `ClientUpdate::Unicast`, which is scope creep
-/// for phase 5.
+/// TODO: narrow `source` to `SocketAddrV4` to match the `TransportSocket`
+/// trait's IPv4-only contract — today the field is always a
+/// `SocketAddr::V4(_)` wrapping, and the V6 variant is unreachable.
+/// Deferred because the rename ripples through `DiscoveryMessage` and
+/// `ClientUpdate::Unicast`.
 #[derive(Clone, Debug)]
 pub struct ReceivedMessage<P> {
     pub message: Message<P>,
@@ -216,9 +202,8 @@ where
     ///
     /// # Socket bounds
     ///
-    /// Phase 12 relaxed the previous `F::Socket = TokioSocket` pin by
-    /// switching [`TransportSocket`] to GATs. The factory's socket type
-    /// must now satisfy:
+    /// [`TransportSocket`] uses GATs so the factory's socket type must
+    /// satisfy:
     ///
     /// - `Send + Sync + 'static` — so the socket loop future can be
     ///   spawned on a multithreaded executor and outlive its owner.
@@ -230,19 +215,19 @@ where
     ///
     /// Stable Rust cannot express `Send` bounds on the anonymous future
     /// types of `async fn` trait methods at use sites, which is why
-    /// Phase 12 chose named associated types over RPITIT. See
+    /// the trait uses named associated types over RPITIT. See
     /// [`TransportSocket::SendFuture`](crate::transport::TransportSocket::SendFuture).
     ///
     /// # Bare-metal path
     ///
-    /// Phase 11 abstracted the channel primitives behind
+    /// The channel primitives are abstracted behind
     /// [`ChannelFactory`](crate::transport::ChannelFactory). The
-    /// `bare_metal` feature activates `EmbassySyncChannels` as an
-    /// alternative to `TokioChannels`. With Phase 12's relaxed socket
-    /// bound, a bare-metal consumer can now supply their own
-    /// `TransportSocket` impl (e.g. wrapping `embassy_net::udp::UdpSocket`)
-    /// as long as it is `Send + Sync + 'static` and its `SendFuture` /
-    /// `RecvFuture` GAT projections are `Send` for every borrow lifetime.
+    /// `bare_metal` feature activates `EmbassySyncChannels` and
+    /// `define_static_channels!` as alternatives to `TokioChannels`.
+    /// Bare-metal consumers can supply their own `TransportSocket` impl
+    /// (e.g. wrapping `embassy_net::udp::UdpSocket`) as long as it is
+    /// `Send + Sync + 'static` and its `SendFuture` / `RecvFuture` GAT
+    /// projections are `Send` for every borrow lifetime.
     pub async fn bind_discovery_seeded_with_transport<F, S, R>(
         factory: &F,
         spawner: &S,
@@ -276,7 +261,7 @@ where
             o.reuse_address = true;
             o.reuse_port = true;
             o.multicast_if_v4 = Some(interface);
-            o.multicast_loop_v4 = multicast_loopback;
+            o.multicast_loop_v4 = Some(multicast_loopback);
             o
         };
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, sd::MULTICAST_PORT);
@@ -286,6 +271,49 @@ where
 
         let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
         spawner.spawn(fut);
+        Ok(Self {
+            receiver: rx_rx,
+            sender: tx_tx,
+            local_port: sd::MULTICAST_PORT,
+            session_id: session_id.max(1),
+            session_has_wrapped,
+        })
+    }
+
+    /// `!Send` counterpart to [`Self::bind_discovery_seeded_with_transport`].
+    ///
+    /// Called by [`super::bind_dispatch::LocalSpawnerDispatch`] which is
+    /// wired through [`super::Client::new_with_deps_local`].
+    pub async fn bind_discovery_seeded_with_transport_local<F, S, R>(
+        factory: &F,
+        spawner: &S,
+        interface: Ipv4Addr,
+        e2e_registry: R,
+        session_id: u16,
+        session_has_wrapped: bool,
+        multicast_loopback: bool,
+    ) -> Result<Self, Error>
+    where
+        F: TransportFactory,
+        F::Socket: 'static,
+        S: LocalSpawner,
+        R: E2ERegistryHandle,
+    {
+        let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
+        let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
+        let options = {
+            let mut o = SocketOptions::new();
+            o.reuse_address = true;
+            o.reuse_port = true;
+            o.multicast_if_v4 = Some(interface);
+            o.multicast_loop_v4 = Some(multicast_loopback);
+            o
+        };
+        let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, sd::MULTICAST_PORT);
+        let socket = factory.bind(bind_addr, &options).await?;
+        socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
+        spawner.spawn_local(fut);
         Ok(Self {
             receiver: rx_rx,
             sender: tx_tx,
@@ -360,6 +388,47 @@ where
         let port = socket.local_addr()?.port();
         let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
         spawner.spawn(fut);
+        Ok(Self {
+            receiver: rx_rx,
+            sender: tx_tx,
+            local_port: port,
+            session_id: 1,
+            session_has_wrapped: false,
+        })
+    }
+
+    /// `!Send` counterpart to [`Self::bind_with_transport`].
+    ///
+    /// Identical to the Send variant except: the factory's socket and
+    /// its GAT futures are not required to be `Send`, and the per-socket
+    /// I/O loop is submitted through a [`LocalSpawner`] (single-threaded
+    /// executor) rather than a [`Spawner`] (multi-threaded). Use this
+    /// path when the underlying transport (e.g. embassy-net) produces
+    /// non-`Send` socket state.
+    pub async fn bind_with_transport_local<F, S, R>(
+        factory: &F,
+        spawner: &S,
+        port: u16,
+        e2e_registry: R,
+    ) -> Result<Self, Error>
+    where
+        F: TransportFactory,
+        F::Socket: 'static,
+        S: LocalSpawner,
+        R: E2ERegistryHandle,
+    {
+        let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
+        let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
+        let options = {
+            let mut o = SocketOptions::new();
+            o.reuse_address = true;
+            o
+        };
+        let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+        let socket = factory.bind(bind_addr, &options).await?;
+        let port = socket.local_addr()?.port();
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
+        spawner.spawn_local(fut);
         Ok(Self {
             receiver: rx_rx,
             sender: tx_tx,
@@ -447,7 +516,14 @@ where
             ..
         } = self;
         drop(sender);
-        _ = MpscRecv::recv(&mut receiver).await;
+        // Drain until the receiver returns `None` — i.e. the socket
+        // loop has dropped its sender. A single `recv()` could
+        // resolve via a buffered `ReceivedMessage` while the loop is
+        // still running and still holding the underlying transport
+        // socket; that would leave the OS-level fd / multicast group
+        // potentially still bound when the next `bind_*` ran. Loop
+        // until close is observed.
+        while MpscRecv::recv(&mut receiver).await.is_some() {}
     }
 
     /// Build the I/O loop over any [`TransportSocket`] as a future.
@@ -478,9 +554,7 @@ where
         mut tx_rx: C::BoundedReceiver<SendMessage<MessageDefinitions, C>, 16>,
         e2e_registry: R,
     ) where
-        T: TransportSocket + Send + Sync + 'static,
-        for<'a> T::SendFuture<'a>: Send,
-        for<'a> T::RecvFuture<'a>: Send,
+        T: TransportSocket + 'static,
         R: E2ERegistryHandle,
     {
         // Maximum number of consecutive `recv_from` errors tolerated before
@@ -572,7 +646,13 @@ where
                                     message_length = 16 + protected_len;
                                 }
                                 Some(Err(e)) => {
-                                    error!("E2E protect error: {:?}", e);
+                                    error!(
+                                        "E2E protect failed for configured key {:?}: {:?}; \
+                                         refusing to send unprotected datagram",
+                                        key, e
+                                    );
+                                    let _ = send_message.response.send(Err(Error::E2e(e)));
+                                    continue;
                                 }
                                 None => unreachable!("contains_key was true"),
                             }
@@ -660,22 +740,36 @@ where
                     }
                 }
                 Outcome::Recv(Err(recv_err)) => {
-                    // `tokio_transport::map_io_error` already logs the
-                    // underlying `std::io::Error` (debug for transient
-                    // kinds, warn for unusual ones) — keep this
-                    // call-site at debug to avoid duplicating the same
-                    // failure on the operator's screen.
-                    consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
-                    debug!(
-                        "socket recv_from error ({}/{}): {:?}",
-                        consecutive_recv_errors, MAX_CONSECUTIVE_RECV_ERRORS, recv_err,
+                    // Classify by transport kind: transient kinds
+                    // (ConnectionRefused from inbound ICMP
+                    // port-unreachable, WouldBlock, Interrupted,
+                    // TimedOut, NetworkUnreachable) do NOT count
+                    // toward the consecutive-error cap — a peer
+                    // dying after a flurry of our requests easily
+                    // produces 16 ICMP storms in microseconds, and
+                    // tearing down a healthy socket on that signal
+                    // is wrong. Only fatal kinds (e.g. EBADF mapped
+                    // to `Other`) count toward the kill cap.
+                    let transient = matches!(
+                        recv_err,
+                        crate::transport::TransportError::Io(kind) if kind.is_transient_recv()
                     );
-                    if consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
-                        error!(
-                            "socket recv_from failed {} times consecutively; closing socket loop",
-                            consecutive_recv_errors,
+                    if transient {
+                        debug!("socket recv_from transient error: {:?}", recv_err);
+                    } else {
+                        consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
+                        debug!(
+                            "socket recv_from fatal-class error ({}/{}): {:?}",
+                            consecutive_recv_errors, MAX_CONSECUTIVE_RECV_ERRORS, recv_err,
                         );
-                        break;
+                        if consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                            error!(
+                                "socket recv_from failed {} times consecutively with fatal-class \
+                                 errors; closing socket loop",
+                                consecutive_recv_errors,
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -689,6 +783,7 @@ mod tests {
     use crate::e2e::E2ERegistry;
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
     use crate::tokio_transport::{TokioChannels, TokioSpawner};
+    use std::boxed::Box;
     use std::format;
     use std::sync::{Arc, Mutex};
     use std::vec;
@@ -1001,18 +1096,22 @@ mod tests {
 
         impl TransportFactory for CountingFactory {
             type Socket = TokioSocket;
-            fn bind(
-                &self,
+            type BindFuture<'a> = core::pin::Pin<
+                Box<
+                    dyn Future<Output = Result<Self::Socket, crate::transport::TransportError>>
+                        + Send
+                        + 'a,
+                >,
+            >;
+            fn bind<'a>(
+                &'a self,
                 addr: SocketAddrV4,
-                options: &SocketOptions,
-            ) -> impl Future<Output = Result<Self::Socket, crate::transport::TransportError>>
-            {
+                options: &'a SocketOptions,
+            ) -> Self::BindFuture<'a> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                // Clone the options into the async block so no borrow
-                // escapes the returned future.
                 let options = *options;
                 let inner = self.inner;
-                async move { inner.bind(addr, &options).await }
+                Box::pin(async move { inner.bind(addr, &options).await })
             }
         }
 
@@ -1050,15 +1149,21 @@ mod tests {
         struct ForceReuseFactory;
         impl TransportFactory for ForceReuseFactory {
             type Socket = TokioSocket;
-            fn bind(
-                &self,
+            type BindFuture<'a> = core::pin::Pin<
+                Box<
+                    dyn Future<Output = Result<Self::Socket, crate::transport::TransportError>>
+                        + Send
+                        + 'a,
+                >,
+            >;
+            fn bind<'a>(
+                &'a self,
                 addr: SocketAddrV4,
-                options: &SocketOptions,
-            ) -> impl Future<Output = Result<Self::Socket, crate::transport::TransportError>>
-            {
+                options: &'a SocketOptions,
+            ) -> Self::BindFuture<'a> {
                 let mut opts = *options;
                 opts.reuse_address = true;
-                async move { TokioTransport.bind(addr, &opts).await }
+                Box::pin(async move { TokioTransport.bind(addr, &opts).await })
             }
         }
 
@@ -1100,14 +1205,13 @@ mod tests {
         assert_eq!(view.header().message_id(), crate::protocol::MessageId::SD);
     }
 
-    /// Phase 12 witness: proves `bind_with_transport` accepts a factory
-    /// whose `Socket` type is **not** `TokioSocket`. The Phase 12 gate
-    /// (no `F::Socket = TokioSocket` pin) is a type-system claim, and
-    /// without this test the trait surface could regress to a Tokio
-    /// pin in a future phase without any test catching it. The
-    /// existing `bind_with_transport_*` tests both hardcode
-    /// `type Socket = TokioSocket`, which only covers the previous
-    /// pinned-bound shape.
+    /// Type-witness: proves `bind_with_transport` accepts a factory
+    /// whose `Socket` type is **not** `TokioSocket`. This is a
+    /// type-system claim, and without this test the trait surface could
+    /// regress to a Tokio pin in a future refactor without any test
+    /// catching it. The existing `bind_with_transport_*` tests both
+    /// hardcode `type Socket = TokioSocket`, which only covers the
+    /// tokio-default shape.
     ///
     /// `WrappedSocket` is a transparent newtype around `TokioSocket`
     /// with its own `TransportSocket` impl — the *type identity* is
@@ -1157,16 +1261,19 @@ mod tests {
         struct WrappingFactory;
         impl TransportFactory for WrappingFactory {
             type Socket = WrappedSocket;
-            fn bind(
-                &self,
+            type BindFuture<'a> = core::pin::Pin<
+                Box<dyn Future<Output = Result<Self::Socket, TransportError>> + Send + 'a>,
+            >;
+            fn bind<'a>(
+                &'a self,
                 addr: SocketAddrV4,
-                options: &SocketOptions,
-            ) -> impl Future<Output = Result<Self::Socket, TransportError>> {
+                options: &'a SocketOptions,
+            ) -> Self::BindFuture<'a> {
                 let opts = *options;
-                async move {
+                Box::pin(async move {
                     let inner = TokioTransport.bind(addr, &opts).await?;
                     Ok(WrappedSocket(inner))
-                }
+                })
             }
         }
 
@@ -1219,12 +1326,15 @@ mod tests {
         struct AlwaysBusyFactory;
         impl TransportFactory for AlwaysBusyFactory {
             type Socket = TokioSocket;
-            async fn bind(
-                &self,
+            type BindFuture<'a> = core::pin::Pin<
+                Box<dyn Future<Output = Result<Self::Socket, TransportError>> + Send + 'a>,
+            >;
+            fn bind<'a>(
+                &'a self,
                 _addr: SocketAddrV4,
-                _options: &SocketOptions,
-            ) -> Result<Self::Socket, TransportError> {
-                Err(TransportError::AddressInUse)
+                _options: &'a SocketOptions,
+            ) -> Self::BindFuture<'a> {
+                Box::pin(async move { Err(TransportError::AddressInUse) })
             }
         }
 

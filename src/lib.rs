@@ -19,8 +19,8 @@
 //! | [`protocol`] | Yes | Wire format: headers, messages, message types, return codes, and service discovery (SD) entries/options |
 //! | [`e2e`] | Yes | End-to-End protection — Profile 4 (CRC-32) and Profile 5 (CRC-16) |
 //! | [`WireFormat`] / [`PayloadWireFormat`] | Yes | Traits for serializing messages and defining custom payload types |
-//! | `client` | No | Async tokio client — service discovery, subscriptions, and request/response (feature `client`) |
-//! | `server` | No | Async tokio server — service offering, event publishing, and subscription management (feature `server`) |
+//! | `client` | No | Async client trait surface — service discovery, subscriptions, request/response (feature `client`; add `client-tokio` for `Client::new`) |
+//! | `server` | No | Async server trait surface — service offering, event publishing, subscription management (feature `server`; add `server-tokio` for `Server::new`) |
 //!
 //! ## Feature Flags
 //!
@@ -31,16 +31,18 @@
 //! | `client-tokio` | no | Adds the `Client::new` / `TokioSpawner` / `TokioTransport` convenience defaults; implies `client` + tokio + socket2 |
 //! | `server` | no | Trait-surface server; implies `std` + futures (no tokio) |
 //! | `server-tokio` | no | Adds the `Server::new` / `TokioTransport` / `TokioTimer` convenience defaults; implies `server` + tokio + socket2 |
-//! | `bare_metal` | no | Pure marker — does not enable any crate code. See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable bare-metal integration examples. |
+//! | `bare_metal` | no | Activates embassy-sync, the `static_channels` module (no-alloc `ChannelFactory`), and `AtomicInterfaceHandle`. `StaticE2EHandle` additionally requires `std` because the underlying `E2ERegistry` is currently `std`-only. See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable bare-metal integration examples. |
+//! | `embassy_channels` | no | Heap-backed `EmbassySyncChannels` `ChannelFactory`. Implies `bare_metal` and pulls `extern crate alloc;` into the crate; **on `no_std`, downstream consumers must provide a `#[global_allocator]`**. Useful for tests / early prototypes before sizing static pools. |
 //!
 //! The default feature set is `["std"]`, which links `std` and enables
 //! the `RawPayload` / `VecSdHeader` helpers. For a minimal build with
 //! no allocator requirement — the `protocol`, trait, `transport`, and
 //! `e2e` modules only — pass `--no-default-features`. The
-//! trait-surface canary at `examples/bare_metal/` depends on the crate
-//! with `default-features = false, features = ["bare_metal"]` and
-//! validates that configuration when the bare-metal workspace members are
-//! built in isolation (`cargo build -p bare_metal_client` /
+//! trait-surface canary workspace members (`examples/bare_metal_client`,
+//! `examples/bare_metal_server`) depend on the crate with
+//! `default-features = false, features = ["bare_metal", "client"]` /
+//! `["bare_metal", "server"]` and validate that configuration when built
+//! in isolation (`cargo build -p bare_metal_client` /
 //! `cargo build -p bare_metal_server`), rather than as part of a workspace-wide
 //! build where features may be unified across members.
 //!
@@ -107,11 +109,11 @@
 #[cfg(feature = "std")]
 extern crate std;
 
-// `bare_metal` builds need `alloc` for `EmbassySyncChannels`'s
+// `embassy_channels` needs `alloc` for `EmbassySyncChannels`'s
 // `Arc<Channel<...>>` storage (the heap-backed bare-metal channel
-// primitive). A future no_alloc port stores the channel in a `static`
-// and drops this `extern crate alloc;`.
-#[cfg(feature = "bare_metal")]
+// primitive). The `static_channels` module does NOT need alloc — users
+// who only enable `bare_metal` (without `embassy_channels`) get no-alloc.
+#[cfg(feature = "embassy_channels")]
 extern crate alloc;
 
 /// Maximum size, in bytes, of UDP payloads for `client` / `server` send
@@ -153,12 +155,12 @@ pub mod protocol;
 mod raw_payload;
 /// SOME/IP server for offering services and handling incoming requests.
 ///
-/// Phase 14b: the engine is generic over [`transport::TransportFactory`] +
+/// The engine is generic over [`transport::TransportFactory`] +
 /// [`transport::Timer`] + [`transport::E2ERegistryHandle`] +
 /// [`server::SubscriptionHandle`], so the bare `server` feature exposes the
 /// trait-surface server. The `server-tokio` feature additionally provides
-/// the tokio convenience constructors ([`server::Server::new`],
-/// [`server::Server::new_with_loopback`], [`server::Server::new_passive`])
+/// the tokio convenience constructors (`server::Server::new`,
+/// `server::Server::new_with_loopback`, `server::Server::new_passive`)
 /// that default the type parameters to
 /// `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>` /
 /// `TokioTransport` / `TokioTimer`.
@@ -171,13 +173,14 @@ pub mod server;
 pub mod tokio_transport;
 
 /// `embassy-sync`-backed implementation of [`transport::ChannelFactory`].
-/// Available whenever the `bare_metal` feature is enabled, independent
-/// of any tokio dependency.
-#[cfg(feature = "bare_metal")]
+/// Available whenever the `embassy_channels` feature is enabled. Uses
+/// heap allocation (`Arc<Channel<...>>`) — for no-alloc, use
+/// [`static_channels`] instead.
+#[cfg(feature = "embassy_channels")]
 pub mod embassy_channels;
 /// Static-pool no-alloc primitives for [`transport::ChannelFactory`].
 /// Backs the consumer-declared static `OneshotPool` / `MpscPool`
-/// instances that the upcoming `static_channels!` macro (phase 13.6d)
+/// instances that the [`define_static_channels!`] macro
 /// generates per-`T` `*Pooled<MyChannels>` impls against.
 #[cfg(feature = "bare_metal")]
 pub mod static_channels;
@@ -204,10 +207,12 @@ pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 pub use server::{Server, ServerDeps, SubscriptionHandle};
 #[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
-pub use transport::{
-    ChannelFactory, E2ERegistryHandle, InterfaceHandle, IoErrorKind, MpscRecv, MpscSend,
-    OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram, SocketOptions, Spawner, Timer,
-    TransportError, TransportFactory, TransportSocket, UnboundedRecv, UnboundedSend,
-};
 #[cfg(feature = "bare_metal")]
-pub use transport::{AtomicInterfaceHandle, StaticE2EHandle, StaticE2EStorage};
+pub use transport::AtomicInterfaceHandle;
+pub use transport::{
+    ChannelFactory, E2ERegistryHandle, InterfaceHandle, IoErrorKind, LocalSpawner, MpscRecv,
+    MpscSend, OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram, SocketOptions, Spawner,
+    Timer, TransportError, TransportFactory, TransportSocket, UnboundedRecv, UnboundedSend,
+};
+#[cfg(all(feature = "bare_metal", feature = "std"))]
+pub use transport::{StaticE2EHandle, StaticE2EStorage};

@@ -24,7 +24,7 @@
 //! | Pattern | This example | Firmware replacement |
 //! |---------|-------------|----------------------|
 //! | Transport | `MockFactory` / `MockSocket` | `embassy_net`, smoltcp, custom Ethernet ISR |
-//! | Timer | `MockTimer` using `tokio::task::yield_now` | `embassy_time::Timer::after` |
+//! | Timer | `MockTimer` using `tokio::time::sleep` | `embassy_time::Timer::after` |
 //! | Subscription table | `MockSubscriptions` | `heapless`-backed table behind a CS mutex |
 //! | Lock handle | `Arc<Mutex<E2ERegistry>>` | stack-allocated handle (see below) |
 //!
@@ -63,6 +63,7 @@ use simple_someip::{Server, ServerDeps};
 struct MockPipe {
     sent: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
     inbound: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
+    inbound_waker: Mutex<Option<core::task::Waker>>,
 }
 
 #[derive(Clone)]
@@ -73,12 +74,10 @@ struct MockFactory {
 
 impl TransportFactory for MockFactory {
     type Socket = MockSocket;
+    type BindFuture<'a> =
+        core::pin::Pin<Box<dyn Future<Output = Result<Self::Socket, TransportError>> + Send + 'a>>;
 
-    fn bind(
-        &self,
-        addr: SocketAddrV4,
-        _options: &SocketOptions,
-    ) -> impl Future<Output = Result<Self::Socket, TransportError>> + Send {
+    fn bind<'a>(&'a self, addr: SocketAddrV4, _options: &'a SocketOptions) -> Self::BindFuture<'a> {
         let pipe = Arc::clone(&self.pipe);
         let port = if addr.port() == 0 {
             let mut p = self.next_port.lock().unwrap();
@@ -88,7 +87,7 @@ impl TransportFactory for MockFactory {
             addr.port()
         };
         let local = SocketAddrV4::new(*addr.ip(), port);
-        async move { Ok(MockSocket { pipe, local }) }
+        Box::pin(async move { Ok(MockSocket { pipe, local }) })
     }
 }
 
@@ -123,6 +122,7 @@ struct MockRecvFut<'a> {
 impl Future for MockRecvFut<'_> {
     type Output = Result<ReceivedDatagram, TransportError>;
 
+    #[allow(clippy::single_match_else)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         match me.pipe.inbound.lock().unwrap().pop_front() {
@@ -135,11 +135,20 @@ impl Future for MockRecvFut<'_> {
                     truncated: n < bytes.len(),
                 }))
             }
-            // No datagram — wake immediately and yield. A real bare-metal
-            // impl registers the waker on the network driver's RX-ready
-            // interrupt instead of busy-waking.
+            // No datagram — register the waker on the pipe and park.
+            // A real bare-metal impl registers the waker on the network
+            // driver's RX-ready interrupt instead.
             None => {
-                cx.waker().wake_by_ref();
+                *me.pipe.inbound_waker.lock().unwrap() = Some(cx.waker().clone());
+                if let Some((bytes, source)) = me.pipe.inbound.lock().unwrap().pop_front() {
+                    let n = bytes.len().min(me.buf.len());
+                    me.buf[..n].copy_from_slice(&bytes[..n]);
+                    return Poll::Ready(Ok(ReceivedDatagram {
+                        bytes_received: n,
+                        source,
+                        truncated: n < bytes.len(),
+                    }));
+                }
                 Poll::Pending
             }
         }
@@ -159,7 +168,10 @@ impl TransportSocket for MockSocket {
     }
 
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> MockRecvFut<'a> {
-        MockRecvFut { pipe: Arc::clone(&self.pipe), buf }
+        MockRecvFut {
+            pipe: Arc::clone(&self.pipe),
+            buf,
+        }
     }
 
     fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
@@ -177,15 +189,18 @@ impl TransportSocket for MockSocket {
 
 // ── Mock Timer ────────────────────────────────────────────────────────
 //
-// Uses tokio's yield_now to keep the example executor happy. Real
+// Honors `duration` per the `Timer` trait contract. Real
 // firmware replaces this with e.g. `embassy_time::Timer::after(d).await`.
 
 #[derive(Clone)]
 struct MockTimer;
 
 impl Timer for MockTimer {
-    async fn sleep(&self, _duration: Duration) {
-        tokio::task::yield_now().await;
+    type SleepFuture<'a> = core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    fn sleep(&self, duration: Duration) -> Self::SleepFuture<'_> {
+        Box::pin(async move {
+            tokio::time::sleep(duration).await;
+        })
     }
 }
 
@@ -211,7 +226,7 @@ impl SubscriptionHandle for MockSubscriptions {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), SubscribeError>> + Send + '_ {
+    ) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
         let inner = Arc::clone(&self.0);
         async move {
             let mut guard = inner.lock().unwrap();
@@ -229,7 +244,7 @@ impl SubscriptionHandle for MockSubscriptions {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = ()> + Send + '_ {
+    ) -> impl Future<Output = ()> + '_ {
         let inner = Arc::clone(&self.0);
         async move {
             inner
@@ -239,23 +254,28 @@ impl SubscriptionHandle for MockSubscriptions {
         }
     }
 
-    fn get_subscribers(
-        &self,
+    fn for_each_subscriber<'a, F>(
+        &'a self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-    ) -> impl Future<Output = Vec<Subscriber>> + Send + '_ {
+        mut f: F,
+    ) -> impl Future<Output = usize> + 'a
+    where
+        F: FnMut(&Subscriber) + 'a,
+    {
         let inner = Arc::clone(&self.0);
         async move {
-            inner
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(s, i, e, _)| {
-                    *s == service_id && *i == instance_id && *e == event_group_id
-                })
-                .map(|(s, i, e, addr)| Subscriber::new(*addr, *s, *i, *e))
-                .collect()
+            let guard = inner.lock().unwrap();
+            let mut count = 0;
+            for (s, i, e, addr) in guard.iter() {
+                if *s == service_id && *i == instance_id && *e == event_group_id {
+                    let sub = Subscriber::new(*addr, *s, *i, *e);
+                    f(&sub);
+                    count += 1;
+                }
+            }
+            count
         }
     }
 }
@@ -299,7 +319,9 @@ async fn main() {
     // entries so clients on the network can discover this service.
     // It is Send + 'static and can be handed to any executor.
     let announce_handle = tokio::spawn(
-        server.announcement_loop().expect("non-passive server must have an announcement loop"),
+        server
+            .announcement_loop()
+            .expect("non-passive server must have an announcement loop"),
     );
 
     // Yield twice: the announcement loop fires its first SD offer on the
@@ -309,7 +331,10 @@ async fn main() {
 
     // Verify the server actually sent at least one SD announcement.
     let sent = pipe.sent.lock().unwrap().len();
-    assert!(sent > 0, "server should have multicast at least one SD OfferService");
+    assert!(
+        sent > 0,
+        "server should have multicast at least one SD OfferService"
+    );
 
     announce_handle.abort();
     let _ = announce_handle.await;

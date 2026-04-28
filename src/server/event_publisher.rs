@@ -1,13 +1,24 @@
 //! Event publishing functionality
 
 use super::Error;
-use super::subscription_manager::SubscriptionHandle;
+use super::subscription_manager::{SUBSCRIBERS_PER_GROUP, SubscriptionHandle};
 use crate::UDP_BUFFER_SIZE;
 use crate::e2e::E2EKey;
 use crate::protocol::{Header, Message};
 use crate::traits::{PayloadWireFormat, WireFormat};
 use crate::transport::{E2ERegistryHandle, TransportSocket};
+use core::net::SocketAddrV4;
+use heapless::Vec as HeaplessVec;
 use std::sync::Arc;
+
+/// The publish snapshot buffer is sized to `SUBSCRIBERS_PER_GROUP` so
+/// `for_each_subscriber` can never overflow it. If a future refactor
+/// changes the manager's per-group cap independently, this assert
+/// catches the divergence at compile time.
+const _: () = assert!(
+    SUBSCRIBERS_PER_GROUP >= 1,
+    "SUBSCRIBERS_PER_GROUP must be >= 1 for the publish snapshot to fit any subscribers"
+);
 
 /// Publishes events to subscribers.
 ///
@@ -54,7 +65,9 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if the E2E registry mutex is poisoned.
+    /// May panic if the underlying [`E2ERegistryHandle`](crate::transport::E2ERegistryHandle)
+    /// implementation panics (e.g., `Arc<Mutex<E2ERegistry>>` on mutex poison).
+    #[allow(clippy::too_many_lines)]
     pub async fn publish_event<P: PayloadWireFormat>(
         &self,
         service_id: u16,
@@ -62,10 +75,22 @@ where
         event_group_id: u16,
         message: &Message<P>,
     ) -> Result<usize, Error> {
-        // Get subscribers
-        let subscribers = self
+        // Snapshot subscriber addresses into a stack-allocated buffer so
+        // we can release the subscription read lock before doing async
+        // sends. This avoids a per-event heap allocation that the old
+        // `get_subscribers -> Vec<Subscriber>` API forced.
+        //
+        // The buffer cap matches the manager's per-group cap so push()
+        // is provably infallible — see the `const _` guard below.
+        let mut subscribers: HeaplessVec<SocketAddrV4, SUBSCRIBERS_PER_GROUP> = HeaplessVec::new();
+        let _total = self
             .subscriptions
-            .get_subscribers(service_id, instance_id, event_group_id)
+            .for_each_subscriber(service_id, instance_id, event_group_id, |sub| {
+                // push() can never fail here: SUBSCRIBERS_PER_GROUP is
+                // both the manager's per-group cap and this buffer's
+                // cap, so the manager will never feed us more than fits.
+                let _ = subscribers.push(sub.address);
+            })
             .await;
 
         if subscribers.is_empty() {
@@ -149,24 +174,26 @@ where
 
         let datagram = &buffer[..message_length];
 
-        // Send to all subscribers
-        let mut sent_count = 0;
-        for subscriber in &subscribers {
-            match self.socket.send_to(datagram, subscriber.address).await {
+        // Send to all snapshotted subscribers. Track the last
+        // transport error so we can surface "every send failed" as
+        // `Err(Transport(_))` rather than masking total failure as
+        // `Ok(0)` — which would be indistinguishable from "no
+        // subscribers" to the caller.
+        let mut sent_count = 0usize;
+        let mut last_err: Option<crate::transport::TransportError> = None;
+        for addr in &subscribers {
+            match self.socket.send_to(datagram, *addr).await {
                 Ok(()) => {
                     sent_count += 1;
                     tracing::trace!(
                         "Sent event to subscriber {} ({} bytes)",
-                        subscriber.address,
+                        addr,
                         message_length
                     );
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "Failed to send event to subscriber {}: {:?}",
-                        subscriber.address,
-                        e
-                    );
+                    tracing::error!("Failed to send event to subscriber {}: {:?}", addr, e);
+                    last_err = Some(e);
                 }
             }
         }
@@ -178,6 +205,14 @@ where
             service_id
         );
 
+        if sent_count == 0 {
+            // Every send failed (subscribers was non-empty above, so
+            // last_err is necessarily Some). Surface the most recent
+            // transport error so the caller can react.
+            return Err(Error::Transport(
+                last_err.unwrap_or(crate::transport::TransportError::Unsupported),
+            ));
+        }
         Ok(sent_count)
     }
 
@@ -200,10 +235,14 @@ where
         interface_version: u8,
         payload: &[u8],
     ) -> Result<usize, Error> {
-        // Get subscribers
-        let subscribers = self
+        // Snapshot subscriber addresses into a stack buffer (see
+        // publish_event for rationale).
+        let mut subscribers: HeaplessVec<SocketAddrV4, SUBSCRIBERS_PER_GROUP> = HeaplessVec::new();
+        let _total = self
             .subscriptions
-            .get_subscribers(service_id, instance_id, event_group_id)
+            .for_each_subscriber(service_id, instance_id, event_group_id, |sub| {
+                let _ = subscribers.push(sub.address);
+            })
             .await;
 
         if subscribers.is_empty() {
@@ -263,23 +302,28 @@ where
         buffer[header_len..total_len].copy_from_slice(payload);
         let datagram = &buffer[..total_len];
 
-        // Send to all subscribers
-        let mut sent_count = 0;
-        for subscriber in &subscribers {
-            match self.socket.send_to(datagram, subscriber.address).await {
+        // Send to all snapshotted subscribers; surface total-failure
+        // as `Err(Transport(_))` rather than `Ok(0)` (see
+        // `publish_event`).
+        let mut sent_count = 0usize;
+        let mut last_err: Option<crate::transport::TransportError> = None;
+        for addr in &subscribers {
+            match self.socket.send_to(datagram, *addr).await {
                 Ok(()) => {
                     sent_count += 1;
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "Failed to send raw event to {}: {:?}",
-                        subscriber.address,
-                        e
-                    );
+                    tracing::error!("Failed to send raw event to {}: {:?}", addr, e);
+                    last_err = Some(e);
                 }
             }
         }
 
+        if sent_count == 0 {
+            return Err(Error::Transport(
+                last_err.unwrap_or(crate::transport::TransportError::Unsupported),
+            ));
+        }
         Ok(sent_count)
     }
 
@@ -298,11 +342,10 @@ where
         instance_id: u16,
         event_group_id: u16,
     ) -> bool {
-        !self
-            .subscriptions
-            .get_subscribers(service_id, instance_id, event_group_id)
+        self.subscriptions
+            .for_each_subscriber(service_id, instance_id, event_group_id, |_| {})
             .await
-            .is_empty()
+            > 0
     }
 
     /// Register a subscriber for an event group.
@@ -313,7 +356,7 @@ where
     ///
     /// Calling this method with the same `(service_id, instance_id,
     /// event_group_id, subscriber_addr)` tuple is idempotent — the
-    /// underlying [`SubscriptionManager`] deduplicates — so external
+    /// underlying [`super::SubscriptionManager`] deduplicates — so external
     /// dispatchers can safely call it on every incoming
     /// `SubscribeEventGroup` (including TTL refreshes) without growing
     /// the subscriber list.
@@ -333,7 +376,7 @@ where
     /// # Errors
     ///
     /// Returns [`crate::server::SubscribeError`] when the underlying
-    /// [`SubscriptionManager`] cannot record the subscription because a
+    /// [`super::SubscriptionManager`] cannot record the subscription because a
     /// bounded capacity was hit:
     /// - `SubscribersPerGroupFull` — the per-event-group subscriber list
     ///   is full.
@@ -388,9 +431,8 @@ where
         event_group_id: u16,
     ) -> usize {
         self.subscriptions
-            .get_subscribers(service_id, instance_id, event_group_id)
+            .for_each_subscriber(service_id, instance_id, event_group_id, |_| {})
             .await
-            .len()
     }
 }
 
@@ -411,11 +453,8 @@ mod tests {
     /// Type alias bringing the tokio-flavor concrete type parameters back
     /// into scope so tests can spell `TestEventPublisher` without
     /// chasing the three-type-parameter signature on every call site.
-    type TestEventPublisher = EventPublisher<
-        Arc<Mutex<E2ERegistry>>,
-        Arc<RwLock<SubscriptionManager>>,
-        TokioSocket,
-    >;
+    type TestEventPublisher =
+        EventPublisher<Arc<Mutex<E2ERegistry>>, Arc<RwLock<SubscriptionManager>>, TokioSocket>;
 
     fn test_registry() -> Arc<Mutex<E2ERegistry>> {
         Arc::new(Mutex::new(E2ERegistry::new()))
@@ -532,6 +571,134 @@ mod tests {
         match err {
             Error::Capacity(tag) => assert_eq!(tag, "udp_buffer"),
             other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
+        }
+    }
+
+    /// Regression for H12: when there ARE subscribers but every
+    /// `send_to` fails, `publish_event` must surface the underlying
+    /// transport error instead of masking the failure as `Ok(0)` —
+    /// which is indistinguishable from "no subscribers" to the caller.
+    ///
+    /// Uses a mock `TransportSocket` whose `send_to` always returns
+    /// `Err(TransportError::Io(IoErrorKind::NetworkUnreachable))`.
+    #[tokio::test]
+    async fn publish_event_returns_err_when_every_send_fails() {
+        use crate::transport::{IoErrorKind, ReceivedDatagram, TransportError, TransportSocket};
+        use core::future::{Future, Ready, ready};
+        use core::pin::Pin;
+        use core::task::{Context, Poll};
+
+        struct AlwaysFailSocket;
+
+        struct AlwaysFailSend;
+        impl Future for AlwaysFailSend {
+            type Output = Result<(), TransportError>;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(Err(TransportError::Io(IoErrorKind::NetworkUnreachable)))
+            }
+        }
+
+        impl TransportSocket for AlwaysFailSocket {
+            type SendFuture<'a> = AlwaysFailSend;
+            type RecvFuture<'a> = Ready<Result<ReceivedDatagram, TransportError>>;
+
+            fn send_to<'a>(&'a self, _buf: &'a [u8], _t: SocketAddrV4) -> Self::SendFuture<'a> {
+                AlwaysFailSend
+            }
+            fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+                ready(Err(TransportError::Unsupported))
+            }
+            fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
+                Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            }
+            fn join_multicast_v4(&self, _g: Ipv4Addr, _i: Ipv4Addr) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn leave_multicast_v4(&self, _g: Ipv4Addr, _i: Ipv4Addr) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
+        {
+            let mut mgr = subscriptions.write().await;
+            mgr.subscribe(0x5B, 1, 0x01, addr).unwrap();
+        }
+        let publisher: EventPublisher<
+            Arc<Mutex<E2ERegistry>>,
+            Arc<RwLock<SubscriptionManager>>,
+            AlwaysFailSocket,
+        > = EventPublisher::new(subscriptions, Arc::new(AlwaysFailSocket), test_registry());
+
+        let msg = make_test_message();
+        let err = publisher
+            .publish_event(0x5B, 1, 0x01, &msg)
+            .await
+            .expect_err("total-failure path must surface Err, not Ok(0)");
+        match err {
+            Error::Transport(TransportError::Io(IoErrorKind::NetworkUnreachable)) => {}
+            other => panic!(
+                "expected Transport(Io(NetworkUnreachable)) from total-failure send, got {other:?}"
+            ),
+        }
+    }
+
+    /// Same H12 path through `publish_raw_event`.
+    #[tokio::test]
+    async fn publish_raw_event_returns_err_when_every_send_fails() {
+        use crate::transport::{IoErrorKind, ReceivedDatagram, TransportError, TransportSocket};
+        use core::future::{Future, Ready, ready};
+        use core::pin::Pin;
+        use core::task::{Context, Poll};
+
+        struct AlwaysFailSocket;
+        struct AlwaysFailSend;
+        impl Future for AlwaysFailSend {
+            type Output = Result<(), TransportError>;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(Err(TransportError::Io(IoErrorKind::ConnectionRefused)))
+            }
+        }
+        impl TransportSocket for AlwaysFailSocket {
+            type SendFuture<'a> = AlwaysFailSend;
+            type RecvFuture<'a> = Ready<Result<ReceivedDatagram, TransportError>>;
+            fn send_to<'a>(&'a self, _buf: &'a [u8], _t: SocketAddrV4) -> Self::SendFuture<'a> {
+                AlwaysFailSend
+            }
+            fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+                ready(Err(TransportError::Unsupported))
+            }
+            fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
+                Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            }
+            fn join_multicast_v4(&self, _g: Ipv4Addr, _i: Ipv4Addr) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn leave_multicast_v4(&self, _g: Ipv4Addr, _i: Ipv4Addr) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
+        {
+            let mut mgr = subscriptions.write().await;
+            mgr.subscribe(0x5B, 1, 0x01, addr).unwrap();
+        }
+        let publisher: EventPublisher<
+            Arc<Mutex<E2ERegistry>>,
+            Arc<RwLock<SubscriptionManager>>,
+            AlwaysFailSocket,
+        > = EventPublisher::new(subscriptions, Arc::new(AlwaysFailSocket), test_registry());
+
+        let err = publisher
+            .publish_raw_event(0x5B, 1, 0x01, 0x8001, 0x0001, 0x01, 0x01, &[0xAA, 0xBB])
+            .await
+            .expect_err("total-failure path must surface Err, not Ok(0)");
+        match err {
+            Error::Transport(TransportError::Io(IoErrorKind::ConnectionRefused)) => {}
+            other => panic!("expected Transport(Io(ConnectionRefused)), got {other:?}"),
         }
     }
 

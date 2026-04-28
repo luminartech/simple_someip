@@ -9,7 +9,7 @@ members = [
 
 [package]
 name = "simple-someip"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A lightweight SOME/IP serialization and communication library"
@@ -56,7 +56,7 @@ tracing-subscriber = "0.3"
 [features]
 default = ["std"]
 std = ["embedded-io/std", "thiserror/std", "tracing/std"]
-# Phase 13a split: `client` exposes the protocol/trait-surface client
+# Feature split: `client` exposes the protocol/trait-surface client
 # (no tokio, no socket2); `client-tokio` layers the tokio + socket2
 # convenience defaults on top. Consumers of the bare-metal trait surface
 # enable `client` only (and supply their own `Spawner` / `Timer` /
@@ -65,34 +65,36 @@ std = ["embedded-io/std", "thiserror/std", "tracing/std"]
 # `TokioChannels` / `TokioTransport`) enable `client-tokio`.
 client = ["std", "dep:futures"]
 client-tokio = ["client", "dep:tokio", "dep:socket2"]
-# Phase 14b split (matches phase 13a on the client side): `server`
-# exposes the trait-surface server (no tokio, no socket2). The engine
-# itself uses `futures::select!` so `dep:futures` lives here.
-# `server-tokio` adds the tokio + socket2 convenience defaults
-# (`Server::new`, `Server::new_with_loopback`, `Server::new_passive`),
-# bringing `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>`
+# Feature split (matches the client side): `server` exposes the
+# trait-surface server (no tokio, no socket2). The engine itself uses
+# `futures::select!` so `dep:futures` lives here. `server-tokio` adds
+# the tokio + socket2 convenience defaults (`Server::new`,
+# `Server::new_with_loopback`, `Server::new_passive`), bringing
+# `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>` /
 # / `TokioTransport` / `TokioTimer` defaults into scope.
 server = ["std", "dep:futures"]
 server-tokio = ["server", "dep:tokio", "dep:socket2"]
 # Marks a build as intended for bare-metal / no_std consumption.
-# Currently a pure marker — enables no crate code on its own. Reserved
-# for future phases to gate no_std-specific helper types.
+# Activates embassy-sync as the channel backend, the `static_channels`
+# module, `AtomicInterfaceHandle`, and `StaticE2EHandle`.
 #
 # **To demonstrate the bare-metal trait surface, use the
-# `examples/bare_metal` workspace member directly:** `cargo run -p
-# bare_metal`. That workspace member depends on `simple-someip` with
-# `default-features = false, features = ["bare_metal"]`, so it
-# exercises the actual bare-metal configuration.
+# `examples/bare_metal_client` / `examples/bare_metal_server` workspace
+# members directly:** `cargo build -p bare_metal_client`. Those workspace
+# members depend on `simple-someip` with `default-features = false,
+# features = ["bare_metal", "client"]` / `["bare_metal", "server"]`,
+# so they exercise the actual bare-metal configuration.
 #
 # Enabling `bare_metal` on its own does NOT make the crate
 # bare-metal-complete: the `client` and `server` feature paths still
-# spawn per-socket I/O loops on `tokio::spawn`, and a fully tokio-free
-# build additionally needs a user-provided `Spawner` impl (phase 9).
-# `bare_metal` activates embassy-sync as the channel backend. The feature
-# is a prerequisite for the Phase 11 channel-handle abstraction: with
-# `bare_metal` enabled, `EmbassySyncChannels` is available as the
-# `ChannelFactory` impl that does not depend on tokio.
+# require a user-provided `Spawner` impl and `TransportFactory` impl.
+# With `bare_metal` enabled, `static_channels` and `define_static_channels!`
+# are available as the no-alloc `ChannelFactory` impl.
 bare_metal = ["dep:embassy-sync"]
+# Heap-backed embassy-sync channel backend (`EmbassySyncChannels`).
+# Implies `bare_metal` and pulls in `alloc` for `Arc<Channel<...>>`.
+# Useful for tests or early prototypes before sizing static pools.
+embassy_channels = ["bare_metal"]
 
 [[test]]
 name = "client_server"
@@ -100,6 +102,10 @@ required-features = ["client-tokio", "server-tokio"]
 
 [[test]]
 name = "bare_metal_client"
+required-features = ["client", "bare_metal"]
+
+[[test]]
+name = "bare_metal_client_local"
 required-features = ["client", "bare_metal"]
 
 [[test]]
@@ -114,3 +120,7 @@ harness = false
 [[test]]
 name = "bare_metal_server"
 required-features = ["server", "bare_metal"]
+
+[[test]]
+name = "bare_metal_e2e"
+required-features = ["client", "server", "bare_metal"]

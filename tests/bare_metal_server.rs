@@ -1,4 +1,4 @@
-//! Phase-14b witness test: prove that `Server` can be constructed and
+//! Witness test: prove that `Server` can be constructed and
 //! driven without the `server-tokio` feature, using only the trait
 //! surface (`TransportFactory`, `Timer`, `E2ERegistryHandle`,
 //! `SubscriptionHandle`).
@@ -14,12 +14,12 @@
 //! `Arc<Mutex<E2ERegistry>>` impl that ships under the bare `transport`
 //! module.
 //!
-//! This is the gate witness for the phase-14b claim that `Server`
-//! is reachable on a no-tokio build. Compile-witness alone (Cargo
-//! `required-features` proving the test crate compiles without
-//! `server-tokio`) is the load-bearing assertion; the `tokio::spawn`
-//! at the end is a sanity check that the announcement-loop future is
-//! `Send + 'static` and the trait surface drives a working pipeline.
+//! This is the gate witness for the claim that `Server` is reachable
+//! on a no-tokio build. Compile-witness alone (Cargo `required-features`
+//! proving the test crate compiles without `server-tokio`) is the
+//! load-bearing assertion; the `tokio::spawn` at the end is a sanity
+//! check that the announcement-loop future is `Send + 'static` and
+//! the trait surface drives a working pipeline.
 #![cfg(all(feature = "server", feature = "bare_metal"))]
 
 use core::future::Future;
@@ -32,12 +32,12 @@ use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
 use simple_someip::e2e::E2ERegistry;
+use simple_someip::server::ServerConfig;
 use simple_someip::server::{SubscribeError, Subscriber, SubscriptionHandle};
 use simple_someip::transport::{
     ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory, TransportSocket,
 };
 use simple_someip::{Server, ServerDeps};
-use simple_someip::server::ServerConfig;
 
 // ── Mock transport ─────────────────────────────────────────────────────
 
@@ -45,6 +45,7 @@ use simple_someip::server::ServerConfig;
 struct MockPipe {
     sent: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
     inbound: Mutex<VecDeque<(Vec<u8>, SocketAddrV4)>>,
+    inbound_waker: Mutex<Option<core::task::Waker>>,
 }
 
 #[derive(Clone)]
@@ -55,11 +56,9 @@ struct MockFactory {
 
 impl TransportFactory for MockFactory {
     type Socket = MockSocket;
-    fn bind(
-        &self,
-        addr: SocketAddrV4,
-        _options: &SocketOptions,
-    ) -> impl Future<Output = Result<Self::Socket, TransportError>> + Send {
+    type BindFuture<'a> =
+        core::pin::Pin<Box<dyn Future<Output = Result<Self::Socket, TransportError>> + Send + 'a>>;
+    fn bind<'a>(&'a self, addr: SocketAddrV4, _options: &'a SocketOptions) -> Self::BindFuture<'a> {
         let pipe = Arc::clone(&self.pipe);
         // Mock: assign port deterministically. If caller asked for 0,
         // hand out an incrementing fake ephemeral port.
@@ -72,7 +71,7 @@ impl TransportFactory for MockFactory {
             addr.port()
         };
         let local = SocketAddrV4::new(*addr.ip(), port);
-        async move { Ok(MockSocket { pipe, local }) }
+        Box::pin(async move { Ok(MockSocket { pipe, local }) })
     }
 }
 
@@ -119,10 +118,19 @@ impl Future for MockRecvFut<'_> {
                 }))
             }
             None => {
-                // No data: return Pending and wake immediately to keep
-                // the run-loop ticking. Real bare-metal impls park the
-                // task on an interrupt-driven waker.
-                cx.waker().wake_by_ref();
+                // Park on the pipe's waker. Real bare-metal impls park
+                // the task on an interrupt-driven waker;
+                // wake_by_ref-on-empty would CPU-peg the test runtime.
+                *me.pipe.inbound_waker.lock().unwrap() = Some(cx.waker().clone());
+                if let Some((bytes, source)) = me.pipe.inbound.lock().unwrap().pop_front() {
+                    let n = bytes.len().min(me.buf.len());
+                    me.buf[..n].copy_from_slice(&bytes[..n]);
+                    return Poll::Ready(Ok(ReceivedDatagram {
+                        bytes_received: n,
+                        source,
+                        truncated: n < bytes.len(),
+                    }));
+                }
                 Poll::Pending
             }
         }
@@ -166,14 +174,16 @@ impl TransportSocket for MockSocket {
 #[derive(Clone)]
 struct MockTimer;
 impl Timer for MockTimer {
-    async fn sleep(&self, _duration: Duration) {
-        // The witness here is "the *crate* doesn't pull tokio under
-        // `--features server,bare_metal`," not "the test runs without
-        // tokio at all." The test runtime itself is `#[tokio::test]`
-        // (tokio is a `dev-dependency`), so using `tokio::task::yield_now`
-        // inside this mock is fine — it only proves the production
-        // crate's no-tokio path compiles.
-        tokio::task::yield_now().await;
+    type SleepFuture<'a> = core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    fn sleep(&self, duration: Duration) -> Self::SleepFuture<'_> {
+        // Honor `duration` per the `Timer` trait contract (MAY
+        // overshoot, MUST NOT undershoot). The test runtime is
+        // `#[tokio::test]`; this only demonstrates the no-tokio
+        // production path compiles. A real bare-metal impl would
+        // replace this with `embassy_time::Timer::after`.
+        Box::pin(async move {
+            tokio::time::sleep(duration).await;
+        })
     }
 }
 
@@ -200,7 +210,7 @@ impl SubscriptionHandle for MockSubscriptions {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), SubscribeError>> + Send + '_ {
+    ) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
         let this = self.0.clone();
         async move {
             let mut guard = this.lock().unwrap();
@@ -218,30 +228,36 @@ impl SubscriptionHandle for MockSubscriptions {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = ()> + Send + '_ {
+    ) -> impl Future<Output = ()> + '_ {
         let this = self.0.clone();
         async move {
             let mut guard = this.lock().unwrap();
-            guard.retain(|e| {
-                *e != (service_id, instance_id, event_group_id, subscriber_addr)
-            });
+            guard.retain(|e| *e != (service_id, instance_id, event_group_id, subscriber_addr));
         }
     }
 
-    fn get_subscribers(
-        &self,
+    fn for_each_subscriber<'a, F>(
+        &'a self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-    ) -> impl Future<Output = Vec<Subscriber>> + Send + '_ {
+        mut f: F,
+    ) -> impl Future<Output = usize> + 'a
+    where
+        F: FnMut(&Subscriber) + 'a,
+    {
         let this = self.0.clone();
         async move {
             let guard = this.lock().unwrap();
-            guard
-                .iter()
-                .filter(|(s, i, e, _)| *s == service_id && *i == instance_id && *e == event_group_id)
-                .map(|(s, i, e, addr)| Subscriber::new(*addr, *s, *i, *e))
-                .collect()
+            let mut count = 0;
+            for (s, i, e, addr) in guard.iter() {
+                if *s == service_id && *i == instance_id && *e == event_group_id {
+                    let sub = Subscriber::new(*addr, *s, *i, *e);
+                    f(&sub);
+                    count += 1;
+                }
+            }
+            count
         }
     }
 }
@@ -269,14 +285,10 @@ async fn server_constructible_without_server_tokio_feature() {
             subscriptions: subs,
         };
 
-    let server: Server<
-        Arc<Mutex<E2ERegistry>>,
-        MockSubscriptions,
-        MockFactory,
-        MockTimer,
-    > = Server::new_with_deps(deps, config, false)
-        .await
-        .expect("Server::new_with_deps must succeed with no-tokio mocks");
+    let server: Server<Arc<Mutex<E2ERegistry>>, MockSubscriptions, MockFactory, MockTimer> =
+        Server::new_with_deps(deps, config, false)
+            .await
+            .expect("Server::new_with_deps must succeed with no-tokio mocks");
 
     // Build the announcement-loop future and prove it's `Send + 'static`
     // by spawning it on tokio. The witness is purely structural: if this
@@ -317,12 +329,8 @@ async fn passive_server_constructible_without_server_tokio_feature() {
             subscriptions: subs,
         };
 
-    let _server: Server<
-        Arc<Mutex<E2ERegistry>>,
-        MockSubscriptions,
-        MockFactory,
-        MockTimer,
-    > = Server::new_passive_with_deps(deps, config)
-        .await
-        .expect("Server::new_passive_with_deps must succeed with no-tokio mocks");
+    let _server: Server<Arc<Mutex<E2ERegistry>>, MockSubscriptions, MockFactory, MockTimer> =
+        Server::new_passive_with_deps(deps, config)
+            .await
+            .expect("Server::new_passive_with_deps must succeed with no-tokio mocks");
 }

@@ -1,4 +1,4 @@
-//! Phase-16 no-alloc CI gate: prove that the bare-metal handle types and
+//! No-alloc CI gate: prove that the bare-metal handle types and
 //! static-pool channels do not invoke the global allocator on the hot path.
 //!
 //! # Why `harness = false`
@@ -15,8 +15,8 @@
 //!
 //! A [`PanicAllocator`] replaces the global allocator. It is disarmed by
 //! default; [`assert_no_alloc`] arms it around a closure, causing any
-//! allocation inside the closure to panic — turning a latent regression into
-//! a hard CI failure. Because `main()` is single-threaded and all witnessed
+//! allocation inside the closure to call `process::abort()` — turning a
+//! latent regression into a hard CI failure. Because `main()` is single-threaded and all witnessed
 //! operations are synchronous (no yield points), no background allocations
 //! can fire while the allocator is armed.
 //!
@@ -78,15 +78,13 @@ struct PanicAllocator;
 /// us off the panic-unwind path, whose machinery also allocates.
 fn diagnose_and_abort(kind: &str, size: usize, align_or_new: usize) -> ! {
     ARMED.store(false, Ordering::SeqCst);
-    eprintln!(
-        "no_alloc_witness: forbidden allocation ({kind}): {size} bytes / {align_or_new}",
-    );
+    eprintln!("no_alloc_witness: forbidden allocation ({kind}): {size} bytes / {align_or_new}");
     process::abort();
 }
 
 unsafe impl GlobalAlloc for PanicAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
+        if ARMED.load(Ordering::Acquire) {
             diagnose_and_abort("alloc", layout.size(), layout.align());
         }
         // SAFETY: forwarding to System with caller's layout contract.
@@ -99,7 +97,7 @@ unsafe impl GlobalAlloc for PanicAllocator {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
+        if ARMED.load(Ordering::Acquire) {
             diagnose_and_abort("alloc_zeroed", layout.size(), layout.align());
         }
         // SAFETY: forwarding to System.
@@ -107,7 +105,7 @@ unsafe impl GlobalAlloc for PanicAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
+        if ARMED.load(Ordering::Acquire) {
             diagnose_and_abort("realloc", layout.size(), new_size);
         }
         // SAFETY: forwarding to System; invariants upheld by caller.
@@ -120,8 +118,13 @@ static GLOBAL: PanicAllocator = PanicAllocator;
 
 /// Arm the panic allocator for the duration of `f`, then disarm.
 ///
-/// Any heap allocation inside `f` causes an immediate panic, which exits
-/// the process with a non-zero status code — CI failure.
+/// Any heap allocation inside `f` triggers `diagnose_and_abort`, which
+/// disarms the allocator (so the diagnostic itself can format), prints
+/// the offending kind/size/align to stderr, and then calls
+/// [`std::process::abort`]. The process exits with a non-zero status
+/// without unwinding — CI failure. (Aborting rather than panicking
+/// keeps us off the panic-unwind path, whose machinery would itself
+/// allocate and re-trip the trap.)
 fn assert_no_alloc<T>(label: &str, f: impl FnOnce() -> T) -> T {
     ARMED.store(true, Ordering::SeqCst);
     let result = f();
@@ -170,9 +173,10 @@ fn witness_atomic_interface_handle() {
 fn witness_static_e2e_handle_reads() {
     // Box::leak allocates — that is an accepted construction-time cost.
     let storage: &'static StaticE2EStorage =
-        Box::leak(Box::new(BlockingMutex::<CriticalSectionRawMutex, RefCell<E2ERegistry>>::new(
-            RefCell::new(E2ERegistry::new()),
-        )));
+        Box::leak(Box::new(BlockingMutex::<
+            CriticalSectionRawMutex,
+            RefCell<E2ERegistry>,
+        >::new(RefCell::new(E2ERegistry::new()))));
     let handle = StaticE2EHandle::new(storage);
 
     // register() allocates into the HashMap — also construction-time.
@@ -191,15 +195,20 @@ fn witness_static_e2e_handle_reads() {
     });
 
     assert_no_alloc("StaticE2EHandle::check (absent key → None)", || {
-        assert!(handle.check(E2EKey::new(0xFFFF, 0x0000), b"payload", [0u8; 8]).is_none());
+        assert!(
+            handle
+                .check(E2EKey::new(0xFFFF, 0x0000), b"payload", [0u8; 8])
+                .is_none()
+        );
     });
 }
 
 fn witness_static_e2e_handle_protect_check() {
     let storage: &'static StaticE2EStorage =
-        Box::leak(Box::new(BlockingMutex::<CriticalSectionRawMutex, RefCell<E2ERegistry>>::new(
-            RefCell::new(E2ERegistry::new()),
-        )));
+        Box::leak(Box::new(BlockingMutex::<
+            CriticalSectionRawMutex,
+            RefCell<E2ERegistry>,
+        >::new(RefCell::new(E2ERegistry::new()))));
     let handle = StaticE2EHandle::new(storage);
 
     handle.register(
@@ -220,29 +229,37 @@ fn witness_static_e2e_handle_protect_check() {
     let payload = b"hello";
     let mut protected = [0u8; 64];
 
-    assert_no_alloc("StaticE2EHandle::protect + check round-trip (Profile4)", || {
-        let len = handle
-            .protect(key, payload, [0u8; 8], &mut protected)
-            .expect("profile registered")
-            .expect("protect succeeded");
-        let (status, stripped) =
-            handle.check(key, &protected[..len], [0u8; 8]).expect("profile registered");
-        assert_eq!(status, simple_someip::E2ECheckStatus::Ok);
-        assert_eq!(stripped, payload);
-    });
+    assert_no_alloc(
+        "StaticE2EHandle::protect + check round-trip (Profile4)",
+        || {
+            let len = handle
+                .protect(key, payload, [0u8; 8], &mut protected)
+                .expect("profile registered")
+                .expect("protect succeeded");
+            let (status, stripped) = handle
+                .check(key, &protected[..len], [0u8; 8])
+                .expect("profile registered");
+            assert_eq!(status, simple_someip::E2ECheckStatus::Ok);
+            assert_eq!(stripped, payload);
+        },
+    );
 
     let key5 = E2EKey::new(0x0002, 0x8002);
     let mut protected5 = [0u8; 64];
-    assert_no_alloc("StaticE2EHandle::protect + check round-trip (Profile5)", || {
-        let len = handle
-            .protect(key5, payload, [0u8; 8], &mut protected5)
-            .expect("profile registered")
-            .expect("protect succeeded");
-        let (status, stripped) =
-            handle.check(key5, &protected5[..len], [0u8; 8]).expect("profile registered");
-        assert_eq!(status, simple_someip::E2ECheckStatus::Ok);
-        assert_eq!(stripped, payload);
-    });
+    assert_no_alloc(
+        "StaticE2EHandle::protect + check round-trip (Profile5)",
+        || {
+            let len = handle
+                .protect(key5, payload, [0u8; 8], &mut protected5)
+                .expect("profile registered")
+                .expect("protect succeeded");
+            let (status, stripped) = handle
+                .check(key5, &protected5[..len], [0u8; 8])
+                .expect("profile registered");
+            assert_eq!(status, simple_someip::E2ECheckStatus::Ok);
+            assert_eq!(stripped, payload);
+        },
+    );
 }
 
 fn witness_static_channels_oneshot() {
@@ -280,25 +297,43 @@ fn witness_static_channels_oneshot_recv() {
         tx.send(1u32).ok();
     }
 
-    assert_no_alloc("WitnessChannels::oneshot recv (value already pending)", || {
-        let (tx, rx) = WitnessChannels::oneshot::<u32>();
-        tx.send(123u32).ok();
-        let mut fut = rx.recv();
-        // SAFETY: `fut` is stack-pinned and dropped before this scope ends;
-        // no reference escapes.
-        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
-        match pinned.poll(&mut cx) {
-            core::task::Poll::Ready(Ok(v)) => assert_eq!(v, 123),
-            other => panic!("expected Ready(Ok(123)), got {other:?}"),
-        }
-    });
+    assert_no_alloc(
+        "WitnessChannels::oneshot recv (value already pending)",
+        || {
+            let (tx, rx) = WitnessChannels::oneshot::<u32>();
+            tx.send(123u32).ok();
+            let mut fut = rx.recv();
+            // SAFETY: `fut` is stack-pinned and dropped before this scope ends;
+            // no reference escapes.
+            let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            match pinned.poll(&mut cx) {
+                core::task::Poll::Ready(Ok(v)) => assert_eq!(v, 123),
+                other => panic!("expected Ready(Ok(123)), got {other:?}"),
+            }
+        },
+    );
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────
 
 fn main() {
+    // cargo-nextest runs `--list --format terse` for test discovery. A
+    // `harness = false` binary must print each test name followed by
+    // `: test` or `: benchmark`. We expose a single pseudo-test named
+    // `no_alloc_witness` so nextest can schedule us.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--list") {
+        // nextest calls --list twice: once for normal tests and once with
+        // --ignored. Print nothing for the --ignored pass so nextest does
+        // not classify this test as ignored and skip it by default.
+        if !args.iter().any(|a| a == "--ignored") {
+            println!("no_alloc_witness: test");
+        }
+        return;
+    }
+
     println!("no-alloc witness:");
 
     witness_atomic_interface_handle();

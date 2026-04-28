@@ -28,6 +28,7 @@
 //! port (future), whoever drives the futures must arrange storage for them
 //! (either a `static` or a heap allocator); the capacity constants plus
 //! [`crate::UDP_BUFFER_SIZE`] are the knobs for trimming this footprint.
+mod bind_dispatch;
 mod error;
 mod inner;
 mod service_registry;
@@ -39,8 +40,8 @@ pub use error::Error;
 /// the run-loop. Exposed (rather than `pub(super)`) so callers can
 /// declare static channel pools for it via
 /// `crate::transport::BoundedPooled<C, 4>`. End users typically do not
-/// reference this type directly — the
-/// `crate::static_channels::static_channels!` macro names it for them.
+/// reference this type directly — the `define_static_channels!` macro
+/// (under `feature = "bare_metal"`) names it for them.
 pub use inner::ControlMessage;
 /// Per-socket message types exposed for the same reason as
 /// [`ControlMessage`] — see its docstring.
@@ -178,7 +179,9 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ClientUpdate<P> {
 
 /// Stream of updates from the SOME/IP client event loop.
 ///
-/// Returned by [`Client::new`]. Call [`recv`](Self::recv) to receive
+/// Returned by `Client::new` (under `client-tokio`) or
+/// `Client::new_with_deps` / `Client::new_with_deps_local` (under
+/// `client`). Call [`recv`](Self::recv) to receive
 /// discovery, unicast, and error updates.
 pub struct ClientUpdates<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory> {
     update_receiver: C::UnboundedReceiver<ClientUpdate<MessageDefinitions>>,
@@ -216,7 +219,6 @@ impl<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory>
 pub struct ClientDeps<F, S, Tm, R, I>
 where
     F: TransportFactory,
-    S: Spawner,
     Tm: Timer,
     R: E2ERegistryHandle,
     I: InterfaceHandle,
@@ -244,8 +246,8 @@ where
 /// bare-metal handles backed by a critical-section mutex rather than
 /// `Arc<Mutex<_>>`). On `std + tokio`, the defaults
 /// (`Arc<Mutex<E2ERegistry>>` and `Arc<RwLock<Ipv4Addr>>`) are used by the
-/// standard constructors [`Self::new`] / [`Self::new_with_loopback`] /
-/// [`Self::new_with_spawner_and_loopback`].
+/// standard constructors `Self::new` / `Self::new_with_loopback` /
+/// `Self::new_with_spawner_and_loopback` (all under `client-tokio`).
 #[derive(Clone)]
 pub struct Client<
     MessageDefinitions: PayloadWireFormat + Send + 'static,
@@ -433,8 +435,8 @@ where
     /// [`InterfaceHandle`].
     ///
     /// This is the no-tokio entry point. The `client-tokio` convenience
-    /// constructors ([`Self::new`], [`Self::new_with_loopback`],
-    /// [`Self::new_with_spawner_and_loopback`]) ultimately delegate
+    /// constructors (`Self::new`, `Self::new_with_loopback`,
+    /// `Self::new_with_spawner_and_loopback`) ultimately delegate
     /// here, supplying `TokioTransport` / `TokioTimer` / `TokioSpawner`
     /// / `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<Ipv4Addr>>` for the
     /// generic parameters. Bare-metal callers supply their own.
@@ -466,10 +468,12 @@ where
     where
         F: TransportFactory + Send + Sync + 'static,
         F::Socket: Send + Sync + 'static,
+        for<'a> F::BindFuture<'a>: Send,
         for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
         for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
         S: Spawner + Send + Sync + 'static,
         Tm: Timer + Send + Sync + 'static,
+        for<'a> Tm::SleepFuture<'a>: Send,
     {
         let ClientDeps {
             factory,
@@ -479,15 +483,77 @@ where
             interface,
         } = deps;
         let initial_addr = interface.get();
+        let dispatch = bind_dispatch::SpawnerDispatch { factory, spawner };
         let (control_sender, update_receiver, run_future) =
-            Inner::<MessageDefinitions, F, S, Tm, R, C>::build(
+            Inner::<MessageDefinitions, Tm, R, C, bind_dispatch::SpawnerDispatch<F, S>>::build(
                 initial_addr,
                 e2e_registry.clone(),
                 multicast_loopback,
-                factory,
-                spawner,
+                dispatch,
                 timer,
             );
+        let client = Self {
+            interface,
+            control_sender,
+            e2e_registry,
+        };
+        let updates = ClientUpdates { update_receiver };
+        (client, updates, run_future)
+    }
+
+    /// `!Send` counterpart to [`Self::new_with_deps`].
+    ///
+    /// Constructs a `Client` whose run-loop and per-socket loops are
+    /// submitted through a [`LocalSpawner`]
+    /// (single-threaded executor) rather than a
+    /// [`Spawner`]. The factory's socket type
+    /// and its GAT futures are not required to be `Send`. The returned
+    /// run-loop future is `'static` but `!Send`.
+    ///
+    /// Use this constructor on embassy with `task-arena = 0`, on
+    /// tokio's `LocalSet`, on async-std's `LocalExecutor`, etc., where
+    /// the executor pins futures to a single thread.
+    ///
+    /// [`LocalSpawner`]: crate::transport::LocalSpawner
+    /// [`Spawner`]: crate::transport::Spawner
+    #[allow(clippy::type_complexity)]
+    #[must_use = "the returned run-loop future must be spawned (e.g. via the LocalSpawner) for the client to make progress"]
+    pub fn new_with_deps_local<F, S, Tm>(
+        deps: ClientDeps<F, S, Tm, R, I>,
+        multicast_loopback: bool,
+    ) -> (
+        Self,
+        ClientUpdates<MessageDefinitions, C>,
+        impl core::future::Future<Output = ()> + 'static,
+    )
+    where
+        F: TransportFactory + 'static,
+        F::Socket: 'static,
+        S: crate::transport::LocalSpawner + 'static,
+        Tm: Timer + 'static,
+    {
+        let ClientDeps {
+            factory,
+            spawner,
+            timer,
+            e2e_registry,
+            interface,
+        } = deps;
+        let initial_addr = interface.get();
+        let dispatch = bind_dispatch::LocalSpawnerDispatch { factory, spawner };
+        let (control_sender, update_receiver, run_future) = Inner::<
+            MessageDefinitions,
+            Tm,
+            R,
+            C,
+            bind_dispatch::LocalSpawnerDispatch<F, S>,
+        >::build(
+            initial_addr,
+            e2e_registry.clone(),
+            multicast_loopback,
+            dispatch,
+            timer,
+        );
         let client = Self {
             interface,
             control_sender,
@@ -661,7 +727,7 @@ where
     /// Call this before manually building an SD header (e.g. one passed to
     /// [`send_sd_message`](Self::send_sd_message)) so the reboot flag reflects
     /// the current tracked state instead of a stale value baked at call time.
-    /// Headers passed to [`sd_announcements_loop`](Self::sd_announcements_loop)
+    /// Headers passed to `sd_announcements_loop` (under `client-tokio`)
     /// are refreshed automatically per-tick and do not need this call.
     ///
     /// # Errors
@@ -856,14 +922,29 @@ where
     /// header checked and stripped, and outgoing messages will have E2E
     /// protection applied automatically.
     ///
+    /// # Shutdown semantics
+    ///
+    /// Unlike most public `Client` methods, `register_e2e` does NOT go
+    /// through the run-loop control channel — it operates directly on
+    /// the shared [`E2ERegistryHandle`]. Consequently it does not return
+    /// `Err(Error::Shutdown)` after the run-loop has exited; the
+    /// registry is still accessible via any held `Client` clone.
+    ///
     /// # Panics
     ///
-    /// Panics if the E2E registry mutex is poisoned.
+    /// May panic if the underlying [`E2ERegistryHandle`]
+    /// implementation panics (e.g., `Arc<Mutex<E2ERegistry>>` on mutex poison).
+    ///
+    /// [`E2ERegistryHandle`]: crate::transport::E2ERegistryHandle
     pub fn register_e2e(&self, key: E2EKey, profile: E2EProfile) {
         self.e2e_registry.register(key, profile);
     }
 
     /// Remove E2E configuration for the given key.
+    ///
+    /// Like [`Self::register_e2e`], this method bypasses the run-loop
+    /// control channel and is therefore not subject to
+    /// `Error::Shutdown`.
     pub fn unregister_e2e(&self, key: &E2EKey) {
         self.e2e_registry.unregister(key);
     }
@@ -1125,7 +1206,7 @@ mod tests {
     }
 
     /// Stress test: 200 back-to-back `subscribe_no_wait` calls, each of
-    /// which drops its response oneshot. Phase 8(a) removed the
+    /// which drops its response oneshot. The code removed the
     /// `tokio::spawn(drain-the-oneshot)` wrapper this function used to
     /// have, and dropped the `warn!("...response receiver dropped")`
     /// sites in the inner loop. Regressions that re-introduce either
@@ -1561,17 +1642,16 @@ mod tests {
     /// subsequent `Client` method calls return [`Error::Shutdown`]
     /// rather than panicking.
     ///
-    /// This is intrinsic to the caller-driven lifecycle introduced in
-    /// phase 6 — the run loop is no longer owned by `Client::new`, so
-    /// failing to spawn it is the caller's responsibility. The test
-    /// pins the behavior deterministically so that any attempt to
-    /// silently "fix" this (e.g. internal spawn fallback) would break
-    /// it and force a review.
+    /// This is intrinsic to the caller-driven lifecycle — the run loop
+    /// is no longer owned by `Client::new`, so failing to spawn it is
+    /// the caller's responsibility. The test pins the behavior
+    /// deterministically so that any attempt to silently "fix" this
+    /// (e.g. internal spawn fallback) would break it and force a review.
     ///
-    /// Prior to the phase-6 API change these call sites panicked on
-    /// `.unwrap()` of the send `Result`; the typed error surfaced here
-    /// lets library consumers observe lifecycle mismatches cleanly
-    /// instead of bringing down the caller's task.
+    /// Prior to the API change these call sites panicked on `.unwrap()`
+    /// of the send `Result`; the typed error surfaced here lets library
+    /// consumers observe lifecycle mismatches cleanly instead of bringing
+    /// down the caller's task.
     #[tokio::test]
     async fn dropping_run_future_without_spawn_returns_shutdown_error() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
@@ -1616,12 +1696,11 @@ mod tests {
     /// announcements land on the `Inner` loop's discovery socket
     /// within a bounded window.
     ///
-    /// Phase 7.5 replaced `tokio::time::interval` (wall-clock aligned,
-    /// catches up after slow bodies) with repeated `Timer::sleep`
-    /// calls (interval + body time, no catch-up). For a healthy event
-    /// loop the body is microseconds, so the observed cadence is very
-    /// close to the requested interval. If a future change regresses
-    /// this to "2 * interval" or worse, this test fires.
+    /// The implementation uses repeated `Timer::sleep` calls (interval +
+    /// body time, no catch-up) rather than wall-clock aligned intervals.
+    /// For a healthy event loop the body is microseconds, so the observed
+    /// cadence is very close to the requested interval. If a future
+    /// change regresses this to "2 * interval" or worse, this test fires.
     ///
     /// The test creates a multicast receiver on the SD port/address
     /// with loopback enabled, then runs a client with
