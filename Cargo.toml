@@ -1,7 +1,8 @@
 [workspace]
 members = [
     ".",
-    "examples/bare_metal",
+    "examples/bare_metal_client",
+    "examples/bare_metal_server",
     "examples/client_server",
     "examples/discovery_client",
 ]
