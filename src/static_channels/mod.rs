@@ -209,6 +209,13 @@ pub struct StaticOneshotSender<T: Send + 'static> {
 
 impl<T: Send + 'static> OneshotSend<T> for StaticOneshotSender<T> {
     fn send(mut self, value: T) -> Result<(), T> {
+        // Refuse to send if the receiver has already dropped.
+        // (A subsequent receiver drop between this check and try_send
+        // is harmless — the value lands in the slot and is drained on
+        // slot release.)
+        if self.slot.state.load(Ordering::Acquire) & O_RECEIVER_ALIVE == 0 {
+            return Err(value);
+        }
         match self.slot.chan.try_send(value) {
             Ok(()) => {
                 self.sent = true;
@@ -309,11 +316,17 @@ pub struct MpscSlot<T: Send + 'static, const SLOT_CAP: usize> {
     chan: Channel<CriticalSectionRawMutex, T, SLOT_CAP>,
     /// Wakes the receiver on close.
     close_waker: AtomicWaker,
+    /// Wakes a sender that is `await`ing on a full channel when the
+    /// receiver drops. Single-slot `AtomicWaker` — multi-sender
+    /// contention is best-effort (latest registration wins, others
+    /// re-observe the closed flag on their next poll).
+    send_waker: AtomicWaker,
     /// Number of live senders (clones) + 1 if receiver is alive.
     /// 0 → slot returns to free list.
     refcount: AtomicUsize,
     /// Set when the last sender drops while receiver is still alive,
-    /// so the receiver's `recv()` resolves to `None`.
+    /// so the receiver's `recv()` resolves to `None`. Also set when the
+    /// receiver drops, so subsequent sender ops return `Err`.
     closed: AtomicBool,
     next_free: AtomicUsize,
 }
@@ -325,6 +338,7 @@ impl<T: Send + 'static, const SLOT_CAP: usize> MpscSlot<T, SLOT_CAP> {
         Self {
             chan: Channel::new(),
             close_waker: AtomicWaker::new(),
+            send_waker: AtomicWaker::new(),
             refcount: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             next_free: AtomicUsize::new(0),
@@ -505,8 +519,39 @@ impl<T: Send + 'static, const SLOT_CAP: usize> Drop for StaticBoundedSender<T, S
 
 impl<T: Send + 'static, const SLOT_CAP: usize> MpscSend<T> for StaticBoundedSender<T, SLOT_CAP> {
     async fn send(&self, value: T) -> Result<(), ()> {
-        self.slot.chan.send(value).await;
-        Ok(())
+        let slot = self.slot;
+        // Fast path: receiver already gone.
+        if slot.closed.load(Ordering::Acquire) {
+            return Err(());
+        }
+        // Pin the embassy SendFuture on the stack so it survives
+        // across yields without losing the captured value. Race it
+        // against the closed flag via send_waker.
+        let mut send_fut = core::pin::pin!(slot.chan.send(value));
+        poll_fn(|cx| {
+            // Closed flag wins over a Ready send, so a receiver-drop
+            // race always returns Err even if the slot happened to
+            // accept the value just before close.
+            if slot.closed.load(Ordering::Acquire) {
+                return Poll::Ready(Err(()));
+            }
+            match send_fut.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(Ok(())),
+                Poll::Pending => {
+                    // Register on send_waker so a receiver drop wakes
+                    // us. The embassy SendFuture has already
+                    // registered on the channel's internal waker.
+                    slot.send_waker.register(cx.waker());
+                    // Re-check closed after registering, to close the
+                    // lost-wakeup window.
+                    if slot.closed.load(Ordering::Acquire) {
+                        return Poll::Ready(Err(()));
+                    }
+                    Poll::Pending
+                }
+            }
+        })
+        .await
     }
 }
 
@@ -518,11 +563,13 @@ pub struct StaticBoundedReceiver<T: Send + 'static, const SLOT_CAP: usize> {
 
 impl<T: Send + 'static, const SLOT_CAP: usize> Drop for StaticBoundedReceiver<T, SLOT_CAP> {
     fn drop(&mut self) {
-        // Receiver gone — mark closed so any pending send_now in
-        // unbounded variant returns errors. (Bounded send awaits;
-        // sender that's blocked on full chan won't be unblocked by
-        // this — accepted v1 limitation.)
+        // Receiver gone — mark closed and wake any pending bounded
+        // sender that's awaiting on a full channel. The send-side
+        // poll_fn races send_waker against the closed flag, so a wake
+        // here re-polls and observes Err. Single AtomicWaker —
+        // multi-sender contention is best-effort.
         self.slot.closed.store(true, Ordering::Release);
+        self.slot.send_waker.wake();
         let prev = self.slot.refcount.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             self.pool.release(self.slot);
@@ -578,6 +625,10 @@ impl<T: Send + 'static, const SLOT_CAP: usize> UnboundedSend<T>
     for StaticUnboundedSender<T, SLOT_CAP>
 {
     fn send_now(&self, value: T) -> Result<(), T> {
+        // Refuse to push into a slot whose receiver has dropped.
+        if self.slot.closed.load(Ordering::Acquire) {
+            return Err(value);
+        }
         self.slot.chan.try_send(value).map_err(|e| match e {
             embassy_sync::channel::TrySendError::Full(v) => v,
         })
@@ -593,6 +644,10 @@ pub struct StaticUnboundedReceiver<T: Send + 'static, const SLOT_CAP: usize> {
 impl<T: Send + 'static, const SLOT_CAP: usize> Drop for StaticUnboundedReceiver<T, SLOT_CAP> {
     fn drop(&mut self) {
         self.slot.closed.store(true, Ordering::Release);
+        // Unbounded send_now never awaits, but we still wake
+        // send_waker so any bounded sender on a slot that was reused
+        // for unbounded duty observes the close. Cheap and safe.
+        self.slot.send_waker.wake();
         let prev = self.slot.refcount.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             self.pool.release(self.slot);
@@ -1120,5 +1175,70 @@ mod tests {
         static POOL: MpscPool<u32, 1, 4> = MpscPool::new();
         let _a = POOL.claim_bounded().expect("pool not empty");
         assert!(POOL.claim_bounded().is_none(), "second claim must exhaust pool of size 1");
+    }
+
+    // ── Sender-side close-semantic tests ──────────────────────────────
+
+    #[test]
+    fn oneshot_send_after_receiver_drop_returns_err() {
+        static POOL: OneshotPool<u32, 2> = OneshotPool::new();
+        let (tx, rx) = POOL.claim().expect("pool not empty");
+        drop(rx);
+        match tx.send(42) {
+            Err(42) => {}
+            other => panic!("expected Err(42) after receiver drop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unbounded_send_now_after_receiver_drop_returns_err() {
+        static POOL: MpscPool<u32, 1, 4> = MpscPool::new();
+        let (tx, rx) = POOL.claim_unbounded().expect("pool not empty");
+        drop(rx);
+        match tx.send_now(7) {
+            Err(7) => {}
+            other => panic!("expected Err(7) after receiver drop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_send_unblocks_with_err_on_receiver_drop() {
+        static POOL: MpscPool<u32, 1, 1> = MpscPool::new();
+        let (tx, rx) = POOL.claim_bounded().expect("pool not empty");
+        // Capacity is 1; fill it.
+        {
+            let mut send_fut = pin!(tx.send(1));
+            assert!(matches!(poll_once(&mut send_fut), Poll::Ready(Ok(()))));
+        }
+        // Next send must wait — channel is full.
+        let mut send_fut = pin!(tx.send(2));
+        let (flag, waker) = tracking_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(send_fut.as_mut().poll(&mut cx), Poll::Pending));
+        // Drop the receiver — sender's send_waker must fire and the
+        // next poll must return Err(()).
+        drop(rx);
+        assert!(
+            flag.0.load(SAtomic::Acquire),
+            "send_waker must fire when receiver drops while sender is awaiting"
+        );
+        let noop = Waker::noop();
+        let mut cx2 = Context::from_waker(noop);
+        match send_fut.as_mut().poll(&mut cx2) {
+            Poll::Ready(Err(())) => {}
+            other => panic!("expected Err(()) after receiver drop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_send_after_receiver_drop_returns_err_fast_path() {
+        static POOL: MpscPool<u32, 1, 4> = MpscPool::new();
+        let (tx, rx) = POOL.claim_bounded().expect("pool not empty");
+        drop(rx);
+        let mut send_fut = pin!(tx.send(99));
+        match poll_once(&mut send_fut) {
+            Poll::Ready(Err(())) => {}
+            other => panic!("expected Err(()) on closed slot, got {other:?}"),
+        }
     }
 }

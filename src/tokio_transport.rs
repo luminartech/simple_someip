@@ -269,7 +269,7 @@ fn bind_with_options(addr: SocketAddrV4, options: SocketOptions) -> std::io::Res
     // Apply the multicast-loop flag whenever the caller is doing
     // multicast (interface configured) OR explicitly asked for
     // loop=true. Skipping the syscall only when both are unset avoids
-    // a no-op call on plain-unicast sockets while still honouring an
+    // a no-op call on plain-unicast sockets while still honoring an
     // explicit caller request.
     if options.multicast_if_v4.is_some() || options.multicast_loop_v4 {
         raw.set_multicast_loop_v4(options.multicast_loop_v4)?;
