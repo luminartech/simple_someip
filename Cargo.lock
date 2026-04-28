@@ -3,7 +3,16 @@
 version = 4
 
 [[package]]
-name = "bare_metal"
+name = "bare_metal_client"
+version = "0.0.0"
+dependencies = [
+ "critical-section",
+ "simple-someip",
+ "tokio",
+]
+
+[[package]]
+name = "bare_metal_server"
 version = "0.0.0"
 dependencies = [
  "critical-section",

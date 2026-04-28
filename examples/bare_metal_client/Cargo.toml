@@ -1,0 +1,17 @@
+[package]
+name = "bare_metal_client"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# `simple-someip` is compiled with `default-features = false,
+# features = ["client", "bare_metal"]` — no tokio, no socket2 pulled in
+# by the crate itself. The example binary adds tokio only for its own
+# executor and mock driver; real firmware would use embassy_executor or
+# a similar bare-metal async runtime instead.
+[dependencies]
+simple-someip = { path = "../..", default-features = false, features = ["client", "bare_metal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+# Provides the host platform critical-section implementation required by
+# embassy-sync (pulled in via simple-someip's bare_metal feature).
+critical-section = { version = "1", features = ["std"] }
