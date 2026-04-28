@@ -530,9 +530,10 @@ impl<T: Send + 'static, const SLOT_CAP: usize> MpscSend<T> for StaticBoundedSend
         // against the closed flag via send_waker.
         let mut send_fut = core::pin::pin!(slot.chan.send(value));
         poll_fn(|cx| {
-            // Closed flag wins over a Ready send, so a receiver-drop
-            // race always returns Err even if the slot happened to
-            // accept the value just before close.
+            // If the receiver is already closed, report Err(()). A
+            // send that polls Ready before the closed check returns
+            // Ok(()), even if close happened concurrently after the
+            // pre-poll check.
             if slot.closed.load(Ordering::Acquire) {
                 return Poll::Ready(Err(()));
             }
