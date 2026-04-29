@@ -10,8 +10,20 @@ publish = false
 # executor and mock driver; real firmware would use embassy_executor or
 # a similar bare-metal async runtime instead.
 [dependencies]
-simple-someip = { path = "../..", default-features = false, features = ["server", "bare_metal"] }
+# `std` enabled here because the example uses `tokio::spawn` for the
+# announcement-loop driver and tokio requires std. The `server +
+# bare_metal` shape — std-droppable trait surface (`server` itself
+# does not imply std as of 0.8.0) — is verified by the cortex-m4f
+# cross-build in CI; this host example additionally exercises the
+# runtime end-to-end.
+simple-someip = { path = "../..", default-features = false, features = ["std", "server", "bare_metal"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 # Provides the host platform critical-section implementation required by
 # embassy-sync (pulled in via simple-someip's bare_metal feature).
 critical-section = { version = "1", features = ["std"] }
+# Used directly by this example's `static StaticE2EStorage` /
+# `static StaticSubscriptionStorage` declarations to spell the
+# `BlockingMutex<CriticalSectionRawMutex, RefCell<_>>` types. The
+# version pin matches what simple-someip's `bare_metal` feature pulls
+# transitively (so we don't accidentally fork the dep tree).
+embassy-sync = "0.6"

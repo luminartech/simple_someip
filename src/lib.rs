@@ -26,12 +26,12 @@
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `std` | yes | Enables std-dependent helpers (`RawPayload`, `VecSdHeader`, `OfferedEndpoint`) |
-//! | `client` | no | Trait-surface client; implies `std` + futures (no tokio) |
-//! | `client-tokio` | no | Adds the `Client::new` / `TokioSpawner` / `TokioTransport` convenience defaults; implies `client` + tokio + socket2 |
-//! | `server` | no | Trait-surface server; implies `std` + futures (no tokio) |
-//! | `server-tokio` | no | Adds the `Server::new` / `TokioTransport` / `TokioTimer` convenience defaults; implies `server` + tokio + socket2 |
-//! | `bare_metal` | no | Activates embassy-sync, the `static_channels` module (no-alloc `ChannelFactory`), `AtomicInterfaceHandle`, and `StaticE2EHandle`. All four are pure `no_std` (no allocator required). See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable bare-metal integration examples. |
+//! | `std` | yes | Enables std-dependent helpers (`RawPayload`, `VecSdHeader`) and the `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<…>>` default lock-handle impls used by the tokio backends. |
+//! | `client` | no | Trait-surface client. Pure `no_std`-clean (does not pull `extern crate alloc`). Caller supplies `Spawner` / `Timer` / `ChannelFactory` / `TransportFactory` / `E2ERegistryHandle` / `InterfaceHandle` impls. |
+//! | `client-tokio` | no | Adds the `Client::new` / `TokioSpawner` / `TokioTransport` convenience defaults; implies `client` + std + tokio + socket2. |
+//! | `server` | no | Trait-surface server. Pulls `extern crate alloc` (for `Arc<EventPublisher>` / `Arc<F::Socket>`); on `no_std`, downstream consumers must provide a `#[global_allocator]`. |
+//! | `server-tokio` | no | Adds the `Server::new` / `TokioTransport` / `TokioTimer` convenience defaults; implies `server` + std + tokio + socket2. |
+//! | `bare_metal` | no | Activates embassy-sync, the `static_channels` module (no-alloc `ChannelFactory`), `AtomicInterfaceHandle`, `StaticE2EHandle`, and `StaticSubscriptionHandle`. All five are pure `no_std` (no allocator required). See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable bare-metal integration examples. |
 //! | `embassy_channels` | no | Heap-backed `EmbassySyncChannels` `ChannelFactory`. Implies `bare_metal` and pulls `extern crate alloc;` into the crate; **on `no_std`, downstream consumers must provide a `#[global_allocator]`**. Useful for tests / early prototypes before sizing static pools. |
 //!
 //! The default feature set is `["std"]`, which links `std` and enables
