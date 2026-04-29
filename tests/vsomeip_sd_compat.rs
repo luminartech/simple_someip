@@ -20,72 +20,55 @@
 //!
 //! # Running locally
 //!
-//! 1. Pull or build a vsomeip container. The COVESA project doesn't
-//!    publish a "ready-to-go" image; the simplest path is a small
-//!    Dockerfile around vsomeip's cmake build. The image needs
-//!    `routingmanagerd` (the SD daemon) plus a JSON config that
-//!    declares an "offerer" application with the service we want
-//!    advertised. Phase 20g will add a reference Dockerfile under
-//!    `tests/data/vsomeip-offerer/` once the manual setup is
-//!    proven; until then, hand-rolled is fine.
-//!
-//! 2. Save the config below as `vsomeip-offerer.json` and start
-//!    the container in host-network mode so SD multicast (224.0.23.0)
-//!    flows between the host and the container:
+//! 1. Build the offerer image (one-time, ~5-10 min):
 //!
 //!    ```text
-//!    docker run --rm -d \
-//!      --name vsomeip-offerer \
-//!      --network host \
-//!      -v $(pwd)/vsomeip-offerer.json:/etc/vsomeip.json:ro \
-//!      -e VSOMEIP_CONFIGURATION=/etc/vsomeip.json \
-//!      -e VSOMEIP_APPLICATION_NAME=offerer \
-//!      <your vsomeip image>
+//!    docker build --network=host -t vsomeip-offerer \
+//!        tests/data/vsomeip-offerer/
 //!    ```
 //!
-//!    Sample vsomeip-offerer.json that offers service 0x1234
-//!    instance 0x0001 over UDP port 30509:
-//!
-//!    ```json
-//!    {
-//!      "unicast": "127.0.0.1",
-//!      "logging": { "level": "info", "console": "true" },
-//!      "applications": [
-//!        { "name": "offerer", "id": "0x1277" }
-//!      ],
-//!      "services": [
-//!        {
-//!          "service": "0x1234",
-//!          "instance": "0x0001",
-//!          "unreliable": "30509"
-//!        }
-//!      ],
-//!      "routing": "offerer",
-//!      "service-discovery": {
-//!        "enable": "true",
-//!        "multicast": "224.0.23.0",
-//!        "port": "30490",
-//!        "protocol": "udp",
-//!        "initial_delay_min": "10",
-//!        "initial_delay_max": "100",
-//!        "repetitions_base_delay": "200",
-//!        "repetitions_max": "3",
-//!        "ttl": "5"
-//!      }
-//!    }
-//!    ```
-//!
-//! 3. Set the test's listening interface via env var to whatever IP
-//!    vsomeip is announcing on. For host-network Docker, that's
-//!    typically `127.0.0.1` (matches `unicast` in the config above):
+//! 2. Find a multicast-capable interface IP on your host. **Do not
+//!    use 127.0.0.1** — Linux's `lo` interface lacks the `MULTICAST`
+//!    flag by default, so SD multicast (`224.0.23.0`) never leaves
+//!    the host:
 //!
 //!    ```text
-//!    SIMPLE_SOMEIP_TEST_INTERFACE=127.0.0.1 \
+//!    ip route get 224.0.23.0
+//!    # multicast 224.0.23.0 dev wlp0s20f3 src 192.168.1.42 ...
+//!    #                                        ^^^^^^^^^^^^
+//!    ```
+//!
+//!    The `src` IP is what you pass on both sides below.
+//!
+//! 3. Start the offerer (host-network mode so SD multicast flows on
+//!    the actual interface):
+//!
+//!    ```text
+//!    docker run --rm -d --name vsomeip-offerer --network host \
+//!        -e VSOMEIP_UNICAST=192.168.1.42 \
+//!        vsomeip-offerer
+//!    ```
+//!
+//!    Verify it's emitting:
+//!
+//!    ```text
+//!    docker logs vsomeip-offerer | grep -E "Joining|OFFER"
+//!    # Joining to multicast group 224.0.23.0 from 192.168.1.42
+//!    # OFFER(1277): [1234.0001:1.0] (true)
+//!    ```
+//!
+//! 4. Run the test (use the same interface IP):
+//!
+//!    ```text
+//!    SIMPLE_SOMEIP_TEST_INTERFACE=192.168.1.42 \
 //!    cargo test --features client-tokio,server-tokio \
 //!      --test vsomeip_sd_compat -- --ignored --nocapture
 //!    ```
 //!
-//! 4. Tear down: `docker stop vsomeip-offerer`.
+//!    Expected: `client_sees_vsomeip_offer_service ... ok` in well
+//!    under a second.
+//!
+//! 5. Tear down: `docker stop vsomeip-offerer`.
 //!
 //! # Why `#[ignore]`?
 //!

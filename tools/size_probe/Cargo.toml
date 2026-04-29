@@ -1,0 +1,38 @@
+[package]
+name = "size_probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Phase-20-pre flash-size measurement probe. Builds a `staticlib`
+# that exposes `extern "C"` shims around simple-someip's
+# Option-A-relevant entry points, so post-link dead-code-elimination
+# only keeps what an actual halo-style FFI consumer would call.
+#
+# Build:
+#   cargo build -p size_probe --release --target thumbv7em-none-eabihf
+#
+# Measure:
+#   llvm-size target/thumbv7em-none-eabihf/release/libsize_probe.a
+#
+# NOT a real production crate — exists purely to give us a flash-size
+# floor on the cortex-m4f target, since we don't have access to the
+# actual proxy LLVM-IR-TriCore toolchain locally.
+
+[lib]
+name = "size_probe"
+crate-type = ["staticlib"]
+
+[dependencies]
+# `bare_metal` only — no `server` (pulls `extern crate alloc` per
+# the lib.rs feature table). Codec-only FFI doesn't need server's
+# Server actor or Arc-shared state. `client` would be alloc-free
+# but not needed here either. Matches halo PR #4429's surface.
+simple-someip = { path = "../..", default-features = false, features = ["bare_metal"] }
+
+[profile.release]
+opt-level = "z"   # optimize for size
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
