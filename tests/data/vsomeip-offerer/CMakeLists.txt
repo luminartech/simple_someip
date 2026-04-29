@@ -8,16 +8,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # stage of the Dockerfile) provides the imported targets we need.
 find_package(vsomeip3 REQUIRED)
 
-# Offerer binary: tiny, links libvsomeip3.
+# Two binaries: offerer (advertises the service) and subscriber
+# (consumes it via SD availability handler). The Dockerfile builds
+# both; the entrypoint dispatches based on `VSOMEIP_ROLE`.
 add_executable(offerer offerer.cpp)
+add_executable(subscriber subscriber.cpp)
 
-target_link_libraries(offerer
-    PRIVATE
-        vsomeip3
-)
-
-# vsomeip publishes its headers under <vsomeip/...>.
-target_include_directories(offerer
-    PRIVATE
-        ${VSOMEIP_INCLUDE_DIRS}
-)
+foreach(target offerer subscriber)
+    target_link_libraries(${target} PRIVATE vsomeip3)
+    target_include_directories(${target} PRIVATE ${VSOMEIP_INCLUDE_DIRS})
+endforeach()

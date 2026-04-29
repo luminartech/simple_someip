@@ -141,6 +141,20 @@ jobs:
           cargo doc --no-deps --all-features
       - name: No-alloc witness (explicit gate)
         run: cargo test --features client,bare_metal --test no_alloc_witness
+      - name: SD wire-format conformance (TX direction)
+        # `tx_announcement_loop_emits_wire_format_offer` is `#[ignore]`'d by
+        # default because it needs an interface with the `MULTICAST` link
+        # flag. CI's `lo` lacks it; flip it on, point the test at
+        # 127.0.0.1, and run just this one test (the rest of the file's
+        # ignored tests need an external vsomeip docker container — they
+        # stay skipped).
+        run: |
+          sudo ip link set lo multicast on
+          SIMPLE_SOMEIP_TEST_INTERFACE=127.0.0.1 \
+            cargo test --features client-tokio,server-tokio \
+              --test vsomeip_sd_compat \
+              tx_announcement_loop_emits_wire_format_offer \
+              -- --ignored --exact --nocapture
       - run: cargo llvm-cov nextest --all-features --lcov --output-path ./target/lcov.info
       - name: Upload Coverage report
         uses: codecov/codecov-action@v5
