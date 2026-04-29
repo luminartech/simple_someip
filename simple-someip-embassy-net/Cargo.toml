@@ -1,0 +1,59 @@
+[package]
+name = "simple-someip-embassy-net"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "embassy-net `TransportFactory` / `TransportSocket` adapter for the simple-someip crate"
+repository = "https://github.com/luminartech/simple_someip"
+readme = "README.md"
+
+# This crate is the reference no_std backend for `simple-someip`'s
+# trait surface. It depends on `simple-someip` with
+# `default-features = false, features = ["client", "server", "bare_metal"]`
+# — no std, no tokio, no socket2 — and provides a thin adapter from
+# embassy-net's `UdpSocket` API to simple-someip's
+# `TransportSocket` / `TransportFactory` traits.
+#
+# Sized for: bare-metal Rust embedded targets running embassy-net +
+# embassy-executor (cortex-m, RISC-V). Does not require alloc.
+#
+# See `bare_metal_plan_v3.md` for the surrounding plan (phase 19).
+
+[dependencies]
+simple-someip = { path = "..", version = "0.8", default-features = false, features = [
+    "client",
+    "server",
+    "bare_metal",
+] }
+# Pinned to a version known to coexist with `simple-someip`'s
+# `embassy-sync = "0.6"` dep. embassy-net 0.4.x is the last
+# release line that builds against embassy-sync 0.6; later
+# embassy-net releases (0.5+) require embassy-sync 0.7+, which
+# would force a parallel-version cargo resolution that bloats the
+# binary. Bumping both deps in lockstep is its own future phase.
+embassy-net = { version = "0.4", default-features = false, features = [
+    "udp",
+    "proto-ipv4",
+    "igmp",
+    # smoltcp (embassy-net's underlying TCP/IP stack) requires at
+    # least one network-medium feature to be enabled. We enable both
+    # `medium-ethernet` (the common case for SOME/IP on automotive
+    # Ethernet) and `medium-ip` (for raw IP backends like SLIP / lwIP
+    # tap devices). `medium-ieee802154` is intentionally not enabled
+    # — SOME/IP-over-802.15.4 is not in scope for this adapter.
+    "medium-ethernet",
+    "medium-ip",
+] }
+embassy-sync = "0.6"
+heapless = "0.9"
+
+[dev-dependencies]
+# Host-side tests use a tuntap-backed embassy-net stack to drive a
+# request/response roundtrip. The dev-dep is what gets us link-time
+# `critical-section` impls on the host.
+critical-section = { version = "1", features = ["std"] }
+embassy-executor = { version = "0.6", features = [
+    "arch-std",
+    "executor-thread",
+] }
+embassy-time = { version = "0.3", features = ["std", "generic-queue-8"] }
