@@ -930,14 +930,27 @@ where
     /// `Err(Error::Shutdown)` after the run-loop has exited; the
     /// registry is still accessible via any held `Client` clone.
     ///
+    /// # Errors
+    ///
+    /// Returns [`crate::e2e::E2ERegistryFull`] when the underlying
+    /// registry has no room for a new key. Replacing the profile of an
+    /// already-registered key always succeeds. Bare-metal users sizing
+    /// their E2E registry should set
+    /// [`crate::e2e::E2E_REGISTRY_CAP`]-equivalent storage to their
+    /// workload's high-water mark.
+    ///
     /// # Panics
     ///
     /// May panic if the underlying [`E2ERegistryHandle`]
     /// implementation panics (e.g., `Arc<Mutex<E2ERegistry>>` on mutex poison).
     ///
     /// [`E2ERegistryHandle`]: crate::transport::E2ERegistryHandle
-    pub fn register_e2e(&self, key: E2EKey, profile: E2EProfile) {
-        self.e2e_registry.register(key, profile);
+    pub fn register_e2e(
+        &self,
+        key: E2EKey,
+        profile: E2EProfile,
+    ) -> Result<(), crate::e2e::E2ERegistryFull> {
+        self.e2e_registry.register(key, profile)
     }
 
     /// Remove E2E configuration for the given key.
@@ -1373,7 +1386,9 @@ mod tests {
             method_or_event_id: 0x0001,
         };
         let profile = E2EProfile::Profile4(crate::e2e::Profile4Config::new(42, 10));
-        client.register_e2e(key, profile);
+        client
+            .register_e2e(key, profile)
+            .expect("E2E registry has capacity for one entry");
         client.unregister_e2e(&key);
         client.shut_down();
     }
