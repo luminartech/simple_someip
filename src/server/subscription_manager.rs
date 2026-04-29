@@ -2,10 +2,10 @@
 
 use super::service_info::Subscriber;
 use core::future::Future;
+use core::net::SocketAddrV4;
 use heapless::{Vec as HeaplessVec, index_map::FnvIndexMap};
 #[cfg(feature = "server-tokio")]
 use std::sync::Arc;
-use std::{net::SocketAddrV4, vec::Vec};
 #[cfg(feature = "server-tokio")]
 use tokio::sync::RwLock;
 
@@ -231,14 +231,25 @@ impl SubscriptionManager {
         }
     }
 
-    /// Get all subscribers for an event group
+    /// Get all subscribers for an event group as a heap-allocated `Vec`.
+    ///
+    /// Convenience accessor for `std` consumers (testing, ad-hoc tooling).
+    /// **Production code paths use [`Self::for_each_subscriber`] instead**
+    /// — that visitor walks the same data structure under the lock without
+    /// allocating per call, which is required for the bare-metal /
+    /// no-alloc story.
+    ///
+    /// Gated on `feature = "std"` because the return type forces an
+    /// `alloc` dependency. Without `std`, callers should use
+    /// [`Self::for_each_subscriber`].
+    #[cfg(feature = "std")]
     #[must_use]
     pub fn get_subscribers(
         &self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-    ) -> Vec<Subscriber> {
+    ) -> std::vec::Vec<Subscriber> {
         let key = (service_id, instance_id, event_group_id);
         self.subscriptions
             .get(&key)
@@ -381,6 +392,7 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+    use std::vec::Vec;
 
     #[test]
     fn test_subscription_management() {
