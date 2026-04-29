@@ -25,18 +25,19 @@
 //! |---------|-------------|----------------------|
 //! | Transport | `MockFactory` / `MockSocket` | `embassy_net`, smoltcp, custom Ethernet ISR |
 //! | Timer | `MockTimer` using `tokio::time::sleep` | `embassy_time::Timer::after` |
-//! | Subscription table | `MockSubscriptions` | `heapless`-backed table behind a CS mutex |
-//! | Lock handle | `Arc<Mutex<E2ERegistry>>` | stack-allocated handle (see below) |
+//! | Subscription table | `StaticSubscriptionHandle` over `&'static StaticSubscriptionStorage` | same — already firmware-ready |
+//! | E2E registry | `StaticE2EHandle` over `&'static StaticE2EStorage` | same — already firmware-ready |
 //!
-//! # What is not yet demonstrated
-//!
-//! The `E2ERegistry` handle still uses a heap-allocated `Arc<Mutex<_>>`.
-//! A future verification pass will replace this with a stack-allocated
-//! alternative and confirm zero heap allocation after
-//! `Server::new_with_deps` returns.
+//! Both handles are pure `no_std` (no allocator required) and use a
+//! `&'static` critical-section mutex around the underlying state, which
+//! is the firmware-target shape. `E2ERegistry::new()` and
+//! `SubscriptionManager::new()` are both `const`, so the storage lives
+//! in plain `static` declarations at module scope (see `E2E_STORAGE`
+//! and `SUBS_STORAGE` near the top of this file).
 //!
 //! [`Server::new_with_deps`]: simple_someip::Server::new_with_deps
 
+use core::cell::RefCell;
 use core::future::Future;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::pin::Pin;
@@ -47,12 +48,34 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use simple_someip::e2e::E2ERegistry;
-use simple_someip::server::{ServerConfig, SubscribeError, Subscriber, SubscriptionHandle};
+use simple_someip::server::{
+    ServerConfig, StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager,
+};
 use simple_someip::transport::{
     ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory, TransportSocket,
 };
-use simple_someip::{Server, ServerDeps};
+use simple_someip::{Server, ServerDeps, StaticE2EHandle, StaticE2EStorage};
+
+// ── Bare-metal lock-handle storage ────────────────────────────────────
+//
+// `&'static` storage for the no-alloc lock handles. Both
+// `E2ERegistry::new()` and `SubscriptionManager::new()` are `const`,
+// so the storage lives in plain `static`s — no `Box::leak` required.
+// On real firmware you'd write the same `static` declarations in
+// boot code.
+
+static E2E_STORAGE: StaticE2EStorage =
+    BlockingMutex::<CriticalSectionRawMutex, RefCell<E2ERegistry>>::new(RefCell::new(
+        E2ERegistry::new(),
+    ));
+
+static SUBS_STORAGE: StaticSubscriptionStorage = BlockingMutex::<
+    CriticalSectionRawMutex,
+    RefCell<SubscriptionManager>,
+>::new(RefCell::new(SubscriptionManager::new()));
 
 // ── Mock transport ────────────────────────────────────────────────────
 //
@@ -204,82 +227,6 @@ impl Timer for MockTimer {
     }
 }
 
-// ── Mock SubscriptionHandle ───────────────────────────────────────────
-//
-// On `server-tokio`, `Arc<RwLock<SubscriptionManager>>` is the built-in
-// impl. Bare-metal callers supply their own. A real firmware impl would
-// back this with a `critical_section::Mutex<RefCell<_>>` or
-// `spin::Mutex<_>` over a `heapless`-backed table; here we use
-// `std::sync::Mutex` over a `Vec` because the example runs on the host.
-// The trait impl itself is the portable pattern — only the concurrency
-// primitive and storage type change on firmware.
-
-type SubKey = (u16, u16, u16, SocketAddrV4);
-
-#[derive(Clone, Default)]
-struct MockSubscriptions(Arc<Mutex<Vec<SubKey>>>);
-
-impl SubscriptionHandle for MockSubscriptions {
-    fn subscribe(
-        &self,
-        service_id: u16,
-        instance_id: u16,
-        event_group_id: u16,
-        subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
-        let inner = Arc::clone(&self.0);
-        async move {
-            let mut guard = inner.lock().unwrap();
-            let key = (service_id, instance_id, event_group_id, subscriber_addr);
-            if !guard.contains(&key) {
-                guard.push(key);
-            }
-            Ok(())
-        }
-    }
-
-    fn unsubscribe(
-        &self,
-        service_id: u16,
-        instance_id: u16,
-        event_group_id: u16,
-        subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = ()> + '_ {
-        let inner = Arc::clone(&self.0);
-        async move {
-            inner
-                .lock()
-                .unwrap()
-                .retain(|e| *e != (service_id, instance_id, event_group_id, subscriber_addr));
-        }
-    }
-
-    fn for_each_subscriber<'a, F>(
-        &'a self,
-        service_id: u16,
-        instance_id: u16,
-        event_group_id: u16,
-        mut f: F,
-    ) -> impl Future<Output = usize> + 'a
-    where
-        F: FnMut(&Subscriber) + 'a,
-    {
-        let inner = Arc::clone(&self.0);
-        async move {
-            let guard = inner.lock().unwrap();
-            let mut count = 0;
-            for (s, i, e, addr) in guard.iter() {
-                if *s == service_id && *i == instance_id && *e == event_group_id {
-                    let sub = Subscriber::new(*addr, *s, *i, *e);
-                    f(&sub);
-                    count += 1;
-                }
-            }
-            count
-        }
-    }
-}
-
 // ── Main ──────────────────────────────────────────────────────────────
 
 // current_thread matches a single-core bare-metal executor; yields are
@@ -293,27 +240,30 @@ async fn main() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    // std Arc/Mutex implements E2ERegistryHandle and is gated by
-    // `feature = "std"`, not `server-tokio`. A future no-alloc port
-    // replaces this with a stack-allocated handle.
-    let e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
-    let subs = MockSubscriptions::default();
+    // Bare-metal lock handles: both StaticE2EHandle and
+    // StaticSubscriptionHandle are pure no_std (alloc-free) and back
+    // their state with a `&'static` critical-section mutex. The
+    // `static` storages themselves live at module scope (see top of
+    // file) — clippy::pedantic dislikes `static` after `let`.
+    let e2e = StaticE2EHandle::new(&E2E_STORAGE);
+    let subs = StaticSubscriptionHandle::new(&SUBS_STORAGE);
 
     // service_id=0x1234, instance_id=1, bound to LOCALHOST:30490.
     let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30490, 0x1234, 1);
 
-    let server = Server::<
-        Arc<Mutex<E2ERegistry>>,
-        MockSubscriptions,
-        MockFactory,
-        MockTimer,
-    >::new_with_deps(
-        ServerDeps { factory, timer: MockTimer, e2e_registry: e2e, subscriptions: subs },
-        config,
-        false, // multicast_loopback
-    )
-    .await
-    .expect("Server::new_with_deps failed");
+    let server =
+        Server::<StaticE2EHandle, StaticSubscriptionHandle, MockFactory, MockTimer>::new_with_deps(
+            ServerDeps {
+                factory,
+                timer: MockTimer,
+                e2e_registry: e2e,
+                subscriptions: subs,
+            },
+            config,
+            false, // multicast_loopback
+        )
+        .await
+        .expect("Server::new_with_deps failed");
 
     // The announcement loop periodically multicasts SD OfferService
     // entries so clients on the network can discover this service.
