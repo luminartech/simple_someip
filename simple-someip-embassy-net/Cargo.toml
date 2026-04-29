@@ -48,6 +48,20 @@ embassy-sync = "0.6"
 heapless = "0.9"
 
 [dev-dependencies]
+# Re-pin `simple-someip` with `std` enabled for the host-side test
+# harness. Production builds of this adapter still pull in
+# `simple-someip` with `default-features = false`, so the adapter
+# library itself stays no_std. The dev-dep override only widens
+# what the *tests* can import — `RawPayload`, `VecSdHeader`, and
+# the `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<…>>` default
+# handle impls — all of which are gated on `feature = "std"` in
+# the parent crate.
+simple-someip = { path = "..", default-features = false, features = [
+    "client",
+    "server",
+    "bare_metal",
+    "std",
+] }
 # Host-side tests run two embassy-net stacks bridged by a software
 # `LoopbackDriver` pair (no kernel TUN, no privilege requirement).
 # `critical-section/std` provides a host platform impl so embassy-sync
