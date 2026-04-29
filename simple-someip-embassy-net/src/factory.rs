@@ -14,7 +14,7 @@ use embassy_net::Stack;
 use embassy_net::driver::Driver;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 
-use simple_someip::transport::{IoErrorKind, SocketOptions, TransportError, TransportFactory};
+use simple_someip::transport::{SocketOptions, TransportError, TransportFactory};
 
 use crate::socket::{EmbassyNetSocket, SlotReclaim};
 
@@ -315,11 +315,4 @@ where
             inner: Some(Ok(socket)),
         }
     }
-}
-
-/// Internal: unused-import guard so `IoErrorKind` stays threaded
-/// through for use in the upcoming 19c socket-level error mapping.
-#[allow(dead_code)]
-fn _phantom_io_error_kind_use() -> IoErrorKind {
-    IoErrorKind::Other
 }

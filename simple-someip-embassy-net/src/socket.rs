@@ -1,17 +1,18 @@
 //! `TransportSocket` impl wrapping `embassy_net::udp::UdpSocket`.
 //!
-//! Phase 19b: the type is constructed by [`crate::factory::EmbassyNetFactory::bind`]
-//! and carries the slot-reclamation hook so its `Drop` impl returns
-//! the buffer pool slot to the free list. The `TransportSocket`
-//! trait impl (named `send_to` / `recv_from` futures driving
-//! `poll_send_to` / `poll_recv_from`, plus the multicast / local-addr
-//! shims) lands in 19c.
+//! Phase 19c lands the real send/recv I/O — named future structs
+//! drive `embassy_net`'s `poll_send_to` / `poll_recv_from` directly,
+//! so each datagram costs zero heap allocations on the hot path.
 
-use core::future::Ready;
+use core::future::Future;
 use core::net::{Ipv4Addr, SocketAddrV4};
+use core::pin::Pin;
+use core::task::{Context, Poll};
 
-use embassy_net::udp::UdpSocket;
-use simple_someip::transport::{ReceivedDatagram, TransportError, TransportSocket};
+use embassy_net::udp::{RecvError, SendError, UdpSocket};
+use embassy_net::{IpAddress, IpEndpoint};
+
+use simple_someip::transport::{IoErrorKind, ReceivedDatagram, TransportError, TransportSocket};
 
 /// Hook implemented by [`crate::SocketPool`] for releasing a
 /// claimed slot back to the free list when an
@@ -62,19 +63,6 @@ impl EmbassyNetSocket {
             reclaim,
         }
     }
-
-    /// Borrow the inner `UdpSocket` for the upcoming
-    /// `TransportSocket` send/recv impl in 19c.
-    #[allow(dead_code)] // wired in 19c
-    pub(crate) fn inner(&self) -> &UdpSocket<'static> {
-        &self.inner
-    }
-
-    /// Local address recorded at bind time.
-    #[allow(dead_code)] // wired in 19c
-    pub(crate) fn local(&self) -> SocketAddrV4 {
-        self.local
-    }
 }
 
 impl Drop for EmbassyNetSocket {
@@ -87,32 +75,112 @@ impl Drop for EmbassyNetSocket {
     }
 }
 
-// ── TransportSocket impl (stub) ──────────────────────────────────────
+// ── Named send / recv futures ────────────────────────────────────────
 //
-// Phase 19b ships a minimum-viable impl so the
-// `EmbassyNetFactory::TransportFactory` impl typechecks (the trait
-// requires `Self::Socket: TransportSocket`). Every method here
-// returns `Err(TransportError::Unsupported)`. Phase 19c replaces
-// them with real `poll_send_to` / `poll_recv_from`-driven named
-// futures.
-//
-// Until 19c, attempting to use a bound `EmbassyNetSocket` for actual
-// I/O will fail at runtime with `Unsupported`. This is intentional:
-// the 19b commit verifies the factory + pool + Drop wiring without
-// requiring the full I/O bring-up, which is its own scoped work.
+// Hand-rolled `Future` types over embassy-net's `poll_send_to` /
+// `poll_recv_from` rather than wrapping the async `send_to` /
+// `recv_from` in `Box::pin(async move { ... })`. The named-struct
+// shape is what makes the adapter zero-alloc on the hot path —
+// every datagram incurs no allocator traffic.
+
+/// Future returned by [`EmbassyNetSocket::send_to`]. Drives
+/// `embassy_net::udp::UdpSocket::poll_send_to` directly.
+pub struct EmbassyNetSendFut<'a> {
+    socket: &'a UdpSocket<'static>,
+    buf: &'a [u8],
+    target: IpEndpoint,
+}
+
+impl Future for EmbassyNetSendFut<'_> {
+    type Output = Result<(), TransportError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // EmbassyNetSendFut has no self-referential fields; the
+        // underlying `UdpSocket::poll_send_to` only borrows
+        // through `&self`, and `me.buf` is a fresh reborrow every
+        // poll. Safe to project to `&mut Self`.
+        let me = self.get_mut();
+        match me.socket.poll_send_to(me.buf, me.target, cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(SendError::NoRoute)) => {
+                Poll::Ready(Err(TransportError::Io(IoErrorKind::NetworkUnreachable)))
+            }
+            Poll::Ready(Err(SendError::SocketNotBound)) => {
+                // Programming error — we always bind before
+                // returning the socket from `EmbassyNetFactory::bind`.
+                // Surface as `Other` so it shows up in operator
+                // logs distinctly from a routing failure.
+                Poll::Ready(Err(TransportError::Io(IoErrorKind::Other)))
+            }
+        }
+    }
+}
+
+/// Future returned by [`EmbassyNetSocket::recv_from`]. Drives
+/// `embassy_net::udp::UdpSocket::poll_recv_from` directly.
+pub struct EmbassyNetRecvFut<'a> {
+    socket: &'a UdpSocket<'static>,
+    buf: &'a mut [u8],
+}
+
+impl Future for EmbassyNetRecvFut<'_> {
+    type Output = Result<ReceivedDatagram, TransportError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        match me.socket.poll_recv_from(me.buf, cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok((n, endpoint))) => match endpoint_to_socket_addr_v4(endpoint) {
+                Some(source) => Poll::Ready(Ok(ReceivedDatagram {
+                    bytes_received: n,
+                    source,
+                    // embassy-net's `recv_slice` returns
+                    // `Truncated` (mapped to `Err` below) when the
+                    // datagram doesn't fit; on the success path it
+                    // delivered the whole thing.
+                    truncated: false,
+                })),
+                None => {
+                    // IPv6 source on a v4-bound SOME/IP socket is a
+                    // misconfiguration upstream — surface as
+                    // `Unsupported` for the same reason
+                    // `tokio_transport::recv_from` does.
+                    Poll::Ready(Err(TransportError::Unsupported))
+                }
+            },
+            Poll::Ready(Err(RecvError::Truncated)) => {
+                // Caller's buffer was smaller than the datagram.
+                // simple-someip uses `UDP_BUFFER_SIZE = 1500` for
+                // its recv buffers, which exceeds typical UDP
+                // payloads — hitting this branch indicates either
+                // an undersized SocketPool RX_BUF or an
+                // unexpectedly large incoming datagram. Either way
+                // the application has a sizing problem worth
+                // logging through the operator pipeline.
+                Poll::Ready(Err(TransportError::Io(IoErrorKind::Other)))
+            }
+        }
+    }
+}
 
 impl TransportSocket for EmbassyNetSocket {
-    type SendFuture<'a> = Ready<Result<(), TransportError>>;
-    type RecvFuture<'a> = Ready<Result<ReceivedDatagram, TransportError>>;
+    type SendFuture<'a> = EmbassyNetSendFut<'a>;
+    type RecvFuture<'a> = EmbassyNetRecvFut<'a>;
 
-    fn send_to<'a>(&'a self, _buf: &'a [u8], _target: SocketAddrV4) -> Self::SendFuture<'a> {
-        // 19c: drive `inner.poll_send_to(buf, target.into(), cx)`.
-        core::future::ready(Err(TransportError::Unsupported))
+    fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddrV4) -> Self::SendFuture<'a> {
+        EmbassyNetSendFut {
+            socket: &self.inner,
+            buf,
+            target: socket_addr_v4_to_endpoint(target),
+        }
     }
 
-    fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
-        // 19c: drive `inner.poll_recv_from(buf, cx)`.
-        core::future::ready(Err(TransportError::Unsupported))
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+        EmbassyNetRecvFut {
+            socket: &self.inner,
+            buf,
+        }
     }
 
     fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
@@ -135,5 +203,41 @@ impl TransportSocket for EmbassyNetSocket {
         // Symmetric to join_multicast_v4 — leave is also on the
         // stack, not the socket. Documented no-op.
         Ok(())
+    }
+}
+
+// ── Address conversions ──────────────────────────────────────────────
+
+fn socket_addr_v4_to_endpoint(addr: SocketAddrV4) -> IpEndpoint {
+    let o = addr.ip().octets();
+    IpEndpoint {
+        addr: IpAddress::v4(o[0], o[1], o[2], o[3]),
+        port: addr.port(),
+    }
+}
+
+/// Convert an embassy-net `IpEndpoint` to `SocketAddrV4`. Returns
+/// `None` for non-IPv4 endpoints (SOME/IP's transport layer is
+/// IPv4-only at this layer; an IPv6 source on a v4-bound socket
+/// indicates a misconfiguration upstream).
+///
+/// The wildcard arm covers the case where smoltcp's `proto-ipv6`
+/// feature gets pulled in via cargo's feature unification (e.g.
+/// another crate in the dep graph enables it). Without the arm
+/// the match would silently become non-exhaustive in that build.
+fn endpoint_to_socket_addr_v4(endpoint: IpEndpoint) -> Option<SocketAddrV4> {
+    match endpoint.addr {
+        IpAddress::Ipv4(v4) => {
+            // smoltcp's `Ipv4Address` is `pub struct Address(pub [u8; 4])`
+            // — no `octets()` accessor; the public tuple field is the
+            // documented way in.
+            let o = v4.0;
+            Some(SocketAddrV4::new(
+                Ipv4Addr::new(o[0], o[1], o[2], o[3]),
+                endpoint.port,
+            ))
+        }
+        #[allow(unreachable_patterns)]
+        _ => None,
     }
 }
