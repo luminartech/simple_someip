@@ -2,10 +2,10 @@
 
 use super::service_info::Subscriber;
 use core::future::Future;
+use core::net::SocketAddrV4;
 use heapless::{Vec as HeaplessVec, index_map::FnvIndexMap};
 #[cfg(feature = "server-tokio")]
 use std::sync::Arc;
-use std::{net::SocketAddrV4, vec::Vec};
 #[cfg(feature = "server-tokio")]
 use tokio::sync::RwLock;
 
@@ -72,9 +72,11 @@ pub struct SubscriptionManager {
 }
 
 impl SubscriptionManager {
-    /// Create a new subscription manager
+    /// Create a new subscription manager. `const`-constructible so a
+    /// `static` instance can be declared in firmware boot code (used by
+    /// `StaticSubscriptionHandle` on bare-metal targets).
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             subscriptions: FnvIndexMap::new(),
         }
@@ -231,14 +233,25 @@ impl SubscriptionManager {
         }
     }
 
-    /// Get all subscribers for an event group
+    /// Get all subscribers for an event group as a heap-allocated `Vec`.
+    ///
+    /// Convenience accessor for `std` consumers (testing, ad-hoc tooling).
+    /// **Production code paths use [`Self::for_each_subscriber`] instead**
+    /// — that visitor walks the same data structure under the lock without
+    /// allocating per call, which is required for the bare-metal /
+    /// no-alloc story.
+    ///
+    /// Gated on `feature = "std"` because the return type forces an
+    /// `alloc` dependency. Without `std`, callers should use
+    /// [`Self::for_each_subscriber`].
+    #[cfg(feature = "std")]
     #[must_use]
     pub fn get_subscribers(
         &self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-    ) -> Vec<Subscriber> {
+    ) -> std::vec::Vec<Subscriber> {
         let key = (service_id, instance_id, event_group_id);
         self.subscriptions
             .get(&key)
@@ -377,10 +390,143 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
     }
 }
 
+/// No-alloc [`SubscriptionHandle`] backed by a `&'static`
+/// critical-section mutex around a [`SubscriptionManager`].
+///
+/// The bare-metal counterpart to `Arc<RwLock<SubscriptionManager>>`.
+/// All clones are the same thin pointer; the mutex serializes
+/// concurrent subscribe/unsubscribe/visit calls. The futures returned
+/// by the [`SubscriptionHandle`] methods are `!Send`-friendly because
+/// the embassy-sync mutex's lock closure is synchronous — no `.await`
+/// inside the critical section.
+///
+/// # Example
+///
+/// ```ignore
+/// use core::cell::RefCell;
+/// use embassy_sync::blocking_mutex::Mutex;
+/// use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+/// use simple_someip::server::{StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager};
+///
+/// // Place the storage in a `static` so the handle can borrow it for
+/// // `'static`. `SubscriptionManager::new()` is `const`, so no
+/// // `Box::leak` is needed.
+/// static SUBS: StaticSubscriptionStorage =
+///     Mutex::new(RefCell::new(SubscriptionManager::new()));
+///
+/// let handle = StaticSubscriptionHandle::new(&SUBS);
+/// ```
+#[cfg(feature = "bare_metal")]
+pub mod bare_metal_subscription_impl {
+    use super::{SubscribeError, Subscriber, SubscriptionHandle, SubscriptionManager};
+    use core::cell::RefCell;
+    use core::future::Future;
+    use core::net::SocketAddrV4;
+    use embassy_sync::blocking_mutex::Mutex;
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+
+    /// Convenience type alias for the embassy-sync critical-section
+    /// mutex backing [`StaticSubscriptionHandle`].
+    pub type StaticSubscriptionStorage =
+        Mutex<CriticalSectionRawMutex, RefCell<SubscriptionManager>>;
+
+    /// No-alloc [`SubscriptionHandle`] backed by a `&'static`
+    /// critical-section mutex.
+    ///
+    /// All clones are the same thin pointer. Construct via
+    /// [`Self::new`] and supply a `&'static StaticSubscriptionStorage`.
+    /// Because [`SubscriptionManager::new`] is `const`, the storage can
+    /// live in a plain `static` — no `Box::leak` required.
+    #[derive(Clone, Copy)]
+    pub struct StaticSubscriptionHandle(&'static StaticSubscriptionStorage);
+
+    impl StaticSubscriptionHandle {
+        /// Wraps a static reference to the backing mutex.
+        #[must_use]
+        pub const fn new(storage: &'static StaticSubscriptionStorage) -> Self {
+            Self(storage)
+        }
+    }
+
+    impl SubscriptionHandle for StaticSubscriptionHandle {
+        fn subscribe(
+            &self,
+            service_id: u16,
+            instance_id: u16,
+            event_group_id: u16,
+            subscriber_addr: SocketAddrV4,
+        ) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
+            let storage = self.0;
+            async move {
+                storage.lock(|cell| {
+                    cell.borrow_mut().subscribe(
+                        service_id,
+                        instance_id,
+                        event_group_id,
+                        subscriber_addr,
+                    )
+                })
+            }
+        }
+
+        fn unsubscribe(
+            &self,
+            service_id: u16,
+            instance_id: u16,
+            event_group_id: u16,
+            subscriber_addr: SocketAddrV4,
+        ) -> impl Future<Output = ()> + '_ {
+            let storage = self.0;
+            async move {
+                storage.lock(|cell| {
+                    cell.borrow_mut().unsubscribe(
+                        service_id,
+                        instance_id,
+                        event_group_id,
+                        subscriber_addr,
+                    );
+                });
+            }
+        }
+
+        fn for_each_subscriber<'a, F>(
+            &'a self,
+            service_id: u16,
+            instance_id: u16,
+            event_group_id: u16,
+            mut f: F,
+        ) -> impl Future<Output = usize> + 'a
+        where
+            F: FnMut(&Subscriber) + 'a,
+        {
+            let storage = self.0;
+            async move {
+                storage.lock(|cell| {
+                    let guard = cell.borrow();
+                    let key = (service_id, instance_id, event_group_id);
+                    match guard.subscriptions.get(&key) {
+                        Some(list) => {
+                            for sub in list {
+                                f(sub);
+                            }
+                            list.len()
+                        }
+                        None => 0,
+                    }
+                })
+            }
+        }
+    }
+}
+
+#[cfg(feature = "bare_metal")]
+pub use bare_metal_subscription_impl::{StaticSubscriptionHandle, StaticSubscriptionStorage};
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+    use std::vec::Vec;
 
     #[test]
     fn test_subscription_management() {
@@ -603,6 +749,75 @@ mod tests {
             let count = handle
                 .for_each_subscriber(0x5B, 1, 0x01, |s| visited.push(s.address))
                 .await;
+            assert_eq!(count, 1);
+            assert_eq!(visited, [a2]);
+        }
+    }
+
+    /// `StaticSubscriptionHandle` must satisfy the full
+    /// [`SubscriptionHandle`] contract so a bare-metal Server can be
+    /// constructed with it as the `S: SubscriptionHandle` parameter.
+    /// Walks subscribe → for_each_subscriber → unsubscribe →
+    /// for_each_subscriber to lock in each method's wiring.
+    #[cfg(feature = "bare_metal")]
+    mod static_handle {
+        use super::*;
+        use crate::server::{StaticSubscriptionHandle, StaticSubscriptionStorage};
+        use core::cell::RefCell;
+        use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+        use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+
+        // Driver for poll-once tests: SubscriptionHandle methods return
+        // a Future that may complete synchronously when the underlying
+        // storage is a critical-section mutex (no actual yield point).
+        // We poll with a noop waker to avoid spinning up a runtime.
+        fn block_on_sync<F: core::future::Future>(fut: F) -> F::Output {
+            use core::pin::pin;
+            use core::task::{Context, Poll, Waker};
+            let mut fut = pin!(fut);
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => v,
+                Poll::Pending => panic!(
+                    "StaticSubscriptionHandle methods must complete \
+                     synchronously (no .await inside the lock); got Pending"
+                ),
+            }
+        }
+
+        #[test]
+        fn static_subscription_handle_full_contract() {
+            // Box::leak rather than a #[test]-local `static` so we
+            // don't need to thread const-init constraints through
+            // every test.
+            let storage: &'static StaticSubscriptionStorage =
+                std::boxed::Box::leak(std::boxed::Box::new(BlockingMutex::<
+                    CriticalSectionRawMutex,
+                    RefCell<SubscriptionManager>,
+                >::new(RefCell::new(
+                    SubscriptionManager::new(),
+                ))));
+            let handle = StaticSubscriptionHandle::new(storage);
+            let a1 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8001);
+            let a2 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 8002);
+
+            block_on_sync(handle.subscribe(0x5B, 1, 0x01, a1)).unwrap();
+            block_on_sync(handle.subscribe(0x5B, 1, 0x01, a2)).unwrap();
+
+            let mut visited: std::vec::Vec<SocketAddrV4> = std::vec::Vec::new();
+            let count = block_on_sync(
+                handle.for_each_subscriber(0x5B, 1, 0x01, |s| visited.push(s.address)),
+            );
+            assert_eq!(count, 2);
+            assert!(visited.contains(&a1));
+            assert!(visited.contains(&a2));
+
+            block_on_sync(handle.unsubscribe(0x5B, 1, 0x01, a1));
+            visited.clear();
+            let count = block_on_sync(
+                handle.for_each_subscriber(0x5B, 1, 0x01, |s| visited.push(s.address)),
+            );
             assert_eq!(count, 1);
             assert_eq!(visited, [a2]);
         }

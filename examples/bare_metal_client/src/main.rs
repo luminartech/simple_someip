@@ -26,28 +26,34 @@
 //! | Channel factory | `BareMetalChannels` via `define_static_channels!` | same macro, sized to your HWM |
 //! | Transport | `MockFactory` / `MockSocket` | `embassy_net`, smoltcp, custom Ethernet ISR |
 //! | Timer | `MockTimer` using `tokio::time::sleep` | `embassy_time::Timer::after` |
-//! | Task spawner | `TokioBackedSpawner` | `embassy_executor::Spawner` |
-//! | Lock handles | `Arc<Mutex<_>>` / `Arc<RwLock<_>>` | stack-allocated handles (see below) |
+//! | Task spawner | `TokioBackedSpawner` wrapping `tokio::spawn` | `embassy_executor::Spawner` |
+//! | E2E registry handle | `StaticE2EHandle` over `&'static StaticE2EStorage` | same — already firmware-ready |
+//! | Interface handle | `AtomicInterfaceHandle` over `&'static AtomicU32` | same — already firmware-ready |
 //!
-//! # What is not yet demonstrated
-//!
-//! The `E2ERegistry` and interface handles still use heap-allocated
-//! `Arc<Mutex<_>>` / `Arc<RwLock<_>>` wrappers. A future verification
-//! pass will replace these with stack-allocated alternatives and confirm
-//! zero heap allocation after `Client::new_with_deps` returns.
+//! All five handle/factory types except `Transport` and `Timer` are the
+//! actual `no_std` types you'd ship — `Static*` /
+//! `Atomic*` over `&'static` storage. The transport and timer are
+//! mocks because the example runs on the host; firmware swaps them
+//! for embassy-net + embassy-time. `RawPayload` is std-only (it uses
+//! a heap `Vec` for SD storage); a true firmware build provides its
+//! own `PayloadWireFormat` impl.
 //!
 //! [`Client::new_with_deps`]: simple_someip::Client::new_with_deps
 //! [`ChannelFactory`]: simple_someip::transport::ChannelFactory
 
+use core::cell::RefCell;
 use core::future::Future;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::pin::Pin;
+use core::sync::atomic::AtomicU32;
 use core::task::{Context, Poll};
 use core::time::Duration;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use simple_someip::client::Error as ClientError;
 use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::define_static_channels;
@@ -57,6 +63,7 @@ use simple_someip::transport::{
     ReceivedDatagram, SocketOptions, Spawner, Timer, TransportError, TransportFactory,
     TransportSocket,
 };
+use simple_someip::{AtomicInterfaceHandle, StaticE2EHandle, StaticE2EStorage};
 use simple_someip::{Client, ClientDeps, RawPayload};
 
 // ── Static-pool channel factory ───────────────────────────────────────
@@ -81,6 +88,21 @@ define_static_channels! {
         (ClientUpdate<RawPayload>, 1),
     ],
 }
+
+// ── Bare-metal lock-handle storage ────────────────────────────────────
+//
+// `&'static` storage for the no-alloc lock handles. `E2ERegistry::new()`
+// is `const`, so the storage lives in plain `static`s — no `Box::leak`
+// required. On real firmware you'd write the same `static` declarations
+// in boot code.
+
+static E2E_STORAGE: StaticE2EStorage =
+    BlockingMutex::<CriticalSectionRawMutex, RefCell<E2ERegistry>>::new(RefCell::new(
+        E2ERegistry::new(),
+    ));
+
+// 127.0.0.1 packed as a big-endian u32.
+static IFACE_STORAGE: AtomicU32 = AtomicU32::new(0x7F00_0001);
 
 // ── Mock transport ────────────────────────────────────────────────────
 //
@@ -257,18 +279,17 @@ async fn main() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    // std Arc/Mutex/RwLock are sufficient here — they implement the
-    // E2ERegistryHandle / InterfaceHandle lock-handle traits and are
-    // gated by `feature = "std"`, not by `client-tokio`. A future
-    // no-alloc port replaces these with stack-allocated handles.
-    let e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
-    let iface: Arc<std::sync::RwLock<Ipv4Addr>> =
-        Arc::new(std::sync::RwLock::new(Ipv4Addr::LOCALHOST));
+    // Bare-metal lock handles: both pure no_std (no allocator), each
+    // backed by a `&'static` storage. The `static`s themselves are
+    // declared at module scope (see top of file) — clippy::pedantic
+    // dislikes `static` after `let` statements.
+    let e2e = StaticE2EHandle::new(&E2E_STORAGE);
+    let iface = AtomicInterfaceHandle::new(&IFACE_STORAGE);
 
     let (client, _updates, run_fut) = Client::<
         RawPayload,
-        Arc<Mutex<E2ERegistry>>,
-        Arc<std::sync::RwLock<Ipv4Addr>>,
+        StaticE2EHandle,
+        AtomicInterfaceHandle,
         BareMetalChannels,
     >::new_with_deps(
         ClientDeps {

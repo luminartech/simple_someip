@@ -1,9 +1,8 @@
 use core::future;
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use core::task::Poll;
-use futures::{FutureExt, pin_mut, select};
+use futures_util::{FutureExt, pin_mut, select_biased};
 use heapless::{Deque, index_map::FnvIndexMap};
-use std::borrow::ToOwned;
 #[cfg(all(test, feature = "client-tokio"))]
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, trace, warn};
@@ -84,8 +83,8 @@ pub enum ControlMessage<P: PayloadWireFormat + 'static, C: ChannelFactory> {
     ForceSdSessionWrappedForTest(bool, C::OneshotSender<Result<(), Error>>),
 }
 
-impl<P: PayloadWireFormat + 'static, C: ChannelFactory> std::fmt::Debug for ControlMessage<P, C> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<P: PayloadWireFormat + 'static, C: ChannelFactory> core::fmt::Debug for ControlMessage<P, C> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::SetInterface(addr, _) => f.debug_tuple("SetInterface").field(addr).finish(),
             Self::BindDiscovery(_) => f.write_str("BindDiscovery"),
@@ -363,10 +362,10 @@ pub(super) struct Inner<
     phantom: core::marker::PhantomData<PayloadDefinitions>,
 }
 
-impl<P: PayloadWireFormat, Tm: Timer, R: E2ERegistryHandle, C: ChannelFactory, D> std::fmt::Debug
+impl<P: PayloadWireFormat, Tm: Timer, R: E2ERegistryHandle, C: ChannelFactory, D> core::fmt::Debug
     for Inner<P, Tm, R, C, D>
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Inner")
             .field("interface", &self.interface)
             .field("session_tracker", &self.session_tracker)
@@ -379,7 +378,7 @@ impl<P: PayloadWireFormat, Tm: Timer, R: E2ERegistryHandle, C: ChannelFactory, D
 
 impl<PayloadDefinitions, Tm, R, C, D> Inner<PayloadDefinitions, Tm, R, C, D>
 where
-    PayloadDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + Send + 'static,
+    PayloadDefinitions: PayloadWireFormat + Clone + core::fmt::Debug + Send + 'static,
     Tm: Timer + 'static,
     R: E2ERegistryHandle,
     C: ChannelFactory,
@@ -591,7 +590,7 @@ where
         let received = result?;
         let someip_header = received.message.header().clone();
         if let Some(sd_header) = received.message.sd_header() {
-            Ok((received.source, someip_header, sd_header.to_owned()))
+            Ok((received.source, someip_header, Clone::clone(sd_header)))
         } else {
             Err(Error::UnexpectedDiscoveryMessage(someip_header))
         }
@@ -616,7 +615,7 @@ where
             return future::pending().await;
         }
 
-        std::future::poll_fn(|cx| {
+        core::future::poll_fn(|cx| {
             // Collect ports of any sockets that report `Ready(None)`
             // (loop has exited). Evict them after the iteration so we
             // do not mutate the map while iterating it.
@@ -1077,7 +1076,7 @@ where
                 // arm check order each poll so no single arm can
                 // starve the others under sustained load. Matches
                 // the original `tokio::select!` fairness behavior.
-                select! {
+                select_biased! {
                 // Receive a control message
                 ctrl = control_fut => {
                     if let Some(ctrl) = ctrl {
@@ -1122,7 +1121,7 @@ where
                             // detection works for all SD traffic (FindService,
                             // Subscribe, SubscribeAck, etc.).
                             let mut rebooted = false;
-                            for (svc_id, inst_id) in sd_payload.service_instances() {
+                            sd_payload.for_each_service_instance(|svc_id, inst_id| {
                                 let verdict = session_tracker.check(
                                     source,
                                     TransportKind::Multicast,
@@ -1134,11 +1133,11 @@ where
                                 if verdict == SessionVerdict::Reboot {
                                     rebooted = true;
                                 }
-                            }
+                            });
 
                             // Auto-populate service registry from offer/stop-offer
                             // SD entries.
-                            for ep in sd_payload.offered_endpoints() {
+                            sd_payload.for_each_offered_endpoint(|ep| {
                                 let id = ServiceInstanceId {
                                     service_id: ep.service_id,
                                     instance_id: ep.instance_id,
@@ -1175,7 +1174,7 @@ where
                                         ep.service_id, ep.instance_id,
                                     );
                                 }
-                            }
+                            });
 
                             if rebooted {
                                 let _ = update_sender.send_now(ClientUpdate::SenderRebooted(source));
@@ -1290,7 +1289,7 @@ mod tests {
     #[test]
     fn reject_with_capacity_notifies_every_sender() {
         use crate::transport::OneshotCancelled;
-        use futures::FutureExt;
+        use futures_util::FutureExt;
 
         fn expect_capacity<F>(rx: F, label: &str)
         where
@@ -1462,7 +1461,7 @@ mod tests {
     /// alive so a future unicast reply can resolve it.
     #[tokio::test]
     async fn track_or_reject_pending_response_inserts_when_room_available() {
-        use futures::FutureExt;
+        use futures_util::FutureExt;
         let mut inner = make_inner_for_test();
         let (tx, rx) = oneshot::channel::<Result<TestPayload, Error>>();
 
@@ -1556,7 +1555,7 @@ mod tests {
     /// caller gets a clean `Result` instead of a panicking `RecvError`.
     #[tokio::test]
     async fn track_or_reject_pending_response_completes_displaced_sender() {
-        use futures::FutureExt;
+        use futures_util::FutureExt;
 
         let mut inner = make_inner_for_test();
         let key: u32 = 0xCAFE_F00D;

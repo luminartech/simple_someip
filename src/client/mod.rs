@@ -93,8 +93,8 @@ pub struct PendingResponse<P: Send + 'static, C: ChannelFactory> {
     receiver: C::OneshotReceiver<Result<P, Error>>,
 }
 
-impl<P: Send + 'static, C: ChannelFactory> std::fmt::Debug for PendingResponse<P, C> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<P: Send + 'static, C: ChannelFactory> core::fmt::Debug for PendingResponse<P, C> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PendingResponse").finish_non_exhaustive()
     }
 }
@@ -128,8 +128,8 @@ pub struct DiscoveryMessage<P: PayloadWireFormat> {
     pub sd_header: P::SdHeader,
 }
 
-impl<P: PayloadWireFormat> std::fmt::Debug for DiscoveryMessage<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<P: PayloadWireFormat> core::fmt::Debug for DiscoveryMessage<P> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DiscoveryMessage")
             .field("source", &self.source)
             .field("someip_header", &self.someip_header)
@@ -159,8 +159,8 @@ pub enum ClientUpdate<P: PayloadWireFormat> {
     Error(Error),
 }
 
-impl<P: PayloadWireFormat> std::fmt::Debug for ClientUpdate<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<P: PayloadWireFormat> core::fmt::Debug for ClientUpdate<P> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::DiscoveryUpdated(msg) => f.debug_tuple("DiscoveryUpdated").field(msg).finish(),
             Self::SenderRebooted(addr) => f.debug_tuple("SenderRebooted").field(addr).finish(),
@@ -187,10 +187,10 @@ pub struct ClientUpdates<MessageDefinitions: PayloadWireFormat + 'static, C: Cha
     update_receiver: C::UnboundedReceiver<ClientUpdate<MessageDefinitions>>,
 }
 
-impl<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory> std::fmt::Debug
+impl<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory> core::fmt::Debug
     for ClientUpdates<MessageDefinitions, C>
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ClientUpdates").finish_non_exhaustive()
     }
 }
@@ -260,14 +260,14 @@ pub struct Client<
     e2e_registry: R,
 }
 
-impl<MessageDefinitions, R, I, C> std::fmt::Debug for Client<MessageDefinitions, R, I, C>
+impl<MessageDefinitions, R, I, C> core::fmt::Debug for Client<MessageDefinitions, R, I, C>
 where
     MessageDefinitions: PayloadWireFormat + Send + 'static,
     R: E2ERegistryHandle,
     I: InterfaceHandle,
     C: ChannelFactory,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Client")
             .field("interface", &self.interface.get())
             .finish_non_exhaustive()
@@ -284,7 +284,7 @@ where
 impl<MessageDefinitions>
     Client<MessageDefinitions, Arc<Mutex<E2ERegistry>>, Arc<RwLock<Ipv4Addr>>, TokioChannels>
 where
-    MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
+    MessageDefinitions: PayloadWireFormat + Clone + core::fmt::Debug + 'static,
 {
     /// Creates a new client bound to the given network interface and returns its run-loop future to be driven by the caller.
     ///
@@ -417,7 +417,7 @@ where
 /// Methods available on all `Client<M, R, I, C>` regardless of handle types.
 impl<MessageDefinitions, R, I, C> Client<MessageDefinitions, R, I, C>
 where
-    MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + Send + 'static,
+    MessageDefinitions: PayloadWireFormat + Clone + core::fmt::Debug + Send + 'static,
     R: E2ERegistryHandle,
     I: InterfaceHandle,
     C: ChannelFactory,
@@ -930,14 +930,27 @@ where
     /// `Err(Error::Shutdown)` after the run-loop has exited; the
     /// registry is still accessible via any held `Client` clone.
     ///
+    /// # Errors
+    ///
+    /// Returns [`crate::e2e::E2ERegistryFull`] when the underlying
+    /// registry has no room for a new key. Replacing the profile of an
+    /// already-registered key always succeeds. Bare-metal users sizing
+    /// their E2E registry should set
+    /// [`crate::e2e::E2E_REGISTRY_CAP`]-equivalent storage to their
+    /// workload's high-water mark.
+    ///
     /// # Panics
     ///
     /// May panic if the underlying [`E2ERegistryHandle`]
     /// implementation panics (e.g., `Arc<Mutex<E2ERegistry>>` on mutex poison).
     ///
     /// [`E2ERegistryHandle`]: crate::transport::E2ERegistryHandle
-    pub fn register_e2e(&self, key: E2EKey, profile: E2EProfile) {
-        self.e2e_registry.register(key, profile);
+    pub fn register_e2e(
+        &self,
+        key: E2EKey,
+        profile: E2EProfile,
+    ) -> Result<(), crate::e2e::E2ERegistryFull> {
+        self.e2e_registry.register(key, profile)
     }
 
     /// Remove E2E configuration for the given key.
@@ -966,7 +979,7 @@ where
 #[cfg(feature = "client-tokio")]
 impl<MessageDefinitions, R, I> Client<MessageDefinitions, R, I, TokioChannels>
 where
-    MessageDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
+    MessageDefinitions: PayloadWireFormat + Clone + core::fmt::Debug + 'static,
     R: E2ERegistryHandle,
     I: InterfaceHandle,
 {
@@ -1373,7 +1386,9 @@ mod tests {
             method_or_event_id: 0x0001,
         };
         let profile = E2EProfile::Profile4(crate::e2e::Profile4Config::new(42, 10));
-        client.register_e2e(key, profile);
+        client
+            .register_e2e(key, profile)
+            .expect("E2E registry has capacity for one entry");
         client.unregister_e2e(&key);
         client.shut_down();
     }

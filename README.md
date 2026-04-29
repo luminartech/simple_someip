@@ -53,15 +53,15 @@ simple-someip = { version = "0.8", features = ["client-tokio", "server-tokio"] }
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `std` | **yes** | Enables `thiserror`, `tracing`, and `embedded-io/std` |
-| `client` | no | Client trait surface; implies `std` + futures (no tokio) |
-| `client-tokio` | no | Adds `Client::new` / `TokioSpawner` / `TokioTransport` defaults; implies `client` + tokio + socket2 |
-| `server` | no | Server trait surface; implies `std` + futures (no tokio) |
-| `server-tokio` | no | Adds `Server::new` / `TokioTimer` / `TokioTransport` defaults; implies `server` + tokio + socket2 |
-| `bare_metal` | no | Activates embassy-sync, no-alloc `static_channels` module, `AtomicInterfaceHandle`, and `StaticE2EHandle`. See `examples/bare_metal_client` and `examples/bare_metal_server`; verify with `cargo build -p bare_metal_client` (NOT `cargo build --workspace`, which can unify features). |
+| `std` | **yes** | Enables `thiserror`, `tracing`, and `embedded-io/std`. The `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<…>>` default lock-handle impls (used by the tokio backends) live behind this gate. |
+| `client` | no | Client trait surface. Pure `no_std`-clean (does not pull `extern crate alloc`). Caller supplies trait impls for transport / channels / spawner / timer / lock handles. |
+| `client-tokio` | no | Adds `Client::new` / `TokioSpawner` / `TokioTransport` defaults; implies `client` + std + tokio + socket2. |
+| `server` | no | Server trait surface. Pulls `extern crate alloc` (for `Arc<EventPublisher>` / `Arc<F::Socket>`); on no_std, downstream consumers must provide a `#[global_allocator]`. |
+| `server-tokio` | no | Adds `Server::new` / `TokioTimer` / `TokioTransport` defaults; implies `server` + std + tokio + socket2. |
+| `bare_metal` | no | Activates embassy-sync, no-alloc `static_channels` module, `AtomicInterfaceHandle`, `StaticE2EHandle`, and `StaticSubscriptionHandle` — all five pure `no_std` (no allocator required). See `examples/bare_metal_client` and `examples/bare_metal_server`; verify with `cargo build -p bare_metal_client` (NOT `cargo build --workspace`, which can unify features). |
 | `embassy_channels` | no | Heap-backed `EmbassySyncChannels` (implies `bare_metal` + `alloc`). Useful for tests before sizing static pools. |
 
-By default the crate enables `std`. To use in a `no_std` environment (e.g., embedded targets), disable default features with `default-features = false`. In that mode the `protocol`, `traits`, `transport`, and `e2e` modules are available; `client` / `server` (and their `tokio_transport` backend) are not. Most applications only need one of `client` or `server`.
+By default the crate enables `std`. To use in a `no_std` environment (e.g., embedded targets), disable default features with `default-features = false`. In that mode the `protocol`, `traits`, `transport`, and `e2e` modules are always available; `client` / `server` are usable too (the trait surfaces compile in pure no_std), but the tokio convenience defaults (`Client::new`, `Server::new`) live behind `client-tokio` / `server-tokio` and require std. The `cargo build --target thumbv7em-none-eabihf --no-default-features --features client,server,bare_metal` cross-build is verified in CI on every PR.
 
 ## Quick Start
 

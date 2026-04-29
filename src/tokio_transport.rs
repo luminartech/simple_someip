@@ -279,22 +279,36 @@ impl crate::transport::Spawner for TokioSpawner {
         // their owning `SocketManager` drops its channel ends, at
         // which point the future completes naturally.
         //
-        // Wrap in `catch_unwind` so a panic inside the spawned task is
-        // logged through the `tracing` pipeline that the rest of the
-        // crate uses, instead of being swallowed silently to stderr by
-        // tokio's default panic handler. The caller's
-        // `Error::SocketClosedUnexpectedly` (surfaced when the
-        // panicking task drops its channel ends) then has a
-        // corresponding diagnostic in the operator's logs.
-        use futures::FutureExt;
+        // Spawn the future on tokio. If it panics, tokio aborts the
+        // task and the `JoinHandle::await` resolves to a `JoinError`
+        // with `is_panic() == true`; we log through the `tracing`
+        // pipeline so the panic is visible alongside the rest of the
+        // crate's diagnostics, instead of being swallowed to stderr.
+        // The caller's `Error::SocketClosedUnexpectedly` (surfaced
+        // when the panicking task drops its channel ends) then has a
+        // corresponding log line. Done via a watcher task rather than
+        // `futures::FutureExt::catch_unwind` so we don't need
+        // futures-util's std feature on the bare-metal builds (the
+        // tokio backend pulls std anyway, but the dep wiring is
+        // simpler this way).
+        let join = tokio::spawn(future);
         drop(tokio::spawn(async move {
-            let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
-            if let Err(payload) = result {
-                let msg = panic_payload_str(&payload);
-                tracing::error!(
-                    panic_message = msg,
-                    "spawned task panicked; channels will close",
-                );
+            match join.await {
+                Ok(()) => {}
+                Err(e) if e.is_panic() => {
+                    let payload = e.into_panic();
+                    let msg = panic_payload_str(&payload);
+                    tracing::error!(
+                        panic_message = msg,
+                        "spawned task panicked; channels will close",
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        join_error = ?e,
+                        "spawned task ended without panic (e.g. cancelled)",
+                    );
+                }
             }
         }));
     }

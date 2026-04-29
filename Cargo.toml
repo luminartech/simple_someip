@@ -28,9 +28,15 @@ embedded-io = { version = "0.7" }
 # `select!` macro and `FutureExt::fuse` / `pin_mut!` helpers — used by
 # the client/server event loops in place of `tokio::select!`. Default
 # features disabled so we only pull in the parts we use.
-futures = { version = "0.3", default-features = false, features = [
+# `futures-util` (not the `futures` umbrella) because the umbrella
+# gates the `select!` macro re-export behind its `std` feature, and
+# pulling that feature drags in `slab` / `memchr` / `futures-io` etc.
+# which do not compile on no_std targets. `futures-util` itself
+# provides `select!`, `pin_mut!`, `FutureExt::fuse`, and friends
+# under just `async-await` (which is alloc-friendly, no_std-clean).
+futures-util = { version = "0.3", default-features = false, features = [
     "async-await",
-    "std",
+    "async-await-macro",
 ], optional = true }
 heapless = "0.9"
 socket2 = { version = "0.5", optional = true, features = ["all"] }
@@ -63,17 +69,18 @@ std = ["embedded-io/std", "thiserror/std", "tracing/std"]
 # `ChannelFactory` / `TransportFactory` impls). Consumers who want the
 # `Client::new` shortcut (defaulting to `TokioSpawner` / `TokioTimer` /
 # `TokioChannels` / `TokioTransport`) enable `client-tokio`.
-client = ["std", "dep:futures"]
-client-tokio = ["client", "dep:tokio", "dep:socket2"]
+client = ["dep:futures-util"]
+client-tokio = ["client", "std", "dep:tokio", "dep:socket2"]
 # Feature split (matches the client side): `server` exposes the
-# trait-surface server (no tokio, no socket2). The engine itself uses
-# `futures::select!` so `dep:futures` lives here. `server-tokio` adds
-# the tokio + socket2 convenience defaults (`Server::new`,
-# `Server::new_with_loopback`, `Server::new_passive`), bringing
-# `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>` /
-# / `TokioTransport` / `TokioTimer` defaults into scope.
-server = ["std", "dep:futures"]
-server-tokio = ["server", "dep:tokio", "dep:socket2"]
+# trait-surface server (no tokio, no socket2, no std). The engine
+# itself uses `futures::select!` so `dep:futures` lives here.
+# `server-tokio` adds the tokio + socket2 convenience defaults
+# (`Server::new`, `Server::new_with_loopback`, `Server::new_passive`),
+# bringing `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>` /
+# / `TokioTransport` / `TokioTimer` defaults into scope, and forces
+# `std`.
+server = ["dep:futures-util"]
+server-tokio = ["server", "std", "dep:tokio", "dep:socket2"]
 # Marks a build as intended for bare-metal / no_std consumption.
 # Activates embassy-sync as the channel backend, the `static_channels`
 # module, `AtomicInterfaceHandle`, and `StaticE2EHandle`.

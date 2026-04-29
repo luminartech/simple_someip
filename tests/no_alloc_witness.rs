@@ -179,11 +179,15 @@ fn witness_static_e2e_handle_reads() {
         >::new(RefCell::new(E2ERegistry::new()))));
     let handle = StaticE2EHandle::new(storage);
 
-    // register() allocates into the HashMap — also construction-time.
-    handle.register(
-        E2EKey::new(0x1234, 0x0001),
-        E2EProfile::Profile4(Profile4Config::new(0xDEAD_BEEF, 15)),
-    );
+    // register() writes into the heapless FnvIndexMap — fits within the
+    // E2E_REGISTRY_CAP, so no allocation. Done at construction-time
+    // (outside the assert_no_alloc closures below).
+    handle
+        .register(
+            E2EKey::new(0x1234, 0x0001),
+            E2EProfile::Profile4(Profile4Config::new(0xDEAD_BEEF, 15)),
+        )
+        .expect("register fits within E2E_REGISTRY_CAP");
 
     // Hot-path reads must be alloc-free.
     assert_no_alloc("StaticE2EHandle::contains_key (hit)", || {
@@ -211,19 +215,23 @@ fn witness_static_e2e_handle_protect_check() {
         >::new(RefCell::new(E2ERegistry::new()))));
     let handle = StaticE2EHandle::new(storage);
 
-    handle.register(
-        E2EKey::new(0x0001, 0x8001),
-        E2EProfile::Profile4(Profile4Config::new(0x1234_5678, 15)),
-    );
+    handle
+        .register(
+            E2EKey::new(0x0001, 0x8001),
+            E2EProfile::Profile4(Profile4Config::new(0x1234_5678, 15)),
+        )
+        .expect("register fits within E2E_REGISTRY_CAP");
     // Register a second profile (Profile5) so the protect/check witness
     // covers both profile families' hot paths, not just Profile4.
-    handle.register(
-        E2EKey::new(0x0002, 0x8002),
-        // data_length must equal payload length (5 = b"hello".len())
-        // — a mismatch routes through `tracing::warn!`, which is fine in
-        // production but adds noise to a no-alloc witness.
-        E2EProfile::Profile5(Profile5Config::new(0xABCD, 5, 15)),
-    );
+    handle
+        .register(
+            E2EKey::new(0x0002, 0x8002),
+            // data_length must equal payload length (5 = b"hello".len())
+            // — a mismatch routes through `tracing::warn!`, which is fine in
+            // production but adds noise to a no-alloc witness.
+            E2EProfile::Profile5(Profile5Config::new(0xABCD, 5, 15)),
+        )
+        .expect("register fits within E2E_REGISTRY_CAP");
 
     let key = E2EKey::new(0x0001, 0x8001);
     let payload = b"hello";

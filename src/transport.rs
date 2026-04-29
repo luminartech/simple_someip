@@ -732,7 +732,17 @@ pub trait Spawner {
 /// event loop.
 pub trait E2ERegistryHandle: Clone + Send + Sync + 'static {
     /// Register an E2E profile for the given key, replacing any prior entry.
-    fn register(&self, key: E2EKey, profile: E2EProfile);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`E2ERegistryFull`] when the underlying registry has no
+    /// capacity for a new key. Replacing an already-registered key
+    /// always succeeds (the existing slot is reused). Implementations
+    /// that wrap [`crate::e2e::E2ERegistry`] forward this error
+    /// directly; backends with their own storage should pick an
+    /// equivalent overflow contract.
+    fn register(&self, key: E2EKey, profile: E2EProfile)
+    -> Result<(), crate::e2e::E2ERegistryFull>;
 
     /// Remove the E2E configuration for the given key. No-op if absent.
     fn unregister(&self, key: &E2EKey);
@@ -794,15 +804,15 @@ pub trait InterfaceHandle: Clone + Send + Sync + 'static {
 mod std_handle_impls {
     use super::{E2ERegistryHandle, InterfaceHandle};
     use crate::e2e::Error as E2EError;
-    use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry};
+    use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, E2ERegistryFull};
     use core::net::Ipv4Addr;
     use std::sync::{Arc, Mutex, RwLock};
 
     impl E2ERegistryHandle for Arc<Mutex<E2ERegistry>> {
-        fn register(&self, key: E2EKey, profile: E2EProfile) {
+        fn register(&self, key: E2EKey, profile: E2EProfile) -> Result<(), E2ERegistryFull> {
             self.lock()
                 .expect("e2e registry lock poisoned")
-                .register(key, profile);
+                .register(key, profile)
         }
 
         fn unregister(&self, key: &E2EKey) {
@@ -949,15 +959,17 @@ pub mod bare_metal_handle_impls {
 }
 
 /// `StaticE2EHandle` — no-alloc `E2ERegistryHandle` backed by a
-/// `&'static` critical-section mutex. Requires `feature = "std"` because
-/// the underlying [`crate::e2e::E2ERegistry`] currently uses `HashMap`.
-/// On a pure-`no_std` target the registry must be ported (see crate
-/// roadmap); until then, callers wanting bare-metal interface handles
-/// (the more common need) can use [`AtomicInterfaceHandle`] alone.
-#[cfg(all(feature = "bare_metal", feature = "std"))]
+/// `&'static` critical-section mutex.
+///
+/// Available in pure `no_std` builds: [`crate::e2e::E2ERegistry`] is
+/// backed by [`heapless::index_map::FnvIndexMap`] (since phase 18a),
+/// so no allocator is required.
+#[cfg(feature = "bare_metal")]
 pub mod bare_metal_e2e_impl {
     use super::E2ERegistryHandle;
-    use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, Error as E2EError};
+    use crate::e2e::{
+        E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, E2ERegistryFull, Error as E2EError,
+    };
     use core::cell::RefCell;
     use embassy_sync::blocking_mutex::Mutex;
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -983,8 +995,8 @@ pub mod bare_metal_e2e_impl {
     }
 
     impl E2ERegistryHandle for StaticE2EHandle {
-        fn register(&self, key: E2EKey, profile: E2EProfile) {
-            self.0.lock(|cell| cell.borrow_mut().register(key, profile));
+        fn register(&self, key: E2EKey, profile: E2EProfile) -> Result<(), E2ERegistryFull> {
+            self.0.lock(|cell| cell.borrow_mut().register(key, profile))
         }
 
         fn unregister(&self, key: &E2EKey) {
@@ -1023,7 +1035,7 @@ pub mod bare_metal_e2e_impl {
 #[cfg(feature = "bare_metal")]
 pub use bare_metal_handle_impls::AtomicInterfaceHandle;
 
-#[cfg(all(feature = "bare_metal", feature = "std"))]
+#[cfg(feature = "bare_metal")]
 pub use bare_metal_e2e_impl::{StaticE2EHandle, StaticE2EStorage};
 
 // ── Channel-handle abstraction ────────────────────────────────────────────
@@ -1422,7 +1434,13 @@ mod tests {
     struct NullE2ERegistry;
 
     impl E2ERegistryHandle for NullE2ERegistry {
-        fn register(&self, _key: E2EKey, _profile: E2EProfile) {}
+        fn register(
+            &self,
+            _key: E2EKey,
+            _profile: E2EProfile,
+        ) -> Result<(), crate::e2e::E2ERegistryFull> {
+            Ok(())
+        }
         fn unregister(&self, _key: &E2EKey) {}
         fn contains_key(&self, _key: &E2EKey) -> bool {
             false
@@ -1463,7 +1481,8 @@ mod tests {
         r.register(
             key,
             crate::e2e::E2EProfile::Profile4(crate::e2e::Profile4Config::new(0, 8)),
-        );
+        )
+        .expect("NullE2ERegistry::register is infallible");
         assert!(!r.contains_key(&key));
         assert!(r.check(key, b"hello", [0; 8]).is_none());
     }

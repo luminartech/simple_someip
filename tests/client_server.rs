@@ -421,7 +421,9 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
         method_or_event_id: 0x0001,
     };
     let profile = E2EProfile::Profile4(Profile4Config::new(0x12345678, 15));
-    server.register_e2e(key, profile.clone());
+    server
+        .register_e2e(key, profile.clone())
+        .expect("E2E registry has capacity for one entry");
 
     let server_handle = tokio::spawn(async move { server.run().await });
 
@@ -429,7 +431,9 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
     let _run_handle = tokio::spawn(run_fut);
 
     // Register matching E2E profile on client
-    client.register_e2e(key, profile);
+    client
+        .register_e2e(key, profile)
+        .expect("E2E registry has capacity for one entry");
 
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client
