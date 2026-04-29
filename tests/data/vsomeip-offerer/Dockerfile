@@ -58,8 +58,10 @@ RUN mkdir build && cd build \
     && make install \
     && ldconfig
 
-# Build our offerer. It links against the just-installed libvsomeip3.
-COPY offerer.cpp /src/offerer/offerer.cpp
+# Build our offerer + subscriber. They link against the just-installed
+# libvsomeip3.
+COPY offerer.cpp    /src/offerer/offerer.cpp
+COPY subscriber.cpp /src/offerer/subscriber.cpp
 COPY CMakeLists.txt /src/offerer/CMakeLists.txt
 
 WORKDIR /src/offerer
@@ -78,17 +80,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libboost-log1.74.0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy installed vsomeip libs + the offerer binary + the config + entrypoint.
+# Copy installed vsomeip libs + both binaries + both configs + entrypoint.
 COPY --from=build /usr/local/lib/libvsomeip3*.so* /usr/local/lib/
 COPY --from=build /src/offerer/build/offerer /usr/local/bin/offerer
+COPY --from=build /src/offerer/build/subscriber /usr/local/bin/subscriber
 COPY offerer.json /etc/vsomeip-offerer.json
+COPY subscriber.json /etc/vsomeip-subscriber.json
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 RUN ldconfig && chmod +x /usr/local/bin/entrypoint.sh
 
-# Entrypoint script templates VSOMEIP_UNICAST into the JSON config
-# before launching the offerer. Caller MUST pass `-e VSOMEIP_UNICAST=
-# <multicast-capable-iface-IP>` on `docker run`; the script exits
-# loudly otherwise. See entrypoint.sh for the rationale (lo's lack of
-# MULTICAST flag is the gotcha).
+# Entrypoint script templates VSOMEIP_UNICAST into the chosen
+# role's JSON config and execs offerer or subscriber based on
+# VSOMEIP_ROLE (default: offerer). Caller MUST pass
+# `-e VSOMEIP_UNICAST=<multicast-capable-iface-IP>` on `docker run`;
+# the script exits loudly otherwise. See entrypoint.sh for the
+# rationale (lo's lack of MULTICAST flag is the gotcha).
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
