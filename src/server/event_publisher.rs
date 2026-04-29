@@ -7,7 +7,7 @@ use crate::e2e::E2EKey;
 use crate::protocol::{Header, Message};
 use crate::traits::{PayloadWireFormat, WireFormat};
 use crate::transport::{E2ERegistryHandle, SocketHandle, TransportSocket};
-#[cfg(test)]
+#[cfg(any(feature = "embassy_channels", feature = "server"))]
 use alloc::sync::Arc;
 use core::net::SocketAddrV4;
 use heapless::Vec as HeaplessVec;
@@ -448,6 +448,100 @@ where
         self.subscriptions
             .for_each_subscriber(service_id, instance_id, event_group_id, |_| {})
             .await
+    }
+}
+
+/// Shared handle to the [`EventPublisher`] backing a
+/// [`Server`](super::Server).
+///
+/// Abstracts how the event publisher is shared between the Server's
+/// run loop and any external task that wants to publish events
+/// (`server.publisher().publish_event(...)`). Two impls ship out
+/// of the box, mirroring the pattern established by
+/// [`crate::transport::SocketHandle`] and
+/// [`super::SdStateHandle`]:
+///
+/// - `Arc<EventPublisher<R, S, H>>` on alloc-using builds — the
+///   default for `Server::new_with_deps` / `new_passive_with_deps`.
+/// - `&'static EventPublisher<R, S, H>` on bare-metal-no-alloc
+///   — caller declares a `static` somewhere and supplies the
+///   reference into a future `Server::new_with_handles`
+///   constructor.
+///
+/// `Clone + 'static` only — neither `Send` nor `Sync` at the trait
+/// level. Method-level `where` clauses on Server add Send bounds
+/// at use sites that need them (`announcement_loop`'s
+/// `+ Send`-bounded return type, etc.).
+pub trait EventPublisherHandle<R, S, H>: Clone + 'static
+where
+    R: E2ERegistryHandle,
+    S: SubscriptionHandle,
+    H: SocketHandle,
+{
+    /// Borrow the underlying [`EventPublisher`] for read-only
+    /// access. Used by Server's run loop and accessor.
+    fn publisher(&self) -> &EventPublisher<R, S, H>;
+}
+
+// `&'static EventPublisher<...>`: trivially `Copy + Clone + 'static`
+// for any 'static publisher. Caller arranges the static storage.
+impl<R, S, H> EventPublisherHandle<R, S, H> for &'static EventPublisher<R, S, H>
+where
+    R: E2ERegistryHandle,
+    S: SubscriptionHandle,
+    H: SocketHandle,
+{
+    fn publisher(&self) -> &EventPublisher<R, S, H> {
+        self
+    }
+}
+
+#[cfg(any(feature = "embassy_channels", feature = "server"))]
+impl<R, S, H> EventPublisherHandle<R, S, H> for Arc<EventPublisher<R, S, H>>
+where
+    R: E2ERegistryHandle,
+    S: SubscriptionHandle,
+    H: SocketHandle,
+{
+    fn publisher(&self) -> &EventPublisher<R, S, H> {
+        self
+    }
+}
+
+/// Extension of [`EventPublisherHandle`] for handles that can be
+/// constructed inline from an owned [`EventPublisher`].
+///
+/// Required by `Server` constructors that build the publisher
+/// internally (the alloc-using path). The future
+/// `Server::new_with_handles` will accept a pre-built `Hep:
+/// EventPublisherHandle` directly and won't need this trait —
+/// callers using `&'static EventPublisher<...>` declare their
+/// `static` storage themselves and pass the reference in.
+///
+/// Mirrors the [`crate::transport::WrappableSocketHandle`] /
+/// [`super::WrappableSdStateHandle`] split: the basic `Handle`
+/// trait gives read access; the `Wrappable*` extension adds the
+/// inline-construction path that requires an allocator.
+pub trait WrappableEventPublisherHandle<R, S, H>: EventPublisherHandle<R, S, H>
+where
+    R: E2ERegistryHandle,
+    S: SubscriptionHandle,
+    H: SocketHandle,
+{
+    /// Place an owned [`EventPublisher`] behind this handle's
+    /// shared storage.
+    fn wrap(publisher: EventPublisher<R, S, H>) -> Self;
+}
+
+#[cfg(any(feature = "embassy_channels", feature = "server"))]
+impl<R, S, H> WrappableEventPublisherHandle<R, S, H> for Arc<EventPublisher<R, S, H>>
+where
+    R: E2ERegistryHandle,
+    S: SubscriptionHandle,
+    H: SocketHandle,
+{
+    fn wrap(publisher: EventPublisher<R, S, H>) -> Self {
+        Arc::new(publisher)
     }
 }
 

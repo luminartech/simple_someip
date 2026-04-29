@@ -13,7 +13,7 @@ mod service_info;
 mod subscription_manager;
 
 pub use error::Error;
-pub use event_publisher::EventPublisher;
+pub use event_publisher::{EventPublisher, EventPublisherHandle, WrappableEventPublisherHandle};
 pub use service_info::Subscriber;
 #[cfg(feature = "std")]
 pub use service_info::{EventGroupInfo, ServiceInfo};
@@ -143,8 +143,15 @@ where
 /// these as `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>`
 /// / `TokioTransport` / `TokioTimer`. Bare-metal callers use
 /// [`Self::new_with_deps`] (under `server`) and supply their own.
-pub struct Server<R, S, F, Tm, H = Arc<<F as TransportFactory>::Socket>, Hsd = Arc<SdStateManager>>
-where
+pub struct Server<
+    R,
+    S,
+    F,
+    Tm,
+    H = Arc<<F as TransportFactory>::Socket>,
+    Hsd = Arc<SdStateManager>,
+    Hep = Arc<EventPublisher<R, S, H>>,
+> where
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
     F: TransportFactory + 'static,
@@ -152,6 +159,7 @@ where
     Tm: Timer + Clone + 'static,
     H: SocketHandle<Socket = F::Socket>,
     Hsd: SdStateHandle,
+    Hep: EventPublisherHandle<R, S, H>,
 {
     config: ServerConfig,
     /// Socket for receiving subscription requests, behind whatever
@@ -163,8 +171,10 @@ where
     sd_socket: H,
     /// Subscription manager
     subscriptions: S,
-    /// Event publisher
-    publisher: Arc<EventPublisher<R, S, H>>,
+    /// Event publisher, behind whatever shared-storage `Hep` chose
+    /// (`Arc<EventPublisher<R, S, H>>` on std,
+    /// `&'static EventPublisher<R, S, H>` on bare-metal-no-alloc).
+    publisher: Hep,
     /// SD session-ID counter and announcement emitter, behind whatever
     /// shared-storage `Hsd` chose (`Arc<SdStateManager>` on std,
     /// `&'static SdStateManager` on bare-metal-no-alloc).
@@ -282,7 +292,7 @@ impl
     }
 }
 
-impl<R, S, F, Tm, H, Hsd> Server<R, S, F, Tm, H, Hsd>
+impl<R, S, F, Tm, H, Hsd, Hep> Server<R, S, F, Tm, H, Hsd, Hep>
 where
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
@@ -291,6 +301,7 @@ where
     Tm: Timer + Clone + 'static,
     H: WrappableSocketHandle<Socket = F::Socket>,
     Hsd: WrappableSdStateHandle,
+    Hep: WrappableEventPublisherHandle<R, S, H>,
 {
     /// Bare-metal-friendly constructor that takes every dependency
     /// explicitly via a [`ServerDeps`] bundle. The `server-tokio`
@@ -358,7 +369,7 @@ where
             sd::MULTICAST_IP
         );
 
-        let publisher = Arc::new(EventPublisher::new(
+        let publisher = Hep::wrap(EventPublisher::new(
             subscriptions.clone(),
             unicast_socket.clone(),
             e2e_registry.clone(),
@@ -428,7 +439,7 @@ where
             sd_placeholder_addr
         );
 
-        let publisher = Arc::new(EventPublisher::new(
+        let publisher = Hep::wrap(EventPublisher::new(
             subscriptions.clone(),
             unicast_socket.clone(),
             e2e_registry.clone(),
@@ -450,7 +461,7 @@ where
     }
 }
 
-impl<R, S, F, Tm, H, Hsd> Server<R, S, F, Tm, H, Hsd>
+impl<R, S, F, Tm, H, Hsd, Hep> Server<R, S, F, Tm, H, Hsd, Hep>
 where
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
@@ -459,6 +470,7 @@ where
     Tm: Timer + Clone + 'static,
     H: SocketHandle<Socket = F::Socket>,
     Hsd: SdStateHandle,
+    Hep: EventPublisherHandle<R, S, H>,
 {
     /// Build the periodic-SD-announcement future.
     ///
@@ -694,10 +706,14 @@ where
         Ok(())
     }
 
-    /// Get the event publisher for sending events
+    /// Get a clone of the event-publisher handle for sending events.
+    ///
+    /// Returns the [`EventPublisherHandle`] type — `Arc<EventPublisher<R,
+    /// S, H>>` for std users (the default `Hep`),
+    /// `&'static EventPublisher<R, S, H>` for bare-metal-no-alloc.
     #[must_use]
-    pub fn publisher(&self) -> Arc<EventPublisher<R, S, H>> {
-        Arc::clone(&self.publisher)
+    pub fn publisher(&self) -> Hep {
+        self.publisher.clone()
     }
 
     /// Get the local address of the unicast socket.
@@ -1219,7 +1235,7 @@ fn extract_subscriber_endpoint(
     }
 }
 
-impl<R, S, F, Tm, H, Hsd> Server<R, S, F, Tm, H, Hsd>
+impl<R, S, F, Tm, H, Hsd, Hep> Server<R, S, F, Tm, H, Hsd, Hep>
 where
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
@@ -1228,6 +1244,7 @@ where
     Tm: Timer + Clone + 'static,
     H: SocketHandle<Socket = F::Socket>,
     Hsd: SdStateHandle,
+    Hep: EventPublisherHandle<R, S, H>,
 {
     /// Send `SubscribeAck` from an entry view
     async fn send_subscribe_ack_from_view(
