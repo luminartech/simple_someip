@@ -796,69 +796,94 @@ pub trait InterfaceHandle: Clone + Send + Sync + 'static {
     fn set(&self, addr: Ipv4Addr);
 }
 
-/// Shared handle to a bound transport socket.
+/// Shared handle to a single owned-or-borrowed `T`.
 ///
-/// Abstracts over `Arc<T>` on `std` (and any bare-metal target with an
-/// allocator) and `StaticSocketHandle<T>` on bare metal without an
-/// allocator. The single method [`SocketHandle::socket`] borrows the
-/// underlying socket so [`crate::server::Server`] / [`crate::server::EventPublisher`]
-/// can forward `send_to` / `recv_from` / `local_addr` /
-/// `join_multicast_v4` / `leave_multicast_v4` calls without caring how
-/// the socket is stored.
+/// One trait covering every "Server holds an `Arc<T>` for sharing
+/// between its run loop and consumer-side tasks" pattern in this
+/// crate. Replaces the three separate handle traits this crate
+/// shipped earlier (`SocketHandle`, `SdStateHandle`,
+/// `EventPublisherHandle`), each of which had the same shape with
+/// a different concrete `T`.
 ///
-/// The trait is bounded on `Clone + 'static` only — neither `Send` nor
-/// `Sync` — so a `Server` parameterized over a `SocketHandle` whose
-/// underlying `Socket` is `!Sync` (e.g. an `embassy-net`
-/// `UdpSocket<'static>` borrowing from a `RefCell<Inner<D>>`-bearing
-/// `Stack`) is still constructible. Methods that *return* a
-/// `Send`-bounded future (notably [`crate::server::Server::announcement_loop`])
-/// add Send bounds at the method level so the impl block can stay
-/// permissive.
+/// Two impls ship out of the box, both via blanket impls so any
+/// consumer-defined type wrapped in `Arc<T>` or `&'static T`
+/// satisfies the bound automatically:
 ///
-/// `Socket` is an associated type rather than a generic parameter so
-/// downstream stores (`EventPublisher`, `Server`) don't need to carry
-/// it as a separate type parameter — the handle type uniquely
-/// determines its target socket type, which matches the established
-/// no-allocation pattern used by [`E2ERegistryHandle`] /
-/// [`InterfaceHandle`].
+/// - `Arc<T>: SharedHandle<T>` on alloc-using builds (`std` or
+///   `bare_metal`-with-alloc). `Arc::clone` increments the
+///   refcount; `get` returns the inner reference.
+/// - `&'static T: SharedHandle<T>` on bare-metal-no-alloc. The
+///   reference is `Copy + Clone + 'static`; the user declares the
+///   underlying `static` storage at boot.
 ///
-/// Matches the bound profile of
-/// [`SubscriptionHandle`](crate::server::SubscriptionHandle):
-/// `Clone + 'static`, no Send/Sync at the trait level. Two impls ship
-/// out of the box:
-/// - `Arc<T>` on `std` (in `std_handle_impls`).
-/// - `StaticSocketHandle<T>` on bare metal (in `bare_metal_handle_impls`).
-pub trait SocketHandle: Clone + 'static {
-    /// The underlying transport socket type this handle borrows.
-    type Socket: TransportSocket + 'static;
-
-    /// Borrow the underlying socket.
-    fn socket(&self) -> &Self::Socket;
+/// `Clone + 'static` only — neither `Send` nor `Sync` at the
+/// trait level. Method-level `where` clauses on `Server` add
+/// Send bounds at the use sites that need them
+/// (`announcement_loop`'s `+ Send` return type, etc.).
+///
+/// `T: 'static` because both blanket impls require it: an `Arc<T>`
+/// is `'static` only when `T: 'static`, and `&'static T` requires
+/// `T: 'static` by definition.
+///
+/// `?Sized` is intentionally NOT supported — the inline-construction
+/// path ([`WrappableSharedHandle::wrap`]) needs an owned `T`, which
+/// requires `Sized`.
+pub trait SharedHandle<T: 'static>: Clone + 'static {
+    /// Borrow the underlying `T`. Both blanket impls return a
+    /// reference into the underlying storage; consumers should
+    /// not assume more than a fresh borrow's worth of lifetime.
+    fn get(&self) -> &T;
 }
 
-/// Extension of [`SocketHandle`] for handles that can be constructed
-/// inline from an owned socket.
+/// Extension of [`SharedHandle`] for handles that can be
+/// constructed inline from an owned `T`.
 ///
-/// Required by [`crate::server::Server`] constructors that bind
-/// sockets internally via [`TransportFactory::bind`] (the std /
-/// alloc path) — those constructors call `factory.bind(...).await?`
-/// to get an owned `F::Socket`, then `H::wrap(socket)` to place it
-/// behind whatever shared-storage the caller chose.
+/// Required by `Server` constructors that build the underlying
+/// `T` internally (the alloc-using path —
+/// e.g., `Server::new_with_deps` calls `factory.bind(...).await?`
+/// to get an `F::Socket`, then `H::wrap(socket)` to place it
+/// behind the caller's chosen shared-storage). The no-alloc
+/// counterpart constructors (`Server::new_with_handles`) take
+/// pre-built handles directly and don't need this trait.
 ///
-/// `Arc<T>` is the std-side impl: `Arc::new(socket)` is a no-op
-/// wrapping.
-///
-/// `StaticSocketHandle<T>` deliberately does **not** implement this
-/// trait: materializing a `&'static T` requires either an
-/// allocator (`Box::leak`) or a slot-based init pattern
-/// (`StaticCell::init`) that the trait method's signature can't
-/// express. Pure-no-alloc consumers need a future Server
-/// constructor variant that takes pre-built handles directly
-/// rather than binding internally; that variant is not in 19f's
-/// scope.
-pub trait WrappableSocketHandle: SocketHandle {
-    /// Place an owned socket behind this handle's shared storage.
-    fn wrap(socket: Self::Socket) -> Self;
+/// `&'static T` deliberately does NOT implement this trait —
+/// materializing a `&'static T` from an owned `T` inside a trait
+/// method's body requires an allocator (`Box::leak`) or a
+/// slot-based init pattern (`StaticCell::init`) that the trait
+/// method's signature can't express. No-alloc consumers declare
+/// their `static` storage themselves and pass `&STATIC` into the
+/// no-wrap constructor.
+pub trait WrappableSharedHandle<T: 'static>: SharedHandle<T> {
+    /// Place an owned `T` behind this handle's shared storage.
+    fn wrap(value: T) -> Self;
+}
+
+// `&'static T` is the no-alloc handle. `&'static T: Copy + Clone +
+// 'static` for any `T: 'static`, so the trait bounds are met
+// without further work.
+impl<T: 'static> SharedHandle<T> for &'static T {
+    fn get(&self) -> &T {
+        self
+    }
+}
+
+// `Arc<T>` is the alloc-using handle. `Arc::clone` is the
+// reference-count increment; `wrap` is `Arc::new`. Gated to
+// where `alloc` is available — `feature = "embassy_channels"`
+// or `feature = "server"` per the crate-root `extern crate
+// alloc` declaration.
+#[cfg(any(feature = "embassy_channels", feature = "server"))]
+impl<T: 'static> SharedHandle<T> for alloc::sync::Arc<T> {
+    fn get(&self) -> &T {
+        self
+    }
+}
+
+#[cfg(any(feature = "embassy_channels", feature = "server"))]
+impl<T: 'static> WrappableSharedHandle<T> for alloc::sync::Arc<T> {
+    fn wrap(value: T) -> Self {
+        alloc::sync::Arc::new(value)
+    }
 }
 
 /// Default `std`-flavoured impls of [`E2ERegistryHandle`] /
@@ -868,25 +893,11 @@ pub trait WrappableSocketHandle: SocketHandle {
 /// module rather than the tokio backend.
 #[cfg(feature = "std")]
 mod std_handle_impls {
-    use super::{E2ERegistryHandle, InterfaceHandle, SocketHandle, TransportSocket};
+    use super::{E2ERegistryHandle, InterfaceHandle};
     use crate::e2e::Error as E2EError;
     use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, E2ERegistryFull};
     use core::net::Ipv4Addr;
     use std::sync::{Arc, Mutex, RwLock};
-
-    impl<T: TransportSocket + 'static> SocketHandle for Arc<T> {
-        type Socket = T;
-
-        fn socket(&self) -> &T {
-            self
-        }
-    }
-
-    impl<T: TransportSocket + 'static> super::WrappableSocketHandle for Arc<T> {
-        fn wrap(socket: T) -> Self {
-            Arc::new(socket)
-        }
-    }
 
     impl E2ERegistryHandle for Arc<Mutex<E2ERegistry>> {
         fn register(&self, key: E2EKey, profile: E2EProfile) -> Result<(), E2ERegistryFull> {
@@ -1036,52 +1047,12 @@ pub mod bare_metal_handle_impls {
             self.0.store(u32::from(addr), Ordering::Release);
         }
     }
-
-    /// No-alloc [`SocketHandle`](super::SocketHandle) backed by
-    /// `&'static T`.
-    ///
-    /// Used by [`crate::server::Server`] / [`crate::server::EventPublisher`]
-    /// to share a transport socket without an allocator. Both clones
-    /// of the handle hold the same thin pointer, so the underlying
-    /// socket sees every operation through the same `&T` reference.
-    ///
-    /// ```ignore
-    /// // `Box::leak` is fine in system init; for fully-static targets,
-    /// // bind via a `OnceCell` / `static_cell::StaticCell::init` and
-    /// // wrap the resulting `&'static T` here.
-    /// let socket: T = factory.bind(...).await?;
-    /// let handle = StaticSocketHandle::new(Box::leak(Box::new(socket)));
-    /// ```
-    pub struct StaticSocketHandle<T: super::TransportSocket + 'static>(&'static T);
-
-    impl<T: super::TransportSocket + 'static> StaticSocketHandle<T> {
-        /// Wraps a static reference to the backing socket.
-        #[must_use]
-        pub const fn new(socket: &'static T) -> Self {
-            Self(socket)
-        }
-    }
-
-    // Manual `Clone` + `Copy` (rather than `#[derive]`) because the
-    // auto-derived bounds would require `T: Clone` / `T: Copy`; we
-    // only need cloning the reference, which is `Copy` regardless
-    // of `T`. `clone` delegates to `*self` to satisfy clippy's
-    // canonical-clone-on-Copy lint.
-    impl<T: super::TransportSocket + 'static> Clone for StaticSocketHandle<T> {
-        fn clone(&self) -> Self {
-            *self
-        }
-    }
-
-    impl<T: super::TransportSocket + 'static> Copy for StaticSocketHandle<T> {}
-
-    impl<T: super::TransportSocket + 'static> super::SocketHandle for StaticSocketHandle<T> {
-        type Socket = T;
-
-        fn socket(&self) -> &T {
-            self.0
-        }
-    }
+    // Phase 20e collapsed `StaticSocketHandle<T>(&'static T)` into a
+    // direct `impl SharedHandle<T> for &'static T` blanket — the
+    // wrapper type's only role was carrying the `'static` lifetime,
+    // which the blanket impl achieves without a wrapper. Consumers
+    // that previously constructed `StaticSocketHandle::new(&SOCKET)`
+    // now pass `&SOCKET` directly into Server's no-wrap constructors.
 }
 
 /// `StaticE2EHandle` — no-alloc `E2ERegistryHandle` backed by a

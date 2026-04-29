@@ -216,80 +216,11 @@ impl SdStateManager {
     }
 }
 
-/// Shared handle to the [`SdStateManager`] backing a [`Server`].
-///
-/// Abstracts how the SD-session-state is shared between the Server's
-/// run loop and its spawned `announcement_loop` future. Two impls
-/// ship out of the box, mirroring the pattern established by
-/// [`crate::transport::SocketHandle`]:
-///
-/// - `Arc<SdStateManager>` on alloc-using builds — the existing
-///   default for `Server::new_with_deps`.
-/// - `&'static SdStateManager` on bare-metal-no-alloc — caller
-///   declares a `static SdStateManager = SdStateManager::new();`
-///   and passes the reference into a future
-///   `Server::new_with_handles` constructor.
-///
-/// Required to be `Clone + 'static` so the handle can be cheaply
-/// cloned into the announcement-loop future without borrowing
-/// `&self`. The bound is intentionally permissive — neither `Send`
-/// nor `Sync` at the trait level — so a `!Send` storage backend
-/// (e.g., `Rc<SdStateManager>` if a single-threaded alloc target
-/// ever wants it) would also satisfy.
-///
-/// [`Server`]: crate::server::Server
-pub trait SdStateHandle: Clone + 'static {
-    /// Borrow the underlying `SdStateManager` for SD-session-state
-    /// reads / atomic increments.
-    fn sd_state(&self) -> &SdStateManager;
-}
-
-// `&'static SdStateManager` is the no-alloc handle. `&'static T` is
-// `Copy + Clone + 'static` for any `T: 'static` so the trait bounds
-// are met without further work — the user only needs to declare
-// the underlying `static` storage once at boot.
-impl SdStateHandle for &'static SdStateManager {
-    fn sd_state(&self) -> &SdStateManager {
-        self
-    }
-}
-
-#[cfg(any(feature = "embassy_channels", feature = "server"))]
-impl SdStateHandle for alloc::sync::Arc<SdStateManager> {
-    fn sd_state(&self) -> &SdStateManager {
-        self
-    }
-}
-
-/// Extension of [`SdStateHandle`] for handles that can be
-/// constructed inline from an owned `SdStateManager`.
-///
-/// Required by `Server` constructors that build an `SdStateManager`
-/// internally (the alloc-using path —
-/// `Server::new_with_deps` calls `SdStateManager::new()` then wraps).
-/// The future `Server::new_with_handles` (post-alloc-audit follow-up)
-/// will accept a pre-built `Hsd: SdStateHandle` directly and won't
-/// need this trait.
-///
-/// `&'static SdStateManager` deliberately does **not** implement this
-/// trait — there is no allocator-free way to materialize a `&'static`
-/// reference inside a trait method (the user has to declare a
-/// `static` themselves and supply the reference via a different
-/// constructor). This mirrors how
-/// [`crate::transport::WrappableSocketHandle`] is split from
-/// [`crate::transport::SocketHandle`].
-pub trait WrappableSdStateHandle: SdStateHandle {
-    /// Place an owned `SdStateManager` behind this handle's shared
-    /// storage.
-    fn wrap(state: SdStateManager) -> Self;
-}
-
-#[cfg(any(feature = "embassy_channels", feature = "server"))]
-impl WrappableSdStateHandle for alloc::sync::Arc<SdStateManager> {
-    fn wrap(state: SdStateManager) -> Self {
-        alloc::sync::Arc::new(state)
-    }
-}
+// Phase 20e collapsed `SdStateHandle` / `WrappableSdStateHandle`
+// into the unified `crate::transport::SharedHandle<SdStateManager>`
+// / `WrappableSharedHandle<SdStateManager>` traits. The blanket
+// impls there cover both `&'static SdStateManager` and
+// `Arc<SdStateManager>`; no dedicated trait survives here.
 
 #[cfg(all(test, feature = "server-tokio"))]
 mod tests {

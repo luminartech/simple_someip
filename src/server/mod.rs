@@ -13,7 +13,7 @@ mod service_info;
 mod subscription_manager;
 
 pub use error::Error;
-pub use event_publisher::{EventPublisher, EventPublisherHandle, WrappableEventPublisherHandle};
+pub use event_publisher::EventPublisher;
 pub use service_info::Subscriber;
 #[cfg(feature = "std")]
 pub use service_info::{EventGroupInfo, ServiceInfo};
@@ -21,7 +21,7 @@ pub use service_info::{EventGroupInfo, ServiceInfo};
 pub use subscription_manager::{StaticSubscriptionHandle, StaticSubscriptionStorage};
 pub use subscription_manager::{SubscribeError, SubscriptionHandle, SubscriptionManager};
 
-pub use sd_state::{SdStateHandle, SdStateManager, WrappableSdStateHandle};
+pub use sd_state::SdStateManager;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -29,8 +29,8 @@ use crate::Timer;
 use crate::e2e::{E2EKey, E2EProfile};
 use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
 use crate::transport::{
-    E2ERegistryHandle, SocketHandle, SocketOptions, TransportFactory, TransportSocket,
-    WrappableSocketHandle,
+    E2ERegistryHandle, SharedHandle, SocketOptions, TransportFactory, TransportSocket,
+    WrappableSharedHandle,
 };
 use alloc::sync::Arc;
 use core::net::{Ipv4Addr, SocketAddrV4};
@@ -151,9 +151,9 @@ where
     Tm: Timer,
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
-    H: SocketHandle<Socket = F::Socket>,
-    Hsd: SdStateHandle,
-    Hep: EventPublisherHandle<R, S, H>,
+    H: SharedHandle<F::Socket>,
+    Hsd: SharedHandle<SdStateManager>,
+    Hep: SharedHandle<EventPublisher<R, S, H, F::Socket>>,
 {
     /// Transport factory. Retained on the `Server` for any
     /// post-construction state the backend needs to keep alive
@@ -207,16 +207,16 @@ pub struct Server<
     Tm,
     H = Arc<<F as TransportFactory>::Socket>,
     Hsd = Arc<SdStateManager>,
-    Hep = Arc<EventPublisher<R, S, H>>,
+    Hep = Arc<EventPublisher<R, S, H, <F as TransportFactory>::Socket>>,
 > where
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
     F: TransportFactory + 'static,
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
-    H: SocketHandle<Socket = F::Socket>,
-    Hsd: SdStateHandle,
-    Hep: EventPublisherHandle<R, S, H>,
+    H: SharedHandle<F::Socket>,
+    Hsd: SharedHandle<SdStateManager>,
+    Hep: SharedHandle<EventPublisher<R, S, H, F::Socket>>,
 {
     config: ServerConfig,
     /// Socket for receiving subscription requests, behind whatever
@@ -356,9 +356,9 @@ where
     F: TransportFactory + 'static,
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
-    H: WrappableSocketHandle<Socket = F::Socket>,
-    Hsd: WrappableSdStateHandle,
-    Hep: WrappableEventPublisherHandle<R, S, H>,
+    H: WrappableSharedHandle<F::Socket>,
+    Hsd: WrappableSharedHandle<SdStateManager>,
+    Hep: WrappableSharedHandle<EventPublisher<R, S, H, F::Socket>>,
 {
     /// Bare-metal-friendly constructor that takes every dependency
     /// explicitly via a [`ServerDeps`] bundle. The `server-tokio`
@@ -525,9 +525,9 @@ where
     F: TransportFactory + 'static,
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
-    H: SocketHandle<Socket = F::Socket>,
-    Hsd: SdStateHandle,
-    Hep: EventPublisherHandle<R, S, H>,
+    H: SharedHandle<F::Socket>,
+    Hsd: SharedHandle<SdStateManager>,
+    Hep: SharedHandle<EventPublisher<R, S, H, F::Socket>>,
 {
     /// Construct a `Server` from pre-built dependencies + storage
     /// handles. The bare-metal-no-alloc counterpart to
@@ -555,7 +555,7 @@ where
         deps: ServerHandles<F, Tm, R, S, H, Hsd, Hep>,
         mut config: ServerConfig,
     ) -> Result<Self, Error> {
-        let bound_port = deps.unicast_socket.socket().local_addr()?.port();
+        let bound_port = deps.unicast_socket.get().local_addr()?.port();
         config.local_port = bound_port;
         tracing::info!(
             "Server (handles) bound to {}:{} for service 0x{:04X}",
@@ -603,7 +603,7 @@ where
         deps: ServerHandles<F, Tm, R, S, H, Hsd, Hep>,
         mut config: ServerConfig,
     ) -> Result<Self, Error> {
-        let bound_port = deps.unicast_socket.socket().local_addr()?.port();
+        let bound_port = deps.unicast_socket.get().local_addr()?.port();
         config.local_port = bound_port;
         tracing::info!(
             "Passive server (handles) bound to {}:{} for service 0x{:04X}",
@@ -703,8 +703,8 @@ where
             let mut announcement_count = 0u32;
             loop {
                 match sd_state
-                    .sd_state()
-                    .send_offer_service(&config, sd_socket.socket())
+                    .get()
+                    .send_offer_service(&config, sd_socket.get())
                     .await
                 {
                     Ok(()) => {
@@ -783,8 +783,8 @@ where
             let mut announcement_count = 0u32;
             loop {
                 match sd_state
-                    .sd_state()
-                    .send_offer_service(&config, sd_socket.socket())
+                    .get()
+                    .send_offer_service(&config, sd_socket.get())
                     .await
                 {
                     Ok(()) => {
@@ -838,7 +838,7 @@ where
         // Atomic (sid, reboot_flag) pair so concurrent emissions cannot
         // race around the wrap boundary — see
         // `SdStateManager::next_session_id_with_reboot_flag` docs.
-        let (sid, reboot_flag) = self.sd_state.sd_state().next_session_id_with_reboot_flag();
+        let (sid, reboot_flag) = self.sd_state.get().next_session_id_with_reboot_flag();
         let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &options);
 
         let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
@@ -849,7 +849,7 @@ where
 
         let target_v4 = socket_addr_v4(target)?;
         self.sd_socket
-            .socket()
+            .get()
             .send_to(&buffer[..total_len], target_v4)
             .await?;
         tracing::debug!(
@@ -877,7 +877,7 @@ where
     ///
     /// Returns an error if the socket's local address cannot be retrieved.
     pub fn unicast_local_addr(&self) -> Result<core::net::SocketAddr, Error> {
-        match self.unicast_socket.socket().local_addr() {
+        match self.unicast_socket.get().local_addr() {
             Ok(v4) => Ok(core::net::SocketAddr::V4(v4)),
             Err(e) => Err(Error::Transport(e)),
         }
@@ -995,10 +995,10 @@ where
                 // — direct `&mut foo` would produce `&mut &mut [u8]`.
                 let unicast_fut = self
                     .unicast_socket
-                    .socket()
+                    .get()
                     .recv_from(&mut *unicast_buf)
                     .fuse();
-                let sd_fut = self.sd_socket.socket().recv_from(&mut *sd_buf).fuse();
+                let sd_fut = self.sd_socket.get().recv_from(&mut *sd_buf).fuse();
                 pin_mut!(unicast_fut, sd_fut);
                 select_biased! {
                     result = unicast_fut => {
@@ -1397,9 +1397,9 @@ where
     F: TransportFactory + 'static,
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
-    H: SocketHandle<Socket = F::Socket>,
-    Hsd: SdStateHandle,
-    Hep: EventPublisherHandle<R, S, H>,
+    H: SharedHandle<F::Socket>,
+    Hsd: SharedHandle<SdStateManager>,
+    Hep: SharedHandle<EventPublisher<R, S, H, F::Socket>>,
 {
     /// Send `SubscribeAck` from an entry view
     async fn send_subscribe_ack_from_view(
@@ -1425,7 +1425,7 @@ where
         let entries = [ack_entry];
         // Atomic (sid, reboot_flag) pair — see
         // `SdStateManager::next_session_id_with_reboot_flag`.
-        let (sid, reboot_flag) = self.sd_state.sd_state().next_session_id_with_reboot_flag();
+        let (sid, reboot_flag) = self.sd_state.get().next_session_id_with_reboot_flag();
         let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &[]);
 
         let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
@@ -1436,7 +1436,7 @@ where
 
         let subscriber_v4 = socket_addr_v4(subscriber)?;
         self.sd_socket
-            .socket()
+            .get()
             .send_to(&buffer[..total_len], subscriber_v4)
             .await?;
 
@@ -1475,7 +1475,7 @@ where
         let entries = [nack_entry];
         // Atomic (sid, reboot_flag) pair — see
         // `SdStateManager::next_session_id_with_reboot_flag`.
-        let (sid, reboot_flag) = self.sd_state.sd_state().next_session_id_with_reboot_flag();
+        let (sid, reboot_flag) = self.sd_state.get().next_session_id_with_reboot_flag();
         let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &[]);
 
         let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
@@ -1486,7 +1486,7 @@ where
 
         let subscriber_v4 = socket_addr_v4(subscriber)?;
         self.sd_socket
-            .socket()
+            .get()
             .send_to(&buffer[..total_len], subscriber_v4)
             .await?;
 
