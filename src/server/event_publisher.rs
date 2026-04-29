@@ -54,8 +54,8 @@ where
     socket: H,
     e2e_registry: R,
     /// `T` appears only in the bound `H: SharedHandle<T>`; the
-    /// struct doesn't directly hold a `T`. PhantomData carries the
-    /// type so the parameter is well-formed without affecting
+    /// struct doesn't directly hold a `T`. `PhantomData` carries
+    /// the type so the parameter is well-formed without affecting
     /// drop-check or auto-trait propagation negatively.
     _phantom: PhantomData<T>,
 }
@@ -667,6 +667,10 @@ mod tests {
             let mut mgr = subscriptions.write().await;
             mgr.subscribe(0x5B, 1, 0x01, addr).unwrap();
         }
+        #[allow(
+            clippy::type_complexity,
+            reason = "tests reasonably spell out the full type for clarity"
+        )]
         let publisher: EventPublisher<
             Arc<Mutex<E2ERegistry>>,
             Arc<RwLock<SubscriptionManager>>,
@@ -729,6 +733,10 @@ mod tests {
             let mut mgr = subscriptions.write().await;
             mgr.subscribe(0x5B, 1, 0x01, addr).unwrap();
         }
+        #[allow(
+            clippy::type_complexity,
+            reason = "tests reasonably spell out the full type for clarity"
+        )]
         let publisher: EventPublisher<
             Arc<Mutex<E2ERegistry>>,
             Arc<RwLock<SubscriptionManager>>,

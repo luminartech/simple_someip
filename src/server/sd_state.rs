@@ -65,7 +65,19 @@ impl SdStateManager {
     pub const fn new() -> Self {
         Self::with_initial(1)
     }
+}
 
+impl Default for SdStateManager {
+    /// Equivalent to [`Self::new`]. Provided for clippy-pedantic
+    /// completeness; bare-metal callers should prefer the explicit
+    /// `SdStateManager::new()` because it is `const` and works in a
+    /// `static` initializer.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SdStateManager {
     /// Construct with a specific starting session counter. Primarily used by
     /// tests to validate wrap behavior; callers in production should use
     /// [`Self::new`].
