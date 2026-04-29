@@ -1,7 +1,7 @@
 use core::future;
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use core::task::Poll;
-use futures::{FutureExt, pin_mut, select};
+use futures_util::{FutureExt, pin_mut, select_biased};
 use heapless::{Deque, index_map::FnvIndexMap};
 #[cfg(all(test, feature = "client-tokio"))]
 use std::sync::{Arc, Mutex};
@@ -1090,7 +1090,7 @@ where
                 // arm check order each poll so no single arm can
                 // starve the others under sustained load. Matches
                 // the original `tokio::select!` fairness behavior.
-                select! {
+                select_biased! {
                 // Receive a control message
                 ctrl = control_fut => {
                     if let Some(ctrl) = ctrl {
@@ -1303,7 +1303,7 @@ mod tests {
     #[test]
     fn reject_with_capacity_notifies_every_sender() {
         use crate::transport::OneshotCancelled;
-        use futures::FutureExt;
+        use futures_util::FutureExt;
 
         fn expect_capacity<F>(rx: F, label: &str)
         where
@@ -1475,7 +1475,7 @@ mod tests {
     /// alive so a future unicast reply can resolve it.
     #[tokio::test]
     async fn track_or_reject_pending_response_inserts_when_room_available() {
-        use futures::FutureExt;
+        use futures_util::FutureExt;
         let mut inner = make_inner_for_test();
         let (tx, rx) = oneshot::channel::<Result<TestPayload, Error>>();
 
@@ -1569,7 +1569,7 @@ mod tests {
     /// caller gets a clean `Result` instead of a panicking `RecvError`.
     #[tokio::test]
     async fn track_or_reject_pending_response_completes_displaced_sender() {
-        use futures::FutureExt;
+        use futures_util::FutureExt;
 
         let mut inner = make_inner_for_test();
         let key: u32 = 0xCAFE_F00D;

@@ -56,7 +56,7 @@ use core::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     task::{Context, Poll},
 };
-use futures::{FutureExt, pin_mut, select};
+use futures_util::{FutureExt, pin_mut, select_biased};
 use tracing::{debug, error, info, trace, warn};
 
 /// A received message together with the source address it came from.
@@ -584,7 +584,7 @@ where
                 let send_fut = MpscRecv::recv(&mut tx_rx).fuse();
                 let recv_fut = socket.recv_from(&mut buf).fuse();
                 pin_mut!(send_fut, recv_fut);
-                select! {
+                select_biased! {
                     message = send_fut => Outcome::Send(message),
                     result = recv_fut => Outcome::Recv(result),
                 }

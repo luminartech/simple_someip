@@ -31,7 +31,7 @@ use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, Transp
 use crate::transport::{E2ERegistryHandle, SocketOptions, TransportFactory, TransportSocket};
 use alloc::sync::Arc;
 use core::net::{Ipv4Addr, SocketAddrV4};
-use futures::{FutureExt, pin_mut, select};
+use futures_util::{FutureExt, pin_mut, select_biased};
 #[cfg(test)]
 use std::vec::Vec;
 
@@ -695,7 +695,7 @@ where
                 let unicast_fut = self.unicast_socket.recv_from(&mut unicast_buf).fuse();
                 let sd_fut = self.sd_socket.recv_from(&mut sd_buf).fuse();
                 pin_mut!(unicast_fut, sd_fut);
-                select! {
+                select_biased! {
                     result = unicast_fut => {
                         let datagram = result?;
                         (
