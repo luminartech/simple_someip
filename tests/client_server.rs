@@ -74,7 +74,7 @@ type TestServer = Server<
 type TestEventPublisher = simple_someip::server::EventPublisher<
     std::sync::Arc<std::sync::Mutex<simple_someip::e2e::E2ERegistry>>,
     std::sync::Arc<tokio::sync::RwLock<simple_someip::server::SubscriptionManager>>,
-    simple_someip::TokioSocket,
+    std::sync::Arc<simple_someip::TokioSocket>,
 >;
 
 /// Create a server on an ephemeral unicast port, returning (Server, actual_port).
