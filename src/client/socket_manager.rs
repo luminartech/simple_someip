@@ -52,11 +52,11 @@ use crate::{
 };
 
 use super::error::Error;
-use futures::{FutureExt, pin_mut, select};
-use std::{
+use core::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     task::{Context, Poll},
 };
+use futures::{FutureExt, pin_mut, select};
 use tracing::{debug, error, info, trace, warn};
 
 /// A received message together with the source address it came from.
@@ -80,10 +80,10 @@ pub struct SendMessage<PayloadDefinitions: Send + 'static, C: ChannelFactory> {
     response: C::OneshotSender<Result<(), Error>>,
 }
 
-impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> std::fmt::Debug
+impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> core::fmt::Debug
     for SendMessage<P, C>
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SendMessage")
             .field("target_addr", &self.target_addr)
             .field("message", &self.message)
@@ -133,10 +133,10 @@ pub struct SocketManager<PayloadDefinitions: Send + 'static, C: ChannelFactory> 
     session_has_wrapped: bool,
 }
 
-impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> std::fmt::Debug
+impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> core::fmt::Debug
     for SocketManager<P, C>
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SocketManager")
             .field("local_port", &self.local_port)
             .field("session_id", &self.session_id)

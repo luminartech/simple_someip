@@ -14,7 +14,9 @@ mod subscription_manager;
 
 pub use error::Error;
 pub use event_publisher::EventPublisher;
-pub use service_info::{EventGroupInfo, ServiceInfo, Subscriber};
+pub use service_info::Subscriber;
+#[cfg(feature = "std")]
+pub use service_info::{EventGroupInfo, ServiceInfo};
 #[cfg(feature = "bare_metal")]
 pub use subscription_manager::{StaticSubscriptionHandle, StaticSubscriptionStorage};
 pub use subscription_manager::{SubscribeError, SubscriptionHandle, SubscriptionManager};
@@ -27,15 +29,11 @@ use crate::Timer;
 use crate::e2e::{E2EKey, E2EProfile};
 use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
 use crate::transport::{E2ERegistryHandle, SocketOptions, TransportFactory, TransportSocket};
+use alloc::sync::Arc;
+use core::net::{Ipv4Addr, SocketAddrV4};
 use futures::{FutureExt, pin_mut, select};
 #[cfg(test)]
 use std::vec::Vec;
-use std::{
-    format,
-    net::{Ipv4Addr, SocketAddrV4},
-    sync::Arc,
-    vec,
-};
 
 #[cfg(feature = "server-tokio")]
 use crate::e2e::E2ERegistry;
@@ -478,30 +476,26 @@ where
         &self,
     ) -> Result<impl core::future::Future<Output = ()> + Send + 'static, Error> {
         if self.is_passive {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "announcement_loop called on passive Server for service 0x{:04X}; \
-                     announcements must be driven externally (e.g. via \
-                     `simple_someip::Client::sd_announcements_loop`)",
-                    self.config.service_id
-                ),
-            )));
+            tracing::warn!(
+                "announcement_loop called on passive Server for service 0x{:04X}; \
+                 announcements must be driven externally (e.g. via \
+                 `simple_someip::Client::sd_announcements_loop`)",
+                self.config.service_id
+            );
+            return Err(Error::InvalidUsage("passive_server_announcement_loop"));
         }
         if self
             .announcement_loop_started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "announcement_loop already started for service 0x{:04X}; \
-                     two announcement futures cannot share the same SD socket \
-                     and session counter",
-                    self.config.service_id
-                ),
-            )));
+            tracing::warn!(
+                "announcement_loop already started for service 0x{:04X}; \
+                 two announcement futures cannot share the same SD socket \
+                 and session counter",
+                self.config.service_id
+            );
+            return Err(Error::InvalidUsage("announcement_loop_already_started"));
         }
         let config = self.config.clone();
         let sd_socket = Arc::clone(&self.sd_socket);
@@ -542,7 +536,7 @@ where
     }
 
     /// Send a unicast `OfferService` to a specific address (in response to `FindService`)
-    async fn send_unicast_offer(&self, target: std::net::SocketAddr) -> Result<(), Error> {
+    async fn send_unicast_offer(&self, target: core::net::SocketAddr) -> Result<(), Error> {
         use crate::protocol::Header as SomeIpHeader;
         use crate::traits::WireFormat;
 
@@ -601,9 +595,9 @@ where
     /// # Errors
     ///
     /// Returns an error if the socket's local address cannot be retrieved.
-    pub fn unicast_local_addr(&self) -> Result<std::net::SocketAddr, Error> {
+    pub fn unicast_local_addr(&self) -> Result<core::net::SocketAddr, Error> {
         match self.unicast_socket.local_addr() {
-            Ok(v4) => Ok(std::net::SocketAddr::V4(v4)),
+            Ok(v4) => Ok(core::net::SocketAddr::V4(v4)),
             Err(e) => Err(Error::Transport(e)),
         }
     }
@@ -655,16 +649,14 @@ where
         use crate::protocol::MessageView;
 
         if self.is_passive {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "run called on passive Server for service 0x{:04X}; \
-                     SD receive must be driven externally (e.g. via the \
-                     Client's discovery socket, routing Subscribes to \
-                     `EventPublisher::register_subscriber`)",
-                    self.config.service_id
-                ),
-            )));
+            tracing::warn!(
+                "run called on passive Server for service 0x{:04X}; \
+                 SD receive must be driven externally (e.g. via the \
+                 Client's discovery socket, routing Subscribes to \
+                 `EventPublisher::register_subscriber`)",
+                self.config.service_id
+            );
+            return Err(Error::InvalidUsage("passive_server_run"));
         }
 
         // Incoming-peer buffers sized to the IP datagram limit (64 KiB - 1).
@@ -676,8 +668,8 @@ where
         // 1500 by an undersized buffer. Out-going `EventPublisher` paths
         // do use the smaller `UDP_BUFFER_SIZE` because we control the
         // wire size of what we emit; that asymmetry is intentional.
-        let mut unicast_buf = vec![0u8; 65535];
-        let mut sd_buf = vec![0u8; 65535];
+        let mut unicast_buf = alloc::vec![0u8; 65535];
+        let mut sd_buf = alloc::vec![0u8; 65535];
 
         loop {
             // `select!` (not `select_biased!`) gives pseudo-random fairness
@@ -708,7 +700,7 @@ where
                         let datagram = result?;
                         (
                             datagram.bytes_received,
-                            std::net::SocketAddr::V4(datagram.source),
+                            core::net::SocketAddr::V4(datagram.source),
                             "unicast",
                             true,
                         )
@@ -717,7 +709,7 @@ where
                         let datagram = result?;
                         (
                             datagram.bytes_received,
-                            std::net::SocketAddr::V4(datagram.source),
+                            core::net::SocketAddr::V4(datagram.source),
                             "sd-multicast",
                             false,
                         )
@@ -786,7 +778,7 @@ where
     async fn handle_sd_message(
         &mut self,
         sd_view: &sd::SdHeaderView<'_>,
-        sender: std::net::SocketAddr,
+        sender: core::net::SocketAddr,
     ) -> Result<(), Error> {
         tracing::trace!("Handling SD message from {}", sender);
 
@@ -988,17 +980,17 @@ where
     }
 }
 
-/// Convert a [`std::net::SocketAddr`] into a [`SocketAddrV4`] for the
+/// Convert a [`core::net::SocketAddr`] into a [`SocketAddrV4`] for the
 /// transport layer. SOME/IP-SD is IPv4-only at this layer; if a V6
 /// address ever surfaces here it indicates a misconfiguration upstream
 /// (a V6 socket binding the SD port, or a V6 source address surfaced
 /// by a transport that should not produce one). Returns
 /// [`TransportError::Unsupported`](crate::transport::TransportError::Unsupported)
 /// in that case so the caller can log and drop the message instead of panicking.
-fn socket_addr_v4(addr: std::net::SocketAddr) -> Result<SocketAddrV4, Error> {
+fn socket_addr_v4(addr: core::net::SocketAddr) -> Result<SocketAddrV4, Error> {
     match addr {
-        std::net::SocketAddr::V4(v4) => Ok(v4),
-        std::net::SocketAddr::V6(_) => Err(Error::Transport(
+        core::net::SocketAddr::V4(v4) => Ok(v4),
+        core::net::SocketAddr::V6(_) => Err(Error::Transport(
             crate::transport::TransportError::Unsupported,
         )),
     }
@@ -1084,7 +1076,7 @@ where
     async fn send_subscribe_ack_from_view(
         &self,
         entry_view: &sd::EntryView<'_>,
-        subscriber: std::net::SocketAddr,
+        subscriber: core::net::SocketAddr,
     ) -> Result<(), Error> {
         use crate::protocol::Header as SomeIpHeader;
         use crate::traits::WireFormat;
@@ -1132,7 +1124,7 @@ where
     async fn send_subscribe_nack_from_view(
         &self,
         entry_view: &sd::EntryView<'_>,
-        subscriber: std::net::SocketAddr,
+        subscriber: core::net::SocketAddr,
         reason: &str,
     ) -> Result<(), Error> {
         use crate::protocol::Header as SomeIpHeader;
@@ -1189,6 +1181,7 @@ mod tests {
     use crate::traits::WireFormat;
     use std::format;
     use std::net::IpAddr;
+    use std::vec;
     use tokio::net::UdpSocket;
 
     /// Type alias bringing the tokio-flavor concrete type parameters back
@@ -1339,7 +1332,7 @@ mod tests {
         );
         let view = MessageView::parse(&bytes).expect("parse Subscribe");
         let sd_view = view.sd_header().expect("Subscribe has SD header");
-        let sender = std::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 45000));
+        let sender = core::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 45000));
 
         // The H3 fix: handle_sd_message must NOT bubble the ACK send
         // failure as Err — it logs and continues.
@@ -1372,16 +1365,15 @@ mod tests {
             .expect("first announcement_loop call must succeed");
         let second = server.announcement_loop();
         match second {
-            Err(Error::Io(io_err)) => {
-                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidInput);
-                let msg = format!("{io_err}");
-                assert!(
-                    msg.contains("already started"),
-                    "expected the diagnostic to say 'already started', got: {msg}"
-                );
+            Err(Error::InvalidUsage(tag)) => {
+                assert_eq!(tag, "announcement_loop_already_started");
             }
             Ok(_) => panic!("second announcement_loop must error, got Ok"),
-            Err(other) => panic!("expected Error::Io(InvalidInput), got {other:?}"),
+            Err(other) => {
+                panic!(
+                    "expected Error::InvalidUsage(\"announcement_loop_already_started\"), got {other:?}"
+                )
+            }
         }
     }
 
@@ -1444,8 +1436,8 @@ mod tests {
             .await
             .expect("Failed to create server");
         let port = match server.unicast_local_addr().unwrap() {
-            std::net::SocketAddr::V4(addr) => addr.port(),
-            std::net::SocketAddr::V6(_) => panic!("expected IPv4 address"),
+            core::net::SocketAddr::V4(addr) => addr.port(),
+            core::net::SocketAddr::V6(_) => panic!("expected IPv4 address"),
         };
         // Update config to reflect actual bound port
         server.set_local_port(port);
@@ -1514,7 +1506,7 @@ mod tests {
             let mut buf = vec![0u8; 65535];
             let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
             let len = datagram.bytes_received;
-            let addr = std::net::SocketAddr::V4(datagram.source);
+            let addr = core::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1568,7 +1560,7 @@ mod tests {
             let mut buf = vec![0u8; 65535];
             let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
             let len = datagram.bytes_received;
-            let addr = std::net::SocketAddr::V4(datagram.source);
+            let addr = core::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1619,7 +1611,7 @@ mod tests {
             let mut buf = vec![0u8; 65535];
             let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
             let len = datagram.bytes_received;
-            let addr = std::net::SocketAddr::V4(datagram.source);
+            let addr = core::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1668,7 +1660,7 @@ mod tests {
             let mut buf = vec![0u8; 65535];
             let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
             let len = datagram.bytes_received;
-            let addr = std::net::SocketAddr::V4(datagram.source);
+            let addr = core::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1720,7 +1712,7 @@ mod tests {
             let mut buf = vec![0u8; 65535];
             let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
             let len = datagram.bytes_received;
-            let addr = std::net::SocketAddr::V4(datagram.source);
+            let addr = core::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1769,7 +1761,7 @@ mod tests {
             let mut buf = vec![0u8; 65535];
             let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
             let len = datagram.bytes_received;
-            let addr = std::net::SocketAddr::V4(datagram.source);
+            let addr = core::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1811,7 +1803,7 @@ mod tests {
             let mut buf = vec![0u8; 65535];
             let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
             let len = datagram.bytes_received;
-            let addr = std::net::SocketAddr::V4(datagram.source);
+            let addr = core::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -1890,8 +1882,8 @@ mod tests {
         let (mut server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_port = match client_socket.local_addr().unwrap() {
-            std::net::SocketAddr::V4(a) => a.port(),
-            std::net::SocketAddr::V6(_) => panic!("expected v4 source address"),
+            core::net::SocketAddr::V4(a) => a.port(),
+            core::net::SocketAddr::V6(_) => panic!("expected v4 source address"),
         };
 
         let subscriptions = Arc::clone(&server.subscriptions);
@@ -1959,8 +1951,8 @@ mod tests {
         let (mut server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_port = match client_socket.local_addr().unwrap() {
-            std::net::SocketAddr::V4(a) => a.port(),
-            std::net::SocketAddr::V6(_) => panic!("expected v4 source address"),
+            core::net::SocketAddr::V4(a) => a.port(),
+            core::net::SocketAddr::V6(_) => panic!("expected v4 source address"),
         };
 
         let subscriptions = Arc::clone(&server.subscriptions);
@@ -2065,7 +2057,7 @@ mod tests {
             let mut buf = vec![0u8; 65535];
             let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
             let len = datagram.bytes_received;
-            let addr = std::net::SocketAddr::V4(datagram.source);
+            let addr = core::net::SocketAddr::V4(datagram.source);
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
@@ -2363,7 +2355,7 @@ mod tests {
         .expect("timeout receiving combined SD packet")
         .unwrap();
         let len = datagram.bytes_received;
-        let sender = std::net::SocketAddr::V4(datagram.source);
+        let sender = core::net::SocketAddr::V4(datagram.source);
         let view = MessageView::parse(&buf[..len]).unwrap();
         let sd_view = view.sd_header().unwrap();
         server.handle_sd_message(&sd_view, sender).await.unwrap();
@@ -2413,14 +2405,14 @@ mod tests {
         let server = make_passive_server(0x005C, 0x0001).await;
         let local = server.unicast_local_addr().unwrap();
         match local {
-            std::net::SocketAddr::V4(v4) => {
+            core::net::SocketAddr::V4(v4) => {
                 assert_ne!(
                     v4.port(),
                     0,
                     "kernel should assign an ephemeral port when local_port=0"
                 );
             }
-            std::net::SocketAddr::V6(_) => panic!("expected IPv4 unicast address"),
+            core::net::SocketAddr::V6(_) => panic!("expected IPv4 unicast address"),
         }
     }
 
@@ -2473,19 +2465,12 @@ mod tests {
             .err()
             .expect("announcement_loop on a passive server must fail");
         match err {
-            Error::Io(io_err) => {
-                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidInput);
-                let msg = format!("{io_err}");
-                assert!(
-                    msg.contains("passive"),
-                    "error message should mention 'passive': {msg}"
-                );
-                assert!(
-                    msg.contains("0x005C"),
-                    "error message should include the service_id: {msg}"
-                );
+            Error::InvalidUsage(tag) => {
+                assert_eq!(tag, "passive_server_announcement_loop");
             }
-            other => panic!("expected Error::Io(InvalidInput), got {other:?}"),
+            other => panic!(
+                "expected Error::InvalidUsage(\"passive_server_announcement_loop\"), got {other:?}"
+            ),
         }
     }
 
@@ -2497,19 +2482,10 @@ mod tests {
             .await
             .expect_err("run on a passive server must fail");
         match err {
-            Error::Io(io_err) => {
-                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidInput);
-                let msg = format!("{io_err}");
-                assert!(
-                    msg.contains("passive"),
-                    "error message should mention 'passive': {msg}"
-                );
-                assert!(
-                    msg.contains("0x005C"),
-                    "error message should include the service_id: {msg}"
-                );
+            Error::InvalidUsage(tag) => {
+                assert_eq!(tag, "passive_server_run");
             }
-            other => panic!("expected Error::Io(InvalidInput), got {other:?}"),
+            other => panic!("expected Error::InvalidUsage(\"passive_server_run\"), got {other:?}"),
         }
     }
 
@@ -2561,7 +2537,7 @@ mod tests {
             s.set_reuse_address(true).unwrap();
             #[cfg(unix)]
             s.set_reuse_port(true).unwrap();
-            s.bind(&std::net::SocketAddr::new(IpAddr::V4(iface), sd::MULTICAST_PORT).into())
+            s.bind(&core::net::SocketAddr::new(IpAddr::V4(iface), sd::MULTICAST_PORT).into())
                 .unwrap();
             s.set_nonblocking(true).unwrap();
             let std_s: std::net::UdpSocket = s.into();
@@ -2651,8 +2627,8 @@ mod tests {
             .await
             .expect("blocker bind should succeed");
         let blocker_port = match blocker.local_addr().unwrap() {
-            std::net::SocketAddr::V4(v4) => v4.port(),
-            std::net::SocketAddr::V6(_) => panic!("expected IPv4"),
+            core::net::SocketAddr::V4(v4) => v4.port(),
+            core::net::SocketAddr::V6(_) => panic!("expected IPv4"),
         };
 
         let config = ServerConfig::new(Ipv4Addr::LOCALHOST, blocker_port, 0x005C, 0x0001);
@@ -2793,7 +2769,7 @@ mod tests {
         raw_rx.set_reuse_port(true).unwrap();
         raw_rx.set_multicast_loop_v4(true).unwrap();
         raw_rx
-            .bind(&std::net::SocketAddr::new(IpAddr::V4(interface), sd::MULTICAST_PORT).into())
+            .bind(&core::net::SocketAddr::new(IpAddr::V4(interface), sd::MULTICAST_PORT).into())
             .unwrap();
         raw_rx.set_nonblocking(true).unwrap();
         let rx: UdpSocket = UdpSocket::from_std(raw_rx.into()).unwrap();

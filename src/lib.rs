@@ -109,11 +109,22 @@
 #[cfg(feature = "std")]
 extern crate std;
 
-// `embassy_channels` needs `alloc` for `EmbassySyncChannels`'s
-// `Arc<Channel<...>>` storage (the heap-backed bare-metal channel
-// primitive). The `static_channels` module does NOT need alloc — users
-// who only enable `bare_metal` (without `embassy_channels`) get no-alloc.
-#[cfg(feature = "embassy_channels")]
+// `alloc` is required by:
+// - `embassy_channels` — `EmbassySyncChannels` heap-allocates an
+//   `Arc<Channel<...>>` per oneshot/bounded/unbounded.
+// - `server` — `EventPublisher` and the `Server` struct hold
+//   `Arc<EventPublisher<...>>` / `Arc<F::Socket>` for sharing
+//   between the run loop and external publishing tasks. A
+//   future refactor may switch to `&'static` borrows so the
+//   server compiles in pure no_std without an allocator;
+//   tracked in `bare_metal_plan_v3.md` Phase 21+ backlog.
+//
+// The `static_channels` module (under `bare_metal` alone) does
+// NOT need alloc — users wanting `client` + `bare_metal` without
+// allocator get the no-alloc oneshot/mpsc primitives via the
+// macro. Pure `bare_metal` without `client` / `server` /
+// `embassy_channels` also stays alloc-free.
+#[cfg(any(feature = "embassy_channels", feature = "server"))]
 extern crate alloc;
 
 /// Maximum size, in bytes, of UDP payloads for `client` / `server` send
