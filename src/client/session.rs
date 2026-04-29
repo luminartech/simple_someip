@@ -1,6 +1,6 @@
 use crate::protocol::sd::RebootFlag;
+use core::net::SocketAddr;
 use heapless::index_map::FnvIndexMap;
-use std::net::SocketAddr;
 
 /// Max number of distinct `(sender, transport, service, instance)` tuples tracked
 /// for reboot detection. Must be a power of two (heapless `FnvIndexMap`

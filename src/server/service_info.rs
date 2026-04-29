@@ -1,8 +1,16 @@
 //! Service and event group information
 
-use std::{net::SocketAddrV4, vec::Vec};
+use core::net::SocketAddrV4;
+#[cfg(feature = "std")]
+use std::vec::Vec;
 
-/// Information about a SOME/IP service being provided
+/// Information about a SOME/IP service being provided.
+///
+/// Gated on `feature = "std"` because the `event_groups` field is a
+/// heap `Vec`. Bare-metal consumers don't construct this type today;
+/// a future port will switch to `heapless::Vec` if a use case
+/// emerges.
+#[cfg(feature = "std")]
 #[derive(Debug, Clone)]
 pub struct ServiceInfo {
     /// Service ID
@@ -17,7 +25,11 @@ pub struct ServiceInfo {
     pub event_groups: Vec<EventGroupInfo>,
 }
 
-/// Information about an event group
+/// Information about an event group.
+///
+/// Gated on `feature = "std"` for the same reason as
+/// [`ServiceInfo`].
+#[cfg(feature = "std")]
 #[derive(Debug, Clone)]
 pub struct EventGroupInfo {
     /// Event group ID
@@ -26,6 +38,7 @@ pub struct EventGroupInfo {
     pub event_ids: Vec<u16>,
 }
 
+#[cfg(feature = "std")]
 impl EventGroupInfo {
     /// Create a new event group
     #[must_use]

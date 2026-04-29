@@ -11,6 +11,12 @@ pub enum Error {
     #[error(transparent)]
     Protocol(#[from] crate::protocol::Error),
     /// An I/O error from the underlying network transport.
+    ///
+    /// Gated on `feature = "std"` because [`std::io::Error`] is itself
+    /// std-only. Bare-metal consumers receive transport-layer
+    /// failures through [`Self::Transport`] instead, which carries a
+    /// portable [`crate::transport::IoErrorKind`].
+    #[cfg(feature = "std")]
     #[error(transparent)]
     Io(#[from] std::io::Error),
     /// A transport-layer error from a [`crate::transport::TransportFactory`]
@@ -27,6 +33,19 @@ pub enum Error {
     /// tags: `"udp_buffer"` (→ `crate::UDP_BUFFER_SIZE`).
     #[error("internal capacity exceeded: {0}")]
     Capacity(&'static str),
+    /// A `Server` API was called in a way that violates its
+    /// preconditions. The argument is a `&'static str` tag naming the
+    /// misuse; current tags:
+    /// - `"passive_server_announcement_loop"` — `announcement_loop`
+    ///   was called on a server constructed via `new_passive`. Passive
+    ///   servers have no real SD socket bound to port 30490, so any
+    ///   announcements would go out with an incorrect source port.
+    ///   Drive announcements from the client side instead.
+    /// - `"announcement_loop_already_started"` — `announcement_loop`
+    ///   was called twice on the same server. Two announcement
+    ///   futures cannot share the same SD socket and session counter.
+    #[error("invalid server usage: {0}")]
+    InvalidUsage(&'static str),
 }
 
 impl From<crate::protocol::sd::Error> for Error {

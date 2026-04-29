@@ -7,9 +7,9 @@ use crate::e2e::E2EKey;
 use crate::protocol::{Header, Message};
 use crate::traits::{PayloadWireFormat, WireFormat};
 use crate::transport::{E2ERegistryHandle, TransportSocket};
+use alloc::sync::Arc;
 use core::net::SocketAddrV4;
 use heapless::Vec as HeaplessVec;
-use std::sync::Arc;
 
 /// The publish snapshot buffer is sized to `SUBSCRIBERS_PER_GROUP` so
 /// `for_each_subscriber` can never overflow it. If a future refactor
@@ -394,7 +394,7 @@ where
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-        subscriber_addr: std::net::SocketAddrV4,
+        subscriber_addr: core::net::SocketAddrV4,
     ) -> Result<(), crate::server::SubscribeError> {
         self.subscriptions
             .subscribe(service_id, instance_id, event_group_id, subscriber_addr)
@@ -416,7 +416,7 @@ where
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-        subscriber_addr: std::net::SocketAddrV4,
+        subscriber_addr: core::net::SocketAddrV4,
     ) {
         self.subscriptions
             .unsubscribe(service_id, instance_id, event_group_id, subscriber_addr)
@@ -514,7 +514,7 @@ mod tests {
 
         // Create a receiver socket to act as subscriber
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let std::net::SocketAddr::V4(recv_addr) = receiver.local_addr().unwrap() else {
+        let core::net::SocketAddr::V4(recv_addr) = receiver.local_addr().unwrap() else {
             panic!("expected v4 source address");
         };
 
@@ -826,7 +826,7 @@ mod tests {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
 
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let std::net::SocketAddr::V4(recv_addr) = receiver.local_addr().unwrap() else {
+        let core::net::SocketAddr::V4(recv_addr) = receiver.local_addr().unwrap() else {
             panic!("expected v4 source address");
         };
 

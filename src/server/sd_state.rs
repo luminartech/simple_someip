@@ -10,8 +10,8 @@
 //! parameter on [`SdStateManager::send_offer_service`] becomes the single
 //! migration point for the announcement path.
 
+use core::net::SocketAddrV4;
 use core::sync::atomic::{AtomicU32, Ordering};
-use std::net::SocketAddrV4;
 
 use crate::protocol::sd::{
     self, Entry, Flags, OptionsCount, RebootFlag, ServiceEntry, TransportProtocol,
