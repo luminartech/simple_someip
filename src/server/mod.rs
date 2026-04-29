@@ -28,7 +28,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::Timer;
 use crate::e2e::{E2EKey, E2EProfile};
 use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
-use crate::transport::{E2ERegistryHandle, SocketOptions, TransportFactory, TransportSocket};
+use crate::transport::{
+    E2ERegistryHandle, SocketHandle, SocketOptions, TransportFactory, TransportSocket,
+    WrappableSocketHandle,
+};
 use alloc::sync::Arc;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use futures_util::{FutureExt, pin_mut, select_biased};
@@ -140,23 +143,27 @@ where
 /// these as `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>`
 /// / `TokioTransport` / `TokioTimer`. Bare-metal callers use
 /// [`Self::new_with_deps`] (under `server`) and supply their own.
-pub struct Server<R, S, F, Tm>
+pub struct Server<R, S, F, Tm, H = Arc<<F as TransportFactory>::Socket>>
 where
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
-    F: TransportFactory + Send + Sync + 'static,
-    F::Socket: Send + Sync + 'static,
-    Tm: Timer + Clone + Send + Sync + 'static,
+    F: TransportFactory + 'static,
+    F::Socket: 'static,
+    Tm: Timer + Clone + 'static,
+    H: SocketHandle<Socket = F::Socket>,
 {
     config: ServerConfig,
-    /// Socket for receiving subscription requests
-    unicast_socket: Arc<F::Socket>,
-    /// Socket for sending SD announcements
-    sd_socket: Arc<F::Socket>,
+    /// Socket for receiving subscription requests, behind whatever
+    /// shared-storage `H` chose (`Arc<T>` on std,
+    /// `StaticSocketHandle<T>` on bare metal).
+    unicast_socket: H,
+    /// Socket for sending SD announcements (same handle type as
+    /// `unicast_socket`; both are produced by the same factory).
+    sd_socket: H,
     /// Subscription manager
     subscriptions: S,
     /// Event publisher
-    publisher: Arc<EventPublisher<R, S, F::Socket>>,
+    publisher: Arc<EventPublisher<R, S, H>>,
     /// SD session-ID counter and announcement emitter
     sd_state: Arc<SdStateManager>,
     /// Shared E2E registry for runtime E2E configuration
@@ -272,20 +279,27 @@ impl
     }
 }
 
-impl<R, S, F, Tm> Server<R, S, F, Tm>
+impl<R, S, F, Tm, H> Server<R, S, F, Tm, H>
 where
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
-    F: TransportFactory + Send + Sync + 'static,
-    F::Socket: Send + Sync + 'static,
-    for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
-    for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
-    Tm: Timer + Clone + Send + Sync + 'static,
+    F: TransportFactory + 'static,
+    F::Socket: 'static,
+    Tm: Timer + Clone + 'static,
+    H: WrappableSocketHandle<Socket = F::Socket>,
 {
     /// Bare-metal-friendly constructor that takes every dependency
     /// explicitly via a [`ServerDeps`] bundle. The `server-tokio`
     /// convenience constructors (`Self::new`, `Self::new_with_loopback`,
     /// `Self::new_passive`) ultimately delegate here.
+    ///
+    /// `H: WrappableSocketHandle` is required because this constructor
+    /// binds two sockets internally (`unicast` + `sd`) and needs to
+    /// place each one behind the caller's chosen shared-storage. On
+    /// std this is `Arc<F::Socket>`; on bare metal with an allocator
+    /// it can be any `WrappableSocketHandle` impl. Pure-no-alloc
+    /// consumers using `StaticSocketHandle` need a future
+    /// external-bind constructor variant — see `SocketHandle` docs.
     ///
     /// # Errors
     ///
@@ -304,13 +318,17 @@ where
             subscriptions,
         } = deps;
 
-        // Bind unicast socket for receiving subscriptions.
+        // Bind unicast socket for receiving subscriptions, then wrap
+        // through `WrappableSocketHandle` so the rest of the Server
+        // sees the caller's chosen shared-storage type rather than
+        // the raw `F::Socket`.
         let unicast_addr = SocketAddrV4::new(config.interface, config.local_port);
-        let unicast_socket = Arc::new(factory.bind(unicast_addr, &SocketOptions::new()).await?);
+        let unicast_raw = factory.bind(unicast_addr, &SocketOptions::new()).await?;
+        let bound_port = unicast_raw.local_addr()?.port();
+        let unicast_socket: H = H::wrap(unicast_raw);
         // If the caller passed local_port = 0, the kernel picked an
         // ephemeral port. Back-fill the config so SD offers and event
         // publishers advertise the actual bound port instead of 0.
-        let bound_port = unicast_socket.local_addr()?.port();
         config.local_port = bound_port;
         tracing::info!(
             "Server bound to {}:{} for service 0x{:04X}",
@@ -326,9 +344,9 @@ where
         sd_opts.multicast_if_v4 = Some(config.interface);
         sd_opts.multicast_loop_v4 = Some(multicast_loopback);
         let sd_addr = SocketAddrV4::new(config.interface, sd::MULTICAST_PORT);
-        let sd_socket = factory.bind(sd_addr, &sd_opts).await?;
-        sd_socket.join_multicast_v4(sd::MULTICAST_IP, config.interface)?;
-        let sd_socket = Arc::new(sd_socket);
+        let sd_raw = factory.bind(sd_addr, &sd_opts).await?;
+        sd_raw.join_multicast_v4(sd::MULTICAST_IP, config.interface)?;
+        let sd_socket: H = H::wrap(sd_raw);
         tracing::info!(
             "Server SD socket bound to {} (expected port {}), joined multicast {}",
             sd_addr,
@@ -338,7 +356,7 @@ where
 
         let publisher = Arc::new(EventPublisher::new(
             subscriptions.clone(),
-            Arc::clone(&unicast_socket),
+            unicast_socket.clone(),
             e2e_registry.clone(),
         ));
 
@@ -381,9 +399,10 @@ where
 
         // Bind unicast socket at the configured local_port.
         let unicast_addr = SocketAddrV4::new(config.interface, config.local_port);
-        let unicast_socket = Arc::new(factory.bind(unicast_addr, &SocketOptions::new()).await?);
+        let unicast_raw = factory.bind(unicast_addr, &SocketOptions::new()).await?;
+        let bound_port = unicast_raw.local_addr()?.port();
+        let unicast_socket: H = H::wrap(unicast_raw);
         // Back-fill the actual bound port if the caller passed 0.
-        let bound_port = unicast_socket.local_addr()?.port();
         config.local_port = bound_port;
         tracing::info!(
             "Passive server bound to {}:{} for service 0x{:04X}",
@@ -395,7 +414,7 @@ where
         // Placeholder SD socket on an ephemeral port — no multicast options,
         // no group join. Nothing should route to it.
         let sd_placeholder_addr = SocketAddrV4::new(config.interface, 0);
-        let sd_socket = Arc::new(
+        let sd_socket: H = H::wrap(
             factory
                 .bind(sd_placeholder_addr, &SocketOptions::new())
                 .await?,
@@ -407,7 +426,7 @@ where
 
         let publisher = Arc::new(EventPublisher::new(
             subscriptions.clone(),
-            Arc::clone(&unicast_socket),
+            unicast_socket.clone(),
             e2e_registry.clone(),
         ));
 
@@ -427,17 +446,14 @@ where
     }
 }
 
-impl<R, S, F, Tm> Server<R, S, F, Tm>
+impl<R, S, F, Tm, H> Server<R, S, F, Tm, H>
 where
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
-    F: TransportFactory + Send + Sync + 'static,
-    F::Socket: Send + Sync + 'static,
-    for<'a> F::BindFuture<'a>: Send,
-    for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
-    for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
-    Tm: Timer + Clone + Send + Sync + 'static,
-    for<'a> Tm::SleepFuture<'a>: Send,
+    F: TransportFactory + 'static,
+    F::Socket: 'static,
+    Tm: Timer + Clone + 'static,
+    H: SocketHandle<Socket = F::Socket>,
 {
     /// Build the periodic-SD-announcement future.
     ///
@@ -474,7 +490,15 @@ where
     #[must_use = "the returned announcement-loop future must be spawned (e.g. tokio::spawn) or awaited for the server to emit SD announcements; dropping it silently disables announcements"]
     pub fn announcement_loop(
         &self,
-    ) -> Result<impl core::future::Future<Output = ()> + Send + 'static, Error> {
+    ) -> Result<impl core::future::Future<Output = ()> + Send + 'static, Error>
+    where
+        F: Send + Sync,
+        F::Socket: Send + Sync,
+        for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
+        H: Send + Sync,
+        Tm: Send + Sync,
+        for<'a> Tm::SleepFuture<'a>: Send,
+    {
         if self.is_passive {
             tracing::warn!(
                 "announcement_loop called on passive Server for service 0x{:04X}; \
@@ -498,14 +522,17 @@ where
             return Err(Error::InvalidUsage("announcement_loop_already_started"));
         }
         let config = self.config.clone();
-        let sd_socket = Arc::clone(&self.sd_socket);
+        let sd_socket = self.sd_socket.clone();
         let sd_state = Arc::clone(&self.sd_state);
         let timer = self.timer.clone();
 
         Ok(async move {
             let mut announcement_count = 0u32;
             loop {
-                match sd_state.send_offer_service(&config, &*sd_socket).await {
+                match sd_state
+                    .send_offer_service(&config, sd_socket.socket())
+                    .await
+                {
                     Ok(()) => {
                         announcement_count += 1;
                         if announcement_count == 1 {
@@ -530,6 +557,80 @@ where
                 // the `Timer` trait so bare-metal consumers can swap in
                 // a different timer impl; today it resolves to
                 // `TokioTimer` under the `server-tokio` feature.
+                timer.sleep(core::time::Duration::from_secs(1)).await;
+            }
+        })
+    }
+
+    /// `!Send` counterpart to [`Self::announcement_loop`].
+    ///
+    /// Returns the same announcement-loop future without the `+ Send`
+    /// bound on the return type, so it can be driven by single-threaded
+    /// executors (`tokio::task::LocalSet`, embassy with `task-arena = 0`,
+    /// etc.) over a `!Sync` transport such as `embassy-net`. Use this on
+    /// bare-metal targets where `H::Socket` is `!Sync`; use the
+    /// Send-bounded `announcement_loop` on multi-threaded targets.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::announcement_loop`].
+    #[must_use = "the returned announcement-loop future must be driven (e.g. tokio::task::spawn_local) for the server to emit SD announcements; dropping it silently disables announcements"]
+    pub fn announcement_loop_local(
+        &self,
+    ) -> Result<impl core::future::Future<Output = ()> + 'static, Error> {
+        if self.is_passive {
+            tracing::warn!(
+                "announcement_loop_local called on passive Server for service 0x{:04X}; \
+                 announcements must be driven externally (e.g. via \
+                 `simple_someip::Client::sd_announcements_loop`)",
+                self.config.service_id
+            );
+            return Err(Error::InvalidUsage("passive_server_announcement_loop"));
+        }
+        if self
+            .announcement_loop_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            tracing::warn!(
+                "announcement_loop already started for service 0x{:04X}; \
+                 two announcement futures cannot share the same SD socket \
+                 and session counter",
+                self.config.service_id
+            );
+            return Err(Error::InvalidUsage("announcement_loop_already_started"));
+        }
+        let config = self.config.clone();
+        let sd_socket = self.sd_socket.clone();
+        let sd_state = Arc::clone(&self.sd_state);
+        let timer = self.timer.clone();
+
+        Ok(async move {
+            let mut announcement_count = 0u32;
+            loop {
+                match sd_state
+                    .send_offer_service(&config, sd_socket.socket())
+                    .await
+                {
+                    Ok(()) => {
+                        announcement_count += 1;
+                        if announcement_count == 1 {
+                            tracing::info!(
+                                "Sent first SD announcement for service 0x{:04X}",
+                                config.service_id
+                            );
+                        } else {
+                            tracing::debug!(
+                                "Sent {} SD announcements for service 0x{:04X}",
+                                announcement_count,
+                                config.service_id
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to send OfferService: {:?}", e);
+                    }
+                }
                 timer.sleep(core::time::Duration::from_secs(1)).await;
             }
         })
@@ -573,6 +674,7 @@ where
 
         let target_v4 = socket_addr_v4(target)?;
         self.sd_socket
+            .socket()
             .send_to(&buffer[..total_len], target_v4)
             .await?;
         tracing::debug!(
@@ -586,7 +688,7 @@ where
 
     /// Get the event publisher for sending events
     #[must_use]
-    pub fn publisher(&self) -> Arc<EventPublisher<R, S, F::Socket>> {
+    pub fn publisher(&self) -> Arc<EventPublisher<R, S, H>> {
         Arc::clone(&self.publisher)
     }
 
@@ -596,7 +698,7 @@ where
     ///
     /// Returns an error if the socket's local address cannot be retrieved.
     pub fn unicast_local_addr(&self) -> Result<core::net::SocketAddr, Error> {
-        match self.unicast_socket.local_addr() {
+        match self.unicast_socket.socket().local_addr() {
             Ok(v4) => Ok(core::net::SocketAddr::V4(v4)),
             Err(e) => Err(Error::Transport(e)),
         }
@@ -692,8 +794,12 @@ where
             // select macro returns, freeing the buffer we index into
             // below.
             let (len, addr, source, from_unicast) = {
-                let unicast_fut = self.unicast_socket.recv_from(&mut unicast_buf).fuse();
-                let sd_fut = self.sd_socket.recv_from(&mut sd_buf).fuse();
+                let unicast_fut = self
+                    .unicast_socket
+                    .socket()
+                    .recv_from(&mut unicast_buf)
+                    .fuse();
+                let sd_fut = self.sd_socket.socket().recv_from(&mut sd_buf).fuse();
                 pin_mut!(unicast_fut, sd_fut);
                 select_biased! {
                     result = unicast_fut => {
@@ -1062,15 +1168,14 @@ fn extract_subscriber_endpoint(
     }
 }
 
-impl<R, S, F, Tm> Server<R, S, F, Tm>
+impl<R, S, F, Tm, H> Server<R, S, F, Tm, H>
 where
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
-    F: TransportFactory + Send + Sync + 'static,
-    F::Socket: Send + Sync + 'static,
-    for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
-    for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
-    Tm: Timer + Clone + Send + Sync + 'static,
+    F: TransportFactory + 'static,
+    F::Socket: 'static,
+    Tm: Timer + Clone + 'static,
+    H: SocketHandle<Socket = F::Socket>,
 {
     /// Send `SubscribeAck` from an entry view
     async fn send_subscribe_ack_from_view(
@@ -1107,6 +1212,7 @@ where
 
         let subscriber_v4 = socket_addr_v4(subscriber)?;
         self.sd_socket
+            .socket()
             .send_to(&buffer[..total_len], subscriber_v4)
             .await?;
 
@@ -1156,6 +1262,7 @@ where
 
         let subscriber_v4 = socket_addr_v4(subscriber)?;
         self.sd_socket
+            .socket()
             .send_to(&buffer[..total_len], subscriber_v4)
             .await?;
 
@@ -1313,9 +1420,12 @@ mod tests {
             subscriptions: subscriptions.clone(),
         };
         let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0x5B, 1);
-        let mut server = Server::new_with_deps(deps, config, false)
-            .await
-            .expect("create failing-socket server");
+        // Explicit `Arc<FailingSocket>` H so the compiler doesn't have
+        // to invent it across the deps-bundle indirection.
+        let mut server: Server<_, _, _, _, Arc<FailingSocket>> =
+            Server::new_with_deps(deps, config, false)
+                .await
+                .expect("create failing-socket server");
 
         // Build a valid Subscribe; our service id/instance/major
         // match the config's defaults, so the only failure point
