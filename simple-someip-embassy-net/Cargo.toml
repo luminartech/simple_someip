@@ -48,12 +48,21 @@ embassy-sync = "0.6"
 heapless = "0.9"
 
 [dev-dependencies]
-# Host-side tests use a tuntap-backed embassy-net stack to drive a
-# request/response roundtrip. The dev-dep is what gets us link-time
-# `critical-section` impls on the host.
+# Host-side tests run two embassy-net stacks bridged by a software
+# `LoopbackDriver` pair (no kernel TUN, no privilege requirement).
+# `critical-section/std` provides a host platform impl so embassy-sync
+# / embassy-net link on host; firmware supplies its own.
 critical-section = { version = "1", features = ["std"] }
 embassy-executor = { version = "0.6", features = [
     "arch-std",
     "executor-thread",
 ] }
 embassy-time = { version = "0.3", features = ["std", "generic-queue-8"] }
+# Tokio drives the test harness — `#[tokio::test]` for setup,
+# `tokio::spawn` for the per-stack `Stack::run()` futures, and
+# `tokio::time::timeout` for bounded assertions. Same shape as the
+# parent crate's `tests/bare_metal_e2e.rs` harness.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# `futures` brings `select_biased!` / `FusedFuture` / `pin_mut!` into
+# scope for the test driver.
+futures = "0.3"
