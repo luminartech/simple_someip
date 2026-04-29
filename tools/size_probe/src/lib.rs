@@ -139,9 +139,7 @@ pub unsafe extern "C" fn e2e_profile4_round_trip(
     if buf.len() < payload_len + 12 {
         return out;
     }
-    let Ok(protected_len) =
-        protect_profile4(&config, &mut protect_state, payload, &mut buf)
-    else {
+    let Ok(protected_len) = protect_profile4(&config, &mut protect_state, payload, &mut buf) else {
         return out;
     };
 
@@ -183,16 +181,13 @@ pub unsafe extern "C" fn e2e_profile5_round_trip(
         return out;
     };
     let config = Profile5Config::new(0x1234, payload_len_u16, 15);
-    let mut protect_state =
-        Profile5State::with_initial_counter((initial_counter & 0xFF) as u8);
+    let mut protect_state = Profile5State::with_initial_counter((initial_counter & 0xFF) as u8);
 
     let mut buf = [0u8; 1500];
     if buf.len() < payload_len + 4 {
         return out;
     }
-    let Ok(protected_len) =
-        protect_profile5(&config, &mut protect_state, payload, &mut buf)
-    else {
+    let Ok(protected_len) = protect_profile5(&config, &mut protect_state, payload, &mut buf) else {
         return out;
     };
 
