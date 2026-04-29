@@ -21,7 +21,8 @@
     "routing": "offerer",
     "service-discovery": {
         "enable": "true",
-        "multicast": "224.0.23.0",
+        "_multicast_comment": "simple-someip's default SD multicast is hardcoded to 239.255.0.255 (see src/protocol/sd/mod.rs:MULTICAST_IP — Luminar-internal-network style, predates spec-default alignment). vsomeip's default would be 224.0.23.0 (the SOME/IP-SD spec value). For these conformance tests we match simple-someip; future work should make simple-someip's multicast group configurable so we can test against spec-default vsomeip too.",
+        "multicast": "239.255.0.255",
         "port": "30490",
         "protocol": "udp",
         "initial_delay_min": "10",
