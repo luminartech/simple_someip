@@ -615,8 +615,18 @@ where
     ///
     /// Once registered, outgoing events published via [`EventPublisher::publish_event`]
     /// will have E2E protection applied automatically.
-    pub fn register_e2e(&self, key: E2EKey, profile: E2EProfile) {
-        self.e2e_registry.register(key, profile);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::e2e::E2ERegistryFull`] when the underlying
+    /// registry has no room for a new key. Replacing the profile of an
+    /// already-registered key always succeeds.
+    pub fn register_e2e(
+        &self,
+        key: E2EKey,
+        profile: E2EProfile,
+    ) -> Result<(), crate::e2e::E2ERegistryFull> {
+        self.e2e_registry.register(key, profile)
     }
 
     /// Remove E2E configuration for the given key.
