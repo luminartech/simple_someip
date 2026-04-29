@@ -51,6 +51,66 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: obi1kenobi/cargo-semver-checks-action@v2
 
+  no_std_target:
+    # Cross-build for a true no_std target (cortex-m4f, no allocator,
+    # no std). This is the literal phase-18 gate from
+    # `bare_metal_plan_v3.md`: phases 4–17 shipped the trait surface
+    # and no-alloc primitives, but until this job is green the crate
+    # cannot actually be consumed on cortex-m. Each combination here
+    # is a separate `cargo build` so a failure surfaces the specific
+    # feature combo that regressed.
+    #
+    # `client + bare_metal` is verified alloc-free (no `__rust_alloc`
+    # symbols in the rlib); `server + bare_metal` and the combined
+    # build pull `extern crate alloc` for `Arc<EventPublisher>` /
+    # `Arc<F::Socket>` and so do reference allocator symbols — that's
+    # documented in `lib.rs` and tracked for a future refactor.
+    name: no_std target build (thumbv7em-none-eabihf)
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: bare_metal alone
+        run: cargo build --target thumbv7em-none-eabihf --no-default-features --features bare_metal
+      - name: server + bare_metal
+        run: cargo build --target thumbv7em-none-eabihf --no-default-features --features server,bare_metal
+      - name: client + server + bare_metal
+        run: cargo build --target thumbv7em-none-eabihf --no-default-features --features client,server,bare_metal
+      # `client + bare_metal` runs LAST so the rlib in
+      # target/thumbv7em-none-eabihf/debug/ comes from this exact
+      # feature set when the alloc-symbol audit reads it.
+      - name: client + bare_metal
+        run: |
+          # Wipe the bare_metal-only artifact from earlier in this
+          # job so the audit step doesn't accidentally read it; then
+          # build fresh under client+bare_metal.
+          rm -f target/thumbv7em-none-eabihf/debug/libsimple_someip*.rlib
+          cargo build --target thumbv7em-none-eabihf --no-default-features --features client,bare_metal
+      - name: alloc-symbol audit (client + bare_metal must be alloc-free)
+        # If `client + bare_metal` ever starts pulling `__rust_alloc`,
+        # something inside the client engine has regressed onto an
+        # allocator-bound primitive. Fail loudly so it gets caught in
+        # the PR rather than discovered downstream. (`server` and
+        # `client+server` builds DO reference alloc symbols via
+        # `Arc<EventPublisher>` — documented; not gated here.)
+        run: |
+          rlib=$(find target/thumbv7em-none-eabihf -name 'libsimple_someip*.rlib' | head -1)
+          if [ -z "$rlib" ]; then
+            echo "::error::no simple_someip rlib found under target/thumbv7em-none-eabihf"
+            exit 1
+          fi
+          alloc_refs=$(nm -A "$rlib" 2>/dev/null | grep -c -E '__rust_alloc|__rg_alloc' || true)
+          echo "client+bare_metal alloc-symbol references: $alloc_refs"
+          if [ "$alloc_refs" -ne 0 ]; then
+            echo "::error::client+bare_metal must be alloc-free; found $alloc_refs alloc references."
+            nm -A "$rlib" 2>/dev/null | grep -E '__rust_alloc|__rg_alloc' || true
+            exit 1
+          fi
+
   test:
     name: Build, Test & Coverage
     needs: check
