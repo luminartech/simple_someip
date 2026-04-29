@@ -128,6 +128,63 @@ where
     pub subscriptions: S,
 }
 
+/// Bundle of pre-built dependencies + storage handles for
+/// [`Server::new_with_handles`] / [`Server::new_passive_with_handles`].
+///
+/// Variant of [`ServerDeps`] for callers who have already bound
+/// their sockets externally and assembled storage handles
+/// themselves — the bare-metal-no-alloc path. Each
+/// `Wrappable*Handle`-using constructor on the alloc path
+/// (`Server::new_with_deps`, `Server::new_passive_with_deps`) has a
+/// counterpart here that takes pre-built handles directly,
+/// skipping the internal `wrap` step. That lets a no-alloc consumer
+/// supply `StaticSocketHandle<EmbassyNetSocket>` /
+/// `&'static SdStateManager` / `&'static EventPublisher<...>`
+/// instances they materialized via their preferred static-storage
+/// pattern.
+///
+/// All eight fields are public so the struct can be assembled
+/// inline.
+pub struct ServerHandles<F, Tm, R, S, H, Hsd, Hep>
+where
+    F: TransportFactory + 'static,
+    Tm: Timer,
+    R: E2ERegistryHandle,
+    S: SubscriptionHandle,
+    H: SocketHandle<Socket = F::Socket>,
+    Hsd: SdStateHandle,
+    Hep: EventPublisherHandle<R, S, H>,
+{
+    /// Transport factory. Retained on the `Server` for any
+    /// post-construction state the backend needs to keep alive
+    /// (e.g., embassy-net `Stack` handle); the new-with-handles
+    /// constructor does NOT call `factory.bind()`.
+    pub factory: F,
+    /// Async sleep primitive used by the announcement loop's
+    /// 1-second tick.
+    pub timer: Tm,
+    /// Shared E2E registry handle for runtime E2E configuration.
+    pub e2e_registry: R,
+    /// Shared subscription manager handle.
+    pub subscriptions: S,
+    /// Pre-built unicast socket handle. Caller has already bound
+    /// the underlying socket to the desired interface + port.
+    pub unicast_socket: H,
+    /// Pre-built SD socket handle. For active servers, caller has
+    /// bound to the SD multicast port (30490) and joined the SD
+    /// multicast group; for passive servers, this is whatever
+    /// placeholder socket the caller chose (will not be driven).
+    pub sd_socket: H,
+    /// Pre-built SD-state handle (`&'static SdStateManager` for
+    /// no-alloc, `Arc<SdStateManager>` for alloc).
+    pub sd_state: Hsd,
+    /// Pre-built `EventPublisher` handle. For std users this is
+    /// typically `Arc<EventPublisher::new(subscriptions, unicast,
+    /// e2e)>`; for no-alloc, a `&'static EventPublisher<...>`
+    /// declared externally.
+    pub publisher: Hep,
+}
+
 /// SOME/IP Server that can offer services and publish events.
 ///
 /// Generic over the four pluggable infrastructure types bundled in
@@ -472,6 +529,104 @@ where
     Hsd: SdStateHandle,
     Hep: EventPublisherHandle<R, S, H>,
 {
+    /// Construct a `Server` from pre-built dependencies + storage
+    /// handles. The bare-metal-no-alloc counterpart to
+    /// [`Self::new_with_deps`].
+    ///
+    /// Unlike `new_with_deps`, this constructor does NOT call
+    /// `factory.bind(...)` and does NOT join any multicast group.
+    /// The caller has already bound their unicast and SD sockets
+    /// (typically against an externally-managed UDP stack — lwIP,
+    /// vendor IP, etc.) and joined the SOME/IP-SD multicast group
+    /// (`224.0.23.0`) on the SD socket externally. The caller has
+    /// also assembled the `EventPublisher` and `SdStateManager`
+    /// handles into whatever shared-storage their target uses
+    /// (`Arc<...>` on alloc, `&'static ...` on no-alloc).
+    ///
+    /// `config.local_port` is back-filled from
+    /// `unicast_socket.local_addr()?.port()` so SD offers and
+    /// event publishers advertise the actual bound port.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying `unicast_socket.local_addr()`
+    /// fails on the underlying transport.
+    pub fn new_with_handles(
+        deps: ServerHandles<F, Tm, R, S, H, Hsd, Hep>,
+        mut config: ServerConfig,
+    ) -> Result<Self, Error> {
+        let bound_port = deps.unicast_socket.socket().local_addr()?.port();
+        config.local_port = bound_port;
+        tracing::info!(
+            "Server (handles) bound to {}:{} for service 0x{:04X}",
+            config.interface,
+            bound_port,
+            config.service_id
+        );
+
+        Ok(Self {
+            config,
+            unicast_socket: deps.unicast_socket,
+            sd_socket: deps.sd_socket,
+            subscriptions: deps.subscriptions,
+            publisher: deps.publisher,
+            sd_state: deps.sd_state,
+            e2e_registry: deps.e2e_registry,
+            factory: deps.factory,
+            timer: deps.timer,
+            is_passive: false,
+            announcement_loop_started: AtomicBool::new(false),
+        })
+    }
+
+    /// Passive-server counterpart to [`Self::new_with_handles`].
+    ///
+    /// Same shape; the resulting server is marked
+    /// `is_passive = true` so [`Self::announcement_loop`] /
+    /// [`Self::announcement_loop_local`] / [`Self::run`] /
+    /// [`Self::run_with_buffers`] return
+    /// `Err(Error::InvalidUsage(...))` rather than driving the SD
+    /// loop. The caller is expected to handle SD externally
+    /// (typically via a `Client::sd_announcements_loop` on the
+    /// same host).
+    ///
+    /// The `sd_socket` field is retained but never driven; pass
+    /// any pre-built handle the caller can spare (a placeholder
+    /// socket bound to an ephemeral port is fine, mirroring
+    /// `Server::new_passive_with_deps`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying `unicast_socket.local_addr()`
+    /// fails on the underlying transport.
+    pub fn new_passive_with_handles(
+        deps: ServerHandles<F, Tm, R, S, H, Hsd, Hep>,
+        mut config: ServerConfig,
+    ) -> Result<Self, Error> {
+        let bound_port = deps.unicast_socket.socket().local_addr()?.port();
+        config.local_port = bound_port;
+        tracing::info!(
+            "Passive server (handles) bound to {}:{} for service 0x{:04X}",
+            config.interface,
+            bound_port,
+            config.service_id
+        );
+
+        Ok(Self {
+            config,
+            unicast_socket: deps.unicast_socket,
+            sd_socket: deps.sd_socket,
+            subscriptions: deps.subscriptions,
+            publisher: deps.publisher,
+            sd_state: deps.sd_state,
+            e2e_registry: deps.e2e_registry,
+            factory: deps.factory,
+            timer: deps.timer,
+            is_passive: true,
+            announcement_loop_started: AtomicBool::new(false),
+        })
+    }
+
     /// Build the periodic-SD-announcement future.
     ///
     /// Returns a future that sends an `OfferService` message to the SD
