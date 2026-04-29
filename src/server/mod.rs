@@ -21,7 +21,7 @@ pub use service_info::{EventGroupInfo, ServiceInfo};
 pub use subscription_manager::{StaticSubscriptionHandle, StaticSubscriptionStorage};
 pub use subscription_manager::{SubscribeError, SubscriptionHandle, SubscriptionManager};
 
-use sd_state::SdStateManager;
+pub use sd_state::{SdStateHandle, SdStateManager, WrappableSdStateHandle};
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -143,7 +143,7 @@ where
 /// these as `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>`
 /// / `TokioTransport` / `TokioTimer`. Bare-metal callers use
 /// [`Self::new_with_deps`] (under `server`) and supply their own.
-pub struct Server<R, S, F, Tm, H = Arc<<F as TransportFactory>::Socket>>
+pub struct Server<R, S, F, Tm, H = Arc<<F as TransportFactory>::Socket>, Hsd = Arc<SdStateManager>>
 where
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
@@ -151,6 +151,7 @@ where
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
     H: SocketHandle<Socket = F::Socket>,
+    Hsd: SdStateHandle,
 {
     config: ServerConfig,
     /// Socket for receiving subscription requests, behind whatever
@@ -164,8 +165,10 @@ where
     subscriptions: S,
     /// Event publisher
     publisher: Arc<EventPublisher<R, S, H>>,
-    /// SD session-ID counter and announcement emitter
-    sd_state: Arc<SdStateManager>,
+    /// SD session-ID counter and announcement emitter, behind whatever
+    /// shared-storage `Hsd` chose (`Arc<SdStateManager>` on std,
+    /// `&'static SdStateManager` on bare-metal-no-alloc).
+    sd_state: Hsd,
     /// Shared E2E registry for runtime E2E configuration
     e2e_registry: R,
     /// Transport factory. Used at construction time to bind sockets;
@@ -279,7 +282,7 @@ impl
     }
 }
 
-impl<R, S, F, Tm, H> Server<R, S, F, Tm, H>
+impl<R, S, F, Tm, H, Hsd> Server<R, S, F, Tm, H, Hsd>
 where
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
@@ -287,6 +290,7 @@ where
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
     H: WrappableSocketHandle<Socket = F::Socket>,
+    Hsd: WrappableSdStateHandle,
 {
     /// Bare-metal-friendly constructor that takes every dependency
     /// explicitly via a [`ServerDeps`] bundle. The `server-tokio`
@@ -366,7 +370,7 @@ where
             sd_socket,
             subscriptions,
             publisher,
-            sd_state: Arc::new(SdStateManager::new()),
+            sd_state: Hsd::wrap(SdStateManager::new()),
             e2e_registry,
             factory,
             timer,
@@ -436,7 +440,7 @@ where
             sd_socket,
             subscriptions,
             publisher,
-            sd_state: Arc::new(SdStateManager::new()),
+            sd_state: Hsd::wrap(SdStateManager::new()),
             e2e_registry,
             factory,
             timer,
@@ -446,7 +450,7 @@ where
     }
 }
 
-impl<R, S, F, Tm, H> Server<R, S, F, Tm, H>
+impl<R, S, F, Tm, H, Hsd> Server<R, S, F, Tm, H, Hsd>
 where
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
@@ -454,6 +458,7 @@ where
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
     H: SocketHandle<Socket = F::Socket>,
+    Hsd: SdStateHandle,
 {
     /// Build the periodic-SD-announcement future.
     ///
@@ -496,6 +501,7 @@ where
         F::Socket: Send + Sync,
         for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
         H: Send + Sync,
+        Hsd: Send + Sync,
         Tm: Send + Sync,
         for<'a> Tm::SleepFuture<'a>: Send,
     {
@@ -523,13 +529,14 @@ where
         }
         let config = self.config.clone();
         let sd_socket = self.sd_socket.clone();
-        let sd_state = Arc::clone(&self.sd_state);
+        let sd_state = self.sd_state.clone();
         let timer = self.timer.clone();
 
         Ok(async move {
             let mut announcement_count = 0u32;
             loop {
                 match sd_state
+                    .sd_state()
                     .send_offer_service(&config, sd_socket.socket())
                     .await
                 {
@@ -602,13 +609,14 @@ where
         }
         let config = self.config.clone();
         let sd_socket = self.sd_socket.clone();
-        let sd_state = Arc::clone(&self.sd_state);
+        let sd_state = self.sd_state.clone();
         let timer = self.timer.clone();
 
         Ok(async move {
             let mut announcement_count = 0u32;
             loop {
                 match sd_state
+                    .sd_state()
                     .send_offer_service(&config, sd_socket.socket())
                     .await
                 {
@@ -663,7 +671,7 @@ where
         // Atomic (sid, reboot_flag) pair so concurrent emissions cannot
         // race around the wrap boundary — see
         // `SdStateManager::next_session_id_with_reboot_flag` docs.
-        let (sid, reboot_flag) = self.sd_state.next_session_id_with_reboot_flag();
+        let (sid, reboot_flag) = self.sd_state.sd_state().next_session_id_with_reboot_flag();
         let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &options);
 
         let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
@@ -1211,7 +1219,7 @@ fn extract_subscriber_endpoint(
     }
 }
 
-impl<R, S, F, Tm, H> Server<R, S, F, Tm, H>
+impl<R, S, F, Tm, H, Hsd> Server<R, S, F, Tm, H, Hsd>
 where
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
@@ -1219,6 +1227,7 @@ where
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
     H: SocketHandle<Socket = F::Socket>,
+    Hsd: SdStateHandle,
 {
     /// Send `SubscribeAck` from an entry view
     async fn send_subscribe_ack_from_view(
@@ -1244,7 +1253,7 @@ where
         let entries = [ack_entry];
         // Atomic (sid, reboot_flag) pair — see
         // `SdStateManager::next_session_id_with_reboot_flag`.
-        let (sid, reboot_flag) = self.sd_state.next_session_id_with_reboot_flag();
+        let (sid, reboot_flag) = self.sd_state.sd_state().next_session_id_with_reboot_flag();
         let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &[]);
 
         let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
@@ -1294,7 +1303,7 @@ where
         let entries = [nack_entry];
         // Atomic (sid, reboot_flag) pair — see
         // `SdStateManager::next_session_id_with_reboot_flag`.
-        let (sid, reboot_flag) = self.sd_state.next_session_id_with_reboot_flag();
+        let (sid, reboot_flag) = self.sd_state.sd_state().next_session_id_with_reboot_flag();
         let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &[]);
 
         let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
