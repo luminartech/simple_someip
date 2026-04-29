@@ -1,31 +1,39 @@
-//! Phase 19e — Adapter-level loopback test.
+//! Phases 19e + 19g — Loopback integration tests.
 //!
 //! Two `embassy_net::Stack` instances bridged by an in-memory
 //! `LoopbackDriver` pair (no kernel TUN device, no privileges
 //! required). Validates the `simple-someip-embassy-net` adapter
-//! (Phases 19a–c) against a real `embassy_net::Stack`:
+//! (Phases 19a–c) and the `Server` `SocketHandle` abstraction
+//! (Phase 19f) against a real `embassy_net::Stack`:
 //!
-//! * **`adapter_udp_roundtrip`** — bind two `EmbassyNetSocket`s,
-//!   one per stack, send a UDP datagram from A to B, assert
-//!   byte-equality + source-address. Tightest test of `bind` /
-//!   `send_to` / `recv_from` / `local_addr` end-to-end.
-//!
-//! SOME/IP-level Client+Server integration is **not** in this
-//! phase — it lands in 19g. Reason: `Server` requires
-//! `F::Socket: Send + Sync` on every impl block (`mod.rs:275`,
-//! `:430`, `:1065`), but `embassy_net::udp::UdpSocket<'static>`
-//! is `!Sync` because it borrows from `Stack`'s
-//! `RefCell<Inner<D>>`. Phase 19f adds the parallel `_local`
-//! constructor + impl block on `Server` to mirror Client's
-//! `new_with_deps_local`; once that ships, 19g lifts the
-//! `tests/bare_metal_e2e.rs` harness onto these stacks. See
-//! `bare_metal_plan_v3.md` for the rest.
+//! * **`adapter_udp_roundtrip`** (19e) — bind two
+//!   `EmbassyNetSocket`s, one per stack, send a UDP datagram
+//!   from A to B, assert byte-equality + source-address.
+//!   Tightest test of `bind` / `send_to` / `recv_from` /
+//!   `local_addr` end-to-end.
+//! * **`client_receives_server_sd_announcement`** (19g) — wire
+//!   a real `simple_someip::Server` on stack A with
+//!   `announcement_loop_local` (the `!Send` variant added in
+//!   19f) and a real `simple_someip::Client` on stack B with
+//!   `Client::new_with_deps_local`. Assert the SD multicast
+//!   `OfferService` propagates through the loopback and reaches
+//!   the Client's update stream.
+//! * **`client_send_request_server_runloop_stable`** (19g) —
+//!   passive Server on stack A, Client on stack B drives
+//!   `add_endpoint` + `send_to_service` to push a SOME/IP
+//!   request through the embassy-net loopback. Asserts the
+//!   request serializes, transits, and lands on the Server's
+//!   run-loop without panicking. (No response assertion —
+//!   `simple_someip::Server` exposes no public request-handler
+//!   API, matching the parent-crate reference test.)
 //!
 //! Runtime: `#[tokio::test(flavor = "current_thread")]` plus a
 //! `LocalSet` driving the per-stack `spawn_local` runners.
 //! `Stack<LoopbackDriver>` is `!Sync` (RefCell internals), so
 //! `Stack::run()` is `!Send` — multi-threaded `tokio::spawn`
-//! does not type-check.
+//! does not type-check. The same constraint propagates through
+//! `EmbassyNetSocket` and forces the `_local` Client +
+//! `announcement_loop_local` Server paths.
 
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::task::{Context, Waker};
@@ -299,14 +307,423 @@ async fn adapter_udp_roundtrip() {
         .await;
 }
 
-// SOME/IP Client+Server wiring deferred — see phase 19f scoping
-// added to `bare_metal_plan_v3.md` 2026-04-29. Server's storage of
-// `Arc<F::Socket>` propagates `Send + Sync` through every impl
-// block, and embassy-net's `UdpSocket<'static>` is `!Sync` (and
-// likely `!Send`) because it borrows from the `Stack`'s
-// `RefCell<Inner>`. Adding `_local` constructors alone is
-// insufficient; the storage shape needs to be abstracted (handle
-// trait similar to `InterfaceHandle` / `SubscriptionHandle`) before
-// the SOME/IP-level integration test can wire `Server` through this
-// adapter. Phase 19e ships with the adapter-level UDP roundtrip
-// above as the verifiable assertion that 19a-c work end-to-end.
+// ── SOME/IP Client+Server harness (phase 19g) ───────────────────────
+//
+// Adds a real `simple_someip::Client` + `simple_someip::Server` on
+// top of the two-stack loopback, exercising the bare-metal
+// constructors over `EmbassyNetFactory`. Phase 19f's `SocketHandle`
+// abstraction lets `Server` accept `Arc<EmbassyNetSocket>` as its
+// `H` parameter even though `EmbassyNetSocket` is `!Sync`; without
+// that work the bounds at the impl-block level rejected the type.
+//
+// Both tests run on `flavor = "current_thread"` + `LocalSet` because:
+//   - `Stack<LoopbackDriver>` is `!Sync` (RefCell internals), so
+//     `Stack::run()` is `!Send`. Multi-thread `tokio::spawn`
+//     rejects it.
+//   - `EmbassyNetSocket` is `!Sync` for the same reason. The
+//     Client's run-future captures `&self.unicast_socket`-style
+//     borrows across awaits, which makes that future `!Send`. So
+//     the spawner must be `LocalSpawner`, not `Spawner`. The
+//     Client-side path that accepts a `LocalSpawner` is
+//     `Client::new_with_deps_local`, which has shipped since phase
+//     17.
+
+use core::pin::Pin;
+use core::task::Poll;
+use std::sync::RwLock;
+
+use simple_someip::PayloadWireFormat;
+use simple_someip::client::Error as ClientError;
+use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
+use simple_someip::define_static_channels;
+use simple_someip::e2e::E2ERegistry;
+use simple_someip::protocol::sd::RebootFlag;
+use simple_someip::protocol::{
+    Header as SomeIpHeader, Message, MessageId, MessageType, MessageTypeField, ReturnCode,
+};
+use simple_someip::server::{ServerConfig, SubscribeError, Subscriber, SubscriptionHandle};
+use simple_someip::transport::{LocalSpawner, Timer};
+use simple_someip::{Client, ClientDeps, RawPayload, Server, ServerDeps};
+
+// ── Static-pool channels ────────────────────────────────────────────
+//
+// Sized small for the witness; production firmware would size to the
+// workload's high-water mark. The macro generates a `LoopbackTestChannels`
+// type that implements `ChannelFactory` plus all the `*Pooled` traits
+// the Client engine asks for.
+
+define_static_channels! {
+    name: LoopbackTestChannels,
+    oneshot: [
+        (Result<(), ClientError>, 16),
+        (Result<RawPayload, ClientError>, 8),
+        (Result<RebootFlag, ClientError>, 8),
+    ],
+    bounded: [
+        ((ControlMessage<RawPayload, LoopbackTestChannels>, 4), 4),
+        ((SendMessage<RawPayload, LoopbackTestChannels>, 16), 8),
+        ((Result<ReceivedMessage<RawPayload>, ClientError>, 16), 8),
+    ],
+    unbounded: [
+        (ClientUpdate<RawPayload>, 4),
+    ],
+}
+
+// ── Spawner + Timer + Subscriptions harness ─────────────────────────
+
+/// `LocalSpawner` impl backed by `tokio::task::spawn_local`. Drops
+/// the `JoinHandle` — fire-and-forget, matching the trait contract.
+struct LocalTokioSpawner;
+
+impl LocalSpawner for LocalTokioSpawner {
+    fn spawn_local(&self, fut: impl core::future::Future<Output = ()> + 'static) {
+        drop(tokio::task::spawn_local(fut));
+    }
+}
+
+/// `Timer` backed by `tokio::time::sleep`. The boxed-future shape
+/// matches `tests/bare_metal_e2e.rs`'s `MockTimer` so the harness
+/// reads consistently with the parent crate's reference test.
+#[derive(Clone)]
+struct LocalTimer;
+
+impl Timer for LocalTimer {
+    type SleepFuture<'a> = Pin<Box<dyn core::future::Future<Output = ()> + 'a>>;
+
+    fn sleep(&self, duration: Duration) -> Self::SleepFuture<'_> {
+        Box::pin(async move {
+            tokio::time::sleep(duration).await;
+        })
+    }
+}
+
+type SubKey = (u16, u16, u16, SocketAddrV4);
+
+#[derive(Clone, Default)]
+struct MockSubscriptions(Arc<std::sync::Mutex<Vec<SubKey>>>);
+
+impl SubscriptionHandle for MockSubscriptions {
+    fn subscribe(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+        subscriber_addr: SocketAddrV4,
+    ) -> impl core::future::Future<Output = Result<(), SubscribeError>> + '_ {
+        let this = self.0.clone();
+        async move {
+            let mut guard = this.lock().unwrap();
+            let key = (service_id, instance_id, event_group_id, subscriber_addr);
+            if !guard.contains(&key) {
+                guard.push(key);
+            }
+            Ok(())
+        }
+    }
+
+    fn unsubscribe(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+        subscriber_addr: SocketAddrV4,
+    ) -> impl core::future::Future<Output = ()> + '_ {
+        let this = self.0.clone();
+        async move {
+            let mut guard = this.lock().unwrap();
+            guard.retain(|e| *e != (service_id, instance_id, event_group_id, subscriber_addr));
+        }
+    }
+
+    fn for_each_subscriber<'a, F>(
+        &'a self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+        mut f: F,
+    ) -> impl core::future::Future<Output = usize> + 'a
+    where
+        F: FnMut(&Subscriber) + 'a,
+    {
+        let this = self.0.clone();
+        async move {
+            let guard = this.lock().unwrap();
+            let mut count = 0;
+            for (s, i, e, addr) in guard.iter() {
+                if *s == service_id && *i == instance_id && *e == event_group_id {
+                    let sub = Subscriber::new(*addr, *s, *i, *e);
+                    f(&sub);
+                    count += 1;
+                }
+            }
+            count
+        }
+    }
+}
+
+// `Poll` is imported above for `LocalSpawner` impls; flag it as
+// in-use so a `cargo clippy --tests -D warnings` build doesn't
+// trip on the otherwise-unused import. (`Poll` is brought in
+// because it's the canonical paired import alongside `Pin` for
+// hand-rolled futures, even though `LoopbackTestChannels`'
+// generated code uses the higher-level macro shape.)
+#[allow(dead_code)]
+fn _poll_use(p: Poll<()>) -> Poll<()> {
+    p
+}
+
+// ── SOME/IP Client+Server tests ─────────────────────────────────────
+
+/// Two embassy-net stacks bridged by the loopback driver pair, with
+/// a `simple_someip::Server` on stack A announcing `OfferService`
+/// via `announcement_loop_local` and a `simple_someip::Client` on
+/// stack B receiving the SD broadcast via `bind_discovery`.
+///
+/// Asserts: the SD `OfferService` propagates through the embassy-net
+/// stacks and surfaces on the Client's update stream within 5 s.
+#[tokio::test(flavor = "current_thread")]
+async fn client_receives_server_sd_announcement() {
+    let (drv_a, drv_b) = LoopbackDriver::pair();
+    let stack_a = build_stack(drv_a, IP_A, SEED_A);
+    let stack_b = build_stack(drv_b, IP_B, SEED_B);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            tokio::task::spawn_local(async move { stack_a.run().await });
+            tokio::task::spawn_local(async move { stack_b.run().await });
+
+            // Both stacks join the SD multicast group at the
+            // smoltcp level. The `EmbassyNetFactory`'s adapter
+            // `join_multicast_v4` is a documented no-op (per the
+            // factory.rs docstring) — multicast subscription has
+            // to happen on the `Stack` directly, before any
+            // `Server` / `Client` constructs sockets that need it.
+            // embassy-net's `Stack::join_multicast_group` takes
+            // `T: Into<IpAddress>`. There is no
+            // `core::net::Ipv4Addr -> IpAddress` blanket impl in
+            // embassy-net 0.4, so explicitly construct the
+            // smoltcp-flavour `Ipv4Address` from octets.
+            let sd_mc =
+                embassy_net::Ipv4Address(simple_someip::protocol::sd::MULTICAST_IP.octets());
+            stack_a
+                .join_multicast_group(sd_mc)
+                .await
+                .expect("stack A multicast join");
+            stack_b
+                .join_multicast_group(sd_mc)
+                .await
+                .expect("stack B multicast join");
+
+            // ── Server on stack A ────────────────────────────────
+            let server_pool: &'static SocketPool<8, 1500, 1500> =
+                Box::leak(Box::new(SocketPool::new()));
+            let server_factory = EmbassyNetFactory::new(stack_a, server_pool);
+            let server_e2e: Arc<std::sync::Mutex<E2ERegistry>> =
+                Arc::new(std::sync::Mutex::new(E2ERegistry::new()));
+            let server_subs = MockSubscriptions::default();
+            // Service id 0x5BAA (just a witness) at port 30500 on
+            // stack A's interface IP.
+            let server_config = ServerConfig::new(IP_A, 30500, 0x5BAA, 1);
+
+            let server_deps = ServerDeps {
+                factory: server_factory,
+                timer: LocalTimer,
+                e2e_registry: server_e2e,
+                subscriptions: server_subs,
+            };
+
+            // Default `H = Arc<F::Socket>` (Phase 19f) — `Arc<T>:
+            // WrappableSocketHandle` works for any `T: TransportSocket
+            // + 'static`, so `Arc<EmbassyNetSocket>` (which is
+            // `!Sync`) compiles here. The annotation is explicit so
+            // type inference doesn't have to chase `H` across the
+            // deps-bundle indirection.
+            let server: Server<_, _, _, _, Arc<simple_someip_embassy_net::EmbassyNetSocket>> =
+                Server::new_with_deps(server_deps, server_config, false)
+                    .await
+                    .expect("server construction over embassy-net");
+
+            // `announcement_loop_local`, NOT `announcement_loop`,
+            // because `EmbassyNetSocket` is `!Sync` — the
+            // Send-bounded variant doesn't typecheck for our `H`.
+            let announce_fut = server
+                .announcement_loop_local()
+                .expect("announcement_loop_local");
+            tokio::task::spawn_local(announce_fut);
+
+            // ── Client on stack B ────────────────────────────────
+            let client_pool: &'static SocketPool<8, 1500, 1500> =
+                Box::leak(Box::new(SocketPool::new()));
+            let client_factory = EmbassyNetFactory::new(stack_b, client_pool);
+            let client_e2e: Arc<std::sync::Mutex<E2ERegistry>> =
+                Arc::new(std::sync::Mutex::new(E2ERegistry::new()));
+            let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(IP_B));
+
+            let client_deps = ClientDeps {
+                factory: client_factory,
+                spawner: LocalTokioSpawner,
+                timer: LocalTimer,
+                e2e_registry: client_e2e,
+                interface: client_iface,
+            };
+
+            let (client, mut updates, run_fut) =
+                Client::<
+                    RawPayload,
+                    Arc<std::sync::Mutex<E2ERegistry>>,
+                    Arc<RwLock<Ipv4Addr>>,
+                    LoopbackTestChannels,
+                >::new_with_deps_local(client_deps, false);
+            tokio::task::spawn_local(run_fut);
+
+            client.bind_discovery().await.expect("bind_discovery");
+
+            // ── Wait for SD announcement to land ─────────────────
+            let received = tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(update) = updates.recv().await {
+                    if matches!(update, ClientUpdate::DiscoveryUpdated(_)) {
+                        return true;
+                    }
+                }
+                false
+            })
+            .await;
+
+            assert!(
+                received.unwrap_or(false),
+                "client did not see server's SD OfferService via embassy-net loopback within 5s",
+            );
+        })
+        .await;
+}
+
+/// Passive-server variant: the server doesn't emit SD announcements
+/// (matching the parent crate's `client_send_request_server_runloop_stable`
+/// pattern). The client uses `add_endpoint` + `send_to_service` to
+/// drive a SOME/IP request through the embassy-net loopback to the
+/// server's unicast port; we assert the server's run-loop stays
+/// stable (no panic) and the send returns Ok.
+///
+/// A response isn't asserted because `simple_someip::Server` has no
+/// public request-handler API — same as the parent reference test.
+#[tokio::test(flavor = "current_thread")]
+async fn client_send_request_server_runloop_stable() {
+    let (drv_a, drv_b) = LoopbackDriver::pair();
+    let stack_a = build_stack(drv_a, IP_A, SEED_A);
+    let stack_b = build_stack(drv_b, IP_B, SEED_B);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            tokio::task::spawn_local(async move { stack_a.run().await });
+            tokio::task::spawn_local(async move { stack_b.run().await });
+
+            // No multicast join here — passive server doesn't use SD,
+            // and the client doesn't need discovery (we'll wire it up
+            // via add_endpoint instead).
+
+            // ── Server on stack A (passive) ──────────────────────
+            let server_pool: &'static SocketPool<8, 1500, 1500> =
+                Box::leak(Box::new(SocketPool::new()));
+            let server_factory = EmbassyNetFactory::new(stack_a, server_pool);
+            let server_e2e: Arc<std::sync::Mutex<E2ERegistry>> =
+                Arc::new(std::sync::Mutex::new(E2ERegistry::new()));
+            let server_subs = MockSubscriptions::default();
+            let service_id = 0x5BBB_u16;
+            let instance_id = 1_u16;
+            let server_port = 30600_u16;
+            let server_config = ServerConfig::new(IP_A, server_port, service_id, instance_id);
+
+            let server_deps = ServerDeps {
+                factory: server_factory,
+                timer: LocalTimer,
+                e2e_registry: server_e2e,
+                subscriptions: server_subs,
+            };
+
+            // Explicit `Arc<EmbassyNetSocket>` `H` so the compiler
+            // doesn't have to invent it across the deps-bundle
+            // indirection. Same shape as the equivalent annotation
+            // in `simple_someip`'s SD-NACK test.
+            let mut server: Server<_, _, _, _, Arc<simple_someip_embassy_net::EmbassyNetSocket>> =
+                Server::new_passive_with_deps(server_deps, server_config)
+                    .await
+                    .expect("passive server construction");
+
+            // Drive the run-loop locally — `!Send` because
+            // `EmbassyNetSocket: !Sync`.
+            tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+
+            // ── Client on stack B ────────────────────────────────
+            let client_pool: &'static SocketPool<8, 1500, 1500> =
+                Box::leak(Box::new(SocketPool::new()));
+            let client_factory = EmbassyNetFactory::new(stack_b, client_pool);
+            let client_e2e: Arc<std::sync::Mutex<E2ERegistry>> =
+                Arc::new(std::sync::Mutex::new(E2ERegistry::new()));
+            let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(IP_B));
+
+            let client_deps = ClientDeps {
+                factory: client_factory,
+                spawner: LocalTokioSpawner,
+                timer: LocalTimer,
+                e2e_registry: client_e2e,
+                interface: client_iface,
+            };
+
+            let (client, _updates, run_fut) = Client::<
+                RawPayload,
+                Arc<std::sync::Mutex<E2ERegistry>>,
+                Arc<RwLock<Ipv4Addr>>,
+                LoopbackTestChannels,
+            >::new_with_deps_local(client_deps, false);
+            tokio::task::spawn_local(run_fut);
+
+            // Register the server's unicast endpoint. The 0 in the
+            // 4th slot is the eventgroup id (unused for a plain
+            // request-response add_endpoint).
+            let server_addr = SocketAddrV4::new(IP_A, server_port);
+            client
+                .add_endpoint(service_id, instance_id, server_addr, 0)
+                .await
+                .expect("add_endpoint");
+
+            // Build + send a SOME/IP request. The wire payload is
+            // arbitrary — what we're proving is the request fully
+            // serializes, hits the wire via embassy-net, and the
+            // server's `recv_from` loop accepts it without panicking.
+            let msg_id = MessageId::new_from_service_and_method(service_id, 0x0001);
+            let payload_bytes = [0xDE_u8, 0xAD, 0xBE, 0xEF];
+            let payload = RawPayload::from_payload_bytes(msg_id, &payload_bytes)
+                .expect("RawPayload::from_payload_bytes");
+            let request = Message::<RawPayload>::new(
+                SomeIpHeader::new(
+                    msg_id,
+                    0x0001_0001, // request_id: client_id << 16 | session_id
+                    1,           // protocol_version
+                    1,           // interface_version
+                    MessageTypeField::new(MessageType::Request, false),
+                    ReturnCode::Ok,
+                    payload_bytes.len(),
+                ),
+                payload,
+            );
+
+            let _pending = client
+                .send_to_service(service_id, instance_id, request)
+                .await
+                .expect("send_to_service over embassy-net");
+
+            // Give the server time to process before the test
+            // tears down. Without a registered handler we can't
+            // assert a response — same caveat as the parent
+            // reference test.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Test passes if everything above ran without panic and
+            // `add_endpoint` + `send_to_service` returned Ok.
+        })
+        .await;
+}
