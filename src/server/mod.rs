@@ -926,7 +926,7 @@ where
     /// unicast port. Backends that surface truncation
     /// (`ReceivedDatagram::truncated`) emit a `tracing::warn!` when
     /// the caller's buffer was too small; backends that don't
-    /// (TokioSocket today) silently truncate at the OS level.
+    /// (`TokioSocket` today) silently truncate at the OS level.
     ///
     /// On bare-metal, callers typically place the buffers in
     /// `static` storage:
