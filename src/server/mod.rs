@@ -15,6 +15,8 @@ mod subscription_manager;
 pub use error::Error;
 pub use event_publisher::EventPublisher;
 pub use service_info::{EventGroupInfo, ServiceInfo, Subscriber};
+#[cfg(feature = "bare_metal")]
+pub use subscription_manager::{StaticSubscriptionHandle, StaticSubscriptionStorage};
 pub use subscription_manager::{SubscribeError, SubscriptionHandle, SubscriptionManager};
 
 use sd_state::SdStateManager;

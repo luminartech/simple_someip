@@ -31,7 +31,7 @@
 //! | `client-tokio` | no | Adds the `Client::new` / `TokioSpawner` / `TokioTransport` convenience defaults; implies `client` + tokio + socket2 |
 //! | `server` | no | Trait-surface server; implies `std` + futures (no tokio) |
 //! | `server-tokio` | no | Adds the `Server::new` / `TokioTransport` / `TokioTimer` convenience defaults; implies `server` + tokio + socket2 |
-//! | `bare_metal` | no | Activates embassy-sync, the `static_channels` module (no-alloc `ChannelFactory`), and `AtomicInterfaceHandle`. `StaticE2EHandle` additionally requires `std` because the underlying `E2ERegistry` is currently `std`-only. See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable bare-metal integration examples. |
+//! | `bare_metal` | no | Activates embassy-sync, the `static_channels` module (no-alloc `ChannelFactory`), `AtomicInterfaceHandle`, and `StaticE2EHandle`. All four are pure `no_std` (no allocator required). See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable bare-metal integration examples. |
 //! | `embassy_channels` | no | Heap-backed `EmbassySyncChannels` `ChannelFactory`. Implies `bare_metal` and pulls `extern crate alloc;` into the crate; **on `no_std`, downstream consumers must provide a `#[global_allocator]`**. Useful for tests / early prototypes before sizing static pools. |
 //!
 //! The default feature set is `["std"]`, which links `std` and enables
@@ -214,5 +214,5 @@ pub use transport::{
     MpscSend, OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram, SocketOptions, Spawner,
     Timer, TransportError, TransportFactory, TransportSocket, UnboundedRecv, UnboundedSend,
 };
-#[cfg(all(feature = "bare_metal", feature = "std"))]
+#[cfg(feature = "bare_metal")]
 pub use transport::{StaticE2EHandle, StaticE2EStorage};

@@ -959,12 +959,12 @@ pub mod bare_metal_handle_impls {
 }
 
 /// `StaticE2EHandle` — no-alloc `E2ERegistryHandle` backed by a
-/// `&'static` critical-section mutex. Requires `feature = "std"` because
-/// the underlying [`crate::e2e::E2ERegistry`] currently uses `HashMap`.
-/// On a pure-`no_std` target the registry must be ported (see crate
-/// roadmap); until then, callers wanting bare-metal interface handles
-/// (the more common need) can use [`AtomicInterfaceHandle`] alone.
-#[cfg(all(feature = "bare_metal", feature = "std"))]
+/// `&'static` critical-section mutex.
+///
+/// Available in pure `no_std` builds: [`crate::e2e::E2ERegistry`] is
+/// backed by [`heapless::index_map::FnvIndexMap`] (since phase 18a),
+/// so no allocator is required.
+#[cfg(feature = "bare_metal")]
 pub mod bare_metal_e2e_impl {
     use super::E2ERegistryHandle;
     use crate::e2e::{
@@ -1035,7 +1035,7 @@ pub mod bare_metal_e2e_impl {
 #[cfg(feature = "bare_metal")]
 pub use bare_metal_handle_impls::AtomicInterfaceHandle;
 
-#[cfg(all(feature = "bare_metal", feature = "std"))]
+#[cfg(feature = "bare_metal")]
 pub use bare_metal_e2e_impl::{StaticE2EHandle, StaticE2EStorage};
 
 // ── Channel-handle abstraction ────────────────────────────────────────────
