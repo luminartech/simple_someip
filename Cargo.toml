@@ -7,6 +7,7 @@ members = [
     "examples/discovery_client",
     "examples/embassy_net_client",
     "simple-someip-embassy-net",
+    "tools/size_probe",
 ]
 
 [package]
