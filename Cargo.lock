@@ -280,6 +280,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1177859559ebf42cd24ae7ba8fe6ee707489b01d0bf471f8827b7b12dcb0bc0"
 
 [[package]]
+name = "embassy_net_client"
+version = "0.0.0"
+dependencies = [
+ "critical-section",
+ "embassy-net",
+ "embassy-time",
+ "simple-someip",
+ "simple-someip-embassy-net",
+ "tokio",
+]
+
+[[package]]
 name = "embedded-hal"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
