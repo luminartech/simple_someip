@@ -18,8 +18,21 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
+      # `--workspace --all-features` activates every feature on every
+      # workspace member through cargo's feature unification, which
+      # gives strong "max coverage" but means that, e.g., a clippy
+      # regression triggered only by smoltcp's `proto-ipv6` (pulled in
+      # transitively via the embassy-net adapter under all-features)
+      # blocks merges on the parent simple-someip crate. The explicit
+      # per-feature passes below run clippy on `simple-someip` alone
+      # under the feature combos we actually ship, so a feature-set
+      # regression surfaces against its responsible feature flag
+      # rather than as workspace-wide noise.
       - run: cargo clippy --workspace --all-features -- -D warnings -D clippy::pedantic
       - run: cargo clippy --no-default-features -- -D warnings -D clippy::pedantic
+      - run: cargo clippy -p simple-someip --no-default-features --features client,bare_metal -- -D warnings -D clippy::pedantic
+      - run: cargo clippy -p simple-someip --no-default-features --features server,bare_metal -- -D warnings -D clippy::pedantic
+      - run: cargo clippy -p simple-someip --no-default-features --features client,server,bare_metal -- -D warnings -D clippy::pedantic
 
   linear-history:
     name: Linear PR History

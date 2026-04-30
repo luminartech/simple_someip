@@ -599,12 +599,19 @@ async fn client_receives_server_sd_announcement() {
 /// Passive-server variant: the server doesn't emit SD announcements
 /// (matching the parent crate's `client_send_request_server_runloop_stable`
 /// pattern). The client uses `add_endpoint` + `send_to_service` to
-/// drive a SOME/IP request through the embassy-net loopback to the
-/// server's unicast port; we assert the server's run-loop stays
-/// stable (no panic) and the send returns Ok.
+/// drive a SOME/IP request through the embassy-net loopback toward
+/// the server's unicast port. We assert the client's serialize +
+/// transmit path completes (`send_to_service` returns Ok) — NOT
+/// that the server's run loop processes the bytes, because the
+/// passive server's `run()` returns `Err(InvalidUsage)` immediately
+/// (passive servers expect SD to be driven externally) and is
+/// therefore not actually running. A response isn't asserted because
+/// `simple_someip::Server` has no public request-handler API.
 ///
-/// A response isn't asserted because `simple_someip::Server` has no
-/// public request-handler API — same as the parent reference test.
+/// In short: this is a TX-side smoke test for the embassy-net
+/// adapter's send path, not a server-runloop test. Despite the
+/// historical name (kept for git-blame continuity with the parent
+/// reference test).
 #[tokio::test(flavor = "current_thread")]
 async fn client_send_request_server_runloop_stable() {
     let (drv_a, drv_b) = LoopbackDriver::pair();
@@ -649,11 +656,15 @@ async fn client_send_request_server_runloop_stable() {
                     .await
                     .expect("passive server construction");
 
-            // Drive the run-loop locally — `!Send` because
-            // `EmbassyNetSocket: !Sync`.
-            tokio::task::spawn_local(async move {
-                let _ = server.run().await;
-            });
+            // NOTE: we do NOT spawn `server.run()` here. A passive
+            // server's `run()` returns `Err(InvalidUsage)`
+            // immediately (passive servers expect SD to be driven
+            // externally), so the spawn would just be a no-op task
+            // exiting on first poll. The server is constructed only
+            // so its unicast socket bind happens — the kernel-level
+            // recv buffer absorbs the client's request bytes
+            // independently of any application run-loop.
+            let _ = &mut server; // suppress unused-mut warning
 
             // ── Client on stack B ────────────────────────────────
             let client_pool: &'static SocketPool<8, LINK_MTU, LINK_MTU> =
