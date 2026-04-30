@@ -1671,6 +1671,10 @@ mod tests {
     #[tokio::test]
     async fn new_with_handles_back_fills_local_port_on_zero() {
         let (handles, bound_port) = build_test_handles(0).await;
+        assert_ne!(
+            bound_port, 0,
+            "test precondition: kernel must assign a real ephemeral port",
+        );
         // Port 0 → caller asks for back-fill from the bound port.
         let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0xFE10, 1);
         let server = TestServer::new_with_handles(handles, config)
@@ -1694,10 +1698,13 @@ mod tests {
     #[tokio::test]
     async fn new_with_handles_rejects_local_port_mismatch() {
         let (handles, bound_port) = build_test_handles(0).await;
-        // Pick a port that cannot match the ephemeral allocation.
-        // Port 1 is privileged on Linux and effectively never
-        // ephemeral-allocated; absurd-by-construction is the point.
-        let bogus_port = if bound_port == 1 { 2 } else { 1 };
+        // Bogus port: deterministically `bound_port + 1` (wrapping
+        // for the impossible bound_port == u16::MAX). The kernel
+        // doesn't allocate adjacent ports back-to-back across separate
+        // bind() calls in the same process, so this is reliably
+        // distinct from `bound_port`.
+        let bogus_port = bound_port.wrapping_add(1);
+        assert_ne!(bogus_port, bound_port);
         let config = ServerConfig::new(Ipv4Addr::LOCALHOST, bogus_port, 0xFE12, 1);
         let result = TestServer::new_with_handles(handles, config);
         match result {
@@ -1726,7 +1733,8 @@ mod tests {
     #[tokio::test]
     async fn new_passive_with_handles_rejects_local_port_mismatch() {
         let (handles, bound_port) = build_test_handles(0).await;
-        let bogus_port = if bound_port == 1 { 2 } else { 1 };
+        let bogus_port = bound_port.wrapping_add(1);
+        assert_ne!(bogus_port, bound_port);
         let config = ServerConfig::new(Ipv4Addr::LOCALHOST, bogus_port, 0xFE14, 1);
         let result = TestServer::new_passive_with_handles(handles, config);
         match result {
