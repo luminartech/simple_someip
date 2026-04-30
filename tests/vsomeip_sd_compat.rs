@@ -29,13 +29,18 @@
 //!
 //! 2. Find a multicast-capable interface IP on your host. **Do not
 //!    use 127.0.0.1** — Linux's `lo` interface lacks the `MULTICAST`
-//!    flag by default, so SD multicast (`224.0.23.0`) never leaves
-//!    the host:
+//!    flag by default, so SD multicast never leaves the host. Note:
+//!    simple-someip's `MULTICAST_IP` is hardcoded to `239.255.0.255`
+//!    (Luminar-internal-network style, predates spec-default
+//!    alignment), NOT vsomeip's spec-default `224.0.23.0`. The
+//!    offerer.json under `tests/data/vsomeip-offerer/` overrides
+//!    vsomeip's default to match. Use the simple-someip group when
+//!    looking for the interface:
 //!
 //!    ```text
-//!    ip route get 224.0.23.0
-//!    # multicast 224.0.23.0 dev wlp0s20f3 src 192.168.1.42 ...
-//!    #                                        ^^^^^^^^^^^^
+//!    ip route get 239.255.0.255
+//!    # multicast 239.255.0.255 dev wlp0s20f3 src 192.168.1.42 ...
+//!    #                                          ^^^^^^^^^^^^
 //!    ```
 //!
 //!    The `src` IP is what you pass on both sides below.
@@ -53,7 +58,7 @@
 //!
 //!    ```text
 //!    docker logs vsomeip-offerer | grep -E "Joining|OFFER"
-//!    # Joining to multicast group 224.0.23.0 from 192.168.1.42
+//!    # Joining to multicast group 239.255.0.255 from 192.168.1.42
 //!    # OFFER(1277): [1234.0001:1.0] (true)
 //!    ```
 //!
@@ -235,9 +240,17 @@ async fn client_sees_vsomeip_offer_service() {
         .expect("bind_discovery failed (network setup problem?)");
     eprintln!("[test] bind_discovery OK; waiting for OfferService");
 
+    // Port vsomeip's `offerer.json` advertises in `services[].unreliable`.
+    // Used below to verify simple-someip parsed the OfferService's
+    // IPv4 endpoint option correctly — without this assertion a
+    // parser regression that dropped options would still pass the
+    // test as long as the entry itself decoded.
+    const VSOMEIP_OFFERED_PORT: u16 = 30509;
+
     // Drain the update stream until either (a) we see an
-    // `OfferService` matching the expected service+instance, or
-    // (b) the timeout fires.
+    // `OfferService` matching the expected service+instance AND
+    // carrying the expected IPv4 endpoint option, or (b) the
+    // timeout fires.
     let saw_offer = tokio::time::timeout(SD_TIMEOUT, async {
         while let Some(update) = updates.recv().await {
             let ClientUpdate::DiscoveryUpdated(msg) = update else {
@@ -252,6 +265,45 @@ async fn client_sees_vsomeip_offer_service() {
                     && svc.service_id == SERVICE_ID
                     && svc.instance_id == INSTANCE_ID
                 {
+                    // Verify the endpoint option vsomeip MUST attach to
+                    // its OfferService is present and parsed correctly.
+                    // A parser regression that silently dropped options
+                    // would let the entry-only check above pass; this
+                    // assertion is the load-bearing wire-format gate.
+                    let mut found_endpoint = false;
+                    for opt in &msg.sd_header.options {
+                        use simple_someip::protocol::sd::Options;
+                        if let Options::IpV4Endpoint { ip, protocol, port } = opt {
+                            // vsomeip's `unicast` field IS the offerer
+                            // host's IP; on host-network docker that's
+                            // typically the test interface itself.
+                            // We can't pin to a specific IP because the
+                            // container's host IP is environment-specific,
+                            // but the protocol and port ARE stable.
+                            if *protocol == sd::TransportProtocol::Udp
+                                && *port == VSOMEIP_OFFERED_PORT
+                            {
+                                eprintln!(
+                                    "[test] matched OfferService endpoint option: \
+                                     ip={ip}, port={port}, protocol={protocol:?}"
+                                );
+                                found_endpoint = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !found_endpoint {
+                        panic!(
+                            "OfferService entry matched (service=0x{SERVICE_ID:04X}, \
+                             instance=0x{INSTANCE_ID:04X}) but no IPv4 endpoint option \
+                             with port={VSOMEIP_OFFERED_PORT} UDP found in sd_header.options. \
+                             Either vsomeip emitted an offer without an endpoint option \
+                             (config bug in offerer.json) or simple-someip's option \
+                             parser dropped it (regression). \
+                             Options seen: {opts:?}",
+                            opts = msg.sd_header.options,
+                        );
+                    }
                     eprintln!(
                         "[test] matched OfferService from {} (ttl={}, mv={}.{})",
                         msg.source, svc.ttl, svc.major_version, svc.minor_version
@@ -289,7 +341,9 @@ async fn client_sees_vsomeip_offer_service() {
                  (1) vsomeip container not running on host network — try `docker ps`; \
                  (2) vsomeip's `unicast` config doesn't match the listening interface — \
                  set SIMPLE_SOMEIP_TEST_INTERFACE accordingly; \
-                 (3) firewall dropping multicast 224.0.23.0:30490 — try `sudo iptables -L`; \
+                 (3) firewall dropping multicast 239.255.0.255:30490 — try `sudo iptables -L` \
+                     (NOTE: simple-someip uses 239.255.0.255, NOT spec-default 224.0.23.0; \
+                     see src/protocol/sd/mod.rs::MULTICAST_IP); \
                  (4) vsomeip configured with a different service ID — recheck the JSON; \
                  (5) genuine bug in simple-someip's SD-receive path (least likely \
                  given existing loopback tests pass).",
@@ -565,29 +619,47 @@ async fn tx_announcement_loop_emits_wire_format_offer() {
     struct CapturedOffer {
         someip_service_id: u16,
         someip_method_id: u16,
+        request_id: u32,
         message_type: MessageType,
         return_code: ReturnCode,
         protocol_version: u8,
         interface_version: u8,
         sd_unicast: bool,
+        sd_reboot: RebootFlag,
         entry_service_id: u16,
         entry_instance_id: u16,
         entry_major_version: u8,
         entry_minor_version: u32,
         entry_ttl: u32,
+        entry_options_first: u8,
+        entry_options_second: u8,
+        sd_entries_count: usize,
+        sd_options_count: usize,
         endpoint_ip: Ipv4Addr,
         endpoint_port: u16,
         endpoint_protocol: TransportProtocol,
         len: usize,
     }
 
-    // Cyclic offer delay defaults to ~1 s; 5 s is generous and
-    // bounded.
-    let recv_timeout = Duration::from_secs(5);
-    let recv_loop = async {
-        let mut buf = [0u8; 2048];
+    // Capture two consecutive announcements so we can assert
+    // session-ID monotonicity and confirm the reboot flag flips
+    // RecentlyRebooted → Continuous on the second tick. Cyclic offer
+    // delay defaults to ~1 s; 5 s timeout for the FIRST and a 3 s
+    // timeout for the SECOND covers a generous bound.
+    let first_timeout = Duration::from_secs(5);
+    let second_timeout = Duration::from_secs(3);
+    let mut buf = [0u8; 2048];
+
+    // Inner async fn. Pulls one matching OfferService off the wire
+    // and snapshots it. Free fn (not a closure) because returning
+    // an async-block from a closure tangles inferred lifetimes
+    // between the borrow of `buf` and the returned future.
+    async fn capture_one(
+        rx: &tokio::net::UdpSocket,
+        buf: &mut [u8; 2048],
+    ) -> CapturedOffer {
         loop {
-            let (len, _from) = rx.recv_from(&mut buf).await.expect("recv_from");
+            let (len, _from) = rx.recv_from(buf).await.expect("recv_from");
             let Ok(view) = MessageView::parse(&buf[..len]) else {
                 continue;
             };
@@ -613,72 +685,146 @@ async fn tx_announcement_loop_emits_wire_format_offer() {
             let (endpoint_ip, endpoint_protocol, endpoint_port) = first_option
                 .as_ipv4()
                 .expect("endpoint option should decode as IPv4");
+            let opts_count = entry.options_count();
             return CapturedOffer {
                 someip_service_id: view.header().message_id().service_id(),
                 someip_method_id: view.header().message_id().method_id(),
+                request_id: view.header().request_id(),
                 message_type: view.header().message_type().message_type(),
                 return_code: view.header().return_code(),
                 protocol_version: view.header().protocol_version(),
                 interface_version: view.header().interface_version(),
                 sd_unicast: sd_view.flags().unicast(),
+                sd_reboot: sd_view.flags().reboot(),
                 entry_service_id: entry.service_id(),
                 entry_instance_id: entry.instance_id(),
                 entry_major_version: entry.major_version(),
                 entry_minor_version: entry.minor_version(),
                 entry_ttl: entry.ttl(),
+                entry_options_first: opts_count.first_options_count,
+                entry_options_second: opts_count.second_options_count,
+                sd_entries_count: sd_view.entries().count(),
+                sd_options_count: sd_view.options().count(),
                 endpoint_ip,
                 endpoint_port,
                 endpoint_protocol,
                 len,
             };
         }
-    };
-    let captured = tokio::time::timeout(recv_timeout, recv_loop).await;
+    }
 
-    announce_handle.abort();
-    server_handle.abort();
-
-    let offer = captured.unwrap_or_else(|_| {
+    let first = tokio::time::timeout(first_timeout, capture_one(&rx, &mut buf)).await;
+    let first = first.unwrap_or_else(|_| {
         panic!(
-            "Timed out after {}s waiting to capture our own OfferService on \
+            "Timed out after {}s waiting to capture FIRST OfferService on \
              {interface}. Most likely cause: `lo` lacks the MULTICAST flag, \
              or SIMPLE_SOMEIP_TEST_INTERFACE points to an interface that \
              cannot loop multicast back to a same-host receiver. Try a \
              real NIC IP (`ip route get 239.255.0.255` to find one).",
-            recv_timeout.as_secs(),
+            first_timeout.as_secs(),
         )
     });
 
+    // Use a fresh buffer for the second capture so the first's
+    // borrow chain is fully dropped — the snapshot is already an
+    // owned scalar bag.
+    let mut buf2 = [0u8; 2048];
+    let second = tokio::time::timeout(second_timeout, capture_one(&rx, &mut buf2)).await;
+    let second = second.unwrap_or_else(|_| {
+        panic!(
+            "Timed out after {}s waiting to capture SECOND OfferService \
+             on {interface}. Cyclic offer delay is ~1s; if first arrived \
+             but second didn't, something tore down the announcement loop \
+             mid-test (check announce_handle / server_handle for early \
+             failure).",
+            second_timeout.as_secs(),
+        )
+    });
+
+    announce_handle.abort();
+    server_handle.abort();
+
+    // ── First announcement: full envelope shape + reboot flag ────────
+    //
     // SOME/IP envelope (spec-fixed for SD).
-    assert_eq!(offer.someip_service_id, 0xFFFF, "SD service_id");
-    assert_eq!(offer.someip_method_id, 0x8100, "SD method_id");
-    assert_eq!(offer.message_type, MessageType::Notification);
-    assert_eq!(offer.return_code, ReturnCode::Ok);
-    assert_eq!(offer.protocol_version, 0x01);
-    assert_eq!(offer.interface_version, 0x01);
-    // SD flags — unicast must always be set; reboot may be either
-    // RecentlyRebooted or Continuous depending on session counter
-    // wrap state, so we don't assert it here (covered by the inner
-    // sd_state tests).
-    assert!(offer.sd_unicast, "SD unicast flag must be set");
+    assert_eq!(first.someip_service_id, 0xFFFF, "SD service_id");
+    assert_eq!(first.someip_method_id, 0x8100, "SD method_id");
+    assert_eq!(first.message_type, MessageType::Notification);
+    assert_eq!(first.return_code, ReturnCode::Ok);
+    assert_eq!(first.protocol_version, 0x01);
+    assert_eq!(first.interface_version, 0x01);
+    // SD flags. Unicast must always be set on emitted SD. Reboot
+    // flag is `RecentlyRebooted` on the first announcement after a
+    // fresh `Server` construction (per
+    // `SdStateManager::announcement_state` → wraps to Continuous
+    // only after session-counter wrap).
+    assert!(first.sd_unicast, "SD unicast flag must be set");
+    assert_eq!(
+        first.sd_reboot,
+        RebootFlag::RecentlyRebooted,
+        "first announcement must carry RecentlyRebooted"
+    );
     // OfferService entry body.
-    assert_eq!(offer.entry_service_id, SERVICE_ID);
-    assert_eq!(offer.entry_instance_id, INSTANCE_ID);
-    assert_eq!(offer.entry_major_version, 1, "default major_version");
-    assert_eq!(offer.entry_minor_version, 0, "default minor_version");
-    assert!(offer.entry_ttl > 0, "TTL must be non-zero on Offer");
+    assert_eq!(first.entry_service_id, SERVICE_ID);
+    assert_eq!(first.entry_instance_id, INSTANCE_ID);
+    assert_eq!(first.entry_major_version, 1, "default major_version");
+    assert_eq!(first.entry_minor_version, 0, "default minor_version");
+    // Default TTL is 3 s per `ServerConfig::default()` /
+    // `Server::new_with_loopback`. Asserting the exact value is the
+    // spec-conformance signal we want — `> 0` was effectively a
+    // no-op gate.
+    assert_eq!(first.entry_ttl, 3, "default TTL must be 3 s");
+    // OfferService carries exactly one IPv4 endpoint option in the
+    // first run, none in the second.
+    assert_eq!(first.entry_options_first, 1);
+    assert_eq!(first.entry_options_second, 0);
+    // Single SD entry, single SD option in the whole header.
+    assert_eq!(first.sd_entries_count, 1);
+    assert_eq!(first.sd_options_count, 1);
     // Endpoint option — must advertise the configured (interface, port)
     // pair as UDP, which is what vsomeip's parser scans for.
-    assert_eq!(offer.endpoint_ip, interface);
-    assert_eq!(offer.endpoint_port, ADVERTISED_PORT);
-    assert_eq!(offer.endpoint_protocol, TransportProtocol::Udp);
+    assert_eq!(first.endpoint_ip, interface);
+    assert_eq!(first.endpoint_port, ADVERTISED_PORT);
+    assert_eq!(first.endpoint_protocol, TransportProtocol::Udp);
+
+    // ── Second announcement: session-ID monotonicity ─────────────────
+    //
+    // simple-someip's `request_id` packs `client_id << 16 | session_id`
+    // and (by spec) the session_id MUST advance monotonically per
+    // emitted SD packet. Wrap from 0xFFFF → 0x0001 (skipping zero) is
+    // the only valid non-monotonic step; we don't trigger that in 2
+    // ticks, so a strict `>` check is sound.
+    assert!(
+        second.request_id > first.request_id,
+        "session_id must advance: first.request_id=0x{:08X}, \
+         second.request_id=0x{:08X}",
+        first.request_id,
+        second.request_id,
+    );
+    // After the first announcement the reboot flag flips to
+    // Continuous (session counter no longer at the post-boot value).
+    assert_eq!(
+        second.sd_reboot,
+        RebootFlag::Continuous,
+        "second announcement should be Continuous, not RecentlyRebooted",
+    );
+    // Endpoint advertised should be byte-identical between
+    // announcements — service offers don't change shape per tick.
+    assert_eq!(second.endpoint_ip, first.endpoint_ip);
+    assert_eq!(second.endpoint_port, first.endpoint_port);
+    assert_eq!(second.entry_service_id, first.entry_service_id);
+    assert_eq!(second.entry_instance_id, first.entry_instance_id);
+    assert_eq!(second.entry_ttl, first.entry_ttl);
 
     eprintln!(
         "[test] PASS — captured wire-format OfferService for service=0x{SERVICE_ID:04X} \
-         on {interface} ({len} bytes)",
-        len = offer.len
+         on {interface} ({len1} bytes first / {len2} bytes second; \
+         session 0x{rid1:08X} → 0x{rid2:08X}; reboot {r1:?} → {r2:?})",
+        len1 = first.len,
+        len2 = second.len,
+        rid1 = first.request_id,
+        rid2 = second.request_id,
+        r1 = first.sd_reboot,
+        r2 = second.sd_reboot,
     );
-    // `RebootFlag` is referenced via the trace-friendly Display path
-    // implicitly by tracing; pin the import so it's not flagged.
-    let _ = RebootFlag::RecentlyRebooted;
 }

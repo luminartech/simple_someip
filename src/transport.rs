@@ -325,11 +325,16 @@ pub enum TransportError {
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct SocketOptions {
-    /// Enable `SO_REUSEADDR` (required for the SD port 30490 on hosts
-    /// that run more than one SOME/IP endpoint on the same interface).
+    /// Enable `SO_REUSEADDR`. Required on the SD port 30490 when more
+    /// than one SOME/IP endpoint runs on the same interface; on Linux,
+    /// callers binding 30490 should set BOTH this and [`Self::reuse_port`]
+    /// because Linux ties multicast-group membership to the
+    /// `SO_REUSEPORT` group rather than `SO_REUSEADDR` alone — without
+    /// REUSEPORT a second binder may fail or silently steal datagrams.
     pub reuse_address: bool,
     /// Enable `SO_REUSEPORT` where supported (Linux, BSD). Ignored on
-    /// platforms that do not expose it.
+    /// platforms that do not expose it. See [`Self::reuse_address`] for
+    /// the Linux-specific reason both are required on the SD socket.
     pub reuse_port: bool,
     /// Outbound multicast interface (`IP_MULTICAST_IF`). `None` lets the
     /// backend choose.

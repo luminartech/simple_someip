@@ -11,11 +11,12 @@
     "applications": [
         { "name": "subscriber", "id": "0x1278" }
     ],
+    "_clients_comment": "Port matches the simple-someip Server's `ADVERTISED_PORT` (30500 in tests/vsomeip_sd_compat.rs). subscriber.json is paired with the simple-someip Server in the TX-direction conformance test, NOT with offerer.json — offerer.json offers on its own port (30509) and is paired with simple-someip's Client in the RX direction. The two configs are independent.",
     "clients": [
         {
             "service": "0x1234",
             "instance": "0x0001",
-            "unreliable": [30509]
+            "unreliable": [30500]
         }
     ],
     "routing": "subscriber",
