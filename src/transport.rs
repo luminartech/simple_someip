@@ -740,7 +740,7 @@ pub trait E2ERegistryHandle: Clone + Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`E2ERegistryFull`] when the underlying registry has no
+    /// Returns [`crate::e2e::E2ERegistryFull`] when the underlying registry has no
     /// capacity for a new key. Replacing an already-registered key
     /// always succeeds (the existing slot is reused). Implementations
     /// that wrap [`crate::e2e::E2ERegistry`] forward this error

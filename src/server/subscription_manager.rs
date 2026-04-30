@@ -236,22 +236,25 @@ impl SubscriptionManager {
     /// Get all subscribers for an event group as a heap-allocated `Vec`.
     ///
     /// Convenience accessor for `std` consumers (testing, ad-hoc tooling).
-    /// **Production code paths use [`Self::for_each_subscriber`] instead**
-    /// — that visitor walks the same data structure under the lock without
+    /// **Production code paths use
+    /// [`SubscriptionHandle::for_each_subscriber`] instead** — that
+    /// visitor walks the same data structure under the lock without
     /// allocating per call, which is required for the bare-metal /
     /// no-alloc story.
     ///
-    /// Gated on `feature = "std"` because the return type forces an
-    /// `alloc` dependency. Without `std`, callers should use
-    /// [`Self::for_each_subscriber`].
-    #[cfg(feature = "std")]
+    /// Gated on the internal `_alloc` feature because the return type
+    /// forces an `alloc` dependency. `_alloc` is implied by `std`,
+    /// `server`, and `embassy_channels` — i.e. anywhere `Vec` is
+    /// already in scope. Without `_alloc`, callers should use
+    /// [`SubscriptionHandle::for_each_subscriber`].
+    #[cfg(feature = "_alloc")]
     #[must_use]
     pub fn get_subscribers(
         &self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-    ) -> std::vec::Vec<Subscriber> {
+    ) -> alloc::vec::Vec<Subscriber> {
         let key = (service_id, instance_id, event_group_id);
         self.subscriptions
             .get(&key)

@@ -863,9 +863,12 @@ where
 
     /// Get a clone of the event-publisher handle for sending events.
     ///
-    /// Returns the [`EventPublisherHandle`] type — `Arc<EventPublisher<R,
-    /// S, H>>` for std users (the default `Hep`),
-    /// `&'static EventPublisher<R, S, H>` for bare-metal-no-alloc.
+    /// Returns the `Hep` type parameter — typically
+    /// `Arc<EventPublisher<R, S, H>>` for std users (the default
+    /// `Hep`), `&'static EventPublisher<R, S, H>` for
+    /// bare-metal-no-alloc. (`EventPublisherHandle` was a former
+    /// trait alias collapsed into [`crate::transport::SharedHandle`]
+    /// in phase 19f / 20e.)
     #[must_use]
     pub fn publisher(&self) -> Hep {
         self.publisher.clone()
@@ -923,18 +926,35 @@ where
     /// (64 KiB - 1) — peer SD messages are bounded by the link MTU,
     /// but a SOME/IP server should not silently cap at 1500 because
     /// it is a sink for any peer datagram landing on its SD or
-    /// unicast port. Backends that surface truncation
-    /// (`ReceivedDatagram::truncated`) emit a `tracing::warn!` when
-    /// the caller's buffer was too small; backends that don't
-    /// (`TokioSocket` today) silently truncate at the OS level.
+    /// unicast port. The `ReceivedDatagram::truncated` flag
+    /// returned by [`crate::transport::TransportSocket::recv_from`]
+    /// is currently NOT inspected by this run loop: backends that
+    /// surface truncation will have it observable on the value, but
+    /// a follow-up pass is needed to emit the corresponding
+    /// `tracing::warn!`. Tracking issue: bare-metal plan v3 phase
+    /// 21+ backlog.
     ///
     /// On bare-metal, callers typically place the buffers in
-    /// `static` storage:
+    /// `static` storage. `static mut` would require unsafe and is
+    /// a hard error in Rust 2024 when used through `&mut`; the
+    /// recommended pattern is a `static` cell wrapped in interior
+    /// mutability:
     /// ```ignore
-    /// static mut UNICAST_BUF: [u8; 65535] = [0; 65535];
-    /// static mut SD_BUF: [u8; 65535] = [0; 65535];
+    /// use core::cell::UnsafeCell;
+    /// // One owner per buffer: only the task driving
+    /// // `run_with_buffers` ever obtains a `&mut` from these cells,
+    /// // and the borrow lives only for the run-loop's lifetime.
+    /// struct Buf(UnsafeCell<[u8; 65535]>);
+    /// // SAFETY: hand-shaken — only the `Server::run_with_buffers`
+    /// // task touches the inner storage, so the `Sync` claim is
+    /// // sound for that single-owner discipline.
+    /// unsafe impl Sync for Buf {}
+    /// static UNICAST_BUF: Buf = Buf(UnsafeCell::new([0; 65535]));
+    /// static SD_BUF: Buf = Buf(UnsafeCell::new([0; 65535]));
     /// // SAFETY: only one task drives `run_with_buffers` for a given Server.
-    /// unsafe { server.run_with_buffers(&mut UNICAST_BUF, &mut SD_BUF).await }?;
+    /// let unicast = unsafe { &mut *UNICAST_BUF.0.get() };
+    /// let sd = unsafe { &mut *SD_BUF.0.get() };
+    /// server.run_with_buffers(unicast, sd).await?;
     /// ```
     ///
     /// On std (or any alloc-using target), [`Self::run`] is the

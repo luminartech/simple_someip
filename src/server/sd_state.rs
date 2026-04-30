@@ -27,8 +27,11 @@ use super::{Error, ServerConfig};
 /// the reboot flag on emitted SD messages is
 /// [`RebootFlag::RecentlyRebooted`] from startup until the counter wraps
 /// once, then [`RebootFlag::Continuous`] permanently — `SdStateManager`
-/// tracks that transition and exposes it via [`Self::reboot_flag`] so every
-/// server-side SD emission path reads from a single source of truth.
+/// tracks that transition and bundles the `(session_id, reboot_flag)` pair
+/// atomically through
+/// [`Self::next_session_id_with_reboot_flag`] so every server-side SD
+/// emission path reads from a single source of truth and concurrent
+/// emitters cannot race around the wrap boundary.
 #[derive(Debug)]
 pub struct SdStateManager {
     /// Packed `(has_wrapped, session_id)` state.
@@ -78,10 +81,14 @@ impl Default for SdStateManager {
 }
 
 impl SdStateManager {
-    /// Construct with a specific starting session counter. Primarily used by
-    /// tests to validate wrap behavior; callers in production should use
-    /// [`Self::new`].
-    pub(super) const fn with_initial(initial: u16) -> Self {
+    /// Construct with a specific starting session counter. `pub`
+    /// (rather than `pub(super)`) so external test harnesses — e.g.
+    /// `tests/vsomeip_sd_compat.rs`'s wire-format checks — can
+    /// pre-seed counter state to validate wrap-around behaviour
+    /// without driving a full Server lifecycle. Production callers
+    /// should use [`Self::new`].
+    #[must_use]
+    pub const fn with_initial(initial: u16) -> Self {
         Self {
             // has_wrapped starts false; session_id starts at `initial`.
             session_state: AtomicU32::new(initial as u32),
@@ -102,7 +109,7 @@ impl SdStateManager {
     /// `(0xFFFF, Continuous)` or `(0x0001, RecentlyRebooted)` — both
     /// violations of AUTOSAR SOME/IP-SD's stated semantics that the
     /// wrap message itself carries `Continuous`.
-    pub(super) fn next_session_id_with_reboot_flag(&self) -> (u32, RebootFlag) {
+    pub fn next_session_id_with_reboot_flag(&self) -> (u32, RebootFlag) {
         let prev_state = self
             .session_state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
