@@ -572,9 +572,7 @@ where
                 config.local_port,
                 bound_port,
             );
-            return Err(Error::InvalidUsage(
-                "new_with_handles_local_port_mismatch",
-            ));
+            return Err(Error::InvalidUsage("new_with_handles_local_port_mismatch"));
         }
         tracing::info!(
             "Server (handles) bound to {}:{} for service 0x{:04X}",
@@ -1076,7 +1074,11 @@ where
             prefer_sd_first = !prefer_sd_first;
             let len = datagram.bytes_received;
             let addr = core::net::SocketAddr::V4(datagram.source);
-            let source = if from_unicast { "unicast" } else { "sd-multicast" };
+            let source = if from_unicast {
+                "unicast"
+            } else {
+                "sd-multicast"
+            };
             let data = if from_unicast {
                 &unicast_buf[..len]
             } else {

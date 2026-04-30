@@ -263,8 +263,10 @@ async fn adapter_udp_roundtrip() {
             tokio::task::spawn_local(async move { stack_a.run().await });
             tokio::task::spawn_local(async move { stack_b.run().await });
 
-            let pool_a: &'static SocketPool<2, LINK_MTU, LINK_MTU> = Box::leak(Box::new(SocketPool::new()));
-            let pool_b: &'static SocketPool<2, LINK_MTU, LINK_MTU> = Box::leak(Box::new(SocketPool::new()));
+            let pool_a: &'static SocketPool<2, LINK_MTU, LINK_MTU> =
+                Box::leak(Box::new(SocketPool::new()));
+            let pool_b: &'static SocketPool<2, LINK_MTU, LINK_MTU> =
+                Box::leak(Box::new(SocketPool::new()));
             let factory_a = EmbassyNetFactory::new(stack_a, pool_a);
             let factory_b = EmbassyNetFactory::new(stack_b, pool_b);
 
