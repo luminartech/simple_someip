@@ -868,18 +868,18 @@ impl<T: 'static> SharedHandle<T> for &'static T {
 }
 
 // `Arc<T>` is the alloc-using handle. `Arc::clone` is the
-// reference-count increment; `wrap` is `Arc::new`. Gated to
-// where `alloc` is available — `feature = "embassy_channels"`
-// or `feature = "server"` per the crate-root `extern crate
-// alloc` declaration.
-#[cfg(any(feature = "embassy_channels", feature = "server"))]
+// reference-count increment; `wrap` is `Arc::new`. Gated on the
+// internal `_alloc` feature, which is also what gates the
+// crate-root `extern crate alloc` declaration — server,
+// embassy_channels, and std all imply it.
+#[cfg(feature = "_alloc")]
 impl<T: 'static> SharedHandle<T> for alloc::sync::Arc<T> {
     fn get(&self) -> &T {
         self
     }
 }
 
-#[cfg(any(feature = "embassy_channels", feature = "server"))]
+#[cfg(feature = "_alloc")]
 impl<T: 'static> WrappableSharedHandle<T> for alloc::sync::Arc<T> {
     fn wrap(value: T) -> Self {
         alloc::sync::Arc::new(value)

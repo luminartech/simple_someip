@@ -124,7 +124,11 @@ extern crate std;
 // allocator get the no-alloc oneshot/mpsc primitives via the
 // macro. Pure `bare_metal` without `client` / `server` /
 // `embassy_channels` also stays alloc-free.
-#[cfg(any(feature = "embassy_channels", feature = "server"))]
+// Pulls `alloc` into scope. Gated on the internal `_alloc` feature
+// (implied by `server`, `embassy_channels`, and `std`). The
+// `Arc<T>: SharedHandle<T>` impl in `transport.rs` shares the same
+// gate so they move in lockstep.
+#[cfg(feature = "_alloc")]
 extern crate alloc;
 
 /// Maximum size, in bytes, of UDP payloads for `client` / `server` send
@@ -205,9 +209,7 @@ mod traits;
 pub mod transport;
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
-#[cfg(feature = "std")]
-pub use traits::OfferedEndpoint;
-pub use traits::{PayloadWireFormat, WireFormat};
+pub use traits::{OfferedEndpoint, PayloadWireFormat, WireFormat};
 
 #[cfg(feature = "client")]
 pub use client::{
