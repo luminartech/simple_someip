@@ -5,7 +5,22 @@ members = [
     "examples/bare_metal_server",
     "examples/client_server",
     "examples/discovery_client",
+    "examples/embassy_net_client",
+    "simple-someip-embassy-net",
 ]
+# `tools/size_probe` is a `no_std` `staticlib` with its own
+# `#[panic_handler]` and `#[global_allocator]` — including it as a
+# workspace member triggers `E0152` when the workspace is checked
+# under a host target (`cargo clippy --workspace --all-features`),
+# because `simple-someip` brings in `std`'s panic_impl through its
+# transitive deps. Excluding keeps the probe usable via its own
+# `cd tools/size_probe && cargo build --release --target thumbv7em-none-eabihf`
+# invocation (it's a flash-size measurement tool, not a publishable
+# crate) without poisoning the host workspace lint gate. Note: a
+# `cargo build -p size_probe` from the workspace root no longer
+# resolves because the probe is excluded; build it through its own
+# manifest.
+exclude = ["tools/size_probe"]
 
 [package]
 name = "simple-someip"
@@ -28,9 +43,15 @@ embedded-io = { version = "0.7" }
 # `select!` macro and `FutureExt::fuse` / `pin_mut!` helpers — used by
 # the client/server event loops in place of `tokio::select!`. Default
 # features disabled so we only pull in the parts we use.
-futures = { version = "0.3", default-features = false, features = [
+# `futures-util` (not the `futures` umbrella) because the umbrella
+# gates the `select!` macro re-export behind its `std` feature, and
+# pulling that feature drags in `slab` / `memchr` / `futures-io` etc.
+# which do not compile on no_std targets. `futures-util` itself
+# provides `select!`, `pin_mut!`, `FutureExt::fuse`, and friends
+# under just `async-await` (which is alloc-friendly, no_std-clean).
+futures-util = { version = "0.3", default-features = false, features = [
     "async-await",
-    "std",
+    "async-await-macro",
 ], optional = true }
 heapless = "0.9"
 socket2 = { version = "0.5", optional = true, features = ["all"] }
@@ -55,7 +76,7 @@ tracing-subscriber = "0.3"
 
 [features]
 default = ["std"]
-std = ["embedded-io/std", "thiserror/std", "tracing/std"]
+std = ["embedded-io/std", "thiserror/std", "tracing/std", "_alloc"]
 # Feature split: `client` exposes the protocol/trait-surface client
 # (no tokio, no socket2); `client-tokio` layers the tokio + socket2
 # convenience defaults on top. Consumers of the bare-metal trait surface
@@ -63,17 +84,25 @@ std = ["embedded-io/std", "thiserror/std", "tracing/std"]
 # `ChannelFactory` / `TransportFactory` impls). Consumers who want the
 # `Client::new` shortcut (defaulting to `TokioSpawner` / `TokioTimer` /
 # `TokioChannels` / `TokioTransport`) enable `client-tokio`.
-client = ["std", "dep:futures"]
-client-tokio = ["client", "dep:tokio", "dep:socket2"]
+client = ["dep:futures-util"]
+client-tokio = ["client", "std", "dep:tokio", "dep:socket2"]
+# Internal marker: features that need `extern crate alloc`. Pulls in
+# `alloc::sync::Arc` for `SharedHandle<T>` and `Arc<EventPublisher>`.
+# Not part of the public surface — implied by `server` /
+# `embassy_channels` / `std` and tied to the `extern crate alloc`
+# declaration in `lib.rs` so both sides of "alloc is available"
+# move in lockstep. Naming: `_`-prefix flags it as private.
+_alloc = []
 # Feature split (matches the client side): `server` exposes the
-# trait-surface server (no tokio, no socket2). The engine itself uses
-# `futures::select!` so `dep:futures` lives here. `server-tokio` adds
-# the tokio + socket2 convenience defaults (`Server::new`,
-# `Server::new_with_loopback`, `Server::new_passive`), bringing
-# `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>` /
-# / `TokioTransport` / `TokioTimer` defaults into scope.
-server = ["std", "dep:futures"]
-server-tokio = ["server", "dep:tokio", "dep:socket2"]
+# trait-surface server (no tokio, no socket2, no std). The engine
+# itself uses `futures::select!` so `dep:futures` lives here.
+# `server-tokio` adds the tokio + socket2 convenience defaults
+# (`Server::new`, `Server::new_with_loopback`, `Server::new_passive`),
+# bringing `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>` /
+# / `TokioTransport` / `TokioTimer` defaults into scope, and forces
+# `std`.
+server = ["dep:futures-util", "_alloc"]
+server-tokio = ["server", "std", "dep:tokio", "dep:socket2"]
 # Marks a build as intended for bare-metal / no_std consumption.
 # Activates embassy-sync as the channel backend, the `static_channels`
 # module, `AtomicInterfaceHandle`, and `StaticE2EHandle`.
@@ -94,10 +123,21 @@ bare_metal = ["dep:embassy-sync"]
 # Heap-backed embassy-sync channel backend (`EmbassySyncChannels`).
 # Implies `bare_metal` and pulls in `alloc` for `Arc<Channel<...>>`.
 # Useful for tests or early prototypes before sizing static pools.
-embassy_channels = ["bare_metal"]
+embassy_channels = ["bare_metal", "_alloc"]
 
 [[test]]
 name = "client_server"
+required-features = ["client-tokio", "server-tokio"]
+
+[[test]]
+# Without `required-features`, `cargo test` would silently report
+# "0 tests" when client-tokio/server-tokio aren't enabled — the
+# vsomeip-conformance file is unconditionally compiled but every
+# function inside it depends on `Client::new_with_loopback` /
+# `Server::new_with_loopback` (tokio path) and on
+# `tracing-subscriber` / `socket2`. Pinning the required-features
+# makes the test cleanly skipped under the wrong feature set.
+name = "vsomeip_sd_compat"
 required-features = ["client-tokio", "server-tokio"]
 
 [[test]]

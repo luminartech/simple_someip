@@ -26,12 +26,12 @@
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `std` | yes | Enables std-dependent helpers (`RawPayload`, `VecSdHeader`, `OfferedEndpoint`) |
-//! | `client` | no | Trait-surface client; implies `std` + futures (no tokio) |
-//! | `client-tokio` | no | Adds the `Client::new` / `TokioSpawner` / `TokioTransport` convenience defaults; implies `client` + tokio + socket2 |
-//! | `server` | no | Trait-surface server; implies `std` + futures (no tokio) |
-//! | `server-tokio` | no | Adds the `Server::new` / `TokioTransport` / `TokioTimer` convenience defaults; implies `server` + tokio + socket2 |
-//! | `bare_metal` | no | Activates embassy-sync, the `static_channels` module (no-alloc `ChannelFactory`), and `AtomicInterfaceHandle`. `StaticE2EHandle` additionally requires `std` because the underlying `E2ERegistry` is currently `std`-only. See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable bare-metal integration examples. |
+//! | `std` | yes | Enables std-dependent helpers (`RawPayload`, `VecSdHeader`) and the `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<…>>` default lock-handle impls used by the tokio backends. |
+//! | `client` | no | Trait-surface client. Pure `no_std`-clean (does not pull `extern crate alloc`). Caller supplies `Spawner` / `Timer` / `ChannelFactory` / `TransportFactory` / `E2ERegistryHandle` / `InterfaceHandle` impls. |
+//! | `client-tokio` | no | Adds the `Client::new` / `TokioSpawner` / `TokioTransport` convenience defaults; implies `client` + std + tokio + socket2. |
+//! | `server` | no | Trait-surface server. Pulls `extern crate alloc` (for `Arc<EventPublisher>` / `Arc<F::Socket>`); on `no_std`, downstream consumers must provide a `#[global_allocator]`. |
+//! | `server-tokio` | no | Adds the `Server::new` / `TokioTransport` / `TokioTimer` convenience defaults; implies `server` + std + tokio + socket2. |
+//! | `bare_metal` | no | Activates embassy-sync, the `static_channels` module (no-alloc `ChannelFactory`), `AtomicInterfaceHandle`, `StaticE2EHandle`, and `StaticSubscriptionHandle`. All five are pure `no_std` (no allocator required). See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable bare-metal integration examples. |
 //! | `embassy_channels` | no | Heap-backed `EmbassySyncChannels` `ChannelFactory`. Implies `bare_metal` and pulls `extern crate alloc;` into the crate; **on `no_std`, downstream consumers must provide a `#[global_allocator]`**. Useful for tests / early prototypes before sizing static pools. |
 //!
 //! The default feature set is `["std"]`, which links `std` and enables
@@ -109,11 +109,26 @@
 #[cfg(feature = "std")]
 extern crate std;
 
-// `embassy_channels` needs `alloc` for `EmbassySyncChannels`'s
-// `Arc<Channel<...>>` storage (the heap-backed bare-metal channel
-// primitive). The `static_channels` module does NOT need alloc — users
-// who only enable `bare_metal` (without `embassy_channels`) get no-alloc.
-#[cfg(feature = "embassy_channels")]
+// `alloc` is required by:
+// - `embassy_channels` — `EmbassySyncChannels` heap-allocates an
+//   `Arc<Channel<...>>` per oneshot/bounded/unbounded.
+// - `server` — `EventPublisher` and the `Server` struct hold
+//   `Arc<EventPublisher<...>>` / `Arc<F::Socket>` for sharing
+//   between the run loop and external publishing tasks. A
+//   future refactor may switch to `&'static` borrows so the
+//   server compiles in pure no_std without an allocator;
+//   tracked in `bare_metal_plan_v3.md` Phase 21+ backlog.
+//
+// The `static_channels` module (under `bare_metal` alone) does
+// NOT need alloc — users wanting `client` + `bare_metal` without
+// allocator get the no-alloc oneshot/mpsc primitives via the
+// macro. Pure `bare_metal` without `client` / `server` /
+// `embassy_channels` also stays alloc-free.
+// Pulls `alloc` into scope. Gated on the internal `_alloc` feature
+// (implied by `server`, `embassy_channels`, and `std`). The
+// `Arc<T>: SharedHandle<T>` impl in `transport.rs` shares the same
+// gate so they move in lockstep.
+#[cfg(feature = "_alloc")]
 extern crate alloc;
 
 /// Maximum size, in bytes, of UDP payloads for `client` / `server` send
@@ -194,9 +209,7 @@ mod traits;
 pub mod transport;
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
-#[cfg(feature = "std")]
-pub use traits::OfferedEndpoint;
-pub use traits::{PayloadWireFormat, WireFormat};
+pub use traits::{OfferedEndpoint, PayloadWireFormat, WireFormat};
 
 #[cfg(feature = "client")]
 pub use client::{
@@ -204,7 +217,7 @@ pub use client::{
 };
 pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
-pub use server::{Server, ServerDeps, SubscriptionHandle};
+pub use server::{Server, ServerDeps, ServerHandles, SubscriptionHandle};
 #[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
 #[cfg(feature = "bare_metal")]
@@ -214,5 +227,5 @@ pub use transport::{
     MpscSend, OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram, SocketOptions, Spawner,
     Timer, TransportError, TransportFactory, TransportSocket, UnboundedRecv, UnboundedSend,
 };
-#[cfg(all(feature = "bare_metal", feature = "std"))]
+#[cfg(feature = "bare_metal")]
 pub use transport::{StaticE2EHandle, StaticE2EStorage};

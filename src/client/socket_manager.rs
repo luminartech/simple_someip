@@ -52,11 +52,11 @@ use crate::{
 };
 
 use super::error::Error;
-use futures::{FutureExt, pin_mut, select};
-use std::{
+use core::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     task::{Context, Poll},
 };
+use futures_util::{FutureExt, pin_mut, select_biased};
 use tracing::{debug, error, info, trace, warn};
 
 /// A received message together with the source address it came from.
@@ -80,10 +80,10 @@ pub struct SendMessage<PayloadDefinitions: Send + 'static, C: ChannelFactory> {
     response: C::OneshotSender<Result<(), Error>>,
 }
 
-impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> std::fmt::Debug
+impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> core::fmt::Debug
     for SendMessage<P, C>
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SendMessage")
             .field("target_addr", &self.target_addr)
             .field("message", &self.message)
@@ -133,10 +133,10 @@ pub struct SocketManager<PayloadDefinitions: Send + 'static, C: ChannelFactory> 
     session_has_wrapped: bool,
 }
 
-impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> std::fmt::Debug
+impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> core::fmt::Debug
     for SocketManager<P, C>
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SocketManager")
             .field("local_port", &self.local_port)
             .field("session_id", &self.session_id)
@@ -567,13 +567,16 @@ where
         const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 16;
         let mut consecutive_recv_errors: u32 = 0;
         let mut buf = [0u8; UDP_BUFFER_SIZE];
+        // Iteration counter used solely to flip `select_biased!` arm
+        // priority each turn so a sustained one-sided load (only-send
+        // or only-recv) cannot starve the other arm. We can't use
+        // futures-util's pseudo-random `select!` because that needs
+        // `std`; `select_biased!` polls top-down deterministically.
+        // Flipping the priority each iteration approximates the
+        // fairness `select!` would give without pulling std.
+        let mut prefer_recv_first = false;
 
         loop {
-            // `select!` (not `select_biased!`) gives pseudo-random
-            // fairness across ready arms — matches prior
-            // `tokio::select!` behavior and avoids starving either
-            // the send or recv arm under sustained one-sided load.
-            //
             // The fresh `.fuse()`'d per-iteration futures are pinned
             // on the stack (required: `Fuse<_>` is not `Unpin`).
             // Returning an `Outcome<P>` scalar from the inner block
@@ -584,11 +587,19 @@ where
                 let send_fut = MpscRecv::recv(&mut tx_rx).fuse();
                 let recv_fut = socket.recv_from(&mut buf).fuse();
                 pin_mut!(send_fut, recv_fut);
-                select! {
-                    message = send_fut => Outcome::Send(message),
-                    result = recv_fut => Outcome::Recv(result),
+                if prefer_recv_first {
+                    select_biased! {
+                        result = recv_fut => Outcome::Recv(result),
+                        message = send_fut => Outcome::Send(message),
+                    }
+                } else {
+                    select_biased! {
+                        message = send_fut => Outcome::Send(message),
+                        result = recv_fut => Outcome::Recv(result),
+                    }
                 }
             };
+            prefer_recv_first = !prefer_recv_first;
 
             match outcome {
                 Outcome::Send(Some(send_message)) => {
@@ -1047,7 +1058,8 @@ mod tests {
         let message_id = MessageId::new_from_service_and_method(0x1234, 0x5678);
         let key = E2EKey::from_message_id(message_id);
         let mut reg = E2ERegistry::new();
-        reg.register(key, E2EProfile::Profile4(Profile4Config::new(0, 15)));
+        reg.register(key, E2EProfile::Profile4(Profile4Config::new(0, 15)))
+            .expect("E2E registry has capacity for one entry");
         let e2e_registry = Arc::new(Mutex::new(reg));
 
         let mut sm = SocketManager::<RawPayload, TokioChannels>::bind(0, e2e_registry)

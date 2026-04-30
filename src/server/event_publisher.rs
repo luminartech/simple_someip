@@ -6,10 +6,12 @@ use crate::UDP_BUFFER_SIZE;
 use crate::e2e::E2EKey;
 use crate::protocol::{Header, Message};
 use crate::traits::{PayloadWireFormat, WireFormat};
-use crate::transport::{E2ERegistryHandle, TransportSocket};
+use crate::transport::{E2ERegistryHandle, SharedHandle, TransportSocket};
+#[cfg(test)]
+use alloc::sync::Arc;
+use core::marker::PhantomData;
 use core::net::SocketAddrV4;
 use heapless::Vec as HeaplessVec;
-use std::sync::Arc;
 
 /// The publish snapshot buffer is sized to `SUBSCRIBERS_PER_GROUP` so
 /// `for_each_subscriber` can never overflow it. If a future refactor
@@ -22,32 +24,63 @@ const _: () = assert!(
 
 /// Publishes events to subscribers.
 ///
-/// Generic over `T: TransportSocket` (the socket primitive — `TokioSocket`
-/// in the std/tokio path, a bare-metal embassy / smoltcp wrapper on
-/// firmware), `R: E2ERegistryHandle`, and `S: SubscriptionHandle`.
-pub struct EventPublisher<R, S, T>
+/// Generic over `H: SharedHandle<T>` (abstracting how the
+/// transport socket is shared — `Arc<T>` in alloc-using builds,
+/// `&'static T` on bare-metal-no-alloc), `T: TransportSocket`
+/// (the concrete underlying socket type), `R: E2ERegistryHandle`,
+/// and `S: SubscriptionHandle`.
+///
+/// Pre-19f revision: this type held an `Arc<T>` directly and required
+/// `T: Send + Sync + 'static`. The handle indirection drops the
+/// Send/Sync requirement so consumers with a `!Sync` socket — most
+/// notably `embassy-net`'s `UdpSocket<'static>` — can still
+/// construct an `EventPublisher`. Multi-threaded callers continue
+/// to use `Arc<T>` (which is `Send + Sync` whenever `T` is) without
+/// any change.
+///
+/// The explicit `T` parameter is the price of consolidating all
+/// three former handle traits (Phase 20e) into a single
+/// [`SharedHandle<T>`]: the trait carries `T` as a generic, not
+/// as an associated type, so consumers that need to name the
+/// socket type spell it out.
+pub struct EventPublisher<R, S, H, T>
 where
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
-    T: TransportSocket + Send + Sync + 'static,
+    T: TransportSocket + 'static,
+    H: SharedHandle<T>,
 {
     subscriptions: S,
-    socket: Arc<T>,
+    socket: H,
     e2e_registry: R,
+    /// `T` appears only in the bound `H: SharedHandle<T>`; the
+    /// struct doesn't directly hold a `T`. `PhantomData<fn() -> T>`
+    /// (rather than `PhantomData<T>`) carries the type without
+    /// re-imposing `T: Send + Sync` redundantly with `H`'s bounds:
+    /// a future `!Send T` behind a `Send` static-mutex handle would
+    /// otherwise force the whole `EventPublisher: !Send`. `fn() -> T`
+    /// is unconditionally `Send + Sync`.
+    _phantom: PhantomData<fn() -> T>,
 }
 
-impl<R, S, T> EventPublisher<R, S, T>
+impl<R, S, H, T> EventPublisher<R, S, H, T>
 where
     R: E2ERegistryHandle,
     S: SubscriptionHandle,
-    T: TransportSocket + Send + Sync + 'static,
+    T: TransportSocket + 'static,
+    H: SharedHandle<T>,
 {
-    /// Create a new event publisher
-    pub fn new(subscriptions: S, socket: Arc<T>, e2e_registry: R) -> Self {
+    /// Create a new event publisher.
+    ///
+    /// `socket` is whatever [`SharedHandle<T>`] impl the caller
+    /// chose for storage — `Arc<T>` on std/alloc, `&'static T` on
+    /// bare-metal-no-alloc.
+    pub fn new(subscriptions: S, socket: H, e2e_registry: R) -> Self {
         Self {
             subscriptions,
             socket,
             e2e_registry,
+            _phantom: PhantomData,
         }
     }
 
@@ -182,7 +215,7 @@ where
         let mut sent_count = 0usize;
         let mut last_err: Option<crate::transport::TransportError> = None;
         for addr in &subscribers {
-            match self.socket.send_to(datagram, *addr).await {
+            match self.socket.get().send_to(datagram, *addr).await {
                 Ok(()) => {
                     sent_count += 1;
                     tracing::trace!(
@@ -308,7 +341,7 @@ where
         let mut sent_count = 0usize;
         let mut last_err: Option<crate::transport::TransportError> = None;
         for addr in &subscribers {
-            match self.socket.send_to(datagram, *addr).await {
+            match self.socket.get().send_to(datagram, *addr).await {
                 Ok(()) => {
                     sent_count += 1;
                 }
@@ -394,7 +427,7 @@ where
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-        subscriber_addr: std::net::SocketAddrV4,
+        subscriber_addr: core::net::SocketAddrV4,
     ) -> Result<(), crate::server::SubscribeError> {
         self.subscriptions
             .subscribe(service_id, instance_id, event_group_id, subscriber_addr)
@@ -416,7 +449,7 @@ where
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-        subscriber_addr: std::net::SocketAddrV4,
+        subscriber_addr: core::net::SocketAddrV4,
     ) {
         self.subscriptions
             .unsubscribe(service_id, instance_id, event_group_id, subscriber_addr)
@@ -436,6 +469,14 @@ where
     }
 }
 
+// Phase 20e collapsed `EventPublisherHandle<R, S, H>` /
+// `WrappableEventPublisherHandle<R, S, H>` into the unified
+// `crate::transport::SharedHandle<EventPublisher<R, S, H, T>>` /
+// `WrappableSharedHandle<EventPublisher<R, S, H, T>>` traits. The
+// blanket impls there cover both `&'static EventPublisher<...>`
+// and `Arc<EventPublisher<...>>`; no dedicated trait survives
+// here.
+
 #[cfg(all(test, feature = "server-tokio"))]
 mod tests {
     use super::*;
@@ -452,9 +493,13 @@ mod tests {
 
     /// Type alias bringing the tokio-flavor concrete type parameters back
     /// into scope so tests can spell `TestEventPublisher` without
-    /// chasing the three-type-parameter signature on every call site.
-    type TestEventPublisher =
-        EventPublisher<Arc<Mutex<E2ERegistry>>, Arc<RwLock<SubscriptionManager>>, TokioSocket>;
+    /// chasing the four-type-parameter signature on every call site.
+    type TestEventPublisher = EventPublisher<
+        Arc<Mutex<E2ERegistry>>,
+        Arc<RwLock<SubscriptionManager>>,
+        Arc<TokioSocket>,
+        TokioSocket,
+    >;
 
     fn test_registry() -> Arc<Mutex<E2ERegistry>> {
         Arc::new(Mutex::new(E2ERegistry::new()))
@@ -514,7 +559,7 @@ mod tests {
 
         // Create a receiver socket to act as subscriber
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let std::net::SocketAddr::V4(recv_addr) = receiver.local_addr().unwrap() else {
+        let core::net::SocketAddr::V4(recv_addr) = receiver.local_addr().unwrap() else {
             panic!("expected v4 source address");
         };
 
@@ -625,9 +670,14 @@ mod tests {
             let mut mgr = subscriptions.write().await;
             mgr.subscribe(0x5B, 1, 0x01, addr).unwrap();
         }
+        #[allow(
+            clippy::type_complexity,
+            reason = "tests reasonably spell out the full type for clarity"
+        )]
         let publisher: EventPublisher<
             Arc<Mutex<E2ERegistry>>,
             Arc<RwLock<SubscriptionManager>>,
+            Arc<AlwaysFailSocket>,
             AlwaysFailSocket,
         > = EventPublisher::new(subscriptions, Arc::new(AlwaysFailSocket), test_registry());
 
@@ -686,9 +736,14 @@ mod tests {
             let mut mgr = subscriptions.write().await;
             mgr.subscribe(0x5B, 1, 0x01, addr).unwrap();
         }
+        #[allow(
+            clippy::type_complexity,
+            reason = "tests reasonably spell out the full type for clarity"
+        )]
         let publisher: EventPublisher<
             Arc<Mutex<E2ERegistry>>,
             Arc<RwLock<SubscriptionManager>>,
+            Arc<AlwaysFailSocket>,
             AlwaysFailSocket,
         > = EventPublisher::new(subscriptions, Arc::new(AlwaysFailSocket), test_registry());
 
@@ -772,7 +827,8 @@ mod tests {
         let message_id = MessageId::new_from_service_and_method(0x5B, 0x8001);
         let key = E2EKey::from_message_id(message_id);
         let mut reg = E2ERegistry::new();
-        reg.register(key, E2EProfile::Profile4(Profile4Config::new(0, 15)));
+        reg.register(key, E2EProfile::Profile4(Profile4Config::new(0, 15)))
+            .expect("E2E registry has capacity for one entry");
         let e2e_registry = Arc::new(Mutex::new(reg));
 
         // Pre-register a subscriber so we don't short-circuit on the
@@ -825,7 +881,7 @@ mod tests {
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
 
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let std::net::SocketAddr::V4(recv_addr) = receiver.local_addr().unwrap() else {
+        let core::net::SocketAddr::V4(recv_addr) = receiver.local_addr().unwrap() else {
             panic!("expected v4 source address");
         };
 

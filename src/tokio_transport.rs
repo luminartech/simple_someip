@@ -136,7 +136,7 @@ impl TransportFactory for TokioTransport {
 ///
 /// Drives [`tokio::net::UdpSocket::poll_send_to`] directly so the GAT
 /// associated type ([`TransportSocket::SendFuture`]) can be named on
-/// stable Rust without heap-allocating a [`futures::future::BoxFuture`]
+/// stable Rust without heap-allocating a `futures::future::BoxFuture`
 /// per datagram. Auto-derives `Send`.
 pub struct SendTo<'a> {
     socket: &'a UdpSocket,
@@ -160,7 +160,7 @@ impl Future for SendTo<'_> {
 ///
 /// Drives [`tokio::net::UdpSocket::poll_recv_from`] directly so the GAT
 /// associated type ([`TransportSocket::RecvFuture`]) can be named on
-/// stable Rust without heap-allocating a [`futures::future::BoxFuture`]
+/// stable Rust without heap-allocating a `futures::future::BoxFuture`
 /// per datagram. Auto-derives `Send`.
 pub struct RecvFrom<'a> {
     socket: &'a UdpSocket,
@@ -273,30 +273,56 @@ impl Timer for TokioTimer {
     }
 }
 
-impl crate::transport::Spawner for TokioSpawner {
-    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
-        // Drop the returned `JoinHandle` — per-socket loops run until
-        // their owning `SocketManager` drops its channel ends, at
-        // which point the future completes naturally.
-        //
-        // Wrap in `catch_unwind` so a panic inside the spawned task is
-        // logged through the `tracing` pipeline that the rest of the
-        // crate uses, instead of being swallowed silently to stderr by
-        // tokio's default panic handler. The caller's
-        // `Error::SocketClosedUnexpectedly` (surfaced when the
-        // panicking task drops its channel ends) then has a
-        // corresponding diagnostic in the operator's logs.
-        use futures::FutureExt;
-        drop(tokio::spawn(async move {
-            let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
-            if let Err(payload) = result {
+/// Wraps a `Future` so that any panic during `poll` is logged via
+/// `tracing::error!` and the future then resolves cleanly. Lets
+/// `TokioSpawner::spawn` use exactly **one** tokio task per call
+/// instead of pairing each work future with a `JoinHandle`-watcher
+/// task — the prior watcher-pair pattern doubled task count and
+/// added `UNICAST_SOCKETS_CAP` extra tasks per `Client`.
+struct PanicLoggingFut<F> {
+    inner: F,
+}
+
+impl<F: Future<Output = ()>> Future for PanicLoggingFut<F> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: structural pinning of `inner`. We never move out of
+        // `inner` and project pin through it consistently.
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.inner) };
+        // `AssertUnwindSafe` is sound here because:
+        //  - if `inner.poll` panics, the future is logged-and-dropped
+        //    and never polled again, so any half-mutated state is
+        //    discarded with the future itself.
+        //  - the spawned task is the sole owner of this future; no
+        //    aliasing observer can witness inconsistent state.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(poll) => poll,
+            Err(payload) => {
                 let msg = panic_payload_str(&payload);
                 tracing::error!(
                     panic_message = msg,
                     "spawned task panicked; channels will close",
                 );
+                // The panicking poll's borrows are gone (caught
+                // unwind dropped the stack frame), so the dependent
+                // `Error::SocketClosedUnexpectedly` will surface on
+                // the receiver side as the caller's channel ends
+                // drop. Resolve the future cleanly so tokio doesn't
+                // also flag this as an aborted task.
+                Poll::Ready(())
             }
-        }));
+        }
+    }
+}
+
+impl crate::transport::Spawner for TokioSpawner {
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+        // Drop the returned `JoinHandle` — per-socket loops run until
+        // their owning `SocketManager` drops its channel ends, at
+        // which point the future completes naturally. Panic-logging
+        // is built into the wrapper; one task per spawn.
+        drop(tokio::spawn(PanicLoggingFut { inner: future }));
     }
 }
 
@@ -687,5 +713,131 @@ mod tests {
             map_io_error(&Error::from(ErrorKind::Other)),
             TransportError::Io(IoErrorKind::Other)
         ));
+    }
+
+    /// `PanicLoggingFut::poll` on a non-panicking inner future
+    /// must (a) actually call `inner.poll` and (b) forward its
+    /// `Poll::Ready` result. Tested by polling the wrapper directly
+    /// rather than going through `TokioSpawner::spawn` — a spawn
+    /// integration test would pass even if the wrapper were
+    /// silently bypassed (tokio runs raw futures fine).
+    #[tokio::test]
+    async fn panic_logging_fut_passes_through_normal_completion() {
+        use core::future::Future as _;
+        use core::pin::pin;
+        use core::task::{Context, Poll};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let poll_count_clone = poll_count.clone();
+        let inner = async move {
+            poll_count_clone.fetch_add(1, Ordering::SeqCst);
+        };
+        let fut = PanicLoggingFut { inner };
+        let mut fut = pin!(fut);
+        // Manual poll with a no-op waker: the inner future is
+        // immediately ready (it just bumps the counter and returns),
+        // so one poll must resolve it.
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(()) => {}
+            Poll::Pending => panic!(
+                "PanicLoggingFut wrapping a Ready future returned Pending; \
+                 wrapper is not forwarding `inner.poll` correctly",
+            ),
+        }
+        assert_eq!(
+            poll_count.load(Ordering::SeqCst),
+            1,
+            "inner future must have been polled exactly once",
+        );
+    }
+
+    /// `PanicLoggingFut::poll` on a panicking inner future must
+    /// (a) catch the panic via `catch_unwind` and (b) resolve to
+    /// `Poll::Ready(())` so the spawn task ends cleanly. Asserted
+    /// by polling the wrapper directly — if `catch_unwind` were
+    /// missing or the Err arm bypassed, the panic would propagate
+    /// out of `poll` and abort the test (failing it).
+    #[tokio::test]
+    async fn panic_logging_fut_catches_panic_and_resolves_cleanly() {
+        use core::future::Future as _;
+        use core::pin::pin;
+        use core::task::{Context, Poll};
+        use std::boxed::Box;
+
+        // Suppress the default panic-hook stderr noise. Hook is
+        // restored at end-of-test; if the body panics on assertion,
+        // the hook is leaked, which is acceptable for a unit test.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let inner = async {
+            panic!("intentional test panic — must be caught by PanicLoggingFut");
+        };
+        let fut = PanicLoggingFut { inner };
+        let mut fut = pin!(fut);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let result = fut.as_mut().poll(&mut cx);
+
+        std::panic::set_hook(prev_hook);
+
+        match result {
+            Poll::Ready(()) => {}
+            Poll::Pending => panic!(
+                "PanicLoggingFut on a panicking future returned Pending; \
+                 expected Ready(()) from the catch_unwind Err arm",
+            ),
+        }
+    }
+
+    /// Integration smoke test: `TokioSpawner::spawn` actually wraps
+    /// the spawned future in `PanicLoggingFut`. Verifies the
+    /// behavioural difference end-to-end: a panicking spawned task
+    /// must NOT abort the runtime, AND a healthy spawned task
+    /// queued *after* the panicking one must still complete. Bounded
+    /// by `tokio::time::timeout` so a runtime regression that
+    /// stalled would fail the test rather than hang.
+    #[tokio::test]
+    async fn tokio_spawner_isolates_panicking_tasks_from_runtime() {
+        use crate::transport::Spawner;
+        use std::boxed::Box;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        TokioSpawner.spawn(async {
+            panic!("intentional test panic in spawned task");
+        });
+
+        let healthy_done = Arc::new(AtomicBool::new(false));
+        let healthy_clone = healthy_done.clone();
+        TokioSpawner.spawn(async move {
+            healthy_clone.store(true, Ordering::SeqCst);
+        });
+
+        // Bounded wait — if the runtime is alive, the healthy task
+        // resolves within a few yields. 1s is generous; CI flake
+        // here would indicate a real regression, not a timing bug.
+        let observed = tokio::time::timeout(Duration::from_secs(1), async {
+            while !healthy_done.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+
+        std::panic::set_hook(prev_hook);
+
+        observed.expect(
+            "healthy task spawned after a panicking one must still complete; \
+             a hang here means the panic took down the runtime — \
+             PanicLoggingFut wrapper missing or broken",
+        );
     }
 }

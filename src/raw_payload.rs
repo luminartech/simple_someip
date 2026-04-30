@@ -175,49 +175,49 @@ impl PayloadWireFormat for RawPayload {
         header.flags = sd::Flags::new(bool::from(reboot), header.flags.unicast());
     }
 
-    fn offered_endpoints(&self) -> Vec<crate::OfferedEndpoint> {
+    fn for_each_offered_endpoint<F>(&self, mut f: F)
+    where
+        F: FnMut(crate::OfferedEndpoint),
+    {
         let header = match &self.kind {
             RawPayloadKind::Sd(header) => header,
-            RawPayloadKind::Raw(_) => return Vec::new(),
+            RawPayloadKind::Raw(_) => return,
         };
-        header
-            .entries
-            .iter()
-            .filter_map(|entry| match entry {
-                sd::Entry::OfferService(svc) | sd::Entry::StopOfferService(svc) => {
-                    let is_offer = matches!(entry, sd::Entry::OfferService(_));
-                    let addr = sd::extract_ipv4_endpoint(&header.options);
-                    Some(crate::OfferedEndpoint {
-                        service_id: svc.service_id,
-                        instance_id: svc.instance_id,
-                        major_version: svc.major_version,
-                        minor_version: svc.minor_version,
-                        addr,
-                        is_offer,
-                    })
-                }
-                _ => None,
-            })
-            .collect()
+        for entry in &header.entries {
+            if let sd::Entry::OfferService(svc) | sd::Entry::StopOfferService(svc) = entry {
+                let is_offer = matches!(entry, sd::Entry::OfferService(_));
+                let addr = sd::extract_ipv4_endpoint(&header.options);
+                f(crate::OfferedEndpoint {
+                    service_id: svc.service_id,
+                    instance_id: svc.instance_id,
+                    major_version: svc.major_version,
+                    minor_version: svc.minor_version,
+                    addr,
+                    is_offer,
+                });
+            }
+        }
     }
 
-    fn service_instances(&self) -> Vec<(u16, u16)> {
+    fn for_each_service_instance<F>(&self, mut f: F)
+    where
+        F: FnMut(u16, u16),
+    {
         let header = match &self.kind {
             RawPayloadKind::Sd(header) => header,
-            RawPayloadKind::Raw(_) => return Vec::new(),
+            RawPayloadKind::Raw(_) => return,
         };
-        header
-            .entries
-            .iter()
-            .map(|entry| match entry {
+        for entry in &header.entries {
+            let (svc, inst) = match entry {
                 sd::Entry::FindService(svc)
                 | sd::Entry::OfferService(svc)
                 | sd::Entry::StopOfferService(svc) => (svc.service_id, svc.instance_id),
                 sd::Entry::SubscribeEventGroup(eg) | sd::Entry::SubscribeAckEventGroup(eg) => {
                     (eg.service_id, eg.instance_id)
                 }
-            })
-            .collect()
+            };
+            f(svc, inst);
+        }
     }
 }
 

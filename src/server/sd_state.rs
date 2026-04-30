@@ -10,8 +10,8 @@
 //! parameter on [`SdStateManager::send_offer_service`] becomes the single
 //! migration point for the announcement path.
 
+use core::net::SocketAddrV4;
 use core::sync::atomic::{AtomicU32, Ordering};
-use std::net::SocketAddrV4;
 
 use crate::protocol::sd::{
     self, Entry, Flags, OptionsCount, RebootFlag, ServiceEntry, TransportProtocol,
@@ -27,10 +27,13 @@ use super::{Error, ServerConfig};
 /// the reboot flag on emitted SD messages is
 /// [`RebootFlag::RecentlyRebooted`] from startup until the counter wraps
 /// once, then [`RebootFlag::Continuous`] permanently — `SdStateManager`
-/// tracks that transition and exposes it via [`Self::reboot_flag`] so every
-/// server-side SD emission path reads from a single source of truth.
+/// tracks that transition and bundles the `(session_id, reboot_flag)` pair
+/// atomically through
+/// [`Self::next_session_id_with_reboot_flag`] so every server-side SD
+/// emission path reads from a single source of truth and concurrent
+/// emitters cannot race around the wrap boundary.
 #[derive(Debug)]
-pub(super) struct SdStateManager {
+pub struct SdStateManager {
     /// Packed `(has_wrapped, session_id)` state.
     ///
     /// - bits 0..16: current session id (1..=0xFFFF, never 0).
@@ -50,14 +53,42 @@ const SID_MASK: u32 = 0xFFFF;
 const WRAPPED_BIT: u32 = 1 << 16;
 
 impl SdStateManager {
-    pub(super) const fn new() -> Self {
+    /// Construct an `SdStateManager` with a fresh session counter
+    /// (starts at `1`, reboot flag = `RecentlyRebooted`).
+    ///
+    /// `const fn` so consumers can declare a `static`-storage instance
+    /// without an allocator:
+    ///
+    /// ```ignore
+    /// static SD_STATE: SdStateManager = SdStateManager::new();
+    /// // pass `&SD_STATE` (an `&'static SdStateManager`) into the
+    /// // appropriate `Server` constructor.
+    /// ```
+    #[must_use]
+    pub const fn new() -> Self {
         Self::with_initial(1)
     }
+}
 
-    /// Construct with a specific starting session counter. Primarily used by
-    /// tests to validate wrap behavior; callers in production should use
-    /// [`Self::new`].
-    pub(super) const fn with_initial(initial: u16) -> Self {
+impl Default for SdStateManager {
+    /// Equivalent to [`Self::new`]. Provided for clippy-pedantic
+    /// completeness; bare-metal callers should prefer the explicit
+    /// `SdStateManager::new()` because it is `const` and works in a
+    /// `static` initializer.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SdStateManager {
+    /// Construct with a specific starting session counter. `pub`
+    /// (rather than `pub(super)`) so external test harnesses — e.g.
+    /// `tests/vsomeip_sd_compat.rs`'s wire-format checks — can
+    /// pre-seed counter state to validate wrap-around behaviour
+    /// without driving a full Server lifecycle. Production callers
+    /// should use [`Self::new`].
+    #[must_use]
+    pub const fn with_initial(initial: u16) -> Self {
         Self {
             // has_wrapped starts false; session_id starts at `initial`.
             session_state: AtomicU32::new(initial as u32),
@@ -78,7 +109,15 @@ impl SdStateManager {
     /// `(0xFFFF, Continuous)` or `(0x0001, RecentlyRebooted)` — both
     /// violations of AUTOSAR SOME/IP-SD's stated semantics that the
     /// wrap message itself carries `Continuous`.
-    pub(super) fn next_session_id_with_reboot_flag(&self) -> (u32, RebootFlag) {
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic in practice: the inner `fetch_update` closure
+    /// always returns `Some(_)` (the wrap step is unconditional), so
+    /// the `.unwrap()` is statically infallible. Documented for
+    /// clippy's `missing_panics_doc` and as a tripwire if the closure
+    /// is ever changed to be conditional.
+    pub fn next_session_id_with_reboot_flag(&self) -> (u32, RebootFlag) {
         let prev_state = self
             .session_state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
@@ -204,9 +243,15 @@ impl SdStateManager {
     }
 }
 
+// Phase 20e collapsed `SdStateHandle` / `WrappableSdStateHandle`
+// into the unified `crate::transport::SharedHandle<SdStateManager>`
+// / `WrappableSharedHandle<SdStateManager>` traits. The blanket
+// impls there cover both `&'static SdStateManager` and
+// `Arc<SdStateManager>`; no dedicated trait survives here.
+
 #[cfg(all(test, feature = "server-tokio"))]
 mod tests {
-    use super::{SdStateManager, ServerConfig};
+    use super::{Error, SdStateManager, ServerConfig};
     use crate::protocol::sd::{self, EntryType, Flags, RebootFlag, TransportProtocol};
     use crate::protocol::{MessageType, MessageView, ReturnCode};
     use crate::tokio_transport::TokioSocket;
@@ -365,6 +410,301 @@ mod tests {
             sd.next_session_id();
         }
         assert_eq!(sd.reboot_flag(), RebootFlag::Continuous);
+    }
+
+    // ── Mock-socket tests (default `cargo test` runs these) ────────────
+    //
+    // These exercise `send_offer_service`'s encoding + framing path
+    // through a mock `TransportSocket` that captures the bytes the
+    // loop would have emitted. They run in default `cargo test` (no
+    // MULTICAST flag required) and provide the primary coverage for
+    // the encoding lines.
+    //
+    // The `#[ignore]`d multicast tests further down test the SAME
+    // properties (session-id advancement, wrap, TTL=0 round-trip)
+    // through a real kernel-loopback multicast socket. Those tests
+    // remain because they additionally exercise the
+    // `socket.send_to(multicast_addr, ...)` kernel path, which the
+    // mock can't observe. Don't delete them in favour of the mocks
+    // — the kernel-multicast verification is the only signal we
+    // have for "the wire form actually leaves the OS correctly."
+
+    use crate::transport::{IoErrorKind, ReceivedDatagram, TransportError, TransportSocket};
+    use std::sync::Mutex;
+    use std::vec::Vec;
+
+    /// `TransportSocket` impl that captures every `send_to` call
+    /// instead of touching a real network. `recv_from` and the
+    /// socket-level queries are stubbed because `send_offer_service`
+    /// never touches them.
+    struct CapturingSocket {
+        sent: Mutex<Vec<(SocketAddrV4, Vec<u8>)>>,
+    }
+
+    impl CapturingSocket {
+        fn new() -> Self {
+            Self {
+                sent: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn drain_sent(&self) -> Vec<(SocketAddrV4, Vec<u8>)> {
+            std::mem::take(&mut *self.sent.lock().unwrap())
+        }
+    }
+
+    impl TransportSocket for CapturingSocket {
+        type SendFuture<'a> = core::future::Ready<Result<(), TransportError>>;
+        type RecvFuture<'a> = core::future::Pending<Result<ReceivedDatagram, TransportError>>;
+
+        fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddrV4) -> Self::SendFuture<'a> {
+            self.sent.lock().unwrap().push((target, buf.to_vec()));
+            core::future::ready(Ok(()))
+        }
+
+        fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+            core::future::pending()
+        }
+
+        fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
+            Err(TransportError::Io(IoErrorKind::Other))
+        }
+
+        fn join_multicast_v4(
+            &self,
+            _group: Ipv4Addr,
+            _iface: Ipv4Addr,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn leave_multicast_v4(
+            &self,
+            _group: Ipv4Addr,
+            _iface: Ipv4Addr,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// `TransportSocket` that fails on `send_to` so we can test
+    /// `send_offer_service`'s error propagation path.
+    struct FailingSocket;
+
+    impl TransportSocket for FailingSocket {
+        type SendFuture<'a> = core::future::Ready<Result<(), TransportError>>;
+        type RecvFuture<'a> = core::future::Pending<Result<ReceivedDatagram, TransportError>>;
+
+        fn send_to<'a>(&'a self, _buf: &'a [u8], _target: SocketAddrV4) -> Self::SendFuture<'a> {
+            core::future::ready(Err(TransportError::Io(IoErrorKind::NetworkUnreachable)))
+        }
+
+        fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+            core::future::pending()
+        }
+
+        fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
+            Err(TransportError::Io(IoErrorKind::Other))
+        }
+
+        fn join_multicast_v4(
+            &self,
+            _group: Ipv4Addr,
+            _iface: Ipv4Addr,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn leave_multicast_v4(
+            &self,
+            _group: Ipv4Addr,
+            _iface: Ipv4Addr,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// Assert that the captured datagram is byte-for-byte the
+    /// `OfferService` we expected — SOME/IP envelope, SD entry, and
+    /// the IPv4 endpoint option.
+    fn assert_captured_offer_matches(
+        bytes: &[u8],
+        target: SocketAddrV4,
+        config: &ServerConfig,
+        expected_session_id: u32,
+        expected_reboot: RebootFlag,
+    ) {
+        // Goes to the SD multicast group on port 30490.
+        assert_eq!(
+            target,
+            SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT),
+        );
+        let view = MessageView::parse(bytes).expect("parses as SOME/IP");
+        // SD envelope. message_id = (0xFFFF, 0x8100), notification, ok.
+        assert_eq!(view.header().message_id().service_id(), 0xFFFF);
+        assert_eq!(view.header().message_id().method_id(), 0x8100);
+        assert_eq!(view.header().request_id(), expected_session_id);
+        assert_eq!(
+            view.header().message_type().message_type(),
+            MessageType::Notification,
+        );
+        assert_eq!(view.header().return_code(), ReturnCode::Ok);
+        // SD body.
+        let sd_view = view.sd_header().expect("sd header parses");
+        assert_eq!(sd_view.flags().reboot(), expected_reboot);
+        assert!(sd_view.flags().unicast(), "unicast flag must be set");
+        // Exactly one OfferService entry, exactly one IPv4 endpoint.
+        assert_eq!(sd_view.entries().count(), 1);
+        assert_eq!(sd_view.options().count(), 1);
+        let entry = sd_view.entries().next().unwrap();
+        assert!(matches!(entry.entry_type(), Ok(EntryType::OfferService),));
+        assert_eq!(entry.service_id(), config.service_id);
+        assert_eq!(entry.instance_id(), config.instance_id);
+        assert_eq!(entry.major_version(), config.major_version);
+        assert_eq!(entry.ttl(), config.ttl);
+        assert_eq!(entry.minor_version(), config.minor_version);
+        let opts_count = entry.options_count();
+        assert_eq!(opts_count.first_options_count, 1);
+        assert_eq!(opts_count.second_options_count, 0);
+        let option = sd_view.options().next().unwrap();
+        let (ip, protocol, port) = option.as_ipv4().expect("ipv4 endpoint option");
+        assert_eq!(ip, config.interface);
+        assert_eq!(port, config.local_port);
+        assert_eq!(protocol, TransportProtocol::Udp);
+    }
+
+    #[tokio::test]
+    async fn send_offer_service_through_mock_emits_full_someip_sd_envelope() {
+        let config = ServerConfig::new(
+            Ipv4Addr::LOCALHOST,
+            TEST_ADVERTISED_PORT,
+            TEST_SERVICE_ID,
+            TEST_INSTANCE_ID,
+        );
+        let sd_state = SdStateManager::with_initial(0x1233);
+        let sock = CapturingSocket::new();
+
+        sd_state
+            .send_offer_service(&config, &sock)
+            .await
+            .expect("send_offer_service should succeed against the mock");
+
+        let captured = sock.drain_sent();
+        assert_eq!(captured.len(), 1, "expected exactly one send_to call");
+        let (target, bytes) = &captured[0];
+        // Initial counter 0x1233 → first emission carries 0x0000_1234,
+        // and the manager has not wrapped, so reboot=RecentlyRebooted.
+        assert_captured_offer_matches(
+            bytes,
+            *target,
+            &config,
+            0x0000_1234,
+            RebootFlag::RecentlyRebooted,
+        );
+    }
+
+    #[tokio::test]
+    async fn send_offer_service_through_mock_advances_session_id_across_calls() {
+        let config = ServerConfig::new(
+            Ipv4Addr::LOCALHOST,
+            TEST_ADVERTISED_PORT,
+            TEST_SERVICE_ID,
+            TEST_INSTANCE_ID,
+        );
+        let sd_state = SdStateManager::with_initial(0x1233);
+        let sock = CapturingSocket::new();
+
+        sd_state.send_offer_service(&config, &sock).await.unwrap();
+        sd_state.send_offer_service(&config, &sock).await.unwrap();
+
+        let sent = sock.drain_sent();
+        assert_eq!(sent.len(), 2);
+        let v0 = MessageView::parse(&sent[0].1).unwrap();
+        let v1 = MessageView::parse(&sent[1].1).unwrap();
+        assert_eq!(v0.header().request_id(), 0x0000_1234);
+        assert_eq!(v1.header().request_id(), 0x0000_1235);
+    }
+
+    #[tokio::test]
+    async fn send_offer_service_through_mock_reboot_flag_flips_on_wrap() {
+        let config = ServerConfig::new(
+            Ipv4Addr::LOCALHOST,
+            TEST_ADVERTISED_PORT,
+            TEST_SERVICE_ID,
+            TEST_INSTANCE_ID,
+        );
+        // Seed so the FIRST send takes 0xFFFE → 0xFFFF (still
+        // RecentlyRebooted) and the SECOND sees the wrap to 0x0001
+        // (Continuous).
+        let sd_state = SdStateManager::with_initial(0xFFFE);
+        let sock = CapturingSocket::new();
+        sd_state.send_offer_service(&config, &sock).await.unwrap();
+        sd_state.send_offer_service(&config, &sock).await.unwrap();
+
+        let sent = sock.drain_sent();
+        assert_eq!(sent.len(), 2);
+        let v0 = MessageView::parse(&sent[0].1).unwrap();
+        let v1 = MessageView::parse(&sent[1].1).unwrap();
+        assert_eq!(v0.header().request_id(), 0x0000_FFFF);
+        assert_eq!(
+            v1.header().request_id(),
+            0x0000_0001,
+            "must skip reserved 0 on wrap",
+        );
+        assert_eq!(
+            v0.sd_header().unwrap().flags().reboot(),
+            RebootFlag::RecentlyRebooted,
+            "first emit is pre-wrap",
+        );
+        assert_eq!(
+            v1.sd_header().unwrap().flags().reboot(),
+            RebootFlag::Continuous,
+            "second emit is post-wrap",
+        );
+    }
+
+    #[tokio::test]
+    async fn send_offer_service_through_mock_preserves_zero_ttl() {
+        let mut config = ServerConfig::new(
+            Ipv4Addr::LOCALHOST,
+            TEST_ADVERTISED_PORT,
+            TEST_SERVICE_ID,
+            TEST_INSTANCE_ID,
+        );
+        config.ttl = 0;
+        let sd_state = SdStateManager::with_initial(0x1233);
+        let sock = CapturingSocket::new();
+        sd_state.send_offer_service(&config, &sock).await.unwrap();
+
+        let sent = sock.drain_sent();
+        let view = MessageView::parse(&sent[0].1).unwrap();
+        let entry = view.sd_header().unwrap().entries().next().unwrap();
+        assert_eq!(entry.ttl(), 0, "TTL=0 must round-trip end-to-end");
+    }
+
+    #[tokio::test]
+    async fn send_offer_service_through_mock_propagates_socket_errors() {
+        let config = ServerConfig::new(
+            Ipv4Addr::LOCALHOST,
+            TEST_ADVERTISED_PORT,
+            TEST_SERVICE_ID,
+            TEST_INSTANCE_ID,
+        );
+        let sd_state = SdStateManager::with_initial(0x1233);
+        let sock = FailingSocket;
+        let result = sd_state.send_offer_service(&config, &sock).await;
+        // Narrow assertion: the error must specifically be the
+        // `Io(NetworkUnreachable)` propagated from `FailingSocket::send_to`.
+        // `Err(_)` would also pass on unrelated regressions (encoding
+        // failures, internal panics) and falsely attribute them to
+        // socket-error propagation.
+        match result {
+            Err(Error::Transport(TransportError::Io(IoErrorKind::NetworkUnreachable))) => {}
+            other => panic!(
+                "expected Err(Transport(Io(NetworkUnreachable))) propagated from \
+                 FailingSocket::send_to; got {other:?}",
+            ),
+        }
     }
 
     // ── Multicast-loopback harness ──────────────────────────────────────

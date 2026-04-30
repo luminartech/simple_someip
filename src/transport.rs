@@ -325,11 +325,16 @@ pub enum TransportError {
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct SocketOptions {
-    /// Enable `SO_REUSEADDR` (required for the SD port 30490 on hosts
-    /// that run more than one SOME/IP endpoint on the same interface).
+    /// Enable `SO_REUSEADDR`. Required on the SD port 30490 when more
+    /// than one SOME/IP endpoint runs on the same interface; on Linux,
+    /// callers binding 30490 should set BOTH this and [`Self::reuse_port`]
+    /// because Linux ties multicast-group membership to the
+    /// `SO_REUSEPORT` group rather than `SO_REUSEADDR` alone — without
+    /// REUSEPORT a second binder may fail or silently steal datagrams.
     pub reuse_address: bool,
     /// Enable `SO_REUSEPORT` where supported (Linux, BSD). Ignored on
-    /// platforms that do not expose it.
+    /// platforms that do not expose it. See [`Self::reuse_address`] for
+    /// the Linux-specific reason both are required on the SD socket.
     pub reuse_port: bool,
     /// Outbound multicast interface (`IP_MULTICAST_IF`). `None` lets the
     /// backend choose.
@@ -732,7 +737,17 @@ pub trait Spawner {
 /// event loop.
 pub trait E2ERegistryHandle: Clone + Send + Sync + 'static {
     /// Register an E2E profile for the given key, replacing any prior entry.
-    fn register(&self, key: E2EKey, profile: E2EProfile);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::e2e::E2ERegistryFull`] when the underlying registry has no
+    /// capacity for a new key. Replacing an already-registered key
+    /// always succeeds (the existing slot is reused). Implementations
+    /// that wrap [`crate::e2e::E2ERegistry`] forward this error
+    /// directly; backends with their own storage should pick an
+    /// equivalent overflow contract.
+    fn register(&self, key: E2EKey, profile: E2EProfile)
+    -> Result<(), crate::e2e::E2ERegistryFull>;
 
     /// Remove the E2E configuration for the given key. No-op if absent.
     fn unregister(&self, key: &E2EKey);
@@ -786,23 +801,114 @@ pub trait InterfaceHandle: Clone + Send + Sync + 'static {
     fn set(&self, addr: Ipv4Addr);
 }
 
-/// Default `std`-flavoured impls of [`E2ERegistryHandle`] and
-/// [`InterfaceHandle`] backed by `std::sync::{Arc, Mutex, RwLock}`. Pure
-/// std — no tokio dependency — so they live in the executor-agnostic
-/// transport module rather than the tokio backend.
+/// Shared handle to a single owned-or-borrowed `T`.
+///
+/// One trait covering every "Server holds an `Arc<T>` for sharing
+/// between its run loop and consumer-side tasks" pattern in this
+/// crate. Replaces the three separate handle traits this crate
+/// shipped earlier (`SocketHandle`, `SdStateHandle`,
+/// `EventPublisherHandle`), each of which had the same shape with
+/// a different concrete `T`.
+///
+/// Two impls ship out of the box, both via blanket impls so any
+/// consumer-defined type wrapped in `Arc<T>` or `&'static T`
+/// satisfies the bound automatically:
+///
+/// - `Arc<T>: SharedHandle<T>` on alloc-using builds (`std` or
+///   `bare_metal`-with-alloc). `Arc::clone` increments the
+///   refcount; `get` returns the inner reference.
+/// - `&'static T: SharedHandle<T>` on bare-metal-no-alloc. The
+///   reference is `Copy + Clone + 'static`; the user declares the
+///   underlying `static` storage at boot.
+///
+/// `Clone + 'static` only — neither `Send` nor `Sync` at the
+/// trait level. Method-level `where` clauses on `Server` add
+/// Send bounds at the use sites that need them
+/// (`announcement_loop`'s `+ Send` return type, etc.).
+///
+/// `T: 'static` because both blanket impls require it: an `Arc<T>`
+/// is `'static` only when `T: 'static`, and `&'static T` requires
+/// `T: 'static` by definition.
+///
+/// `?Sized` is intentionally NOT supported — the inline-construction
+/// path ([`WrappableSharedHandle::wrap`]) needs an owned `T`, which
+/// requires `Sized`.
+pub trait SharedHandle<T: 'static>: Clone + 'static {
+    /// Borrow the underlying `T`. Both blanket impls return a
+    /// reference into the underlying storage; consumers should
+    /// not assume more than a fresh borrow's worth of lifetime.
+    fn get(&self) -> &T;
+}
+
+/// Extension of [`SharedHandle`] for handles that can be
+/// constructed inline from an owned `T`.
+///
+/// Required by `Server` constructors that build the underlying
+/// `T` internally (the alloc-using path —
+/// e.g., `Server::new_with_deps` calls `factory.bind(...).await?`
+/// to get an `F::Socket`, then `H::wrap(socket)` to place it
+/// behind the caller's chosen shared-storage). The no-alloc
+/// counterpart constructors (`Server::new_with_handles`) take
+/// pre-built handles directly and don't need this trait.
+///
+/// `&'static T` deliberately does NOT implement this trait —
+/// materializing a `&'static T` from an owned `T` inside a trait
+/// method's body requires an allocator (`Box::leak`) or a
+/// slot-based init pattern (`StaticCell::init`) that the trait
+/// method's signature can't express. No-alloc consumers declare
+/// their `static` storage themselves and pass `&STATIC` into the
+/// no-wrap constructor.
+pub trait WrappableSharedHandle<T: 'static>: SharedHandle<T> {
+    /// Place an owned `T` behind this handle's shared storage.
+    fn wrap(value: T) -> Self;
+}
+
+// `&'static T` is the no-alloc handle. `&'static T: Copy + Clone +
+// 'static` for any `T: 'static`, so the trait bounds are met
+// without further work.
+impl<T: 'static> SharedHandle<T> for &'static T {
+    fn get(&self) -> &T {
+        self
+    }
+}
+
+// `Arc<T>` is the alloc-using handle. `Arc::clone` is the
+// reference-count increment; `wrap` is `Arc::new`. Gated on the
+// internal `_alloc` feature, which is also what gates the
+// crate-root `extern crate alloc` declaration — server,
+// embassy_channels, and std all imply it.
+#[cfg(feature = "_alloc")]
+impl<T: 'static> SharedHandle<T> for alloc::sync::Arc<T> {
+    fn get(&self) -> &T {
+        self
+    }
+}
+
+#[cfg(feature = "_alloc")]
+impl<T: 'static> WrappableSharedHandle<T> for alloc::sync::Arc<T> {
+    fn wrap(value: T) -> Self {
+        alloc::sync::Arc::new(value)
+    }
+}
+
+/// Default `std`-flavoured impls of [`E2ERegistryHandle`] /
+/// [`InterfaceHandle`] / [`SocketHandle`] backed by
+/// `std::sync::{Arc, Mutex, RwLock}`. Pure std — no tokio
+/// dependency — so they live in the executor-agnostic transport
+/// module rather than the tokio backend.
 #[cfg(feature = "std")]
 mod std_handle_impls {
     use super::{E2ERegistryHandle, InterfaceHandle};
     use crate::e2e::Error as E2EError;
-    use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry};
+    use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, E2ERegistryFull};
     use core::net::Ipv4Addr;
     use std::sync::{Arc, Mutex, RwLock};
 
     impl E2ERegistryHandle for Arc<Mutex<E2ERegistry>> {
-        fn register(&self, key: E2EKey, profile: E2EProfile) {
+        fn register(&self, key: E2EKey, profile: E2EProfile) -> Result<(), E2ERegistryFull> {
             self.lock()
                 .expect("e2e registry lock poisoned")
-                .register(key, profile);
+                .register(key, profile)
         }
 
         fn unregister(&self, key: &E2EKey) {
@@ -946,18 +1052,26 @@ pub mod bare_metal_handle_impls {
             self.0.store(u32::from(addr), Ordering::Release);
         }
     }
+    // Phase 20e collapsed `StaticSocketHandle<T>(&'static T)` into a
+    // direct `impl SharedHandle<T> for &'static T` blanket — the
+    // wrapper type's only role was carrying the `'static` lifetime,
+    // which the blanket impl achieves without a wrapper. Consumers
+    // that previously constructed `StaticSocketHandle::new(&SOCKET)`
+    // now pass `&SOCKET` directly into Server's no-wrap constructors.
 }
 
 /// `StaticE2EHandle` — no-alloc `E2ERegistryHandle` backed by a
-/// `&'static` critical-section mutex. Requires `feature = "std"` because
-/// the underlying [`crate::e2e::E2ERegistry`] currently uses `HashMap`.
-/// On a pure-`no_std` target the registry must be ported (see crate
-/// roadmap); until then, callers wanting bare-metal interface handles
-/// (the more common need) can use [`AtomicInterfaceHandle`] alone.
-#[cfg(all(feature = "bare_metal", feature = "std"))]
+/// `&'static` critical-section mutex.
+///
+/// Available in pure `no_std` builds: [`crate::e2e::E2ERegistry`] is
+/// backed by [`heapless::index_map::FnvIndexMap`] (since phase 18a),
+/// so no allocator is required.
+#[cfg(feature = "bare_metal")]
 pub mod bare_metal_e2e_impl {
     use super::E2ERegistryHandle;
-    use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, Error as E2EError};
+    use crate::e2e::{
+        E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, E2ERegistryFull, Error as E2EError,
+    };
     use core::cell::RefCell;
     use embassy_sync::blocking_mutex::Mutex;
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -983,8 +1097,8 @@ pub mod bare_metal_e2e_impl {
     }
 
     impl E2ERegistryHandle for StaticE2EHandle {
-        fn register(&self, key: E2EKey, profile: E2EProfile) {
-            self.0.lock(|cell| cell.borrow_mut().register(key, profile));
+        fn register(&self, key: E2EKey, profile: E2EProfile) -> Result<(), E2ERegistryFull> {
+            self.0.lock(|cell| cell.borrow_mut().register(key, profile))
         }
 
         fn unregister(&self, key: &E2EKey) {
@@ -1023,7 +1137,7 @@ pub mod bare_metal_e2e_impl {
 #[cfg(feature = "bare_metal")]
 pub use bare_metal_handle_impls::AtomicInterfaceHandle;
 
-#[cfg(all(feature = "bare_metal", feature = "std"))]
+#[cfg(feature = "bare_metal")]
 pub use bare_metal_e2e_impl::{StaticE2EHandle, StaticE2EStorage};
 
 // ── Channel-handle abstraction ────────────────────────────────────────────
@@ -1422,7 +1536,13 @@ mod tests {
     struct NullE2ERegistry;
 
     impl E2ERegistryHandle for NullE2ERegistry {
-        fn register(&self, _key: E2EKey, _profile: E2EProfile) {}
+        fn register(
+            &self,
+            _key: E2EKey,
+            _profile: E2EProfile,
+        ) -> Result<(), crate::e2e::E2ERegistryFull> {
+            Ok(())
+        }
         fn unregister(&self, _key: &E2EKey) {}
         fn contains_key(&self, _key: &E2EKey) -> bool {
             false
@@ -1463,7 +1583,8 @@ mod tests {
         r.register(
             key,
             crate::e2e::E2EProfile::Profile4(crate::e2e::Profile4Config::new(0, 8)),
-        );
+        )
+        .expect("NullE2ERegistry::register is infallible");
         assert!(!r.contains_key(&key));
         assert!(r.check(key, b"hello", [0; 8]).is_none());
     }

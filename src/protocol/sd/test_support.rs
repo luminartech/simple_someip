@@ -76,14 +76,13 @@ impl PayloadWireFormat for TestPayload {
     ) -> Result<usize, crate::protocol::Error> {
         self.header.encode(writer)
     }
-    #[cfg(feature = "std")]
     fn new_subscription_sd_header(
         service_id: u16,
         instance_id: u16,
         major_version: u8,
         ttl: u32,
         event_group_id: u16,
-        client_ip: std::net::Ipv4Addr,
+        client_ip: core::net::Ipv4Addr,
         protocol: sd::TransportProtocol,
         client_port: u16,
         reboot_flag: sd::RebootFlag,
@@ -110,7 +109,6 @@ impl PayloadWireFormat for TestPayload {
             options,
         }
     }
-    #[cfg(feature = "std")]
     fn set_reboot_flag(header: &mut TestSdHeader, reboot: sd::RebootFlag) {
         header.flags = sd::Flags::new(bool::from(reboot), header.flags.unicast());
     }

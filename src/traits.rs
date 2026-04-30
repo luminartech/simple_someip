@@ -1,9 +1,7 @@
-#[cfg(feature = "std")]
 use crate::protocol::sd;
 use crate::protocol::{self, MessageId, sd::Flags};
 
 /// Information about a service endpoint extracted from an SD message.
-#[cfg(feature = "std")]
 pub struct OfferedEndpoint {
     /// The SOME/IP service ID.
     pub service_id: u16,
@@ -14,7 +12,7 @@ pub struct OfferedEndpoint {
     /// The minor version of the offered service interface.
     pub minor_version: u32,
     /// The IPv4 socket address extracted from the SD options, if present.
-    pub addr: Option<std::net::SocketAddrV4>,
+    pub addr: Option<core::net::SocketAddrV4>,
     /// `true` for `OfferService`, `false` for `StopOfferService`.
     pub is_offer: bool,
 }
@@ -87,7 +85,6 @@ pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
     fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
 
     /// Construct an SD header for subscribing to an event group.
-    #[cfg(feature = "std")]
     #[allow(clippy::too_many_arguments)]
     fn new_subscription_sd_header(
         service_id: u16,
@@ -95,7 +92,7 @@ pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
         major_version: u8,
         ttl: u32,
         event_group_id: u16,
-        client_ip: std::net::Ipv4Addr,
+        client_ip: core::net::Ipv4Addr,
         protocol: sd::TransportProtocol,
         client_port: u16,
         reboot_flag: sd::RebootFlag,
@@ -103,31 +100,66 @@ pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
 
     /// Override the reboot flag on an SD header in-place.
     ///
-    /// Used by `Client::sd_announcements_loop` (when the `client` feature is
-    /// enabled) to refresh the reboot flag per-tick from the client's
-    /// tracked state. Defaults to a no-op so that `std`-but-not-`client`
-    /// consumers (e.g. host-side tooling that builds SD headers manually
-    /// without ever driving an announcement loop) don't have to provide
-    /// an impl that will never be called.
-    #[cfg(feature = "std")]
+    /// Used by `Client::sd_announcements_loop` to refresh the reboot
+    /// flag per-tick from the client's tracked state. Defaults to a
+    /// no-op so payload types that never participate in SD reboot
+    /// tracking (e.g. `RawPayload` for static-only SD use) don't have
+    /// to provide an impl that will never be called.
     fn set_reboot_flag(_header: &mut Self::SdHeader, _reboot: sd::RebootFlag) {}
 
-    /// Extract offered/stopped service endpoints from this SD payload.
+    /// Visit each offered / stopped service endpoint in this SD
+    /// payload with `f`.
     ///
-    /// Default implementation returns an empty vec. Concrete implementations
-    /// that have access to SD entries and options should override this.
-    #[cfg(feature = "std")]
-    fn offered_endpoints(&self) -> std::vec::Vec<OfferedEndpoint> {
-        std::vec::Vec::new()
+    /// Visitor pattern (rather than returning a `Vec`) so the trait
+    /// is `no_std`-compatible: the implementation walks its internal
+    /// SD entries and invokes `f` for each `OfferedEndpoint`. The
+    /// `Client` run loop uses this to auto-populate its service
+    /// registry from inbound discovery messages.
+    ///
+    /// The default implementation visits nothing — payload types
+    /// that don't carry SD entries (e.g. application payloads) leave
+    /// it unimplemented; SD-bearing types (e.g. `RawPayload`'s
+    /// `VecSdHeader` payload) override.
+    fn for_each_offered_endpoint<F>(&self, _f: F)
+    where
+        F: FnMut(OfferedEndpoint),
+    {
     }
 
-    /// Return `(service_id, instance_id)` pairs for every SD entry in this
-    /// payload, regardless of entry type.
+    /// Visit `(service_id, instance_id)` for every SD entry in this
+    /// payload, regardless of entry type, with `f`.
     ///
-    /// Used for per-service-instance session/reboot tracking so that all SD
-    /// traffic (not just offers) contributes to reboot detection.
+    /// Used by the `Client` run loop for per-service-instance
+    /// session/reboot tracking so that all SD traffic (not just
+    /// offers) contributes to reboot detection.
+    ///
+    /// Visitor pattern for the same `no_std` reason as
+    /// [`Self::for_each_offered_endpoint`]; default visits nothing.
+    fn for_each_service_instance<F>(&self, _f: F)
+    where
+        F: FnMut(u16, u16),
+    {
+    }
+
+    /// Convenience accessor returning all offered endpoints as a heap
+    /// `Vec`. Wraps [`Self::for_each_offered_endpoint`] so std users
+    /// get the original ergonomic shape; bare-metal users use the
+    /// visitor directly. Gated on `feature = "std"`.
+    #[cfg(feature = "std")]
+    fn offered_endpoints(&self) -> std::vec::Vec<OfferedEndpoint> {
+        let mut out = std::vec::Vec::new();
+        self.for_each_offered_endpoint(|ep| out.push(ep));
+        out
+    }
+
+    /// Convenience accessor returning all `(service_id, instance_id)`
+    /// pairs as a heap `Vec`. Wraps
+    /// [`Self::for_each_service_instance`] for std users. Gated on
+    /// `feature = "std"`.
     #[cfg(feature = "std")]
     fn service_instances(&self) -> std::vec::Vec<(u16, u16)> {
-        std::vec::Vec::new()
+        let mut out = std::vec::Vec::new();
+        self.for_each_service_instance(|svc, inst| out.push((svc, inst)));
+        out
     }
 }
