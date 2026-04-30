@@ -136,7 +136,7 @@ impl TransportFactory for TokioTransport {
 ///
 /// Drives [`tokio::net::UdpSocket::poll_send_to`] directly so the GAT
 /// associated type ([`TransportSocket::SendFuture`]) can be named on
-/// stable Rust without heap-allocating a [`futures::future::BoxFuture`]
+/// stable Rust without heap-allocating a `futures::future::BoxFuture`
 /// per datagram. Auto-derives `Send`.
 pub struct SendTo<'a> {
     socket: &'a UdpSocket,
@@ -160,7 +160,7 @@ impl Future for SendTo<'_> {
 ///
 /// Drives [`tokio::net::UdpSocket::poll_recv_from`] directly so the GAT
 /// associated type ([`TransportSocket::RecvFuture`]) can be named on
-/// stable Rust without heap-allocating a [`futures::future::BoxFuture`]
+/// stable Rust without heap-allocating a `futures::future::BoxFuture`
 /// per datagram. Auto-derives `Send`.
 pub struct RecvFrom<'a> {
     socket: &'a UdpSocket,
@@ -273,44 +273,56 @@ impl Timer for TokioTimer {
     }
 }
 
+/// Wraps a `Future` so that any panic during `poll` is logged via
+/// `tracing::error!` and the future then resolves cleanly. Lets
+/// `TokioSpawner::spawn` use exactly **one** tokio task per call
+/// instead of pairing each work future with a `JoinHandle`-watcher
+/// task — the prior watcher-pair pattern doubled task count and
+/// added `UNICAST_SOCKETS_CAP` extra tasks per `Client`.
+struct PanicLoggingFut<F> {
+    inner: F,
+}
+
+impl<F: Future<Output = ()>> Future for PanicLoggingFut<F> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: structural pinning of `inner`. We never move out of
+        // `inner` and project pin through it consistently.
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.inner) };
+        // `AssertUnwindSafe` is sound here because:
+        //  - if `inner.poll` panics, the future is logged-and-dropped
+        //    and never polled again, so any half-mutated state is
+        //    discarded with the future itself.
+        //  - the spawned task is the sole owner of this future; no
+        //    aliasing observer can witness inconsistent state.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(poll) => poll,
+            Err(payload) => {
+                let msg = panic_payload_str(&payload);
+                tracing::error!(
+                    panic_message = msg,
+                    "spawned task panicked; channels will close",
+                );
+                // The panicking poll's borrows are gone (caught
+                // unwind dropped the stack frame), so the dependent
+                // `Error::SocketClosedUnexpectedly` will surface on
+                // the receiver side as the caller's channel ends
+                // drop. Resolve the future cleanly so tokio doesn't
+                // also flag this as an aborted task.
+                Poll::Ready(())
+            }
+        }
+    }
+}
+
 impl crate::transport::Spawner for TokioSpawner {
     fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
         // Drop the returned `JoinHandle` — per-socket loops run until
         // their owning `SocketManager` drops its channel ends, at
-        // which point the future completes naturally.
-        //
-        // Spawn the future on tokio. If it panics, tokio aborts the
-        // task and the `JoinHandle::await` resolves to a `JoinError`
-        // with `is_panic() == true`; we log through the `tracing`
-        // pipeline so the panic is visible alongside the rest of the
-        // crate's diagnostics, instead of being swallowed to stderr.
-        // The caller's `Error::SocketClosedUnexpectedly` (surfaced
-        // when the panicking task drops its channel ends) then has a
-        // corresponding log line. Done via a watcher task rather than
-        // `futures::FutureExt::catch_unwind` so we don't need
-        // futures-util's std feature on the bare-metal builds (the
-        // tokio backend pulls std anyway, but the dep wiring is
-        // simpler this way).
-        let join = tokio::spawn(future);
-        drop(tokio::spawn(async move {
-            match join.await {
-                Ok(()) => {}
-                Err(e) if e.is_panic() => {
-                    let payload = e.into_panic();
-                    let msg = panic_payload_str(&payload);
-                    tracing::error!(
-                        panic_message = msg,
-                        "spawned task panicked; channels will close",
-                    );
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        join_error = ?e,
-                        "spawned task ended without panic (e.g. cancelled)",
-                    );
-                }
-            }
-        }));
+        // which point the future completes naturally. Panic-logging
+        // is built into the wrapper; one task per spawn.
+        drop(tokio::spawn(PanicLoggingFut { inner: future }));
     }
 }
 

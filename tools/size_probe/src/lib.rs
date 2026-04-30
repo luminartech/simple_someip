@@ -17,16 +17,21 @@ use core::panic::PanicInfo;
 use core::ptr;
 use core::slice;
 
-/// Stub allocator. Some transitive dep pulls `extern crate alloc`
-/// even with simple-someip's `default-features = false`, requiring a
-/// `#[global_allocator]` link target. The codec-only FFI surface
-/// (header encode + E2E protect/check) never actually allocates, so
-/// this stub returning null on alloc is sound for the probe; if any
-/// path it fronts ever does allocate, that's an explicit FFI-design
-/// bug surfaced at link time, not silent corruption at runtime.
-struct PanicAllocator;
+/// Stub allocator that returns null on every `alloc` call. Some
+/// transitive dep pulls `extern crate alloc` even with simple-someip's
+/// `default-features = false`, requiring a `#[global_allocator]`
+/// link target. The codec-only FFI surface (header encode + E2E
+/// protect/check) never actually allocates, so a `null_mut()` return
+/// is sound for the probe — if any code path ever does try to alloc,
+/// the resulting null deref shows up at runtime as the FFI-design
+/// bug it is, rather than being papered over with hidden heap usage.
+/// (Named `NullAllocator` rather than `PanicAllocator` because it
+/// returns null, it doesn't panic, and the original name was
+/// confusing reviewers into thinking link-time failures were the
+/// failure mode.)
+struct NullAllocator;
 
-unsafe impl GlobalAlloc for PanicAllocator {
+unsafe impl GlobalAlloc for NullAllocator {
     unsafe fn alloc(&self, _: Layout) -> *mut u8 {
         ptr::null_mut()
     }
@@ -34,14 +39,14 @@ unsafe impl GlobalAlloc for PanicAllocator {
 }
 
 #[global_allocator]
-static ALLOC: PanicAllocator = PanicAllocator;
+static ALLOC: NullAllocator = NullAllocator;
 
 use simple_someip::WireFormat;
 use simple_someip::e2e::{
     Profile4Config, Profile4State, Profile5Config, Profile5State, check_profile4, check_profile5,
     protect_profile4, protect_profile5,
 };
-use simple_someip::protocol::{Header, MessageId, MessageType, MessageTypeField, ReturnCode};
+use simple_someip::protocol::{Header, MessageId, MessageTypeField, ReturnCode};
 
 /// Required for no_std staticlib targeting thumbv7em.
 #[panic_handler]
@@ -79,12 +84,23 @@ pub unsafe extern "C" fn someip_header_encode(
     let h = unsafe { &*header };
     let message_id = MessageId::new_from_service_and_method(h.service_id, h.method_id);
     let request_id = (u32::from(h.client_id) << 16) | u32::from(h.session_id);
-    let Ok(msg_type_raw) = MessageType::try_from(h.message_type & 0xBF) else {
+    // Validate the message_type byte BEFORE splitting off the TP
+    // flag. `MessageTypeField::try_from` rejects any reserved-bit
+    // pattern (e.g. `0x40`) instead of silently masking it down to
+    // `Request` like a `MessageType::try_from(byte & 0xBF)` would.
+    let Ok(msg_type) = MessageTypeField::try_from(h.message_type) else {
         return 0;
     };
-    let msg_type = MessageTypeField::new(msg_type_raw, (h.message_type & 0x20) != 0);
     let Ok(ret_code) = ReturnCode::try_from(h.return_code) else {
         return 0;
+    };
+    // SOME/IP `length` covers (request_id .. end-of-payload) — the 8
+    // SOME/IP header bytes after the length field plus the payload.
+    // `Header::new` takes `payload_len` and adds 8 internally, so
+    // recover payload_len from the caller's full-`length`.
+    let payload_len = match (h.length as usize).checked_sub(8) {
+        Some(p) => p,
+        None => return 0,
     };
     let header = Header::new(
         message_id,
@@ -93,7 +109,7 @@ pub unsafe extern "C" fn someip_header_encode(
         h.interface_version,
         msg_type,
         ret_code,
-        0,
+        payload_len,
     );
     let out = unsafe { slice::from_raw_parts_mut(buf, buf_len) };
     header.encode(&mut &mut out[..]).unwrap_or(0)
@@ -136,7 +152,10 @@ pub unsafe extern "C" fn e2e_profile4_round_trip(
 
     // Probe-only stack buffer; production code uses caller-supplied storage.
     let mut buf = [0u8; 1500];
-    if buf.len() < payload_len + 12 {
+    let Some(needed) = payload_len.checked_add(12) else {
+        return out;
+    };
+    if buf.len() < needed {
         return out;
     }
     let Ok(protected_len) = protect_profile4(&config, &mut protect_state, payload, &mut buf) else {
@@ -184,7 +203,10 @@ pub unsafe extern "C" fn e2e_profile5_round_trip(
     let mut protect_state = Profile5State::with_initial_counter((initial_counter & 0xFF) as u8);
 
     let mut buf = [0u8; 1500];
-    if buf.len() < payload_len + 4 {
+    let Some(needed) = payload_len.checked_add(4) else {
+        return out;
+    };
+    if buf.len() < needed {
         return out;
     }
     let Ok(protected_len) = protect_profile5(&config, &mut protect_state, payload, &mut buf) else {
