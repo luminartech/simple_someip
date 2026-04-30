@@ -25,12 +25,18 @@ simple-someip = { path = "..", version = "0.8", default-features = false, featur
     "server",
     "bare_metal",
 ] }
-# Pinned to a version known to coexist with `simple-someip`'s
-# `embassy-sync = "0.6"` dep. embassy-net 0.4.x is the last
-# release line that builds against embassy-sync 0.6; later
-# embassy-net releases (0.5+) require embassy-sync 0.7+, which
-# would force a parallel-version cargo resolution that bloats the
-# binary. Bumping both deps in lockstep is its own future phase.
+# Pinned to embassy-net 0.4.x. NOTE: this does NOT unify the
+# `embassy-sync` version across the resolved graph — embassy-net
+# 0.4 itself depends on `embassy-sync 0.5.x`, while
+# `simple-someip` (and this crate) use `embassy-sync 0.6`. So the
+# resolved Cargo.lock already carries both versions in parallel,
+# which costs some binary size on firmware targets. We accept
+# that today because the alternative is worse: newer embassy-net
+# releases (0.5+) move on to embassy-sync 0.7+, widening the
+# split further unless the whole embassy stack is upgraded
+# together. Unifying on a single embassy-sync version is a
+# future phase that requires coordinated dep bumps across
+# embassy-{sync,net,executor,time}.
 embassy-net = { version = "0.4", default-features = false, features = [
     "udp",
     "proto-ipv4",
