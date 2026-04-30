@@ -1,3 +1,11 @@
+# Standalone-workspace marker: `tools/size_probe` is intentionally
+# excluded from the parent `[workspace]` (its `#[panic_handler]` +
+# `#[global_allocator]` clash with `std`'s lang items when the
+# workspace is checked on a host target). Empty `[workspace]` table
+# makes this `Cargo.toml` its own workspace root so cargo doesn't
+# walk up to the parent and complain.
+[workspace]
+
 [package]
 name = "size_probe"
 version = "0.0.0"
@@ -10,7 +18,7 @@ publish = false
 # only keeps what an actual halo-style FFI consumer would call.
 #
 # Build:
-#   cargo build -p size_probe --release --target thumbv7em-none-eabihf
+#   cd tools/size_probe && cargo build --release --target thumbv7em-none-eabihf
 #
 # Measure:
 #   llvm-size target/thumbv7em-none-eabihf/release/libsize_probe.a

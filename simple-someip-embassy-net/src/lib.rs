@@ -47,3 +47,18 @@ pub mod socket;
 
 pub use factory::{EmbassyNetFactory, SocketPool};
 pub use socket::EmbassyNetSocket;
+
+/// Suggested link-layer MTU for sizing [`SocketPool`] RX/TX buffers
+/// and matching driver `Capabilities::max_transmission_unit`.
+///
+/// 1500 is the canonical Ethernet MTU and the default
+/// [`simple_someip::UDP_BUFFER_SIZE`] also lands at 1500. Sizing
+/// `SocketPool<_, RX, TX>` with `RX = TX = LINK_MTU` is the
+/// configuration these docs assume; smaller values risk dropping
+/// full-MTU datagrams at the embassy-net layer (see `SocketPool`
+/// for details). Distinct from
+/// [`simple_someip::UDP_BUFFER_SIZE`] because that constant is the
+/// *application*-payload cap and this one is the *link-layer*
+/// frame cap — they coincide at 1500 today but the concepts are
+/// orthogonal.
+pub const LINK_MTU: usize = 1500;

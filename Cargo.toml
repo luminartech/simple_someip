@@ -7,8 +7,17 @@ members = [
     "examples/discovery_client",
     "examples/embassy_net_client",
     "simple-someip-embassy-net",
-    "tools/size_probe",
 ]
+# `tools/size_probe` is a `no_std` `staticlib` with its own
+# `#[panic_handler]` and `#[global_allocator]` — including it as a
+# workspace member triggers `E0152` when the workspace is checked
+# under a host target (`cargo clippy --workspace --all-features`),
+# because `simple-someip` brings in `std`'s panic_impl through its
+# transitive deps. Excluding keeps the probe usable via its own
+# `cargo build -p size_probe --target thumbv7em-none-eabihf`
+# invocation (it's a flash-size measurement tool, not a publishable
+# crate) without poisoning the host workspace lint gate.
+exclude = ["tools/size_probe"]
 
 [package]
 name = "simple-someip"
