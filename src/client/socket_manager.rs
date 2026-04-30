@@ -567,13 +567,16 @@ where
         const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 16;
         let mut consecutive_recv_errors: u32 = 0;
         let mut buf = [0u8; UDP_BUFFER_SIZE];
+        // Iteration counter used solely to flip `select_biased!` arm
+        // priority each turn so a sustained one-sided load (only-send
+        // or only-recv) cannot starve the other arm. We can't use
+        // futures-util's pseudo-random `select!` because that needs
+        // `std`; `select_biased!` polls top-down deterministically.
+        // Flipping the priority each iteration approximates the
+        // fairness `select!` would give without pulling std.
+        let mut prefer_recv_first = false;
 
         loop {
-            // `select!` (not `select_biased!`) gives pseudo-random
-            // fairness across ready arms — matches prior
-            // `tokio::select!` behavior and avoids starving either
-            // the send or recv arm under sustained one-sided load.
-            //
             // The fresh `.fuse()`'d per-iteration futures are pinned
             // on the stack (required: `Fuse<_>` is not `Unpin`).
             // Returning an `Outcome<P>` scalar from the inner block
@@ -584,11 +587,19 @@ where
                 let send_fut = MpscRecv::recv(&mut tx_rx).fuse();
                 let recv_fut = socket.recv_from(&mut buf).fuse();
                 pin_mut!(send_fut, recv_fut);
-                select_biased! {
-                    message = send_fut => Outcome::Send(message),
-                    result = recv_fut => Outcome::Recv(result),
+                if prefer_recv_first {
+                    select_biased! {
+                        result = recv_fut => Outcome::Recv(result),
+                        message = send_fut => Outcome::Send(message),
+                    }
+                } else {
+                    select_biased! {
+                        message = send_fut => Outcome::Send(message),
+                        result = recv_fut => Outcome::Recv(result),
+                    }
                 }
             };
+            prefer_recv_first = !prefer_recv_first;
 
             match outcome {
                 Outcome::Send(Some(send_message)) => {

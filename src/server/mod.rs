@@ -968,12 +968,14 @@ where
             return Err(Error::InvalidUsage("passive_server_run"));
         }
 
+        // Iteration counter used to flip `select_biased!` arm priority
+        // each turn. We can't use the pseudo-random `select!` (it needs
+        // `std`), so flipping arm order each iteration approximates the
+        // fairness it would give without pulling std — a sustained
+        // one-sided load (only-unicast or only-sd) cannot starve the
+        // other arm.
+        let mut prefer_sd_first = false;
         loop {
-            // `select!` (not `select_biased!`) gives pseudo-random fairness
-            // across ready arms each poll — matches the prior
-            // `tokio::select!` behavior and avoids starving either the
-            // unicast or SD-multicast arm under sustained one-sided load.
-            //
             // SAFETY: both arms call `TransportSocket::recv_from`. The
             // `TokioSocket` backend is cancel-safe per tokio docs — a
             // non-selected arm can be dropped without losing in-flight
@@ -1000,27 +1002,51 @@ where
                     .fuse();
                 let sd_fut = self.sd_socket.get().recv_from(&mut *sd_buf).fuse();
                 pin_mut!(unicast_fut, sd_fut);
-                select_biased! {
-                    result = unicast_fut => {
-                        let datagram = result?;
-                        (
-                            datagram.bytes_received,
-                            core::net::SocketAddr::V4(datagram.source),
-                            "unicast",
-                            true,
-                        )
+                if prefer_sd_first {
+                    select_biased! {
+                        result = sd_fut => {
+                            let datagram = result?;
+                            (
+                                datagram.bytes_received,
+                                core::net::SocketAddr::V4(datagram.source),
+                                "sd-multicast",
+                                false,
+                            )
+                        }
+                        result = unicast_fut => {
+                            let datagram = result?;
+                            (
+                                datagram.bytes_received,
+                                core::net::SocketAddr::V4(datagram.source),
+                                "unicast",
+                                true,
+                            )
+                        }
                     }
-                    result = sd_fut => {
-                        let datagram = result?;
-                        (
-                            datagram.bytes_received,
-                            core::net::SocketAddr::V4(datagram.source),
-                            "sd-multicast",
-                            false,
-                        )
+                } else {
+                    select_biased! {
+                        result = unicast_fut => {
+                            let datagram = result?;
+                            (
+                                datagram.bytes_received,
+                                core::net::SocketAddr::V4(datagram.source),
+                                "unicast",
+                                true,
+                            )
+                        }
+                        result = sd_fut => {
+                            let datagram = result?;
+                            (
+                                datagram.bytes_received,
+                                core::net::SocketAddr::V4(datagram.source),
+                                "sd-multicast",
+                                false,
+                            )
+                        }
                     }
                 }
             };
+            prefer_sd_first = !prefer_sd_first;
             let data = if from_unicast {
                 &unicast_buf[..len]
             } else {

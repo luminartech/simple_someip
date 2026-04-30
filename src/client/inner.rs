@@ -1072,10 +1072,21 @@ where
                 let unicast_fut = Self::receive_any_unicast(unicast_sockets).fuse();
                 pin_mut!(control_fut, sleep_fut, discovery_fut, unicast_fut);
 
-                // `select!` (not `select_biased!`) randomizes the
-                // arm check order each poll so no single arm can
-                // starve the others under sustained load. Matches
-                // the original `tokio::select!` fairness behavior.
+                // `select_biased!` (rather than `select!`) because
+                // futures-util's pseudo-random `select!` requires
+                // `std`. Top-down arm priority is intentional here:
+                // `control_fut` sits first because control messages
+                // drive loop lifecycle (shutdown, queue submissions)
+                // and dropping them on the floor would deadlock the
+                // caller's request path. Beyond control, the order
+                // is `sleep_fut → discovery_fut → unicast_fut`; the
+                // sleep arm is a 125 ms tick so it can't drive
+                // sustained pressure, and discovery (multicast SD)
+                // is bursty enough that unicast is not at real risk
+                // of starvation in practice. If a future workload
+                // proves otherwise, the per-iteration arm-flip
+                // pattern used in `socket_manager`'s send/recv
+                // select can be lifted here too.
                 select_biased! {
                 // Receive a control message
                 ctrl = control_fut => {
