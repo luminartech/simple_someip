@@ -85,10 +85,14 @@ jobs:
       # feature set when the alloc-symbol audit reads it.
       - name: client + bare_metal
         run: |
-          # Wipe the bare_metal-only artifact from earlier in this
-          # job so the audit step doesn't accidentally read it; then
-          # build fresh under client+bare_metal.
-          rm -f target/thumbv7em-none-eabihf/debug/libsimple_someip*.rlib
+          # Invalidate the cargo fingerprint for any prior `simple-someip`
+          # rlib in this target so the audit step sees an artifact built
+          # under exactly `client,bare_metal` and not a leftover from
+          # `bare_metal alone` / `server + bare_metal` / `client + server +
+          # bare_metal` — `rm -f` of just the rlib does NOT invalidate the
+          # fingerprint, so the next build would no-op without rewriting
+          # it. `cargo clean -p` does both in one step.
+          cargo clean -p simple-someip --target thumbv7em-none-eabihf
           cargo build --target thumbv7em-none-eabihf --no-default-features --features client,bare_metal
       - name: alloc-symbol audit (client + bare_metal must be alloc-free)
         # If `client + bare_metal` ever starts pulling `__rust_alloc`,
@@ -98,16 +102,26 @@ jobs:
         # `client+server` builds DO reference alloc symbols via
         # `Arc<EventPublisher>` — documented; not gated here.)
         run: |
-          rlib=$(find target/thumbv7em-none-eabihf -name 'libsimple_someip*.rlib' | head -1)
-          if [ -z "$rlib" ]; then
-            echo "::error::no simple_someip rlib found under target/thumbv7em-none-eabihf"
+          # Pin to the exact rlib path. `find ... | head -1` was
+          # nondeterministic and silently picked up stale debug-script
+          # artifacts. With `cargo clean -p` above, this path is
+          # guaranteed to be the artifact built by the previous step.
+          rlib="target/thumbv7em-none-eabihf/debug/libsimple_someip.rlib"
+          if [ ! -f "$rlib" ]; then
+            echo "::error::expected rlib not found at $rlib"
+            ls -la target/thumbv7em-none-eabihf/debug/ || true
             exit 1
           fi
-          alloc_refs=$(nm -A "$rlib" 2>/dev/null | grep -c -E '__rust_alloc|__rg_alloc' || true)
+          # No `2>/dev/null` on `nm`: a tool failure (e.g. missing
+          # binutils, malformed rlib) used to swallow the error and
+          # report 0 alloc refs, silently letting a regression through.
+          # `set -o pipefail` plus visible stderr makes that loud.
+          set -o pipefail
+          alloc_refs=$(nm -A "$rlib" | grep -c -E '__rust_alloc|__rg_alloc' || true)
           echo "client+bare_metal alloc-symbol references: $alloc_refs"
           if [ "$alloc_refs" -ne 0 ]; then
             echo "::error::client+bare_metal must be alloc-free; found $alloc_refs alloc references."
-            nm -A "$rlib" 2>/dev/null | grep -E '__rust_alloc|__rg_alloc' || true
+            nm -A "$rlib" | grep -E '__rust_alloc|__rg_alloc' || true
             exit 1
           fi
 
