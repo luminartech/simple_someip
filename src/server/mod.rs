@@ -544,19 +544,38 @@ where
     /// (`Arc<...>` on alloc, `&'static ...` on no-alloc).
     ///
     /// `config.local_port` is back-filled from
-    /// `unicast_socket.local_addr()?.port()` so SD offers and
-    /// event publishers advertise the actual bound port.
+    /// `unicast_socket.local_addr()?.port()` *only when the caller
+    /// passed `local_port = 0`*. If the caller supplied a non-zero
+    /// `local_port`, it must equal the actual bound port — otherwise
+    /// the SD offers would advertise a port the unicast socket isn't
+    /// listening on. This matches `Server::new_with_deps`'s
+    /// back-fill-only-on-zero discipline.
     ///
     /// # Errors
     ///
     /// Returns an error if querying `unicast_socket.local_addr()`
-    /// fails on the underlying transport.
+    /// fails on the underlying transport, or
+    /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
+    /// and does not equal the unicast socket's bound port.
     pub fn new_with_handles(
         deps: ServerHandles<F, Tm, R, S, H, Hsd, Hep>,
         mut config: ServerConfig,
     ) -> Result<Self, Error> {
         let bound_port = deps.unicast_socket.get().local_addr()?.port();
-        config.local_port = bound_port;
+        if config.local_port == 0 {
+            config.local_port = bound_port;
+        } else if config.local_port != bound_port {
+            tracing::error!(
+                "ServerConfig.local_port ({}) does not match unicast socket's \
+                 bound port ({}); SD offers would lie. Pass local_port = 0 to \
+                 auto-fill from the bound port instead.",
+                config.local_port,
+                bound_port,
+            );
+            return Err(Error::InvalidUsage(
+                "new_with_handles_local_port_mismatch",
+            ));
+        }
         tracing::info!(
             "Server (handles) bound to {}:{} for service 0x{:04X}",
             config.interface,
@@ -598,13 +617,30 @@ where
     /// # Errors
     ///
     /// Returns an error if querying `unicast_socket.local_addr()`
-    /// fails on the underlying transport.
+    /// fails on the underlying transport, or
+    /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
+    /// and does not equal the unicast socket's bound port (same
+    /// back-fill-only-on-zero discipline as
+    /// [`Self::new_with_handles`]).
     pub fn new_passive_with_handles(
         deps: ServerHandles<F, Tm, R, S, H, Hsd, Hep>,
         mut config: ServerConfig,
     ) -> Result<Self, Error> {
         let bound_port = deps.unicast_socket.get().local_addr()?.port();
-        config.local_port = bound_port;
+        if config.local_port == 0 {
+            config.local_port = bound_port;
+        } else if config.local_port != bound_port {
+            tracing::error!(
+                "ServerConfig.local_port ({}) does not match unicast socket's \
+                 bound port ({}); event publishers would advertise a port \
+                 nothing is listening on. Pass local_port = 0 to auto-fill.",
+                config.local_port,
+                bound_port,
+            );
+            return Err(Error::InvalidUsage(
+                "new_passive_with_handles_local_port_mismatch",
+            ));
+        }
         tracing::info!(
             "Passive server (handles) bound to {}:{} for service 0x{:04X}",
             config.interface,
@@ -1010,11 +1046,14 @@ where
             // of `unicast_buf` / `sd_buf` / the sockets end when the
             // select macro returns, freeing the buffer we index into
             // below.
-            let (len, addr, source, from_unicast) = {
+            // Each arm returns just `(datagram, from_unicast)`; the
+            // `(len, addr, source)` derivation lives once below the
+            // select so the arm-flip pattern doesn't duplicate it.
+            let (datagram, from_unicast) = {
                 // Reborrow `&mut *foo` rather than `&mut foo` because
                 // `unicast_buf` / `sd_buf` are `&mut [u8]` parameters
-                // here (caller-owned), not owned `Vec<u8>` locals
-                // — direct `&mut foo` would produce `&mut &mut [u8]`.
+                // here (caller-owned), not owned `Vec<u8>` locals —
+                // direct `&mut foo` would produce `&mut &mut [u8]`.
                 let unicast_fut = self
                     .unicast_socket
                     .get()
@@ -1024,49 +1063,20 @@ where
                 pin_mut!(unicast_fut, sd_fut);
                 if prefer_sd_first {
                     select_biased! {
-                        result = sd_fut => {
-                            let datagram = result?;
-                            (
-                                datagram.bytes_received,
-                                core::net::SocketAddr::V4(datagram.source),
-                                "sd-multicast",
-                                false,
-                            )
-                        }
-                        result = unicast_fut => {
-                            let datagram = result?;
-                            (
-                                datagram.bytes_received,
-                                core::net::SocketAddr::V4(datagram.source),
-                                "unicast",
-                                true,
-                            )
-                        }
+                        result = sd_fut => (result?, false),
+                        result = unicast_fut => (result?, true),
                     }
                 } else {
                     select_biased! {
-                        result = unicast_fut => {
-                            let datagram = result?;
-                            (
-                                datagram.bytes_received,
-                                core::net::SocketAddr::V4(datagram.source),
-                                "unicast",
-                                true,
-                            )
-                        }
-                        result = sd_fut => {
-                            let datagram = result?;
-                            (
-                                datagram.bytes_received,
-                                core::net::SocketAddr::V4(datagram.source),
-                                "sd-multicast",
-                                false,
-                            )
-                        }
+                        result = unicast_fut => (result?, true),
+                        result = sd_fut => (result?, false),
                     }
                 }
             };
             prefer_sd_first = !prefer_sd_first;
+            let len = datagram.bytes_received;
+            let addr = core::net::SocketAddr::V4(datagram.source);
+            let source = if from_unicast { "unicast" } else { "sd-multicast" };
             let data = if from_unicast {
                 &unicast_buf[..len]
             } else {

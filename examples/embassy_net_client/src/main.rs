@@ -210,8 +210,12 @@ fn build_stack(driver: LoopbackDriver, ip: Ipv4Addr, seed: u64) -> &'static Stac
         address: embassy_net::Ipv4Cidr::new(embassy_net::Ipv4Address(ip.octets()), 24),
         gateway: None,
         // `Default::default()` picks up embassy-net's bundled
-        // `heapless::Vec` rather than this crate's (different
-        // majors don't share types).
+        // `heapless::Vec` (re-exported privately) rather than this
+        // crate's heapless dep — different majors don't share types,
+        // and we don't want a direct heapless dep here just to spell
+        // out the type. `#[allow]` for clippy::default_trait_access:
+        // the inference is exactly the point.
+        #[allow(clippy::default_trait_access)]
         dns_servers: Default::default(),
     });
     Box::leak(Box::new(Stack::new(driver, config, resources, seed)))
@@ -385,8 +389,7 @@ async fn main() {
                 .expect("announcement_loop_local");
             tokio::task::spawn_local(announce_fut);
             println!(
-                "[server] announcement loop spawned, emitting OfferService(0x{:04X}) every 1s",
-                SERVICE_ID
+                "[server] announcement loop spawned, emitting OfferService(0x{SERVICE_ID:04X}) every 1s"
             );
 
             // ── Client on stack B ────────────────────────────────
@@ -418,12 +421,12 @@ async fn main() {
                 .bind_discovery()
                 .await
                 .expect("client bound discovery");
-            println!("[client] discovery bound on {}:30490", IP_B);
+            println!("[client] discovery bound on {IP_B}:30490");
 
             // ── Wait for the SD announcement ─────────────────────
             let result = tokio::time::timeout(Duration::from_secs(5), async {
                 while let Some(update) = updates.recv().await {
-                    println!("[client] received SD update: {:?}", update);
+                    println!("[client] received SD update: {update:?}");
                     if matches!(update, ClientUpdate::DiscoveryUpdated(_)) {
                         return true;
                     }

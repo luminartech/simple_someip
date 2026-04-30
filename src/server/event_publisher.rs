@@ -54,10 +54,13 @@ where
     socket: H,
     e2e_registry: R,
     /// `T` appears only in the bound `H: SharedHandle<T>`; the
-    /// struct doesn't directly hold a `T`. `PhantomData` carries
-    /// the type so the parameter is well-formed without affecting
-    /// drop-check or auto-trait propagation negatively.
-    _phantom: PhantomData<T>,
+    /// struct doesn't directly hold a `T`. `PhantomData<fn() -> T>`
+    /// (rather than `PhantomData<T>`) carries the type without
+    /// re-imposing `T: Send + Sync` redundantly with `H`'s bounds:
+    /// a future `!Send T` behind a `Send` static-mutex handle would
+    /// otherwise force the whole `EventPublisher: !Send`. `fn() -> T`
+    /// is unconditionally `Send + Sync`.
+    _phantom: PhantomData<fn() -> T>,
 }
 
 impl<R, S, H, T> EventPublisher<R, S, H, T>

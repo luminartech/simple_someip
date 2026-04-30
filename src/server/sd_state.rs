@@ -109,6 +109,14 @@ impl SdStateManager {
     /// `(0xFFFF, Continuous)` or `(0x0001, RecentlyRebooted)` — both
     /// violations of AUTOSAR SOME/IP-SD's stated semantics that the
     /// wrap message itself carries `Continuous`.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic in practice: the inner `fetch_update` closure
+    /// always returns `Some(_)` (the wrap step is unconditional), so
+    /// the `.unwrap()` is statically infallible. Documented for
+    /// clippy's `missing_panics_doc` and as a tripwire if the closure
+    /// is ever changed to be conditional.
     pub fn next_session_id_with_reboot_flag(&self) -> (u32, RebootFlag) {
         let prev_state = self
             .session_state
