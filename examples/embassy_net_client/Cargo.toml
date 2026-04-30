@@ -1,0 +1,51 @@
+[package]
+name = "embassy_net_client"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Host-runnable demonstration of `simple-someip` wired through the
+# `simple-someip-embassy-net` adapter. Two `embassy_net::Stack`
+# instances are bridged by an in-memory `LoopbackDriver` pair so the
+# whole exchange runs on a single Linux host with no privileges.
+# Real firmware would replace the `LoopbackDriver` with a hardware
+# MAC driver (lan8742, w5500, vendor IP, etc.), `tokio::main` with
+# `#[embassy_executor::main]`, and `tokio::time::sleep` with
+# `embassy_time::Timer::after`. The simple-someip side stays
+# unchanged.
+
+[dependencies]
+# Adapter pulls `simple-someip` with `default-features = false,
+# features = ["client", "server", "bare_metal"]` transitively.
+# We add `std` here for `RawPayload` / `Arc<Mutex<E2ERegistry>>`
+# default impls — the host-side conveniences.
+simple-someip = { path = "../..", default-features = false, features = [
+    "std",
+    "client",
+    "server",
+    "bare_metal",
+] }
+simple-someip-embassy-net = { path = "../../simple-someip-embassy-net" }
+
+# embassy-net + embassy-sync versions pinned to match the adapter
+# crate's deps so cargo doesn't fork the dep tree.
+embassy-net = { version = "0.4", default-features = false, features = [
+    "udp",
+    "proto-ipv4",
+    "igmp",
+    "medium-ethernet",
+    "medium-ip",
+] }
+
+# Host runtime for the example. Real firmware swaps for embassy_executor.
+tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
+
+# Host platform critical-section impl required by embassy-sync
+# (pulled in via simple-someip's bare_metal feature).
+critical-section = { version = "1", features = ["std"] }
+
+# embassy-time provides the time driver embassy-net's TCP/IGMP code
+# uses internally. The `std` + `generic-queue-8` features supply a
+# host platform driver so the binary links. Real firmware uses a
+# board-specific embassy-time driver and drops these features.
+embassy-time = { version = "0.3", features = ["std", "generic-queue-8"] }

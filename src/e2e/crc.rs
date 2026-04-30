@@ -115,10 +115,10 @@ mod tests {
     #[test]
     fn test_crc32_p4_basic() {
         // Basic smoke test - verify CRC changes with different inputs
-        let crc1 = compute_crc32_p4(10, 0, 0x12345678, b"test");
-        let crc2 = compute_crc32_p4(10, 1, 0x12345678, b"test");
-        let crc3 = compute_crc32_p4(10, 0, 0x12345679, b"test");
-        let crc4 = compute_crc32_p4(10, 0, 0x12345678, b"Test");
+        let crc1 = compute_crc32_p4(10, 0, 0x1234_5678, b"test");
+        let crc2 = compute_crc32_p4(10, 1, 0x1234_5678, b"test");
+        let crc3 = compute_crc32_p4(10, 0, 0x1234_5679, b"test");
+        let crc4 = compute_crc32_p4(10, 0, 0x1234_5678, b"Test");
 
         assert_ne!(crc1, crc2, "Different counter should produce different CRC");
         assert_ne!(crc1, crc3, "Different data_id should produce different CRC");
@@ -141,8 +141,8 @@ mod tests {
     #[test]
     fn test_crc32_p4_deterministic() {
         // Same inputs should always produce same output
-        let crc1 = compute_crc32_p4(20, 5, 0xABCDEF01, b"payload data");
-        let crc2 = compute_crc32_p4(20, 5, 0xABCDEF01, b"payload data");
+        let crc1 = compute_crc32_p4(20, 5, 0xABCD_EF01, b"payload data");
+        let crc2 = compute_crc32_p4(20, 5, 0xABCD_EF01, b"payload data");
         assert_eq!(crc1, crc2);
     }
 
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn test_crc32_p4_empty_payload() {
         // Should work with empty payload
-        let crc = compute_crc32_p4(8, 0, 0x12345678, b"");
+        let crc = compute_crc32_p4(8, 0, 0x1234_5678, b"");
         assert_ne!(crc, 0); // CRC should be non-trivial even for empty payload
     }
 

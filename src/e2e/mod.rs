@@ -12,7 +12,7 @@
 //!     E2ECheckStatus,
 //! };
 //!
-//! let config = Profile4Config::new(0x12345678, 15);
+//! let config = Profile4Config::new(0x1234_5678, 15);
 //! let mut protect_state = Profile4State::new();
 //! let mut check_state = Profile4State::new();
 //!
@@ -29,7 +29,6 @@ mod crc;
 mod e2e_checker;
 mod e2e_protector;
 mod error;
-#[cfg(feature = "std")]
 mod registry;
 mod state;
 
@@ -40,8 +39,7 @@ pub use e2e_protector::{
     protect_profile5_with_header,
 };
 pub use error::Error;
-#[cfg(feature = "std")]
-pub use registry::E2ERegistry;
+pub use registry::{E2E_REGISTRY_CAP, E2ERegistry, E2ERegistryFull};
 pub use state::{Profile4State, Profile5State};
 
 /// Status result from E2E check operations.
@@ -161,7 +159,6 @@ impl E2EKey {
 }
 
 /// Internal E2E state, one per registered key.
-#[cfg(feature = "std")]
 #[derive(Debug, Clone)]
 pub(crate) enum E2EState {
     /// State for Profile 4.
@@ -170,7 +167,6 @@ pub(crate) enum E2EState {
     Profile5(Profile5State),
 }
 
-#[cfg(feature = "std")]
 impl E2EState {
     pub(crate) fn from_profile(profile: &E2EProfile) -> Self {
         match profile {
@@ -184,7 +180,6 @@ impl E2EState {
 
 /// Run the appropriate E2E check for the given profile, returning the status
 /// and the best available payload slice (stripped on success, original on error).
-#[cfg(feature = "std")]
 pub(crate) fn e2e_check<'a>(
     profile: &E2EProfile,
     state: &mut E2EState,
@@ -212,7 +207,6 @@ pub(crate) fn e2e_check<'a>(
 /// # Errors
 ///
 /// Returns [`Error::BufferTooSmall`] if `output` cannot hold the protected payload.
-#[cfg(feature = "std")]
 pub(crate) fn e2e_protect(
     profile: &E2EProfile,
     state: &mut E2EState,
@@ -251,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_profile4_roundtrip() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -291,7 +285,7 @@ mod tests {
 
     #[test]
     fn test_profile4_sequence_detection() {
-        let config = Profile4Config::new(0x12345678, 5);
+        let config = Profile4Config::new(0x1234_5678, 5);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -319,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_profile4_some_lost_detection() {
-        let config = Profile4Config::new(0x12345678, 5);
+        let config = Profile4Config::new(0x1234_5678, 5);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -343,7 +337,7 @@ mod tests {
 
     #[test]
     fn test_profile4_wrong_sequence_detection() {
-        let config = Profile4Config::new(0x12345678, 2);
+        let config = Profile4Config::new(0x1234_5678, 2);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -368,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_profile4_crc_error() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut protect_state = Profile4State::new();
         let mut check_state = Profile4State::new();
 
@@ -403,7 +397,7 @@ mod tests {
 
     #[test]
     fn test_profile4_bad_argument_short_message() {
-        let config = Profile4Config::new(0x12345678, 15);
+        let config = Profile4Config::new(0x1234_5678, 15);
         let mut check_state = Profile4State::new();
 
         // Message too short (less than 12-byte header)
