@@ -229,10 +229,7 @@ where
     /// the simple-someip run-loop's task state (which itself outlives
     /// the `EmbassyNetFactory`).
     #[must_use]
-    pub fn new(
-        stack: &'static Stack<D>,
-        pool: &'static SocketPool<POOL, RX_BUF, TX_BUF>,
-    ) -> Self {
+    pub fn new(stack: &'static Stack<D>, pool: &'static SocketPool<POOL, RX_BUF, TX_BUF>) -> Self {
         Self {
             stack,
             pool,

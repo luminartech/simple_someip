@@ -654,10 +654,7 @@ async fn tx_announcement_loop_emits_wire_format_offer() {
     // and snapshots it. Free fn (not a closure) because returning
     // an async-block from a closure tangles inferred lifetimes
     // between the borrow of `buf` and the returned future.
-    async fn capture_one(
-        rx: &tokio::net::UdpSocket,
-        buf: &mut [u8; 2048],
-    ) -> CapturedOffer {
+    async fn capture_one(rx: &tokio::net::UdpSocket, buf: &mut [u8; 2048]) -> CapturedOffer {
         loop {
             let (len, _from) = rx.recv_from(buf).await.expect("recv_from");
             let Ok(view) = MessageView::parse(&buf[..len]) else {
@@ -801,12 +798,16 @@ async fn tx_announcement_loop_emits_wire_format_offer() {
         first.request_id,
         second.request_id,
     );
-    // After the first announcement the reboot flag flips to
-    // Continuous (session counter no longer at the post-boot value).
+    // Reboot flag stays `RecentlyRebooted` until the session counter
+    // wraps from 0xFFFF → 0x0001 — per AUTOSAR SOME/IP-SD that's the
+    // single transition that flips it to `Continuous` permanently.
+    // Two announcements don't cross that boundary, so both should
+    // still carry `RecentlyRebooted`. (`SdStateManager` unit tests
+    // cover the wrap transition itself.)
     assert_eq!(
         second.sd_reboot,
-        RebootFlag::Continuous,
-        "second announcement should be Continuous, not RecentlyRebooted",
+        RebootFlag::RecentlyRebooted,
+        "reboot flag stays RecentlyRebooted until session-counter wrap",
     );
     // Endpoint advertised should be byte-identical between
     // announcements — service offers don't change shape per tick.

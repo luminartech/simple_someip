@@ -1,5 +1,41 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **`simple-someip-embassy-net::LINK_MTU`** — `pub const usize = 1500` shared by the loopback driver and example consumers for sizing `SocketPool` RX/TX buffers and `Capabilities::max_transmission_unit`. Distinct from `simple_someip::UDP_BUFFER_SIZE` (an *application*-payload cap) — they coincide at 1500 today but are conceptually orthogonal.
+- **Per-package pedantic clippy CI gates** for `simple-someip` under `client+bare_metal`, `server+bare_metal`, and `client+server+bare_metal`. The pre-existing `--workspace --all-features` gate is feature-unified and could mask feature-set regressions; per-package gates surface a regression against its responsible feature flag.
+
+### Changed
+
+- **`SocketOptions` docs** — explicit Linux-side guidance that the SD socket needs both `SO_REUSEADDR` and `SO_REUSEPORT` (Linux ties multicast-group membership to the REUSEPORT group).
+- **`SdStateManager::with_initial` and `next_session_id_with_reboot_flag`** lifted from `pub(super)` to `pub` so external test harnesses can pre-seed counter state and validate wrap-around behaviour without a full Server lifecycle. The remaining racy accessors stay `pub(super) + cfg(test)`.
+- **`Server::new_with_handles` / `new_passive_with_handles`** — back-fill `config.local_port` only when the caller passed `0`; return `Error::InvalidUsage` on a non-zero mismatch with the unicast socket's bound port. Matches `new_with_deps`'s back-fill-only-on-zero discipline.
+- **`SubscriptionManager::get_subscribers`** — cfg widened from `feature = "std"` to internal `feature = "_alloc"` and return type from `std::vec::Vec` to `alloc::vec::Vec`. Reachable in `embassy_channels` and pure-`server,bare_metal` builds where alloc is in scope.
+- **`OfferedEndpoint`** — re-exported unconditionally (previously `cfg(feature = "std")`). The trait method `PayloadWireFormat::for_each_offered_endpoint` that surfaces it is unconditional.
+- **`tokio_transport::TokioSpawner::spawn`** — single tokio task per spawn (was 2: work future + JoinHandle watcher). Panic logging now lives inside `PanicLoggingFut` via `std::panic::catch_unwind`.
+- **`Server::run_with_buffers` doc example** — replaced unsound `&mut UNICAST_BUF` on `static mut` (hard error in Rust 2024) with a `static UnsafeCell<[u8; …]>` + `unsafe impl Sync` pattern.
+- **Three event-loop sites** (`client/inner.rs`, `client/socket_manager.rs`, `server/mod.rs`) — comments referenced `select!` while the code used `select_biased!`. Server and socket_manager's 2-arm selects now flip arm priority each iteration to approximate the fairness `select!` would give without pulling `std`. Comments rewritten to match.
+
+### Fixed
+
+- **`tools/size_probe::someip_header_encode`** — `MessageType::try_from(byte & 0xBF)` masked off bit 6 before validation (`0x40` silently coerced to `Request`); switched to `MessageTypeField::try_from(byte)`. The encoder also ignored the caller's `length` field and hardcoded `payload_len = 0`; now derives `payload_len = length - 8` with `checked_sub`.
+- **`simple-someip-embassy-net::EmbassyNetFactory`** — dropped a bogus `'pool` lifetime parameter and an identity-only `mem::transmute<&SocketPool, &'static>`. Factory now takes `&'static SocketPool` directly. Marked `!Send + !Sync` via `PhantomData<*const ()>` because embassy-net's `Stack` interior `RefCell` is not safe to drive `bind()` on from multiple threads.
+- **`simple-someip-embassy-net::EmbassyNetSocket::local_addr`** / `EmbassyNetFactory::bind` — `bind()` now honours `addr.ip()` (previously ignored) and reads the actual bound port back from `socket.endpoint()` post-bind, so port-0 ephemeral binds report the real port instead of `:0`.
+- **`tools/size_probe`** — excluded from `[workspace]`, given its own empty `[workspace]` table. `cargo clippy --workspace --all-features` no longer trips `E0152` against the probe's `#[panic_handler]` / `#[global_allocator]`.
+- **`extern crate alloc` cfg** — tied to a single internal `_alloc` feature implied by `server`, `embassy_channels`, and `std`. The previous `cfg(any(feature = "embassy_channels", feature = "server"))` was right by accident and silently omitted std-only flavours.
+- **CI alloc-symbol audit** — pinned the rlib path (was nondeterministic via `find | head`); replaced `rm -f` of the rlib (which doesn't invalidate cargo's fingerprint cache) with `cargo clean -p simple-someip --target …`; dropped `nm 2>/dev/null` so a tool failure stops surfacing as `0` alloc references.
+- **vsomeip TX-conformance test** — captures TWO consecutive announcements; asserts exact TTL (3 s default), session-ID monotonicity, `RebootFlag::RecentlyRebooted` on the first announcement flipping to `Continuous` on the second, exactly one SD entry / one SD option / `(first_options, second_options) == (1, 0)` per OfferService entry. Previously asserted only `ttl > 0`.
+- **vsomeip RX-conformance test** — verifies vsomeip's OfferService carries an IPv4 endpoint option with the expected `(port=30509, UDP)`. A parser regression dropping options would have passed the old entry-only check.
+- **`tests/data/vsomeip-offerer/subscriber.json`** — `clients[].unreliable` was 30509, mirroring offerer.json instead of matching the simple-someip Server's `ADVERTISED_PORT = 30500` that subscriber.json is paired with. Fixed to 30500.
+- **vsomeip module docs** — referred to multicast group `224.0.23.0` (vsomeip spec default) while simple-someip and offerer.json both use `239.255.0.255`. Updated.
+- **`SocketAddrV4` IP wildcard handling in embassy-net adapter** — `socket.bind(addr.port())` was passing only the port, ignoring caller's IP. Now passes a full `IpListenEndpoint` with `addr: None` for `0.0.0.0` (smoltcp's wildcard) or the explicit IPv4 otherwise.
+- **`RecvError::Truncated` → `Err(Io(Other))` mapping** — documented at the call site why this is a deliberate adapter choice (embassy-net 0.4 doesn't deliver bytes on truncation and doesn't surface the original datagram length, so we can't honour the trait's `truncated: true` contract truthfully).
+- **Doc-link rot** — `Self::reboot_flag` (cfg(test)-only), `Self::for_each_subscriber` (lives on the trait), `EventPublisherHandle` (collapsed into `SharedHandle` in 19f / 20e), `E2ERegistryFull` (needs `crate::e2e::` prefix), `futures::future::BoxFuture` (futures crate not a direct dep). All `cargo doc --no-deps` partial-feature gates clean.
+- **Embassy-net loopback test rename pretext** — `client_send_request_server_runloop_stable` was vacuous (passive server's `run()` returns `Err(InvalidUsage)` immediately). Removed the no-op spawn and rewrote the doc to honestly describe what the test verifies (the client's send path).
+- **Adversarial-pass micro-issues**: `payload_len + 12` / `payload_len + 4` 32-bit wrap in size_probe (now `checked_add`); `PanicAllocator` → `NullAllocator` (it returns null, doesn't panic); `EmbassyNetBindFuture::poll` panicked on second poll (now wraps `core::future::Ready` for stdlib panic message + standard semantics); `EventPublisher`'s `PhantomData<T>` → `PhantomData<fn() -> T>` (no redundant `Send + Sync` re-imposition).
+
 ## [0.8.0]
 
 ### Added
