@@ -138,10 +138,11 @@ where
 /// (`Server::new_with_deps`, `Server::new_passive_with_deps`) has a
 /// counterpart here that takes pre-built handles directly,
 /// skipping the internal `wrap` step. That lets a no-alloc consumer
-/// supply `StaticSocketHandle<EmbassyNetSocket>` /
+/// supply `&'static EmbassyNetSocket` /
 /// `&'static SdStateManager` / `&'static EventPublisher<...>`
 /// instances they materialized via their preferred static-storage
-/// pattern.
+/// pattern (the blanket `SharedHandle<T>` impl on `&'static T`
+/// makes the `&'static …` shape a drop-in for the `Arc<…>` shape).
 ///
 /// All eight fields are public so the struct can be assembled
 /// inline.
@@ -220,8 +221,8 @@ pub struct Server<
 {
     config: ServerConfig,
     /// Socket for receiving subscription requests, behind whatever
-    /// shared-storage `H` chose (`Arc<T>` on std,
-    /// `StaticSocketHandle<T>` on bare metal).
+    /// shared-storage `H` chose (`Arc<T>` on std, `&'static T` on
+    /// bare metal — both impls of [`SharedHandle<T>`]).
     unicast_socket: H,
     /// Socket for sending SD announcements (same handle type as
     /// `unicast_socket`; both are produced by the same factory).
@@ -369,9 +370,10 @@ where
     /// binds two sockets internally (`unicast` + `sd`) and needs to
     /// place each one behind the caller's chosen shared-storage. On
     /// std this is `Arc<F::Socket>`; on bare metal with an allocator
-    /// it can be any `WrappableSocketHandle` impl. Pure-no-alloc
-    /// consumers using `StaticSocketHandle` need a future
-    /// external-bind constructor variant — see `SocketHandle` docs.
+    /// it can be any [`WrappableSharedHandle`] impl. Pure-no-alloc
+    /// consumers (`&'static T` handles) take pre-built sockets via
+    /// [`Self::new_with_handles`] / [`Self::new_passive_with_handles`]
+    /// instead.
     ///
     /// # Errors
     ///
@@ -684,7 +686,9 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`] if:
+    /// Returns [`Error::InvalidUsage`] (with the tag
+    /// `"passive_server_announcement_loop"` or
+    /// `"announcement_loop_already_started"`) if:
     /// - called on a server constructed via `Server::new_passive` — passive
     ///   servers have no real SD socket bound to port 30490, so any
     ///   announcements would go out with an incorrect source port; or
@@ -997,7 +1001,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`] if
+    /// Returns [`Error::InvalidUsage`] (tag `"passive_server_run"`) if
     /// called on a server constructed via `Server::new_passive` — passive
     /// servers have no real SD socket to read from, so the run loop would
     /// block forever on the ephemeral placeholder socket.
@@ -1590,6 +1594,186 @@ mod tests {
 
         let server: Result<TestServer, _> = TestServer::new(config).await;
         assert!(server.is_ok());
+    }
+
+    // ── new_with_handles / new_passive_with_handles tests ──────────────
+    //
+    // These constructors take pre-built socket handles instead of
+    // calling `factory.bind()` themselves, and validate that the
+    // caller-supplied `config.local_port` matches the actual bound
+    // port (back-fill-only-on-zero, MED-22 in phase 20 cleanup).
+    // The validation logic only exercises through these tests; the
+    // production code paths use `new` / `new_with_deps`.
+
+    /// Build a `ServerHandles<…>` whose unicast socket is bound to
+    /// the given port (port `0` for ephemeral) and whose other
+    /// fields are the std defaults a tokio consumer would assemble.
+    /// Used by the `new_with_handles` tests below.
+    async fn build_test_handles(
+        unicast_port: u16,
+    ) -> (
+        ServerHandles<
+            TokioTransport,
+            TokioTimer,
+            Arc<Mutex<E2ERegistry>>,
+            Arc<RwLock<SubscriptionManager>>,
+            Arc<crate::tokio_transport::TokioSocket>,
+            Arc<SdStateManager>,
+            Arc<
+                EventPublisher<
+                    Arc<Mutex<E2ERegistry>>,
+                    Arc<RwLock<SubscriptionManager>>,
+                    Arc<crate::tokio_transport::TokioSocket>,
+                    crate::tokio_transport::TokioSocket,
+                >,
+            >,
+        >,
+        u16, // actual bound port (0 → ephemeral)
+    ) {
+        let factory = TokioTransport;
+        let unicast_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, unicast_port);
+        let unicast_raw = factory
+            .bind(unicast_addr, &SocketOptions::new())
+            .await
+            .expect("bind unicast");
+        let bound_port = unicast_raw.local_addr().expect("local_addr").port();
+        let unicast_socket = Arc::new(unicast_raw);
+        // SD socket is bound ephemerally — these tests don't drive
+        // `run_with_buffers` so the SD socket never has to be on
+        // 30490 / multicast-joined.
+        let sd_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+        let sd_socket = Arc::new(
+            factory
+                .bind(sd_addr, &SocketOptions::new())
+                .await
+                .expect("bind sd"),
+        );
+        let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let publisher = Arc::new(EventPublisher::new(
+            subscriptions.clone(),
+            unicast_socket.clone(),
+            e2e_registry.clone(),
+        ));
+        let handles = ServerHandles {
+            factory,
+            timer: TokioTimer,
+            e2e_registry,
+            subscriptions,
+            unicast_socket,
+            sd_socket,
+            sd_state: Arc::new(SdStateManager::new()),
+            publisher,
+        };
+        (handles, bound_port)
+    }
+
+    #[tokio::test]
+    async fn new_with_handles_back_fills_local_port_on_zero() {
+        let (handles, bound_port) = build_test_handles(0).await;
+        // Port 0 → caller asks for back-fill from the bound port.
+        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0xFE10, 1);
+        let server = TestServer::new_with_handles(handles, config)
+            .expect("new_with_handles must accept local_port = 0");
+        assert_eq!(
+            server.config.local_port, bound_port,
+            "config.local_port must be back-filled from the unicast socket's bound port",
+        );
+    }
+
+    #[tokio::test]
+    async fn new_with_handles_accepts_matching_local_port() {
+        let (handles, bound_port) = build_test_handles(0).await;
+        // Caller supplies the matching port explicitly.
+        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, bound_port, 0xFE11, 1);
+        let server = TestServer::new_with_handles(handles, config)
+            .expect("matching local_port must be accepted");
+        assert_eq!(server.config.local_port, bound_port);
+    }
+
+    #[tokio::test]
+    async fn new_with_handles_rejects_local_port_mismatch() {
+        let (handles, bound_port) = build_test_handles(0).await;
+        // Pick a port that cannot match the ephemeral allocation.
+        // Port 1 is privileged on Linux and effectively never
+        // ephemeral-allocated; absurd-by-construction is the point.
+        let bogus_port = if bound_port == 1 { 2 } else { 1 };
+        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, bogus_port, 0xFE12, 1);
+        let result = TestServer::new_with_handles(handles, config);
+        match result {
+            Err(Error::InvalidUsage(tag)) => {
+                assert_eq!(tag, "new_with_handles_local_port_mismatch");
+            }
+            Ok(_) => panic!("non-zero non-matching local_port must be rejected"),
+            Err(other) => {
+                panic!(
+                    "expected Error::InvalidUsage(\"new_with_handles_local_port_mismatch\"), got {other:?}"
+                )
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn new_passive_with_handles_back_fills_local_port_on_zero() {
+        let (handles, bound_port) = build_test_handles(0).await;
+        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0xFE13, 1);
+        let server = TestServer::new_passive_with_handles(handles, config)
+            .expect("new_passive_with_handles must accept local_port = 0");
+        assert_eq!(server.config.local_port, bound_port);
+        assert!(server.is_passive, "passive constructor must set is_passive");
+    }
+
+    #[tokio::test]
+    async fn new_passive_with_handles_rejects_local_port_mismatch() {
+        let (handles, bound_port) = build_test_handles(0).await;
+        let bogus_port = if bound_port == 1 { 2 } else { 1 };
+        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, bogus_port, 0xFE14, 1);
+        let result = TestServer::new_passive_with_handles(handles, config);
+        match result {
+            Err(Error::InvalidUsage(tag)) => {
+                assert_eq!(tag, "new_passive_with_handles_local_port_mismatch");
+            }
+            Ok(_) => panic!("non-zero non-matching local_port must be rejected"),
+            Err(other) => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// Passive server's `run_with_buffers` must short-circuit with
+    /// `Err(InvalidUsage)` rather than block forever on the
+    /// ephemeral SD socket.
+    #[tokio::test]
+    async fn passive_server_run_with_buffers_returns_invalid_usage() {
+        let (handles, _) = build_test_handles(0).await;
+        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0xFE15, 1);
+        let mut server =
+            TestServer::new_passive_with_handles(handles, config).expect("passive ctor");
+        let mut unicast_buf = vec![0u8; 1500];
+        let mut sd_buf = vec![0u8; 1500];
+        let result = server.run_with_buffers(&mut unicast_buf, &mut sd_buf).await;
+        match result {
+            Err(Error::InvalidUsage(tag)) => assert_eq!(tag, "passive_server_run"),
+            other => {
+                panic!("passive server's run_with_buffers must return InvalidUsage, got {other:?}",)
+            }
+        }
+    }
+
+    /// Same short-circuit on the announcement-loop side.
+    #[tokio::test]
+    async fn passive_server_announcement_loop_returns_invalid_usage() {
+        let (handles, _) = build_test_handles(0).await;
+        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0xFE16, 1);
+        let server = TestServer::new_passive_with_handles(handles, config).expect("passive ctor");
+        // The success arm returns an opaque `impl Future` that
+        // doesn't impl Debug, so we can't pattern-match on a
+        // `Result` directly with `{:?}`. Discriminate explicitly.
+        match server.announcement_loop() {
+            Err(Error::InvalidUsage(tag)) => {
+                assert_eq!(tag, "passive_server_announcement_loop");
+            }
+            Err(other) => panic!("expected InvalidUsage, got {other:?}"),
+            Ok(_) => panic!("passive server's announcement_loop must error"),
+        }
     }
 
     /// Regression for H5: `ServerConfig::accepts_event_group` must

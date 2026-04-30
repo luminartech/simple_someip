@@ -21,7 +21,7 @@
 //! | `SocketPool` | `static`-leaked at startup | `static` declaration in firmware boot, no leak |
 //! | `Timer` | `tokio::time::sleep` | `embassy_time::Timer::after` |
 //! | `LocalSpawner` | `tokio::task::spawn_local` | `embassy_executor::Spawner::spawn` |
-//! | `SocketHandle` `H` | `Arc<EmbassyNetSocket>` (alloc) | same on alloc-targets, `StaticSocketHandle` on no-alloc |
+//! | `SocketHandle` `H` | `Arc<EmbassyNetSocket>` (alloc) | same on alloc-targets, `&'static EmbassyNetSocket` on no-alloc (via the blanket `SharedHandle<T>` impl) |
 //!
 //! Build + run:
 //!

@@ -307,6 +307,75 @@ async fn adapter_udp_roundtrip() {
         .await;
 }
 
+/// Exhaust a tiny `SocketPool` so the next `bind` returns
+/// `TransportError::AddressInUse`. Covers the pool-exhausted fallback
+/// path inside `EmbassyNetFactory::bind`; without an explicit test
+/// that branch is dead code per coverage.
+#[tokio::test(flavor = "current_thread")]
+async fn factory_bind_returns_address_in_use_when_pool_exhausted() {
+    let (drv_a, _drv_b) = LoopbackDriver::pair();
+    let stack_a = build_stack(drv_a, IP_A, SEED_A);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            tokio::task::spawn_local(async move { stack_a.run().await });
+
+            // Pool of size 1: claim the only slot, then verify a
+            // second bind fails with AddressInUse.
+            let pool: &'static SocketPool<1, LINK_MTU, LINK_MTU> =
+                Box::leak(Box::new(SocketPool::new()));
+            let factory = EmbassyNetFactory::new(stack_a, pool);
+            let opts = SocketOptions::default();
+            let _hold = factory
+                .bind(SocketAddrV4::new(IP_A, 41000), &opts)
+                .await
+                .expect("first bind on a fresh size-1 pool must succeed");
+            let second = factory.bind(SocketAddrV4::new(IP_A, 41001), &opts).await;
+            match second {
+                Err(simple_someip::transport::TransportError::AddressInUse) => {}
+                Err(other) => panic!(
+                    "second bind on exhausted pool must yield AddressInUse, got Err({other:?})"
+                ),
+                Ok(_) => panic!("second bind on exhausted pool must fail"),
+            }
+        })
+        .await;
+}
+
+/// Bind via the factory using `0.0.0.0` (wildcard IP) to cover the
+/// `addr.ip().is_unspecified()` branch in `EmbassyNetFactory::bind`
+/// that translates wildcard IPs to embassy-net's `addr: None`
+/// listen-on-any-interface mode.
+#[tokio::test(flavor = "current_thread")]
+async fn factory_bind_accepts_wildcard_ip() {
+    let (drv_a, _drv_b) = LoopbackDriver::pair();
+    let stack_a = build_stack(drv_a, IP_A, SEED_A);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            tokio::task::spawn_local(async move { stack_a.run().await });
+
+            let pool: &'static SocketPool<1, LINK_MTU, LINK_MTU> =
+                Box::leak(Box::new(SocketPool::new()));
+            let factory = EmbassyNetFactory::new(stack_a, pool);
+            let opts = SocketOptions::default();
+            let sock = factory
+                .bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 41100), &opts)
+                .await
+                .expect("wildcard bind must succeed");
+            // `local_addr` reflects the wildcard IP back to the
+            // caller (we record the caller's intent verbatim since
+            // embassy-net's `endpoint().addr` is `None` here and we
+            // have nothing better to substitute).
+            let local = sock.local_addr().expect("local_addr");
+            assert_eq!(*local.ip(), Ipv4Addr::UNSPECIFIED);
+            assert_eq!(local.port(), 41100);
+        })
+        .await;
+}
+
 // ── SOME/IP Client+Server harness (phase 19g) ───────────────────────
 //
 // Adds a real `simple_someip::Client` + `simple_someip::Server` on

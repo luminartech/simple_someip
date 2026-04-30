@@ -714,4 +714,61 @@ mod tests {
             TransportError::Io(IoErrorKind::Other)
         ));
     }
+
+    /// `PanicLoggingFut` must complete normally for a non-panicking
+    /// inner future — covering the `Ok(poll)` arm of
+    /// `catch_unwind`.
+    #[tokio::test]
+    async fn panic_logging_fut_passes_through_normal_completion() {
+        use crate::transport::Spawner;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = done.clone();
+        TokioSpawner.spawn(async move {
+            done_clone.store(true, Ordering::SeqCst);
+        });
+        // Yield until the spawned future ran. `tokio::task::yield_now`
+        // gives the runtime a chance to drive the just-spawned task.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if done.load(Ordering::SeqCst) {
+                return;
+            }
+        }
+        panic!("spawned future did not complete within the polling budget");
+    }
+
+    /// A panicking inner future must (a) NOT crash the runtime and
+    /// (b) resolve the wrapper to `Poll::Ready(())` so the
+    /// `catch_unwind` Err arm is exercised. The panic-tracing log
+    /// is observable but not asserted on (we don't capture
+    /// `tracing` events here).
+    #[tokio::test]
+    async fn panic_logging_fut_catches_panic_and_resolves_cleanly() {
+        use crate::transport::Spawner;
+        use std::boxed::Box;
+
+        // The default panic hook prints to stderr per panic, which
+        // pollutes test output. Swap to a no-op hook for the
+        // duration of this test.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        TokioSpawner.spawn(async {
+            panic!("intentional test panic — caught by PanicLoggingFut");
+        });
+        // Drive the runtime long enough for the spawned task to be
+        // polled and panic. We can't `await` the JoinHandle because
+        // `Spawner::spawn` doesn't return one; instead, yield enough
+        // times that the runtime polls and resolves the panicking
+        // task. Reaching this point without the test process aborting
+        // is the assertion: `catch_unwind` swallowed the panic.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        std::panic::set_hook(prev_hook);
+    }
 }

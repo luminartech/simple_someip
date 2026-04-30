@@ -14,9 +14,12 @@ members = [
 # under a host target (`cargo clippy --workspace --all-features`),
 # because `simple-someip` brings in `std`'s panic_impl through its
 # transitive deps. Excluding keeps the probe usable via its own
-# `cargo build -p size_probe --target thumbv7em-none-eabihf`
+# `cd tools/size_probe && cargo build --release --target thumbv7em-none-eabihf`
 # invocation (it's a flash-size measurement tool, not a publishable
-# crate) without poisoning the host workspace lint gate.
+# crate) without poisoning the host workspace lint gate. Note: a
+# `cargo build -p size_probe` from the workspace root no longer
+# resolves because the probe is excluded; build it through its own
+# manifest.
 exclude = ["tools/size_probe"]
 
 [package]

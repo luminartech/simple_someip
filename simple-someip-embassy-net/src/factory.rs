@@ -181,6 +181,34 @@ impl<const POOL: usize, const RX_BUF: usize, const TX_BUF: usize> SlotReclaim
 /// `borrow_mut()`. The simple-someip run-loops live on one task per
 /// `Client` / `Server` anyway, which matches this constraint.
 ///
+/// The `!Send + !Sync` claim is enforced by `_not_thread_safe:
+/// PhantomData<*const ()>`; raw pointers do not implement
+/// `Send`/`Sync` by default, so the marker propagates the negative
+/// bound. The doctests below lock that in — a future change that
+/// flipped the marker (e.g. to `PhantomData<()>`) would make the
+/// `compile_fail` assertions start compiling and a CI doctest run
+/// would fail.
+///
+/// ```compile_fail
+/// # use simple_someip_embassy_net::{EmbassyNetFactory, SocketPool};
+/// # use embassy_net::driver::Driver;
+/// fn assert_send<T: Send>() {}
+/// fn check<D: Driver + 'static>() {
+///     // `EmbassyNetFactory` is intentionally `!Send` — this must NOT compile.
+///     assert_send::<EmbassyNetFactory<D, 1, 1, 1>>();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// # use simple_someip_embassy_net::{EmbassyNetFactory, SocketPool};
+/// # use embassy_net::driver::Driver;
+/// fn assert_sync<T: Sync>() {}
+/// fn check<D: Driver + 'static>() {
+///     // `EmbassyNetFactory` is intentionally `!Sync` — this must NOT compile.
+///     assert_sync::<EmbassyNetFactory<D, 1, 1, 1>>();
+/// }
+/// ```
+///
 /// # Multicast group join (important)
 ///
 /// `TransportSocket::join_multicast_v4` on the returned socket is

@@ -642,8 +642,11 @@ async fn tx_announcement_loop_emits_wire_format_offer() {
     }
 
     // Capture two consecutive announcements so we can assert
-    // session-ID monotonicity and confirm the reboot flag flips
-    // RecentlyRebooted → Continuous on the second tick. Cyclic offer
+    // session-ID monotonicity and confirm the reboot flag does NOT
+    // flip on the second tick (it stays `RecentlyRebooted` until the
+    // session counter wraps from `0xFFFF` → `0x0001`, which two
+    // announcements don't reach — the wrap transition itself is
+    // covered by the `SdStateManager` unit tests). Cyclic offer
     // delay defaults to ~1 s; 5 s timeout for the FIRST and a 3 s
     // timeout for the SECOND covers a generous bound.
     let first_timeout = Duration::from_secs(5);
@@ -772,7 +775,9 @@ async fn tx_announcement_loop_emits_wire_format_offer() {
     // no-op gate.
     assert_eq!(first.entry_ttl, 3, "default TTL must be 3 s");
     // OfferService carries exactly one IPv4 endpoint option in the
-    // first run, none in the second.
+    // entry's first options-run; the second options-run is empty.
+    // (`first_options_count` and `second_options_count` are the two
+    // counts the SD spec packs into a single byte per entry.)
     assert_eq!(first.entry_options_first, 1);
     assert_eq!(first.entry_options_second, 0);
     // Single SD entry, single SD option in the whole header.
