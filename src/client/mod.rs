@@ -242,6 +242,146 @@ where
     pub spawner: Sp,
 }
 
+/// Tokio-defaulted constructor.
+///
+/// Available under the `client-tokio` feature. Returns a `ClientDeps`
+/// pre-populated with `TokioTransport` / `TokioTimer` / `TokioSpawner`
+/// and a fresh `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<Ipv4Addr>>`.
+/// Combine with the [`ClientDeps::with_factory`] / [`ClientDeps::with_timer`]
+/// / [`ClientDeps::with_e2e_registry`] / [`ClientDeps::with_interface`]
+/// / [`ClientDeps::with_spawner`] builders to override individual
+/// fields without spelling out the rest by hand.
+///
+/// ```no_run
+/// # #[cfg(feature = "client-tokio")]
+/// # fn demo() {
+/// use simple_someip::{Client, ClientDeps, RawPayload, TokioChannels};
+/// use std::net::Ipv4Addr;
+/// let deps = ClientDeps::tokio(Ipv4Addr::LOCALHOST);
+/// let (_client, _updates, _run) =
+///     Client::<RawPayload, _, _, TokioChannels>::new_with_deps(deps, false);
+/// # }
+/// ```
+#[cfg(feature = "client-tokio")]
+impl
+    ClientDeps<
+        crate::tokio_transport::TokioTransport,
+        TokioTimer,
+        Arc<Mutex<E2ERegistry>>,
+        Arc<RwLock<Ipv4Addr>>,
+        TokioSpawner,
+    >
+{
+    /// Build a `ClientDeps` with the tokio defaults.
+    #[must_use]
+    pub fn tokio(interface: Ipv4Addr) -> Self {
+        Self {
+            factory: crate::tokio_transport::TokioTransport,
+            timer: TokioTimer,
+            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            interface: Arc::new(RwLock::new(interface)),
+            spawner: TokioSpawner,
+        }
+    }
+}
+
+/// Field-by-field fluent builder. Each `with_*` returns a new
+/// `ClientDeps` with that single field replaced (and its corresponding
+/// generic parameter updated). Lets callers start from
+/// [`ClientDeps::tokio`] and override individual fields without
+/// spelling out the full struct literal.
+///
+/// ```no_run
+/// # #[cfg(feature = "client-tokio")]
+/// # fn demo() {
+/// # use simple_someip::{ClientDeps, Spawner};
+/// # use std::net::Ipv4Addr;
+/// # struct MySpawner;
+/// # impl Spawner for MySpawner {
+/// #     fn spawn(&self, _: impl core::future::Future<Output = ()> + Send + 'static) {}
+/// # }
+/// let deps = ClientDeps::tokio(Ipv4Addr::LOCALHOST)
+///     .with_spawner(MySpawner);
+/// # let _ = deps;
+/// # }
+/// ```
+impl<F, Tm, R, I, Sp> ClientDeps<F, Tm, R, I, Sp>
+where
+    F: TransportFactory,
+    Tm: Timer,
+    R: E2ERegistryHandle,
+    I: InterfaceHandle,
+{
+    /// Replace the `factory` field, returning a `ClientDeps` over the
+    /// new factory type.
+    pub fn with_factory<F2: TransportFactory>(self, factory: F2) -> ClientDeps<F2, Tm, R, I, Sp> {
+        ClientDeps {
+            factory,
+            timer: self.timer,
+            e2e_registry: self.e2e_registry,
+            interface: self.interface,
+            spawner: self.spawner,
+        }
+    }
+
+    /// Replace the `timer` field, returning a `ClientDeps` over the new
+    /// timer type.
+    pub fn with_timer<Tm2: Timer>(self, timer: Tm2) -> ClientDeps<F, Tm2, R, I, Sp> {
+        ClientDeps {
+            factory: self.factory,
+            timer,
+            e2e_registry: self.e2e_registry,
+            interface: self.interface,
+            spawner: self.spawner,
+        }
+    }
+
+    /// Replace the `e2e_registry` field, returning a `ClientDeps` over
+    /// the new registry-handle type.
+    pub fn with_e2e_registry<R2: E2ERegistryHandle>(
+        self,
+        e2e_registry: R2,
+    ) -> ClientDeps<F, Tm, R2, I, Sp> {
+        ClientDeps {
+            factory: self.factory,
+            timer: self.timer,
+            e2e_registry,
+            interface: self.interface,
+            spawner: self.spawner,
+        }
+    }
+
+    /// Replace the `interface` field, returning a `ClientDeps` over the
+    /// new interface-handle type.
+    pub fn with_interface<I2: InterfaceHandle>(
+        self,
+        interface: I2,
+    ) -> ClientDeps<F, Tm, R, I2, Sp> {
+        ClientDeps {
+            factory: self.factory,
+            timer: self.timer,
+            e2e_registry: self.e2e_registry,
+            interface,
+            spawner: self.spawner,
+        }
+    }
+
+    /// Replace the `spawner` field, returning a `ClientDeps` over the
+    /// new spawner type. Bounds on the spawner are checked at the
+    /// eventual `Client::new_with_deps` (or `..._local`) call, not
+    /// here, so this method works for both `Spawner` and `LocalSpawner`
+    /// values.
+    pub fn with_spawner<Sp2>(self, spawner: Sp2) -> ClientDeps<F, Tm, R, I, Sp2> {
+        ClientDeps {
+            factory: self.factory,
+            timer: self.timer,
+            e2e_registry: self.e2e_registry,
+            interface: self.interface,
+            spawner,
+        }
+    }
+}
+
 /// A SOME/IP client that handles service discovery and message exchange.
 ///
 /// `Client` is cheaply [`Clone`]-able. All clones share the same underlying
