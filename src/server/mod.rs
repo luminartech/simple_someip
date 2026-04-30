@@ -128,6 +128,114 @@ where
     pub subscriptions: Sub,
 }
 
+/// Tokio-defaulted constructor.
+///
+/// Available under the `server-tokio` feature. Returns a `ServerDeps`
+/// pre-populated with `TokioTransport` / `TokioTimer` and a fresh
+/// `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>`.
+/// Combine with the [`ServerDeps::with_factory`] /
+/// [`ServerDeps::with_timer`] / [`ServerDeps::with_e2e_registry`] /
+/// [`ServerDeps::with_subscriptions`] builders to override individual
+/// fields without spelling out the rest by hand.
+///
+/// ```no_run
+/// # #[cfg(feature = "server-tokio")]
+/// # async fn demo() -> Result<(), simple_someip::server::Error> {
+/// use simple_someip::{Server, ServerDeps};
+/// use simple_someip::server::ServerConfig;
+/// use std::net::Ipv4Addr;
+/// let deps = ServerDeps::tokio();
+/// let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0x1234, 1);
+/// // Binding-site type lets Server's `H` / `Hsd` / `Hep` defaults kick in.
+/// let _server: Server<_, _, _, _> =
+///     Server::new_with_deps(deps, config, false).await?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "server-tokio")]
+impl
+    ServerDeps<
+        crate::tokio_transport::TokioTransport,
+        crate::tokio_transport::TokioTimer,
+        Arc<Mutex<E2ERegistry>>,
+        Arc<RwLock<SubscriptionManager>>,
+    >
+{
+    /// Build a `ServerDeps` with the tokio defaults.
+    #[must_use]
+    pub fn tokio() -> Self {
+        Self {
+            factory: crate::tokio_transport::TokioTransport,
+            timer: crate::tokio_transport::TokioTimer,
+            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
+        }
+    }
+}
+
+/// Field-by-field fluent builder. Each `with_*` returns a new
+/// `ServerDeps` with that single field replaced (and its corresponding
+/// generic parameter updated). Lets callers start from
+/// [`ServerDeps::tokio`] and override individual fields without
+/// spelling out the full struct literal.
+impl<F, Tm, R, Sub> ServerDeps<F, Tm, R, Sub>
+where
+    F: TransportFactory,
+    Tm: Timer,
+    R: E2ERegistryHandle,
+    Sub: SubscriptionHandle,
+{
+    /// Replace the `factory` field, returning a `ServerDeps` over the
+    /// new factory type.
+    pub fn with_factory<F2: TransportFactory>(self, factory: F2) -> ServerDeps<F2, Tm, R, Sub> {
+        ServerDeps {
+            factory,
+            timer: self.timer,
+            e2e_registry: self.e2e_registry,
+            subscriptions: self.subscriptions,
+        }
+    }
+
+    /// Replace the `timer` field, returning a `ServerDeps` over the new
+    /// timer type.
+    pub fn with_timer<Tm2: Timer>(self, timer: Tm2) -> ServerDeps<F, Tm2, R, Sub> {
+        ServerDeps {
+            factory: self.factory,
+            timer,
+            e2e_registry: self.e2e_registry,
+            subscriptions: self.subscriptions,
+        }
+    }
+
+    /// Replace the `e2e_registry` field, returning a `ServerDeps` over
+    /// the new registry-handle type.
+    pub fn with_e2e_registry<R2: E2ERegistryHandle>(
+        self,
+        e2e_registry: R2,
+    ) -> ServerDeps<F, Tm, R2, Sub> {
+        ServerDeps {
+            factory: self.factory,
+            timer: self.timer,
+            e2e_registry,
+            subscriptions: self.subscriptions,
+        }
+    }
+
+    /// Replace the `subscriptions` field, returning a `ServerDeps` over
+    /// the new subscription-handle type.
+    pub fn with_subscriptions<Sub2: SubscriptionHandle>(
+        self,
+        subscriptions: Sub2,
+    ) -> ServerDeps<F, Tm, R, Sub2> {
+        ServerDeps {
+            factory: self.factory,
+            timer: self.timer,
+            e2e_registry: self.e2e_registry,
+            subscriptions,
+        }
+    }
+}
+
 /// Bundle of pre-built dependencies + storage handles for
 /// [`Server::new_with_handles`] / [`Server::new_passive_with_handles`].
 ///
