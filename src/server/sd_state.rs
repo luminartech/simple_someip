@@ -251,7 +251,7 @@ impl SdStateManager {
 
 #[cfg(all(test, feature = "server-tokio"))]
 mod tests {
-    use super::{SdStateManager, ServerConfig};
+    use super::{Error, SdStateManager, ServerConfig};
     use crate::protocol::sd::{self, EntryType, Flags, RebootFlag, TransportProtocol};
     use crate::protocol::{MessageType, MessageView, ReturnCode};
     use crate::tokio_transport::TokioSocket;
@@ -412,14 +412,22 @@ mod tests {
         assert_eq!(sd.reboot_flag(), RebootFlag::Continuous);
     }
 
-    // ── Mock-socket tests ───────────────────────────────────────────────
+    // ── Mock-socket tests (default `cargo test` runs these) ────────────
     //
-    // These exercise `send_offer_service`'s encoding path through a
-    // mock `TransportSocket` that captures the bytes the loop would
-    // have emitted. They run in default `cargo test` (no MULTICAST
-    // flag required) and cover the encoding lines that the
-    // `#[ignore]`d multicast tests below would otherwise be the only
-    // exercisers of.
+    // These exercise `send_offer_service`'s encoding + framing path
+    // through a mock `TransportSocket` that captures the bytes the
+    // loop would have emitted. They run in default `cargo test` (no
+    // MULTICAST flag required) and provide the primary coverage for
+    // the encoding lines.
+    //
+    // The `#[ignore]`d multicast tests further down test the SAME
+    // properties (session-id advancement, wrap, TTL=0 round-trip)
+    // through a real kernel-loopback multicast socket. Those tests
+    // remain because they additionally exercise the
+    // `socket.send_to(multicast_addr, ...)` kernel path, which the
+    // mock can't observe. Don't delete them in favour of the mocks
+    // — the kernel-multicast verification is the only signal we
+    // have for "the wire form actually leaves the OS correctly."
 
     use crate::transport::{IoErrorKind, ReceivedDatagram, TransportError, TransportSocket};
     use std::sync::Mutex;
@@ -566,7 +574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_offer_service_emits_full_someip_sd_envelope() {
+    async fn send_offer_service_through_mock_emits_full_someip_sd_envelope() {
         let config = ServerConfig::new(
             Ipv4Addr::LOCALHOST,
             TEST_ADVERTISED_PORT,
@@ -596,7 +604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_offer_service_advances_session_id_across_calls_via_mock() {
+    async fn send_offer_service_through_mock_advances_session_id_across_calls() {
         let config = ServerConfig::new(
             Ipv4Addr::LOCALHOST,
             TEST_ADVERTISED_PORT,
@@ -618,7 +626,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_offer_service_reboot_flag_flips_on_wrap_via_mock() {
+    async fn send_offer_service_through_mock_reboot_flag_flips_on_wrap() {
         let config = ServerConfig::new(
             Ipv4Addr::LOCALHOST,
             TEST_ADVERTISED_PORT,
@@ -656,7 +664,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_offer_service_preserves_zero_ttl_via_mock() {
+    async fn send_offer_service_through_mock_preserves_zero_ttl() {
         let mut config = ServerConfig::new(
             Ipv4Addr::LOCALHOST,
             TEST_ADVERTISED_PORT,
@@ -675,7 +683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_offer_service_propagates_socket_errors() {
+    async fn send_offer_service_through_mock_propagates_socket_errors() {
         let config = ServerConfig::new(
             Ipv4Addr::LOCALHOST,
             TEST_ADVERTISED_PORT,
@@ -685,11 +693,18 @@ mod tests {
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = FailingSocket;
         let result = sd_state.send_offer_service(&config, &sock).await;
-        assert!(
-            matches!(result, Err(_)),
-            "underlying socket send_to error must propagate, got: {:?}",
-            result,
-        );
+        // Narrow assertion: the error must specifically be the
+        // `Io(NetworkUnreachable)` propagated from `FailingSocket::send_to`.
+        // `Err(_)` would also pass on unrelated regressions (encoding
+        // failures, internal panics) and falsely attribute them to
+        // socket-error propagation.
+        match result {
+            Err(Error::Transport(TransportError::Io(IoErrorKind::NetworkUnreachable))) => {}
+            other => panic!(
+                "expected Err(Transport(Io(NetworkUnreachable))) propagated from \
+                 FailingSocket::send_to; got {other:?}",
+            ),
+        }
     }
 
     // ── Multicast-loopback harness ──────────────────────────────────────
