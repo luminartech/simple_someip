@@ -213,7 +213,8 @@ pub use traits::{OfferedEndpoint, PayloadWireFormat, WireFormat};
 
 #[cfg(feature = "client")]
 pub use client::{
-    Client, ClientDeps, ClientUpdate, ClientUpdates, DiscoveryMessage, PendingResponse,
+    Client, ClientChannelTypes, ClientDeps, ClientUpdate, ClientUpdates, ControlMessage,
+    DiscoveryMessage, PendingResponse, ReceivedMessage, SendMessage,
 };
 pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
