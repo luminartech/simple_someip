@@ -127,6 +127,17 @@ name = "client_server"
 required-features = ["client-tokio", "server-tokio"]
 
 [[test]]
+# Without `required-features`, `cargo test` would silently report
+# "0 tests" when client-tokio/server-tokio aren't enabled — the
+# vsomeip-conformance file is unconditionally compiled but every
+# function inside it depends on `Client::new_with_loopback` /
+# `Server::new_with_loopback` (tokio path) and on
+# `tracing-subscriber` / `socket2`. Pinning the required-features
+# makes the test cleanly skipped under the wrong feature set.
+name = "vsomeip_sd_compat"
+required-features = ["client-tokio", "server-tokio"]
+
+[[test]]
 name = "bare_metal_client"
 required-features = ["client", "bare_metal"]
 
