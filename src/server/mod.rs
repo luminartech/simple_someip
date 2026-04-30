@@ -98,6 +98,68 @@ impl ServerConfig {
     pub fn accepts_event_group(&self, event_group_id: u16) -> bool {
         self.event_group_ids.is_empty() || self.event_group_ids.contains(&event_group_id)
     }
+
+    // ── Fluent builder ───────────────────────────────────────────────
+    //
+    // Each `with_*` setter consumes and returns `self` so callers can
+    // chain overrides starting from `Self::new(...)`. The struct's
+    // public fields stay available; the builder is just a less-noisy
+    // path for the common "constructor + a couple of overrides" shape.
+
+    /// Set the SOME/IP major version. Defaults to `1` from
+    /// [`Self::new`].
+    #[must_use]
+    pub fn with_major_version(mut self, major_version: u8) -> Self {
+        self.major_version = major_version;
+        self
+    }
+
+    /// Set the SOME/IP minor version. Defaults to `0` from
+    /// [`Self::new`].
+    #[must_use]
+    pub fn with_minor_version(mut self, minor_version: u32) -> Self {
+        self.minor_version = minor_version;
+        self
+    }
+
+    /// Set the SD announcement TTL in seconds. Defaults to `3` from
+    /// [`Self::new`] (typical for SOME/IP).
+    #[must_use]
+    pub fn with_ttl(mut self, ttl_seconds: u32) -> Self {
+        self.ttl = ttl_seconds;
+        self
+    }
+
+    /// Append an event-group ID to the registered set. Subscriptions
+    /// for groups not in this set are NACK'd; an empty set (the
+    /// default after [`Self::new`]) accepts any group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if more than [`Self::EVENT_GROUP_IDS_CAP`] groups have
+    /// been registered. Use [`Self::try_with_event_group`] for the
+    /// fallible variant.
+    #[must_use]
+    pub fn with_event_group(mut self, event_group_id: u16) -> Self {
+        self.event_group_ids
+            .push(event_group_id)
+            .expect("event_group_ids capacity exceeded");
+        self
+    }
+
+    /// Fallible counterpart to [`Self::with_event_group`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the unmodified config (in `Err`) if registering would
+    /// exceed [`Self::EVENT_GROUP_IDS_CAP`].
+    pub fn try_with_event_group(mut self, event_group_id: u16) -> Result<Self, Self> {
+        if self.event_group_ids.push(event_group_id).is_ok() {
+            Ok(self)
+        } else {
+            Err(self)
+        }
+    }
 }
 
 /// Bundle of pluggable infrastructure passed to [`Server::new_with_deps`].
@@ -1706,6 +1768,36 @@ mod tests {
 
         let server: Result<TestServer, _> = TestServer::new(config).await;
         assert!(server.is_ok());
+    }
+
+    #[test]
+    fn server_config_builder_chain_overrides_each_field() {
+        let cfg = ServerConfig::new(Ipv4Addr::LOCALHOST, 30683, 0x5B, 1)
+            .with_major_version(2)
+            .with_minor_version(7)
+            .with_ttl(10)
+            .with_event_group(0x42)
+            .with_event_group(0x43);
+        assert_eq!(cfg.major_version, 2);
+        assert_eq!(cfg.minor_version, 7);
+        assert_eq!(cfg.ttl, 10);
+        assert!(cfg.accepts_event_group(0x42));
+        assert!(cfg.accepts_event_group(0x43));
+        assert!(!cfg.accepts_event_group(0x44));
+    }
+
+    #[test]
+    fn server_config_try_with_event_group_rejects_at_capacity() {
+        let mut cfg = ServerConfig::new(Ipv4Addr::LOCALHOST, 30684, 0x5B, 1);
+        for i in 0..u16::try_from(ServerConfig::EVENT_GROUP_IDS_CAP).unwrap() {
+            cfg = cfg.try_with_event_group(i).expect("under cap");
+        }
+        // One more should be rejected and return the unmodified config.
+        let cap = ServerConfig::EVENT_GROUP_IDS_CAP;
+        let result = cfg.try_with_event_group(0xFFFF);
+        let returned = result.expect_err("at-cap insert must fail");
+        assert_eq!(returned.event_group_ids.len(), cap);
+        assert!(!returned.accepts_event_group(0xFFFF));
     }
 
     // ── new_with_handles / new_passive_with_handles tests ──────────────
