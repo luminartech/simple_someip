@@ -63,10 +63,10 @@ type TestClient = Client<
 /// scope so callers can spell `TestServer::new(...)` without chasing the
 /// four-type-parameter signature on every call site.
 type TestServer = Server<
-    std::sync::Arc<std::sync::Mutex<simple_someip::e2e::E2ERegistry>>,
-    std::sync::Arc<tokio::sync::RwLock<simple_someip::server::SubscriptionManager>>,
     simple_someip::TokioTransport,
     simple_someip::TokioTimer,
+    std::sync::Arc<std::sync::Mutex<simple_someip::e2e::E2ERegistry>>,
+    std::sync::Arc<tokio::sync::RwLock<simple_someip::server::SubscriptionManager>>,
 >;
 
 /// Type alias for the event publisher concrete type used by `TestServer`'s

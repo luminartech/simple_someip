@@ -252,7 +252,7 @@ async fn main() {
     let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30490, 0x1234, 1);
 
     let server =
-        Server::<StaticE2EHandle, StaticSubscriptionHandle, MockFactory, MockTimer>::new_with_deps(
+        Server::<MockFactory, MockTimer, StaticE2EHandle, StaticSubscriptionHandle>::new_with_deps(
             ServerDeps {
                 factory,
                 timer: MockTimer,

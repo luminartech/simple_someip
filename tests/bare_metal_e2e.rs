@@ -359,7 +359,7 @@ async fn client_receives_server_sd_announcement() {
         subscriptions: server_subs,
     };
 
-    let server: Server<Arc<Mutex<E2ERegistry>>, MockSubscriptions, MockFactory, MockTimer> =
+    let server: Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
         Server::new_with_deps(server_deps, server_config, false)
             .await
             .expect("server creation");
@@ -452,7 +452,7 @@ async fn client_send_request_server_runloop_stable() {
         subscriptions: server_subs,
     };
 
-    let mut server: Server<Arc<Mutex<E2ERegistry>>, MockSubscriptions, MockFactory, MockTimer> =
+    let mut server: Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
         Server::new_passive_with_deps(server_deps, server_config)
             .await
             .expect("passive server creation");
