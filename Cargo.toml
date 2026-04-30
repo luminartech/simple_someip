@@ -73,7 +73,7 @@ tracing-subscriber = "0.3"
 
 [features]
 default = ["std"]
-std = ["embedded-io/std", "thiserror/std", "tracing/std"]
+std = ["embedded-io/std", "thiserror/std", "tracing/std", "_alloc"]
 # Feature split: `client` exposes the protocol/trait-surface client
 # (no tokio, no socket2); `client-tokio` layers the tokio + socket2
 # convenience defaults on top. Consumers of the bare-metal trait surface
@@ -83,6 +83,13 @@ std = ["embedded-io/std", "thiserror/std", "tracing/std"]
 # `TokioChannels` / `TokioTransport`) enable `client-tokio`.
 client = ["dep:futures-util"]
 client-tokio = ["client", "std", "dep:tokio", "dep:socket2"]
+# Internal marker: features that need `extern crate alloc`. Pulls in
+# `alloc::sync::Arc` for `SharedHandle<T>` and `Arc<EventPublisher>`.
+# Not part of the public surface — implied by `server` /
+# `embassy_channels` / `std` and tied to the `extern crate alloc`
+# declaration in `lib.rs` so both sides of "alloc is available"
+# move in lockstep. Naming: `_`-prefix flags it as private.
+_alloc = []
 # Feature split (matches the client side): `server` exposes the
 # trait-surface server (no tokio, no socket2, no std). The engine
 # itself uses `futures::select!` so `dep:futures` lives here.
@@ -91,7 +98,7 @@ client-tokio = ["client", "std", "dep:tokio", "dep:socket2"]
 # bringing `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>` /
 # / `TokioTransport` / `TokioTimer` defaults into scope, and forces
 # `std`.
-server = ["dep:futures-util"]
+server = ["dep:futures-util", "_alloc"]
 server-tokio = ["server", "std", "dep:tokio", "dep:socket2"]
 # Marks a build as intended for bare-metal / no_std consumption.
 # Activates embassy-sync as the channel backend, the `static_channels`
@@ -113,7 +120,7 @@ bare_metal = ["dep:embassy-sync"]
 # Heap-backed embassy-sync channel backend (`EmbassySyncChannels`).
 # Implies `bare_metal` and pulls in `alloc` for `Arc<Channel<...>>`.
 # Useful for tests or early prototypes before sizing static pools.
-embassy_channels = ["bare_metal"]
+embassy_channels = ["bare_metal", "_alloc"]
 
 [[test]]
 name = "client_server"
