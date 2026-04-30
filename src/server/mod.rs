@@ -108,12 +108,12 @@ impl ServerConfig {
 ///
 /// All four fields are public so callers can construct the struct
 /// inline.
-pub struct ServerDeps<F, Tm, R, S>
+pub struct ServerDeps<F, Tm, R, Sub>
 where
     F: TransportFactory,
     Tm: Timer,
     R: E2ERegistryHandle,
-    S: SubscriptionHandle,
+    Sub: SubscriptionHandle,
 {
     /// Transport factory used to bind the unicast and SD sockets.
     pub factory: F,
@@ -125,7 +125,7 @@ where
     /// `Server::new` (under `server-tokio`) builds an
     /// `Arc<RwLock<SubscriptionManager>>` for this; bare-metal callers
     /// supply their own [`SubscriptionHandle`] impl.
-    pub subscriptions: S,
+    pub subscriptions: Sub,
 }
 
 /// Bundle of pre-built dependencies + storage handles for
@@ -146,15 +146,15 @@ where
 ///
 /// All eight fields are public so the struct can be assembled
 /// inline.
-pub struct ServerHandles<F, Tm, R, S, H, Hsd, Hep>
+pub struct ServerHandles<F, Tm, R, Sub, H, Hsd, Hep>
 where
     F: TransportFactory + 'static,
     Tm: Timer,
     R: E2ERegistryHandle,
-    S: SubscriptionHandle,
+    Sub: SubscriptionHandle,
     H: SharedHandle<F::Socket>,
     Hsd: SharedHandle<SdStateManager>,
-    Hep: SharedHandle<EventPublisher<R, S, H, F::Socket>>,
+    Hep: SharedHandle<EventPublisher<R, Sub, H, F::Socket>>,
 {
     /// Transport factory. Retained on the `Server` for any
     /// post-construction state the backend needs to keep alive
@@ -167,7 +167,7 @@ where
     /// Shared E2E registry handle for runtime E2E configuration.
     pub e2e_registry: R,
     /// Shared subscription manager handle.
-    pub subscriptions: S,
+    pub subscriptions: Sub,
     /// Pre-built unicast socket handle. Caller has already bound
     /// the underlying socket to the desired interface + port.
     pub unicast_socket: H,
@@ -190,34 +190,38 @@ where
 ///
 /// Generic over the four pluggable infrastructure types bundled in
 /// [`ServerDeps`]:
-/// - `R: E2ERegistryHandle` — runtime E2E configuration registry
-/// - `S: SubscriptionHandle` — event-group subscription state
 /// - `F: TransportFactory` — socket primitive (carried as a stored
 ///   unit-struct in the tokio path; bare-metal impls may carry state)
 /// - `Tm: Timer` — async sleep used by the announcement loop
+/// - `R: E2ERegistryHandle` — runtime E2E configuration registry
+/// - `Sub: SubscriptionHandle` — event-group subscription state
+///
+/// The generic order mirrors [`ServerDeps`] (and, for the shared
+/// infrastructure parameters `F`, `Tm`, `R`, the order is also shared
+/// with [`crate::ClientDeps`]).
 ///
 /// The convenience constructors `Self::new` / `Self::new_with_loopback`
 /// / `Self::new_passive` (under the `server-tokio` feature) instantiate
-/// these as `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>`
-/// / `TokioTransport` / `TokioTimer`. Bare-metal callers use
+/// these as `TokioTransport` / `TokioTimer` / `Arc<Mutex<E2ERegistry>>`
+/// / `Arc<RwLock<SubscriptionManager>>`. Bare-metal callers use
 /// [`Self::new_with_deps`] (under `server`) and supply their own.
 pub struct Server<
-    R,
-    S,
     F,
     Tm,
+    R,
+    Sub,
     H = Arc<<F as TransportFactory>::Socket>,
     Hsd = Arc<SdStateManager>,
-    Hep = Arc<EventPublisher<R, S, H, <F as TransportFactory>::Socket>>,
+    Hep = Arc<EventPublisher<R, Sub, H, <F as TransportFactory>::Socket>>,
 > where
-    R: E2ERegistryHandle,
-    S: SubscriptionHandle,
     F: TransportFactory + 'static,
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
+    R: E2ERegistryHandle,
+    Sub: SubscriptionHandle,
     H: SharedHandle<F::Socket>,
     Hsd: SharedHandle<SdStateManager>,
-    Hep: SharedHandle<EventPublisher<R, S, H, F::Socket>>,
+    Hep: SharedHandle<EventPublisher<R, Sub, H, F::Socket>>,
 {
     config: ServerConfig,
     /// Socket for receiving subscription requests, behind whatever
@@ -228,10 +232,10 @@ pub struct Server<
     /// `unicast_socket`; both are produced by the same factory).
     sd_socket: H,
     /// Subscription manager
-    subscriptions: S,
+    subscriptions: Sub,
     /// Event publisher, behind whatever shared-storage `Hep` chose
-    /// (`Arc<EventPublisher<R, S, H>>` on std,
-    /// `&'static EventPublisher<R, S, H>` on bare-metal-no-alloc).
+    /// (`Arc<EventPublisher<R, Sub, H>>` on std,
+    /// `&'static EventPublisher<R, Sub, H>` on bare-metal-no-alloc).
     publisher: Hep,
     /// SD session-ID counter and announcement emitter, behind whatever
     /// shared-storage `Hsd` chose (`Arc<SdStateManager>` on std,
@@ -265,10 +269,10 @@ pub struct Server<
 #[cfg(feature = "server-tokio")]
 impl
     Server<
-        Arc<Mutex<E2ERegistry>>,
-        Arc<RwLock<SubscriptionManager>>,
         crate::tokio_transport::TokioTransport,
         crate::tokio_transport::TokioTimer,
+        Arc<Mutex<E2ERegistry>>,
+        Arc<RwLock<SubscriptionManager>>,
     >
 {
     /// Create a new SOME/IP server
@@ -350,16 +354,16 @@ impl
     }
 }
 
-impl<R, S, F, Tm, H, Hsd, Hep> Server<R, S, F, Tm, H, Hsd, Hep>
+impl<F, Tm, R, Sub, H, Hsd, Hep> Server<F, Tm, R, Sub, H, Hsd, Hep>
 where
-    R: E2ERegistryHandle,
-    S: SubscriptionHandle,
     F: TransportFactory + 'static,
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
+    R: E2ERegistryHandle,
+    Sub: SubscriptionHandle,
     H: WrappableSharedHandle<F::Socket>,
     Hsd: WrappableSharedHandle<SdStateManager>,
-    Hep: WrappableSharedHandle<EventPublisher<R, S, H, F::Socket>>,
+    Hep: WrappableSharedHandle<EventPublisher<R, Sub, H, F::Socket>>,
 {
     /// Bare-metal-friendly constructor that takes every dependency
     /// explicitly via a [`ServerDeps`] bundle. The `server-tokio`
@@ -381,7 +385,7 @@ where
     /// [`TransportFactory::bind`] fails, or if joining the SD multicast
     /// group fails.
     pub async fn new_with_deps(
-        deps: ServerDeps<F, Tm, R, S>,
+        deps: ServerDeps<F, Tm, R, Sub>,
         mut config: ServerConfig,
         multicast_loopback: bool,
     ) -> Result<Self, Error> {
@@ -461,7 +465,7 @@ where
     ///
     /// Returns an error if binding either socket fails.
     pub async fn new_passive_with_deps(
-        deps: ServerDeps<F, Tm, R, S>,
+        deps: ServerDeps<F, Tm, R, Sub>,
         mut config: ServerConfig,
     ) -> Result<Self, Error> {
         let ServerDeps {
@@ -520,16 +524,16 @@ where
     }
 }
 
-impl<R, S, F, Tm, H, Hsd, Hep> Server<R, S, F, Tm, H, Hsd, Hep>
+impl<F, Tm, R, Sub, H, Hsd, Hep> Server<F, Tm, R, Sub, H, Hsd, Hep>
 where
-    R: E2ERegistryHandle,
-    S: SubscriptionHandle,
     F: TransportFactory + 'static,
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
+    R: E2ERegistryHandle,
+    Sub: SubscriptionHandle,
     H: SharedHandle<F::Socket>,
     Hsd: SharedHandle<SdStateManager>,
-    Hep: SharedHandle<EventPublisher<R, S, H, F::Socket>>,
+    Hep: SharedHandle<EventPublisher<R, Sub, H, F::Socket>>,
 {
     /// Construct a `Server` from pre-built dependencies + storage
     /// handles. The bare-metal-no-alloc counterpart to
@@ -560,7 +564,7 @@ where
     /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
     /// and does not equal the unicast socket's bound port.
     pub fn new_with_handles(
-        deps: ServerHandles<F, Tm, R, S, H, Hsd, Hep>,
+        deps: ServerHandles<F, Tm, R, Sub, H, Hsd, Hep>,
         mut config: ServerConfig,
     ) -> Result<Self, Error> {
         let bound_port = deps.unicast_socket.get().local_addr()?.port();
@@ -623,7 +627,7 @@ where
     /// back-fill-only-on-zero discipline as
     /// [`Self::new_with_handles`]).
     pub fn new_passive_with_handles(
-        deps: ServerHandles<F, Tm, R, S, H, Hsd, Hep>,
+        deps: ServerHandles<F, Tm, R, Sub, H, Hsd, Hep>,
         mut config: ServerConfig,
     ) -> Result<Self, Error> {
         let bound_port = deps.unicast_socket.get().local_addr()?.port();
@@ -1452,16 +1456,16 @@ fn extract_subscriber_endpoint(
     }
 }
 
-impl<R, S, F, Tm, H, Hsd, Hep> Server<R, S, F, Tm, H, Hsd, Hep>
+impl<F, Tm, R, Sub, H, Hsd, Hep> Server<F, Tm, R, Sub, H, Hsd, Hep>
 where
-    R: E2ERegistryHandle,
-    S: SubscriptionHandle,
     F: TransportFactory + 'static,
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
+    R: E2ERegistryHandle,
+    Sub: SubscriptionHandle,
     H: SharedHandle<F::Socket>,
     Hsd: SharedHandle<SdStateManager>,
-    Hep: SharedHandle<EventPublisher<R, S, H, F::Socket>>,
+    Hep: SharedHandle<EventPublisher<R, Sub, H, F::Socket>>,
 {
     /// Send `SubscribeAck` from an entry view
     async fn send_subscribe_ack_from_view(
@@ -1582,10 +1586,10 @@ mod tests {
     /// chasing the four-type-parameter signature on every call site.
     /// Mirrors the `TestClient` pattern from `tests/client_server.rs`.
     type TestServer = Server<
-        Arc<Mutex<E2ERegistry>>,
-        Arc<RwLock<SubscriptionManager>>,
         TokioTransport,
         TokioTimer,
+        Arc<Mutex<E2ERegistry>>,
+        Arc<RwLock<SubscriptionManager>>,
     >;
 
     #[tokio::test]

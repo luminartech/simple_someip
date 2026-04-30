@@ -208,15 +208,21 @@ impl<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory>
 }
 
 /// Bundle of dependencies passed to [`Client::new_with_deps`]. Bundling
-/// the five pluggable infrastructure types (`TransportFactory`,
-/// `Spawner`, `Timer`, `E2ERegistryHandle`, `InterfaceHandle`) into a
-/// single struct keeps the constructor's argument list manageable
-/// (consumers see one named field per dependency rather than positional
-/// args six deep).
+/// the five pluggable infrastructure types (`TransportFactory`, `Timer`,
+/// `E2ERegistryHandle`, `InterfaceHandle`, `Spawner`) into a single
+/// struct keeps the constructor's argument list manageable (consumers
+/// see one named field per dependency rather than positional args six
+/// deep).
+///
+/// Generic order mirrors [`crate::server::ServerDeps`] for the shared
+/// infrastructure (`F`, `Tm`, `R`), then side-specific dependencies
+/// (`I` for the client's interface handle, `Sub` for the server's
+/// subscription handle), then any side-only extras (`Sp` for the
+/// client's spawner — the server has no internal task-spawning).
 ///
 /// All five fields are public so callers can construct the struct
 /// inline; there's no builder ceremony beyond the field assignments.
-pub struct ClientDeps<F, S, Tm, R, I>
+pub struct ClientDeps<F, Tm, R, I, Sp>
 where
     F: TransportFactory,
     Tm: Timer,
@@ -225,8 +231,6 @@ where
 {
     /// Transport factory used by `bind_*` to construct sockets.
     pub factory: F,
-    /// Task-spawner used by `bind_*` to drive per-socket I/O loops.
-    pub spawner: S,
     /// Async sleep primitive used by the run-loop's idle tick.
     pub timer: Tm,
     /// Shared E2E registry handle for runtime E2E configuration.
@@ -234,6 +238,8 @@ where
     /// Shared interface-address handle. The run-loop reads its current
     /// value when `bind_*` is invoked.
     pub interface: I,
+    /// Task-spawner used by `bind_*` to drive per-socket I/O loops.
+    pub spawner: Sp,
 }
 
 /// A SOME/IP client that handles service discovery and message exchange.
@@ -381,7 +387,7 @@ where
     ///
     /// # Bounds
     ///
-    /// `S: Spawner + Send + Sync + 'static` — the spawner is stored in
+    /// `Sp: Spawner + Send + Sync + 'static` — the spawner is stored in
     /// the run-loop future, which is `Send + 'static`, so the spawner
     /// must match those bounds. `Sync` is required because `&self.spawner`
     /// is held across `.await` points inside
@@ -389,25 +395,25 @@ where
     /// `bind_discovery_seeded_with_transport`, both of which execute on
     /// the driven run-loop task (not on the user's call site).
     #[must_use = "the returned run-loop future must be spawned (e.g. via the Spawner) for the client to make progress"]
-    pub fn new_with_spawner_and_loopback<S>(
+    pub fn new_with_spawner_and_loopback<Sp>(
         interface: Ipv4Addr,
         multicast_loopback: bool,
-        spawner: S,
+        spawner: Sp,
     ) -> (
         Self,
         ClientUpdates<MessageDefinitions, TokioChannels>,
         impl core::future::Future<Output = ()> + Send + 'static,
     )
     where
-        S: Spawner + Send + Sync + 'static,
+        Sp: Spawner + Send + Sync + 'static,
     {
         Self::new_with_deps(
             ClientDeps {
                 factory: crate::tokio_transport::TokioTransport,
-                spawner,
                 timer: TokioTimer,
                 e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
                 interface: Arc::new(RwLock::new(interface)),
+                spawner,
             },
             multicast_loopback,
         )
@@ -457,8 +463,8 @@ where
     /// `LocalSet`-style spawner shim.
     #[allow(clippy::type_complexity)]
     #[must_use = "the returned run-loop future must be spawned (e.g. via the Spawner) for the client to make progress"]
-    pub fn new_with_deps<F, S, Tm>(
-        deps: ClientDeps<F, S, Tm, R, I>,
+    pub fn new_with_deps<F, Tm, Sp>(
+        deps: ClientDeps<F, Tm, R, I, Sp>,
         multicast_loopback: bool,
     ) -> (
         Self,
@@ -471,21 +477,21 @@ where
         for<'a> F::BindFuture<'a>: Send,
         for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
         for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
-        S: Spawner + Send + Sync + 'static,
+        Sp: Spawner + Send + Sync + 'static,
         Tm: Timer + Send + Sync + 'static,
         for<'a> Tm::SleepFuture<'a>: Send,
     {
         let ClientDeps {
             factory,
-            spawner,
             timer,
             e2e_registry,
             interface,
+            spawner,
         } = deps;
         let initial_addr = interface.get();
         let dispatch = bind_dispatch::SpawnerDispatch { factory, spawner };
         let (control_sender, update_receiver, run_future) =
-            Inner::<MessageDefinitions, Tm, R, C, bind_dispatch::SpawnerDispatch<F, S>>::build(
+            Inner::<MessageDefinitions, Tm, R, C, bind_dispatch::SpawnerDispatch<F, Sp>>::build(
                 initial_addr,
                 e2e_registry.clone(),
                 multicast_loopback,
@@ -518,8 +524,8 @@ where
     /// [`Spawner`]: crate::transport::Spawner
     #[allow(clippy::type_complexity)]
     #[must_use = "the returned run-loop future must be spawned (e.g. via the LocalSpawner) for the client to make progress"]
-    pub fn new_with_deps_local<F, S, Tm>(
-        deps: ClientDeps<F, S, Tm, R, I>,
+    pub fn new_with_deps_local<F, Tm, Sp>(
+        deps: ClientDeps<F, Tm, R, I, Sp>,
         multicast_loopback: bool,
     ) -> (
         Self,
@@ -529,15 +535,15 @@ where
     where
         F: TransportFactory + 'static,
         F::Socket: 'static,
-        S: crate::transport::LocalSpawner + 'static,
+        Sp: crate::transport::LocalSpawner + 'static,
         Tm: Timer + 'static,
     {
         let ClientDeps {
             factory,
-            spawner,
             timer,
             e2e_registry,
             interface,
+            spawner,
         } = deps;
         let initial_addr = interface.get();
         let dispatch = bind_dispatch::LocalSpawnerDispatch { factory, spawner };
@@ -546,7 +552,7 @@ where
             Tm,
             R,
             C,
-            bind_dispatch::LocalSpawnerDispatch<F, S>,
+            bind_dispatch::LocalSpawnerDispatch<F, Sp>,
         >::build(
             initial_addr,
             e2e_registry.clone(),

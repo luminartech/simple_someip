@@ -285,7 +285,7 @@ async fn server_constructible_without_server_tokio_feature() {
             subscriptions: subs,
         };
 
-    let server: Server<Arc<Mutex<E2ERegistry>>, MockSubscriptions, MockFactory, MockTimer> =
+    let server: Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
         Server::new_with_deps(deps, config, false)
             .await
             .expect("Server::new_with_deps must succeed with no-tokio mocks");
@@ -329,7 +329,7 @@ async fn passive_server_constructible_without_server_tokio_feature() {
             subscriptions: subs,
         };
 
-    let _server: Server<Arc<Mutex<E2ERegistry>>, MockSubscriptions, MockFactory, MockTimer> =
+    let _server: Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
         Server::new_passive_with_deps(deps, config)
             .await
             .expect("Server::new_passive_with_deps must succeed with no-tokio mocks");
