@@ -150,14 +150,28 @@ impl Future for EmbassyNetRecvFut<'_> {
                 }
             },
             Poll::Ready(Err(RecvError::Truncated)) => {
-                // Caller's buffer was smaller than the datagram.
-                // simple-someip uses `UDP_BUFFER_SIZE = 1500` for
-                // its recv buffers, which exceeds typical UDP
-                // payloads — hitting this branch indicates either
-                // an undersized SocketPool RX_BUF or an
-                // unexpectedly large incoming datagram. Either way
-                // the application has a sizing problem worth
-                // logging through the operator pipeline.
+                // CONTRACT NOTE: simple-someip's `TransportSocket::
+                // recv_from` documents that "a datagram whose payload
+                // exceeds `buf` is **not** an error; it is returned
+                // with [`ReceivedDatagram::truncated`] set to `true`."
+                //
+                // embassy-net 0.4's `poll_recv_from` returns
+                // `RecvError::Truncated` and (a) does not deliver any
+                // bytes when the datagram doesn't fit and (b) does
+                // not surface the original datagram length. We can't
+                // honor the trait's `truncated: true` semantics
+                // truthfully — there's no copied prefix to return and
+                // no original-length to record. This adapter
+                // therefore treats truncation as a fatal *operator*
+                // configuration error, mapped to `IoErrorKind::Other`
+                // so it shows up distinctly in logs.
+                //
+                // The caller-side fix is to size `SocketPool`'s
+                // `RX_BUF` ≥ link MTU (typically 1500). With
+                // `RX_BUF = 1500`, IPv4 + UDP header overhead capped
+                // at 28 B, and `simple-someip::UDP_BUFFER_SIZE`
+                // already at 1500, this branch should never fire
+                // under correct configuration.
                 Poll::Ready(Err(TransportError::Io(IoErrorKind::Other)))
             }
         }
@@ -221,10 +235,16 @@ fn socket_addr_v4_to_endpoint(addr: SocketAddrV4) -> IpEndpoint {
 /// IPv4-only at this layer; an IPv6 source on a v4-bound socket
 /// indicates a misconfiguration upstream).
 ///
-/// The wildcard arm covers the case where smoltcp's `proto-ipv6`
-/// feature gets pulled in via cargo's feature unification (e.g.
-/// another crate in the dep graph enables it). Without the arm
-/// the match would silently become non-exhaustive in that build.
+/// The wildcard arm exists so this match stays exhaustive when
+/// smoltcp's `proto-ipv6` feature is enabled (either by this
+/// adapter directly or transitively via cargo's feature
+/// unification). With only `proto-ipv4`, smoltcp's `Address` enum
+/// has a single `Ipv4` variant and the `_ => None` arm is
+/// unreachable — hence the `#[allow(unreachable_patterns)]`. With
+/// `proto-ipv6` also enabled, an `Ipv6` variant appears and the
+/// arm catches it. Either way an IPv6 source on a v4-only SOME/IP
+/// socket maps to `None`, which `recv_from` surfaces as
+/// `TransportError::Unsupported`.
 fn endpoint_to_socket_addr_v4(endpoint: IpEndpoint) -> Option<SocketAddrV4> {
     match endpoint.addr {
         IpAddress::Ipv4(v4) => {

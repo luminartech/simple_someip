@@ -60,7 +60,7 @@ use simple_someip::protocol::sd::RebootFlag;
 use simple_someip::server::{ServerConfig, SubscribeError, Subscriber, SubscriptionHandle};
 use simple_someip::transport::{LocalSpawner, Timer};
 use simple_someip::{Client, ClientDeps, RawPayload, Server, ServerDeps};
-use simple_someip_embassy_net::{EmbassyNetFactory, EmbassyNetSocket, SocketPool};
+use simple_someip_embassy_net::{EmbassyNetFactory, EmbassyNetSocket, LINK_MTU, SocketPool};
 
 // ── LoopbackDriver pair ──────────────────────────────────────────────
 //
@@ -156,7 +156,7 @@ impl Driver for LoopbackDriver {
 
     fn capabilities(&self) -> Capabilities {
         let mut caps = Capabilities::default();
-        caps.max_transmission_unit = 1500;
+        caps.max_transmission_unit = LINK_MTU;
         caps.max_burst_size = None;
         caps
     }
@@ -355,7 +355,7 @@ async fn main() {
                 .expect("client stack joined SD multicast");
 
             // ── Server on stack A ────────────────────────────────
-            let server_pool: &'static SocketPool<8, 1500, 1500> =
+            let server_pool: &'static SocketPool<8, LINK_MTU, LINK_MTU> =
                 Box::leak(Box::new(SocketPool::new()));
             let server_factory = EmbassyNetFactory::new(stack_a, server_pool);
             let server_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
@@ -390,7 +390,7 @@ async fn main() {
             );
 
             // ── Client on stack B ────────────────────────────────
-            let client_pool: &'static SocketPool<8, 1500, 1500> =
+            let client_pool: &'static SocketPool<8, LINK_MTU, LINK_MTU> =
                 Box::leak(Box::new(SocketPool::new()));
             let client_factory = EmbassyNetFactory::new(stack_b, client_pool);
             let client_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));

@@ -6,13 +6,15 @@
 //! reclaims it when the returned [`EmbassyNetSocket`] is dropped.
 
 use core::cell::UnsafeCell;
-use core::future::Future;
-use core::net::SocketAddrV4;
+use core::future::Ready;
+use core::marker::PhantomData;
+use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_net::Stack;
 use embassy_net::driver::Driver;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
+use embassy_net::{IpAddress, IpListenEndpoint};
 
 use simple_someip::transport::{SocketOptions, TransportError, TransportFactory};
 
@@ -42,6 +44,18 @@ pub const PACKET_METADATA_LEN: usize = 4;
 /// storage in a single `static` and the [`EmbassyNetFactory`] hands
 /// each `bind()` call a fresh slot.
 ///
+/// # Buffer sizing — IMPORTANT
+///
+/// `RX_BUF` / `TX_BUF` are **link-layer payload caps**, not application
+/// payload caps. SOME/IP-over-UDP datagrams are bounded by the
+/// path-MTU minus the IP header (20 B for IPv4) minus the UDP header
+/// (8 B). For a 1500-byte Ethernet MTU that's a 1472-byte ceiling on
+/// the application payload before fragmentation. Sizing
+/// `RX_BUF`/`TX_BUF` to **at least** the link MTU (1500) gives full
+/// headroom for any datagram the L2/L3 stack will deliver; sizing
+/// strictly to the application cap (1472) risks dropping otherwise-
+/// valid datagrams. Most consumers should pick 1500 or larger.
+///
 /// # Example
 ///
 /// ```ignore
@@ -67,12 +81,16 @@ pub struct SocketPool<const POOL: usize, const RX_BUF: usize, const TX_BUF: usiz
     in_use: [AtomicBool; POOL],
 }
 
-// SAFETY: the `slots` field is accessed only via the per-slot
-// `in_use` AtomicBool: a slot's UnsafeCell-wrapped storage is
-// touched only between a successful CAS `false -> true` and the
-// reciprocal `true -> false` on slot release. Cross-task access is
-// serialized by that CAS handshake, which gives us the same
-// happens-before guarantees as a Mutex<T> would.
+// SAFETY: `SocketPool::Sync` is sound for shared *slot data* access:
+// each slot's `UnsafeCell`-wrapped storage is touched only between a
+// successful CAS `false -> true` (in `claim`) and the reciprocal
+// `true -> false` on release (in `Drop`). That CAS handshake gives
+// the same happens-before guarantee as a `Mutex`. NOTE: this only
+// covers the *pool*'s slot data — the `EmbassyNetFactory` that
+// mediates `bind()` is intentionally `!Send + !Sync` (see
+// `_not_thread_safe: PhantomData<*const ()>` below) because
+// `embassy_net::Stack` uses interior `RefCell` and is not safe to
+// drive `bind()` on from multiple threads.
 unsafe impl<const POOL: usize, const RX_BUF: usize, const TX_BUF: usize> Sync
     for SocketPool<POOL, RX_BUF, TX_BUF>
 {
@@ -153,6 +171,16 @@ impl<const POOL: usize, const RX_BUF: usize, const TX_BUF: usize> SlotReclaim
 /// Holds a reference to the embassy-net `Stack<D>` and a `&'static`
 /// [`SocketPool`] from which `bind()` allocates per-socket buffers.
 ///
+/// # Thread-safety
+///
+/// `EmbassyNetFactory` is intentionally `!Send + !Sync`. embassy-net's
+/// `Stack<D>` uses interior `RefCell` for its socket-set bookkeeping
+/// and is designed to be driven from a single embassy executor task;
+/// allowing the factory to cross thread boundaries would let two
+/// threads call `bind()` concurrently and race on the stack's
+/// `borrow_mut()`. The simple-someip run-loops live on one task per
+/// `Client` / `Server` anyway, which matches this constraint.
+///
 /// # Multicast group join (important)
 ///
 /// `TransportSocket::join_multicast_v4` on the returned socket is
@@ -175,29 +203,41 @@ impl<const POOL: usize, const RX_BUF: usize, const TX_BUF: usize> SlotReclaim
 ///
 /// Without that explicit join, multicast SD traffic will not be
 /// delivered to any socket bound through this factory.
-pub struct EmbassyNetFactory<'pool, D, const POOL: usize, const RX_BUF: usize, const TX_BUF: usize>
+pub struct EmbassyNetFactory<D, const POOL: usize, const RX_BUF: usize, const TX_BUF: usize>
 where
     D: Driver + 'static,
 {
     stack: &'static Stack<D>,
-    pool: &'pool SocketPool<POOL, RX_BUF, TX_BUF>,
+    pool: &'static SocketPool<POOL, RX_BUF, TX_BUF>,
+    /// Marker that pins the factory to a single thread. embassy-net's
+    /// `Stack` is not safe to drive `bind()` on from multiple threads
+    /// because of its internal `RefCell`. `*const ()` makes us
+    /// `!Send + !Sync` without occupying any storage.
+    _not_thread_safe: PhantomData<*const ()>,
 }
 
-impl<'pool, D, const POOL: usize, const RX_BUF: usize, const TX_BUF: usize>
-    EmbassyNetFactory<'pool, D, POOL, RX_BUF, TX_BUF>
+impl<D, const POOL: usize, const RX_BUF: usize, const TX_BUF: usize>
+    EmbassyNetFactory<D, POOL, RX_BUF, TX_BUF>
 where
     D: Driver + 'static,
 {
     /// Build a factory borrowing from the given `Stack` and socket pool.
     ///
-    /// The `Stack` reference must be `'static` because each bound
-    /// [`UdpSocket`] borrows from it for the socket's lifetime, and
-    /// our [`EmbassyNetSocket`] is stored in the simple-someip
-    /// run-loop's task state (which itself outlives the
-    /// `EmbassyNetFactory`).
+    /// Both references must be `'static` because each bound
+    /// [`UdpSocket`] borrows from the stack and pool storage for the
+    /// socket's lifetime, and our [`EmbassyNetSocket`] is stored in
+    /// the simple-someip run-loop's task state (which itself outlives
+    /// the `EmbassyNetFactory`).
     #[must_use]
-    pub fn new(stack: &'static Stack<D>, pool: &'pool SocketPool<POOL, RX_BUF, TX_BUF>) -> Self {
-        Self { stack, pool }
+    pub fn new(
+        stack: &'static Stack<D>,
+        pool: &'static SocketPool<POOL, RX_BUF, TX_BUF>,
+    ) -> Self {
+        Self {
+            stack,
+            pool,
+            _not_thread_safe: PhantomData,
+        }
     }
 }
 
@@ -205,29 +245,33 @@ where
 ///
 /// `EmbassyNetFactory::bind` is logically synchronous — claim a
 /// pool slot, construct the `UdpSocket`, call `bind(port)` — but
-/// the trait wants a `Future`. This wrapper resolves on the first
-/// poll. The `Option`-and-take pattern lets us yield the eventual
-/// `Result` exactly once per future without storing it twice.
+/// the trait wants a `Future`. We delegate to [`core::future::Ready`]
+/// so the future resolves on first poll. Polling after completion
+/// panics with `core::future::Ready`'s standard message ("`Ready`
+/// polled after completion") — a Future-contract violation by the
+/// caller; not something a well-behaved executor will trigger.
 pub struct EmbassyNetBindFuture {
-    inner: Option<Result<EmbassyNetSocket, TransportError>>,
+    inner: Ready<Result<EmbassyNetSocket, TransportError>>,
 }
 
-impl Future for EmbassyNetBindFuture {
+impl core::future::Future for EmbassyNetBindFuture {
     type Output = Result<EmbassyNetSocket, TransportError>;
 
     fn poll(
-        mut self: core::pin::Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
-        match self.inner.take() {
-            Some(result) => core::task::Poll::Ready(result),
-            None => panic!("EmbassyNetBindFuture polled after completion"),
-        }
+        // Project the inner Ready and forward poll. We're a
+        // structural Pin destination per pin-projection rules: the
+        // inner `Ready` is itself `Unpin`, so we can take a `&mut`
+        // through the `Pin<&mut Self>` projection safely.
+        let me = unsafe { self.get_unchecked_mut() };
+        core::pin::Pin::new(&mut me.inner).poll(cx)
     }
 }
 
 impl<D, const POOL: usize, const RX_BUF: usize, const TX_BUF: usize> TransportFactory
-    for EmbassyNetFactory<'static, D, POOL, RX_BUF, TX_BUF>
+    for EmbassyNetFactory<D, POOL, RX_BUF, TX_BUF>
 where
     D: Driver + 'static,
 {
@@ -240,7 +284,7 @@ where
         //    addition could carry a dedicated `PoolExhausted` kind.
         let Some(slot_index) = self.pool.claim() else {
             return EmbassyNetBindFuture {
-                inner: Some(Err(TransportError::AddressInUse)),
+                inner: core::future::ready(Err(TransportError::AddressInUse)),
             };
         };
 
@@ -257,14 +301,9 @@ where
         // set back to false (in `socket::Drop`); the next claim()
         // observes that via Acquire.
         //
-        // Lifetime erasure: UnsafeCell::get() returns *mut T; we
-        // dereference to &'static mut [T]. That's sound because
-        // (a) the SocketPool itself is &'static (held by the
-        // factory as &'pool, but the pool we pass at construction
-        // is required to be &'static for the F::Socket: 'static
-        // bound elsewhere — see the impl bound above) and (b) the
-        // exclusive-access invariant from in_use serializes
-        // overlapping mutations.
+        // Lifetime: `self.pool` is already `&'static`, so the
+        // `&mut` reborrows below are `'static` too. No transmute
+        // needed.
         let (rx_meta, rx_buf, tx_meta, tx_buf) = unsafe {
             (
                 &mut *slot.rx_meta.get(),
@@ -276,43 +315,64 @@ where
 
         let mut socket = UdpSocket::new(self.stack, rx_meta, rx_buf, tx_meta, tx_buf);
 
-        // 3. bind() to the requested port. Port 0 means
-        //    "ephemeral, let the stack pick" — embassy-net
-        //    interprets bind on a `port: 0` IpListenEndpoint as
-        //    "any port". The actual local addr is read back via
-        //    EmbassyNetSocket::local_addr.
-        if let Err(_e) = socket.bind(addr.port()) {
+        // 3. bind() to the requested endpoint.
+        //
+        // Honor `addr.ip()`: if the caller specified a non-wildcard
+        // local address, bind to it (otherwise smoltcp would accept
+        // datagrams on any interface, ignoring caller intent). For
+        // `0.0.0.0` we pass `addr: None` so embassy-net binds on
+        // any local interface (its "wildcard" mode).
+        //
+        // Port 0 means "ephemeral, let the stack pick" — embassy-net
+        // allocates a dynamic port and writes it back into the
+        // bound endpoint, which we read out via `socket.endpoint()`
+        // below to record the actual local address.
+        let listen_addr: Option<IpAddress> = if addr.ip().is_unspecified() {
+            None
+        } else {
+            let o = addr.ip().octets();
+            Some(IpAddress::v4(o[0], o[1], o[2], o[3]))
+        };
+        let listen_endpoint = IpListenEndpoint {
+            addr: listen_addr,
+            port: addr.port(),
+        };
+        if socket.bind(listen_endpoint).is_err() {
             // Bind failed. Release the slot so it doesn't leak.
             // SAFETY: slot was claimed at the top of this fn; no
             // other path has observed it.
-            self.pool.in_use[slot_index].store(false, Ordering::Release);
+            self.pool.release(slot_index);
             return EmbassyNetBindFuture {
-                inner: Some(Err(TransportError::AddressInUse)),
+                inner: core::future::ready(Err(TransportError::AddressInUse)),
             };
         }
 
-        // 4. Wrap into our EmbassyNetSocket. Erase the pool's
-        //    const generics by coercing &'static SocketPool<...>
-        //    to &'static dyn SlotReclaim — the socket only ever
-        //    needs to call `release(slot_index)` on drop.
-        //
-        // SAFETY: see the lifetime-erasure note above.
-        let pool_dyn: &'static dyn SlotReclaim = unsafe {
-            // Lift `self.pool: &SocketPool<...>` from `'pool` to
-            // `'static`. The `impl<...> for EmbassyNetFactory<'static, ...>`
-            // bound above guarantees the factory we're being called
-            // through has a `'static` pool reference, so the lift
-            // is identity.
-            core::mem::transmute::<
-                &SocketPool<POOL, RX_BUF, TX_BUF>,
-                &'static SocketPool<POOL, RX_BUF, TX_BUF>,
-            >(self.pool)
-        };
-        let local = SocketAddrV4::new(*addr.ip(), addr.port());
+        // 4. Read back the actual bound port. embassy-net replaces
+        //    `port: 0` with the picked ephemeral port inside
+        //    `bind()`, so `endpoint().port` is the truth post-bind.
+        //    The address we record is what the caller asked for
+        //    (with `0.0.0.0` preserved as the wildcard) — embassy-
+        //    net's `endpoint().addr` is `None` for wildcard binds
+        //    and we have nothing better to substitute there.
+        let actual_port = socket.endpoint().port;
+        let local = SocketAddrV4::new(*addr.ip(), actual_port);
+
+        // 5. Wrap into our EmbassyNetSocket. `&'static SocketPool`
+        //    coerces directly to `&'static dyn SlotReclaim`; no
+        //    transmute / lifetime erasure needed.
+        let pool_dyn: &'static dyn SlotReclaim = self.pool;
         let socket = EmbassyNetSocket::new(socket, local, slot_index, pool_dyn);
 
         EmbassyNetBindFuture {
-            inner: Some(Ok(socket)),
+            inner: core::future::ready(Ok(socket)),
         }
     }
 }
+
+// Compile-time assertion documented at the type level: `Ipv4Addr`
+// `is_unspecified()` returns true exactly when the address is
+// `0.0.0.0`. This keeps a future Rust stdlib reshape from silently
+// changing how `bind` interprets the wildcard IP.
+const _: () = {
+    assert!(Ipv4Addr::UNSPECIFIED.is_unspecified());
+};

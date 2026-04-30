@@ -45,7 +45,7 @@ use embassy_net::driver::{Capabilities, Driver, HardwareAddress, LinkState, RxTo
 use embassy_net::{Config, Stack, StackResources, StaticConfigV4};
 
 use simple_someip::transport::{SocketOptions, TransportFactory, TransportSocket};
-use simple_someip_embassy_net::{EmbassyNetFactory, SocketPool};
+use simple_someip_embassy_net::{EmbassyNetFactory, LINK_MTU, SocketPool};
 
 // ── LoopbackDriver pair ──────────────────────────────────────────────
 //
@@ -160,11 +160,9 @@ impl Driver for LoopbackDriver {
 
     fn capabilities(&self) -> Capabilities {
         let mut caps = Capabilities::default();
-        // 1500 matches simple-someip's `UDP_BUFFER_SIZE`. The
-        // `medium-ip` smoltcp feature lets us skip the
-        // Ethernet-frame layer and ship raw IP packets, which is
-        // what `HardwareAddress::Ip` below also requests.
-        caps.max_transmission_unit = 1500;
+        // `medium-ip` smoltcp feature: raw IP packets, no Ethernet
+        // frame, paired with `HardwareAddress::Ip` below.
+        caps.max_transmission_unit = LINK_MTU;
         caps.max_burst_size = None;
         caps
     }
@@ -265,8 +263,8 @@ async fn adapter_udp_roundtrip() {
             tokio::task::spawn_local(async move { stack_a.run().await });
             tokio::task::spawn_local(async move { stack_b.run().await });
 
-            let pool_a: &'static SocketPool<2, 1500, 1500> = Box::leak(Box::new(SocketPool::new()));
-            let pool_b: &'static SocketPool<2, 1500, 1500> = Box::leak(Box::new(SocketPool::new()));
+            let pool_a: &'static SocketPool<2, LINK_MTU, LINK_MTU> = Box::leak(Box::new(SocketPool::new()));
+            let pool_b: &'static SocketPool<2, LINK_MTU, LINK_MTU> = Box::leak(Box::new(SocketPool::new()));
             let factory_a = EmbassyNetFactory::new(stack_a, pool_a);
             let factory_b = EmbassyNetFactory::new(stack_b, pool_b);
 
@@ -516,7 +514,7 @@ async fn client_receives_server_sd_announcement() {
                 .expect("stack B multicast join");
 
             // ── Server on stack A ────────────────────────────────
-            let server_pool: &'static SocketPool<8, 1500, 1500> =
+            let server_pool: &'static SocketPool<8, LINK_MTU, LINK_MTU> =
                 Box::leak(Box::new(SocketPool::new()));
             let server_factory = EmbassyNetFactory::new(stack_a, server_pool);
             let server_e2e: Arc<std::sync::Mutex<E2ERegistry>> =
@@ -553,7 +551,7 @@ async fn client_receives_server_sd_announcement() {
             tokio::task::spawn_local(announce_fut);
 
             // ── Client on stack B ────────────────────────────────
-            let client_pool: &'static SocketPool<8, 1500, 1500> =
+            let client_pool: &'static SocketPool<8, LINK_MTU, LINK_MTU> =
                 Box::leak(Box::new(SocketPool::new()));
             let client_factory = EmbassyNetFactory::new(stack_b, client_pool);
             let client_e2e: Arc<std::sync::Mutex<E2ERegistry>> =
@@ -624,7 +622,7 @@ async fn client_send_request_server_runloop_stable() {
             // via add_endpoint instead).
 
             // ── Server on stack A (passive) ──────────────────────
-            let server_pool: &'static SocketPool<8, 1500, 1500> =
+            let server_pool: &'static SocketPool<8, LINK_MTU, LINK_MTU> =
                 Box::leak(Box::new(SocketPool::new()));
             let server_factory = EmbassyNetFactory::new(stack_a, server_pool);
             let server_e2e: Arc<std::sync::Mutex<E2ERegistry>> =
@@ -658,7 +656,7 @@ async fn client_send_request_server_runloop_stable() {
             });
 
             // ── Client on stack B ────────────────────────────────
-            let client_pool: &'static SocketPool<8, 1500, 1500> =
+            let client_pool: &'static SocketPool<8, LINK_MTU, LINK_MTU> =
                 Box::leak(Box::new(SocketPool::new()));
             let client_factory = EmbassyNetFactory::new(stack_b, client_pool);
             let client_e2e: Arc<std::sync::Mutex<E2ERegistry>> =
