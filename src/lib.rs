@@ -115,9 +115,8 @@ extern crate std;
 // - `server` — `EventPublisher` and the `Server` struct hold
 //   `Arc<EventPublisher<...>>` / `Arc<F::Socket>` for sharing
 //   between the run loop and external publishing tasks. A
-//   future refactor may switch to `&'static` borrows so the
-//   server compiles in pure no_std without an allocator;
-//   tracked in `bare_metal_plan_v3.md` Phase 21+ backlog.
+//   the `&'static`-borrow refactor tracked in #115 would let
+//   server compile in pure no_std without an allocator.
 //
 // The `static_channels` module (under `bare_metal` alone) does
 // NOT need alloc — users wanting `client` + `bare_metal` without

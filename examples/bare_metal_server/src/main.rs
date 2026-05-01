@@ -267,9 +267,9 @@ async fn main() {
         .await
         .expect("Server::new_with_deps failed");
 
-    // Phase 21b: receive + announce are folded into the single
-    // combined run-future. It is `'static` and can be handed to any
-    // executor (here tokio for the canary harness).
+    // The combined run-future drives both receive and announce. It
+    // is `'static` and can be handed to any executor (here tokio for
+    // the canary harness).
     let announce_handle = tokio::spawn(run);
 
     // Yield twice: the announcement loop fires its first SD offer on the

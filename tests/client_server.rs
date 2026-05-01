@@ -80,12 +80,11 @@ type TestEventPublisher = simple_someip::server::EventPublisher<
 
 /// Create a server on an ephemeral unicast port, returning (Server, actual_port).
 ///
-/// Phase 21b: `TestServer::new` returns a `(Server, ServerHandles, run)` tuple.
-/// Tests in this module historically constructed the server, queried the
-/// kernel-assigned port via `unicast_local_addr`, and never spawned the run
-/// future themselves. We preserve that pattern here by destructuring and
-/// dropping the run-future; tests that need it spawn `server.run()` after
-/// receiving the `Server` handle from this helper.
+/// `TestServer::new` returns a `(Server, ServerHandles, run)` tuple.
+/// Tests in this module construct the server, query the
+/// kernel-assigned port via `unicast_local_addr`, and don't spawn
+/// the run future from this helper — the few tests that need it call
+/// `server.run()` directly after receiving the `Server` handle.
 async fn create_server(service_id: u16, instance_id: u16) -> (TestServer, u16) {
     let config = ServerConfig::new(service_id, instance_id)
         .with_interface(Ipv4Addr::LOCALHOST)

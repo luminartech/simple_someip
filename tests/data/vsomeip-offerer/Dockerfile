@@ -1,6 +1,6 @@
 # vsomeip 3.4.10 + a minimal offerer that advertises service 0x1234
-# instance 0x0001 via SD multicast. Used by phase 20f's host-side
-# conformance test (`tests/vsomeip_sd_compat.rs`).
+# instance 0x0001 via SD multicast. Used by the host-side
+# conformance test in `tests/vsomeip_sd_compat.rs`.
 #
 # Build:
 #   docker build -t vsomeip-offerer tests/data/vsomeip-offerer/

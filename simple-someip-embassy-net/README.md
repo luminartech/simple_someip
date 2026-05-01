@@ -11,12 +11,11 @@ add, without writing their own transport adapter.
 
 ## Status
 
-Phase 19 of the [bare-metal roadmap][plan-v3]. As of phase 19a, this
-crate is a scaffolded skeleton; the full `TransportFactory` /
-`TransportSocket` impl lands incrementally in 19b–19c, with a host
-loopback integration test in 19e and an in-tree example in 19f.
+Reference adapter implementing the full `TransportFactory` /
+`TransportSocket` surface, with a host loopback integration test and
+an in-tree example.
 
-## Quick sketch (target shape, post-19c)
+## Quick sketch
 
 ```rust,ignore
 use simple_someip::{Client, ClientDeps};
@@ -51,4 +50,3 @@ MIT OR Apache-2.0, matching `simple-someip`.
 [embassy-net]: https://crates.io/crates/embassy-net
 [embassy-executor]: https://crates.io/crates/embassy-executor
 [`simple-someip`]: https://crates.io/crates/simple-someip
-[plan-v3]: https://github.com/luminartech/simple_someip

@@ -287,10 +287,10 @@ impl Default for SubscriptionManager {
 /// `Send`-bounded entry point used by `tokio::spawn`) accept them via
 /// the `for<'a> Sub::SubscribeFuture<'a>: Send` bound.
 ///
-/// Phase 21F (2026-05) promoted the `subscribe` / `unsubscribe`
-/// futures from RPIT to named [GATs] so `Server::run`'s where clause
-/// can spell their `Send`-ness explicitly. The `for_each_subscriber`
-/// future stayed as RPIT — it is called by
+/// `subscribe` and `unsubscribe` use named [GATs] (rather than
+/// return-position `impl Trait`) so `Server::run`'s where clause can
+/// spell their `Send`-ness explicitly. `for_each_subscriber` stays
+/// as RPIT — it is called by
 /// [`EventPublisher::publish_event`](crate::server::EventPublisher),
 /// not by the SD run-future, so no `Send` bound on it is currently
 /// load-bearing.
@@ -492,16 +492,16 @@ pub mod bare_metal_subscription_impl {
     }
 
     impl SubscriptionHandle for StaticSubscriptionHandle {
-        // Phase 21F: futures are `Send` even though
-        // `SubscriptionManager` itself isn't `Sync` — the
-        // `embassy-sync` `CriticalSectionRawMutex` wrapping it IS
-        // `Sync`, and the future bodies have no `.await` points
-        // inside the lock closure (they capture only the `&'static`
-        // storage handle and the by-value args, all `Send`). Boxing
-        // with `+ Send` lets `Server::run`'s `Send` bound be
-        // satisfied. The `server` feature (required for
-        // `SubscriptionHandle` to be in scope) implies `_alloc`, so
-        // `Box::pin` is always available here.
+        // Futures are `Send` even though `SubscriptionManager` itself
+        // isn't `Sync` — the `embassy-sync`
+        // `CriticalSectionRawMutex` wrapping it IS `Sync`, and the
+        // future bodies have no `.await` points inside the lock
+        // closure (they capture only the `&'static` storage handle
+        // and the by-value args, all `Send`). Boxing with `+ Send`
+        // lets `Server::run`'s `Send` bound be satisfied. The
+        // `server` feature (required for `SubscriptionHandle` to be
+        // in scope) implies `_alloc`, so `Box::pin` is always
+        // available here.
         type SubscribeFuture<'a> = core::pin::Pin<
             alloc::boxed::Box<dyn Future<Output = Result<(), SubscribeError>> + Send + 'a>,
         >;

@@ -9,21 +9,14 @@
 //!
 //! # Why this crate exists
 //!
-//! Phase 18 of the bare-metal effort closed the literal compile gate:
-//! `simple-someip` + `client,server,bare_metal` cross-compiles for
-//! `thumbv7em-none-eabihf`. But "compiles" is not "works" — until a
-//! real backend satisfies the trait surface against an actual `no_std`
-//! network stack, the trait surface is unverified. This crate is the
-//! verification: an end-to-end working backend that bare-metal Rust
-//! consumers can either depend on directly or treat as the worked
-//! example for their own (lwIP, smoltcp-direct, vendor-stack) adapters.
-//!
-//! # Status
-//!
-//! Phase 19 in progress (per `bare_metal_plan_v3.md`). 19a (this
-//! commit) is the scaffold; 19b implements [`EmbassyNetFactory`],
-//! 19c implements [`EmbassyNetSocket`], 19e wires up the loopback
-//! integration test, 19f produces an in-tree example.
+//! `simple-someip` with `client,server,bare_metal` cross-compiles for
+//! `thumbv7em-none-eabihf` — the literal compile gate is closed. But
+//! "compiles" is not "works": until a real backend satisfies the
+//! trait surface against an actual `no_std` network stack, that trait
+//! surface is unverified. This crate is the verification — an
+//! end-to-end working backend that bare-metal Rust consumers can
+//! either depend on directly or treat as the worked example for
+//! their own (lwIP, smoltcp-direct, vendor-stack) adapters.
 //!
 //! # Pairing with `simple-someip`
 //!

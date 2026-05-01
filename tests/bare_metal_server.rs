@@ -299,10 +299,10 @@ async fn server_constructible_without_server_tokio_feature() {
         .await
         .expect("Server::new_with_deps must succeed with no-tokio mocks");
 
-    // Phase 21b: receive + announce folded into the combined run-future.
-    // Spawning it on tokio proves it's `'static`. The witness is purely
-    // structural: if this line compiles, `Server` is reachable on a
-    // no-tokio build.
+    // The combined run-future drives both receive and announce.
+    // Spawning it on tokio proves it's `'static`. The witness is
+    // purely structural: if this line compiles, `Server` is reachable
+    // on a no-tokio build.
     let handle = tokio::spawn(run);
 
     // Yield once so the spawned future has a chance to poll (its first

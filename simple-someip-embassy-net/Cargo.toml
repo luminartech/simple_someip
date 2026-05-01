@@ -17,7 +17,6 @@ readme = "README.md"
 # Sized for: bare-metal Rust embedded targets running embassy-net +
 # embassy-executor (cortex-m, RISC-V). Does not require alloc.
 #
-# See `bare_metal_plan_v3.md` for the surrounding plan (phase 19).
 
 [dependencies]
 simple-someip = { path = "..", version = "0.8", default-features = false, features = [

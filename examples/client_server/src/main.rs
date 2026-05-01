@@ -124,10 +124,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_local_port(MY_SERVER_PORT)
     };
 
-    // Phase 21b: dispatcher topology — the client drives all SD
-    // traffic via its own `sd_announcements_loop`, so we suppress the
-    // server's own announcement arm with `with_announce(false)`. The
-    // single returned run-future drives only the receive loop.
+    // Dispatcher topology — the client drives all SD traffic via
+    // its own `sd_announcements_loop`, so we suppress the server's
+    // own announcement arm with `with_announce(false)`. The single
+    // returned run-future drives only the receive loop.
     let config = config.with_announce(false);
     let (_server, handles, run) = Server::new(config).await?;
     info!("Server bound on port {MY_SERVER_PORT}");
