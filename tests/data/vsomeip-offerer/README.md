@@ -104,7 +104,7 @@ docker stop vsomeip-offerer
   For real-NIC testing, set this to the host's interface IP and
   set `SIMPLE_SOMEIP_TEST_INTERFACE` to match.
 
-## Future (phase 20g+)
+## Future
 
 - Wire this Dockerfile into CI via TestContainers-rs (or
   equivalent) so `cargo test ... -- --ignored` runs in a

@@ -1,10 +1,11 @@
 //! Server runtime helpers — free async functions that drive the
 //! receive loop, the SD announcement loop, and SD-message handling.
 //!
-//! Phase 21b moved this logic out of `&self` methods on [`Server`] so
-//! that the run-future returned from `Server::new` can be `'static`
-//! (built by cloning the cheap shared-handles into an `async move`)
-//! without aliasing whatever `Server` value the caller holds.
+//! These live as free functions (rather than `&self` methods on
+//! [`Server`]) so the run-future returned from `Server::new` can be
+//! `'static` — built by cloning the cheap shared-handles into an
+//! `async move` instead of borrowing whatever `Server` value the
+//! caller holds.
 //!
 //! All functions here take their state by reference; ownership lives
 //! in the caller's async-move scope, which is itself constructed by
@@ -494,6 +495,10 @@ where
         } else {
             "sd-multicast"
         };
+        // The `datagram.truncated` flag is currently not surfaced via
+        // `tracing::warn!` — backends that report truncation honestly
+        // (embassy-net today, tokio after #119) won't be observable
+        // from the server side until #120 lands.
         let data = if from_unicast {
             &unicast_buf[..len]
         } else {

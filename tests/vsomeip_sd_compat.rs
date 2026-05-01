@@ -1,4 +1,4 @@
-//! Phase 20f — Conformance test against the COVESA vsomeip reference
+//! Conformance test against the COVESA vsomeip reference
 //! SOME/IP-SD implementation.
 //!
 //! `#[ignore]`'d by default. Run on demand once you have vsomeip
@@ -353,7 +353,7 @@ async fn client_sees_vsomeip_offer_service() {
     }
 }
 
-// ── Phase 20h: TX direction — simple-someip emits, vsomeip subscribes ─
+// ── TX direction — simple-someip emits, vsomeip subscribes ───────────
 
 /// Container name for the subscriber-role container. Hardcoded so the
 /// test knows which `docker logs` to scrape; if you run the container
@@ -438,8 +438,8 @@ async fn vsomeip_sees_simple_someip_offer_service() {
         .await
         .expect("Server::new_with_loopback failed (network setup problem?)");
 
-    // Phase 21b: announcements are folded into `Server::run`'s combined
-    // future. Spawning it works here because TokioSocket is Send + Sync.
+    // Announcements are folded into `Server::run`'s combined future.
+    // Spawning it works here because TokioSocket is Send + Sync.
     let server_handle = tokio::spawn(run);
     // Compatibility shim: tests below still wait on `announce_handle`.
     let announce_handle: tokio::task::JoinHandle<()> = tokio::spawn(async {});
@@ -515,7 +515,7 @@ async fn vsomeip_sees_simple_someip_offer_service() {
     }
 }
 
-// ── Phase 20h: TX direction — wire-format self-check (no docker) ──────
+// ── TX direction — wire-format self-check (no docker) ────────────────
 
 /// Verifies `Server::announcement_loop` emits SOME/IP-SD bytes that
 /// match the AUTOSAR SOME/IP-SD spec, by capturing the bytes on a
@@ -595,7 +595,7 @@ async fn tx_announcement_loop_emits_wire_format_offer() {
     let (_server, _handles, run) = Server::new_with_loopback(config, true)
         .await
         .expect("Server::new_with_loopback failed");
-    // Phase 21b: combined announce + receive run-future.
+    // Combined announce + receive run-future.
     let server_handle = tokio::spawn(run);
     let announce_handle: tokio::task::JoinHandle<()> = tokio::spawn(async {});
 

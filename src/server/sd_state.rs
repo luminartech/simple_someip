@@ -243,10 +243,10 @@ impl SdStateManager {
     }
 }
 
-// Phase 20e collapsed `SdStateHandle` / `WrappableSdStateHandle`
-// into the unified `crate::transport::SharedHandle<SdStateManager>`
-// / `WrappableSharedHandle<SdStateManager>` traits. The blanket
-// impls there cover both `&'static SdStateManager` and
+// `SdStateHandle` / `WrappableSdStateHandle` were collapsed into the
+// unified `crate::transport::SharedHandle<SdStateManager>` /
+// `WrappableSharedHandle<SdStateManager>` traits. The blanket impls
+// there cover both `&'static SdStateManager` and
 // `Arc<SdStateManager>`; no dedicated trait survives here.
 
 #[cfg(all(test, feature = "server-tokio"))]

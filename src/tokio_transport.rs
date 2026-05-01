@@ -189,11 +189,11 @@ impl Future for RecvFrom<'_> {
                 // truncates when the caller's `buf` is smaller than the
                 // datagram and returns only the bytes that fit — it does
                 // NOT expose a truncation flag. Surfacing a reliable
-                // `truncated: bool` here would require a platform-specific
-                // `recvmsg`/MSG_TRUNC path (libc + unsafe), which is
-                // deferred for now. Until then, this field is always
-                // `false` for the Tokio backend; callers must not rely on
-                // it for truncation detection. This is documented on
+                // `truncated: bool` here requires a platform-specific
+                // `recvmsg`/MSG_TRUNC path (libc + unsafe) — tracked in
+                // #119. Until then, this field is always `false` for the
+                // Tokio backend; callers must not rely on it for
+                // truncation detection. Also documented on
                 // `ReceivedDatagram::truncated`'s field doc.
                 Poll::Ready(Ok(ReceivedDatagram {
                     bytes_received: n,

@@ -297,7 +297,6 @@ where
 /// use std::net::Ipv4Addr;
 /// let deps = ServerDeps::tokio();
 /// let config = ServerConfig::new(0x1234, 1).with_interface(Ipv4Addr::LOCALHOST).with_local_port(0);
-/// // Phase 21b: constructor returns `(Server, ServerHandles, run_future)`.
 /// // The binding-site type fixes Server's `H`/`Hsd`/`Hep` to their
 /// // `Arc<…>` defaults so type inference doesn't have to chase them.
 /// let (_server, _handles, _run): (Server<_, _, _, _>, _, _) =
@@ -1050,8 +1049,7 @@ where
     /// `Arc<EventPublisher<R, Sub, H, T>>` for std users (the default
     /// `Hep`), `&'static EventPublisher<R, Sub, H, T>` for
     /// bare-metal-no-alloc. (`EventPublisherHandle` was a former
-    /// trait alias collapsed into [`crate::transport::SharedHandle`]
-    /// in phase 19f / 20e.)
+    /// trait alias collapsed into [`crate::transport::SharedHandle`].)
     #[must_use]
     pub fn publisher(&self) -> Hep {
         self.publisher.clone()
@@ -1306,8 +1304,8 @@ mod tests {
         assert_eq!(cfg.ttl, 2, "sub-second is truncated, not rounded");
     }
 
-    /// Phase 21b: `announce` defaults to `true` from `ServerConfig::new`,
-    /// and `with_announce(false)` flips it. The dispatcher topology in
+    /// `announce` defaults to `true` from `ServerConfig::new`, and
+    /// `with_announce(false)` flips it. The dispatcher topology in
     /// `examples/client_server` depends on this default-vs-override
     /// being load-bearing — see
     /// `with_announce_false_suppresses_offer_service` for the
@@ -1359,9 +1357,9 @@ mod tests {
     // These constructors take pre-built socket handles instead of
     // calling `factory.bind()` themselves, and validate that the
     // caller-supplied `config.local_port` matches the actual bound
-    // port (back-fill-only-on-zero, MED-22 in phase 20 cleanup).
-    // The validation logic only exercises through these tests; the
-    // production code paths use `new` / `new_with_deps`.
+    // port (back-fill-only-on-zero). The validation logic only
+    // exercises through these tests; the production code paths use
+    // `new` / `new_with_deps`.
 
     /// Build a `ServerStorage<…>` whose unicast socket is bound to
     /// the given port (port `0` for ephemeral) and whose other
@@ -1536,11 +1534,10 @@ mod tests {
         }
     }
 
-    // The previous `passive_server_announcement_loop_returns_invalid_usage`
-    // test was removed alongside the public `announcement_loop` method:
-    // phase 21b folded the announcement loop into the combined
-    // [`Server::run`] future, so the only entry point that can short-
-    // circuit on a passive server is `run_with_buffers` (covered by
+    // No standalone `passive_server_announcement_loop` test: the
+    // announcement loop is folded into the combined [`Server::run`]
+    // future, so the only entry point that can short-circuit on a
+    // passive server is `run_with_buffers` (covered by
     // `passive_server_run_with_buffers_returns_invalid_usage` above).
 
     /// Regression for H5: `ServerConfig::accepts_event_group` must
@@ -1704,13 +1701,13 @@ mod tests {
         );
     }
 
-    // Phase 21b removed the public `announcement_loop` method and the
-    // `announcement_loop_started` latch that protected it from being
-    // started twice. The latch existed because two independently-
-    // spawned announcement futures would race on the SD socket /
-    // session counter; with the loop folded into the single combined
-    // run-future, there is now only one entry point and the
-    // double-start failure mode is structurally impossible.
+    // No standalone `announcement_loop` method: the announcement
+    // loop is folded into the single combined run-future, so there
+    // is only one entry point. (The previous
+    // `announcement_loop_started: AtomicBool` latch existed because
+    // two independently-spawned announcement futures would race on
+    // the SD socket / session counter; that failure mode is now
+    // structurally impossible.)
 
     #[tokio::test]
     async fn test_server_creation_with_loopback_enabled() {
@@ -2206,10 +2203,10 @@ mod tests {
         assert_eq!(entry.service_id(), 0x5B);
         assert_eq!(entry.instance_id(), 1);
 
-        // Phase 21b: announcement is folded into `Server::run`. We just
-        // verify a fresh server can build its combined run-future
-        // without error; intentionally do not poll or spawn it (would
-        // loop indefinitely emitting multicast).
+        // Announcements are folded into `Server::run`. Verify a
+        // fresh server can build its combined run-future without
+        // error; intentionally do not poll or spawn it (would loop
+        // indefinitely emitting multicast).
         drop(server);
         let (server2, _) = create_test_server(0x5B, 1).await;
         let fut = server2.run();
@@ -2805,11 +2802,10 @@ mod tests {
         assert!(!publisher.has_subscribers(0x005C, 0x0001, 0x0001).await);
     }
 
-    // Phase 21b removed the standalone `announcement_loop` /
-    // `announcement_loop_local` methods (folded into the combined
-    // `Server::run` future). The "is_passive" check that those
-    // methods used to perform now lives on `run` itself, exercised
-    // by `run_on_passive_returns_invalid_input` below.
+    // The announcement loop is folded into the combined
+    // `Server::run` future, so the `is_passive` check happens on
+    // `run` itself — exercised by
+    // `run_on_passive_returns_invalid_input` below.
 
     #[tokio::test]
     async fn run_on_passive_returns_invalid_input() {
@@ -2828,11 +2824,12 @@ mod tests {
 
     #[tokio::test]
     async fn run_on_regular_server_builds_future_ok() {
-        // Regression guard for phase 21b: the combined run-future must
-        // build without error on a non-passive server. We don't poll or
-        // spawn — doing so would leave the run-loop emitting multicast
-        // for the rest of the test binary's lifetime and interfere with
-        // parallel tests that share the SD multicast group.
+        // Regression guard: the combined run-future must build
+        // without error on a non-passive server. We don't poll or
+        // spawn — doing so would leave the run-loop emitting
+        // multicast for the rest of the test binary's lifetime and
+        // interfere with parallel tests that share the SD multicast
+        // group.
         let (server, _port) = create_test_server(0x005C, 0x0001).await;
         let fut = server.run();
         drop(fut);
@@ -2881,10 +2878,10 @@ mod tests {
             .with_interface(iface)
             .with_local_port(30501);
         let (_server, _handles, run) = TestServer::new_with_loopback(config, true).await.unwrap();
-        // Phase 21b: announcement is now folded into `Server::run`'s
-        // combined receive+announce future. The receive arm here just
-        // waits for traffic that never arrives in this test; the
-        // announce arm is what we capture on `recv` below.
+        // `Server::run` is the combined receive+announce future. The
+        // receive arm here just waits for traffic that never arrives
+        // in this test; the announce arm is what we capture on `recv`
+        // below.
         let handle = tokio::spawn(async move {
             let _ = run.await;
         });
@@ -2938,13 +2935,14 @@ mod tests {
         handle.abort();
     }
 
-    /// Phase 21b: `ServerConfig::with_announce(false)` is the contract
-    /// the dispatcher topology relies on (`examples/client_server`). It
-    /// MUST suppress the announce arm of the combined run-future, even
-    /// though the receive arm keeps running. This is the negative
-    /// counterpart to `announcement_loop_sends_offer_service_when_driven`
-    /// above — same SD-multicast capture machinery, but we assert the
-    /// listen window expires *without* seeing one of our OfferServices.
+    /// `ServerConfig::with_announce(false)` is the contract the
+    /// dispatcher topology relies on (`examples/client_server`). It
+    /// MUST suppress the announce arm of the combined run-future,
+    /// even though the receive arm keeps running. This is the
+    /// negative counterpart to
+    /// `announcement_loop_sends_offer_service_when_driven` above —
+    /// same SD-multicast capture machinery, but we assert the listen
+    /// window expires *without* seeing one of our OfferServices.
     #[tokio::test]
     async fn with_announce_false_suppresses_offer_service() {
         use crate::protocol::MessageId;
@@ -3210,7 +3208,7 @@ mod tests {
         let (_server, _handles, run_fut) = TestServer::new_with_loopback(config, true)
             .await
             .expect("server must bind with loopback enabled");
-        // Phase 21b: announcement folded into the combined run future.
+        // Announcement is folded into the combined run-future.
         let announce_handle = tokio::spawn(async move {
             let _ = run_fut.await;
         });

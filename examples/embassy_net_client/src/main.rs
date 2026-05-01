@@ -376,15 +376,14 @@ async fn main() {
                 subscriptions: InMemorySubscriptions::default(),
             };
 
-            // Phase 19f: default `H = Arc<F::Socket>`. Annotation
-            // is explicit because type inference can't chase H
-            // across the `ServerDeps` indirection. Phase 21b:
-            // constructor returns a `(Server, ServerHandles, run)`
-            // tuple. We use `run_with_buffers` instead of the
-            // returned alloc-backed `run` because `EmbassyNetSocket:
-            // !Sync`, which makes the `run`-future `!Send`; ignoring
-            // it and re-building via `run_with_buffers` keeps us on
-            // the `spawn_local` path.
+            // Default `H = Arc<F::Socket>`. Annotation is explicit
+            // because type inference can't chase H across the
+            // `ServerDeps` indirection. We use `run_with_buffers`
+            // instead of the alloc-backed `run` returned from the
+            // constructor because `EmbassyNetSocket: !Sync` makes
+            // the `run`-future `!Send`; ignoring it and re-building
+            // via `run_with_buffers` keeps us on the `spawn_local`
+            // path.
             let (server, _handles, _run): (
                 Server<_, _, _, _, Arc<EmbassyNetSocket>>,
                 _,

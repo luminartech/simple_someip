@@ -38,11 +38,11 @@ const _: () = assert!(
 /// to use `Arc<T>` (which is `Send + Sync` whenever `T` is) without
 /// any change.
 ///
-/// The explicit `T` parameter is the price of consolidating all
-/// three former handle traits (Phase 20e) into a single
-/// [`SharedHandle<T>`]: the trait carries `T` as a generic, not
-/// as an associated type, so consumers that need to name the
-/// socket type spell it out.
+/// The explicit `T` parameter is the price of consolidating the
+/// three former handle traits (`SocketHandle`, `SdStateHandle`,
+/// `EventPublisherHandle`) into a single [`SharedHandle<T>`]: the
+/// trait carries `T` as a generic, not as an associated type, so
+/// consumers that need to name the socket type spell it out.
 pub struct EventPublisher<R, S, H, T>
 where
     R: E2ERegistryHandle,
@@ -469,13 +469,12 @@ where
     }
 }
 
-// Phase 20e collapsed `EventPublisherHandle<R, S, H>` /
-// `WrappableEventPublisherHandle<R, S, H>` into the unified
-// `crate::transport::SharedHandle<EventPublisher<R, S, H, T>>` /
-// `WrappableSharedHandle<EventPublisher<R, S, H, T>>` traits. The
-// blanket impls there cover both `&'static EventPublisher<...>`
-// and `Arc<EventPublisher<...>>`; no dedicated trait survives
-// here.
+// `EventPublisherHandle<R, S, H>` /
+// `WrappableEventPublisherHandle<R, S, H>` were collapsed into the
+// unified `crate::transport::SharedHandle<EventPublisher<R, S, H, T>>`
+// / `WrappableSharedHandle<EventPublisher<R, S, H, T>>` traits. The
+// blanket impls there cover both `&'static EventPublisher<...>` and
+// `Arc<EventPublisher<...>>`; no dedicated trait survives here.
 
 #[cfg(all(test, feature = "server-tokio"))]
 mod tests {

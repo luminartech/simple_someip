@@ -373,7 +373,7 @@ async fn client_receives_server_sd_announcement() {
         .await
         .expect("server creation");
 
-    // Phase 21b: combined run-future drives both announcement + receive.
+    // Combined run-future drives both announcement + receive.
     let announce_handle = tokio::spawn(run);
 
     // Create client
