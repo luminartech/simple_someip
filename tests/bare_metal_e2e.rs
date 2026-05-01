@@ -266,22 +266,26 @@ type SubKey = (u16, u16, u16, SocketAddrV4);
 struct MockSubscriptions(Arc<Mutex<Vec<SubKey>>>);
 
 impl SubscriptionHandle for MockSubscriptions {
+    type SubscribeFuture<'a> =
+        core::pin::Pin<Box<dyn Future<Output = Result<(), SubscribeError>> + Send + 'a>>;
+    type UnsubscribeFuture<'a> = core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
     fn subscribe(
         &self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
+    ) -> Self::SubscribeFuture<'_> {
         let this = self.0.clone();
-        async move {
+        Box::pin(async move {
             let mut guard = this.lock().unwrap();
             let key = (service_id, instance_id, event_group_id, subscriber_addr);
             if !guard.contains(&key) {
                 guard.push(key);
             }
             Ok(())
-        }
+        })
     }
 
     fn unsubscribe(
@@ -290,12 +294,12 @@ impl SubscriptionHandle for MockSubscriptions {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = ()> + '_ {
+    ) -> Self::UnsubscribeFuture<'_> {
         let this = self.0.clone();
-        async move {
+        Box::pin(async move {
             let mut guard = this.lock().unwrap();
             guard.retain(|e| *e != (service_id, instance_id, event_group_id, subscriber_addr));
-        }
+        })
     }
 
     fn for_each_subscriber<'a, F>(
@@ -361,14 +365,16 @@ async fn client_receives_server_sd_announcement() {
         subscriptions: server_subs,
     };
 
-    let server: Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        Server::new_with_deps(server_deps, server_config, false)
-            .await
-            .expect("server creation");
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(server_deps, server_config, false)
+        .await
+        .expect("server creation");
 
-    // Start server announcement loop
-    let announce_fut = server.announcement_loop().expect("announcement_loop");
-    let announce_handle = tokio::spawn(announce_fut);
+    // Phase 21b: combined run-future drives both announcement + receive.
+    let announce_handle = tokio::spawn(run);
 
     // Create client
     let client_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
@@ -455,14 +461,17 @@ async fn client_send_request_server_runloop_stable() {
         subscriptions: server_subs,
     };
 
-    let mut server: Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        Server::new_passive_with_deps(server_deps, server_config)
-            .await
-            .expect("passive server creation");
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_passive_with_deps(server_deps, server_config)
+        .await
+        .expect("passive server creation");
 
-    // Start server run loop
+    // Start server run loop (passive — receive only, no announcements).
     let run_handle = tokio::spawn(async move {
-        let _ = server.run().await;
+        let _ = run.await;
     });
 
     // Create client

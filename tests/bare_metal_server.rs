@@ -204,22 +204,26 @@ type SubKey = (u16, u16, u16, SocketAddrV4);
 struct MockSubscriptions(Arc<Mutex<Vec<SubKey>>>);
 
 impl SubscriptionHandle for MockSubscriptions {
+    type SubscribeFuture<'a> =
+        core::pin::Pin<Box<dyn Future<Output = Result<(), SubscribeError>> + Send + 'a>>;
+    type UnsubscribeFuture<'a> = core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
     fn subscribe(
         &self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
+    ) -> Self::SubscribeFuture<'_> {
         let this = self.0.clone();
-        async move {
+        Box::pin(async move {
             let mut guard = this.lock().unwrap();
             let key = (service_id, instance_id, event_group_id, subscriber_addr);
             if !guard.contains(&key) {
                 guard.push(key);
             }
             Ok(())
-        }
+        })
     }
 
     fn unsubscribe(
@@ -228,12 +232,12 @@ impl SubscriptionHandle for MockSubscriptions {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = ()> + '_ {
+    ) -> Self::UnsubscribeFuture<'_> {
         let this = self.0.clone();
-        async move {
+        Box::pin(async move {
             let mut guard = this.lock().unwrap();
             guard.retain(|e| *e != (service_id, instance_id, event_group_id, subscriber_addr));
-        }
+        })
     }
 
     fn for_each_subscriber<'a, F>(
@@ -287,18 +291,19 @@ async fn server_constructible_without_server_tokio_feature() {
             subscriptions: subs,
         };
 
-    let server: Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        Server::new_with_deps(deps, config, false)
-            .await
-            .expect("Server::new_with_deps must succeed with no-tokio mocks");
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed with no-tokio mocks");
 
-    // Build the announcement-loop future and prove it's `Send + 'static`
-    // by spawning it on tokio. The witness is purely structural: if this
-    // line compiles, `Server` is reachable on a no-tokio build.
-    let announce_fut = server
-        .announcement_loop()
-        .expect("announcement_loop must build on a non-passive server");
-    let handle = tokio::spawn(announce_fut);
+    // Phase 21b: receive + announce folded into the combined run-future.
+    // Spawning it on tokio proves it's `'static`. The witness is purely
+    // structural: if this line compiles, `Server` is reachable on a
+    // no-tokio build.
+    let handle = tokio::spawn(run);
 
     // Yield once so the spawned future has a chance to poll (its first
     // tick fires `send_to` immediately, before the timer sleep).
@@ -333,8 +338,11 @@ async fn passive_server_constructible_without_server_tokio_feature() {
             subscriptions: subs,
         };
 
-    let _server: Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        Server::new_passive_with_deps(deps, config)
-            .await
-            .expect("Server::new_passive_with_deps must succeed with no-tokio mocks");
+    let (_server, _handles, _run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_passive_with_deps(deps, config)
+        .await
+        .expect("Server::new_passive_with_deps must succeed with no-tokio mocks");
 }

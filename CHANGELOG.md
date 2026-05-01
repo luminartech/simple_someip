@@ -2,6 +2,139 @@
 
 ## [Unreleased]
 
+### Phase 21 — Client/Server API symmetry & ergonomics (0.9.0)
+
+The remaining 0.9.0 surface pass on `feature/phase21_api_symmetry`. Six sub-tasks: 21a (generic-parameter alignment), 21c (tokio-defaulted Deps builders), 21d (channel-types rustdoc), 21e (ServerConfig fluent builder), 21b (Server constructor reshape — the one breaking change in this set), and 21F (SubscriptionHandle GAT promotion). Migration in this section is copy-pasteable; `cargo build` will surface every remaining call-site.
+
+#### Breaking — `SubscriptionHandle::SubscribeFuture` / `UnsubscribeFuture` are now [generic associated types]
+
+The `subscribe` and `unsubscribe` methods on `SubscriptionHandle` previously returned `impl Future<…> + '_` (return-position impl Trait). Phase 21F promoted those return types to named GATs:
+
+```rust
+pub trait SubscriptionHandle: Clone + 'static {
+    type SubscribeFuture<'a>: Future<Output = Result<(), SubscribeError>> + 'a where Self: 'a;
+    type UnsubscribeFuture<'a>: Future<Output = ()> + 'a where Self: 'a;
+
+    fn subscribe(...) -> Self::SubscribeFuture<'_>;
+    fn unsubscribe(...) -> Self::UnsubscribeFuture<'_>;
+    // for_each_subscriber stayed RPIT — no Server::run-side bound needs it.
+}
+```
+
+Implementors must now spell their concrete return type (typically `Pin<Box<dyn Future<Output = …> + Send + 'a>>`). All four in-tree implementations (`Arc<RwLock<SubscriptionManager>>`, `StaticSubscriptionHandle`, the example `InMemorySubscriptions`, three test `MockSubscriptions` variants) were converted; downstream implementors will hit a compile error that names the missing associated types verbatim.
+
+Why this is worth a breaking change: it lets [`Server::run`]'s where clause spell `for<'a> Sub::SubscribeFuture<'a>: Send`, which in turn lets the function declare `+ Send` on its return type instead of relying on auto-trait inference. Compile errors for `tokio::spawn`-vs-`!Send`-handle mismatches now surface at the library boundary instead of deep inside `tokio::spawn`'s bound check.
+
+[generic associated types]: https://blog.rust-lang.org/2022/10/28/gats-stabilization.html
+
+##### Migration
+
+Before:
+
+```rust
+impl SubscriptionHandle for MyHandle {
+    fn subscribe(&self, ...) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
+        async move { /* … */ }
+    }
+    fn unsubscribe(&self, ...) -> impl Future<Output = ()> + '_ {
+        async move { /* … */ }
+    }
+}
+```
+
+After:
+
+```rust
+impl SubscriptionHandle for MyHandle {
+    type SubscribeFuture<'a> =
+        Pin<Box<dyn Future<Output = Result<(), SubscribeError>> + Send + 'a>>;
+    type UnsubscribeFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    fn subscribe(&self, ...) -> Self::SubscribeFuture<'_> {
+        Box::pin(async move { /* … */ })
+    }
+    fn unsubscribe(&self, ...) -> Self::UnsubscribeFuture<'_> {
+        Box::pin(async move { /* … */ })
+    }
+}
+```
+
+Drop `+ Send` from the type aliases on `!Send` handles (rare). The `Box::pin` allocation happens at SD-rate (typically ≤ 1 Hz subscribes during steady-state SD churn), small cost relative to the wire activity it gates.
+
+
+
+#### Breaking — `Server::new` now returns a `(Server, ServerHandles, run-future)` tuple
+
+`Server::new` (and the `new_with_loopback`, `new_passive`, `new_with_deps`, `new_passive_with_deps` variants) now mirrors `Client::new`'s shape: the constructor returns a three-tuple of `(Server, ServerHandles, impl Future + 'static)` instead of just `Server`. The single returned run-future drives the receive loop *and* the SD `OfferService` announcement loop concurrently, so callers no longer have to remember to spawn `announcement_loop` separately. The runtime check that used to live on `Server::announcement_loop` ("called on passive server" → `Err`) is now structurally impossible because the announcement loop has no separate entry point. The dispatcher topology where a co-located `Client` drives SD announcements is now opted into via [`ServerConfig::with_announce(false)`] instead of "just don't call this method".
+
+`Server::new_with_handles` and `Server::new_passive_with_handles` are unchanged — bare-metal callers still get back `Self` and call `server.run_with_buffers(unicast, sd)` directly with their own static buffers. The combined receive + announce select runs in `run_with_buffers` too.
+
+The previous `ServerHandles` type (the no-alloc deps bundle accepted by `new_with_handles`) was renamed to **`ServerStorage`** to free the `ServerHandles` name for the new post-construction accessor struct returned from `Server::new`. The eight fields are unchanged.
+
+##### Migration
+
+Before:
+
+```rust
+let mut server = Server::new(config).await?;
+let publisher = server.publisher();
+tokio::spawn(server.announcement_loop()?);
+tokio::spawn(async move {
+    if let Err(e) = server.run().await { /* … */ }
+});
+```
+
+After:
+
+```rust
+let (_server, handles, run) = Server::new(config).await?;
+let publisher = handles.publisher;
+tokio::spawn(async move {
+    if let Err(e) = run.await { /* … */ }
+});
+```
+
+Bare-metal-no-alloc, before:
+
+```rust
+let server = Server::new_with_handles(deps, config)?;
+let announce = server.announcement_loop_local()?;
+spawn_local(announce);
+spawn_local(server.run_with_buffers(unicast_buf, sd_buf));
+```
+
+After:
+
+```rust
+let server = Server::new_with_handles(deps, config)?;
+spawn_local(server.run_with_buffers(unicast_buf, sd_buf));
+```
+
+(`run_with_buffers` is now the combined receive + announce future.)
+
+Dispatcher topology (was: implicit "just don't call announcement_loop") becomes explicit:
+
+```rust
+let config = ServerConfig::new(svc, inst).with_announce(false);
+let (_server, _handles, run) = Server::new(config).await?;
+tokio::spawn(run);  // receive only; co-located Client drives SD
+```
+
+#### Removed
+
+- **`Server::announcement_loop` / `Server::announcement_loop_local`** — folded into the combined run-future. The `announcement_loop_started: AtomicBool` latch that protected against two simultaneously-driven announcement futures is gone with them (single entry point makes the failure mode structurally impossible).
+- **`Server::set_local_port`** — vestigial. The bind-time back-fill on `new_with_deps` / `new_with_handles` already records the kernel-assigned port into `config.local_port` before `Server::new` returns, and mutating it post-construction would lie to peers about an endpoint the unicast socket isn't actually bound to (the same failure mode `new_with_handles` rejects with `local_port_mismatch`). Both in-tree call sites were no-ops.
+
+#### Added (additive — no migration)
+
+- **`ServerHandles<Hep>`** — post-construction accessor bundle returned alongside `Server` from `Server::new`. Single public field today: `publisher`. Reserved for future fields (e.g. a `BindCompleted` oneshot if a real adopter asks).
+- **`ServerConfig::announce: bool`** + **`with_announce(bool)`** fluent setter. Defaults to `true`. Set to `false` for the dispatcher topology.
+- **`ServerStorage<F, Tm, R, Sub, H, Hsd, Hep>`** (replaces the old `ServerHandles` deps bundle name).
+- **21a — generic-parameter alignment** across `Client`, `Server`, `ClientDeps`, `ServerDeps`. Letter-collisions between Spawner (`S` on Client) and SubscriptionHandle (`S` on Server) resolved (`Sp` and `Sub` respectively).
+- **21c — tokio-defaulted `Deps` builders.** `ClientDeps::tokio()` and `ServerDeps::tokio()` produce a fully-defaulted bundle; chain `with_factory` / `with_timer` / `with_e2e_registry` / `with_subscriptions` / `with_spawner` / `with_local_spawner` to override individual fields without spelling the rest out.
+- **21d — discoverable channel types.** New `ClientChannelTypes` trait alias surfaces the set of channel types that `define_static_channels!` must populate; `client::channels` re-exports the relevant types with rustdoc that names each as "channel type for `define_static_channels!`."
+- **21e — `ServerConfig` fluent builder.** Existing struct-literal route stays open; `ServerConfig::new(svc, inst).with_interface(…).with_local_port(…).with_ttl(…).with_event_group(…).with_announce(…)` is the recommended path in docs.
+
 ### Added
 
 - **`simple-someip-embassy-net::LINK_MTU`** — `pub const usize = 1500` shared by the loopback driver and example consumers for sizing `SocketPool` RX/TX buffers and `Capabilities::max_transmission_unit`. Distinct from `simple_someip::UDP_BUFFER_SIZE` (an *application*-payload cap) — they coincide at 1500 today but are conceptually orthogonal.

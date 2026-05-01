@@ -225,7 +225,7 @@ pub use client::{
 // `ClientChannelTypes` elaboration limit at the wrong call site.
 pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
-pub use server::{Server, ServerDeps, ServerHandles, SubscriptionHandle};
+pub use server::{Server, ServerDeps, ServerHandles, ServerStorage, SubscriptionHandle};
 #[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
 #[cfg(feature = "bare_metal")]
