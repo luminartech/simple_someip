@@ -441,8 +441,6 @@ async fn vsomeip_sees_simple_someip_offer_service() {
     // Announcements are folded into `Server::run`'s combined future.
     // Spawning it works here because TokioSocket is Send + Sync.
     let server_handle = tokio::spawn(run);
-    // Compatibility shim: tests below still wait on `announce_handle`.
-    let announce_handle: tokio::task::JoinHandle<()> = tokio::spawn(async {});
 
     eprintln!("[test] announcement loop spawned; polling docker logs");
 
@@ -472,7 +470,6 @@ async fn vsomeip_sees_simple_someip_offer_service() {
     })
     .await;
 
-    announce_handle.abort();
     server_handle.abort();
 
     match saw_marker {
@@ -597,7 +594,6 @@ async fn tx_announcement_loop_emits_wire_format_offer() {
         .expect("Server::new_with_loopback failed");
     // Combined announce + receive run-future.
     let server_handle = tokio::spawn(run);
-    let announce_handle: tokio::task::JoinHandle<()> = tokio::spawn(async {});
 
     // Owned snapshot of the assertion-relevant fields. Pulled out
     // inside `recv_loop` because `MessageView` / `SdHeaderView` /
@@ -721,13 +717,11 @@ async fn tx_announcement_loop_emits_wire_format_offer() {
             "Timed out after {}s waiting to capture SECOND OfferService \
              on {interface}. Cyclic offer delay is ~1s; if first arrived \
              but second didn't, something tore down the announcement loop \
-             mid-test (check announce_handle / server_handle for early \
-             failure).",
+             mid-test (check server_handle for early failure).",
             second_timeout.as_secs(),
         )
     });
 
-    announce_handle.abort();
     server_handle.abort();
 
     // ── First announcement: full envelope shape + reboot flag ────────

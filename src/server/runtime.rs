@@ -455,21 +455,19 @@ where
     // other arm.
     let mut prefer_sd_first = false;
     loop {
-        // SAFETY: both arms call `TransportSocket::recv_from`. The
-        // `TokioSocket` backend is cancel-safe per tokio docs — a
-        // non-selected arm can be dropped without losing in-flight
-        // kernel state. Custom transport backends MUST provide the
-        // same guarantee. A future contributor adding a
-        // non-cancel-safe `FusedFuture` arm here would silently lose
-        // state when the arm is dropped on a select win. Both futures
-        // must therefore stay `FusedFuture + Unpin` *and* cancel-safe.
+        // Both arms call `TransportSocket::recv_from`, whose contract
+        // (see the trait docs) requires the returned future be
+        // cancel-safe — dropping a non-selected arm must not lose
+        // in-flight kernel state. The `TokioSocket` backend satisfies
+        // this; custom backends must too. A future contributor adding
+        // a non-cancel-safe arm here would silently lose datagrams
+        // when the arm is dropped on a select win.
         //
         // Fresh futures are constructed each iteration so the borrows
         // of `unicast_buf` / `sd_buf` / the sockets end when the
         // select macro returns, freeing the buffer we index into
-        // below.
-        // Each arm returns just `(datagram, from_unicast)`; the
-        // `(len, addr, source)` derivation lives once below the
+        // below. Each arm returns just `(datagram, from_unicast)`;
+        // the `(len, addr, source)` derivation lives once below the
         // select so the arm-flip pattern doesn't duplicate it.
         let (datagram, from_unicast) = {
             let unicast_fut = unicast_socket.recv_from(&mut *unicast_buf).fuse();

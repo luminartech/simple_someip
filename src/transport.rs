@@ -485,6 +485,20 @@ pub trait TransportSocket {
     /// socket, or the concurrent send branch of a `select!` cannot
     /// compile.
     ///
+    /// # Cancel safety
+    ///
+    /// The returned [`Self::RecvFuture`] **must be cancel-safe**:
+    /// dropping it before completion (the typical outcome inside a
+    /// `select!` / `select_biased!` where another arm wins) must not
+    /// lose any datagram that the kernel had already delivered to the
+    /// socket. The server run-loop and the client socket-manager both
+    /// race this future against other arms and rely on the
+    /// drop-and-retry pattern; a backend whose recv-future commits
+    /// kernel state before yielding (and loses it on drop) would
+    /// silently drop datagrams. The default `TokioSocket` impl
+    /// satisfies this via tokio's documented cancel-safety on
+    /// `UdpSocket::recv_from`.
+    ///
     /// # Errors
     ///
     /// Returns:
