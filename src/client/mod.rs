@@ -413,12 +413,34 @@ where
         }
     }
 
-    /// Replace the `spawner` field, returning a `ClientDeps` over the
-    /// new spawner type. Bounds on the spawner are checked at the
-    /// eventual `Client::new_with_deps` (or `..._local`) call, not
-    /// here, so this method works for both `Spawner` and `LocalSpawner`
-    /// values.
-    pub fn with_spawner<Sp2>(self, spawner: Sp2) -> ClientDeps<F, Tm, R, I, Sp2> {
+    /// Replace the `spawner` field with a `Send + Sync` spawner
+    /// suitable for [`Client::new_with_deps`].
+    ///
+    /// For single-threaded executors that ship `!Send` futures, use
+    /// [`Self::with_local_spawner`] instead — the eventual
+    /// [`Client::new_with_deps_local`] expects a `LocalSpawner` and
+    /// the bound is enforced here at the builder call site rather
+    /// than deferred to construction.
+    pub fn with_spawner<Sp2: Spawner>(self, spawner: Sp2) -> ClientDeps<F, Tm, R, I, Sp2> {
+        ClientDeps {
+            factory: self.factory,
+            timer: self.timer,
+            e2e_registry: self.e2e_registry,
+            interface: self.interface,
+            spawner,
+        }
+    }
+
+    /// Replace the `spawner` field with a [`LocalSpawner`] for use
+    /// with [`Client::new_with_deps_local`] (single-threaded
+    /// executors such as `tokio::task::LocalSet`,
+    /// `embassy-executor`, or hand-rolled poll loops).
+    ///
+    /// [`LocalSpawner`]: crate::transport::LocalSpawner
+    pub fn with_local_spawner<Sp2: crate::transport::LocalSpawner>(
+        self,
+        spawner: Sp2,
+    ) -> ClientDeps<F, Tm, R, I, Sp2> {
         ClientDeps {
             factory: self.factory,
             timer: self.timer,
@@ -441,6 +463,19 @@ where
 /// (`Arc<Mutex<E2ERegistry>>` and `Arc<RwLock<Ipv4Addr>>`) are used by the
 /// standard constructors `Self::new` / `Self::new_with_loopback` /
 /// `Self::new_with_spawner_and_loopback` (all under `client-tokio`).
+///
+/// # Note on generic-parameter alignment with [`crate::ServerDeps`]
+///
+/// [`ClientDeps`] and [`crate::ServerDeps`] share their first three
+/// generic positions (`F`, `Tm`, `R`) to read symmetrically, but the
+/// `Client` struct itself carries only `<MessageDefinitions, R, I, C>`
+/// — `F`, `Tm`, and `Sp` (Spawner) live on the run-loop future
+/// produced by [`Self::new_with_deps`], not on the handle. The
+/// asymmetry between `Client<…>` and `Server<F, Tm, R, Sub, …>` is
+/// structural, not an oversight: a `Client` value retains no reference
+/// to the transport / timer / spawner once construction is done,
+/// whereas a `Server` value does (factory + timer fields are stored
+/// for the announcement loop and any rebind operations).
 #[derive(Clone)]
 pub struct Client<
     MessageDefinitions: PayloadWireFormat + Send + 'static,

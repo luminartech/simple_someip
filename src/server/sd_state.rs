@@ -575,12 +575,9 @@ mod tests {
 
     #[tokio::test]
     async fn send_offer_service_through_mock_emits_full_someip_sd_envelope() {
-        let config = ServerConfig::new(
-            Ipv4Addr::LOCALHOST,
-            TEST_ADVERTISED_PORT,
-            TEST_SERVICE_ID,
-            TEST_INSTANCE_ID,
-        );
+        let config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(TEST_ADVERTISED_PORT);
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = CapturingSocket::new();
 
@@ -605,12 +602,9 @@ mod tests {
 
     #[tokio::test]
     async fn send_offer_service_through_mock_advances_session_id_across_calls() {
-        let config = ServerConfig::new(
-            Ipv4Addr::LOCALHOST,
-            TEST_ADVERTISED_PORT,
-            TEST_SERVICE_ID,
-            TEST_INSTANCE_ID,
-        );
+        let config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(TEST_ADVERTISED_PORT);
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = CapturingSocket::new();
 
@@ -627,12 +621,9 @@ mod tests {
 
     #[tokio::test]
     async fn send_offer_service_through_mock_reboot_flag_flips_on_wrap() {
-        let config = ServerConfig::new(
-            Ipv4Addr::LOCALHOST,
-            TEST_ADVERTISED_PORT,
-            TEST_SERVICE_ID,
-            TEST_INSTANCE_ID,
-        );
+        let config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(TEST_ADVERTISED_PORT);
         // Seed so the FIRST send takes 0xFFFE → 0xFFFF (still
         // RecentlyRebooted) and the SECOND sees the wrap to 0x0001
         // (Continuous).
@@ -665,12 +656,9 @@ mod tests {
 
     #[tokio::test]
     async fn send_offer_service_through_mock_preserves_zero_ttl() {
-        let mut config = ServerConfig::new(
-            Ipv4Addr::LOCALHOST,
-            TEST_ADVERTISED_PORT,
-            TEST_SERVICE_ID,
-            TEST_INSTANCE_ID,
-        );
+        let mut config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(TEST_ADVERTISED_PORT);
         config.ttl = 0;
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = CapturingSocket::new();
@@ -684,12 +672,9 @@ mod tests {
 
     #[tokio::test]
     async fn send_offer_service_through_mock_propagates_socket_errors() {
-        let config = ServerConfig::new(
-            Ipv4Addr::LOCALHOST,
-            TEST_ADVERTISED_PORT,
-            TEST_SERVICE_ID,
-            TEST_INSTANCE_ID,
-        );
+        let config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(TEST_ADVERTISED_PORT);
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = FailingSocket;
         let result = sd_state.send_offer_service(&config, &sock).await;
@@ -900,12 +885,9 @@ mod tests {
                 loopback multicast is available."]
     #[tokio::test]
     async fn send_offer_service_emits_parseable_offer_to_multicast() {
-        let config = ServerConfig::new(
-            Ipv4Addr::LOCALHOST,
-            TEST_ADVERTISED_PORT,
-            TEST_SERVICE_ID,
-            TEST_INSTANCE_ID,
-        );
+        let config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(TEST_ADVERTISED_PORT);
         let (rx, tx) = mcast_rx_tx().await;
 
         // Seed with a recognisable value so on-wire session_id is exact.
@@ -930,12 +912,9 @@ mod tests {
         // Back-to-back sends must consume distinct, incrementing session
         // IDs — catches a regression where `send_offer_service` reads the
         // counter without advancing it, or reuses a cached value.
-        let config = ServerConfig::new(
-            Ipv4Addr::LOCALHOST,
-            TEST_ADVERTISED_PORT,
-            TEST_SERVICE_ID,
-            TEST_INSTANCE_ID,
-        );
+        let config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(TEST_ADVERTISED_PORT);
         let (rx, tx) = mcast_rx_tx().await;
 
         let sd_state = SdStateManager::with_initial(0x1233);
@@ -956,12 +935,9 @@ mod tests {
         // Session counter wrap must be visible on the wire: 0xFFFE -> 0xFFFF
         // -> 0x0001 (skipping the reserved 0). Exercises the wrap branch
         // *through* the send path, not only the unit test of next_session_id.
-        let config = ServerConfig::new(
-            Ipv4Addr::LOCALHOST,
-            TEST_ADVERTISED_PORT,
-            TEST_SERVICE_ID,
-            TEST_INSTANCE_ID,
-        );
+        let config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(TEST_ADVERTISED_PORT);
         let (rx, tx) = mcast_rx_tx().await;
 
         let sd_state = SdStateManager::with_initial(0xFFFE);
@@ -1000,12 +976,9 @@ mod tests {
         // TTL=0 is a legitimate SOME/IP-SD value meaning "stop offering";
         // `send_offer_service` must preserve it end-to-end rather than,
         // say, defaulting it back to the ServerConfig::new value of 3.
-        let mut config = ServerConfig::new(
-            Ipv4Addr::LOCALHOST,
-            TEST_ADVERTISED_PORT,
-            TEST_SERVICE_ID,
-            TEST_INSTANCE_ID,
-        );
+        let mut config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(TEST_ADVERTISED_PORT);
         config.ttl = 0;
         let (rx, tx) = mcast_rx_tx().await;
 

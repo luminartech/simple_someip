@@ -213,9 +213,16 @@ pub use traits::{OfferedEndpoint, PayloadWireFormat, WireFormat};
 
 #[cfg(feature = "client")]
 pub use client::{
-    Client, ClientChannelTypes, ClientDeps, ClientUpdate, ClientUpdates, ControlMessage,
-    DiscoveryMessage, PendingResponse, ReceivedMessage, SendMessage,
+    Client, ClientDeps, ClientUpdate, ClientUpdates, DiscoveryMessage, PendingResponse,
 };
+// `ClientChannelTypes`, `ControlMessage`, `SendMessage`, `ReceivedMessage`
+// are intentionally NOT re-exported at crate root — they are
+// implementation-detail-with-a-public-name (reachable as
+// `simple_someip::client::ControlMessage` etc. for the
+// `define_static_channels!` macro) rather than first-class crate-API
+// types. Elevating them to crate root would lock their shape into
+// the public-API contract and tempt generic users into hitting the
+// `ClientChannelTypes` elaboration limit at the wrong call site.
 pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
 pub use server::{Server, ServerDeps, ServerHandles, SubscriptionHandle};

@@ -350,7 +350,9 @@ async fn client_receives_server_sd_announcement() {
     // Create server
     let server_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
     let server_subs = MockSubscriptions::default();
-    let server_config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30500, 0x1234, 1);
+    let server_config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30500);
 
     let server_deps = ServerDeps {
         factory: server_factory,
@@ -442,8 +444,9 @@ async fn client_send_request_server_runloop_stable() {
     let service_id = 0x5678_u16;
     let instance_id = 1_u16;
     let server_port = 30600_u16;
-    let server_config =
-        ServerConfig::new(Ipv4Addr::LOCALHOST, server_port, service_id, instance_id);
+    let server_config = ServerConfig::new(service_id, instance_id)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(server_port);
 
     let server_deps = ServerDeps {
         factory: server_factory,
