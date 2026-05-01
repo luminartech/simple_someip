@@ -77,12 +77,47 @@ impl ServerConfig {
     /// subscription manager.
     pub const EVENT_GROUP_IDS_CAP: usize = 32;
 
-    /// Create a new server configuration
+    /// Create a new server configuration with sane defaults for
+    /// development.
+    ///
+    /// Required arguments are the SOME/IP `service_id` and
+    /// `instance_id` — the two values that identify the offered
+    /// service. Other fields use development-friendly defaults that
+    /// production callers will typically override via the fluent
+    /// setters:
+    ///
+    /// | Field | Default | Override via |
+    /// |---|---|---|
+    /// | `interface` | [`Ipv4Addr::UNSPECIFIED`] (`0.0.0.0`) | [`Self::with_interface`] |
+    /// | `local_port` | `0` (kernel-assigned ephemeral) | [`Self::with_local_port`] |
+    /// | `major_version` | `1` | [`Self::with_major_version`] |
+    /// | `minor_version` | `0` | [`Self::with_minor_version`] |
+    /// | `ttl` | 3 seconds (typical for SOME/IP) | [`Self::with_ttl`] |
+    /// | `event_group_ids` | empty (any group accepted) | [`Self::with_event_group`] |
+    ///
+    /// Production deployments almost always need a specific interface
+    /// and port — `0.0.0.0` lets the kernel pick a binding that may
+    /// not match the service's E/E-architecture wiring expectations,
+    /// and an ephemeral port can't be discovered by peers without a
+    /// separate side-channel. Treat the defaults as "good enough to
+    /// stand up a test server in three lines" rather than
+    /// production-ready.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use simple_someip::server::ServerConfig;
+    /// use std::net::Ipv4Addr;
+    ///
+    /// let config = ServerConfig::new(0x5BAA, 1)
+    ///     .with_interface(Ipv4Addr::new(192, 168, 1, 100))
+    ///     .with_local_port(30500);
+    /// ```
     #[must_use]
-    pub fn new(interface: Ipv4Addr, local_port: u16, service_id: u16, instance_id: u16) -> Self {
+    pub fn new(service_id: u16, instance_id: u16) -> Self {
         Self {
-            interface,
-            local_port,
+            interface: Ipv4Addr::UNSPECIFIED,
+            local_port: 0,
             service_id,
             instance_id,
             major_version: 1,
@@ -90,6 +125,27 @@ impl ServerConfig {
             ttl: 3, // 3 seconds is typical for SOME/IP
             event_group_ids: heapless::Vec::new(),
         }
+    }
+
+    /// Set the local interface IP address. Defaults to
+    /// [`Ipv4Addr::UNSPECIFIED`] (`0.0.0.0`) from [`Self::new`] —
+    /// production deployments will almost always override this to
+    /// match their E/E-architecture wiring.
+    #[must_use]
+    pub fn with_interface(mut self, interface: Ipv4Addr) -> Self {
+        self.interface = interface;
+        self
+    }
+
+    /// Set the local UDP port the server listens on for subscription
+    /// requests and unicast traffic. Defaults to `0` from
+    /// [`Self::new`] (kernel-assigned ephemeral port), which is fine
+    /// for tests but cannot be discovered by external peers and
+    /// should be set explicitly in production.
+    #[must_use]
+    pub fn with_local_port(mut self, local_port: u16) -> Self {
+        self.local_port = local_port;
+        self
     }
 
     /// Returns `true` if `event_group_id` is registered, OR
@@ -122,11 +178,18 @@ impl ServerConfig {
         self
     }
 
-    /// Set the SD announcement TTL in seconds. Defaults to `3` from
+    /// Set the SD announcement TTL. Defaults to 3 seconds from
     /// [`Self::new`] (typical for SOME/IP).
+    ///
+    /// The SOME/IP-SD wire format encodes TTL as `u32` whole seconds;
+    /// sub-second precision in the supplied `Duration` is truncated
+    /// (rounded down). Durations exceeding `u32::MAX` seconds (~136
+    /// years) saturate to `u32::MAX`. The reserved special value
+    /// `0xFFFFFF` ("until next reboot") can be requested by passing
+    /// `Duration::from_secs(0xFFFFFF)`.
     #[must_use]
-    pub fn with_ttl(mut self, ttl_seconds: u32) -> Self {
-        self.ttl = ttl_seconds;
+    pub fn with_ttl(mut self, ttl: core::time::Duration) -> Self {
+        self.ttl = u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX);
         self
     }
 
@@ -153,6 +216,7 @@ impl ServerConfig {
     ///
     /// Returns the unmodified config (in `Err`) if registering would
     /// exceed [`Self::EVENT_GROUP_IDS_CAP`].
+    #[must_use = "the returned `Result` carries the (possibly-modified) config — drop is silent"]
     pub fn try_with_event_group(mut self, event_group_id: u16) -> Result<Self, Self> {
         if self.event_group_ids.push(event_group_id).is_ok() {
             Ok(self)
@@ -207,7 +271,7 @@ where
 /// use simple_someip::server::ServerConfig;
 /// use std::net::Ipv4Addr;
 /// let deps = ServerDeps::tokio();
-/// let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0x1234, 1);
+/// let config = ServerConfig::new(0x1234, 1).with_interface(Ipv4Addr::LOCALHOST).with_local_port(0);
 /// // Binding-site type lets Server's `H` / `Hsd` / `Hep` defaults kick in.
 /// let _server: Server<_, _, _, _> =
 ///     Server::new_with_deps(deps, config, false).await?;
@@ -849,7 +913,7 @@ where
     /// # use simple_someip::server::{Server, ServerConfig};
     /// # use std::net::Ipv4Addr;
     /// # async fn demo() -> Result<(), simple_someip::server::Error> {
-    /// # let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30490, 0, 0);
+    /// # let config = ServerConfig::new(0, 0).with_interface(Ipv4Addr::LOCALHOST).with_local_port(30490);
     /// # let server = Server::new(config).await?;
     /// let announce_fut = server.announcement_loop()?;
     /// tokio::spawn(announce_fut);
@@ -1076,8 +1140,8 @@ where
     /// Get a clone of the event-publisher handle for sending events.
     ///
     /// Returns the `Hep` type parameter — typically
-    /// `Arc<EventPublisher<R, S, H>>` for std users (the default
-    /// `Hep`), `&'static EventPublisher<R, S, H>` for
+    /// `Arc<EventPublisher<R, Sub, H, T>>` for std users (the default
+    /// `Hep`), `&'static EventPublisher<R, Sub, H, T>` for
     /// bare-metal-no-alloc. (`EventPublisherHandle` was a former
     /// trait alias collapsed into [`crate::transport::SharedHandle`]
     /// in phase 19f / 20e.)
@@ -1764,7 +1828,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_creation() {
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30682, 0x5B, 1);
+        let config = ServerConfig::new(0x5B, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(30682);
 
         let server: Result<TestServer, _> = TestServer::new(config).await;
         assert!(server.is_ok());
@@ -1772,12 +1838,16 @@ mod tests {
 
     #[test]
     fn server_config_builder_chain_overrides_each_field() {
-        let cfg = ServerConfig::new(Ipv4Addr::LOCALHOST, 30683, 0x5B, 1)
+        let cfg = ServerConfig::new(0x5B, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(30683)
             .with_major_version(2)
             .with_minor_version(7)
-            .with_ttl(10)
+            .with_ttl(core::time::Duration::from_secs(10))
             .with_event_group(0x42)
             .with_event_group(0x43);
+        assert_eq!(cfg.interface, Ipv4Addr::LOCALHOST);
+        assert_eq!(cfg.local_port, 30683);
         assert_eq!(cfg.major_version, 2);
         assert_eq!(cfg.minor_version, 7);
         assert_eq!(cfg.ttl, 10);
@@ -1787,8 +1857,23 @@ mod tests {
     }
 
     #[test]
+    fn server_config_with_ttl_truncates_subsecond_precision() {
+        let cfg = ServerConfig::new(0x5B, 1).with_ttl(core::time::Duration::from_millis(2_999));
+        assert_eq!(cfg.ttl, 2, "sub-second is truncated, not rounded");
+    }
+
+    #[test]
+    fn server_config_with_ttl_saturates_overflow() {
+        let cfg = ServerConfig::new(0x5B, 1)
+            .with_ttl(core::time::Duration::from_secs(u64::from(u32::MAX) + 1));
+        assert_eq!(cfg.ttl, u32::MAX);
+    }
+
+    #[test]
     fn server_config_try_with_event_group_rejects_at_capacity() {
-        let mut cfg = ServerConfig::new(Ipv4Addr::LOCALHOST, 30684, 0x5B, 1);
+        let mut cfg = ServerConfig::new(0x5B, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(30684);
         for i in 0..u16::try_from(ServerConfig::EVENT_GROUP_IDS_CAP).unwrap() {
             cfg = cfg.try_with_event_group(i).expect("under cap");
         }
@@ -1880,7 +1965,9 @@ mod tests {
             "test precondition: kernel must assign a real ephemeral port",
         );
         // Port 0 → caller asks for back-fill from the bound port.
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0xFE10, 1);
+        let config = ServerConfig::new(0xFE10, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(0);
         let server = TestServer::new_with_handles(handles, config)
             .expect("new_with_handles must accept local_port = 0");
         assert_eq!(
@@ -1893,7 +1980,9 @@ mod tests {
     async fn new_with_handles_accepts_matching_local_port() {
         let (handles, bound_port) = build_test_handles(0).await;
         // Caller supplies the matching port explicitly.
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, bound_port, 0xFE11, 1);
+        let config = ServerConfig::new(0xFE11, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(bound_port);
         let server = TestServer::new_with_handles(handles, config)
             .expect("matching local_port must be accepted");
         assert_eq!(server.config.local_port, bound_port);
@@ -1909,7 +1998,9 @@ mod tests {
         // distinct from `bound_port`.
         let bogus_port = bound_port.wrapping_add(1);
         assert_ne!(bogus_port, bound_port);
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, bogus_port, 0xFE12, 1);
+        let config = ServerConfig::new(0xFE12, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(bogus_port);
         let result = TestServer::new_with_handles(handles, config);
         match result {
             Err(Error::InvalidUsage(tag)) => {
@@ -1927,7 +2018,9 @@ mod tests {
     #[tokio::test]
     async fn new_passive_with_handles_back_fills_local_port_on_zero() {
         let (handles, bound_port) = build_test_handles(0).await;
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0xFE13, 1);
+        let config = ServerConfig::new(0xFE13, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(0);
         let server = TestServer::new_passive_with_handles(handles, config)
             .expect("new_passive_with_handles must accept local_port = 0");
         assert_eq!(server.config.local_port, bound_port);
@@ -1939,7 +2032,9 @@ mod tests {
         let (handles, bound_port) = build_test_handles(0).await;
         let bogus_port = bound_port.wrapping_add(1);
         assert_ne!(bogus_port, bound_port);
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, bogus_port, 0xFE14, 1);
+        let config = ServerConfig::new(0xFE14, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(bogus_port);
         let result = TestServer::new_passive_with_handles(handles, config);
         match result {
             Err(Error::InvalidUsage(tag)) => {
@@ -1956,7 +2051,9 @@ mod tests {
     #[tokio::test]
     async fn passive_server_run_with_buffers_returns_invalid_usage() {
         let (handles, _) = build_test_handles(0).await;
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0xFE15, 1);
+        let config = ServerConfig::new(0xFE15, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(0);
         let mut server =
             TestServer::new_passive_with_handles(handles, config).expect("passive ctor");
         let mut unicast_buf = vec![0u8; 1500];
@@ -1974,7 +2071,9 @@ mod tests {
     #[tokio::test]
     async fn passive_server_announcement_loop_returns_invalid_usage() {
         let (handles, _) = build_test_handles(0).await;
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0xFE16, 1);
+        let config = ServerConfig::new(0xFE16, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(0);
         let server = TestServer::new_passive_with_handles(handles, config).expect("passive ctor");
         // The success arm returns an opaque `impl Future` that
         // doesn't impl Debug, so we can't pattern-match on a
@@ -1994,7 +2093,9 @@ mod tests {
     /// working) and validate strictly when populated.
     #[test]
     fn server_config_accepts_event_group_empty_means_any() {
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30490, 0x5B, 1);
+        let config = ServerConfig::new(0x5B, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(30490);
         assert!(config.event_group_ids.is_empty());
         // Empty list: every group accepted.
         assert!(config.accepts_event_group(0x0001));
@@ -2004,7 +2105,9 @@ mod tests {
 
     #[test]
     fn server_config_accepts_event_group_populated_validates() {
-        let mut config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30490, 0x5B, 1);
+        let mut config = ServerConfig::new(0x5B, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(30490);
         config.event_group_ids.push(0x0001).unwrap();
         config.event_group_ids.push(0x0042).unwrap();
         assert!(config.accepts_event_group(0x0001));
@@ -2097,7 +2200,9 @@ mod tests {
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             subscriptions: subscriptions.clone(),
         };
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0x5B, 1);
+        let config = ServerConfig::new(0x5B, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(0);
         // Explicit `Arc<FailingSocket>` H so the compiler doesn't have
         // to invent it across the deps-bundle indirection.
         let mut server: Server<_, _, _, _, Arc<FailingSocket>> =
@@ -2146,7 +2251,9 @@ mod tests {
     /// and session counter.
     #[tokio::test]
     async fn announcement_loop_second_call_returns_invalid_input() {
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30683, 0x5BB4, 1);
+        let config = ServerConfig::new(0x5BB4, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(30683);
         let server = TestServer::new(config).await.expect("create server");
         let _first = server
             .announcement_loop()
@@ -2171,7 +2278,9 @@ mod tests {
         // when the test binary runs tests in parallel. The SD socket binds
         // the SD multicast port (30490) and relies on SO_REUSEPORT, the same
         // as `test_server_creation`.
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30683, 0x5C, 1);
+        let config = ServerConfig::new(0x5C, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(30683);
 
         let server = TestServer::new_with_loopback(config, true)
             .await
@@ -2219,7 +2328,9 @@ mod tests {
     /// Helper: create a server on an ephemeral port and return (Server, port)
     async fn create_test_server(service_id: u16, instance_id: u16) -> (TestServer, u16) {
         // Use port 0 to get an ephemeral port
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, service_id, instance_id);
+        let config = ServerConfig::new(service_id, instance_id)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(0);
         let mut server = TestServer::new(config)
             .await
             .expect("Failed to create server");
@@ -3182,7 +3293,9 @@ mod tests {
     /// Construct a passive server on loopback with an ephemeral unicast
     /// port. Tests use this as a standard fixture.
     async fn make_passive_server(service_id: u16, instance_id: u16) -> TestServer {
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, service_id, instance_id);
+        let config = ServerConfig::new(service_id, instance_id)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(0);
         TestServer::new_passive(config)
             .await
             .expect("new_passive should succeed")
@@ -3334,7 +3447,9 @@ mod tests {
             rs
         };
 
-        let config = ServerConfig::new(iface, 30501, SID, IID);
+        let config = ServerConfig::new(SID, IID)
+            .with_interface(iface)
+            .with_local_port(30501);
         let server = TestServer::new_with_loopback(config, true).await.unwrap();
         let fut = server.announcement_loop().expect("build loop");
         let handle = tokio::spawn(fut);
@@ -3419,7 +3534,9 @@ mod tests {
             core::net::SocketAddr::V6(_) => panic!("expected IPv4"),
         };
 
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, blocker_port, 0x005C, 0x0001);
+        let config = ServerConfig::new(0x005C, 0x0001)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(blocker_port);
         let result = TestServer::new_passive(config).await;
         let Err(err) = result else {
             panic!("new_passive must fail when the unicast port is taken");
@@ -3543,7 +3660,9 @@ mod tests {
         // Pick a service_id and unicast port that do not collide with
         // the other loopback-enabled server test in this file.
         let service_id = 0xFE02;
-        let config = ServerConfig::new(interface, 30684, service_id, 0x43);
+        let config = ServerConfig::new(service_id, 0x43)
+            .with_interface(interface)
+            .with_local_port(30684);
 
         // Receiver joined to the SD multicast group on loopback.
         let raw_rx = socket2::Socket::new(

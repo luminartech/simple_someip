@@ -275,7 +275,9 @@ async fn server_constructible_without_server_tokio_feature() {
     let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
     let subs = MockSubscriptions::default();
 
-    let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30490, 0x5B, 1);
+    let config = ServerConfig::new(0x5B, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30490);
 
     let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
         ServerDeps {
@@ -319,7 +321,9 @@ async fn passive_server_constructible_without_server_tokio_feature() {
     let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
     let subs = MockSubscriptions::default();
 
-    let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0x5C, 2);
+    let config = ServerConfig::new(0x5C, 2)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(0);
 
     let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
         ServerDeps {

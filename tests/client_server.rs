@@ -80,7 +80,9 @@ type TestEventPublisher = simple_someip::server::EventPublisher<
 
 /// Create a server on an ephemeral unicast port, returning (Server, actual_port).
 async fn create_server(service_id: u16, instance_id: u16) -> (TestServer, u16) {
-    let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, service_id, instance_id);
+    let config = ServerConfig::new(service_id, instance_id)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(0);
     let mut server: TestServer = TestServer::new(config).await.expect("Server::new failed");
     let port = match server.unicast_local_addr().expect("local_addr failed") {
         std::net::SocketAddr::V4(a) => a.port(),

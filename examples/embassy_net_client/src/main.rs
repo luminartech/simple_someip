@@ -363,7 +363,7 @@ async fn main() {
                 Box::leak(Box::new(SocketPool::new()));
             let server_factory = EmbassyNetFactory::new(stack_a, server_pool);
             let server_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
-            let server_config = ServerConfig::new(IP_A, 30500, SERVICE_ID, INSTANCE_ID);
+            let server_config = ServerConfig::new(SERVICE_ID, INSTANCE_ID).with_interface(IP_A).with_local_port(30500);
 
             let server_deps = ServerDeps {
                 factory: server_factory,

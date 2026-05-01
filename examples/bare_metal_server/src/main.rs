@@ -249,7 +249,9 @@ async fn main() {
     let subs = StaticSubscriptionHandle::new(&SUBS_STORAGE);
 
     // service_id=0x1234, instance_id=1, bound to LOCALHOST:30490.
-    let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30490, 0x1234, 1);
+    let config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30490);
 
     let server =
         Server::<MockFactory, MockTimer, StaticE2EHandle, StaticSubscriptionHandle>::new_with_deps(

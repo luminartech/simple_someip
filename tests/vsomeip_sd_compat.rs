@@ -431,7 +431,9 @@ async fn vsomeip_sees_simple_someip_offer_service() {
     // Build a tokio-flavor Server with multicast loopback enabled
     // (matches vsomeip's default; lets a same-host subscriber see
     // our broadcasts even on the actual NIC).
-    let config = ServerConfig::new(interface, 30500, SERVICE_ID, INSTANCE_ID);
+    let config = ServerConfig::new(SERVICE_ID, INSTANCE_ID)
+        .with_interface(interface)
+        .with_local_port(30500);
     let mut server = Server::new_with_loopback(config, true)
         .await
         .expect("Server::new_with_loopback failed (network setup problem?)");
@@ -598,7 +600,9 @@ async fn tx_announcement_loop_emits_wire_format_offer() {
     // OfferService packets loop back to our receiver on the same
     // interface.
     const ADVERTISED_PORT: u16 = 30500;
-    let config = ServerConfig::new(interface, ADVERTISED_PORT, SERVICE_ID, INSTANCE_ID);
+    let config = ServerConfig::new(SERVICE_ID, INSTANCE_ID)
+        .with_interface(interface)
+        .with_local_port(ADVERTISED_PORT);
     let mut server = Server::new_with_loopback(config, true)
         .await
         .expect("Server::new_with_loopback failed");

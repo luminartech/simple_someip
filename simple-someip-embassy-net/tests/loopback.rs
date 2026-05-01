@@ -593,7 +593,9 @@ async fn client_receives_server_sd_announcement() {
             let server_subs = MockSubscriptions::default();
             // Service id 0x5BAA (just a witness) at port 30500 on
             // stack A's interface IP.
-            let server_config = ServerConfig::new(IP_A, 30500, 0x5BAA, 1);
+            let server_config = ServerConfig::new(0x5BAA, 1)
+                .with_interface(IP_A)
+                .with_local_port(30500);
 
             let server_deps = ServerDeps {
                 factory: server_factory,
@@ -709,7 +711,9 @@ async fn client_send_request_server_runloop_stable() {
             let service_id = 0x5BBB_u16;
             let instance_id = 1_u16;
             let server_port = 30600_u16;
-            let server_config = ServerConfig::new(IP_A, server_port, service_id, instance_id);
+            let server_config = ServerConfig::new(service_id, instance_id)
+                .with_interface(IP_A)
+                .with_local_port(server_port);
 
             let server_deps = ServerDeps {
                 factory: server_factory,
