@@ -24,6 +24,8 @@ pub use subscription_manager::{SubscribeError, SubscriptionHandle, SubscriptionM
 
 pub use sd_state::SdStateManager;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::Timer;
 use crate::e2e::{E2EKey, E2EProfile};
 use crate::protocol::sd;
@@ -556,6 +558,14 @@ pub struct Server<
     /// passive server is a programming error and returns
     /// [`Error::InvalidUsage`].
     is_passive: bool,
+    /// Latch flipped on the first poll of any run-future built from
+    /// this `Server`. Subsequent run-futures (whether from the
+    /// constructor's tuple, [`Self::run`], or [`Self::run_with_buffers`])
+    /// short-circuit with `Err(Error::InvalidUsage("server_already_running"))`
+    /// rather than racing on the same SD/unicast sockets and session
+    /// counter. `Arc<AtomicBool>` because the run-future captures a
+    /// clone independent of `&self`'s lifetime.
+    started: Arc<AtomicBool>,
 }
 
 /// `Hep` resolved against the `server-tokio` convenience constructors'
@@ -812,6 +822,7 @@ where
             factory,
             timer,
             is_passive: false,
+            started: Arc::new(AtomicBool::new(false)),
         };
         let handles = ServerHandles {
             publisher: server.publisher(),
@@ -893,6 +904,7 @@ where
             factory,
             timer,
             is_passive: true,
+            started: Arc::new(AtomicBool::new(false)),
         };
         let handles = ServerHandles {
             publisher: server.publisher(),
@@ -976,6 +988,7 @@ where
             factory: deps.factory,
             timer: deps.timer,
             is_passive: false,
+            started: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1040,6 +1053,7 @@ where
             factory: deps.factory,
             timer: deps.timer,
             is_passive: true,
+            started: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1145,8 +1159,24 @@ where
         let sd_state = self.sd_state.clone();
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
+        let started = self.started.clone();
 
         async move {
+            // See `run_inner` for the rationale on the first-poll
+            // latch — same race, same fix.
+            if started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                tracing::warn!(
+                    "Server::run_with_buffers already started for service 0x{:04X}; \
+                     a second run-future cannot share the same sockets \
+                     and session counter",
+                    config.service_id
+                );
+                return Err(Error::InvalidUsage("server_already_running"));
+            }
+
             runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm>(
                 config,
                 unicast_socket,
@@ -1224,8 +1254,28 @@ where
         let sd_state = self.sd_state.clone();
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
+        let started = self.started.clone();
 
         async move {
+            // First-poll latch — guards against a caller spawning
+            // both the constructor's run-future *and* a fresh
+            // `server.run()` / `server.run_with_buffers()`. Two
+            // concurrent receive loops would race on the same SD /
+            // unicast sockets and the SD session counter; reject the
+            // second one rather than silently corrupt wire output.
+            if started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                tracing::warn!(
+                    "Server::run already started for service 0x{:04X}; \
+                     a second run-future cannot share the same sockets \
+                     and session counter",
+                    config.service_id
+                );
+                return Err(Error::InvalidUsage("server_already_running"));
+            }
+
             let mut unicast_buf = alloc::vec![0u8; 65535];
             let mut sd_buf = alloc::vec![0u8; 65535];
             runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm>(
@@ -2833,6 +2883,52 @@ mod tests {
         let (server, _port) = create_test_server(0x005C, 0x0001).await;
         let fut = server.run();
         drop(fut);
+    }
+
+    /// Two run-futures from the same `Server` would race on the SD
+    /// and unicast sockets and the SD session counter; the second to
+    /// be polled must short-circuit with
+    /// `Err(Error::InvalidUsage("server_already_running"))` rather
+    /// than silently corrupt wire output. Tests both ordering and
+    /// the buffer-supplied variant.
+    #[tokio::test]
+    async fn second_run_future_returns_already_running() {
+        let (server, _port) = create_test_server(0x005D, 0x0001).await;
+
+        // First run-future: spawn it so its async-move body actually
+        // runs and flips the latch on first poll. Yield once so tokio
+        // schedules the spawned task; the task itself blocks
+        // indefinitely in `recv_from`, which is fine — abort below.
+        let first = tokio::spawn(server.run());
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Second run-future from the same server must reject.
+        let second = server.run().await;
+        match second {
+            Err(Error::InvalidUsage(tag)) => {
+                assert_eq!(tag, "server_already_running");
+            }
+            other => panic!(
+                "second run-future must return InvalidUsage(\"server_already_running\"), got {other:?}"
+            ),
+        }
+
+        // Same gate on `run_with_buffers`.
+        let mut unicast_buf = vec![0u8; 1500];
+        let mut sd_buf = vec![0u8; 1500];
+        let third = server.run_with_buffers(&mut unicast_buf, &mut sd_buf).await;
+        match third {
+            Err(Error::InvalidUsage(tag)) => {
+                assert_eq!(tag, "server_already_running");
+            }
+            other => panic!(
+                "second run_with_buffers must return InvalidUsage(\"server_already_running\"), got {other:?}"
+            ),
+        }
+
+        first.abort();
+        let _ = first.await;
     }
 
     /// Direct test that `announcement_loop` actually emits an SD

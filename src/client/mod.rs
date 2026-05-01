@@ -101,10 +101,16 @@ use tracing::info;
 /// have to do the same.
 ///
 /// In practical terms: the trait surfaces the required pool entries
-/// in one rustdoc page (this one) and is re-exported at crate root.
-/// When stable Rust gains elaboration for these bounds, the per-impl
-/// repetition can collapse to a single `C: ClientChannelTypes<P>`
-/// supertrait without changing the outward contract.
+/// in one rustdoc page (this one), reachable as
+/// [`crate::client::ClientChannelTypes`]. It is intentionally not
+/// re-exported at crate root — making it generic-position-named would
+/// tempt callers to write `C: ClientChannelTypes<P>` and hit Rust's
+/// unsolved trait-bound elaboration limit at the wrong call site
+/// (the bounds you see below in the `where` clause are what
+/// implementors actually have to satisfy). When stable Rust gains
+/// elaboration for these bounds, the per-impl repetition can
+/// collapse to a single `C: ClientChannelTypes<P>` supertrait without
+/// changing the outward contract.
 ///
 /// [`define_static_channels!`]: crate::define_static_channels
 pub trait ClientChannelTypes<P: PayloadWireFormat + 'static>: ChannelFactory
