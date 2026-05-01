@@ -472,22 +472,31 @@ type SubKey = (u16, u16, u16, SocketAddrV4);
 struct MockSubscriptions(Arc<std::sync::Mutex<Vec<SubKey>>>);
 
 impl SubscriptionHandle for MockSubscriptions {
+    // Boxed `!Send` futures — the `spawn_local` paths that exercise
+    // this loopback don't need `Send` and the `Mutex` is only used
+    // synchronously inside.
+    type SubscribeFuture<'a> = core::pin::Pin<
+        Box<dyn core::future::Future<Output = Result<(), SubscribeError>> + 'a>,
+    >;
+    type UnsubscribeFuture<'a> =
+        core::pin::Pin<Box<dyn core::future::Future<Output = ()> + 'a>>;
+
     fn subscribe(
         &self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl core::future::Future<Output = Result<(), SubscribeError>> + '_ {
+    ) -> Self::SubscribeFuture<'_> {
         let this = self.0.clone();
-        async move {
+        Box::pin(async move {
             let mut guard = this.lock().unwrap();
             let key = (service_id, instance_id, event_group_id, subscriber_addr);
             if !guard.contains(&key) {
                 guard.push(key);
             }
             Ok(())
-        }
+        })
     }
 
     fn unsubscribe(
@@ -496,12 +505,12 @@ impl SubscriptionHandle for MockSubscriptions {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl core::future::Future<Output = ()> + '_ {
+    ) -> Self::UnsubscribeFuture<'_> {
         let this = self.0.clone();
-        async move {
+        Box::pin(async move {
             let mut guard = this.lock().unwrap();
             guard.retain(|e| *e != (service_id, instance_id, event_group_id, subscriber_addr));
-        }
+        })
     }
 
     fn for_each_subscriber<'a, F>(
@@ -610,18 +619,23 @@ async fn client_receives_server_sd_announcement() {
             // `!Sync`) compiles here. The annotation is explicit so
             // type inference doesn't have to chase `H` across the
             // deps-bundle indirection.
-            let server: Server<_, _, _, _, Arc<simple_someip_embassy_net::EmbassyNetSocket>> =
-                Server::new_with_deps(server_deps, server_config, false)
-                    .await
-                    .expect("server construction over embassy-net");
+            let (server, _handles, _run): (
+                Server<_, _, _, _, Arc<simple_someip_embassy_net::EmbassyNetSocket>>,
+                _,
+                _,
+            ) = Server::new_with_deps(server_deps, server_config, false)
+                .await
+                .expect("server construction over embassy-net");
 
-            // `announcement_loop_local`, NOT `announcement_loop`,
-            // because `EmbassyNetSocket` is `!Sync` — the
-            // Send-bounded variant doesn't typecheck for our `H`.
-            let announce_fut = server
-                .announcement_loop_local()
-                .expect("announcement_loop_local");
-            tokio::task::spawn_local(announce_fut);
+            // Phase 21b: receive + announce folded into the combined
+            // run-future. The constructor's `_run` is the alloc-backed
+            // version; we use `run_with_buffers` here because
+            // `EmbassyNetSocket: !Sync` makes the `_run` future
+            // `!Send` and we want explicit static buffers anyway.
+            tokio::task::spawn_local(server.run_with_buffers(
+                Box::leak(Box::new([0u8; 65535])),
+                Box::leak(Box::new([0u8; 65535])),
+            ));
 
             // ── Client on stack B ────────────────────────────────
             let client_pool: &'static SocketPool<8, LINK_MTU, LINK_MTU> =
@@ -726,10 +740,13 @@ async fn client_send_request_server_runloop_stable() {
             // doesn't have to invent it across the deps-bundle
             // indirection. Same shape as the equivalent annotation
             // in `simple_someip`'s SD-NACK test.
-            let mut server: Server<_, _, _, _, Arc<simple_someip_embassy_net::EmbassyNetSocket>> =
-                Server::new_passive_with_deps(server_deps, server_config)
-                    .await
-                    .expect("passive server construction");
+            let (server, _handles, _run): (
+                Server<_, _, _, _, Arc<simple_someip_embassy_net::EmbassyNetSocket>>,
+                _,
+                _,
+            ) = Server::new_passive_with_deps(server_deps, server_config)
+                .await
+                .expect("passive server construction");
 
             // NOTE: we do NOT spawn `server.run()` here. A passive
             // server's `run()` returns `Err(InvalidUsage)`
@@ -739,7 +756,7 @@ async fn client_send_request_server_runloop_stable() {
             // so its unicast socket bind happens — the kernel-level
             // recv buffer absorbs the client's request bytes
             // independently of any application run-loop.
-            let _ = &mut server; // suppress unused-mut warning
+            let _ = &server; // anchor binding so the unicast bind sticks
 
             // ── Client on stack B ────────────────────────────────
             let client_pool: &'static SocketPool<8, LINK_MTU, LINK_MTU> =

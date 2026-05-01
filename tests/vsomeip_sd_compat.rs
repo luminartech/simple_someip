@@ -434,26 +434,15 @@ async fn vsomeip_sees_simple_someip_offer_service() {
     let config = ServerConfig::new(SERVICE_ID, INSTANCE_ID)
         .with_interface(interface)
         .with_local_port(30500);
-    let mut server = Server::new_with_loopback(config, true)
+    let (_server, _handles, run) = Server::new_with_loopback(config, true)
         .await
         .expect("Server::new_with_loopback failed (network setup problem?)");
 
-    // `announcement_loop()` returns the `+ Send + 'static` future
-    // that emits OfferService SD broadcasts every cyclic_offer_delay
-    // (default 1s in simple-someip). Spawning it on tokio works
-    // here because TokioSocket is Send + Sync and the std-side
-    // bounds are met by the convenience constructor's defaults.
-    let announce_fut = server
-        .announcement_loop()
-        .expect("announcement_loop failed; passive server?");
-    let announce_handle = tokio::spawn(announce_fut);
-
-    // Drive the server's run loop too — it does multicast-loopback
-    // SD receive, but for this test we only care that announcements
-    // go out. The run loop survives without subscribers.
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run().await;
-    });
+    // Phase 21b: announcements are folded into `Server::run`'s combined
+    // future. Spawning it works here because TokioSocket is Send + Sync.
+    let server_handle = tokio::spawn(run);
+    // Compatibility shim: tests below still wait on `announce_handle`.
+    let announce_handle: tokio::task::JoinHandle<()> = tokio::spawn(async {});
 
     eprintln!("[test] announcement loop spawned; polling docker logs");
 
@@ -603,19 +592,12 @@ async fn tx_announcement_loop_emits_wire_format_offer() {
     let config = ServerConfig::new(SERVICE_ID, INSTANCE_ID)
         .with_interface(interface)
         .with_local_port(ADVERTISED_PORT);
-    let mut server = Server::new_with_loopback(config, true)
+    let (_server, _handles, run) = Server::new_with_loopback(config, true)
         .await
         .expect("Server::new_with_loopback failed");
-    let announce_fut = server
-        .announcement_loop()
-        .expect("announcement_loop failed; passive server?");
-    let announce_handle = tokio::spawn(announce_fut);
-    // Drive run() too so the Server's own SD socket drains, but we
-    // assert against bytes we receive on our independent capture
-    // socket — the run-loop is just to keep the Server healthy.
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run().await;
-    });
+    // Phase 21b: combined announce + receive run-future.
+    let server_handle = tokio::spawn(run);
+    let announce_handle: tokio::task::JoinHandle<()> = tokio::spawn(async {});
 
     // Owned snapshot of the assertion-relevant fields. Pulled out
     // inside `recv_loop` because `MessageView` / `SdHeaderView` /
