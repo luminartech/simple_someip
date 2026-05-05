@@ -1,4 +1,4 @@
-//! Phase 20f — Conformance test against the COVESA vsomeip reference
+//! Conformance test against the COVESA vsomeip reference
 //! SOME/IP-SD implementation.
 //!
 //! `#[ignore]`'d by default. Run on demand once you have vsomeip
@@ -353,7 +353,7 @@ async fn client_sees_vsomeip_offer_service() {
     }
 }
 
-// ── Phase 20h: TX direction — simple-someip emits, vsomeip subscribes ─
+// ── TX direction — simple-someip emits, vsomeip subscribes ───────────
 
 /// Container name for the subscriber-role container. Hardcoded so the
 /// test knows which `docker logs` to scrape; if you run the container
@@ -431,27 +431,16 @@ async fn vsomeip_sees_simple_someip_offer_service() {
     // Build a tokio-flavor Server with multicast loopback enabled
     // (matches vsomeip's default; lets a same-host subscriber see
     // our broadcasts even on the actual NIC).
-    let config = ServerConfig::new(interface, 30500, SERVICE_ID, INSTANCE_ID);
-    let mut server = Server::new_with_loopback(config, true)
+    let config = ServerConfig::new(SERVICE_ID, INSTANCE_ID)
+        .with_interface(interface)
+        .with_local_port(30500);
+    let (_server, _handles, run) = Server::new_with_loopback(config, true)
         .await
         .expect("Server::new_with_loopback failed (network setup problem?)");
 
-    // `announcement_loop()` returns the `+ Send + 'static` future
-    // that emits OfferService SD broadcasts every cyclic_offer_delay
-    // (default 1s in simple-someip). Spawning it on tokio works
-    // here because TokioSocket is Send + Sync and the std-side
-    // bounds are met by the convenience constructor's defaults.
-    let announce_fut = server
-        .announcement_loop()
-        .expect("announcement_loop failed; passive server?");
-    let announce_handle = tokio::spawn(announce_fut);
-
-    // Drive the server's run loop too — it does multicast-loopback
-    // SD receive, but for this test we only care that announcements
-    // go out. The run loop survives without subscribers.
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run().await;
-    });
+    // Announcements are folded into `Server::run`'s combined future.
+    // Spawning it works here because TokioSocket is Send + Sync.
+    let server_handle = tokio::spawn(run);
 
     eprintln!("[test] announcement loop spawned; polling docker logs");
 
@@ -481,7 +470,6 @@ async fn vsomeip_sees_simple_someip_offer_service() {
     })
     .await;
 
-    announce_handle.abort();
     server_handle.abort();
 
     match saw_marker {
@@ -524,7 +512,7 @@ async fn vsomeip_sees_simple_someip_offer_service() {
     }
 }
 
-// ── Phase 20h: TX direction — wire-format self-check (no docker) ──────
+// ── TX direction — wire-format self-check (no docker) ────────────────
 
 /// Verifies `Server::announcement_loop` emits SOME/IP-SD bytes that
 /// match the AUTOSAR SOME/IP-SD spec, by capturing the bytes on a
@@ -598,20 +586,14 @@ async fn tx_announcement_loop_emits_wire_format_offer() {
     // OfferService packets loop back to our receiver on the same
     // interface.
     const ADVERTISED_PORT: u16 = 30500;
-    let config = ServerConfig::new(interface, ADVERTISED_PORT, SERVICE_ID, INSTANCE_ID);
-    let mut server = Server::new_with_loopback(config, true)
+    let config = ServerConfig::new(SERVICE_ID, INSTANCE_ID)
+        .with_interface(interface)
+        .with_local_port(ADVERTISED_PORT);
+    let (_server, _handles, run) = Server::new_with_loopback(config, true)
         .await
         .expect("Server::new_with_loopback failed");
-    let announce_fut = server
-        .announcement_loop()
-        .expect("announcement_loop failed; passive server?");
-    let announce_handle = tokio::spawn(announce_fut);
-    // Drive run() too so the Server's own SD socket drains, but we
-    // assert against bytes we receive on our independent capture
-    // socket — the run-loop is just to keep the Server healthy.
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run().await;
-    });
+    // Combined announce + receive run-future.
+    let server_handle = tokio::spawn(run);
 
     // Owned snapshot of the assertion-relevant fields. Pulled out
     // inside `recv_loop` because `MessageView` / `SdHeaderView` /
@@ -735,13 +717,11 @@ async fn tx_announcement_loop_emits_wire_format_offer() {
             "Timed out after {}s waiting to capture SECOND OfferService \
              on {interface}. Cyclic offer delay is ~1s; if first arrived \
              but second didn't, something tore down the announcement loop \
-             mid-test (check announce_handle / server_handle for early \
-             failure).",
+             mid-test (check server_handle for early failure).",
             second_timeout.as_secs(),
         )
     });
 
-    announce_handle.abort();
     server_handle.abort();
 
     // ── First announcement: full envelope shape + reboot flag ────────

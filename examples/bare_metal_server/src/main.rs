@@ -249,10 +249,12 @@ async fn main() {
     let subs = StaticSubscriptionHandle::new(&SUBS_STORAGE);
 
     // service_id=0x1234, instance_id=1, bound to LOCALHOST:30490.
-    let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30490, 0x1234, 1);
+    let config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30490);
 
-    let server =
-        Server::<StaticE2EHandle, StaticSubscriptionHandle, MockFactory, MockTimer>::new_with_deps(
+    let (_server, _handles, run) =
+        Server::<MockFactory, MockTimer, StaticE2EHandle, StaticSubscriptionHandle>::new_with_deps(
             ServerDeps {
                 factory,
                 timer: MockTimer,
@@ -265,14 +267,10 @@ async fn main() {
         .await
         .expect("Server::new_with_deps failed");
 
-    // The announcement loop periodically multicasts SD OfferService
-    // entries so clients on the network can discover this service.
-    // It is Send + 'static and can be handed to any executor.
-    let announce_handle = tokio::spawn(
-        server
-            .announcement_loop()
-            .expect("non-passive server must have an announcement loop"),
-    );
+    // The combined run-future drives both receive and announce. It
+    // is `'static` and can be handed to any executor (here tokio for
+    // the canary harness).
+    let announce_handle = tokio::spawn(run);
 
     // Yield twice: the announcement loop fires its first SD offer on the
     // first poll before the inter-announcement timer starts.

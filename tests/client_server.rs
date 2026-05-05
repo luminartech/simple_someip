@@ -63,10 +63,10 @@ type TestClient = Client<
 /// scope so callers can spell `TestServer::new(...)` without chasing the
 /// four-type-parameter signature on every call site.
 type TestServer = Server<
-    std::sync::Arc<std::sync::Mutex<simple_someip::e2e::E2ERegistry>>,
-    std::sync::Arc<tokio::sync::RwLock<simple_someip::server::SubscriptionManager>>,
     simple_someip::TokioTransport,
     simple_someip::TokioTimer,
+    std::sync::Arc<std::sync::Mutex<simple_someip::e2e::E2ERegistry>>,
+    std::sync::Arc<tokio::sync::RwLock<simple_someip::server::SubscriptionManager>>,
 >;
 
 /// Type alias for the event publisher concrete type used by `TestServer`'s
@@ -79,14 +79,24 @@ type TestEventPublisher = simple_someip::server::EventPublisher<
 >;
 
 /// Create a server on an ephemeral unicast port, returning (Server, actual_port).
+///
+/// `TestServer::new` returns a `(Server, ServerHandles, run)` tuple.
+/// Tests in this module construct the server, query the
+/// kernel-assigned port via `unicast_local_addr`, and don't spawn
+/// the run future from this helper — the few tests that need it call
+/// `server.run()` directly after receiving the `Server` handle.
 async fn create_server(service_id: u16, instance_id: u16) -> (TestServer, u16) {
-    let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, service_id, instance_id);
-    let mut server: TestServer = TestServer::new(config).await.expect("Server::new failed");
+    let config = ServerConfig::new(service_id, instance_id)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(0);
+    let (server, _handles, _run): (TestServer, _, _) =
+        TestServer::new(config).await.expect("Server::new failed");
+    // Constructor already back-filled `config.local_port` from the
+    // kernel-assigned bound port; just read it back for the test return.
     let port = match server.unicast_local_addr().expect("local_addr failed") {
         std::net::SocketAddr::V4(a) => a.port(),
         _ => panic!("expected IPv4"),
     };
-    server.set_local_port(port);
     (server, port)
 }
 
@@ -114,7 +124,7 @@ async fn wait_for_subscribers(
 async fn test_client_server_subscribe_and_receive_event() {
     // Start server on ephemeral port
     let service_id = next_service_id();
-    let (mut server, server_port) = create_server(service_id, 1).await;
+    let (server, server_port) = create_server(service_id, 1).await;
     let publisher = server.publisher();
     let server_handle = tokio::spawn(async move { server.run().await });
 
@@ -166,7 +176,7 @@ async fn test_client_server_subscribe_and_receive_event() {
 async fn test_client_send_sd_auto_binds_discovery() {
     // Create server so there is something to send to
     let service_id = next_service_id();
-    let (mut server, server_port) = create_server(service_id, 1).await;
+    let (server, server_port) = create_server(service_id, 1).await;
     let server_handle = tokio::spawn(async move { server.run().await });
 
     // Create client — NO bind_discovery
@@ -200,7 +210,7 @@ async fn test_client_send_sd_auto_binds_discovery() {
 #[tokio::test]
 async fn test_client_bind_unbind_lifecycle_with_server() {
     let service_id = next_service_id();
-    let (mut server, server_port) = create_server(service_id, 1).await;
+    let (server, server_port) = create_server(service_id, 1).await;
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
@@ -235,7 +245,7 @@ async fn test_client_bind_unbind_lifecycle_with_server() {
 #[tokio::test]
 async fn test_add_endpoint_and_send_to_service() {
     let service_id = next_service_id();
-    let (mut server, server_port) = create_server(service_id, 1).await;
+    let (server, server_port) = create_server(service_id, 1).await;
     let publisher = server.publisher();
     let server_handle = tokio::spawn(async move { server.run().await });
 
@@ -302,7 +312,7 @@ async fn test_add_endpoint_and_send_to_service() {
 #[tokio::test]
 async fn test_subscribe_auto_binds_discovery() {
     let service_id = next_service_id();
-    let (mut server, server_port) = create_server(service_id, 1).await;
+    let (server, server_port) = create_server(service_id, 1).await;
     let publisher = server.publisher();
     let server_handle = tokio::spawn(async move { server.run().await });
 
@@ -353,7 +363,7 @@ async fn test_subscribe_auto_binds_discovery() {
 #[tokio::test]
 async fn test_client_request_resolves_via_unicast_reply() {
     let service_id = next_service_id();
-    let (mut server, server_port) = create_server(service_id, 1).await;
+    let (server, server_port) = create_server(service_id, 1).await;
     let publisher = server.publisher();
     let server_handle = tokio::spawn(async move { server.run().await });
 
@@ -413,7 +423,7 @@ async fn test_client_request_resolves_via_unicast_reply() {
 #[tokio::test]
 async fn test_e2e_protect_on_publish_and_check_on_receive() {
     let service_id = next_service_id();
-    let (mut server, server_port) = create_server(service_id, 1).await;
+    let (server, server_port) = create_server(service_id, 1).await;
     let publisher = server.publisher();
 
     // Register E2E profile on server for the event message ID
@@ -495,7 +505,7 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
 #[tokio::test]
 async fn test_multiple_subscribers_receive_events() {
     let service_id = next_service_id();
-    let (mut server, server_port) = create_server(service_id, 1).await;
+    let (server, server_port) = create_server(service_id, 1).await;
     let publisher = server.publisher();
     let server_handle = tokio::spawn(async move { server.run().await });
 
@@ -588,7 +598,7 @@ async fn test_updates_drain_after_shutdown() {
 #[tokio::test]
 async fn test_cloned_client_works() {
     let service_id = next_service_id();
-    let (mut server, server_port) = create_server(service_id, 1).await;
+    let (server, server_port) = create_server(service_id, 1).await;
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
@@ -616,7 +626,7 @@ async fn test_cloned_client_works() {
 #[tokio::test]
 async fn test_subscribe_specific_port_reuse() {
     let service_id = next_service_id();
-    let (mut server, server_port) = create_server(service_id, 1).await;
+    let (server, server_port) = create_server(service_id, 1).await;
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);

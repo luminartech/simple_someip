@@ -57,14 +57,14 @@ use core::{
     task::{Context, Poll},
 };
 use futures_util::{FutureExt, pin_mut, select_biased};
-use tracing::{debug, error, info, trace, warn};
+use crate::log::{debug, error, info, trace, warn};
 
 /// A received message together with the source address it came from.
 ///
-/// TODO: narrow `source` to `SocketAddrV4` to match the `TransportSocket`
-/// trait's IPv4-only contract — today the field is always a
-/// `SocketAddr::V4(_)` wrapping, and the V6 variant is unreachable.
-/// Deferred because the rename ripples through `DiscoveryMessage` and
+/// Tracked in #118: narrow `source` to `SocketAddrV4` to match the
+/// `TransportSocket` trait's IPv4-only contract — today the field is
+/// always a `SocketAddr::V4(_)` wrapping, and the V6 variant is
+/// unreachable. The rename ripples through `DiscoveryMessage` and
 /// `ClientUpdate::Unicast`.
 #[derive(Clone, Debug)]
 pub struct ReceivedMessage<P> {

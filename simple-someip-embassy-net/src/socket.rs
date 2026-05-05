@@ -1,8 +1,8 @@
 //! `TransportSocket` impl wrapping `embassy_net::udp::UdpSocket`.
 //!
-//! Phase 19c lands the real send/recv I/O — named future structs
-//! drive `embassy_net`'s `poll_send_to` / `poll_recv_from` directly,
-//! so each datagram costs zero heap allocations on the hot path.
+//! Named future structs drive `embassy_net`'s `poll_send_to` /
+//! `poll_recv_from` directly, so each datagram costs zero heap
+//! allocations on the hot path.
 
 use core::future::Future;
 use core::net::{Ipv4Addr, SocketAddrV4};

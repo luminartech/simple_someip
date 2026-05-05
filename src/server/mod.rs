@@ -8,6 +8,7 @@
 
 mod error;
 mod event_publisher;
+mod runtime;
 mod sd_state;
 mod service_info;
 mod subscription_manager;
@@ -27,14 +28,15 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::Timer;
 use crate::e2e::{E2EKey, E2EProfile};
-use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
+use crate::protocol::sd;
+#[cfg(test)]
+use crate::protocol::sd::{Entry, Flags, ServiceEntry};
 use crate::transport::{
     E2ERegistryHandle, SharedHandle, SocketOptions, TransportFactory, TransportSocket,
     WrappableSharedHandle,
 };
 use alloc::sync::Arc;
 use core::net::{Ipv4Addr, SocketAddrV4};
-use futures_util::{FutureExt, pin_mut, select_biased};
 #[cfg(test)]
 use std::vec::Vec;
 
@@ -69,6 +71,16 @@ pub struct ServerConfig {
     /// accepted — preserves back-compat for callers that have not
     /// enumerated their groups; populate to opt into validation.
     pub event_group_ids: heapless::Vec<u16, { ServerConfig::EVENT_GROUP_IDS_CAP }>,
+    /// Whether the run-future drives the SD `OfferService` announcement
+    /// loop. Defaults to `true`.
+    ///
+    /// Set to `false` (via [`Self::with_announce`]) when an external
+    /// component drives announcements — for example the
+    /// `examples/client_server` topology where a co-located `Client`'s
+    /// `sd_announcements_loop` emits the offers and the server should
+    /// stay silent on SD. Has no effect on passive servers, which never
+    /// announce.
+    pub announce: bool,
 }
 
 impl ServerConfig {
@@ -77,19 +89,76 @@ impl ServerConfig {
     /// subscription manager.
     pub const EVENT_GROUP_IDS_CAP: usize = 32;
 
-    /// Create a new server configuration
+    /// Create a new server configuration with sane defaults for
+    /// development.
+    ///
+    /// Required arguments are the SOME/IP `service_id` and
+    /// `instance_id` — the two values that identify the offered
+    /// service. Other fields use development-friendly defaults that
+    /// production callers will typically override via the fluent
+    /// setters:
+    ///
+    /// | Field | Default | Override via |
+    /// |---|---|---|
+    /// | `interface` | [`Ipv4Addr::UNSPECIFIED`] (`0.0.0.0`) | [`Self::with_interface`] |
+    /// | `local_port` | `0` (kernel-assigned ephemeral) | [`Self::with_local_port`] |
+    /// | `major_version` | `1` | [`Self::with_major_version`] |
+    /// | `minor_version` | `0` | [`Self::with_minor_version`] |
+    /// | `ttl` | 3 seconds (typical for SOME/IP) | [`Self::with_ttl`] |
+    /// | `event_group_ids` | empty (any group accepted) | [`Self::with_event_group`] |
+    ///
+    /// Production deployments almost always need a specific interface
+    /// and port — `0.0.0.0` lets the kernel pick a binding that may
+    /// not match the service's E/E-architecture wiring expectations,
+    /// and an ephemeral port can't be discovered by peers without a
+    /// separate side-channel. Treat the defaults as "good enough to
+    /// stand up a test server in three lines" rather than
+    /// production-ready.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use simple_someip::server::ServerConfig;
+    /// use std::net::Ipv4Addr;
+    ///
+    /// let config = ServerConfig::new(0x5BAA, 1)
+    ///     .with_interface(Ipv4Addr::new(192, 168, 1, 100))
+    ///     .with_local_port(30500);
+    /// ```
     #[must_use]
-    pub fn new(interface: Ipv4Addr, local_port: u16, service_id: u16, instance_id: u16) -> Self {
+    pub fn new(service_id: u16, instance_id: u16) -> Self {
         Self {
-            interface,
-            local_port,
+            interface: Ipv4Addr::UNSPECIFIED,
+            local_port: 0,
             service_id,
             instance_id,
             major_version: 1,
             minor_version: 0,
             ttl: 3, // 3 seconds is typical for SOME/IP
             event_group_ids: heapless::Vec::new(),
+            announce: true,
         }
+    }
+
+    /// Set the local interface IP address. Defaults to
+    /// [`Ipv4Addr::UNSPECIFIED`] (`0.0.0.0`) from [`Self::new`] —
+    /// production deployments will almost always override this to
+    /// match their E/E-architecture wiring.
+    #[must_use]
+    pub fn with_interface(mut self, interface: Ipv4Addr) -> Self {
+        self.interface = interface;
+        self
+    }
+
+    /// Set the local UDP port the server listens on for subscription
+    /// requests and unicast traffic. Defaults to `0` from
+    /// [`Self::new`] (kernel-assigned ephemeral port), which is fine
+    /// for tests but cannot be discovered by external peers and
+    /// should be set explicitly in production.
+    #[must_use]
+    pub fn with_local_port(mut self, local_port: u16) -> Self {
+        self.local_port = local_port;
+        self
     }
 
     /// Returns `true` if `event_group_id` is registered, OR
@@ -97,6 +166,90 @@ impl ServerConfig {
     #[must_use]
     pub fn accepts_event_group(&self, event_group_id: u16) -> bool {
         self.event_group_ids.is_empty() || self.event_group_ids.contains(&event_group_id)
+    }
+
+    // ── Fluent builder ───────────────────────────────────────────────
+    //
+    // Each `with_*` setter consumes and returns `self` so callers can
+    // chain overrides starting from `Self::new(...)`. The struct's
+    // public fields stay available; the builder is just a less-noisy
+    // path for the common "constructor + a couple of overrides" shape.
+
+    /// Set the SOME/IP major version. Defaults to `1` from
+    /// [`Self::new`].
+    #[must_use]
+    pub fn with_major_version(mut self, major_version: u8) -> Self {
+        self.major_version = major_version;
+        self
+    }
+
+    /// Set the SOME/IP minor version. Defaults to `0` from
+    /// [`Self::new`].
+    #[must_use]
+    pub fn with_minor_version(mut self, minor_version: u32) -> Self {
+        self.minor_version = minor_version;
+        self
+    }
+
+    /// Set the SD announcement TTL. Defaults to 3 seconds from
+    /// [`Self::new`] (typical for SOME/IP).
+    ///
+    /// The SOME/IP-SD wire format encodes TTL as `u32` whole seconds;
+    /// sub-second precision in the supplied `Duration` is truncated
+    /// (rounded down). Durations exceeding `u32::MAX` seconds (~136
+    /// years) saturate to `u32::MAX`. The reserved special value
+    /// `0xFFFFFF` ("until next reboot") can be requested by passing
+    /// `Duration::from_secs(0xFFFFFF)`.
+    #[must_use]
+    pub fn with_ttl(mut self, ttl: core::time::Duration) -> Self {
+        self.ttl = u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX);
+        self
+    }
+
+    /// Append an event-group ID to the registered set. Subscriptions
+    /// for groups not in this set are NACK'd; an empty set (the
+    /// default after [`Self::new`]) accepts any group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if more than [`Self::EVENT_GROUP_IDS_CAP`] groups have
+    /// been registered. Use [`Self::try_with_event_group`] for the
+    /// fallible variant.
+    #[must_use]
+    pub fn with_event_group(mut self, event_group_id: u16) -> Self {
+        self.event_group_ids
+            .push(event_group_id)
+            .expect("event_group_ids capacity exceeded");
+        self
+    }
+
+    /// Fallible counterpart to [`Self::with_event_group`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the unmodified config (in `Err`) if registering would
+    /// exceed [`Self::EVENT_GROUP_IDS_CAP`].
+    #[must_use = "the returned `Result` carries the (possibly-modified) config — drop is silent"]
+    pub fn try_with_event_group(mut self, event_group_id: u16) -> Result<Self, Self> {
+        if self.event_group_ids.push(event_group_id).is_ok() {
+            Ok(self)
+        } else {
+            Err(self)
+        }
+    }
+
+    /// Set whether the run-future drives the SD `OfferService`
+    /// announcement loop. Defaults to `true` from [`Self::new`].
+    ///
+    /// Pass `false` for the dispatcher topology where a co-located
+    /// `Client` drives SD via its own `sd_announcements_loop` and the
+    /// server should stay silent on the SD socket. Passive servers
+    /// (constructed via `Server::new_passive*`) ignore this setting —
+    /// they never announce regardless.
+    #[must_use]
+    pub fn with_announce(mut self, announce: bool) -> Self {
+        self.announce = announce;
+        self
     }
 }
 
@@ -108,12 +261,12 @@ impl ServerConfig {
 ///
 /// All four fields are public so callers can construct the struct
 /// inline.
-pub struct ServerDeps<F, Tm, R, S>
+pub struct ServerDeps<F, Tm, R, Sub>
 where
     F: TransportFactory,
     Tm: Timer,
     R: E2ERegistryHandle,
-    S: SubscriptionHandle,
+    Sub: SubscriptionHandle,
 {
     /// Transport factory used to bind the unicast and SD sockets.
     pub factory: F,
@@ -125,7 +278,153 @@ where
     /// `Server::new` (under `server-tokio`) builds an
     /// `Arc<RwLock<SubscriptionManager>>` for this; bare-metal callers
     /// supply their own [`SubscriptionHandle`] impl.
-    pub subscriptions: S,
+    pub subscriptions: Sub,
+}
+
+/// Tokio-defaulted constructor.
+///
+/// Available under the `server-tokio` feature. Returns a `ServerDeps`
+/// pre-populated with `TokioTransport` / `TokioTimer` and a fresh
+/// `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>`.
+/// Combine with the [`ServerDeps::with_factory`] /
+/// [`ServerDeps::with_timer`] / [`ServerDeps::with_e2e_registry`] /
+/// [`ServerDeps::with_subscriptions`] builders to override individual
+/// fields without spelling out the rest by hand.
+///
+/// ```no_run
+/// # #[cfg(feature = "server-tokio")]
+/// # async fn demo() -> Result<(), simple_someip::server::Error> {
+/// use simple_someip::{Server, ServerDeps};
+/// use simple_someip::server::ServerConfig;
+/// use std::net::Ipv4Addr;
+/// let deps = ServerDeps::tokio();
+/// let config = ServerConfig::new(0x1234, 1).with_interface(Ipv4Addr::LOCALHOST).with_local_port(0);
+/// // The binding-site type fixes Server's `H`/`Hsd`/`Hep` to their
+/// // `Arc<…>` defaults so type inference doesn't have to chase them.
+/// let (_server, _handles, _run): (Server<_, _, _, _>, _, _) =
+///     Server::new_with_deps(deps, config, false).await?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "server-tokio")]
+impl
+    ServerDeps<
+        crate::tokio_transport::TokioTransport,
+        crate::tokio_transport::TokioTimer,
+        Arc<Mutex<E2ERegistry>>,
+        Arc<RwLock<SubscriptionManager>>,
+    >
+{
+    /// Build a `ServerDeps` with the tokio defaults.
+    #[must_use]
+    pub fn tokio() -> Self {
+        Self {
+            factory: crate::tokio_transport::TokioTransport,
+            timer: crate::tokio_transport::TokioTimer,
+            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
+        }
+    }
+}
+
+/// Field-by-field fluent builder. Each `with_*` returns a new
+/// `ServerDeps` with that single field replaced (and its corresponding
+/// generic parameter updated). Lets callers start from
+/// [`ServerDeps::tokio`] and override individual fields without
+/// spelling out the full struct literal.
+impl<F, Tm, R, Sub> ServerDeps<F, Tm, R, Sub>
+where
+    F: TransportFactory,
+    Tm: Timer,
+    R: E2ERegistryHandle,
+    Sub: SubscriptionHandle,
+{
+    /// Replace the `factory` field, returning a `ServerDeps` over the
+    /// new factory type.
+    pub fn with_factory<F2: TransportFactory>(self, factory: F2) -> ServerDeps<F2, Tm, R, Sub> {
+        ServerDeps {
+            factory,
+            timer: self.timer,
+            e2e_registry: self.e2e_registry,
+            subscriptions: self.subscriptions,
+        }
+    }
+
+    /// Replace the `timer` field, returning a `ServerDeps` over the new
+    /// timer type.
+    pub fn with_timer<Tm2: Timer>(self, timer: Tm2) -> ServerDeps<F, Tm2, R, Sub> {
+        ServerDeps {
+            factory: self.factory,
+            timer,
+            e2e_registry: self.e2e_registry,
+            subscriptions: self.subscriptions,
+        }
+    }
+
+    /// Replace the `e2e_registry` field, returning a `ServerDeps` over
+    /// the new registry-handle type.
+    pub fn with_e2e_registry<R2: E2ERegistryHandle>(
+        self,
+        e2e_registry: R2,
+    ) -> ServerDeps<F, Tm, R2, Sub> {
+        ServerDeps {
+            factory: self.factory,
+            timer: self.timer,
+            e2e_registry,
+            subscriptions: self.subscriptions,
+        }
+    }
+
+    /// Replace the `subscriptions` field, returning a `ServerDeps` over
+    /// the new subscription-handle type.
+    pub fn with_subscriptions<Sub2: SubscriptionHandle>(
+        self,
+        subscriptions: Sub2,
+    ) -> ServerDeps<F, Tm, R, Sub2> {
+        ServerDeps {
+            factory: self.factory,
+            timer: self.timer,
+            e2e_registry: self.e2e_registry,
+            subscriptions,
+        }
+    }
+}
+
+/// Post-construction accessor bundle returned from `Server::new` (and
+/// the other constructor variants) alongside the [`Server`] handle and
+/// the combined run-future.
+///
+/// Mirrors `crate::ClientUpdates`'s role on the [`Client`](crate::Client)
+/// side: a place to hang things the caller will reach for once
+/// construction completes (today: just the
+/// [`EventPublisher`](crate::server::EventPublisher) handle; future
+/// fields are reserved for forward-compat). Existing
+/// `Server::publisher()` accessor is unchanged — the field on this
+/// struct is the more discoverable path now that `Server::new` returns
+/// it up front.
+///
+/// The single field is public so callers can destructure inline:
+/// ```no_run
+/// # #[cfg(feature = "server-tokio")]
+/// # async fn demo() -> Result<(), simple_someip::server::Error> {
+/// use simple_someip::Server;
+/// use simple_someip::server::ServerConfig;
+/// use std::net::Ipv4Addr;
+/// let config = ServerConfig::new(0x1234, 1)
+///     .with_interface(Ipv4Addr::LOCALHOST)
+///     .with_local_port(0);
+/// let (_server, handles, run) = Server::new(config).await?;
+/// let _publisher = handles.publisher;
+/// tokio::spawn(run);
+/// # Ok(())
+/// # }
+/// ```
+pub struct ServerHandles<Hep> {
+    /// `EventPublisher` handle for emitting events from the server side
+    /// (clone of the field on [`Server`]; included here so the common
+    /// destructuring pattern doesn't have to call `.publisher()`
+    /// separately).
+    pub publisher: Hep,
 }
 
 /// Bundle of pre-built dependencies + storage handles for
@@ -146,15 +445,15 @@ where
 ///
 /// All eight fields are public so the struct can be assembled
 /// inline.
-pub struct ServerHandles<F, Tm, R, S, H, Hsd, Hep>
+pub struct ServerStorage<F, Tm, R, Sub, H, Hsd, Hep>
 where
     F: TransportFactory + 'static,
     Tm: Timer,
     R: E2ERegistryHandle,
-    S: SubscriptionHandle,
+    Sub: SubscriptionHandle,
     H: SharedHandle<F::Socket>,
     Hsd: SharedHandle<SdStateManager>,
-    Hep: SharedHandle<EventPublisher<R, S, H, F::Socket>>,
+    Hep: SharedHandle<EventPublisher<R, Sub, H, F::Socket>>,
 {
     /// Transport factory. Retained on the `Server` for any
     /// post-construction state the backend needs to keep alive
@@ -167,7 +466,7 @@ where
     /// Shared E2E registry handle for runtime E2E configuration.
     pub e2e_registry: R,
     /// Shared subscription manager handle.
-    pub subscriptions: S,
+    pub subscriptions: Sub,
     /// Pre-built unicast socket handle. Caller has already bound
     /// the underlying socket to the desired interface + port.
     pub unicast_socket: H,
@@ -190,34 +489,38 @@ where
 ///
 /// Generic over the four pluggable infrastructure types bundled in
 /// [`ServerDeps`]:
-/// - `R: E2ERegistryHandle` — runtime E2E configuration registry
-/// - `S: SubscriptionHandle` — event-group subscription state
 /// - `F: TransportFactory` — socket primitive (carried as a stored
 ///   unit-struct in the tokio path; bare-metal impls may carry state)
 /// - `Tm: Timer` — async sleep used by the announcement loop
+/// - `R: E2ERegistryHandle` — runtime E2E configuration registry
+/// - `Sub: SubscriptionHandle` — event-group subscription state
+///
+/// The generic order mirrors [`ServerDeps`] (and, for the shared
+/// infrastructure parameters `F`, `Tm`, `R`, the order is also shared
+/// with [`crate::ClientDeps`]).
 ///
 /// The convenience constructors `Self::new` / `Self::new_with_loopback`
 /// / `Self::new_passive` (under the `server-tokio` feature) instantiate
-/// these as `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>`
-/// / `TokioTransport` / `TokioTimer`. Bare-metal callers use
+/// these as `TokioTransport` / `TokioTimer` / `Arc<Mutex<E2ERegistry>>`
+/// / `Arc<RwLock<SubscriptionManager>>`. Bare-metal callers use
 /// [`Self::new_with_deps`] (under `server`) and supply their own.
 pub struct Server<
-    R,
-    S,
     F,
     Tm,
+    R,
+    Sub,
     H = Arc<<F as TransportFactory>::Socket>,
     Hsd = Arc<SdStateManager>,
-    Hep = Arc<EventPublisher<R, S, H, <F as TransportFactory>::Socket>>,
+    Hep = Arc<EventPublisher<R, Sub, H, <F as TransportFactory>::Socket>>,
 > where
-    R: E2ERegistryHandle,
-    S: SubscriptionHandle,
     F: TransportFactory + 'static,
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
+    R: E2ERegistryHandle,
+    Sub: SubscriptionHandle,
     H: SharedHandle<F::Socket>,
     Hsd: SharedHandle<SdStateManager>,
-    Hep: SharedHandle<EventPublisher<R, S, H, F::Socket>>,
+    Hep: SharedHandle<EventPublisher<R, Sub, H, F::Socket>>,
 {
     config: ServerConfig,
     /// Socket for receiving subscription requests, behind whatever
@@ -228,10 +531,10 @@ pub struct Server<
     /// `unicast_socket`; both are produced by the same factory).
     sd_socket: H,
     /// Subscription manager
-    subscriptions: S,
+    subscriptions: Sub,
     /// Event publisher, behind whatever shared-storage `Hep` chose
-    /// (`Arc<EventPublisher<R, S, H>>` on std,
-    /// `&'static EventPublisher<R, S, H>` on bare-metal-no-alloc).
+    /// (`Arc<EventPublisher<R, Sub, H>>` on std,
+    /// `&'static EventPublisher<R, Sub, H>` on bare-metal-no-alloc).
     publisher: Hep,
     /// SD session-ID counter and announcement emitter, behind whatever
     /// shared-storage `Hsd` chose (`Arc<SdStateManager>` on std,
@@ -251,33 +554,84 @@ pub struct Server<
     timer: Tm,
     /// `true` if this server was constructed via `Server::new_passive`.
     /// Passive servers have no real SD socket bound to port 30490; their
-    /// SD handling is managed externally. Calling [`Self::announcement_loop`]
-    /// or [`Self::run`] on a passive server is a programming error and
-    /// returns an [`Error::Io`] with [`std::io::ErrorKind::InvalidInput`].
+    /// SD handling is managed externally. Calling [`Self::run`] on a
+    /// passive server is a programming error and returns
+    /// [`Error::InvalidUsage`].
     is_passive: bool,
-    /// Set the first time [`Self::announcement_loop`] is called. A
-    /// second call returns `Err(Error::Io(InvalidInput))` so two
-    /// independent futures cannot race on the same SD socket and
-    /// session counter.
-    announcement_loop_started: AtomicBool,
+    /// Latch flipped on the first poll of any run-future built from
+    /// this `Server`. Subsequent run-futures (whether from the
+    /// constructor's tuple, [`Self::run`], or [`Self::run_with_buffers`])
+    /// short-circuit with `Err(Error::InvalidUsage("server_already_running"))`
+    /// rather than racing on the same SD/unicast sockets and session
+    /// counter. `Arc<AtomicBool>` because the run-future captures a
+    /// clone independent of `&self`'s lifetime.
+    started: Arc<AtomicBool>,
 }
+
+/// `Hep` resolved against the `server-tokio` convenience constructors'
+/// concrete defaults — the `EventPublisher` shape with all four
+/// publisher type parameters bound to their tokio impls. Lets the
+/// tokio constructors' `(Self, ServerHandles<…>, run-future)` return
+/// type spell out cleanly rather than dragging the four-deep `Arc<…>`
+/// chain through every signature.
+#[cfg(feature = "server-tokio")]
+type DefaultTokioServerHep = Arc<
+    EventPublisher<
+        Arc<Mutex<E2ERegistry>>,
+        Arc<RwLock<SubscriptionManager>>,
+        Arc<crate::tokio_transport::TokioSocket>,
+        crate::tokio_transport::TokioSocket,
+    >,
+>;
 
 #[cfg(feature = "server-tokio")]
 impl
     Server<
-        Arc<Mutex<E2ERegistry>>,
-        Arc<RwLock<SubscriptionManager>>,
         crate::tokio_transport::TokioTransport,
         crate::tokio_transport::TokioTimer,
+        Arc<Mutex<E2ERegistry>>,
+        Arc<RwLock<SubscriptionManager>>,
     >
 {
-    /// Create a new SOME/IP server
+    /// Create a new SOME/IP server.
+    ///
+    /// Returns the `Server` handle for runtime mutation
+    /// (`register_e2e`, `publisher`, etc.), a [`ServerHandles`] bundle
+    /// destructuring the [`EventPublisher`] up front, and a single
+    /// combined run-future the caller spawns to drive both the
+    /// receive loop and (unless suppressed via
+    /// [`ServerConfig::with_announce`]) the SD announcement loop.
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "server-tokio")]
+    /// # async fn demo() -> Result<(), simple_someip::server::Error> {
+    /// use simple_someip::Server;
+    /// use simple_someip::server::ServerConfig;
+    /// use std::net::Ipv4Addr;
+    /// let config = ServerConfig::new(0x1234, 1)
+    ///     .with_interface(Ipv4Addr::LOCALHOST)
+    ///     .with_local_port(0);
+    /// let (_server, handles, run) = Server::new(config).await?;
+    /// let _publisher = handles.publisher;
+    /// tokio::spawn(run);
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
     /// Returns an error if binding the unicast or SD socket fails, or if joining the
     /// SD multicast group fails.
-    pub async fn new(config: ServerConfig) -> Result<Self, Error> {
+    pub async fn new(
+        config: ServerConfig,
+    ) -> Result<
+        (
+            Self,
+            ServerHandles<DefaultTokioServerHep>,
+            impl core::future::Future<Output = Result<(), Error>> + 'static,
+        ),
+        Error,
+    > {
         Self::new_with_loopback(config, false).await
     }
 
@@ -308,7 +662,14 @@ impl
     pub async fn new_with_loopback(
         config: ServerConfig,
         multicast_loopback: bool,
-    ) -> Result<Self, Error> {
+    ) -> Result<
+        (
+            Self,
+            ServerHandles<DefaultTokioServerHep>,
+            impl core::future::Future<Output = Result<(), Error>> + 'static,
+        ),
+        Error,
+    > {
         let deps = ServerDeps {
             factory: crate::tokio_transport::TokioTransport,
             timer: crate::tokio_transport::TokioTimer,
@@ -339,7 +700,16 @@ impl
     /// # Errors
     ///
     /// Returns an error if binding either socket fails.
-    pub async fn new_passive(config: ServerConfig) -> Result<Self, Error> {
+    pub async fn new_passive(
+        config: ServerConfig,
+    ) -> Result<
+        (
+            Self,
+            ServerHandles<DefaultTokioServerHep>,
+            impl core::future::Future<Output = Result<(), Error>> + 'static,
+        ),
+        Error,
+    > {
         let deps = ServerDeps {
             factory: crate::tokio_transport::TokioTransport,
             timer: crate::tokio_transport::TokioTimer,
@@ -350,16 +720,16 @@ impl
     }
 }
 
-impl<R, S, F, Tm, H, Hsd, Hep> Server<R, S, F, Tm, H, Hsd, Hep>
+impl<F, Tm, R, Sub, H, Hsd, Hep> Server<F, Tm, R, Sub, H, Hsd, Hep>
 where
-    R: E2ERegistryHandle,
-    S: SubscriptionHandle,
     F: TransportFactory + 'static,
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
+    R: E2ERegistryHandle,
+    Sub: SubscriptionHandle,
     H: WrappableSharedHandle<F::Socket>,
     Hsd: WrappableSharedHandle<SdStateManager>,
-    Hep: WrappableSharedHandle<EventPublisher<R, S, H, F::Socket>>,
+    Hep: WrappableSharedHandle<EventPublisher<R, Sub, H, F::Socket>>,
 {
     /// Bare-metal-friendly constructor that takes every dependency
     /// explicitly via a [`ServerDeps`] bundle. The `server-tokio`
@@ -381,10 +751,17 @@ where
     /// [`TransportFactory::bind`] fails, or if joining the SD multicast
     /// group fails.
     pub async fn new_with_deps(
-        deps: ServerDeps<F, Tm, R, S>,
+        deps: ServerDeps<F, Tm, R, Sub>,
         mut config: ServerConfig,
         multicast_loopback: bool,
-    ) -> Result<Self, Error> {
+    ) -> Result<
+        (
+            Self,
+            ServerHandles<Hep>,
+            impl core::future::Future<Output = Result<(), Error>> + 'static,
+        ),
+        Error,
+    > {
         let ServerDeps {
             factory,
             timer,
@@ -404,7 +781,7 @@ where
         // ephemeral port. Back-fill the config so SD offers and event
         // publishers advertise the actual bound port instead of 0.
         config.local_port = bound_port;
-        tracing::info!(
+        crate::log::info!(
             "Server bound to {}:{} for service 0x{:04X}",
             config.interface,
             bound_port,
@@ -421,7 +798,7 @@ where
         let sd_raw = factory.bind(sd_addr, &sd_opts).await?;
         sd_raw.join_multicast_v4(sd::MULTICAST_IP, config.interface)?;
         let sd_socket: H = H::wrap(sd_raw);
-        tracing::info!(
+        crate::log::info!(
             "Server SD socket bound to {} (expected port {}), joined multicast {}",
             sd_addr,
             sd::MULTICAST_PORT,
@@ -434,7 +811,7 @@ where
             e2e_registry.clone(),
         ));
 
-        Ok(Self {
+        let server = Self {
             config,
             unicast_socket,
             sd_socket,
@@ -445,8 +822,13 @@ where
             factory,
             timer,
             is_passive: false,
-            announcement_loop_started: AtomicBool::new(false),
-        })
+            started: Arc::new(AtomicBool::new(false)),
+        };
+        let handles = ServerHandles {
+            publisher: server.publisher(),
+        };
+        let run = server.run_inner();
+        Ok((server, handles, run))
     }
 
     /// Bare-metal-friendly passive-server constructor.
@@ -461,9 +843,16 @@ where
     ///
     /// Returns an error if binding either socket fails.
     pub async fn new_passive_with_deps(
-        deps: ServerDeps<F, Tm, R, S>,
+        deps: ServerDeps<F, Tm, R, Sub>,
         mut config: ServerConfig,
-    ) -> Result<Self, Error> {
+    ) -> Result<
+        (
+            Self,
+            ServerHandles<Hep>,
+            impl core::future::Future<Output = Result<(), Error>> + 'static,
+        ),
+        Error,
+    > {
         let ServerDeps {
             factory,
             timer,
@@ -478,7 +867,7 @@ where
         let unicast_socket: H = H::wrap(unicast_raw);
         // Back-fill the actual bound port if the caller passed 0.
         config.local_port = bound_port;
-        tracing::info!(
+        crate::log::info!(
             "Passive server bound to {}:{} for service 0x{:04X}",
             config.interface,
             bound_port,
@@ -493,7 +882,7 @@ where
                 .bind(sd_placeholder_addr, &SocketOptions::new())
                 .await?,
         );
-        tracing::info!(
+        crate::log::info!(
             "Passive server SD placeholder socket bound near {} (not in SD reuseport group)",
             sd_placeholder_addr
         );
@@ -504,7 +893,7 @@ where
             e2e_registry.clone(),
         ));
 
-        Ok(Self {
+        let server = Self {
             config,
             unicast_socket,
             sd_socket,
@@ -515,21 +904,26 @@ where
             factory,
             timer,
             is_passive: true,
-            announcement_loop_started: AtomicBool::new(false),
-        })
+            started: Arc::new(AtomicBool::new(false)),
+        };
+        let handles = ServerHandles {
+            publisher: server.publisher(),
+        };
+        let run = server.run_inner();
+        Ok((server, handles, run))
     }
 }
 
-impl<R, S, F, Tm, H, Hsd, Hep> Server<R, S, F, Tm, H, Hsd, Hep>
+impl<F, Tm, R, Sub, H, Hsd, Hep> Server<F, Tm, R, Sub, H, Hsd, Hep>
 where
-    R: E2ERegistryHandle,
-    S: SubscriptionHandle,
     F: TransportFactory + 'static,
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
+    R: E2ERegistryHandle,
+    Sub: SubscriptionHandle,
     H: SharedHandle<F::Socket>,
     Hsd: SharedHandle<SdStateManager>,
-    Hep: SharedHandle<EventPublisher<R, S, H, F::Socket>>,
+    Hep: SharedHandle<EventPublisher<R, Sub, H, F::Socket>>,
 {
     /// Construct a `Server` from pre-built dependencies + storage
     /// handles. The bare-metal-no-alloc counterpart to
@@ -560,14 +954,14 @@ where
     /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
     /// and does not equal the unicast socket's bound port.
     pub fn new_with_handles(
-        deps: ServerHandles<F, Tm, R, S, H, Hsd, Hep>,
+        deps: ServerStorage<F, Tm, R, Sub, H, Hsd, Hep>,
         mut config: ServerConfig,
     ) -> Result<Self, Error> {
         let bound_port = deps.unicast_socket.get().local_addr()?.port();
         if config.local_port == 0 {
             config.local_port = bound_port;
         } else if config.local_port != bound_port {
-            tracing::error!(
+            crate::log::error!(
                 "ServerConfig.local_port ({}) does not match unicast socket's \
                  bound port ({}); SD offers would lie. Pass local_port = 0 to \
                  auto-fill from the bound port instead.",
@@ -576,7 +970,7 @@ where
             );
             return Err(Error::InvalidUsage("new_with_handles_local_port_mismatch"));
         }
-        tracing::info!(
+        crate::log::info!(
             "Server (handles) bound to {}:{} for service 0x{:04X}",
             config.interface,
             bound_port,
@@ -594,7 +988,7 @@ where
             factory: deps.factory,
             timer: deps.timer,
             is_passive: false,
-            announcement_loop_started: AtomicBool::new(false),
+            started: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -623,14 +1017,14 @@ where
     /// back-fill-only-on-zero discipline as
     /// [`Self::new_with_handles`]).
     pub fn new_passive_with_handles(
-        deps: ServerHandles<F, Tm, R, S, H, Hsd, Hep>,
+        deps: ServerStorage<F, Tm, R, Sub, H, Hsd, Hep>,
         mut config: ServerConfig,
     ) -> Result<Self, Error> {
         let bound_port = deps.unicast_socket.get().local_addr()?.port();
         if config.local_port == 0 {
             config.local_port = bound_port;
         } else if config.local_port != bound_port {
-            tracing::error!(
+            crate::log::error!(
                 "ServerConfig.local_port ({}) does not match unicast socket's \
                  bound port ({}); event publishers would advertise a port \
                  nothing is listening on. Pass local_port = 0 to auto-fill.",
@@ -641,7 +1035,7 @@ where
                 "new_passive_with_handles_local_port_mismatch",
             ));
         }
-        tracing::info!(
+        crate::log::info!(
             "Passive server (handles) bound to {}:{} for service 0x{:04X}",
             config.interface,
             bound_port,
@@ -659,254 +1053,17 @@ where
             factory: deps.factory,
             timer: deps.timer,
             is_passive: true,
-            announcement_loop_started: AtomicBool::new(false),
+            started: Arc::new(AtomicBool::new(false)),
         })
-    }
-
-    /// Build the periodic-SD-announcement future.
-    ///
-    /// Returns a future that sends an `OfferService` message to the SD
-    /// multicast group every second. The caller must drive the future
-    /// (typically via `tokio::spawn`) for announcements to fire; this
-    /// function does no work on its own.
-    ///
-    /// ```no_run
-    /// # #[cfg(feature = "server-tokio")] {
-    /// # use simple_someip::server::{Server, ServerConfig};
-    /// # use std::net::Ipv4Addr;
-    /// # async fn demo() -> Result<(), simple_someip::server::Error> {
-    /// # let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30490, 0, 0);
-    /// # let server = Server::new(config).await?;
-    /// let announce_fut = server.announcement_loop()?;
-    /// tokio::spawn(announce_fut);
-    /// # Ok(())
-    /// # }
-    /// # }
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidUsage`] (with the tag
-    /// `"passive_server_announcement_loop"` or
-    /// `"announcement_loop_already_started"`) if:
-    /// - called on a server constructed via `Server::new_passive` — passive
-    ///   servers have no real SD socket bound to port 30490, so any
-    ///   announcements would go out with an incorrect source port; or
-    /// - called twice on the same server. Two announcement futures
-    ///   driving the same SD socket and session counter would double the
-    ///   announcement rate and race on the wrap-flag latch. Drop the
-    ///   first future to disable announcements before requesting a new
-    ///   one (which currently still requires a fresh `Server`).
-    #[must_use = "the returned announcement-loop future must be spawned (e.g. tokio::spawn) or awaited for the server to emit SD announcements; dropping it silently disables announcements"]
-    pub fn announcement_loop(
-        &self,
-    ) -> Result<impl core::future::Future<Output = ()> + Send + 'static, Error>
-    where
-        F: Send + Sync,
-        F::Socket: Send + Sync,
-        for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
-        H: Send + Sync,
-        Hsd: Send + Sync,
-        Tm: Send + Sync,
-        for<'a> Tm::SleepFuture<'a>: Send,
-    {
-        if self.is_passive {
-            tracing::warn!(
-                "announcement_loop called on passive Server for service 0x{:04X}; \
-                 announcements must be driven externally (e.g. via \
-                 `simple_someip::Client::sd_announcements_loop`)",
-                self.config.service_id
-            );
-            return Err(Error::InvalidUsage("passive_server_announcement_loop"));
-        }
-        if self
-            .announcement_loop_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            tracing::warn!(
-                "announcement_loop already started for service 0x{:04X}; \
-                 two announcement futures cannot share the same SD socket \
-                 and session counter",
-                self.config.service_id
-            );
-            return Err(Error::InvalidUsage("announcement_loop_already_started"));
-        }
-        let config = self.config.clone();
-        let sd_socket = self.sd_socket.clone();
-        let sd_state = self.sd_state.clone();
-        let timer = self.timer.clone();
-
-        Ok(async move {
-            let mut announcement_count = 0u32;
-            loop {
-                match sd_state
-                    .get()
-                    .send_offer_service(&config, sd_socket.get())
-                    .await
-                {
-                    Ok(()) => {
-                        announcement_count += 1;
-                        if announcement_count == 1 {
-                            tracing::info!(
-                                "Sent first SD announcement for service 0x{:04X}",
-                                config.service_id
-                            );
-                        } else {
-                            tracing::debug!(
-                                "Sent {} SD announcements for service 0x{:04X}",
-                                announcement_count,
-                                config.service_id
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to send OfferService: {:?}", e);
-                    }
-                }
-
-                // Send announcements every 1 second. Sleep goes through
-                // the `Timer` trait so bare-metal consumers can swap in
-                // a different timer impl; today it resolves to
-                // `TokioTimer` under the `server-tokio` feature.
-                timer.sleep(core::time::Duration::from_secs(1)).await;
-            }
-        })
-    }
-
-    /// `!Send` counterpart to [`Self::announcement_loop`].
-    ///
-    /// Returns the same announcement-loop future without the `+ Send`
-    /// bound on the return type, so it can be driven by single-threaded
-    /// executors (`tokio::task::LocalSet`, embassy with `task-arena = 0`,
-    /// etc.) over a `!Sync` transport such as `embassy-net`. Use this on
-    /// bare-metal targets where `H::Socket` is `!Sync`; use the
-    /// Send-bounded `announcement_loop` on multi-threaded targets.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::announcement_loop`].
-    #[must_use = "the returned announcement-loop future must be driven (e.g. tokio::task::spawn_local) for the server to emit SD announcements; dropping it silently disables announcements"]
-    pub fn announcement_loop_local(
-        &self,
-    ) -> Result<impl core::future::Future<Output = ()> + 'static, Error> {
-        if self.is_passive {
-            tracing::warn!(
-                "announcement_loop_local called on passive Server for service 0x{:04X}; \
-                 announcements must be driven externally (e.g. via \
-                 `simple_someip::Client::sd_announcements_loop`)",
-                self.config.service_id
-            );
-            return Err(Error::InvalidUsage("passive_server_announcement_loop"));
-        }
-        if self
-            .announcement_loop_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            tracing::warn!(
-                "announcement_loop already started for service 0x{:04X}; \
-                 two announcement futures cannot share the same SD socket \
-                 and session counter",
-                self.config.service_id
-            );
-            return Err(Error::InvalidUsage("announcement_loop_already_started"));
-        }
-        let config = self.config.clone();
-        let sd_socket = self.sd_socket.clone();
-        let sd_state = self.sd_state.clone();
-        let timer = self.timer.clone();
-
-        Ok(async move {
-            let mut announcement_count = 0u32;
-            loop {
-                match sd_state
-                    .get()
-                    .send_offer_service(&config, sd_socket.get())
-                    .await
-                {
-                    Ok(()) => {
-                        announcement_count += 1;
-                        if announcement_count == 1 {
-                            tracing::info!(
-                                "Sent first SD announcement for service 0x{:04X}",
-                                config.service_id
-                            );
-                        } else {
-                            tracing::debug!(
-                                "Sent {} SD announcements for service 0x{:04X}",
-                                announcement_count,
-                                config.service_id
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to send OfferService: {:?}", e);
-                    }
-                }
-                timer.sleep(core::time::Duration::from_secs(1)).await;
-            }
-        })
-    }
-
-    /// Send a unicast `OfferService` to a specific address (in response to `FindService`)
-    async fn send_unicast_offer(&self, target: core::net::SocketAddr) -> Result<(), Error> {
-        use crate::protocol::Header as SomeIpHeader;
-        use crate::traits::WireFormat;
-
-        let entry = Entry::OfferService(ServiceEntry {
-            index_first_options_run: 0,
-            index_second_options_run: 0,
-            options_count: OptionsCount::new(1, 0),
-            service_id: self.config.service_id,
-            instance_id: self.config.instance_id,
-            major_version: self.config.major_version,
-            ttl: self.config.ttl,
-            minor_version: self.config.minor_version,
-        });
-
-        let option = sd::Options::IpV4Endpoint {
-            ip: self.config.interface,
-            port: self.config.local_port,
-            protocol: TransportProtocol::Udp,
-        };
-
-        let entries = [entry];
-        let options = [option];
-        // Atomic (sid, reboot_flag) pair so concurrent emissions cannot
-        // race around the wrap boundary — see
-        // `SdStateManager::next_session_id_with_reboot_flag` docs.
-        let (sid, reboot_flag) = self.sd_state.get().next_session_id_with_reboot_flag();
-        let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &options);
-
-        let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
-        let sd_data_len = sd_payload.encode_to_slice(&mut buffer[16..])?;
-        let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
-        someip_header.encode_to_slice(&mut buffer[..16])?;
-        let total_len = 16 + sd_data_len;
-
-        let target_v4 = socket_addr_v4(target)?;
-        self.sd_socket
-            .get()
-            .send_to(&buffer[..total_len], target_v4)
-            .await?;
-        tracing::debug!(
-            "Sent unicast OfferService to {} for service 0x{:04X}",
-            target,
-            self.config.service_id
-        );
-
-        Ok(())
     }
 
     /// Get a clone of the event-publisher handle for sending events.
     ///
     /// Returns the `Hep` type parameter — typically
-    /// `Arc<EventPublisher<R, S, H>>` for std users (the default
-    /// `Hep`), `&'static EventPublisher<R, S, H>` for
+    /// `Arc<EventPublisher<R, Sub, H, T>>` for std users (the default
+    /// `Hep`), `&'static EventPublisher<R, Sub, H, T>` for
     /// bare-metal-no-alloc. (`EventPublisherHandle` was a former
-    /// trait alias collapsed into [`crate::transport::SharedHandle`]
-    /// in phase 19f / 20e.)
+    /// trait alias collapsed into [`crate::transport::SharedHandle`].)
     #[must_use]
     pub fn publisher(&self) -> Hep {
         self.publisher.clone()
@@ -922,11 +1079,6 @@ where
             Ok(v4) => Ok(core::net::SocketAddr::V4(v4)),
             Err(e) => Err(Error::Transport(e)),
         }
-    }
-
-    /// Update the configured local port (useful after binding to ephemeral port 0).
-    pub fn set_local_port(&mut self, port: u16) {
-        self.config.local_port = port;
     }
 
     /// Register an E2E profile for the given key.
@@ -954,613 +1106,191 @@ where
 
     /// Run the server event loop with caller-provided receive buffers.
     ///
-    /// Handles incoming subscription requests and manages event groups.
-    /// Listens on both the unicast socket (for direct requests) and the
-    /// SD multicast socket (for `FindService` and `SubscribeEventGroup`).
+    /// Drives the receive loop (handling incoming `Subscribe` /
+    /// `FindService` SD messages on the SD multicast socket and
+    /// unicast traffic on the unicast socket) concurrently with the
+    /// 1-Hz `OfferService` announcement loop. The two are combined
+    /// into a single future so callers cannot forget to spawn the
+    /// announcement side; passing
+    /// [`ServerConfig::with_announce(false)`] suppresses the
+    /// announcement arm for dispatcher topologies where a co-located
+    /// `Client` drives SD on the server's behalf.
     ///
     /// `unicast_buf` and `sd_buf` are caller-supplied scratch buffers
     /// for incoming datagrams. Each must be at least one MTU
     /// (~1500 bytes) and ideally up to the IP datagram limit
-    /// (64 KiB - 1) — peer SD messages are bounded by the link MTU,
-    /// but a SOME/IP server should not silently cap at 1500 because
-    /// it is a sink for any peer datagram landing on its SD or
-    /// unicast port. The `ReceivedDatagram::truncated` flag
-    /// returned by [`crate::transport::TransportSocket::recv_from`]
-    /// is currently NOT inspected by this run loop: backends that
-    /// surface truncation will have it observable on the value, but
-    /// a follow-up pass is needed to emit the corresponding
-    /// `tracing::warn!`. Tracking issue: bare-metal plan v3 phase
-    /// 21+ backlog.
+    /// (64 KiB - 1). On bare-metal targets, callers typically place
+    /// these in `static` storage; on std (or any alloc-using
+    /// target), [`Self::run`] is the convenience shim that
+    /// heap-allocates 64 KiB buffers and delegates here.
     ///
-    /// On bare-metal, callers typically place the buffers in
-    /// `static` storage. `static mut` would require unsafe and is
-    /// a hard error in Rust 2024 when used through `&mut`; the
-    /// recommended pattern is a `static` cell wrapped in interior
-    /// mutability:
-    /// ```ignore
-    /// use core::cell::UnsafeCell;
-    /// // One owner per buffer: only the task driving
-    /// // `run_with_buffers` ever obtains a `&mut` from these cells,
-    /// // and the borrow lives only for the run-loop's lifetime.
-    /// struct Buf(UnsafeCell<[u8; 65535]>);
-    /// // SAFETY: hand-shaken — only the `Server::run_with_buffers`
-    /// // task touches the inner storage, so the `Sync` claim is
-    /// // sound for that single-owner discipline.
-    /// unsafe impl Sync for Buf {}
-    /// static UNICAST_BUF: Buf = Buf(UnsafeCell::new([0; 65535]));
-    /// static SD_BUF: Buf = Buf(UnsafeCell::new([0; 65535]));
-    /// // SAFETY: only one task drives `run_with_buffers` for a given Server.
-    /// let unicast = unsafe { &mut *UNICAST_BUF.0.get() };
-    /// let sd = unsafe { &mut *SD_BUF.0.get() };
-    /// server.run_with_buffers(unicast, sd).await?;
-    /// ```
-    ///
-    /// On std (or any alloc-using target), [`Self::run`] is the
-    /// convenience shim that heap-allocates 64 KiB buffers and
-    /// delegates here.
+    /// The returned future is independent of `&self` — the cheap
+    /// shared-handle clones it captures own everything it needs to
+    /// drive both loops, so the caller can keep using `Server` to
+    /// register E2E profiles, query `unicast_local_addr`, etc. while
+    /// the future runs.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidUsage`] (tag `"passive_server_run"`) if
-    /// called on a server constructed via `Server::new_passive` — passive
-    /// servers have no real SD socket to read from, so the run loop would
-    /// block forever on the ephemeral placeholder socket.
+    /// the server was constructed via `Server::new_passive*` — passive
+    /// servers have no real SD socket to read from, so the run loop
+    /// would block forever on the ephemeral placeholder socket.
     ///
-    /// Otherwise returns an error if receiving from a socket fails or
+    /// Otherwise resolves to `Err` if receiving from a socket fails or
     /// handling an SD message fails.
-    pub async fn run_with_buffers(
-        &mut self,
-        unicast_buf: &mut [u8],
-        sd_buf: &mut [u8],
-    ) -> Result<(), Error> {
-        use crate::protocol::MessageView;
+    pub fn run_with_buffers<'a>(
+        &self,
+        unicast_buf: &'a mut [u8],
+        sd_buf: &'a mut [u8],
+    ) -> impl core::future::Future<Output = Result<(), Error>>
+    + 'a
+    + use<'a, F, Tm, R, Sub, H, Hsd, Hep>
+    where
+        Tm: 'a,
+        Sub: 'a,
+        H: 'a,
+        Hsd: 'a,
+    {
+        let config = self.config.clone();
+        let unicast_socket = self.unicast_socket.clone();
+        let sd_socket = self.sd_socket.clone();
+        let subscriptions = self.subscriptions.clone();
+        let sd_state = self.sd_state.clone();
+        let timer = self.timer.clone();
+        let is_passive = self.is_passive;
+        let started = self.started.clone();
 
-        if self.is_passive {
-            tracing::warn!(
-                "run called on passive Server for service 0x{:04X}; \
-                 SD receive must be driven externally (e.g. via the \
-                 Client's discovery socket, routing Subscribes to \
-                 `EventPublisher::register_subscriber`)",
-                self.config.service_id
-            );
-            return Err(Error::InvalidUsage("passive_server_run"));
-        }
-
-        // Iteration counter used to flip `select_biased!` arm priority
-        // each turn. We can't use the pseudo-random `select!` (it needs
-        // `std`), so flipping arm order each iteration approximates the
-        // fairness it would give without pulling std — a sustained
-        // one-sided load (only-unicast or only-sd) cannot starve the
-        // other arm.
-        let mut prefer_sd_first = false;
-        loop {
-            // SAFETY: both arms call `TransportSocket::recv_from`. The
-            // `TokioSocket` backend is cancel-safe per tokio docs — a
-            // non-selected arm can be dropped without losing in-flight
-            // kernel state. Custom transport backends MUST provide the
-            // same guarantee. A future contributor adding a
-            // non-cancel-safe `FusedFuture` arm here would silently lose
-            // state when the arm is dropped on a select win. Both futures
-            // must therefore stay `Send + FusedFuture + Unpin` *and*
-            // cancel-safe.
-            //
-            // Fresh futures are constructed each iteration so the borrows
-            // of `unicast_buf` / `sd_buf` / the sockets end when the
-            // select macro returns, freeing the buffer we index into
-            // below.
-            // Each arm returns just `(datagram, from_unicast)`; the
-            // `(len, addr, source)` derivation lives once below the
-            // select so the arm-flip pattern doesn't duplicate it.
-            let (datagram, from_unicast) = {
-                // Reborrow `&mut *foo` rather than `&mut foo` because
-                // `unicast_buf` / `sd_buf` are `&mut [u8]` parameters
-                // here (caller-owned), not owned `Vec<u8>` locals —
-                // direct `&mut foo` would produce `&mut &mut [u8]`.
-                let unicast_fut = self
-                    .unicast_socket
-                    .get()
-                    .recv_from(&mut *unicast_buf)
-                    .fuse();
-                let sd_fut = self.sd_socket.get().recv_from(&mut *sd_buf).fuse();
-                pin_mut!(unicast_fut, sd_fut);
-                if prefer_sd_first {
-                    select_biased! {
-                        result = sd_fut => (result?, false),
-                        result = unicast_fut => (result?, true),
-                    }
-                } else {
-                    select_biased! {
-                        result = unicast_fut => (result?, true),
-                        result = sd_fut => (result?, false),
-                    }
-                }
-            };
-            prefer_sd_first = !prefer_sd_first;
-            let len = datagram.bytes_received;
-            let addr = core::net::SocketAddr::V4(datagram.source);
-            let source = if from_unicast {
-                "unicast"
-            } else {
-                "sd-multicast"
-            };
-            let data = if from_unicast {
-                &unicast_buf[..len]
-            } else {
-                &sd_buf[..len]
-            };
-
-            // By default IP_MULTICAST_LOOP=false suppresses own multicast
-            // messages on the SD socket, so no source-IP filtering is needed.
-            // When the server was constructed via `Server::new_with_loopback`
-            // with `multicast_loopback = true` (e.g. for same-host testing),
-            // the kernel delivers our own SD multicasts back to this loop.
-            // That is tolerated here: `handle_sd_message` only acts on
-            // `Subscribe` / `SubscribeAck` / `FindService` entries, so the
-            // `OfferService` entries we send ourselves are effectively
-            // ignored. A self-sent `FindService` for our own service ID
-            // would trigger a unicast `OfferService` reply back to
-            // ourselves, which is the same behavior an external peer's
-            // `FindService` would produce and is therefore safe.
-
-            tracing::trace!("Received {} bytes from {} on {} socket", len, addr, source);
-            tracing::trace!("Raw data: {:02X?}", &data[..len.min(64_usize)]);
-
-            // Try to parse as SOME/IP message using zero-copy view
-            match MessageView::parse(data) {
-                Ok(view) => {
-                    tracing::trace!(
-                        "SOME/IP Header: service=0x{:04X}, method=0x{:04X}, type={:?}",
-                        view.header().message_id().service_id(),
-                        view.header().message_id().method_id(),
-                        view.header().message_type().message_type()
-                    );
-
-                    // Check if this is a Service Discovery message (0xFFFF8100)
-                    if view.is_sd() {
-                        tracing::trace!("This is an SD message");
-                        // Parse SD payload
-                        match view.sd_header() {
-                            Ok(sd_view) => {
-                                tracing::trace!("SD message has {} entries", sd_view.entry_count(),);
-                                self.handle_sd_message(&sd_view, addr).await?;
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to parse SD message: {:?}", e);
-                            }
-                        }
-                    } else {
-                        tracing::trace!("Non-SD SOME/IP message, ignoring");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to parse SOME/IP header from {}: {:?}", addr, e);
-                    tracing::trace!("Data: {:02X?}", &data[..len.min(32)]);
-                }
+        async move {
+            // See `run_inner` for the rationale on the first-poll
+            // latch — same race, same fix.
+            if started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                crate::log::warn!(
+                    "Server::run_with_buffers already started for service 0x{:04X}; \
+                     a second run-future cannot share the same sockets \
+                     and session counter",
+                    config.service_id
+                );
+                return Err(Error::InvalidUsage("server_already_running"));
             }
+
+            runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm>(
+                config,
+                unicast_socket,
+                sd_socket,
+                subscriptions,
+                sd_state,
+                timer,
+                is_passive,
+                unicast_buf,
+                sd_buf,
+            )
+            .await
         }
     }
 
-    /// Run the server event loop with heap-allocated 64 KiB recv buffers.
+    /// Run the server event loop with heap-allocated 64 KiB receive
+    /// buffers — the convenience entry point for std and alloc-using
+    /// bare-metal builds. Drives both the receive loop and (unless
+    /// suppressed via [`ServerConfig::with_announce`]) the
+    /// announcement loop in a single future.
     ///
-    /// Convenience wrapper over [`Self::run_with_buffers`] for callers
-    /// who have an allocator available — this is the simplest entry
-    /// point for std and bare-metal-with-alloc consumers. Bare-metal
-    /// callers without an allocator must use
-    /// [`Self::run_with_buffers`] directly with caller-supplied
-    /// buffers (e.g. `static`-declared `[u8; N]` arrays).
+    /// The returned future is `Send + 'static` under the where-clause
+    /// bounds spelled below, so it is suitable for `tokio::spawn`.
+    /// Single-threaded executors that need a `!Send` future (e.g.
+    /// `tokio::task::spawn_local` over a `!Sync` transport) should
+    /// call [`Self::run_with_buffers`] directly, which has no `Send`
+    /// requirement.
     ///
-    /// The 64 KiB sizing matches the IP datagram limit so the server
-    /// surfaces (or cleanly truncates at the OS level) any peer
-    /// datagram that exceeds the link MTU. See
-    /// [`Self::run_with_buffers`] for the full sizing rationale.
+    /// Bare-metal callers without an allocator must use
+    /// [`Self::run_with_buffers`] with caller-supplied buffers
+    /// (e.g. `static`-declared `[u8; N]` arrays).
     ///
     /// # Errors
     ///
     /// Same as [`Self::run_with_buffers`].
-    pub async fn run(&mut self) -> Result<(), Error> {
-        let mut unicast_buf = alloc::vec![0u8; 65535];
-        let mut sd_buf = alloc::vec![0u8; 65535];
-        self.run_with_buffers(&mut unicast_buf, &mut sd_buf).await
-    }
-
-    /// Handle a Service Discovery message
-    #[allow(clippy::too_many_lines)]
-    async fn handle_sd_message(
-        &mut self,
-        sd_view: &sd::SdHeaderView<'_>,
-        sender: core::net::SocketAddr,
-    ) -> Result<(), Error> {
-        tracing::trace!("Handling SD message from {}", sender);
-
-        for entry_view in sd_view.entries() {
-            let entry_type = entry_view.entry_type()?;
-            match entry_type {
-                sd::EntryType::Subscribe => {
-                    tracing::debug!(
-                        "Received Subscribe from {}: service=0x{:04X}, instance={}, eventgroup=0x{:04X}",
-                        sender,
-                        entry_view.service_id(),
-                        entry_view.instance_id(),
-                        entry_view.event_group_id()
-                    );
-
-                    // Check if this is for our service.
-                    if entry_view.service_id() != self.config.service_id {
-                        tracing::warn!(
-                            "Subscribe for wrong service: expected 0x{:04X}, got 0x{:04X}",
-                            self.config.service_id,
-                            entry_view.service_id()
-                        );
-                        self.send_subscribe_nack_from_view(&entry_view, sender, "wrong_service_id")
-                            .await?;
-                    } else if entry_view.instance_id() != self.config.instance_id {
-                        tracing::warn!(
-                            "Subscribe for wrong instance: expected {}, got {}",
-                            self.config.instance_id,
-                            entry_view.instance_id()
-                        );
-                        self.send_subscribe_nack_from_view(
-                            &entry_view,
-                            sender,
-                            "wrong_instance_id",
-                        )
-                        .await?;
-                    } else if entry_view.major_version() != self.config.major_version {
-                        // Per AUTOSAR SOME/IP-SD: a Subscribe whose
-                        // major_version disagrees with the server's
-                        // configured major must be NACKed (TTL=0). Without
-                        // this arm a client probing for a v2 service
-                        // against a v1 server would get an Ack and start
-                        // sending traffic that the application stack
-                        // would silently mis-decode.
-                        tracing::warn!(
-                            "Subscribe for wrong major_version: expected {}, got {}",
-                            self.config.major_version,
-                            entry_view.major_version()
-                        );
-                        if let Err(e) = self
-                            .send_subscribe_nack_from_view(
-                                &entry_view,
-                                sender,
-                                "wrong_major_version",
-                            )
-                            .await
-                        {
-                            tracing::warn!(error = %e, "SubscribeNack send failed");
-                        }
-                    } else if !self.config.accepts_event_group(entry_view.event_group_id()) {
-                        // Per AUTOSAR SOME/IP-SD, the event group must
-                        // be known to the server before subscription
-                        // can be granted. If `event_group_ids` is
-                        // populated and the request is for an
-                        // unrecognised group, NACK so the client
-                        // doesn't believe it's subscribed.
-                        tracing::warn!(
-                            "Subscribe for unknown event_group_id 0x{:04X} (service 0x{:04X})",
-                            entry_view.event_group_id(),
-                            entry_view.service_id()
-                        );
-                        if let Err(e) = self
-                            .send_subscribe_nack_from_view(
-                                &entry_view,
-                                sender,
-                                "unknown_event_group",
-                            )
-                            .await
-                        {
-                            tracing::warn!(error = %e, "SubscribeNack send failed");
-                        }
-                    } else {
-                        // Extract the subscriber endpoint from the entry's
-                        // own options run. Each SD entry describes two runs
-                        // of options via `(index_first_options_run,
-                        // first_options_count)` and the symmetric second
-                        // pair; we walk both runs, collect every
-                        // `IpV4Endpoint` option in them, and take the first.
-                        let first_index = entry_view.index_first_options_run() as usize;
-                        let first_count = entry_view.options_count().first_options_count as usize;
-                        let second_index = entry_view.index_second_options_run() as usize;
-                        let second_count = entry_view.options_count().second_options_count as usize;
-                        if let Some(endpoint_addr) = extract_subscriber_endpoint(
-                            &sd_view.options(),
-                            first_index,
-                            first_count,
-                            second_index,
-                            second_count,
-                        ) {
-                            let subscribe_result = self
-                                .subscriptions
-                                .subscribe(
-                                    entry_view.service_id(),
-                                    entry_view.instance_id(),
-                                    entry_view.event_group_id(),
-                                    endpoint_addr,
-                                )
-                                .await;
-
-                            match subscribe_result {
-                                Ok(()) => {
-                                    // ACK the just-committed subscription. If the
-                                    // ACK send fails (transient transport error),
-                                    // roll back the subscription so we don't leak
-                                    // a committed-but-unacked entry — and log
-                                    // rather than propagate, so a single SD-socket
-                                    // hiccup doesn't tear down `run()`.
-                                    if let Err(e) =
-                                        self.send_subscribe_ack_from_view(&entry_view, sender).await
-                                    {
-                                        tracing::warn!(
-                                            error = %e,
-                                            service_id = entry_view.service_id(),
-                                            instance_id = entry_view.instance_id(),
-                                            event_group_id = entry_view.event_group_id(),
-                                            "SubscribeAck send failed; rolling back subscription"
-                                        );
-                                        self.subscriptions
-                                            .unsubscribe(
-                                                entry_view.service_id(),
-                                                entry_view.instance_id(),
-                                                entry_view.event_group_id(),
-                                                endpoint_addr,
-                                            )
-                                            .await;
-                                    }
-                                }
-                                Err(e) => {
-                                    // Capacity-rejected subscription: NACK so
-                                    // the client doesn't believe it's
-                                    // subscribed.
-                                    let reason: &'static str = match e {
-                                        SubscribeError::SubscribersPerGroupFull => {
-                                            "subscribers_per_group_full"
-                                        }
-                                        SubscribeError::EventGroupsFull => "event_groups_full",
-                                    };
-                                    tracing::debug!("Subscription rejected: {reason}");
-                                    if let Err(e) = self
-                                        .send_subscribe_nack_from_view(&entry_view, sender, reason)
-                                        .await
-                                    {
-                                        tracing::warn!(error = %e, "SubscribeNack send failed");
-                                    }
-                                }
-                            }
-                        } else {
-                            tracing::warn!("No endpoint found in Subscribe message options");
-                            if let Err(e) = self
-                                .send_subscribe_nack_from_view(
-                                    &entry_view,
-                                    sender,
-                                    "no_endpoint_in_options",
-                                )
-                                .await
-                            {
-                                tracing::warn!(error = %e, "SubscribeNack send failed");
-                            }
-                        }
-                    }
-                }
-                sd::EntryType::FindService => {
-                    let find_service_id = entry_view.service_id();
-                    // Check if this FindService is for our service (or wildcard 0xFFFF)
-                    if find_service_id == self.config.service_id || find_service_id == 0xFFFF {
-                        tracing::debug!(
-                            "Received FindService from {} for service 0x{:04X} (ours: 0x{:04X}), sending unicast offer",
-                            sender,
-                            find_service_id,
-                            self.config.service_id
-                        );
-                        if let Err(e) = self.send_unicast_offer(sender).await {
-                            tracing::warn!(error = %e, "Unicast OfferService send failed");
-                        }
-                    } else {
-                        tracing::trace!(
-                            "Ignoring FindService for service 0x{:04X} (not ours)",
-                            find_service_id
-                        );
-                    }
-                }
-                _ => {
-                    tracing::trace!("Ignoring SD entry type: {:?}", entry_type);
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
-/// Convert a [`core::net::SocketAddr`] into a [`SocketAddrV4`] for the
-/// transport layer. SOME/IP-SD is IPv4-only at this layer; if a V6
-/// address ever surfaces here it indicates a misconfiguration upstream
-/// (a V6 socket binding the SD port, or a V6 source address surfaced
-/// by a transport that should not produce one). Returns
-/// [`TransportError::Unsupported`](crate::transport::TransportError::Unsupported)
-/// in that case so the caller can log and drop the message instead of panicking.
-fn socket_addr_v4(addr: core::net::SocketAddr) -> Result<SocketAddrV4, Error> {
-    match addr {
-        core::net::SocketAddr::V4(v4) => Ok(v4),
-        core::net::SocketAddr::V6(_) => Err(Error::Transport(
-            crate::transport::TransportError::Unsupported,
-        )),
-    }
-}
-
-/// Extract a single subscriber endpoint from the options runs associated with
-/// an SD entry. Walks both option runs, returns the first `IpV4Endpoint`
-/// found, and logs a `warn!` if more than one is present.
-fn extract_subscriber_endpoint(
-    options: &sd::OptionIter<'_>,
-    first_index: usize,
-    first_count: usize,
-    second_index: usize,
-    second_count: usize,
-) -> Option<SocketAddrV4> {
-    let mut first_endpoint: Option<SocketAddrV4> = None;
-    let mut endpoint_count: usize = 0;
-    let mut ignored_other: usize = 0;
-
-    let mut walk_run = |index: usize, count: usize| {
-        if count == 0 {
-            return;
-        }
-        for option_view in options.clone().skip(index).take(count) {
-            match option_view.option_type() {
-                Ok(sd::OptionType::IpV4Endpoint) => {
-                    if let Ok((ip, _, port)) = option_view.as_ipv4() {
-                        endpoint_count += 1;
-                        if first_endpoint.is_none() {
-                            first_endpoint = Some(SocketAddrV4::new(ip, port));
-                        }
-                    }
-                }
-                Ok(_) | Err(_) => ignored_other += 1,
-            }
-        }
-    };
-
-    walk_run(first_index, first_count);
-    walk_run(second_index, second_count);
-
-    match endpoint_count {
-        0 => {
-            tracing::warn!(
-                "No IPv4 endpoint in options runs \
-                 (first: idx={first_index}, count={first_count}; \
-                 second: idx={second_index}, count={second_count}; \
-                 ignored={ignored_other})"
-            );
-            None
-        }
-        1 => {
-            let ep = first_endpoint.expect("endpoint_count=1 implies first_endpoint is Some");
-            tracing::trace!("Found IPv4 endpoint {}", ep);
-            Some(ep)
-        }
-        n => {
-            let ep = first_endpoint.expect("endpoint_count>=1 implies first_endpoint is Some");
-            tracing::warn!(
-                "{} IPv4 endpoints found in subscribe options runs; \
-                 using first ({}) and ignoring {} additional. \
-                 Multi-endpoint (e.g. TCP+UDP) subscribers are not yet supported.",
-                n,
-                ep,
-                n - 1
-            );
-            Some(ep)
-        }
-    }
-}
-
-impl<R, S, F, Tm, H, Hsd, Hep> Server<R, S, F, Tm, H, Hsd, Hep>
-where
-    R: E2ERegistryHandle,
-    S: SubscriptionHandle,
-    F: TransportFactory + 'static,
-    F::Socket: 'static,
-    Tm: Timer + Clone + 'static,
-    H: SharedHandle<F::Socket>,
-    Hsd: SharedHandle<SdStateManager>,
-    Hep: SharedHandle<EventPublisher<R, S, H, F::Socket>>,
-{
-    /// Send `SubscribeAck` from an entry view
-    async fn send_subscribe_ack_from_view(
+    pub fn run(
         &self,
-        entry_view: &sd::EntryView<'_>,
-        subscriber: core::net::SocketAddr,
-    ) -> Result<(), Error> {
-        use crate::protocol::Header as SomeIpHeader;
-        use crate::traits::WireFormat;
-
-        let ack_entry = Entry::SubscribeAckEventGroup(sd::EventGroupEntry {
-            index_first_options_run: 0,
-            index_second_options_run: 0,
-            options_count: OptionsCount::new(0, 0),
-            service_id: entry_view.service_id(),
-            instance_id: entry_view.instance_id(),
-            major_version: entry_view.major_version(),
-            ttl: self.config.ttl,
-            counter: entry_view.counter(),
-            event_group_id: entry_view.event_group_id(),
-        });
-
-        let entries = [ack_entry];
-        // Atomic (sid, reboot_flag) pair — see
-        // `SdStateManager::next_session_id_with_reboot_flag`.
-        let (sid, reboot_flag) = self.sd_state.get().next_session_id_with_reboot_flag();
-        let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &[]);
-
-        let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
-        let sd_data_len = sd_payload.encode_to_slice(&mut buffer[16..])?;
-        let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
-        someip_header.encode_to_slice(&mut buffer[..16])?;
-        let total_len = 16 + sd_data_len;
-
-        let subscriber_v4 = socket_addr_v4(subscriber)?;
-        self.sd_socket
-            .get()
-            .send_to(&buffer[..total_len], subscriber_v4)
-            .await?;
-
-        tracing::debug!(
-            "Sent SubscribeAck to {} for service 0x{:04X}, eventgroup 0x{:04X}",
-            subscriber,
-            entry_view.service_id(),
-            entry_view.event_group_id()
-        );
-
-        Ok(())
+    ) -> impl core::future::Future<Output = Result<(), Error>>
+    + Send
+    + 'static
+    + use<F, Tm, R, Sub, H, Hsd, Hep>
+    where
+        F: Send + Sync,
+        F::Socket: Send + Sync,
+        for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
+        for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
+        H: Send + Sync,
+        Sub: Send + Sync,
+        for<'a> Sub::SubscribeFuture<'a>: Send,
+        for<'a> Sub::UnsubscribeFuture<'a>: Send,
+        R: Send + Sync,
+        Tm: Send + Sync,
+        for<'a> Tm::SleepFuture<'a>: Send,
+        Hsd: Send + Sync,
+        Hep: Send + Sync,
+    {
+        self.run_inner()
     }
 
-    /// Send `SubscribeNack` from an entry view
-    async fn send_subscribe_nack_from_view(
+    /// Auto-trait-inferred run-future used by the constructors and by
+    /// the `Send`-requiring [`Self::run`] convenience above. Private
+    /// because it exposes `Send`-or-not as an inference rather than a
+    /// declared bound — callers should prefer `run` (Send-checked at
+    /// the API boundary) or `run_with_buffers` (explicitly no `Send`
+    /// requirement).
+    fn run_inner(
         &self,
-        entry_view: &sd::EntryView<'_>,
-        subscriber: core::net::SocketAddr,
-        reason: &str,
-    ) -> Result<(), Error> {
-        use crate::protocol::Header as SomeIpHeader;
-        use crate::traits::WireFormat;
+    ) -> impl core::future::Future<Output = Result<(), Error>>
+    + 'static
+    + use<F, Tm, R, Sub, H, Hsd, Hep> {
+        let config = self.config.clone();
+        let unicast_socket = self.unicast_socket.clone();
+        let sd_socket = self.sd_socket.clone();
+        let subscriptions = self.subscriptions.clone();
+        let sd_state = self.sd_state.clone();
+        let timer = self.timer.clone();
+        let is_passive = self.is_passive;
+        let started = self.started.clone();
 
-        let nack_entry = Entry::SubscribeAckEventGroup(sd::EventGroupEntry {
-            index_first_options_run: 0,
-            index_second_options_run: 0,
-            options_count: OptionsCount::new(0, 0),
-            service_id: entry_view.service_id(),
-            instance_id: entry_view.instance_id(),
-            major_version: entry_view.major_version(),
-            ttl: 0, // TTL=0 indicates NACK
-            counter: entry_view.counter(),
-            event_group_id: entry_view.event_group_id(),
-        });
+        async move {
+            // First-poll latch — guards against a caller spawning
+            // both the constructor's run-future *and* a fresh
+            // `server.run()` / `server.run_with_buffers()`. Two
+            // concurrent receive loops would race on the same SD /
+            // unicast sockets and the SD session counter; reject the
+            // second one rather than silently corrupt wire output.
+            if started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                crate::log::warn!(
+                    "Server::run already started for service 0x{:04X}; \
+                     a second run-future cannot share the same sockets \
+                     and session counter",
+                    config.service_id
+                );
+                return Err(Error::InvalidUsage("server_already_running"));
+            }
 
-        let entries = [nack_entry];
-        // Atomic (sid, reboot_flag) pair — see
-        // `SdStateManager::next_session_id_with_reboot_flag`.
-        let (sid, reboot_flag) = self.sd_state.get().next_session_id_with_reboot_flag();
-        let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &[]);
-
-        let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
-        let sd_data_len = sd_payload.encode_to_slice(&mut buffer[16..])?;
-        let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
-        someip_header.encode_to_slice(&mut buffer[..16])?;
-        let total_len = 16 + sd_data_len;
-
-        let subscriber_v4 = socket_addr_v4(subscriber)?;
-        self.sd_socket
-            .get()
-            .send_to(&buffer[..total_len], subscriber_v4)
-            .await?;
-
-        tracing::warn!(
-            "Sent SubscribeNack to {} for service 0x{:04X}, eventgroup 0x{:04X} (reason: {})",
-            subscriber,
-            entry_view.service_id(),
-            entry_view.event_group_id(),
-            reason
-        );
-
-        Ok(())
+            let mut unicast_buf = alloc::vec![0u8; 65535];
+            let mut sd_buf = alloc::vec![0u8; 65535];
+            runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm>(
+                config,
+                unicast_socket,
+                sd_socket,
+                subscriptions,
+                sd_state,
+                timer,
+                is_passive,
+                &mut unicast_buf,
+                &mut sd_buf,
+            )
+            .await
+        }
     }
 }
 
@@ -1582,18 +1312,94 @@ mod tests {
     /// chasing the four-type-parameter signature on every call site.
     /// Mirrors the `TestClient` pattern from `tests/client_server.rs`.
     type TestServer = Server<
-        Arc<Mutex<E2ERegistry>>,
-        Arc<RwLock<SubscriptionManager>>,
         TokioTransport,
         TokioTimer,
+        Arc<Mutex<E2ERegistry>>,
+        Arc<RwLock<SubscriptionManager>>,
     >;
 
     #[tokio::test]
     async fn test_server_creation() {
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30682, 0x5B, 1);
+        let config = ServerConfig::new(0x5B, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(30682);
 
-        let server: Result<TestServer, _> = TestServer::new(config).await;
-        assert!(server.is_ok());
+        let result = TestServer::new(config).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn server_config_builder_chain_overrides_each_field() {
+        let cfg = ServerConfig::new(0x5B, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(30683)
+            .with_major_version(2)
+            .with_minor_version(7)
+            .with_ttl(core::time::Duration::from_secs(10))
+            .with_event_group(0x42)
+            .with_event_group(0x43);
+        assert_eq!(cfg.interface, Ipv4Addr::LOCALHOST);
+        assert_eq!(cfg.local_port, 30683);
+        assert_eq!(cfg.major_version, 2);
+        assert_eq!(cfg.minor_version, 7);
+        assert_eq!(cfg.ttl, 10);
+        assert!(cfg.accepts_event_group(0x42));
+        assert!(cfg.accepts_event_group(0x43));
+        assert!(!cfg.accepts_event_group(0x44));
+    }
+
+    #[test]
+    fn server_config_with_ttl_truncates_subsecond_precision() {
+        let cfg = ServerConfig::new(0x5B, 1).with_ttl(core::time::Duration::from_millis(2_999));
+        assert_eq!(cfg.ttl, 2, "sub-second is truncated, not rounded");
+    }
+
+    /// `announce` defaults to `true` from `ServerConfig::new`, and
+    /// `with_announce(false)` flips it. The dispatcher topology in
+    /// `examples/client_server` depends on this default-vs-override
+    /// being load-bearing — see
+    /// `with_announce_false_suppresses_offer_service` for the
+    /// behavioral counterpart that proves the run-future actually
+    /// honours the flag.
+    #[test]
+    fn server_config_with_announce_toggles_field() {
+        let default_cfg = ServerConfig::new(0x5B, 1);
+        assert!(
+            default_cfg.announce,
+            "announce must default to true so a fresh `ServerConfig` emits SD offers"
+        );
+
+        let suppressed = default_cfg.clone().with_announce(false);
+        assert!(!suppressed.announce, "with_announce(false) must clear the field");
+
+        let restored = suppressed.with_announce(true);
+        assert!(
+            restored.announce,
+            "with_announce(true) must re-enable after a previous suppression"
+        );
+    }
+
+    #[test]
+    fn server_config_with_ttl_saturates_overflow() {
+        let cfg = ServerConfig::new(0x5B, 1)
+            .with_ttl(core::time::Duration::from_secs(u64::from(u32::MAX) + 1));
+        assert_eq!(cfg.ttl, u32::MAX);
+    }
+
+    #[test]
+    fn server_config_try_with_event_group_rejects_at_capacity() {
+        let mut cfg = ServerConfig::new(0x5B, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(30684);
+        for i in 0..u16::try_from(ServerConfig::EVENT_GROUP_IDS_CAP).unwrap() {
+            cfg = cfg.try_with_event_group(i).expect("under cap");
+        }
+        // One more should be rejected and return the unmodified config.
+        let cap = ServerConfig::EVENT_GROUP_IDS_CAP;
+        let result = cfg.try_with_event_group(0xFFFF);
+        let returned = result.expect_err("at-cap insert must fail");
+        assert_eq!(returned.event_group_ids.len(), cap);
+        assert!(!returned.accepts_event_group(0xFFFF));
     }
 
     // ── new_with_handles / new_passive_with_handles tests ──────────────
@@ -1601,18 +1407,18 @@ mod tests {
     // These constructors take pre-built socket handles instead of
     // calling `factory.bind()` themselves, and validate that the
     // caller-supplied `config.local_port` matches the actual bound
-    // port (back-fill-only-on-zero, MED-22 in phase 20 cleanup).
-    // The validation logic only exercises through these tests; the
-    // production code paths use `new` / `new_with_deps`.
+    // port (back-fill-only-on-zero). The validation logic only
+    // exercises through these tests; the production code paths use
+    // `new` / `new_with_deps`.
 
-    /// Build a `ServerHandles<…>` whose unicast socket is bound to
+    /// Build a `ServerStorage<…>` whose unicast socket is bound to
     /// the given port (port `0` for ephemeral) and whose other
     /// fields are the std defaults a tokio consumer would assemble.
     /// Used by the `new_with_handles` tests below.
     async fn build_test_handles(
         unicast_port: u16,
     ) -> (
-        ServerHandles<
+        ServerStorage<
             TokioTransport,
             TokioTimer,
             Arc<Mutex<E2ERegistry>>,
@@ -1655,7 +1461,7 @@ mod tests {
             unicast_socket.clone(),
             e2e_registry.clone(),
         ));
-        let handles = ServerHandles {
+        let handles = ServerStorage {
             factory,
             timer: TokioTimer,
             e2e_registry,
@@ -1676,7 +1482,9 @@ mod tests {
             "test precondition: kernel must assign a real ephemeral port",
         );
         // Port 0 → caller asks for back-fill from the bound port.
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0xFE10, 1);
+        let config = ServerConfig::new(0xFE10, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(0);
         let server = TestServer::new_with_handles(handles, config)
             .expect("new_with_handles must accept local_port = 0");
         assert_eq!(
@@ -1689,7 +1497,9 @@ mod tests {
     async fn new_with_handles_accepts_matching_local_port() {
         let (handles, bound_port) = build_test_handles(0).await;
         // Caller supplies the matching port explicitly.
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, bound_port, 0xFE11, 1);
+        let config = ServerConfig::new(0xFE11, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(bound_port);
         let server = TestServer::new_with_handles(handles, config)
             .expect("matching local_port must be accepted");
         assert_eq!(server.config.local_port, bound_port);
@@ -1705,7 +1515,9 @@ mod tests {
         // distinct from `bound_port`.
         let bogus_port = bound_port.wrapping_add(1);
         assert_ne!(bogus_port, bound_port);
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, bogus_port, 0xFE12, 1);
+        let config = ServerConfig::new(0xFE12, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(bogus_port);
         let result = TestServer::new_with_handles(handles, config);
         match result {
             Err(Error::InvalidUsage(tag)) => {
@@ -1723,7 +1535,9 @@ mod tests {
     #[tokio::test]
     async fn new_passive_with_handles_back_fills_local_port_on_zero() {
         let (handles, bound_port) = build_test_handles(0).await;
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0xFE13, 1);
+        let config = ServerConfig::new(0xFE13, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(0);
         let server = TestServer::new_passive_with_handles(handles, config)
             .expect("new_passive_with_handles must accept local_port = 0");
         assert_eq!(server.config.local_port, bound_port);
@@ -1735,7 +1549,9 @@ mod tests {
         let (handles, bound_port) = build_test_handles(0).await;
         let bogus_port = bound_port.wrapping_add(1);
         assert_ne!(bogus_port, bound_port);
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, bogus_port, 0xFE14, 1);
+        let config = ServerConfig::new(0xFE14, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(bogus_port);
         let result = TestServer::new_passive_with_handles(handles, config);
         match result {
             Err(Error::InvalidUsage(tag)) => {
@@ -1752,8 +1568,10 @@ mod tests {
     #[tokio::test]
     async fn passive_server_run_with_buffers_returns_invalid_usage() {
         let (handles, _) = build_test_handles(0).await;
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0xFE15, 1);
-        let mut server =
+        let config = ServerConfig::new(0xFE15, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(0);
+        let server =
             TestServer::new_passive_with_handles(handles, config).expect("passive ctor");
         let mut unicast_buf = vec![0u8; 1500];
         let mut sd_buf = vec![0u8; 1500];
@@ -1766,23 +1584,11 @@ mod tests {
         }
     }
 
-    /// Same short-circuit on the announcement-loop side.
-    #[tokio::test]
-    async fn passive_server_announcement_loop_returns_invalid_usage() {
-        let (handles, _) = build_test_handles(0).await;
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0xFE16, 1);
-        let server = TestServer::new_passive_with_handles(handles, config).expect("passive ctor");
-        // The success arm returns an opaque `impl Future` that
-        // doesn't impl Debug, so we can't pattern-match on a
-        // `Result` directly with `{:?}`. Discriminate explicitly.
-        match server.announcement_loop() {
-            Err(Error::InvalidUsage(tag)) => {
-                assert_eq!(tag, "passive_server_announcement_loop");
-            }
-            Err(other) => panic!("expected InvalidUsage, got {other:?}"),
-            Ok(_) => panic!("passive server's announcement_loop must error"),
-        }
-    }
+    // No standalone `passive_server_announcement_loop` test: the
+    // announcement loop is folded into the combined [`Server::run`]
+    // future, so the only entry point that can short-circuit on a
+    // passive server is `run_with_buffers` (covered by
+    // `passive_server_run_with_buffers_returns_invalid_usage` above).
 
     /// Regression for H5: `ServerConfig::accepts_event_group` must
     /// accept any group when `event_group_ids` is empty (back-compat:
@@ -1790,7 +1596,9 @@ mod tests {
     /// working) and validate strictly when populated.
     #[test]
     fn server_config_accepts_event_group_empty_means_any() {
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30490, 0x5B, 1);
+        let config = ServerConfig::new(0x5B, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(30490);
         assert!(config.event_group_ids.is_empty());
         // Empty list: every group accepted.
         assert!(config.accepts_event_group(0x0001));
@@ -1800,7 +1608,9 @@ mod tests {
 
     #[test]
     fn server_config_accepts_event_group_populated_validates() {
-        let mut config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30490, 0x5B, 1);
+        let mut config = ServerConfig::new(0x5B, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(30490);
         config.event_group_ids.push(0x0001).unwrap();
         config.event_group_ids.push(0x0042).unwrap();
         assert!(config.accepts_event_group(0x0001));
@@ -1893,13 +1703,18 @@ mod tests {
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             subscriptions: subscriptions.clone(),
         };
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, 0x5B, 1);
+        let config = ServerConfig::new(0x5B, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(0);
         // Explicit `Arc<FailingSocket>` H so the compiler doesn't have
         // to invent it across the deps-bundle indirection.
-        let mut server: Server<_, _, _, _, Arc<FailingSocket>> =
-            Server::new_with_deps(deps, config, false)
-                .await
-                .expect("create failing-socket server");
+        let (server, _handles, _run): (
+            Server<_, _, _, _, Arc<FailingSocket>>,
+            _,
+            _,
+        ) = Server::new_with_deps(deps, config, false)
+            .await
+            .expect("create failing-socket server");
 
         // Build a valid Subscribe; our service id/instance/major
         // match the config's defaults, so the only failure point
@@ -1920,7 +1735,7 @@ mod tests {
 
         // The H3 fix: handle_sd_message must NOT bubble the ACK send
         // failure as Err — it logs and continues.
-        let result = server.handle_sd_message(&sd_view, sender).await;
+        let result = runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, sender).await;
         assert!(
             result.is_ok(),
             "handle_sd_message must not propagate transient SD-socket I/O errors; got {result:?}"
@@ -1936,30 +1751,13 @@ mod tests {
         );
     }
 
-    /// Regression for H4: `announcement_loop` must be idempotent.
-    /// Calling it a second time returns `Err(Error::Io(InvalidInput))`
-    /// so two announcement futures cannot race on the same SD socket
-    /// and session counter.
-    #[tokio::test]
-    async fn announcement_loop_second_call_returns_invalid_input() {
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30683, 0x5BB4, 1);
-        let server = TestServer::new(config).await.expect("create server");
-        let _first = server
-            .announcement_loop()
-            .expect("first announcement_loop call must succeed");
-        let second = server.announcement_loop();
-        match second {
-            Err(Error::InvalidUsage(tag)) => {
-                assert_eq!(tag, "announcement_loop_already_started");
-            }
-            Ok(_) => panic!("second announcement_loop must error, got Ok"),
-            Err(other) => {
-                panic!(
-                    "expected Error::InvalidUsage(\"announcement_loop_already_started\"), got {other:?}"
-                )
-            }
-        }
-    }
+    // No standalone `announcement_loop` method: the announcement
+    // loop is folded into the single combined run-future, so there
+    // is only one entry point. (The previous
+    // `announcement_loop_started: AtomicBool` latch existed because
+    // two independently-spawned announcement futures would race on
+    // the SD socket / session counter; that failure mode is now
+    // structurally impossible.)
 
     #[tokio::test]
     async fn test_server_creation_with_loopback_enabled() {
@@ -1967,9 +1765,11 @@ mod tests {
         // when the test binary runs tests in parallel. The SD socket binds
         // the SD multicast port (30490) and relies on SO_REUSEPORT, the same
         // as `test_server_creation`.
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 30683, 0x5C, 1);
+        let config = ServerConfig::new(0x5C, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(30683);
 
-        let server = TestServer::new_with_loopback(config, true)
+        let (server, _handles, _run) = TestServer::new_with_loopback(config, true)
             .await
             .expect("new_with_loopback(true) should succeed on localhost");
 
@@ -2015,16 +1815,19 @@ mod tests {
     /// Helper: create a server on an ephemeral port and return (Server, port)
     async fn create_test_server(service_id: u16, instance_id: u16) -> (TestServer, u16) {
         // Use port 0 to get an ephemeral port
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, service_id, instance_id);
-        let mut server = TestServer::new(config)
+        let config = ServerConfig::new(service_id, instance_id)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(0);
+        let (server, _handles, _run) = TestServer::new(config)
             .await
             .expect("Failed to create server");
+        // Constructor already back-filled `config.local_port` from the
+        // kernel-assigned bound port; just read it back via
+        // `unicast_local_addr` for the test return.
         let port = match server.unicast_local_addr().unwrap() {
             core::net::SocketAddr::V4(addr) => addr.port(),
             core::net::SocketAddr::V6(_) => panic!("expected IPv4 address"),
         };
-        // Update config to reflect actual bound port
-        server.set_local_port(port);
         (server, port)
     }
 
@@ -2063,7 +1866,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_ack_success() {
-        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let (server, server_port) = create_test_server(0x5B, 1).await;
 
         // Create a client socket to send subscription and receive response
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2094,7 +1897,7 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            server.handle_sd_message(&sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
 
             // Check subscription was added
             let subs = server.subscriptions.read().await;
@@ -2121,7 +1924,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_nack_wrong_service() {
-        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let (server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         let message = make_subscription_header(
@@ -2148,7 +1951,7 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            server.handle_sd_message(&sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
 
             // No subscription should have been added
             let subs = server.subscriptions.read().await;
@@ -2173,7 +1976,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_nack_wrong_instance() {
-        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let (server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         let message = make_subscription_header(
@@ -2199,7 +2002,7 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            server.handle_sd_message(&sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
 
             let subs = server.subscriptions.read().await;
             assert_eq!(subs.subscription_count(), 0);
@@ -2222,7 +2025,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_service_sends_unicast_offer() {
-        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let (server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // Send a FindService for 0x5B
@@ -2248,7 +2051,7 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            server.handle_sd_message(&sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
         });
 
         // Receive the unicast OfferService response
@@ -2275,7 +2078,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_service_wildcard() {
-        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let (server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // Send wildcard FindService (0xFFFF)
@@ -2300,7 +2103,7 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            server.handle_sd_message(&sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
         });
 
         let mut resp_buf = vec![0u8; 65535];
@@ -2324,7 +2127,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_service_wrong_service_ignored() {
-        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let (server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // Send FindService for 0x99 (not our service)
@@ -2349,7 +2152,7 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            server.handle_sd_message(&sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
         });
 
         // Should NOT receive any response (short timeout)
@@ -2369,7 +2172,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_nack_no_endpoint() {
-        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let (server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // Build a SubscribeEventGroup with NO endpoint option
@@ -2391,7 +2194,7 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            server.handle_sd_message(&sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
 
             // No subscription should have been added
             let subs = server.subscriptions.read().await;
@@ -2422,10 +2225,14 @@ mod tests {
         let recv_addr = receiver.local_addr().unwrap();
 
         let (server, _) = create_test_server(0x5B, 1).await;
-        server
-            .send_unicast_offer(recv_addr)
-            .await
-            .expect("send_unicast_offer failed");
+        runtime::send_unicast_offer(
+            &server.config,
+            server.sd_socket.get(),
+            server.sd_state.get(),
+            recv_addr,
+        )
+        .await
+        .expect("send_unicast_offer failed");
 
         // Receive and parse the offer
         let mut buf = vec![0u8; 65535];
@@ -2446,24 +2253,19 @@ mod tests {
         assert_eq!(entry.service_id(), 0x5B);
         assert_eq!(entry.instance_id(), 1);
 
-        // Also test that announcement_loop builds a future without error.
+        // Announcements are folded into `Server::run`. Verify a
+        // fresh server can build its combined run-future without
+        // error; intentionally do not poll or spawn it (would loop
+        // indefinitely emitting multicast).
         drop(server);
         let (server2, _) = create_test_server(0x5B, 1).await;
-        let fut = server2
-            .announcement_loop()
-            .expect("announcement_loop on a regular server must build");
-        // Intentionally do not poll or spawn the future: we only care
-        // that constructing it returned Ok. If this future were
-        // spawned, the announcer would loop indefinitely and emit
-        // multicast until explicitly aborted or the Tokio runtime
-        // shut down at end-of-test, which could interfere with
-        // parallel tests using the same multicast group.
+        let fut = server2.run();
         drop(fut);
     }
 
     #[tokio::test]
     async fn test_run_non_sd_message() {
-        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let (server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_port = match client_socket.local_addr().unwrap() {
             core::net::SocketAddr::V4(a) => a.port(),
@@ -2532,7 +2334,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_malformed_data() {
-        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let (server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_port = match client_socket.local_addr().unwrap() {
             core::net::SocketAddr::V4(a) => a.port(),
@@ -2589,7 +2391,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_sd_other_entry_type() {
-        let (mut server, _) = create_test_server(0x5B, 1).await;
+        let (server, _) = create_test_server(0x5B, 1).await;
 
         // Build SD message with a StopOfferService entry (not handled by server)
         let entry = sd::Entry::StopOfferService(sd::ServiceEntry {
@@ -2611,15 +2413,21 @@ mod tests {
         let sd_view = sd::SdHeaderView::parse(&buf[..n]).unwrap();
 
         // Should not panic or error
-        let result = server
-            .handle_sd_message(&sd_view, "127.0.0.1:12345".parse().unwrap())
-            .await;
+        let result = runtime::handle_sd_message(
+            &server.config,
+            server.sd_socket.get(),
+            server.sd_state.get(),
+            &server.subscriptions,
+            &sd_view,
+            "127.0.0.1:12345".parse().unwrap(),
+        )
+        .await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_subscribe_ack_different_endpoint_port() {
-        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        let (server, server_port) = create_test_server(0x5B, 1).await;
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         let message = make_subscription_header(
@@ -2645,7 +2453,7 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            server.handle_sd_message(&sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
 
             // Subscription should have been added
             let subs = server.subscriptions.read().await;
@@ -2718,7 +2526,7 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 1, 30000);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        let got = extract_subscriber_endpoint(&iter, 0, 1, 0, 0);
+        let got = runtime::extract_subscriber_endpoint(&iter, 0, 1, 0, 0);
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30000))
@@ -2728,7 +2536,7 @@ mod tests {
     #[test]
     fn extract_endpoint_zero_options_in_both_runs_returns_none() {
         let iter = sd::OptionIter::new(&[]);
-        assert_eq!(extract_subscriber_endpoint(&iter, 0, 0, 0, 0), None);
+        assert_eq!(runtime::extract_subscriber_endpoint(&iter, 0, 0, 0, 0), None);
     }
 
     #[test]
@@ -2740,7 +2548,7 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 2, 30100);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        assert_eq!(extract_subscriber_endpoint(&iter, 1, 0, 0, 0), None);
+        assert_eq!(runtime::extract_subscriber_endpoint(&iter, 1, 0, 0, 0), None);
     }
 
     #[test]
@@ -2752,7 +2560,7 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 2, 30200);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        let got = extract_subscriber_endpoint(&iter, 0, 2, 0, 0);
+        let got = runtime::extract_subscriber_endpoint(&iter, 0, 2, 0, 0);
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30200))
@@ -2771,7 +2579,7 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 3, 30300);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        let got = extract_subscriber_endpoint(&iter, 0, 1, 2, 1);
+        let got = runtime::extract_subscriber_endpoint(&iter, 0, 1, 2, 1);
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30300))
@@ -2786,7 +2594,7 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 4, 30400);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        let got = extract_subscriber_endpoint(&iter, 2, 1, 0, 0);
+        let got = runtime::extract_subscriber_endpoint(&iter, 2, 1, 0, 0);
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30402))
@@ -2802,7 +2610,7 @@ mod tests {
         let iter = sd::OptionIter::new(&buf[..total]);
 
         // Take only 1 option starting at index 1 -> port 30501.
-        let got = extract_subscriber_endpoint(&iter, 1, 1, 0, 0);
+        let got = runtime::extract_subscriber_endpoint(&iter, 1, 1, 0, 0);
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30501))
@@ -2826,7 +2634,7 @@ mod tests {
         offset += write_load_balancing_option(&mut buf[offset..], 3, 4);
         let iter = sd::OptionIter::new(&buf[..offset]);
 
-        let got = extract_subscriber_endpoint(&iter, 0, 3, 0, 0);
+        let got = runtime::extract_subscriber_endpoint(&iter, 0, 3, 0, 0);
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30600))
@@ -2841,7 +2649,7 @@ mod tests {
         offset += write_load_balancing_option(&mut buf[offset..], 3, 4);
         let iter = sd::OptionIter::new(&buf[..offset]);
 
-        assert_eq!(extract_subscriber_endpoint(&iter, 0, 2, 0, 0), None);
+        assert_eq!(runtime::extract_subscriber_endpoint(&iter, 0, 2, 0, 0), None);
     }
 
     #[test]
@@ -2852,7 +2660,7 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 2, 30700);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        let got = extract_subscriber_endpoint(&iter, 0, 0, 1, 1);
+        let got = runtime::extract_subscriber_endpoint(&iter, 0, 0, 1, 1);
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30701))
@@ -2872,7 +2680,7 @@ mod tests {
     /// wrong endpoint.
     #[tokio::test]
     async fn combined_sd_subscribe_uses_its_own_options_run() {
-        let (mut server, _port) = create_test_server(0x5B, 1).await;
+        let (server, _port) = create_test_server(0x5B, 1).await;
 
         let offer_endpoint_port: u16 = 40_111;
         let subscribe_endpoint_port: u16 = 40_222;
@@ -2942,7 +2750,7 @@ mod tests {
         let sender = core::net::SocketAddr::V4(datagram.source);
         let view = MessageView::parse(&buf[..len]).unwrap();
         let sd_view = view.sd_header().unwrap();
-        server.handle_sd_message(&sd_view, sender).await.unwrap();
+        runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, sender).await.unwrap();
 
         // The server must have registered exactly one subscriber, and
         // its endpoint must be the SubscribeEventGroup entry's options[1]
@@ -2978,10 +2786,13 @@ mod tests {
     /// Construct a passive server on loopback with an ephemeral unicast
     /// port. Tests use this as a standard fixture.
     async fn make_passive_server(service_id: u16, instance_id: u16) -> TestServer {
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, service_id, instance_id);
-        TestServer::new_passive(config)
+        let config = ServerConfig::new(service_id, instance_id)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(0);
+        let (server, _handles, _run) = TestServer::new_passive(config)
             .await
-            .expect("new_passive should succeed")
+            .expect("new_passive should succeed");
+        server
     }
 
     #[tokio::test]
@@ -3041,26 +2852,14 @@ mod tests {
         assert!(!publisher.has_subscribers(0x005C, 0x0001, 0x0001).await);
     }
 
-    #[tokio::test]
-    async fn announcement_loop_on_passive_returns_invalid_input() {
-        let server = make_passive_server(0x005C, 0x0001).await;
-        let err = server
-            .announcement_loop()
-            .err()
-            .expect("announcement_loop on a passive server must fail");
-        match err {
-            Error::InvalidUsage(tag) => {
-                assert_eq!(tag, "passive_server_announcement_loop");
-            }
-            other => panic!(
-                "expected Error::InvalidUsage(\"passive_server_announcement_loop\"), got {other:?}"
-            ),
-        }
-    }
+    // The announcement loop is folded into the combined
+    // `Server::run` future, so the `is_passive` check happens on
+    // `run` itself — exercised by
+    // `run_on_passive_returns_invalid_input` below.
 
     #[tokio::test]
     async fn run_on_passive_returns_invalid_input() {
-        let mut server = make_passive_server(0x005C, 0x0001).await;
+        let server = make_passive_server(0x005C, 0x0001).await;
         let err = server
             .run()
             .await
@@ -3074,21 +2873,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn announcement_loop_on_regular_server_still_succeeds() {
-        // Regression guard: the is_passive check must not break the
-        // standard non-passive path.
+    async fn run_on_regular_server_builds_future_ok() {
+        // Regression guard: the combined run-future must build
+        // without error on a non-passive server. We don't poll or
+        // spawn — doing so would leave the run-loop emitting
+        // multicast for the rest of the test binary's lifetime and
+        // interfere with parallel tests that share the SD multicast
+        // group.
         let (server, _port) = create_test_server(0x005C, 0x0001).await;
-        let fut = server
-            .announcement_loop()
-            .expect("announcement_loop on a regular server must build");
-        // The announcer loops forever; the test succeeds as soon as
-        // construction returns Ok.
-        // Do not poll or spawn the future: doing so would leave the
-        // announcer running and emitting multicast for the rest of the
-        // test binary's lifetime, interfering with parallel tests that
-        // bind the same multicast group. We only care that construction
-        // returned Ok, so drop the future without polling it.
+        let fut = server.run();
         drop(fut);
+    }
+
+    /// Two run-futures from the same `Server` would race on the SD
+    /// and unicast sockets and the SD session counter; the second to
+    /// be polled must short-circuit with
+    /// `Err(Error::InvalidUsage("server_already_running"))` rather
+    /// than silently corrupt wire output. Tests both ordering and
+    /// the buffer-supplied variant.
+    #[tokio::test]
+    async fn second_run_future_returns_already_running() {
+        let (server, _port) = create_test_server(0x005D, 0x0001).await;
+
+        // First run-future: spawn it so its async-move body actually
+        // runs and flips the latch on first poll. Yield once so tokio
+        // schedules the spawned task; the task itself blocks
+        // indefinitely in `recv_from`, which is fine — abort below.
+        let first = tokio::spawn(server.run());
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Second run-future from the same server must reject.
+        let second = server.run().await;
+        match second {
+            Err(Error::InvalidUsage(tag)) => {
+                assert_eq!(tag, "server_already_running");
+            }
+            other => panic!(
+                "second run-future must return InvalidUsage(\"server_already_running\"), got {other:?}"
+            ),
+        }
+
+        // Same gate on `run_with_buffers`.
+        let mut unicast_buf = vec![0u8; 1500];
+        let mut sd_buf = vec![0u8; 1500];
+        let third = server.run_with_buffers(&mut unicast_buf, &mut sd_buf).await;
+        match third {
+            Err(Error::InvalidUsage(tag)) => {
+                assert_eq!(tag, "server_already_running");
+            }
+            other => panic!(
+                "second run_with_buffers must return InvalidUsage(\"server_already_running\"), got {other:?}"
+            ),
+        }
+
+        first.abort();
+        let _ = first.await;
     }
 
     /// Direct test that `announcement_loop` actually emits an SD
@@ -3130,10 +2970,17 @@ mod tests {
             rs
         };
 
-        let config = ServerConfig::new(iface, 30501, SID, IID);
-        let server = TestServer::new_with_loopback(config, true).await.unwrap();
-        let fut = server.announcement_loop().expect("build loop");
-        let handle = tokio::spawn(fut);
+        let config = ServerConfig::new(SID, IID)
+            .with_interface(iface)
+            .with_local_port(30501);
+        let (_server, _handles, run) = TestServer::new_with_loopback(config, true).await.unwrap();
+        // `Server::run` is the combined receive+announce future. The
+        // receive arm here just waits for traffic that never arrives
+        // in this test; the announce arm is what we capture on `recv`
+        // below.
+        let handle = tokio::spawn(async move {
+            let _ = run.await;
+        });
 
         // Filter out any stray SD traffic from other parallel tests
         // until we see one whose OfferService entry carries OUR sid/iid.
@@ -3184,6 +3031,97 @@ mod tests {
         handle.abort();
     }
 
+    /// `ServerConfig::with_announce(false)` is the contract the
+    /// dispatcher topology relies on (`examples/client_server`). It
+    /// MUST suppress the announce arm of the combined run-future,
+    /// even though the receive arm keeps running. This is the
+    /// negative counterpart to
+    /// `announcement_loop_sends_offer_service_when_driven` above —
+    /// same SD-multicast capture machinery, but we assert the listen
+    /// window expires *without* seeing one of our OfferServices.
+    #[tokio::test]
+    async fn with_announce_false_suppresses_offer_service() {
+        use crate::protocol::MessageId;
+
+        // Distinct (sid, iid) so parallel tests on the same SD multicast
+        // group don't bleed into our negative assertion. These IDs must
+        // not appear in any other in-tree test or example.
+        const SID: u16 = 0xAA02;
+        const IID: u16 = 0xFF02;
+
+        let iface = std::net::Ipv4Addr::LOCALHOST;
+        let recv = {
+            let s = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .unwrap();
+            s.set_reuse_address(true).unwrap();
+            #[cfg(unix)]
+            s.set_reuse_port(true).unwrap();
+            s.bind(&core::net::SocketAddr::new(IpAddr::V4(iface), sd::MULTICAST_PORT).into())
+                .unwrap();
+            s.set_nonblocking(true).unwrap();
+            let std_s: std::net::UdpSocket = s.into();
+            let rs = tokio::net::UdpSocket::from_std(std_s).unwrap();
+            rs.join_multicast_v4(sd::MULTICAST_IP, iface).unwrap();
+            rs
+        };
+
+        let config = ServerConfig::new(SID, IID)
+            .with_interface(iface)
+            .with_local_port(30502)
+            .with_announce(false);
+        let (_server, _handles, run) = TestServer::new_with_loopback(config, true).await.unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = run.await;
+        });
+
+        // Listen for ~2 seconds — comfortably more than the 1-second
+        // announcement period the run-future would emit at if announce
+        // were on. If we see an OfferService for OUR (SID, IID) in this
+        // window, the suppression is broken. Stray traffic for *other*
+        // service IDs is ignored (parallel tests share the SD group).
+        let saw_our_offer = tokio::time::timeout(std::time::Duration::from_millis(2_500), async {
+            let mut buf = [0u8; 1500];
+            loop {
+                let (n, _src) = recv.recv_from(&mut buf).await.expect("recv failed");
+                let Ok(view) = crate::protocol::MessageView::parse(&buf[..n]) else {
+                    continue;
+                };
+                if view.header().message_id() != MessageId::SD {
+                    continue;
+                }
+                let Ok(sd_view) = view.sd_header() else {
+                    continue;
+                };
+                let Some(entry) = sd_view.entries().next() else {
+                    continue;
+                };
+                if !matches!(entry.entry_type(), Ok(sd::EntryType::OfferService)) {
+                    continue;
+                }
+                if entry.service_id() == SID && entry.instance_id() == IID {
+                    break true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            !saw_our_offer,
+            "with_announce(false) must suppress OfferService emission for the configured \
+             service; observed an OfferService for (sid={SID:#06x}, iid={IID:#06x}) within \
+             the listen window. The dispatcher topology in examples/client_server depends \
+             on this suppression."
+        );
+    }
+
     #[tokio::test]
     async fn new_passive_two_instances_do_not_fight_over_sd_port() {
         // Two passive servers on the same interface must both construct
@@ -3215,7 +3153,9 @@ mod tests {
             core::net::SocketAddr::V6(_) => panic!("expected IPv4"),
         };
 
-        let config = ServerConfig::new(Ipv4Addr::LOCALHOST, blocker_port, 0x005C, 0x0001);
+        let config = ServerConfig::new(0x005C, 0x0001)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(blocker_port);
         let result = TestServer::new_passive(config).await;
         let Err(err) = result else {
             panic!("new_passive must fail when the unicast port is taken");
@@ -3244,8 +3184,8 @@ mod tests {
 
     #[tokio::test]
     async fn new_passive_with_tracing_subscriber_evaluates_format_args() {
-        // Coverage helper: with no global tracing subscriber, `tracing::info!`
-        // and `tracing::debug!` short-circuit before evaluating their
+        // Coverage helper: with no global tracing subscriber, `crate::log::info!`
+        // and `crate::log::debug!` short-circuit before evaluating their
         // formatted arguments, leaving the format-arg lines in `new_passive`
         // marked as uncovered. This test installs a max-level subscriber so
         // the macros take their full format path and the arg-evaluation
@@ -3298,14 +3238,14 @@ mod tests {
         with_default(subscriber, || {
             // 0 endpoints → warn! "No IPv4 endpoint" branch.
             let iter_empty = sd::OptionIter::new(&[]);
-            assert_eq!(extract_subscriber_endpoint(&iter_empty, 0, 0, 0, 0), None);
+            assert_eq!(runtime::extract_subscriber_endpoint(&iter_empty, 0, 0, 0, 0), None);
 
             // 1 endpoint → trace! "Found IPv4 endpoint" branch.
             let mut buf_one = [0u8; 32];
             let len_one = fill_ipv4_endpoints(&mut buf_one, 1, 31000);
             let iter_one = sd::OptionIter::new(&buf_one[..len_one]);
             assert_eq!(
-                extract_subscriber_endpoint(&iter_one, 0, 1, 0, 0),
+                runtime::extract_subscriber_endpoint(&iter_one, 0, 1, 0, 0),
                 Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 31000))
             );
 
@@ -3314,7 +3254,7 @@ mod tests {
             let len_many = fill_ipv4_endpoints(&mut buf_many, 3, 31100);
             let iter_many = sd::OptionIter::new(&buf_many[..len_many]);
             assert_eq!(
-                extract_subscriber_endpoint(&iter_many, 0, 3, 0, 0),
+                runtime::extract_subscriber_endpoint(&iter_many, 0, 3, 0, 0),
                 Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 31100))
             );
         });
@@ -3339,7 +3279,9 @@ mod tests {
         // Pick a service_id and unicast port that do not collide with
         // the other loopback-enabled server test in this file.
         let service_id = 0xFE02;
-        let config = ServerConfig::new(interface, 30684, service_id, 0x43);
+        let config = ServerConfig::new(service_id, 0x43)
+            .with_interface(interface)
+            .with_local_port(30684);
 
         // Receiver joined to the SD multicast group on loopback.
         let raw_rx = socket2::Socket::new(
@@ -3359,13 +3301,13 @@ mod tests {
         let rx: UdpSocket = UdpSocket::from_std(raw_rx.into()).unwrap();
         rx.join_multicast_v4(sd::MULTICAST_IP, interface).unwrap();
 
-        let server = TestServer::new_with_loopback(config, true)
+        let (_server, _handles, run_fut) = TestServer::new_with_loopback(config, true)
             .await
             .expect("server must bind with loopback enabled");
-        let announce_fut = server
-            .announcement_loop()
-            .expect("announcement_loop should build on a non-passive server");
-        let announce_handle = tokio::spawn(announce_fut);
+        // Announcement is folded into the combined run-future.
+        let announce_handle = tokio::spawn(async move {
+            let _ = run_fut.await;
+        });
 
         // Scan the multicast group for our OfferService. The first tick
         // happens immediately; 2s is ample headroom for scheduler jitter.

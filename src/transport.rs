@@ -485,6 +485,20 @@ pub trait TransportSocket {
     /// socket, or the concurrent send branch of a `select!` cannot
     /// compile.
     ///
+    /// # Cancel safety
+    ///
+    /// The returned [`Self::RecvFuture`] **must be cancel-safe**:
+    /// dropping it before completion (the typical outcome inside a
+    /// `select!` / `select_biased!` where another arm wins) must not
+    /// lose any datagram that the kernel had already delivered to the
+    /// socket. The server run-loop and the client socket-manager both
+    /// race this future against other arms and rely on the
+    /// drop-and-retry pattern; a backend whose recv-future commits
+    /// kernel state before yielding (and loses it on drop) would
+    /// silently drop datagrams. The default `TokioSocket` impl
+    /// satisfies this via tokio's documented cancel-safety on
+    /// `UdpSocket::recv_from`.
+    ///
     /// # Errors
     ///
     /// Returns:
@@ -1052,20 +1066,19 @@ pub mod bare_metal_handle_impls {
             self.0.store(u32::from(addr), Ordering::Release);
         }
     }
-    // Phase 20e collapsed `StaticSocketHandle<T>(&'static T)` into a
+    // `StaticSocketHandle<T>(&'static T)` was collapsed into a
     // direct `impl SharedHandle<T> for &'static T` blanket — the
     // wrapper type's only role was carrying the `'static` lifetime,
     // which the blanket impl achieves without a wrapper. Consumers
-    // that previously constructed `StaticSocketHandle::new(&SOCKET)`
-    // now pass `&SOCKET` directly into Server's no-wrap constructors.
+    // pass `&SOCKET` directly into Server's no-wrap constructors.
 }
 
 /// `StaticE2EHandle` — no-alloc `E2ERegistryHandle` backed by a
 /// `&'static` critical-section mutex.
 ///
 /// Available in pure `no_std` builds: [`crate::e2e::E2ERegistry`] is
-/// backed by [`heapless::index_map::FnvIndexMap`] (since phase 18a),
-/// so no allocator is required.
+/// backed by [`heapless::index_map::FnvIndexMap`], so no allocator is
+/// required.
 #[cfg(feature = "bare_metal")]
 pub mod bare_metal_e2e_impl {
     use super::E2ERegistryHandle;

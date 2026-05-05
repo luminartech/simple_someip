@@ -38,11 +38,11 @@ const _: () = assert!(
 /// to use `Arc<T>` (which is `Send + Sync` whenever `T` is) without
 /// any change.
 ///
-/// The explicit `T` parameter is the price of consolidating all
-/// three former handle traits (Phase 20e) into a single
-/// [`SharedHandle<T>`]: the trait carries `T` as a generic, not
-/// as an associated type, so consumers that need to name the
-/// socket type spell it out.
+/// The explicit `T` parameter is the price of consolidating the
+/// three former handle traits (`SocketHandle`, `SdStateHandle`,
+/// `EventPublisherHandle`) into a single [`SharedHandle<T>`]: the
+/// trait carries `T` as a generic, not as an associated type, so
+/// consumers that need to name the socket type spell it out.
 pub struct EventPublisher<R, S, H, T>
 where
     R: E2ERegistryHandle,
@@ -127,7 +127,7 @@ where
             .await;
 
         if subscribers.is_empty() {
-            tracing::trace!(
+            crate::log::trace!(
                 "No subscribers for service 0x{:04X}, instance {}, event group 0x{:04X}",
                 service_id,
                 instance_id,
@@ -142,7 +142,7 @@ where
         // and the client socket_manager path.
         let required_size = message.required_size();
         if required_size > UDP_BUFFER_SIZE {
-            tracing::error!(
+            crate::log::error!(
                 "Message size ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping publish",
                 required_size,
                 UDP_BUFFER_SIZE
@@ -175,7 +175,7 @@ where
                 match result {
                     Some(Ok(protected_len)) => {
                         if 16 + protected_len > UDP_BUFFER_SIZE {
-                            tracing::error!(
+                            crate::log::error!(
                                 "E2E-protected datagram ({} bytes, header + protected payload) \
                                  exceeds UDP_BUFFER_SIZE ({}); dropping publish",
                                 16 + protected_len,
@@ -197,7 +197,7 @@ where
                         // receiver's CRC/counter checks. Counter
                         // exhaustion, key-lookup races, and similar
                         // backend errors all funnel here.
-                        tracing::error!("E2E protect error: {:?}; dropping publish", e);
+                        crate::log::error!("E2E protect error: {:?}; dropping publish", e);
                         return Err(Error::E2e(e));
                     }
                     None => unreachable!("contains_key was true"),
@@ -218,20 +218,20 @@ where
             match self.socket.get().send_to(datagram, *addr).await {
                 Ok(()) => {
                     sent_count += 1;
-                    tracing::trace!(
+                    crate::log::trace!(
                         "Sent event to subscriber {} ({} bytes)",
                         addr,
                         message_length
                     );
                 }
                 Err(e) => {
-                    tracing::error!("Failed to send event to subscriber {}: {:?}", addr, e);
+                    crate::log::error!("Failed to send event to subscriber {}: {:?}", addr, e);
                     last_err = Some(e);
                 }
             }
         }
 
-        tracing::debug!(
+        crate::log::debug!(
             "Published event to {}/{} subscribers for service 0x{:04X}",
             sent_count,
             subscribers.len(),
@@ -290,7 +290,7 @@ where
         // where `Header::SIZE + payload` could overflow `usize`. The
         // `16` here is the SOME/IP header size in bytes.
         if payload.len() > UDP_BUFFER_SIZE.saturating_sub(16) {
-            tracing::error!(
+            crate::log::error!(
                 "raw event payload ({} bytes) + 16-byte header exceeds UDP_BUFFER_SIZE ({}); dropping publish",
                 payload.len(),
                 UDP_BUFFER_SIZE
@@ -313,7 +313,7 @@ where
         let mut buffer = [0u8; UDP_BUFFER_SIZE];
         let header_len = header.encode_to_slice(&mut buffer)?;
         let Some(total_len) = header_len.checked_add(payload.len()) else {
-            tracing::error!(
+            crate::log::error!(
                 "raw event length computation overflowed usize (header_len={}, payload.len()={}); dropping publish",
                 header_len,
                 payload.len()
@@ -325,7 +325,7 @@ where
         // post-encode tail bytes (e.g. another protect profile) would
         // need this branch. Cheap to keep.
         if total_len > UDP_BUFFER_SIZE {
-            tracing::error!(
+            crate::log::error!(
                 "raw event ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping publish",
                 total_len,
                 UDP_BUFFER_SIZE
@@ -346,7 +346,7 @@ where
                     sent_count += 1;
                 }
                 Err(e) => {
-                    tracing::error!("Failed to send raw event to {}: {:?}", addr, e);
+                    crate::log::error!("Failed to send raw event to {}: {:?}", addr, e);
                     last_err = Some(e);
                 }
             }
@@ -469,13 +469,12 @@ where
     }
 }
 
-// Phase 20e collapsed `EventPublisherHandle<R, S, H>` /
-// `WrappableEventPublisherHandle<R, S, H>` into the unified
-// `crate::transport::SharedHandle<EventPublisher<R, S, H, T>>` /
-// `WrappableSharedHandle<EventPublisher<R, S, H, T>>` traits. The
-// blanket impls there cover both `&'static EventPublisher<...>`
-// and `Arc<EventPublisher<...>>`; no dedicated trait survives
-// here.
+// `EventPublisherHandle<R, S, H>` /
+// `WrappableEventPublisherHandle<R, S, H>` were collapsed into the
+// unified `crate::transport::SharedHandle<EventPublisher<R, S, H, T>>`
+// / `WrappableSharedHandle<EventPublisher<R, S, H, T>>` traits. The
+// blanket impls there cover both `&'static EventPublisher<...>` and
+// `Arc<EventPublisher<...>>`; no dedicated trait survives here.
 
 #[cfg(all(test, feature = "server-tokio"))]
 mod tests {

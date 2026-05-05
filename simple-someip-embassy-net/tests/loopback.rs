@@ -1,39 +1,37 @@
-//! Phases 19e + 19g — Loopback integration tests.
+//! Loopback integration tests.
 //!
 //! Two `embassy_net::Stack` instances bridged by an in-memory
 //! `LoopbackDriver` pair (no kernel TUN device, no privileges
-//! required). Validates the `simple-someip-embassy-net` adapter
-//! (Phases 19a–c) and the `Server` `SocketHandle` abstraction
-//! (Phase 19f) against a real `embassy_net::Stack`:
+//! required). Validates the `simple-someip-embassy-net` adapter and
+//! the `Server` `SocketHandle` abstraction against a real
+//! `embassy_net::Stack`:
 //!
-//! * **`adapter_udp_roundtrip`** (19e) — bind two
-//!   `EmbassyNetSocket`s, one per stack, send a UDP datagram
-//!   from A to B, assert byte-equality + source-address.
-//!   Tightest test of `bind` / `send_to` / `recv_from` /
-//!   `local_addr` end-to-end.
-//! * **`client_receives_server_sd_announcement`** (19g) — wire
-//!   a real `simple_someip::Server` on stack A with
-//!   `announcement_loop_local` (the `!Send` variant added in
-//!   19f) and a real `simple_someip::Client` on stack B with
-//!   `Client::new_with_deps_local`. Assert the SD multicast
-//!   `OfferService` propagates through the loopback and reaches
-//!   the Client's update stream.
-//! * **`client_send_request_server_runloop_stable`** (19g) —
-//!   passive Server on stack A, Client on stack B drives
-//!   `add_endpoint` + `send_to_service` to push a SOME/IP
-//!   request through the embassy-net loopback. Asserts the
-//!   request serializes, transits, and lands on the Server's
-//!   run-loop without panicking. (No response assertion —
-//!   `simple_someip::Server` exposes no public request-handler
-//!   API, matching the parent-crate reference test.)
+//! * **`adapter_udp_roundtrip`** — bind two `EmbassyNetSocket`s,
+//!   one per stack, send a UDP datagram from A to B, assert
+//!   byte-equality + source-address. Tightest test of `bind` /
+//!   `send_to` / `recv_from` / `local_addr` end-to-end.
+//! * **`client_receives_server_sd_announcement`** — wire a real
+//!   `simple_someip::Server` on stack A with `run_with_buffers`
+//!   (the `!Send` path) and a real `simple_someip::Client` on
+//!   stack B with `Client::new_with_deps_local`. Assert the SD
+//!   multicast `OfferService` propagates through the loopback and
+//!   reaches the Client's update stream.
+//! * **`client_send_request_server_runloop_stable`** — passive
+//!   Server on stack A, Client on stack B drives `add_endpoint` +
+//!   `send_to_service` to push a SOME/IP request through the
+//!   embassy-net loopback. Asserts the request serializes,
+//!   transits, and lands on the Server's run-loop without
+//!   panicking. (No response assertion — `simple_someip::Server`
+//!   exposes no public request-handler API, matching the
+//!   parent-crate reference test.)
 //!
 //! Runtime: `#[tokio::test(flavor = "current_thread")]` plus a
 //! `LocalSet` driving the per-stack `spawn_local` runners.
 //! `Stack<LoopbackDriver>` is `!Sync` (RefCell internals), so
-//! `Stack::run()` is `!Send` — multi-threaded `tokio::spawn`
-//! does not type-check. The same constraint propagates through
-//! `EmbassyNetSocket` and forces the `_local` Client +
-//! `announcement_loop_local` Server paths.
+//! `Stack::run()` is `!Send` — multi-threaded `tokio::spawn` does
+//! not type-check. The same constraint propagates through
+//! `EmbassyNetSocket` and forces the `_local` Client paths plus
+//! `Server::run_with_buffers` (no `Send` bound).
 
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::task::{Context, Waker};
@@ -240,9 +238,8 @@ fn build_stack(driver: LoopbackDriver, ip: Ipv4Addr, seed: u64) -> &'static Stac
 // single-threaded test runtime: `#[tokio::test(flavor =
 // "current_thread")]` plus a `LocalSet` that drives the per-stack
 // `spawn_local` runners. The same constraint forces the SOME/IP
-// integration to use `Client::new_with_deps_local` (matching the
-// `LocalSpawner` trait shipped in phase 17 specifically for
-// !Send-bound transports).
+// integration to use `Client::new_with_deps_local` (the
+// `LocalSpawner`-trait counterpart for !Send-bound transports).
 
 const IP_A: Ipv4Addr = Ipv4Addr::new(169, 254, 1, 1);
 const IP_B: Ipv4Addr = Ipv4Addr::new(169, 254, 1, 2);
@@ -376,14 +373,13 @@ async fn factory_bind_accepts_wildcard_ip() {
         .await;
 }
 
-// ── SOME/IP Client+Server harness (phase 19g) ───────────────────────
+// ── SOME/IP Client+Server harness ───────────────────────────────────
 //
 // Adds a real `simple_someip::Client` + `simple_someip::Server` on
 // top of the two-stack loopback, exercising the bare-metal
-// constructors over `EmbassyNetFactory`. Phase 19f's `SocketHandle`
+// constructors over `EmbassyNetFactory`. The `SocketHandle`
 // abstraction lets `Server` accept `Arc<EmbassyNetSocket>` as its
-// `H` parameter even though `EmbassyNetSocket` is `!Sync`; without
-// that work the bounds at the impl-block level rejected the type.
+// `H` parameter even though `EmbassyNetSocket` is `!Sync`.
 //
 // Both tests run on `flavor = "current_thread"` + `LocalSet` because:
 //   - `Stack<LoopbackDriver>` is `!Sync` (RefCell internals), so
@@ -472,22 +468,31 @@ type SubKey = (u16, u16, u16, SocketAddrV4);
 struct MockSubscriptions(Arc<std::sync::Mutex<Vec<SubKey>>>);
 
 impl SubscriptionHandle for MockSubscriptions {
+    // Boxed `!Send` futures — the `spawn_local` paths that exercise
+    // this loopback don't need `Send` and the `Mutex` is only used
+    // synchronously inside.
+    type SubscribeFuture<'a> = core::pin::Pin<
+        Box<dyn core::future::Future<Output = Result<(), SubscribeError>> + 'a>,
+    >;
+    type UnsubscribeFuture<'a> =
+        core::pin::Pin<Box<dyn core::future::Future<Output = ()> + 'a>>;
+
     fn subscribe(
         &self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl core::future::Future<Output = Result<(), SubscribeError>> + '_ {
+    ) -> Self::SubscribeFuture<'_> {
         let this = self.0.clone();
-        async move {
+        Box::pin(async move {
             let mut guard = this.lock().unwrap();
             let key = (service_id, instance_id, event_group_id, subscriber_addr);
             if !guard.contains(&key) {
                 guard.push(key);
             }
             Ok(())
-        }
+        })
     }
 
     fn unsubscribe(
@@ -496,12 +501,12 @@ impl SubscriptionHandle for MockSubscriptions {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl core::future::Future<Output = ()> + '_ {
+    ) -> Self::UnsubscribeFuture<'_> {
         let this = self.0.clone();
-        async move {
+        Box::pin(async move {
             let mut guard = this.lock().unwrap();
             guard.retain(|e| *e != (service_id, instance_id, event_group_id, subscriber_addr));
-        }
+        })
     }
 
     fn for_each_subscriber<'a, F>(
@@ -593,7 +598,9 @@ async fn client_receives_server_sd_announcement() {
             let server_subs = MockSubscriptions::default();
             // Service id 0x5BAA (just a witness) at port 30500 on
             // stack A's interface IP.
-            let server_config = ServerConfig::new(IP_A, 30500, 0x5BAA, 1);
+            let server_config = ServerConfig::new(0x5BAA, 1)
+                .with_interface(IP_A)
+                .with_local_port(30500);
 
             let server_deps = ServerDeps {
                 factory: server_factory,
@@ -602,24 +609,29 @@ async fn client_receives_server_sd_announcement() {
                 subscriptions: server_subs,
             };
 
-            // Default `H = Arc<F::Socket>` (Phase 19f) — `Arc<T>:
+            // Default `H = Arc<F::Socket>`. `Arc<T>:
             // WrappableSocketHandle` works for any `T: TransportSocket
             // + 'static`, so `Arc<EmbassyNetSocket>` (which is
             // `!Sync`) compiles here. The annotation is explicit so
             // type inference doesn't have to chase `H` across the
             // deps-bundle indirection.
-            let server: Server<_, _, _, _, Arc<simple_someip_embassy_net::EmbassyNetSocket>> =
-                Server::new_with_deps(server_deps, server_config, false)
-                    .await
-                    .expect("server construction over embassy-net");
+            let (server, _handles, _run): (
+                Server<_, _, _, _, Arc<simple_someip_embassy_net::EmbassyNetSocket>>,
+                _,
+                _,
+            ) = Server::new_with_deps(server_deps, server_config, false)
+                .await
+                .expect("server construction over embassy-net");
 
-            // `announcement_loop_local`, NOT `announcement_loop`,
-            // because `EmbassyNetSocket` is `!Sync` — the
-            // Send-bounded variant doesn't typecheck for our `H`.
-            let announce_fut = server
-                .announcement_loop_local()
-                .expect("announcement_loop_local");
-            tokio::task::spawn_local(announce_fut);
+            // Receive + announce share the combined run-future. The
+            // constructor's `_run` is the alloc-backed version; we
+            // use `run_with_buffers` here because
+            // `EmbassyNetSocket: !Sync` makes the `_run` future
+            // `!Send` and we want explicit static buffers anyway.
+            tokio::task::spawn_local(server.run_with_buffers(
+                Box::leak(Box::new([0u8; 65535])),
+                Box::leak(Box::new([0u8; 65535])),
+            ));
 
             // ── Client on stack B ────────────────────────────────
             let client_pool: &'static SocketPool<8, LINK_MTU, LINK_MTU> =
@@ -709,7 +721,9 @@ async fn client_send_request_server_runloop_stable() {
             let service_id = 0x5BBB_u16;
             let instance_id = 1_u16;
             let server_port = 30600_u16;
-            let server_config = ServerConfig::new(IP_A, server_port, service_id, instance_id);
+            let server_config = ServerConfig::new(service_id, instance_id)
+                .with_interface(IP_A)
+                .with_local_port(server_port);
 
             let server_deps = ServerDeps {
                 factory: server_factory,
@@ -722,10 +736,13 @@ async fn client_send_request_server_runloop_stable() {
             // doesn't have to invent it across the deps-bundle
             // indirection. Same shape as the equivalent annotation
             // in `simple_someip`'s SD-NACK test.
-            let mut server: Server<_, _, _, _, Arc<simple_someip_embassy_net::EmbassyNetSocket>> =
-                Server::new_passive_with_deps(server_deps, server_config)
-                    .await
-                    .expect("passive server construction");
+            let (server, _handles, _run): (
+                Server<_, _, _, _, Arc<simple_someip_embassy_net::EmbassyNetSocket>>,
+                _,
+                _,
+            ) = Server::new_passive_with_deps(server_deps, server_config)
+                .await
+                .expect("passive server construction");
 
             // NOTE: we do NOT spawn `server.run()` here. A passive
             // server's `run()` returns `Err(InvalidUsage)`
@@ -735,7 +752,7 @@ async fn client_send_request_server_runloop_stable() {
             // so its unicast socket bind happens — the kernel-level
             // recv buffer absorbs the client's request bytes
             // independently of any application run-loop.
-            let _ = &mut server; // suppress unused-mut warning
+            let _ = &server; // anchor binding so the unicast bind sticks
 
             // ── Client on stack B ────────────────────────────────
             let client_pool: &'static SocketPool<8, LINK_MTU, LINK_MTU> =

@@ -884,6 +884,13 @@ pub const UNBOUNDED_DEFAULT_CAP: usize = 128;
 /// has no entries. The bounded entry shape is
 /// `((Type, slot_cap), pool_size)` to disambiguate the slot cap
 /// from the pool size in the macro grammar.
+///
+/// # Required entries for `Client`
+///
+/// To use the generated factory with [`crate::Client`], the macro
+/// invocation must declare the seven channel types enumerated by
+/// [`crate::client::ClientChannelTypes`]. See its rustdoc for the
+/// exhaustive list and a worked example.
 #[macro_export]
 macro_rules! define_static_channels {
     // Entry point: explicit visibility.

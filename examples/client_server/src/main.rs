@@ -119,25 +119,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         major_version: 1,
         minor_version: 0,
         ttl: 3,
-        ..ServerConfig::new(
-            interface,
-            MY_SERVER_PORT,
-            MY_SERVER_SERVICE_ID,
-            MY_SERVER_INSTANCE_ID,
-        )
+        ..ServerConfig::new(MY_SERVER_SERVICE_ID, MY_SERVER_INSTANCE_ID)
+            .with_interface(interface)
+            .with_local_port(MY_SERVER_PORT)
     };
 
-    let mut server = Server::new(config).await?;
+    // Dispatcher topology — the client drives all SD traffic via
+    // its own `sd_announcements_loop`, so we suppress the server's
+    // own announcement arm with `with_announce(false)`. The single
+    // returned run-future drives only the receive loop.
+    let config = config.with_announce(false);
+    let (_server, handles, run) = Server::new(config).await?;
     info!("Server bound on port {MY_SERVER_PORT}");
 
-    // NOTE: We intentionally do NOT spawn server.announcement_loop().
-    // The client's sd_announcements_loop handles all SD traffic.
-
-    let _publisher = server.publisher();
+    let _publisher = handles.publisher;
 
     // Spawn the server event loop (handles incoming subscriptions).
     let _server_handle = tokio::spawn(async move {
-        if let Err(e) = server.run().await {
+        if let Err(e) = run.await {
             error!("Server error: {e}");
         }
     });

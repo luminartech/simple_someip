@@ -129,7 +129,7 @@ impl SubscriptionManager {
             // bump on re-subscribe) are wanted later, update the per-
             // subscriber record here and rename the log accordingly.
             if subscribers.iter().any(|s| s.address == subscriber_addr) {
-                tracing::debug!(
+                crate::log::debug!(
                     "Subscriber {} already subscribed for service 0x{:04X}, instance {}, \
                      event group 0x{:04X}; skipping duplicate",
                     subscriber_addr,
@@ -143,7 +143,7 @@ impl SubscriptionManager {
             let subscriber =
                 Subscriber::new(subscriber_addr, service_id, instance_id, event_group_id);
             if subscribers.push(subscriber).is_err() {
-                tracing::warn!(
+                crate::log::warn!(
                     "Subscribers-per-group at capacity ({}); dropping new subscriber {} \
                      for service 0x{:04X}, instance {}, event group 0x{:04X}",
                     SUBSCRIBERS_PER_GROUP,
@@ -155,7 +155,7 @@ impl SubscriptionManager {
                 return Err(SubscribeError::SubscribersPerGroupFull);
             }
 
-            tracing::info!(
+            crate::log::info!(
                 "Subscriber {} added for service 0x{:04X}, instance {}, event group 0x{:04X}",
                 subscriber_addr,
                 service_id,
@@ -184,7 +184,7 @@ impl SubscriptionManager {
         );
 
         if self.subscriptions.insert(key, list).is_err() {
-            tracing::warn!(
+            crate::log::warn!(
                 "Event-group map at capacity ({}); dropping subscriber {} for new group \
                  service 0x{:04X}, instance {}, event group 0x{:04X}",
                 EVENT_GROUPS_CAP,
@@ -196,7 +196,7 @@ impl SubscriptionManager {
             return Err(SubscribeError::EventGroupsFull);
         }
 
-        tracing::info!(
+        crate::log::info!(
             "Subscriber {} added for service 0x{:04X}, instance {}, event group 0x{:04X}",
             subscriber_addr,
             service_id,
@@ -223,7 +223,7 @@ impl SubscriptionManager {
                 self.subscriptions.remove(&key);
             }
 
-            tracing::info!(
+            crate::log::info!(
                 "Removed subscriber {} from service 0x{:04X}, instance {}, event group 0x{:04X}",
                 subscriber_addr,
                 service_id,
@@ -281,11 +281,42 @@ impl Default for SubscriptionManager {
 /// critical-section-backed equivalents on bare metal. The futures
 /// returned by the methods are not required to be `Send`, allowing
 /// single-threaded executors (embassy-style) to satisfy the trait
-/// without an `Arc<RwLock>`-style shared state.
+/// without an `Arc<RwLock>`-style shared state. Implementations on
+/// multi-threaded executors are free to make their `SubscribeFuture`
+/// / `UnsubscribeFuture` `Send`, which lets `Server::run` (the
+/// `Send`-bounded entry point used by `tokio::spawn`) accept them via
+/// the `for<'a> Sub::SubscribeFuture<'a>: Send` bound.
+///
+/// `subscribe` and `unsubscribe` use named [GATs] (rather than
+/// return-position `impl Trait`) so `Server::run`'s where clause can
+/// spell their `Send`-ness explicitly. `for_each_subscriber` stays
+/// as RPIT — it is called by
+/// [`EventPublisher::publish_event`](crate::server::EventPublisher),
+/// not by the SD run-future, so no `Send` bound on it is currently
+/// load-bearing.
+///
+/// [GATs]: https://blog.rust-lang.org/2022/10/28/gats-stabilization.html
 ///
 /// Both `Server` and `EventPublisher` clone the same handle at construction
 /// time; the underlying subscription state is shared between them.
 pub trait SubscriptionHandle: Clone + 'static {
+    /// Future returned by [`Self::subscribe`].
+    ///
+    /// Implementations choose the concrete type and decide whether to
+    /// implement `Send` / `Sync` on it. Tokio-backed implementations
+    /// (`Arc<RwLock<SubscriptionManager>>`) box a `Send` future so
+    /// `Server::run`'s `Send` where clause is satisfiable; bare-metal
+    /// implementations are free to leave it `!Send`.
+    type SubscribeFuture<'a>: Future<Output = Result<(), SubscribeError>> + 'a
+    where
+        Self: 'a;
+
+    /// Future returned by [`Self::unsubscribe`]. Same `Send`-or-not
+    /// freedom as [`Self::SubscribeFuture`].
+    type UnsubscribeFuture<'a>: Future<Output = ()> + 'a
+    where
+        Self: 'a;
+
     /// Add a subscriber to an event group.
     ///
     /// Idempotent: if the subscriber is already present, this is a no-op
@@ -297,7 +328,7 @@ pub trait SubscriptionHandle: Clone + 'static {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), SubscribeError>> + '_;
+    ) -> Self::SubscribeFuture<'_>;
 
     /// Remove a subscriber from an event group.
     fn unsubscribe(
@@ -306,7 +337,7 @@ pub trait SubscriptionHandle: Clone + 'static {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = ()> + '_;
+    ) -> Self::UnsubscribeFuture<'_>;
 
     /// Visit each subscriber for the given event group with `f`.
     ///
@@ -333,19 +364,28 @@ pub trait SubscriptionHandle: Clone + 'static {
 
 #[cfg(feature = "server-tokio")]
 impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
+    /// Boxed `Send` future so `Server::run`'s `Send` bound is
+    /// satisfiable. The `Box::pin` allocation happens at SD-rate
+    /// (~1 Hz subscribes during steady state), small cost relative to
+    /// the wire-side activity it gates.
+    type SubscribeFuture<'a> =
+        core::pin::Pin<alloc::boxed::Box<dyn Future<Output = Result<(), SubscribeError>> + Send + 'a>>;
+    type UnsubscribeFuture<'a> =
+        core::pin::Pin<alloc::boxed::Box<dyn Future<Output = ()> + Send + 'a>>;
+
     fn subscribe(
         &self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
+    ) -> Self::SubscribeFuture<'_> {
         let this = self.clone();
-        async move {
+        alloc::boxed::Box::pin(async move {
             this.write()
                 .await
                 .subscribe(service_id, instance_id, event_group_id, subscriber_addr)
-        }
+        })
     }
 
     fn unsubscribe(
@@ -354,16 +394,16 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = ()> + '_ {
+    ) -> Self::UnsubscribeFuture<'_> {
         let this = self.clone();
-        async move {
+        alloc::boxed::Box::pin(async move {
             this.write().await.unsubscribe(
                 service_id,
                 instance_id,
                 event_group_id,
                 subscriber_addr,
             );
-        }
+        })
     }
 
     fn for_each_subscriber<'a, F>(
@@ -452,15 +492,31 @@ pub mod bare_metal_subscription_impl {
     }
 
     impl SubscriptionHandle for StaticSubscriptionHandle {
+        // Futures are `Send` even though `SubscriptionManager` itself
+        // isn't `Sync` — the `embassy-sync`
+        // `CriticalSectionRawMutex` wrapping it IS `Sync`, and the
+        // future bodies have no `.await` points inside the lock
+        // closure (they capture only the `&'static` storage handle
+        // and the by-value args, all `Send`). Boxing with `+ Send`
+        // lets `Server::run`'s `Send` bound be satisfied. The
+        // `server` feature (required for `SubscriptionHandle` to be
+        // in scope) implies `_alloc`, so `Box::pin` is always
+        // available here.
+        type SubscribeFuture<'a> = core::pin::Pin<
+            alloc::boxed::Box<dyn Future<Output = Result<(), SubscribeError>> + Send + 'a>,
+        >;
+        type UnsubscribeFuture<'a> =
+            core::pin::Pin<alloc::boxed::Box<dyn Future<Output = ()> + Send + 'a>>;
+
         fn subscribe(
             &self,
             service_id: u16,
             instance_id: u16,
             event_group_id: u16,
             subscriber_addr: SocketAddrV4,
-        ) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
+        ) -> Self::SubscribeFuture<'_> {
             let storage = self.0;
-            async move {
+            alloc::boxed::Box::pin(async move {
                 storage.lock(|cell| {
                     cell.borrow_mut().subscribe(
                         service_id,
@@ -469,7 +525,7 @@ pub mod bare_metal_subscription_impl {
                         subscriber_addr,
                     )
                 })
-            }
+            })
         }
 
         fn unsubscribe(
@@ -478,9 +534,9 @@ pub mod bare_metal_subscription_impl {
             instance_id: u16,
             event_group_id: u16,
             subscriber_addr: SocketAddrV4,
-        ) -> impl Future<Output = ()> + '_ {
+        ) -> Self::UnsubscribeFuture<'_> {
             let storage = self.0;
-            async move {
+            alloc::boxed::Box::pin(async move {
                 storage.lock(|cell| {
                     cell.borrow_mut().unsubscribe(
                         service_id,
@@ -489,7 +545,7 @@ pub mod bare_metal_subscription_impl {
                         subscriber_addr,
                     );
                 });
-            }
+            })
         }
 
         fn for_each_subscriber<'a, F>(

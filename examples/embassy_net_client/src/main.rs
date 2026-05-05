@@ -269,22 +269,26 @@ type SubKey = (u16, u16, u16, SocketAddrV4);
 struct InMemorySubscriptions(Arc<Mutex<Vec<SubKey>>>);
 
 impl SubscriptionHandle for InMemorySubscriptions {
+    type SubscribeFuture<'a> =
+        core::pin::Pin<Box<dyn Future<Output = Result<(), SubscribeError>> + 'a>>;
+    type UnsubscribeFuture<'a> = core::pin::Pin<Box<dyn Future<Output = ()> + 'a>>;
+
     fn subscribe(
         &self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
+    ) -> Self::SubscribeFuture<'_> {
         let this = self.0.clone();
-        async move {
+        Box::pin(async move {
             let mut g = this.lock().unwrap();
             let k = (service_id, instance_id, event_group_id, subscriber_addr);
             if !g.contains(&k) {
                 g.push(k);
             }
             Ok(())
-        }
+        })
     }
 
     fn unsubscribe(
@@ -293,12 +297,12 @@ impl SubscriptionHandle for InMemorySubscriptions {
         instance_id: u16,
         event_group_id: u16,
         subscriber_addr: SocketAddrV4,
-    ) -> impl Future<Output = ()> + '_ {
+    ) -> Self::UnsubscribeFuture<'_> {
         let this = self.0.clone();
-        async move {
+        Box::pin(async move {
             let mut g = this.lock().unwrap();
             g.retain(|e| *e != (service_id, instance_id, event_group_id, subscriber_addr));
-        }
+        })
     }
 
     fn for_each_subscriber<'a, F>(
@@ -363,7 +367,7 @@ async fn main() {
                 Box::leak(Box::new(SocketPool::new()));
             let server_factory = EmbassyNetFactory::new(stack_a, server_pool);
             let server_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
-            let server_config = ServerConfig::new(IP_A, 30500, SERVICE_ID, INSTANCE_ID);
+            let server_config = ServerConfig::new(SERVICE_ID, INSTANCE_ID).with_interface(IP_A).with_local_port(30500);
 
             let server_deps = ServerDeps {
                 factory: server_factory,
@@ -372,24 +376,28 @@ async fn main() {
                 subscriptions: InMemorySubscriptions::default(),
             };
 
-            // Phase 19f: default `H = Arc<F::Socket>`. Annotation
-            // is explicit because type inference can't chase H
-            // across the `ServerDeps` indirection.
-            let server: Server<_, _, _, _, Arc<EmbassyNetSocket>> =
-                Server::new_with_deps(server_deps, server_config, false)
-                    .await
-                    .expect("server construction over embassy-net");
+            // Default `H = Arc<F::Socket>`. Annotation is explicit
+            // because type inference can't chase H across the
+            // `ServerDeps` indirection. We use `run_with_buffers`
+            // instead of the alloc-backed `run` returned from the
+            // constructor because `EmbassyNetSocket: !Sync` makes
+            // the `run`-future `!Send`; ignoring it and re-building
+            // via `run_with_buffers` keeps us on the `spawn_local`
+            // path.
+            let (server, _handles, _run): (
+                Server<_, _, _, _, Arc<EmbassyNetSocket>>,
+                _,
+                _,
+            ) = Server::new_with_deps(server_deps, server_config, false)
+                .await
+                .expect("server construction over embassy-net");
 
-            // `_local` because `EmbassyNetSocket: !Sync` (it borrows
-            // from `Stack<LoopbackDriver>`'s `RefCell`-bearing
-            // internals); the Send-bounded `announcement_loop`
-            // doesn't typecheck for our `H`.
-            let announce_fut = server
-                .announcement_loop_local()
-                .expect("announcement_loop_local");
-            tokio::task::spawn_local(announce_fut);
+            tokio::task::spawn_local(server.run_with_buffers(
+                Box::leak(Box::new([0u8; 65535])),
+                Box::leak(Box::new([0u8; 65535])),
+            ));
             println!(
-                "[server] announcement loop spawned, emitting OfferService(0x{SERVICE_ID:04X}) every 1s"
+                "[server] run loop spawned, emitting OfferService(0x{SERVICE_ID:04X}) every 1s"
             );
 
             // ── Client on stack B ────────────────────────────────

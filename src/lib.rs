@@ -115,9 +115,8 @@ extern crate std;
 // - `server` — `EventPublisher` and the `Server` struct hold
 //   `Arc<EventPublisher<...>>` / `Arc<F::Socket>` for sharing
 //   between the run loop and external publishing tasks. A
-//   future refactor may switch to `&'static` borrows so the
-//   server compiles in pure no_std without an allocator;
-//   tracked in `bare_metal_plan_v3.md` Phase 21+ backlog.
+//   the `&'static`-borrow refactor tracked in #115 would let
+//   server compile in pure no_std without an allocator.
 //
 // The `static_channels` module (under `bare_metal` alone) does
 // NOT need alloc — users wanting `client` + `bare_metal` without
@@ -161,6 +160,7 @@ pub const UDP_BUFFER_SIZE: usize = 1500;
 /// SOME/IP client for discovering services and exchanging messages.
 #[cfg(feature = "client")]
 pub mod client;
+mod log;
 /// End-to-end (E2E) protection utilities for SOME/IP payloads.
 pub mod e2e;
 /// SOME/IP protocol primitives: headers, messages, return codes, and service discovery.
@@ -215,9 +215,17 @@ pub use traits::{OfferedEndpoint, PayloadWireFormat, WireFormat};
 pub use client::{
     Client, ClientDeps, ClientUpdate, ClientUpdates, DiscoveryMessage, PendingResponse,
 };
+// `ClientChannelTypes`, `ControlMessage`, `SendMessage`, `ReceivedMessage`
+// are intentionally NOT re-exported at crate root — they are
+// implementation-detail-with-a-public-name (reachable as
+// `simple_someip::client::ControlMessage` etc. for the
+// `define_static_channels!` macro) rather than first-class crate-API
+// types. Elevating them to crate root would lock their shape into
+// the public-API contract and tempt generic users into hitting the
+// `ClientChannelTypes` elaboration limit at the wrong call site.
 pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
-pub use server::{Server, ServerDeps, ServerHandles, SubscriptionHandle};
+pub use server::{Server, ServerDeps, ServerHandles, ServerStorage, SubscriptionHandle};
 #[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
 #[cfg(feature = "bare_metal")]

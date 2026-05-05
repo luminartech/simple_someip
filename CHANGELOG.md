@@ -1,13 +1,146 @@
 # Changelog
 
-## [Unreleased]
+## [0.8.0]
 
-### Added
+### Client/Server API symmetry & ergonomics
+
+The 0.8.0 ergonomics pass aligning the public Client and Server surfaces, removing the tokio-only `Server::new` cliff, and improving discoverability for bare-metal adopters. Six bundled changes: generic-parameter alignment, tokio-defaulted `Deps` builders, channel-types rustdoc, `ServerConfig` fluent builder, `Server::new` constructor reshape (the one breaking change in this set), and `SubscriptionHandle` GAT promotion. Migration shapes below are written against the previous published version (0.7.0); `cargo build` will surface every remaining call-site.
+
+#### Breaking — `SubscriptionHandle::SubscribeFuture` / `UnsubscribeFuture` are now [generic associated types]
+
+The `subscribe` and `unsubscribe` methods on `SubscriptionHandle` previously returned `impl Future<…> + '_` (return-position impl Trait). They are now named GATs:
+
+```rust
+pub trait SubscriptionHandle: Clone + 'static {
+    type SubscribeFuture<'a>: Future<Output = Result<(), SubscribeError>> + 'a where Self: 'a;
+    type UnsubscribeFuture<'a>: Future<Output = ()> + 'a where Self: 'a;
+
+    fn subscribe(...) -> Self::SubscribeFuture<'_>;
+    fn unsubscribe(...) -> Self::UnsubscribeFuture<'_>;
+    // for_each_subscriber stayed RPIT — no Server::run-side bound needs it.
+}
+```
+
+Implementors must now spell their concrete return type (typically `Pin<Box<dyn Future<Output = …> + Send + 'a>>`). All four in-tree implementations (`Arc<RwLock<SubscriptionManager>>`, `StaticSubscriptionHandle`, the example `InMemorySubscriptions`, three test `MockSubscriptions` variants) were converted; downstream implementors will hit a compile error that names the missing associated types verbatim.
+
+Why this is worth a breaking change: it lets [`Server::run`]'s where clause spell `for<'a> Sub::SubscribeFuture<'a>: Send`, which in turn lets the function declare `+ Send` on its return type instead of relying on auto-trait inference. Compile errors for `tokio::spawn`-vs-`!Send`-handle mismatches now surface at the library boundary instead of deep inside `tokio::spawn`'s bound check.
+
+[generic associated types]: https://blog.rust-lang.org/2022/10/28/gats-stabilization.html
+
+##### Migration
+
+Before:
+
+```rust
+impl SubscriptionHandle for MyHandle {
+    fn subscribe(&self, ...) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
+        async move { /* … */ }
+    }
+    fn unsubscribe(&self, ...) -> impl Future<Output = ()> + '_ {
+        async move { /* … */ }
+    }
+}
+```
+
+After:
+
+```rust
+impl SubscriptionHandle for MyHandle {
+    type SubscribeFuture<'a> =
+        Pin<Box<dyn Future<Output = Result<(), SubscribeError>> + Send + 'a>>;
+    type UnsubscribeFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    fn subscribe(&self, ...) -> Self::SubscribeFuture<'_> {
+        Box::pin(async move { /* … */ })
+    }
+    fn unsubscribe(&self, ...) -> Self::UnsubscribeFuture<'_> {
+        Box::pin(async move { /* … */ })
+    }
+}
+```
+
+Drop `+ Send` from the type aliases on `!Send` handles (rare). The `Box::pin` allocation happens at SD-rate (typically ≤ 1 Hz subscribes during steady-state SD churn), small cost relative to the wire activity it gates.
+
+
+
+#### Breaking — `Server::new` now returns a `(Server, ServerHandles, run-future)` tuple
+
+`Server::new` (and the `new_with_loopback`, `new_passive`, `new_with_deps`, `new_passive_with_deps` variants) now mirrors `Client::new`'s shape: the constructor returns a three-tuple of `(Server, ServerHandles, impl Future + 'static)` instead of just `Server`. The single returned run-future drives the receive loop *and* the SD `OfferService` announcement loop concurrently, so callers no longer have to remember to spawn `announcement_loop` separately. The runtime check that used to live on `Server::announcement_loop` ("called on passive server" → `Err`) is now structurally impossible because the announcement loop has no separate entry point. The dispatcher topology where a co-located `Client` drives SD announcements is now opted into via [`ServerConfig::with_announce(false)`] instead of "just don't call this method".
+
+`Server::new_with_handles` and `Server::new_passive_with_handles` are unchanged — bare-metal callers still get back `Self` and call `server.run_with_buffers(unicast, sd)` directly with their own static buffers. The combined receive + announce select runs in `run_with_buffers` too.
+
+The previous `ServerHandles` type (the no-alloc deps bundle accepted by `new_with_handles`) was renamed to **`ServerStorage`** to free the `ServerHandles` name for the new post-construction accessor struct returned from `Server::new`. The eight fields are unchanged.
+
+##### Migration
+
+Before:
+
+```rust
+let mut server = Server::new(config).await?;
+let publisher = server.publisher();
+tokio::spawn(server.announcement_loop()?);
+tokio::spawn(async move {
+    if let Err(e) = server.run().await { /* … */ }
+});
+```
+
+After:
+
+```rust
+let (_server, handles, run) = Server::new(config).await?;
+let publisher = handles.publisher;
+tokio::spawn(async move {
+    if let Err(e) = run.await { /* … */ }
+});
+```
+
+Bare-metal-no-alloc, before:
+
+```rust
+let server = Server::new_with_handles(deps, config)?;
+let announce = server.announcement_loop_local()?;
+spawn_local(announce);
+spawn_local(server.run_with_buffers(unicast_buf, sd_buf));
+```
+
+After:
+
+```rust
+let server = Server::new_with_handles(deps, config)?;
+spawn_local(server.run_with_buffers(unicast_buf, sd_buf));
+```
+
+(`run_with_buffers` is now the combined receive + announce future.)
+
+Dispatcher topology (was: implicit "just don't call announcement_loop") becomes explicit:
+
+```rust
+let config = ServerConfig::new(svc, inst).with_announce(false);
+let (_server, _handles, run) = Server::new(config).await?;
+tokio::spawn(run);  // receive only; co-located Client drives SD
+```
+
+#### Removed
+
+- **`Server::announcement_loop` / `Server::announcement_loop_local`** — folded into the combined run-future. The `announcement_loop_started: AtomicBool` latch that protected against two simultaneously-driven announcement futures is gone with them (single entry point makes the failure mode structurally impossible).
+- **`Server::set_local_port`** — vestigial. The bind-time back-fill on `new_with_deps` / `new_with_handles` already records the kernel-assigned port into `config.local_port` before `Server::new` returns, and mutating it post-construction would lie to peers about an endpoint the unicast socket isn't actually bound to (the same failure mode `new_with_handles` rejects with `local_port_mismatch`). Both in-tree call sites were no-ops.
+
+#### Added (additive — no migration)
+
+- **`ServerHandles<Hep>`** — post-construction accessor bundle returned alongside `Server` from `Server::new`. Single public field today: `publisher`. Reserved for future fields (e.g. a `BindCompleted` oneshot if a real adopter asks).
+- **`ServerConfig::announce: bool`** + **`with_announce(bool)`** fluent setter. Defaults to `true`. Set to `false` for the dispatcher topology.
+- **`ServerStorage<F, Tm, R, Sub, H, Hsd, Hep>`** (replaces the old `ServerHandles` deps bundle name).
+- **21a — generic-parameter alignment** across `Client`, `Server`, `ClientDeps`, `ServerDeps`. Letter-collisions between Spawner (`S` on Client) and SubscriptionHandle (`S` on Server) resolved (`Sp` and `Sub` respectively).
+- **21c — tokio-defaulted `Deps` builders.** `ClientDeps::tokio()` and `ServerDeps::tokio()` produce a fully-defaulted bundle; chain `with_factory` / `with_timer` / `with_e2e_registry` / `with_subscriptions` / `with_spawner` / `with_local_spawner` to override individual fields without spelling the rest out.
+- **21d — discoverable channel types.** New `ClientChannelTypes` trait alias surfaces the set of channel types that `define_static_channels!` must populate; `client::channels` re-exports the relevant types with rustdoc that names each as "channel type for `define_static_channels!`."
+- **21e — `ServerConfig` fluent builder.** Existing struct-literal route stays open; `ServerConfig::new(svc, inst).with_interface(…).with_local_port(…).with_ttl(…).with_event_group(…).with_announce(…)` is the recommended path in docs.
+
+### Added — correctness & no_std cleanup
 
 - **`simple-someip-embassy-net::LINK_MTU`** — `pub const usize = 1500` shared by the loopback driver and example consumers for sizing `SocketPool` RX/TX buffers and `Capabilities::max_transmission_unit`. Distinct from `simple_someip::UDP_BUFFER_SIZE` (an *application*-payload cap) — they coincide at 1500 today but are conceptually orthogonal.
 - **Per-package pedantic clippy CI gates** for `simple-someip` under `client+bare_metal`, `server+bare_metal`, and `client+server+bare_metal`. The pre-existing `--workspace --all-features` gate is feature-unified and could mask feature-set regressions; per-package gates surface a regression against its responsible feature flag.
 
-### Changed
+### Changed — correctness & no_std cleanup
 
 - **`SocketOptions` docs** — explicit Linux-side guidance that the SD socket needs both `SO_REUSEADDR` and `SO_REUSEPORT` (Linux ties multicast-group membership to the REUSEPORT group).
 - **`SdStateManager::with_initial` and `next_session_id_with_reboot_flag`** lifted from `pub(super)` to `pub` so external test harnesses can pre-seed counter state and validate wrap-around behaviour without a full Server lifecycle. The remaining racy accessors stay `pub(super) + cfg(test)`.
@@ -18,7 +151,7 @@
 - **`Server::run_with_buffers` doc example** — replaced unsound `&mut UNICAST_BUF` on `static mut` (hard error in Rust 2024) with a `static UnsafeCell<[u8; …]>` + `unsafe impl Sync` pattern.
 - **Three event-loop sites** (`client/inner.rs`, `client/socket_manager.rs`, `server/mod.rs`) — comments referenced `select!` while the code used `select_biased!`. Server and socket_manager's 2-arm selects now flip arm priority each iteration to approximate the fairness `select!` would give without pulling `std`. Comments rewritten to match.
 
-### Fixed
+### Fixed — correctness & no_std cleanup
 
 - **`tools/size_probe::someip_header_encode`** — `MessageType::try_from(byte & 0xBF)` masked off bit 6 before validation (`0x40` silently coerced to `Request`); switched to `MessageTypeField::try_from(byte)`. The encoder also ignored the caller's `length` field and hardcoded `payload_len = 0`; now derives `payload_len = length - 8` with `checked_sub`.
 - **`simple-someip-embassy-net::EmbassyNetFactory`** — dropped a bogus `'pool` lifetime parameter and an identity-only `mem::transmute<&SocketPool, &'static>`. Factory now takes `&'static SocketPool` directly. Marked `!Send + !Sync` via `PhantomData<*const ()>` because embassy-net's `Stack` interior `RefCell` is not safe to drive `bind()` on from multiple threads.
@@ -36,9 +169,7 @@
 - **Embassy-net loopback test rename pretext** — `client_send_request_server_runloop_stable` was vacuous (passive server's `run()` returns `Err(InvalidUsage)` immediately). Removed the no-op spawn and rewrote the doc to honestly describe what the test verifies (the client's send path).
 - **Adversarial-pass micro-issues**: `payload_len + 12` / `payload_len + 4` 32-bit wrap in size_probe (now `checked_add`); `PanicAllocator` → `NullAllocator` (it returns null, doesn't panic); `EmbassyNetBindFuture::poll` panicked on second poll (now wraps `core::future::Ready` for stdlib panic message + standard semantics); `EventPublisher`'s `PhantomData<T>` → `PhantomData<fn() -> T>` (no redundant `Send + Sync` re-imposition).
 
-## [0.8.0]
-
-### Added
+### Added — 0.7.0 → 0.8.0 surface baseline
 
 - **`client::Error::Capacity(&'static str)`** — new variant returned when a fixed-capacity internal structure is full. Current tags: `"unicast_sockets"`, `"udp_buffer"`, `"pending_responses"`, `"request_queue"`. Because `client::Error` is not `#[non_exhaustive]`, this is a breaking change for downstream crates that match the enum exhaustively.
 - **`client::Error::Transport(crate::transport::TransportError)`** — new variant surfacing failures from the pluggable transport backend (`#[from]`-converted, displays transparently). Same exhaustive-match caveat as above.
@@ -57,7 +188,7 @@
 - **`E2ERegistryFull`** — new typed error returned by `E2ERegistry::register` (and propagated through `E2ERegistryHandle::register` / `Client::register_e2e` / `Server::register_e2e`) when the fixed-capacity registry is at its `E2E_REGISTRY_CAP` limit. Replacing an already-registered key still always succeeds.
 - **`PayloadWireFormat::for_each_offered_endpoint` / `for_each_service_instance`** — visitor-pattern methods replacing the previous `Vec`-returning `offered_endpoints` / `service_instances`. Lets the `Client` run loop iterate SD entries without per-message heap allocation, which was the last bare-metal blocker on the receive path. The `Vec`-returning forms are preserved as `cfg(feature = "std")` convenience wrappers that delegate to the visitors, so std consumers keep the original ergonomic shape.
 
-### Changed
+### Changed — 0.7.0 → 0.8.0 surface baseline
 
 - **Breaking: `Client::new(interface)` return shape** — previously returned `(Client, ClientUpdates)`; now returns `(Client, ClientUpdates, impl Future<Output = ()> + Send + 'static)`. The third element is the run-loop future, which the caller MUST drive (typically via `tokio::spawn`) for any `Client` method to make progress. Migration: change destructuring to a 3-tuple and spawn or otherwise actively poll the future.
 - **Breaking: `Server::start_announcing` removed → `Server::announcement_loop`** — the new method returns `Result<impl Future<Output = ()> + Send + 'static, Error>` (annotated `#[must_use]`). Spawn the returned future to fire announcements; calling and dropping the future is a silent no-op.
@@ -71,7 +202,7 @@
 - **Breaking: `Server::new` type signature now `Server::<R, S, F, Tm>::new`** — the `Server` struct gained type parameters for the pluggable backends. The tokio-default convenience constructor is now gated behind the `server-tokio` feature (was `server`). Migration: add `features = ["server-tokio"]` to continue using `Server::new`; trait-surface consumers use `Server::new_with_deps`.
 - **Breaking: `SubscriptionHandle` trait redesigned** — the previous `get_subscribers(&self, …) -> impl Future<Output = Vec<Subscriber>>` method has been replaced with `for_each_subscriber(&self, …, f: FnMut)` visitor pattern. This allows `EventPublisher::publish_event` to copy subscriber addresses into a stack buffer (`heapless::Vec<_, 16>`) instead of allocating per-event. Implementors of custom `SubscriptionHandle` must migrate.
 - **Breaking: `SubscriptionHandle` RPITIT futures no longer `+ Send`** — the `subscribe`, `unsubscribe`, and `for_each_subscriber` methods now return `impl Future<…>` without a `+ Send` bound. This enables single-threaded lock-free implementations on bare-metal targets, but means `SubscriptionHandle` trait objects cannot be held across `.await` points in multi-threaded executors. Direct usage with the default `Arc<RwLock<SubscriptionManager>>` is unaffected.
-- **Breaking: `client` and `server` features no longer imply `std`** — previously `client = ["std", "dep:futures"]` and `server = ["std", "dep:futures"]`; now `client = ["dep:futures-util"]` and `server = ["dep:futures-util"]`. The `std` feature moved to `client-tokio` / `server-tokio`, which is where it belongs (the tokio backends genuinely require std). Bare-metal trait-surface consumers (`features = ["client", "bare_metal"]`) compile in pure no_std now. `server` still pulls `extern crate alloc` because `Server` holds `Arc<EventPublisher>` and `EventPublisher` holds `Arc<F::Socket>` — documented in `lib.rs`; refactor to `&'static` borrows is tracked for a future phase.
+- **Breaking: `client` and `server` features no longer imply `std`** — previously `client = ["std", "dep:futures"]` and `server = ["std", "dep:futures"]`; now `client = ["dep:futures-util"]` and `server = ["dep:futures-util"]`. The `std` feature moved to `client-tokio` / `server-tokio`, which is where it belongs (the tokio backends genuinely require std). Bare-metal trait-surface consumers (`features = ["client", "bare_metal"]`) compile in pure no_std now. `server` still pulls `extern crate alloc` because `Server` holds `Arc<EventPublisher>` and `EventPublisher` holds `Arc<F::Socket>` — documented in `lib.rs`; refactor to `&'static` borrows is tracked in #115.
 - **Breaking: optional dep `futures` replaced with `futures-util`** — direct dependency on `futures-util` with features `["async-await", "async-await-macro"]`. The `futures` umbrella crate's `select!` macro re-export is gated on its `std` feature, which transitively pulls `slab` / `memchr` / `futures-io` and breaks no_std cross-compiles. `futures-util` provides `select_biased!`, `pin_mut!`, and `FutureExt` under just `async-await(-macro)`.
 - **Breaking: internal `select!` → `select_biased!`** — `Inner::run_future`, `socket_loop_future`, and `server::run` now poll their select arms top-first instead of pseudo-randomly. For these workloads the bias gives slightly better behavior (control messages, sends, and unicast recvs get priority over their lower-priority siblings) and there is no genuine starvation path because the higher-priority arms are sporadic. The change is observable only under contrived workloads where every arm is permanently ready simultaneously.
 - **Breaking: `PayloadWireFormat::offered_endpoints` / `service_instances` replaced by visitor-pattern methods** — see `for_each_offered_endpoint` / `for_each_service_instance` in "Added" above. Implementors of custom `PayloadWireFormat` types must override the visitors instead of the `Vec`-returning forms. The `Vec`-returning forms remain as default-implemented `cfg(feature = "std")` convenience wrappers, so std callers' code keeps compiling unchanged.
@@ -81,13 +212,13 @@
 - **Breaking: `server::Error::Io(std::io::Error)` now `cfg(feature = "std")`** — the variant is gated on `feature = "std"` because `std::io::Error` is itself std-only. No-std consumers receive transport failures via `Error::Transport(TransportError)` which carries the portable `IoErrorKind`.
 - **Breaking: misuse paths on `Server::announcement_loop` / `Server::run` return `Error::InvalidUsage(...)`** — previously these returned `Error::Io(std::io::Error::new(InvalidInput, ..))` with a formatted message. The new variant is no_std-friendly and carries a machine-readable `&'static str` tag (`"passive_server_announcement_loop"`, `"announcement_loop_already_started"`, `"passive_server_run"`); the diagnostic moves to `tracing::warn!`.
 - **Breaking: `server::SubscriptionManager::get_subscribers` now `cfg(feature = "std")`** — convenience accessor returning a heap `Vec<Subscriber>`. Production code paths use `for_each_subscriber` (visitor) since 0.8.0; this accessor remains for std consumers' tests and ad-hoc tooling. No_std consumers must use `for_each_subscriber`.
-- **Breaking: `server::ServiceInfo` / `server::EventGroupInfo` now `cfg(feature = "std")`** — both types' `pub` fields hold `Vec<...>`. Bare-metal consumers don't construct these types today; if the use case emerges, a future port will switch to `heapless::Vec`. `Subscriber` is unaffected and stays no_std.
+- **Breaking: `server::ServiceInfo` / `server::EventGroupInfo` now `cfg(feature = "std")`** — both types' `pub` fields hold `Vec<...>`. Bare-metal consumers don't construct these types today; if the use case emerges, a port to `heapless::Vec` is tracked in #116. `Subscriber` is unaffected and stays no_std.
 - **Breaking: `E2ERegistry` API change** — backing storage migrated from `std::collections::HashMap` to `heapless::index_map::FnvIndexMap` (cap = `E2E_REGISTRY_CAP = 32`, exposed). `E2ERegistry::register` now returns `Result<(), E2ERegistryFull>`; replacing an already-registered key always succeeds, adding a new key past the cap returns `Err`. `E2ERegistry::new()` is now `const`. The module is no longer `cfg(feature = "std")` — `E2ERegistry` works in pure no_std.
 - **Breaking: `E2ERegistryHandle::register` trait method now returns `Result<(), E2ERegistryFull>`** — propagates the new typed overflow from `E2ERegistry::register` through every handle impl. Callers (`Client::register_e2e`, `Server::register_e2e`) lift the `Result` through to their public surface.
 - `client::Error::Transport` adopts `#[error(transparent)]` Display delegation (the previous wrapping with `{:?}` debug-formatted the inner `TransportError`); user-facing error strings are now stable.
 - Subscribe-NACK reason strings normalized to `snake_case` for log consistency: `wrong_service_id`, `wrong_instance_id`, `wrong_major_version`, `no_endpoint_in_options`, `subscribers_per_group_full`, `event_groups_full`. Wire format is unchanged (NACK is signalled by `TTL=0`).
 
-### Fixed
+### Fixed — 0.7.0 → 0.8.0 surface baseline
 
 - **`server::EventPublisher::publish_event` no longer silently sends UNPROTECTED payloads on E2E protect failure** — counter exhaustion / key-lookup races etc. now surface as `Err(Error::E2e(_))` rather than logging and falling through (which had been emitting an unprotected message claiming an E2E-protected channel).
 - **SD `Subscribe` with mismatched `major_version` is now NACKed** — previously an Ack would be returned and the subscription registered, leaving the application stack to silently mis-decode incompatible-version traffic.
@@ -99,8 +230,8 @@
 ### Notes
 
 - **Crate version bumped to 0.8.0** — reflects the breaking changes above. Downstream `Cargo.toml` snippets in `README.md` were updated accordingly.
-- **Bare-metal compile gate is now literal.** `cargo build --target thumbv7em-none-eabihf --no-default-features --features client,server,bare_metal` succeeds; `client + bare_metal` is verified alloc-free (zero `__rust_alloc` references in the resulting rlib). CI runs this matrix on every PR. The cortex-m4f target is the closest no_std proxy mainline Rust supports — the project's actual production target (Infineon AURIX TriCore) requires HighTec's commercial Rust distribution because mainline Rust + LLVM don't have a TriCore backend; a future phase will swap or layer in a TriCore CI runner once that infrastructure is in place. See `bare_metal_plan_v3.md`.
-- **Known limitation: `server` feature pulls `extern crate alloc`.** `Server` holds `Arc<EventPublisher>` and `EventPublisher` holds `Arc<F::Socket>`; both require an allocator. Pure no_std-without-allocator consumers can use the `client` feature alone (alloc-free) but will need a global allocator for the server side. A refactor to `&'static` borrows is on the v3 phase 21+ backlog.
+- **Bare-metal compile gate is now literal.** `cargo build --target thumbv7em-none-eabihf --no-default-features --features client,server,bare_metal` succeeds; `client + bare_metal` is verified alloc-free (zero `__rust_alloc` references in the resulting rlib). CI runs this matrix on every PR. The cortex-m4f target is the closest no_std proxy mainline Rust supports — the project's actual production target (Infineon AURIX TriCore) requires HighTec's commercial Rust distribution because mainline Rust + LLVM don't have a TriCore backend; a TriCore CI runner is tracked in #117.
+- **Known limitation: `server` feature pulls `extern crate alloc`.** `Server` holds `Arc<EventPublisher>` and `EventPublisher` holds `Arc<F::Socket>`; both require an allocator. Pure no_std-without-allocator consumers can use the `client` feature alone (alloc-free) but will need a global allocator for the server side. A refactor to `&'static` borrows is tracked in #115.
 
 ### Test runner
 
