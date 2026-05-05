@@ -129,7 +129,7 @@ impl SubscriptionManager {
             // bump on re-subscribe) are wanted later, update the per-
             // subscriber record here and rename the log accordingly.
             if subscribers.iter().any(|s| s.address == subscriber_addr) {
-                tracing::debug!(
+                crate::log::debug!(
                     "Subscriber {} already subscribed for service 0x{:04X}, instance {}, \
                      event group 0x{:04X}; skipping duplicate",
                     subscriber_addr,
@@ -143,7 +143,7 @@ impl SubscriptionManager {
             let subscriber =
                 Subscriber::new(subscriber_addr, service_id, instance_id, event_group_id);
             if subscribers.push(subscriber).is_err() {
-                tracing::warn!(
+                crate::log::warn!(
                     "Subscribers-per-group at capacity ({}); dropping new subscriber {} \
                      for service 0x{:04X}, instance {}, event group 0x{:04X}",
                     SUBSCRIBERS_PER_GROUP,
@@ -155,7 +155,7 @@ impl SubscriptionManager {
                 return Err(SubscribeError::SubscribersPerGroupFull);
             }
 
-            tracing::info!(
+            crate::log::info!(
                 "Subscriber {} added for service 0x{:04X}, instance {}, event group 0x{:04X}",
                 subscriber_addr,
                 service_id,
@@ -184,7 +184,7 @@ impl SubscriptionManager {
         );
 
         if self.subscriptions.insert(key, list).is_err() {
-            tracing::warn!(
+            crate::log::warn!(
                 "Event-group map at capacity ({}); dropping subscriber {} for new group \
                  service 0x{:04X}, instance {}, event group 0x{:04X}",
                 EVENT_GROUPS_CAP,
@@ -196,7 +196,7 @@ impl SubscriptionManager {
             return Err(SubscribeError::EventGroupsFull);
         }
 
-        tracing::info!(
+        crate::log::info!(
             "Subscriber {} added for service 0x{:04X}, instance {}, event group 0x{:04X}",
             subscriber_addr,
             service_id,
@@ -223,7 +223,7 @@ impl SubscriptionManager {
                 self.subscriptions.remove(&key);
             }
 
-            tracing::info!(
+            crate::log::info!(
                 "Removed subscriber {} from service 0x{:04X}, instance {}, event group 0x{:04X}",
                 subscriber_addr,
                 service_id,

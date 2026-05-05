@@ -63,7 +63,7 @@ tokio = { version = "1", default-features = false, features = [
     "sync",
     "time",
 ], optional = true }
-tracing = { version = "0.1", default-features = false }
+tracing = { version = "0.1", default-features = false, optional = true }
 
 [dev-dependencies]
 # `critical-section/std` provides a host-platform impl so integration
@@ -76,7 +76,15 @@ tracing-subscriber = "0.3"
 
 [features]
 default = ["std"]
-std = ["embedded-io/std", "thiserror/std", "tracing/std", "_alloc"]
+# `tracing` pulls in `tracing-core`, which (since 0.1.33) declares
+# `extern crate alloc` unconditionally and therefore requires the
+# `alloc` crate to be present in the target sysroot. Bare-metal
+# targets that ship a `core`-only sysroot (e.g. the AURIX TriCore
+# LLVM-IR proxy used by the halo build) cannot satisfy this. Gate
+# tracing behind a feature so those builds can opt out; std users
+# pick it up automatically through the `std` feature below.
+tracing = ["dep:tracing"]
+std = ["embedded-io/std", "thiserror/std", "tracing", "tracing/std", "_alloc"]
 # Feature split: `client` exposes the protocol/trait-surface client
 # (no tokio, no socket2); `client-tokio` layers the tokio + socket2
 # convenience defaults on top. Consumers of the bare-metal trait surface

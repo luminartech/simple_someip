@@ -68,7 +68,7 @@ where
 
     let target_v4 = socket_addr_v4(target)?;
     sd_socket.send_to(&buffer[..total_len], target_v4).await?;
-    tracing::debug!(
+    crate::log::debug!(
         "Sent unicast OfferService to {} for service 0x{:04X}",
         target,
         config.service_id
@@ -118,7 +118,7 @@ where
         .send_to(&buffer[..total_len], subscriber_v4)
         .await?;
 
-    tracing::debug!(
+    crate::log::debug!(
         "Sent SubscribeAck to {} for service 0x{:04X}, eventgroup 0x{:04X}",
         subscriber,
         entry_view.service_id(),
@@ -170,7 +170,7 @@ where
         .send_to(&buffer[..total_len], subscriber_v4)
         .await?;
 
-    tracing::warn!(
+    crate::log::warn!(
         "Sent SubscribeNack to {} for service 0x{:04X}, eventgroup 0x{:04X} (reason: {})",
         subscriber,
         entry_view.service_id(),
@@ -195,13 +195,13 @@ where
     T: TransportSocket,
     Sub: SubscriptionHandle,
 {
-    tracing::trace!("Handling SD message from {}", sender);
+    crate::log::trace!("Handling SD message from {}", sender);
 
     for entry_view in sd_view.entries() {
         let entry_type = entry_view.entry_type()?;
         match entry_type {
             sd::EntryType::Subscribe => {
-                tracing::debug!(
+                crate::log::debug!(
                     "Received Subscribe from {}: service=0x{:04X}, instance={}, eventgroup=0x{:04X}",
                     sender,
                     entry_view.service_id(),
@@ -210,7 +210,7 @@ where
                 );
 
                 if entry_view.service_id() != config.service_id {
-                    tracing::warn!(
+                    crate::log::warn!(
                         "Subscribe for wrong service: expected 0x{:04X}, got 0x{:04X}",
                         config.service_id,
                         entry_view.service_id()
@@ -225,7 +225,7 @@ where
                     )
                     .await?;
                 } else if entry_view.instance_id() != config.instance_id {
-                    tracing::warn!(
+                    crate::log::warn!(
                         "Subscribe for wrong instance: expected {}, got {}",
                         config.instance_id,
                         entry_view.instance_id()
@@ -240,7 +240,7 @@ where
                     )
                     .await?;
                 } else if entry_view.major_version() != config.major_version {
-                    tracing::warn!(
+                    crate::log::warn!(
                         "Subscribe for wrong major_version: expected {}, got {}",
                         config.major_version,
                         entry_view.major_version()
@@ -255,10 +255,10 @@ where
                     )
                     .await
                     {
-                        tracing::warn!(error = %e, "SubscribeNack send failed");
+                        crate::log::warn!("SubscribeNack send failed: {e}");
                     }
                 } else if !config.accepts_event_group(entry_view.event_group_id()) {
-                    tracing::warn!(
+                    crate::log::warn!(
                         "Subscribe for unknown event_group_id 0x{:04X} (service 0x{:04X})",
                         entry_view.event_group_id(),
                         entry_view.service_id()
@@ -273,7 +273,7 @@ where
                     )
                     .await
                     {
-                        tracing::warn!(error = %e, "SubscribeNack send failed");
+                        crate::log::warn!("SubscribeNack send failed: {e}");
                     }
                 } else {
                     let first_index = entry_view.index_first_options_run() as usize;
@@ -307,12 +307,13 @@ where
                                 )
                                 .await
                                 {
-                                    tracing::warn!(
-                                        error = %e,
-                                        service_id = entry_view.service_id(),
-                                        instance_id = entry_view.instance_id(),
-                                        event_group_id = entry_view.event_group_id(),
-                                        "SubscribeAck send failed; rolling back subscription"
+                                    crate::log::warn!(
+                                        "SubscribeAck send failed; rolling back subscription \
+                                         (service_id=0x{:04X}, instance_id={}, \
+                                         event_group_id=0x{:04X}, error={e})",
+                                        entry_view.service_id(),
+                                        entry_view.instance_id(),
+                                        entry_view.event_group_id(),
                                     );
                                     subscriptions
                                         .unsubscribe(
@@ -331,7 +332,7 @@ where
                                     }
                                     SubscribeError::EventGroupsFull => "event_groups_full",
                                 };
-                                tracing::debug!("Subscription rejected: {reason}");
+                                crate::log::debug!("Subscription rejected: {reason}");
                                 if let Err(e) = send_subscribe_nack_from_view(
                                     config,
                                     sd_socket,
@@ -342,12 +343,12 @@ where
                                 )
                                 .await
                                 {
-                                    tracing::warn!(error = %e, "SubscribeNack send failed");
+                                    crate::log::warn!("SubscribeNack send failed: {e}");
                                 }
                             }
                         }
                     } else {
-                        tracing::warn!("No endpoint found in Subscribe message options");
+                        crate::log::warn!("No endpoint found in Subscribe message options");
                         if let Err(e) = send_subscribe_nack_from_view(
                             config,
                             sd_socket,
@@ -358,7 +359,7 @@ where
                         )
                         .await
                         {
-                            tracing::warn!(error = %e, "SubscribeNack send failed");
+                            crate::log::warn!("SubscribeNack send failed: {e}");
                         }
                     }
                 }
@@ -366,7 +367,7 @@ where
             sd::EntryType::FindService => {
                 let find_service_id = entry_view.service_id();
                 if find_service_id == config.service_id || find_service_id == 0xFFFF {
-                    tracing::debug!(
+                    crate::log::debug!(
                         "Received FindService from {} for service 0x{:04X} (ours: 0x{:04X}), sending unicast offer",
                         sender,
                         find_service_id,
@@ -375,17 +376,17 @@ where
                     if let Err(e) =
                         send_unicast_offer(config, sd_socket, sd_state, sender).await
                     {
-                        tracing::warn!(error = %e, "Unicast OfferService send failed");
+                        crate::log::warn!("Unicast OfferService send failed: {e}");
                     }
                 } else {
-                    tracing::trace!(
+                    crate::log::trace!(
                         "Ignoring FindService for service 0x{:04X} (not ours)",
                         find_service_id
                     );
                 }
             }
             _ => {
-                tracing::trace!("Ignoring SD entry type: {:?}", entry_type);
+                crate::log::trace!("Ignoring SD entry type: {:?}", entry_type);
             }
         }
     }
@@ -410,12 +411,12 @@ pub(super) async fn announce_loop<T, Tm>(
             Ok(()) => {
                 announcement_count += 1;
                 if announcement_count == 1 {
-                    tracing::info!(
+                    crate::log::info!(
                         "Sent first SD announcement for service 0x{:04X}",
                         config.service_id
                     );
                 } else {
-                    tracing::debug!(
+                    crate::log::debug!(
                         "Sent {} SD announcements for service 0x{:04X}",
                         announcement_count,
                         config.service_id
@@ -423,7 +424,7 @@ pub(super) async fn announce_loop<T, Tm>(
                 }
             }
             Err(e) => {
-                tracing::error!("Failed to send OfferService: {:?}", e);
+                crate::log::error!("Failed to send OfferService: {:?}", e);
             }
         }
         timer.sleep(core::time::Duration::from_secs(1)).await;
@@ -494,7 +495,7 @@ where
             "sd-multicast"
         };
         // The `datagram.truncated` flag is currently not surfaced via
-        // `tracing::warn!` — backends that report truncation honestly
+        // `crate::log::warn!` — backends that report truncation honestly
         // (embassy-net today, tokio after #119) won't be observable
         // from the server side until #120 lands.
         let data = if from_unicast {
@@ -503,12 +504,12 @@ where
             &sd_buf[..len]
         };
 
-        tracing::trace!("Received {} bytes from {} on {} socket", len, addr, source);
-        tracing::trace!("Raw data: {:02X?}", &data[..len.min(64_usize)]);
+        crate::log::trace!("Received {} bytes from {} on {} socket", len, addr, source);
+        crate::log::trace!("Raw data: {:02X?}", &data[..len.min(64_usize)]);
 
         match MessageView::parse(data) {
             Ok(view) => {
-                tracing::trace!(
+                crate::log::trace!(
                     "SOME/IP Header: service=0x{:04X}, method=0x{:04X}, type={:?}",
                     view.header().message_id().service_id(),
                     view.header().message_id().method_id(),
@@ -516,10 +517,10 @@ where
                 );
 
                 if view.is_sd() {
-                    tracing::trace!("This is an SD message");
+                    crate::log::trace!("This is an SD message");
                     match view.sd_header() {
                         Ok(sd_view) => {
-                            tracing::trace!("SD message has {} entries", sd_view.entry_count());
+                            crate::log::trace!("SD message has {} entries", sd_view.entry_count());
                             handle_sd_message(
                                 config,
                                 sd_socket,
@@ -531,16 +532,16 @@ where
                             .await?;
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to parse SD message: {:?}", e);
+                            crate::log::warn!("Failed to parse SD message: {:?}", e);
                         }
                     }
                 } else {
-                    tracing::trace!("Non-SD SOME/IP message, ignoring");
+                    crate::log::trace!("Non-SD SOME/IP message, ignoring");
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to parse SOME/IP header from {}: {:?}", addr, e);
-                tracing::trace!("Data: {:02X?}", &data[..len.min(32)]);
+                crate::log::warn!("Failed to parse SOME/IP header from {}: {:?}", addr, e);
+                crate::log::trace!("Data: {:02X?}", &data[..len.min(32)]);
             }
         }
     }
@@ -578,7 +579,7 @@ where
     Tm: Timer,
 {
     if is_passive {
-        tracing::warn!(
+        crate::log::warn!(
             "run called on passive Server for service 0x{:04X}; \
              SD receive must be driven externally (e.g. via the \
              Client's discovery socket, routing Subscribes to \
@@ -650,7 +651,7 @@ pub(super) fn extract_subscriber_endpoint(
 
     match endpoint_count {
         0 => {
-            tracing::warn!(
+            crate::log::warn!(
                 "No IPv4 endpoint in options runs \
                  (first: idx={first_index}, count={first_count}; \
                  second: idx={second_index}, count={second_count}; \
@@ -660,12 +661,12 @@ pub(super) fn extract_subscriber_endpoint(
         }
         1 => {
             let ep = first_endpoint.expect("endpoint_count=1 implies first_endpoint is Some");
-            tracing::trace!("Found IPv4 endpoint {}", ep);
+            crate::log::trace!("Found IPv4 endpoint {}", ep);
             Some(ep)
         }
         n => {
             let ep = first_endpoint.expect("endpoint_count>=1 implies first_endpoint is Some");
-            tracing::warn!(
+            crate::log::warn!(
                 "{} IPv4 endpoints found in subscribe options runs; \
                  using first ({}) and ignoring {} additional. \
                  Multi-endpoint (e.g. TCP+UDP) subscribers are not yet supported.",
