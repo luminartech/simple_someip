@@ -274,7 +274,7 @@ impl Timer for TokioTimer {
 }
 
 /// Wraps a `Future` so that any panic during `poll` is logged via
-/// `tracing::error!` and the future then resolves cleanly. Lets
+/// `crate::log::error!` and the future then resolves cleanly. Lets
 /// `TokioSpawner::spawn` use exactly **one** tokio task per call
 /// instead of pairing each work future with a `JoinHandle`-watcher
 /// task — the prior watcher-pair pattern doubled task count and
@@ -300,7 +300,7 @@ impl<F: Future<Output = ()>> Future for PanicLoggingFut<F> {
             Ok(poll) => poll,
             Err(payload) => {
                 let msg = panic_payload_str(&payload);
-                tracing::error!(
+                crate::log::error!(
                     panic_message = msg,
                     "spawned task panicked; channels will close",
                 );
@@ -415,14 +415,14 @@ fn map_io_error(e: &std::io::Error) -> TransportError {
     // so we don't drown out actionable warnings under load.
     match kind {
         K::TimedOut | K::Interrupted | K::ConnectionRefused => {
-            tracing::debug!(
+            crate::log::debug!(
                 "tokio transport io error: {e} (raw_os={:?}, kind={:?}) mapped to {mapped}",
                 e.raw_os_error(),
                 kind,
             );
         }
         _ => {
-            tracing::warn!(
+            crate::log::warn!(
                 "tokio transport io error: {e} (raw_os={:?}, kind={:?}) mapped to {mapped}",
                 e.raw_os_error(),
                 kind,

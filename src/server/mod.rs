@@ -781,7 +781,7 @@ where
         // ephemeral port. Back-fill the config so SD offers and event
         // publishers advertise the actual bound port instead of 0.
         config.local_port = bound_port;
-        tracing::info!(
+        crate::log::info!(
             "Server bound to {}:{} for service 0x{:04X}",
             config.interface,
             bound_port,
@@ -798,7 +798,7 @@ where
         let sd_raw = factory.bind(sd_addr, &sd_opts).await?;
         sd_raw.join_multicast_v4(sd::MULTICAST_IP, config.interface)?;
         let sd_socket: H = H::wrap(sd_raw);
-        tracing::info!(
+        crate::log::info!(
             "Server SD socket bound to {} (expected port {}), joined multicast {}",
             sd_addr,
             sd::MULTICAST_PORT,
@@ -867,7 +867,7 @@ where
         let unicast_socket: H = H::wrap(unicast_raw);
         // Back-fill the actual bound port if the caller passed 0.
         config.local_port = bound_port;
-        tracing::info!(
+        crate::log::info!(
             "Passive server bound to {}:{} for service 0x{:04X}",
             config.interface,
             bound_port,
@@ -882,7 +882,7 @@ where
                 .bind(sd_placeholder_addr, &SocketOptions::new())
                 .await?,
         );
-        tracing::info!(
+        crate::log::info!(
             "Passive server SD placeholder socket bound near {} (not in SD reuseport group)",
             sd_placeholder_addr
         );
@@ -961,7 +961,7 @@ where
         if config.local_port == 0 {
             config.local_port = bound_port;
         } else if config.local_port != bound_port {
-            tracing::error!(
+            crate::log::error!(
                 "ServerConfig.local_port ({}) does not match unicast socket's \
                  bound port ({}); SD offers would lie. Pass local_port = 0 to \
                  auto-fill from the bound port instead.",
@@ -970,7 +970,7 @@ where
             );
             return Err(Error::InvalidUsage("new_with_handles_local_port_mismatch"));
         }
-        tracing::info!(
+        crate::log::info!(
             "Server (handles) bound to {}:{} for service 0x{:04X}",
             config.interface,
             bound_port,
@@ -1024,7 +1024,7 @@ where
         if config.local_port == 0 {
             config.local_port = bound_port;
         } else if config.local_port != bound_port {
-            tracing::error!(
+            crate::log::error!(
                 "ServerConfig.local_port ({}) does not match unicast socket's \
                  bound port ({}); event publishers would advertise a port \
                  nothing is listening on. Pass local_port = 0 to auto-fill.",
@@ -1035,7 +1035,7 @@ where
                 "new_passive_with_handles_local_port_mismatch",
             ));
         }
-        tracing::info!(
+        crate::log::info!(
             "Passive server (handles) bound to {}:{} for service 0x{:04X}",
             config.interface,
             bound_port,
@@ -1168,7 +1168,7 @@ where
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                tracing::warn!(
+                crate::log::warn!(
                     "Server::run_with_buffers already started for service 0x{:04X}; \
                      a second run-future cannot share the same sockets \
                      and session counter",
@@ -1267,7 +1267,7 @@ where
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                tracing::warn!(
+                crate::log::warn!(
                     "Server::run already started for service 0x{:04X}; \
                      a second run-future cannot share the same sockets \
                      and session counter",
@@ -3184,8 +3184,8 @@ mod tests {
 
     #[tokio::test]
     async fn new_passive_with_tracing_subscriber_evaluates_format_args() {
-        // Coverage helper: with no global tracing subscriber, `tracing::info!`
-        // and `tracing::debug!` short-circuit before evaluating their
+        // Coverage helper: with no global tracing subscriber, `crate::log::info!`
+        // and `crate::log::debug!` short-circuit before evaluating their
         // formatted arguments, leaving the format-arg lines in `new_passive`
         // marked as uncovered. This test installs a max-level subscriber so
         // the macros take their full format path and the arg-evaluation

@@ -62,7 +62,7 @@ use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use inner::Inner;
 #[cfg(feature = "client-tokio")]
 use std::sync::{Arc, Mutex, RwLock};
-use tracing::info;
+use crate::log::info;
 
 /// Marker trait declaring the channel-pool entries a [`ChannelFactory`]
 /// must declare for [`Client`] to compile against it. End users do not
@@ -1299,26 +1299,26 @@ where
                 let (flag_rx, flag_msg) =
                     ControlMessage::<MessageDefinitions, TokioChannels>::query_reboot_flag();
                 let Some(sender) = weak_sender.upgrade() else {
-                    tracing::info!("Client shut down, stopping SD announcements");
+                    crate::log::info!("Client shut down, stopping SD announcements");
                     break;
                 };
                 let enqueue_ok = sender.send(flag_msg).await.is_ok();
                 drop(sender);
                 if !enqueue_ok {
-                    tracing::warn!("SD announcement channel closed, stopping");
+                    crate::log::warn!("SD announcement channel closed, stopping");
                     break;
                 }
                 let reboot = match flag_rx.recv().await {
                     Ok(Ok(flag)) => flag,
                     Ok(Err(e)) => {
-                        tracing::warn!(
+                        crate::log::warn!(
                             "SD announcement reboot-flag query returned error ({:?}), skipping tick",
                             e
                         );
                         continue;
                     }
                     Err(_) => {
-                        tracing::warn!("SD announcement reboot-flag query dropped, stopping");
+                        crate::log::warn!("SD announcement reboot-flag query dropped, stopping");
                         break;
                     }
                 };
@@ -1329,14 +1329,14 @@ where
                     ControlMessage::<MessageDefinitions, TokioChannels>::send_sd(target, header);
 
                 let Some(sender) = weak_sender.upgrade() else {
-                    tracing::info!("Client shut down, stopping SD announcements");
+                    crate::log::info!("Client shut down, stopping SD announcements");
                     break;
                 };
                 let send_ok = sender.send(message).await.is_ok();
                 drop(sender);
 
                 if !send_ok {
-                    tracing::warn!("SD announcement channel closed, stopping");
+                    crate::log::warn!("SD announcement channel closed, stopping");
                     break;
                 }
 
@@ -1344,16 +1344,16 @@ where
                     Ok(Ok(())) => {
                         count += 1;
                         if count == 1 {
-                            tracing::info!("Sent first client SD announcement");
+                            crate::log::info!("Sent first client SD announcement");
                         } else {
-                            tracing::trace!("Sent {count} client SD announcements");
+                            crate::log::trace!("Sent {count} client SD announcements");
                         }
                     }
                     Ok(Err(e)) => {
-                        tracing::error!("Failed to send SD announcement: {e:?}");
+                        crate::log::error!("Failed to send SD announcement: {e:?}");
                     }
                     Err(_) => {
-                        tracing::warn!("SD announcement response dropped, stopping");
+                        crate::log::warn!("SD announcement response dropped, stopping");
                         break;
                     }
                 }

@@ -151,7 +151,7 @@ impl SessionTracker {
             // suppress further warnings so a saturated tracker does not
             // spam the log at the incoming-packet rate.
             if !self.saturation_warned {
-                tracing::warn!(
+                crate::log::warn!(
                     "SessionTracker at capacity ({}); dropping new sender state for \
                      sender={} transport={:?} svc=0x{:04X} inst=0x{:04X}. Reboot \
                      detection disabled for this entry and any further new entries \
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn capacity_overflow_warns_only_on_first_hit() {
-        // `saturation_warned` is the latch that guards the tracing::warn!
+        // `saturation_warned` is the latch that guards the crate::log::warn!
         // call in `check()`. It must flip false → true on the first
         // rejected insert and stay true for subsequent hits — otherwise
         // a saturated tracker spams the log at the packet rate.
