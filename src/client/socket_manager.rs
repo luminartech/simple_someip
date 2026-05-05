@@ -57,7 +57,7 @@ use core::{
     task::{Context, Poll},
 };
 use futures_util::{FutureExt, pin_mut, select_biased};
-use tracing::{debug, error, info, trace, warn};
+use crate::log::{debug, error, info, trace, warn};
 
 /// A received message together with the source address it came from.
 ///

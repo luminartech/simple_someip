@@ -227,17 +227,17 @@ impl SdStateManager {
 
         let multicast_addr = SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT);
 
-        tracing::trace!(
+        crate::log::trace!(
             "Sending OfferService: service=0x{:04X}, instance={}, port={}, size={} bytes",
             config.service_id,
             config.instance_id,
             config.local_port,
             total_len
         );
-        tracing::trace!("OfferService data: {:02X?}", &buffer[..total_len.min(64)]);
+        crate::log::trace!("OfferService data: {:02X?}", &buffer[..total_len.min(64)]);
 
         socket.send_to(&buffer[..total_len], multicast_addr).await?;
-        tracing::trace!("Sent to {}", multicast_addr);
+        crate::log::trace!("Sent to {}", multicast_addr);
 
         Ok(())
     }

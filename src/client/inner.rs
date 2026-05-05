@@ -5,7 +5,7 @@ use futures_util::{FutureExt, pin_mut, select_biased};
 use heapless::{Deque, index_map::FnvIndexMap};
 #[cfg(all(test, feature = "client-tokio"))]
 use std::sync::{Arc, Mutex};
-use tracing::{debug, error, info, trace, warn};
+use crate::log::{debug, error, info, trace, warn};
 
 #[cfg(all(test, feature = "client-tokio"))]
 use crate::e2e::E2ERegistry;
@@ -651,7 +651,7 @@ where
             }
             for port in &dead_ports {
                 unicast_sockets.remove(port);
-                tracing::warn!("Unicast socket on port {port} closed; evicted from registry");
+                crate::log::warn!("Unicast socket on port {port} closed; evicted from registry");
             }
             if let Some(msg) = delivered {
                 Poll::Ready(msg)
