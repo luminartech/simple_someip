@@ -159,11 +159,21 @@ dependencies = [
  "crc",
  "embedded-io",
  "heapless",
+ "simple_e2e",
  "socket2 0.5.10",
  "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "simple_e2e"
+version = "0.1.0"
+dependencies = [
+ "crc",
+ "heapless",
+ "thiserror",
 ]
 
 [[package]]
