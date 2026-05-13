@@ -6,7 +6,7 @@ mod socket_manager;
 
 pub use error::Error;
 
-use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry};
+use crate::e2e::{CheckStatus, E2EKey, E2EProfile, E2ERegistry};
 use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
 use inner::{ControlMessage, Inner};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -79,7 +79,7 @@ pub enum ClientUpdate<P: PayloadWireFormat> {
         /// The received SOME/IP message.
         message: Message<P>,
         /// E2E check status, if E2E was configured for this message.
-        e2e_status: Option<E2ECheckStatus>,
+        e2e_status: Option<CheckStatus>,
     },
     /// The client encountered an error.
     Error(Error),
@@ -608,14 +608,24 @@ where
     /// header checked and stripped, and outgoing messages will have E2E
     /// protection applied automatically.
     ///
+    /// # Errors
+    ///
+    /// Returns [`crate::e2e::E2ERegistryFull`] if the registry is at capacity
+    /// and `key` is not already registered. Replacing an existing key's
+    /// profile always succeeds.
+    ///
     /// # Panics
     ///
     /// Panics if the E2E registry mutex is poisoned.
-    pub fn register_e2e(&self, key: E2EKey, profile: E2EProfile) {
+    pub fn register_e2e(
+        &self,
+        key: E2EKey,
+        profile: E2EProfile,
+    ) -> Result<(), crate::e2e::E2ERegistryFull> {
         self.e2e_registry
             .lock()
             .expect("e2e registry lock poisoned")
-            .register(key, profile);
+            .register(key, profile)
     }
 
     /// Remove E2E configuration for the given key.
@@ -844,7 +854,7 @@ mod tests {
             method_or_event_id: 0x0001,
         };
         let profile = E2EProfile::Profile4(crate::e2e::Profile4Config::new(42, 10));
-        client.register_e2e(key, profile);
+        client.register_e2e(key, profile).expect("register");
         client.unregister_e2e(&key);
         client.shut_down();
     }

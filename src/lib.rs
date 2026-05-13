@@ -114,6 +114,6 @@ pub use traits::{PayloadWireFormat, WireFormat};
 
 #[cfg(feature = "client")]
 pub use client::{Client, ClientUpdate, ClientUpdates, DiscoveryMessage, PendingResponse};
-pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
+pub use e2e::{CheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
 pub use server::Server;

@@ -13,6 +13,11 @@ repository = "https://github.com/luminartech/simple_someip"
 crc = "3.4"
 embedded-io = { version = "0.7" }
 heapless = "0.9"
+# Path dep during development; swap to `version = "0.1"` from crates.io
+# before publishing simple_someip 0.8.0. The `registry` feature provides
+# `simple_e2e::registry::Registry<K, CAP>` which simple_someip wraps as
+# `E2ERegistry` keyed on `E2EKey`.
+simple_e2e = { path = "../simple_e2e", default-features = false, features = ["registry"] }
 socket2 = { version = "0.5", optional = true, features = ["all"] }
 thiserror = { version = "2", default-features = false }
 tokio = { version = "1", default-features = false, features = [

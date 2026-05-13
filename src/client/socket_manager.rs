@@ -1,5 +1,5 @@
 use crate::{
-    e2e::{E2ECheckStatus, E2EKey, E2ERegistry, PROFILE4_HEADER_SIZE},
+    e2e::{CheckStatus, E2EKey, E2ERegistry, PROFILE4_HEADER_SIZE},
     protocol::{Message, MessageView, sd},
     traits::{PayloadWireFormat, WireFormat},
 };
@@ -19,7 +19,7 @@ use tracing::{error, info, trace};
 pub struct ReceivedMessage<P> {
     pub message: Message<P>,
     pub source: SocketAddr,
-    pub e2e_status: Option<E2ECheckStatus>,
+    pub e2e_status: Option<CheckStatus>,
 }
 
 /// Structure representing a request to send a message
@@ -225,11 +225,18 @@ where
                                         let key = E2EKey::from_message_id(header.message_id());
                                         let payload_bytes = view.payload_bytes();
 
-                                        // Apply E2E check if configured
+                                        // Apply E2E check if configured.
+                                        // CheckOutcome borrows the input slice for the stripped
+                                        // payload, so we extract the owned status + payload slice
+                                        // here and drop the outcome inside this block.
                                         let (e2e_status, effective_payload) = {
                                             let mut registry = e2e_registry.lock().expect("e2e registry lock poisoned");
                                             match registry.check(key, payload_bytes, upper_header) {
-                                                Some((status, stripped)) => (Some(status), stripped),
+                                                Some(outcome) => {
+                                                    let status = CheckStatus::from_outcome(&outcome);
+                                                    let stripped = outcome.payload().unwrap_or(payload_bytes);
+                                                    (Some(status), stripped)
+                                                }
                                                 None => (None, payload_bytes),
                                             }
                                         };
