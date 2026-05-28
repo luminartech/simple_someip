@@ -1,3 +1,5 @@
+use std::string::String;
+
 use thiserror::Error;
 
 /// Errors that can occur during SOME/IP client operations.
@@ -24,4 +26,10 @@ pub enum Error {
     /// An E2E protection or checking error occurred.
     #[error(transparent)]
     E2e(#[from] crate::e2e::Error),
+    /// A socket factory failed to bind a socket.
+    #[error("Bind failed: {0}")]
+    BindFailed(String),
+    /// A transport-level error from the underlying [`crate::runtime::AsyncUdpSocket`] impl.
+    #[error("Transport error: {0}")]
+    Transport(String),
 }

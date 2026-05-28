@@ -2,7 +2,7 @@ mod error;
 mod inner;
 mod service_registry;
 mod session;
-mod socket_manager;
+mod wire;
 
 pub use error::Error;
 

@@ -124,6 +124,13 @@ pub mod protocol;
 /// A general-purpose, heap-allocated [`PayloadWireFormat`] implementation.
 #[cfg(feature = "std")]
 mod raw_payload;
+/// Concrete adapters that implement the [`runtime`] traits against specific
+/// async runtimes (tokio, etc.).
+#[cfg(feature = "runtime-traits")]
+pub mod adapters;
+/// Runtime-agnostic async I/O traits for SOME/IP transports and timing.
+#[cfg(feature = "runtime-traits")]
+pub mod runtime;
 /// SOME/IP server for offering services and handling incoming requests.
 #[cfg(feature = "server")]
 pub mod server;

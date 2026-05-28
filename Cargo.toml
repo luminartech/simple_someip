@@ -31,8 +31,16 @@ tracing-subscriber = "0.3"
 [features]
 default = ["std"]
 std = ["embedded-io/std", "dep:thiserror", "dep:tracing"]
-client = ["std", "dep:tokio", "dep:socket2"]
-server = ["std", "dep:tokio", "dep:socket2"]
+client = ["std", "dep:tokio", "dep:socket2", "tokio-adapter"]
+server = ["std", "dep:tokio", "dep:socket2", "tokio-adapter"]
+# Runtime-agnostic AsyncUdpSocket / Clock traits for embedded targets.
+# Opt-in during the runtime-agnostic refactor; will become default in a
+# later phase once the generic client/server consume the traits.
+runtime-traits = []
+# Tokio implementation of the runtime traits — for desktop/host code that
+# wants to drive the generic client/server with tokio. Includes a
+# TokioSocketFactory that opens sockets via socket2 + tokio.
+tokio-adapter = ["runtime-traits", "std", "dep:tokio", "dep:socket2"]
 
 [[test]]
 name = "client_server"

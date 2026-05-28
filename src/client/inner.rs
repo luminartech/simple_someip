@@ -2,9 +2,12 @@ use std::{
     borrow::ToOwned,
     collections::{HashMap, VecDeque},
     future,
+    future::poll_fn,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
     task::Poll,
+    vec,
+    vec::Vec,
 };
 use tokio::{
     select,
@@ -16,18 +19,56 @@ use tokio::{
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
+    adapters::tokio::{TokioClock, TokioSocketFactory, TokioUdpSocket},
     client::{
         ClientUpdate, DiscoveryMessage,
         service_registry::{ServiceEndpointInfo, ServiceInstanceId, ServiceRegistry},
         session::{SessionTracker, SessionVerdict, TransportKind},
-        socket_manager::{ReceivedMessage, SocketManager},
+        wire,
     },
-    e2e::E2ERegistry,
-    protocol::{self, Message},
+    e2e::{E2ECheckStatus, E2ERegistry},
+    protocol::{self, Message, sd::RebootFlag},
+    runtime::{AsyncUdpSocket, Clock, SocketFactory},
     traits::PayloadWireFormat,
 };
 
 use super::error::Error;
+
+/// Maximum SOME/IP UDP datagram size — sized for the worst case the
+/// previous `SocketManager` loop allocated.
+const RX_BUF_SIZE: usize = 1400;
+
+/// Slot holding the discovery socket plus its SD session state.
+///
+/// Session state outlives the socket (preserved across
+/// unbind/rebind) and now lives on [`Inner`]; this struct only holds
+/// what is socket-lifetime-scoped.
+struct DiscoverySlot<S: AsyncUdpSocket> {
+    socket: S,
+    rx_buf: Vec<u8>,
+}
+
+/// Slot holding a unicast socket together with its per-port session
+/// counter and a receive buffer (one per socket to avoid aliasing
+/// concurrent `poll_recv_from` calls).
+struct UnicastSlot<S: AsyncUdpSocket> {
+    socket: S,
+    rx_buf: Vec<u8>,
+    local_port: u16,
+    session_id: u16,
+}
+
+impl<S: AsyncUdpSocket> UnicastSlot<S> {
+    fn next_request_id(&mut self) -> u16 {
+        let id = self.session_id;
+        self.session_id = if self.session_id == u16::MAX {
+            1
+        } else {
+            self.session_id + 1
+        };
+        id
+    }
+}
 
 pub(super) enum ControlMessage<P: PayloadWireFormat> {
     SetInterface(Ipv4Addr, oneshot::Sender<Result<(), Error>>),
@@ -207,22 +248,27 @@ impl<P: PayloadWireFormat> ControlMessage<P> {
     }
 }
 
-pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
+pub(super) struct Inner<
+    P: PayloadWireFormat,
+    S: AsyncUdpSocket = TokioUdpSocket,
+    C: Clock = TokioClock,
+    F: SocketFactory<Socket = S> = TokioSocketFactory,
+> {
     /// MPSC Receiver used to receive control messages from outer client
-    control_receiver: Receiver<ControlMessage<PayloadDefinitions>>,
+    control_receiver: Receiver<ControlMessage<P>>,
     /// Queue of pending control messages to process
-    request_queue: VecDeque<ControlMessage<PayloadDefinitions>>,
+    request_queue: VecDeque<ControlMessage<P>>,
     /// Pending request-responses keyed by `request_id` (`client_id` << 16 | `session_counter`).
     /// Set by `SendToService`, cleared when a matching unicast arrives.
-    pending_responses: HashMap<u32, oneshot::Sender<Result<PayloadDefinitions, Error>>>,
+    pending_responses: HashMap<u32, oneshot::Sender<Result<P, Error>>>,
     /// Unbounded sender used to send updates to outer client
-    update_sender: mpsc::UnboundedSender<ClientUpdate<PayloadDefinitions>>,
+    update_sender: mpsc::UnboundedSender<ClientUpdate<P>>,
     /// Target interface for sockets
     interface: Ipv4Addr,
-    /// Socket manager for service discovery if bound
-    discovery_socket: Option<SocketManager<PayloadDefinitions>>,
-    /// Socket managers for unicast messages, keyed by local port
-    unicast_sockets: HashMap<u16, SocketManager<PayloadDefinitions>>,
+    /// Discovery socket slot — `Some` when bound.
+    discovery_socket: Option<DiscoverySlot<S>>,
+    /// Unicast socket slots, keyed by local port
+    unicast_sockets: HashMap<u16, UnicastSlot<S>>,
     /// Per-sender SD session state for reboot detection
     session_tracker: SessionTracker,
     /// Registry of known service endpoints (auto-populated from SD + manual)
@@ -237,15 +283,25 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     /// `unbind_discovery` + `bind_discovery` does not emit a false reboot signal.
     sd_session_id: u16,
     sd_session_has_wrapped: bool,
+    /// Send-buffer reused across iterations to avoid per-send allocation.
+    send_buf: Vec<u8>,
     /// Shared E2E registry for runtime E2E configuration
     e2e_registry: Arc<Mutex<E2ERegistry>>,
     /// Enable multicast loopback on SD sockets for same-host testing
     multicast_loopback: bool,
-    /// Phantom data to represent the generic message definitions
-    phantom: std::marker::PhantomData<PayloadDefinitions>,
+    /// Factory used to bind discovery and unicast sockets.
+    socket_factory: F,
+    /// Clock used for periodic / timeout work inside the run loop.
+    clock: C,
 }
 
-impl<PayloadDefinitions: PayloadWireFormat> std::fmt::Debug for Inner<PayloadDefinitions> {
+impl<P, S, C, F> std::fmt::Debug for Inner<P, S, C, F>
+where
+    P: PayloadWireFormat,
+    S: AsyncUdpSocket,
+    C: Clock,
+    F: SocketFactory<Socket = S>,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inner")
             .field("interface", &self.interface)
@@ -257,22 +313,59 @@ impl<PayloadDefinitions: PayloadWireFormat> std::fmt::Debug for Inner<PayloadDef
     }
 }
 
-impl<PayloadDefinitions> Inner<PayloadDefinitions>
+/// Tokio default-types convenience constructor: keeps the existing
+/// `Inner::spawn` API working for desktop consumers (`Client::new` calls
+/// it). Internally wires the generic `Inner` with [`TokioSocketFactory`]
+/// and [`TokioClock`] and `tokio::spawn`s the run loop.
+impl<P> Inner<P, TokioUdpSocket, TokioClock, TokioSocketFactory>
 where
-    PayloadDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
+    P: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
 {
     pub fn spawn(
         interface: Ipv4Addr,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
         multicast_loopback: bool,
     ) -> (
-        Sender<ControlMessage<PayloadDefinitions>>,
-        mpsc::UnboundedReceiver<ClientUpdate<PayloadDefinitions>>,
+        Sender<ControlMessage<P>>,
+        mpsc::UnboundedReceiver<ClientUpdate<P>>,
     ) {
         info!("Initializing SOME/IP Client");
         let (control_sender, control_receiver) = mpsc::channel(4);
         let (update_sender, update_receiver) = mpsc::unbounded_channel();
-        let inner = Self {
+        let inner = Self::new(
+            control_receiver,
+            update_sender,
+            interface,
+            e2e_registry,
+            multicast_loopback,
+            TokioSocketFactory,
+            TokioClock,
+        );
+        tokio::spawn(inner.run());
+        (control_sender, update_receiver)
+    }
+}
+
+impl<P, S, C, F> Inner<P, S, C, F>
+where
+    P: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
+    S: AsyncUdpSocket,
+    C: Clock,
+    F: SocketFactory<Socket = S>,
+{
+    /// Construct an [`Inner`] without spawning a task. Callers are
+    /// responsible for driving [`run`](Self::run) — either via
+    /// `tokio::spawn` (desktop) or a polled executor (embedded).
+    pub fn new(
+        control_receiver: Receiver<ControlMessage<P>>,
+        update_sender: mpsc::UnboundedSender<ClientUpdate<P>>,
+        interface: Ipv4Addr,
+        e2e_registry: Arc<Mutex<E2ERegistry>>,
+        multicast_loopback: bool,
+        socket_factory: F,
+        clock: C,
+    ) -> Self {
+        Self {
             control_receiver,
             request_queue: VecDeque::new(),
             pending_responses: HashMap::new(),
@@ -287,111 +380,197 @@ where
             session_counter: 1,
             sd_session_id: 1,
             sd_session_has_wrapped: false,
+            send_buf: vec![0u8; RX_BUF_SIZE],
             e2e_registry,
             multicast_loopback,
-            phantom: std::marker::PhantomData,
-        };
-        inner.run();
-        (control_sender, update_receiver)
-    }
-
-    fn bind_discovery(&mut self) -> Result<(), Error> {
-        if self.discovery_socket.is_some() {
-            Ok(())
-        } else {
-            let socket = SocketManager::bind_discovery_seeded(
-                self.interface,
-                Arc::clone(&self.e2e_registry),
-                self.sd_session_id,
-                self.sd_session_has_wrapped,
-                self.multicast_loopback,
-            )?;
-            self.discovery_socket = Some(socket);
-            Ok(())
+            socket_factory,
+            clock,
         }
     }
 
-    // Dropping the receiver kills the loop
+    fn discovery_session_id(&self) -> u16 {
+        self.sd_session_id.max(1)
+    }
+
+    fn discovery_reboot_flag(&self) -> RebootFlag {
+        RebootFlag::from(!self.sd_session_has_wrapped)
+    }
+
+    /// Advance the SD session counter after a successful SD send.
+    fn advance_discovery_session(&mut self) {
+        if self.sd_session_id == u16::MAX {
+            self.sd_session_id = 1;
+            self.sd_session_has_wrapped = true;
+        } else {
+            self.sd_session_id += 1;
+        }
+    }
+
+    async fn bind_discovery(&mut self) -> Result<(), Error> {
+        if self.discovery_socket.is_some() {
+            return Ok(());
+        }
+        let socket = self
+            .socket_factory
+            .bind_discovery(self.interface, self.multicast_loopback)
+            .await
+            .map_err(|e| Error::BindFailed(std::format!("{e:?}")))?;
+        self.discovery_socket = Some(DiscoverySlot {
+            socket,
+            rx_buf: vec![0u8; RX_BUF_SIZE],
+        });
+        Ok(())
+    }
+
+    /// Unbind the discovery socket. Session state stays on `Self` across
+    /// rebinds, so a subsequent `bind_discovery` does not emit a false
+    /// reboot signal.
+    ///
+    /// Kept `async` for API stability with callers that already `.await`
+    /// it; the body is synchronous because the socket drop is enough.
+    #[allow(clippy::unused_async)]
     async fn unbind_discovery(&mut self) {
         debug!("Unbinding Discovery socket.");
-        if let Some(socket) = self.discovery_socket.take() {
-            self.sd_session_id = socket.session_id();
-            self.sd_session_has_wrapped =
-                socket.reboot_flag() == crate::protocol::sd::RebootFlag::Continuous;
-            socket.shut_down().await;
-        }
+        let _ = self.discovery_socket.take();
     }
 
     fn set_interface(&mut self, interface: Ipv4Addr) {
         self.interface = interface;
     }
 
-    fn bind_unicast(&mut self, port: u16) -> Result<u16, Error> {
+    async fn bind_unicast(&mut self, port: u16) -> Result<u16, Error> {
         if port != 0
-            && let Some(socket) = self.unicast_sockets.get(&port)
+            && let Some(slot) = self.unicast_sockets.get(&port)
         {
-            return Ok(socket.port());
+            return Ok(slot.local_port);
         }
-        let unicast_socket = SocketManager::bind(port, Arc::clone(&self.e2e_registry))?;
-        let bound_port = unicast_socket.port();
-        self.unicast_sockets.insert(bound_port, unicast_socket);
+        let (socket, bound_port) = self
+            .socket_factory
+            .bind_unicast(self.interface, port)
+            .await
+            .map_err(|e| Error::BindFailed(std::format!("{e:?}")))?;
+        let slot = UnicastSlot {
+            socket,
+            rx_buf: vec![0u8; RX_BUF_SIZE],
+            local_port: bound_port,
+            session_id: 1,
+        };
+        self.unicast_sockets.insert(bound_port, slot);
         debug!("Bound unicast socket on port {}", bound_port);
         Ok(bound_port)
     }
 
+    /// Receive a single SD message from the discovery socket if bound.
+    /// Returns a future that never resolves when no discovery socket is
+    /// present — callers wrap it in a `select!`.
     async fn receive_discovery(
-        socket_manager: &mut Option<SocketManager<PayloadDefinitions>>,
+        slot: &mut Option<DiscoverySlot<S>>,
+        e2e_registry: &Arc<Mutex<E2ERegistry>>,
     ) -> Result<
         (
             SocketAddr,
             protocol::Header,
-            <PayloadDefinitions as PayloadWireFormat>::SdHeader,
+            <P as PayloadWireFormat>::SdHeader,
+            Option<E2ECheckStatus>,
         ),
         Error,
     > {
-        if let Some(receiver) = socket_manager {
-            match receiver.receive().await {
-                Some(result) => match result {
-                    Ok(received) => {
-                        let someip_header = received.message.header().clone();
-                        if let Some(sd_header) = received.message.sd_header() {
-                            Ok((received.source, someip_header, sd_header.to_owned()))
-                        } else {
-                            Err(Error::UnexpectedDiscoveryMessage(someip_header))
-                        }
-                    }
-                    Err(err) => Err(err),
-                },
-                None => Err(Error::SocketClosedUnexpectedly),
+        let Some(slot) = slot else {
+            return future::pending().await;
+        };
+        let DiscoverySlot { socket, rx_buf } = slot;
+        let recv = poll_fn(|cx| socket.poll_recv_from(cx, rx_buf.as_mut_slice())).await;
+        match recv {
+            Ok((n, src)) => {
+                let decoded = wire::decode_with_e2e::<P>(&rx_buf[..n], e2e_registry)?;
+                let someip_header = decoded.message.header().clone();
+                let Some(sd_header) = decoded.message.sd_header() else {
+                    return Err(Error::UnexpectedDiscoveryMessage(someip_header));
+                };
+                Ok((
+                    SocketAddr::V4(src),
+                    someip_header,
+                    sd_header.to_owned(),
+                    decoded.e2e_status,
+                ))
             }
-        } else {
-            // If we don't have a receiver, we should return a future that never resolves
-            future::pending().await
+            Err(e) => Err(Error::Transport(std::format!("{e:?}"))),
         }
     }
 
-    /// Receive from any bound unicast socket. Returns the first message ready
-    /// from any socket. If no sockets are bound, returns a future that never resolves.
+    /// Receive from any bound unicast socket using a poll-based multiplex.
+    /// Each entry has its own buffer so concurrent polls do not alias.
+    /// Returns a future that never resolves when no sockets are bound.
     async fn receive_any_unicast(
-        unicast_sockets: &mut HashMap<u16, SocketManager<PayloadDefinitions>>,
-    ) -> Result<ReceivedMessage<PayloadDefinitions>, Error> {
+        unicast_sockets: &mut HashMap<u16, UnicastSlot<S>>,
+        e2e_registry: &Arc<Mutex<E2ERegistry>>,
+    ) -> Result<(SocketAddr, Message<P>, Option<E2ECheckStatus>), Error> {
         if unicast_sockets.is_empty() {
             return future::pending().await;
         }
-
-        // Use poll_fn to manually poll each socket's receiver
-        std::future::poll_fn(|cx| {
-            for socket in unicast_sockets.values_mut() {
-                if let Poll::Ready(result) = socket.poll_receive(cx) {
-                    return Poll::Ready(match result {
-                        Some(msg) => msg,
-                        None => Err(Error::SocketClosedUnexpectedly),
-                    });
+        let (n, src, port) = poll_fn(|cx| {
+            for slot in unicast_sockets.values_mut() {
+                let UnicastSlot {
+                    socket,
+                    rx_buf,
+                    local_port,
+                    ..
+                } = slot;
+                match socket.poll_recv_from(cx, rx_buf.as_mut_slice()) {
+                    Poll::Ready(Ok((n, src))) => return Poll::Ready(Ok((n, src, *local_port))),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => {}
                 }
             }
             Poll::Pending
         })
         .await
+        .map_err(|e| Error::Transport(std::format!("{e:?}")))?;
+
+        let slot = unicast_sockets.get(&port).expect("slot present");
+        let decoded = wire::decode_with_e2e::<P>(&slot.rx_buf[..n], e2e_registry)?;
+        Ok((SocketAddr::V4(src), decoded.message, decoded.e2e_status))
+    }
+
+    /// Encode `message` with E2E protection and send via the discovery
+    /// socket; advances the discovery session counter on success.
+    async fn send_discovery(
+        &mut self,
+        target: SocketAddrV4,
+        message: &Message<P>,
+    ) -> Result<(), Error> {
+        let Some(slot) = self.discovery_socket.as_mut() else {
+            return Err(Error::SocketClosedUnexpectedly);
+        };
+        let len = wire::encode_with_e2e(message, &mut self.send_buf, &self.e2e_registry)?;
+        slot.socket
+            .send_to(&self.send_buf[..len], target)
+            .await
+            .map_err(|e| Error::Transport(std::format!("{e:?}")))?;
+        self.advance_discovery_session();
+        Ok(())
+    }
+
+    /// Encode `message` with E2E protection and send via the unicast
+    /// socket at `port`; advances that socket's session counter on
+    /// success.
+    async fn send_unicast(
+        &mut self,
+        port: u16,
+        target: SocketAddrV4,
+        message: &Message<P>,
+    ) -> Result<(), Error> {
+        let len = wire::encode_with_e2e(message, &mut self.send_buf, &self.e2e_registry)?;
+        let slot = self
+            .unicast_sockets
+            .get_mut(&port)
+            .ok_or(Error::SocketClosedUnexpectedly)?;
+        slot.socket
+            .send_to(&self.send_buf[..len], target)
+            .await
+            .map_err(|e| Error::Transport(std::format!("{e:?}")))?;
+        let _ = slot.next_request_id();
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -416,7 +595,7 @@ where
                         return;
                     }
                     info!("Binding to interface: {}", interface);
-                    let bind_result = self.bind_discovery();
+                    let bind_result = self.bind_discovery().await;
                     match &bind_result {
                         Ok(()) => {
                             info!("Successfully Bound to interface: {}", interface);
@@ -430,7 +609,7 @@ where
                     }
                 }
                 ControlMessage::BindDiscovery(response) => {
-                    let result = self.bind_discovery();
+                    let result = self.bind_discovery().await;
                     if response.send(result).is_err() {
                         warn!("BindDiscovery response receiver dropped (caller canceled)");
                     }
@@ -443,43 +622,33 @@ where
                 }
                 ControlMessage::SendSD(target, header, response) => {
                     // SD Message, If the discovery socket is not bound, bind it
-                    match &mut self.discovery_socket {
-                        None => {
-                            match self.bind_discovery() {
-                                Ok(()) => {
-                                    // Discovery socket successfully bound, send the message on the next loop
-                                    self.request_queue.push_front(ControlMessage::SendSD(
-                                        target, header, response,
-                                    ));
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Failed to bind discovery socket for sending SD message: {:?}",
-                                        e
+                    if self.discovery_socket.is_none() {
+                        match self.bind_discovery().await {
+                            Ok(()) => {
+                                // Discovery socket successfully bound, send the message on the next loop
+                                self.request_queue.push_front(ControlMessage::SendSD(
+                                    target, header, response,
+                                ));
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to bind discovery socket for sending SD message: {:?}",
+                                    e
+                                );
+                                if response.send(Err(e)).is_err() {
+                                    warn!(
+                                        "SendSD error response receiver dropped (caller canceled)"
                                     );
-                                    if response.send(Err(e)).is_err() {
-                                        warn!(
-                                            "SendSD error response receiver dropped (caller canceled)"
-                                        );
-                                    }
                                 }
                             }
                         }
-                        Some(discovery_socket) => {
-                            let message = Message::<PayloadDefinitions>::new_sd(
-                                u32::from(discovery_socket.session_id()),
-                                &header,
-                            );
-                            debug!("Sending {:?} to {}", &message, target);
-                            let send_result = self
-                                .discovery_socket
-                                .as_mut()
-                                .unwrap()
-                                .send(target, message)
-                                .await;
-                            if response.send(send_result).is_err() {
-                                warn!("SendSD response receiver dropped (caller canceled)");
-                            }
+                    } else {
+                        let session_id = u32::from(self.discovery_session_id());
+                        let message = Message::<P>::new_sd(session_id, &header);
+                        debug!("Sending {:?} to {}", &message, target);
+                        let send_result = self.send_discovery(target, &message).await;
+                        if response.send(send_result).is_err() {
+                            warn!("SendSD response receiver dropped (caller canceled)");
                         }
                     }
                 }
@@ -544,7 +713,7 @@ where
                     let source_port = if desired_port == 0 {
                         // Ephemeral: auto-bind only if no sockets exist, then use first
                         if self.unicast_sockets.is_empty() {
-                            match self.bind_unicast(0) {
+                            match self.bind_unicast(0).await {
                                 Ok(port) => {
                                     debug!("Auto-bound unicast on port {} for SendToService", port);
                                     port
@@ -559,7 +728,7 @@ where
                         }
                     } else {
                         // Specific port: bind if not already bound
-                        match self.bind_unicast(desired_port) {
+                        match self.bind_unicast(desired_port).await {
                             Ok(port) => port,
                             Err(e) => {
                                 let _ = send_complete.send(Err(e));
@@ -567,7 +736,6 @@ where
                             }
                         }
                     };
-                    let socket = self.unicast_sockets.get_mut(&source_port).unwrap();
 
                     // Stamp request ID
                     let request_id =
@@ -578,7 +746,7 @@ where
                         self.session_counter = 1;
                     }
 
-                    let send_result = socket.send(target, message).await;
+                    let send_result = self.send_unicast(source_port, target, &message).await;
                     match send_result {
                         Ok(()) => {
                             let _ = send_complete.send(Ok(()));
@@ -609,7 +777,7 @@ where
                     }
 
                     // Bind unicast on the requested port (0 = ephemeral)
-                    let unicast_port = match self.bind_unicast(client_port) {
+                    let unicast_port = match self.bind_unicast(client_port).await {
                         Ok(port) => {
                             debug!("Bound unicast on port {} for Subscribe", port);
                             port
@@ -621,8 +789,8 @@ where
                     };
 
                     // Auto-bind discovery if not bound (re-queue like SendSD does)
-                    match &mut self.discovery_socket {
-                        None => match self.bind_discovery() {
+                    if self.discovery_socket.is_none() {
+                        match self.bind_discovery().await {
                             Ok(()) => {
                                 self.request_queue.push_front(ControlMessage::Subscribe {
                                     service_id,
@@ -637,35 +805,29 @@ where
                             Err(e) => {
                                 let _ = response.send(Err(e));
                             }
-                        },
-                        Some(discovery_socket) => {
-                            let sd_header = PayloadDefinitions::new_subscription_sd_header(
-                                service_id,
-                                instance_id,
-                                major_version,
-                                ttl,
-                                event_group_id,
-                                self.interface,
-                                crate::protocol::sd::TransportProtocol::Udp,
-                                unicast_port,
-                                discovery_socket.reboot_flag(),
-                            );
-                            let session_id = u32::from(discovery_socket.session_id());
-                            let message =
-                                Message::<PayloadDefinitions>::new_sd(session_id, &sd_header);
-                            let reg = self.service_registry.get(id).unwrap();
-                            let target =
-                                SocketAddrV4::new(*reg.addr.ip(), protocol::sd::MULTICAST_PORT);
-                            debug!("Sending Subscribe {:?} to {}", &message, target);
-                            let send_result = self
-                                .discovery_socket
-                                .as_mut()
-                                .unwrap()
-                                .send(target, message)
-                                .await;
-                            if response.send(send_result).is_err() {
-                                warn!("Subscribe response receiver dropped (caller canceled)");
-                            }
+                        }
+                    } else {
+                        let reboot_flag = self.discovery_reboot_flag();
+                        let session_id = u32::from(self.discovery_session_id());
+                        let sd_header = P::new_subscription_sd_header(
+                            service_id,
+                            instance_id,
+                            major_version,
+                            ttl,
+                            event_group_id,
+                            self.interface,
+                            crate::protocol::sd::TransportProtocol::Udp,
+                            unicast_port,
+                            reboot_flag,
+                        );
+                        let message = Message::<P>::new_sd(session_id, &sd_header);
+                        let reg = self.service_registry.get(id).unwrap();
+                        let target =
+                            SocketAddrV4::new(*reg.addr.ip(), protocol::sd::MULTICAST_PORT);
+                        debug!("Sending Subscribe {:?} to {}", &message, target);
+                        let send_result = self.send_discovery(target, &message).await;
+                        if response.send(send_result).is_err() {
+                            warn!("Subscribe response receiver dropped (caller canceled)");
                         }
                     }
                 }
@@ -673,43 +835,52 @@ where
         }
     }
 
+    /// Run the client processing loop.
+    ///
+    /// Drives a single `select!` that multiplexes control messages,
+    /// discovery RX, unicast RX (across all bound unicast sockets via
+    /// poll-based fanout), and a periodic tick. Callers drive this
+    /// future via `tokio::spawn(inner.run())` on desktop or via a
+    /// polled mini-executor on embedded.
     #[allow(clippy::too_many_lines)]
-    fn run(mut self) {
-        tokio::spawn(async move {
-            info!("SOME/IP Client processing loop started");
-            loop {
-                let Self {
-                    control_receiver,
-                    pending_responses,
-                    discovery_socket,
-                    unicast_sockets,
-                    update_sender,
-                    request_queue,
-                    session_tracker,
-                    service_registry,
-                    run,
-                    ..
-                } = &mut self;
-                select! {
-                    () = tokio::time::sleep(std::time::Duration::from_millis(125)) => {}
-                    // Receive a control message
-                    ctrl = control_receiver.recv() => {
-                        if let Some(ctrl) = ctrl {
-                            debug!("Received control message: {:?}", ctrl);
-                            request_queue.push_back(ctrl);
-                        } else {
-                            // The sender has been dropped, so we should exit
-                            *run = false;
-                        }
+    pub async fn run(mut self) {
+        info!("SOME/IP Client processing loop started");
+        loop {
+            let Self {
+                control_receiver,
+                pending_responses,
+                discovery_socket,
+                unicast_sockets,
+                update_sender,
+                request_queue,
+                session_tracker,
+                service_registry,
+                run,
+                e2e_registry,
+                clock,
+                ..
+            } = &mut self;
+            let tick = clock.sleep(std::time::Duration::from_millis(125));
+            select! {
+                () = tick => {}
+                // Receive a control message
+                ctrl = control_receiver.recv() => {
+                    if let Some(ctrl) = ctrl {
+                        debug!("Received control message: {:?}", ctrl);
+                        request_queue.push_back(ctrl);
+                    } else {
+                        // The sender has been dropped, so we should exit
+                        *run = false;
                     }
-                    // Receive a discovery message
-                    discovery = Inner::receive_discovery(discovery_socket) => {
-                        trace!("Received discovery message: {:?}", discovery);
-                        match discovery {
-                            Ok((source, someip_header, sd_header)) => {
+                }
+                // Receive a discovery message
+                discovery = Self::receive_discovery(discovery_socket, e2e_registry) => {
+                    trace!("Received discovery message: {:?}", discovery);
+                    match discovery {
+                        Ok((source, someip_header, sd_header, _e2e_status)) => {
                                 // Extract session ID from SOME/IP request_id (lower 16 bits)
                                 let session_id = (someip_header.request_id() & 0xFFFF) as u16;
-                                let sd_payload = PayloadDefinitions::new_sd_payload(&sd_header);
+                                let sd_payload = P::new_sd_payload(&sd_header);
                                 // Extract reboot flag from the SD payload flags
                                 let reboot_flag = sd_payload
                                     .sd_flags()
@@ -786,33 +957,31 @@ where
                             }
                         }
                      }
-                     unicast = Inner::receive_any_unicast(unicast_sockets) => {
-                         trace!("Received unicast message: {:?}", unicast);
-                         match unicast {
-                             Ok(received) => {
-                                 let ReceivedMessage { message: received_message, e2e_status, .. } = received;
-                                 // Check if this matches a pending request-response by request_id
-                                 let request_id = received_message.header().request_id();
-                                 if let Some(sender) = pending_responses.remove(&request_id) {
-                                     let _ = sender.send(Ok(received_message.payload().clone()));
-                                     continue;
-                                 }
-                                 // Not a response — forward as ClientUpdate::Unicast
-                                 let _ = update_sender.send(ClientUpdate::Unicast { message: received_message, e2e_status });
+                 unicast = Self::receive_any_unicast(unicast_sockets, e2e_registry) => {
+                     trace!("Received unicast message: {:?}", unicast);
+                     match unicast {
+                         Ok((_source, received_message, e2e_status)) => {
+                             // Check if this matches a pending request-response by request_id
+                             let request_id = received_message.header().request_id();
+                             if let Some(sender) = pending_responses.remove(&request_id) {
+                                 let _ = sender.send(Ok(received_message.payload().clone()));
+                                 continue;
                              }
-                             Err(err) => {
-                                 let _ = update_sender.send(ClientUpdate::Error(err));
-                             }
+                             // Not a response — forward as ClientUpdate::Unicast
+                             let _ = update_sender.send(ClientUpdate::Unicast { message: received_message, e2e_status });
+                         }
+                         Err(err) => {
+                             let _ = update_sender.send(ClientUpdate::Error(err));
                          }
                      }
-                }
-                if !*run {
-                    info!("SOME/IP Client processing loop exiting");
-                    break;
-                }
-                self.handle_control_message().await;
+                 }
             }
-        });
+            if !self.run {
+                info!("SOME/IP Client processing loop exiting");
+                break;
+            }
+            self.handle_control_message().await;
+        }
     }
 }
 
