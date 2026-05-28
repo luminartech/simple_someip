@@ -41,6 +41,18 @@ runtime-traits = []
 # wants to drive the generic client/server with tokio. Includes a
 # TokioSocketFactory that opens sockets via socket2 + tokio.
 tokio-adapter = ["runtime-traits", "std", "dep:tokio", "dep:socket2"]
+# Sync-polled mini-executor (executors::polled) for no_std embedded
+# targets that drive Rust from an external tick. Pairs with the
+# runtime-traits abstraction; needs no other deps.
+polled-executor = []
+# no_std SOME/IP client/server that uses heapless-backed state and
+# the runtime-agnostic socket/clock traits. For embedded firmware
+# that cannot pull in tokio::sync / std collections.
+no_std-client = ["runtime-traits"]
+# Callback-driven no_std transport: AsyncUdpSocket / Clock /
+# SocketFactory impls that forward to a host-provided
+# TransportCallbacks trait, typically backed by a C network stack.
+callback-transport = ["runtime-traits"]
 
 [[test]]
 name = "client_server"

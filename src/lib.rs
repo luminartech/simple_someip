@@ -115,7 +115,7 @@ pub(crate) use trace_log;
 pub(crate) use warn_log;
 
 /// SOME/IP client for discovering services and exchanging messages.
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "no_std-client"))]
 pub mod client;
 /// End-to-end (E2E) protection utilities for SOME/IP payloads.
 pub mod e2e;
@@ -128,6 +128,10 @@ mod raw_payload;
 /// async runtimes (tokio, etc.).
 #[cfg(feature = "runtime-traits")]
 pub mod adapters;
+/// Optional executor implementations for driving the runtime-agnostic
+/// client and server on targets without a built-in async runtime.
+#[cfg(feature = "polled-executor")]
+pub mod executors;
 /// Runtime-agnostic async I/O traits for SOME/IP transports and timing.
 #[cfg(feature = "runtime-traits")]
 pub mod runtime;
@@ -135,6 +139,10 @@ pub mod runtime;
 #[cfg(feature = "server")]
 pub mod server;
 mod traits;
+/// Concrete transports tailored to specific deployment patterns
+/// (callback-driven embedded, etc.).
+#[cfg(feature = "callback-transport")]
+pub mod transport;
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
 #[cfg(feature = "std")]
