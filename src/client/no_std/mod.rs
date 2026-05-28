@@ -30,14 +30,56 @@
 //! halo firmware uses; downstream projects with different needs
 //! re-specify via the const generic parameters.
 
+use core::future::Future;
 use core::marker::PhantomData;
 use core::net::{Ipv4Addr, SocketAddrV4};
-
+use core::pin::pin;
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use heapless::index_map::FnvIndexMap;
 use heapless::Vec as HVec;
 
+use crate::protocol::sd::{
+    Entry, EntryType, EventGroupEntry, Flags, Header as SdHeader, OptionType, Options,
+    RebootFlag, SdHeaderView, TransportProtocol,
+};
+use crate::protocol::{Header as SomeIpHeader, MessageView};
 use crate::runtime::{AsyncUdpSocket, Clock, SocketFactory};
-use crate::traits::PayloadWireFormat;
+use crate::traits::{PayloadWireFormat, WireFormat};
+
+/// SOME/IP service ID for SD messages (per spec).
+const SD_SERVICE_ID: u16 = 0xFFFF;
+
+// ---------------------------------------------------------------------------
+// Helpers for synchronously driving async fns to completion
+// ---------------------------------------------------------------------------
+//
+// All AsyncUdpSocket / SocketFactory impls intended for use with this
+// Client are expected to be "ready immediately" — they wrap host
+// callbacks that return synchronously. We drive each async call with
+// a no-op waker and poll once; `Pending` is treated as an
+// implementation error.
+
+static NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    |_| RawWaker::new(core::ptr::null(), &NOOP_VTABLE),
+    |_| {},
+    |_| {},
+    |_| {},
+);
+
+fn noop_waker() -> Waker {
+    // SAFETY: all vtable entries are no-ops that ignore the data ptr.
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &NOOP_VTABLE)) }
+}
+
+#[inline]
+fn poll_once<F: Future>(mut fut: core::pin::Pin<&mut F>) -> Option<F::Output> {
+    let w = noop_waker();
+    let mut cx = Context::from_waker(&w);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Configuration constants — defaults sized for the halo / iris catalog.
@@ -102,15 +144,27 @@ struct SubscriberEndpoint {
 }
 
 /// Identifies an offered (service_id, instance_id, eventgroup_id) tuple.
-type OfferedKey = u32;
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct OfferedKey {
+    service_id: u16,
+    instance_id: u16,
+    eventgroup_id: u16,
+}
 
-#[inline]
-const fn offered_key(service_id: u16, instance_id: u16, eventgroup_id: u16) -> OfferedKey {
-    // Pack the three u16s into a u32 — eventgroup_id in the upper 16
-    // bits, service_id and instance_id share the lower 16 bits via
-    // XOR. Acceptable because (service, instance) combinations are
-    // limited and we just need a stable hash key.
-    ((eventgroup_id as u32) << 16) | ((service_id as u32) ^ (instance_id as u32))
+/// Tracks one outbound `Subscribe` we've sent to a peer that offers
+/// a service we want to receive events from. Re-sent every renewal
+/// tick until the entry is removed.
+#[derive(Clone, Copy, Debug)]
+struct OutboundSubscription {
+    service_id: u16,
+    instance_id: u16,
+    eventgroup_id: u16,
+    major_version: u8,
+    ttl_secs: u32,
+    /// Where to send the SD subscribe message (the peer's SD port).
+    target: SocketAddrV4,
+    /// The local port we want events delivered to.
+    receive_port: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,8 +204,15 @@ where
         DEFAULT_MAX_OFFERED_SERVICES,
     >,
 
+    /// Outbound subscriptions to peer services, re-sent every
+    /// renewal tick.
+    outbound_subscriptions: HVec<OutboundSubscription, DEFAULT_MAX_OUTBOUND_SUBS>,
+
     /// Subscription renewal cadence (default 1000 ms).
     renewal_interval_ms: u32,
+
+    /// Accumulated `elapsed_ms` since the last renewal pass.
+    renewal_accumulator_ms: u32,
 
     _phantom: PhantomData<P>,
 }
@@ -175,7 +236,9 @@ where
             discovery: None,
             unicast_sockets: HVec::new(),
             subscribers: FnvIndexMap::new(),
+            outbound_subscriptions: HVec::new(),
             renewal_interval_ms: 1000,
+            renewal_accumulator_ms: 0,
             _phantom: PhantomData,
         }
     }
@@ -261,7 +324,7 @@ where
         instance_id: u16,
         eventgroup_id: u16,
     ) -> Result<(), Error> {
-        let key = offered_key(service_id, instance_id, eventgroup_id);
+        let key = OfferedKey { service_id, instance_id, eventgroup_id };
         if self.subscribers.contains_key(&key) {
             return Ok(());
         }
@@ -276,29 +339,415 @@ where
     #[must_use]
     pub fn subscriber_count(&self, service_id: u16, instance_id: u16, eventgroup_id: u16) -> usize {
         self.subscribers
-            .get(&offered_key(service_id, instance_id, eventgroup_id))
+            .get(&OfferedKey { service_id, instance_id, eventgroup_id })
             .map_or(0, |v| v.len())
     }
 
-    /// Run the client/server loop until it errors or the future is
-    /// dropped. Drives the SD subscription renewal cadence, parses
-    /// inbound traffic, records subscribers, and dispatches received
-    /// events to `handler`.
+    /// Submit an outbound subscription to a peer-offered service.
     ///
-    /// Intended to be pinned in a `static` and polled by the
-    /// [`crate::executors::polled`] executor from the host tick.
-    pub async fn run<H: EventHandler<P>>(&mut self, _handler: &mut H) {
-        // TODO(Phase 6 follow-up): implement the select! loop:
-        //   - discovery_socket.poll_recv_from
-        //   - each unicast_socket.poll_recv_from
-        //   - clock.sleep_until(next_renewal)
-        // For now, await forever so callers can wire up the
-        // pinned-future story and bring the rest of the integration
-        // online before this body lands.
-        loop {
-            self.clock
-                .sleep_until(self.clock.now() + core::time::Duration::from_secs(60))
-                .await;
+    /// Sends a Subscribe SD entry to `target` (the peer's SD port)
+    /// asking the peer to deliver events for
+    /// `(service_id, instance_id, eventgroup_id)` to our
+    /// `receive_port`. The subscription is recorded and re-sent on
+    /// every renewal tick.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotBound`] if the discovery socket has not
+    /// been bound; [`Error::SendFailed`] on encoding or transport
+    /// errors; [`Error::CapacityExceeded`] if the outbound-sub
+    /// table is full.
+    pub fn subscribe(
+        &mut self,
+        service_id: u16,
+        instance_id: u16,
+        eventgroup_id: u16,
+        major_version: u8,
+        ttl_secs: u32,
+        target: SocketAddrV4,
+        receive_port: u16,
+    ) -> Result<(), Error> {
+        let sub = OutboundSubscription {
+            service_id,
+            instance_id,
+            eventgroup_id,
+            major_version,
+            ttl_secs,
+            target,
+            receive_port,
+        };
+        Self::send_subscribe_sd(
+            self.discovery.as_mut().ok_or(Error::NotBound)?,
+            self.interface,
+            &sub,
+        )?;
+        // Refresh if we already have this exact subscription.
+        if let Some(existing) = self
+            .outbound_subscriptions
+            .iter_mut()
+            .find(|s| {
+                s.service_id == service_id
+                    && s.instance_id == instance_id
+                    && s.eventgroup_id == eventgroup_id
+                    && s.target == target
+            })
+        {
+            *existing = sub;
+        } else {
+            self.outbound_subscriptions
+                .push(sub)
+                .map_err(|_| Error::CapacityExceeded)?;
+        }
+        Ok(())
+    }
+
+    /// Publish a notification on a service we offer.
+    ///
+    /// Looks up tracked subscribers for
+    /// `(service_id, instance_id, eventgroup_id)` and sends the
+    /// notification to each via the unicast socket bound on
+    /// `source_port`. Returns the number of subscribers the message
+    /// was delivered to.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotBound`] if either the offered tuple has
+    /// not been registered via [`offer_service`](Self::offer_service)
+    /// or no unicast socket is bound on `source_port`.
+    /// [`Error::SendFailed`] on encoding errors.
+    pub fn publish(
+        &mut self,
+        service_id: u16,
+        instance_id: u16,
+        eventgroup_id: u16,
+        method_id: u16,
+        payload: &[u8],
+        source_port: u16,
+    ) -> Result<usize, Error> {
+        let key = OfferedKey {
+            service_id,
+            instance_id,
+            eventgroup_id,
+        };
+        // Snapshot subscriber endpoints so we don't hold a borrow of
+        // self.subscribers across the &mut borrow on unicast_sockets.
+        let mut targets: HVec<SocketAddrV4, DEFAULT_MAX_SUBSCRIBERS> = HVec::new();
+        let Some(slot) = self.subscribers.get(&key) else {
+            return Err(Error::NotBound);
+        };
+        if slot.is_empty() {
+            return Ok(0);
+        }
+        for sub in slot {
+            let _ = targets.push(SocketAddrV4::new(sub.addr, sub.port));
+        }
+
+        let Some(sock_slot) = self
+            .unicast_sockets
+            .iter_mut()
+            .find(|s| s.local_port == source_port)
+        else {
+            return Err(Error::NotBound);
+        };
+
+        let mut sent = 0usize;
+        for target in targets.iter() {
+            if Self::send_event(sock_slot, *target, service_id, method_id, payload).is_ok() {
+                sent += 1;
+            }
+        }
+        Ok(sent)
+    }
+
+    /// Build + send a Subscribe SD message via the discovery socket.
+    fn send_subscribe_sd(
+        discovery: &mut DiscoverySlot<S>,
+        local_addr: Ipv4Addr,
+        sub: &OutboundSubscription,
+    ) -> Result<(), Error> {
+        // Build SD payload: one SubscribeEventGroup entry + one
+        // IpV4Endpoint option pointing at our receive endpoint.
+        let entry = Entry::SubscribeEventGroup(EventGroupEntry::new(
+            sub.service_id,
+            sub.instance_id,
+            sub.major_version,
+            sub.ttl_secs,
+            sub.eventgroup_id,
+        ));
+        let option = Options::IpV4Endpoint {
+            ip: local_addr,
+            protocol: TransportProtocol::Udp,
+            port: sub.receive_port,
+        };
+        let reboot = if discovery.session_has_wrapped {
+            RebootFlag::Continuous
+        } else {
+            RebootFlag::RecentlyRebooted
+        };
+        let entries = [entry];
+        let options = [option];
+        let sd_hdr = SdHeader::new(Flags::new_sd(reboot), &entries, &options);
+
+        // Encode SD payload first.
+        let mut sd_buf = [0u8; 128];
+        let sd_len = sd_hdr
+            .encode_to_slice(&mut sd_buf)
+            .map_err(|_| Error::SendFailed)?;
+
+        // Wrap in a SOME/IP SD header.
+        let request_id = u32::from(discovery.session_id);
+        let someip_hdr = SomeIpHeader::new_sd(request_id, sd_len);
+
+        let mut buf = [0u8; 256];
+        let hdr_len = someip_hdr
+            .encode_to_slice(&mut buf)
+            .map_err(|_| Error::SendFailed)?;
+        if hdr_len + sd_len > buf.len() {
+            return Err(Error::SendFailed);
+        }
+        buf[hdr_len..hdr_len + sd_len].copy_from_slice(&sd_buf[..sd_len]);
+        let total = hdr_len + sd_len;
+
+        // Drive the async send synchronously.
+        let fut = discovery.socket.send_to(&buf[..total], sub.target);
+        let mut fut = pin!(fut);
+        match poll_once(fut.as_mut()) {
+            Some(Ok(())) => {}
+            Some(Err(_)) | None => return Err(Error::SendFailed),
+        }
+
+        Self::advance_session(&mut discovery.session_id, &mut discovery.session_has_wrapped);
+        Ok(())
+    }
+
+    /// Build + send a single Notification SOME/IP message via a
+    /// unicast socket. Advances that socket's session counter on
+    /// success.
+    fn send_event(
+        slot: &mut UnicastSlot<S>,
+        target: SocketAddrV4,
+        service_id: u16,
+        method_id: u16,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        let request_id = u32::from(slot.session_id);
+        let header = SomeIpHeader::new_event(service_id, method_id, request_id, 1, 1, payload.len());
+
+        let mut buf = [0u8; 1500];
+        let hdr_len = header
+            .encode_to_slice(&mut buf)
+            .map_err(|_| Error::SendFailed)?;
+        if hdr_len + payload.len() > buf.len() {
+            return Err(Error::SendFailed);
+        }
+        buf[hdr_len..hdr_len + payload.len()].copy_from_slice(payload);
+        let total = hdr_len + payload.len();
+
+        let fut = slot.socket.send_to(&buf[..total], target);
+        let mut fut = pin!(fut);
+        match poll_once(fut.as_mut()) {
+            Some(Ok(())) => {}
+            Some(Err(_)) | None => return Err(Error::SendFailed),
+        }
+
+        let mut wrapped_dummy = false;
+        Self::advance_session(&mut slot.session_id, &mut wrapped_dummy);
+        Ok(())
+    }
+
+    fn advance_session(session_id: &mut u16, wrapped: &mut bool) {
+        if *session_id == u16::MAX {
+            *session_id = 1;
+            *wrapped = true;
+        } else {
+            *session_id += 1;
+        }
+    }
+
+    /// Drive the client/server forward by one step.
+    ///
+    /// Drains a single received datagram from each bound socket
+    /// (discovery + each unicast), decrements subscriber TTLs by
+    /// `elapsed_ms`, and — if a renewal interval has passed —
+    /// re-sends every tracked outbound subscription.
+    ///
+    /// Call periodically from the host tick. `elapsed_ms` should be
+    /// the milliseconds elapsed since the last `tick` call.
+    pub fn tick<H: EventHandler<P>>(&mut self, elapsed_ms: u32, handler: &mut H) {
+        let mut rx_buf = [0u8; 1500];
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Discovery
+        if let Some(slot) = self.discovery.as_ref()
+            && let Poll::Ready(Ok((len, src))) = slot.socket.poll_recv_from(&mut cx, &mut rx_buf)
+        {
+            Self::dispatch_rx(
+                &mut self.subscribers,
+                handler,
+                &rx_buf[..len],
+                src,
+                /* is_sd */ true,
+            );
+        }
+
+        // Each unicast (one packet per socket per tick).
+        for slot in self.unicast_sockets.iter() {
+            if let Poll::Ready(Ok((len, src))) = slot.socket.poll_recv_from(&mut cx, &mut rx_buf) {
+                Self::dispatch_rx(
+                    &mut self.subscribers,
+                    handler,
+                    &rx_buf[..len],
+                    src,
+                    /* is_sd */ false,
+                );
+            }
+        }
+
+        // Tick TTLs on tracked subscribers.
+        Self::tick_subscriber_ttls(&mut self.subscribers, elapsed_ms);
+
+        // Renew outbound subscriptions on cadence.
+        self.renewal_accumulator_ms = self.renewal_accumulator_ms.saturating_add(elapsed_ms);
+        if self.renewal_accumulator_ms >= self.renewal_interval_ms {
+            self.renewal_accumulator_ms = 0;
+            self.renew_outbound_subscriptions();
+        }
+    }
+
+    fn renew_outbound_subscriptions(&mut self) {
+        let Some(discovery) = self.discovery.as_mut() else {
+            return;
+        };
+        for sub in self.outbound_subscriptions.iter() {
+            let _ = Self::send_subscribe_sd(discovery, self.interface, sub);
+        }
+    }
+
+    /// Parse a received datagram and either record subscribers
+    /// (SD) or dispatch the event (unicast).
+    fn dispatch_rx<H: EventHandler<P>>(
+        subscribers: &mut FnvIndexMap<
+            OfferedKey,
+            HVec<SubscriberEndpoint, DEFAULT_MAX_SUBSCRIBERS>,
+            DEFAULT_MAX_OFFERED_SERVICES,
+        >,
+        handler: &mut H,
+        bytes: &[u8],
+        src: SocketAddrV4,
+        is_sd_socket: bool,
+    ) {
+        let Ok(msg_view) = MessageView::parse(bytes) else {
+            handler.on_error(1 /* parse */, 0);
+            return;
+        };
+        let hdr = msg_view.header();
+        let payload = msg_view.payload_bytes();
+
+        let is_sd_message = is_sd_socket
+            && (hdr.message_id().service_id() == SD_SERVICE_ID
+                || hdr.message_id().method_id() == 0x8100);
+
+        if is_sd_message {
+            Self::process_sd_payload(subscribers, payload, src);
+        } else {
+            // Best-effort event dispatch. E2E checking is deferred
+            // to Phase 5.5c — for now `e2e_status` is reported as
+            // `Unchecked` (0).
+            handler.on_event(
+                hdr.message_id().service_id(),
+                hdr.message_id().method_id(),
+                payload,
+                0,
+            );
+        }
+    }
+
+    /// Walk the entries in an SD payload, recording any `Subscribe`
+    /// entry that targets one of our offered (service, instance,
+    /// eventgroup) tuples.
+    fn process_sd_payload(
+        subscribers: &mut FnvIndexMap<
+            OfferedKey,
+            HVec<SubscriberEndpoint, DEFAULT_MAX_SUBSCRIBERS>,
+            DEFAULT_MAX_OFFERED_SERVICES,
+        >,
+        payload: &[u8],
+        _src: SocketAddrV4,
+    ) {
+        let Ok(sd_view) = SdHeaderView::parse(payload) else {
+            return;
+        };
+        for entry in sd_view.entries() {
+            let Ok(entry_type) = entry.entry_type() else {
+                continue;
+            };
+            if entry_type != EntryType::Subscribe {
+                continue;
+            }
+            let svc = entry.service_id();
+            let inst = entry.instance_id();
+            let eg = entry.event_group_id();
+            let ttl_secs = entry.ttl();
+            let key = OfferedKey { service_id: svc, instance_id: inst, eventgroup_id: eg };
+            let Some(slot) = subscribers.get_mut(&key) else {
+                // Not one of our offered tuples.
+                continue;
+            };
+            // Find the first IPv4 endpoint option in this entry's
+            // first-options run; that's the subscriber's receive
+            // endpoint.
+            let first_idx = entry.index_first_options_run() as usize;
+            let first_count = entry.options_count().first_options_count as usize;
+            let Some(endpoint) = sd_view
+                .options()
+                .skip(first_idx)
+                .take(first_count)
+                .filter_map(|opt| {
+                    if matches!(opt.option_type(), Ok(OptionType::IpV4Endpoint)) {
+                        opt.as_ipv4().ok().map(|(ip, _proto, port)| (ip, port))
+                    } else {
+                        None
+                    }
+                })
+                .next()
+            else {
+                continue;
+            };
+            // Record / refresh subscriber.
+            let ttl_ms = ttl_secs.saturating_mul(1000);
+            if let Some(existing) = slot
+                .iter_mut()
+                .find(|s| s.addr == endpoint.0 && s.port == endpoint.1)
+            {
+                existing.ttl_remaining_ms = ttl_ms;
+            } else {
+                let _ = slot.push(SubscriberEndpoint {
+                    addr: endpoint.0,
+                    port: endpoint.1,
+                    ttl_remaining_ms: ttl_ms,
+                });
+            }
+        }
+    }
+
+    fn tick_subscriber_ttls(
+        subscribers: &mut FnvIndexMap<
+            OfferedKey,
+            HVec<SubscriberEndpoint, DEFAULT_MAX_SUBSCRIBERS>,
+            DEFAULT_MAX_OFFERED_SERVICES,
+        >,
+        elapsed_ms: u32,
+    ) {
+        for (_key, slot) in subscribers.iter_mut() {
+            // Decrement and drop expired in-place via swap_remove.
+            let mut i = 0;
+            while i < slot.len() {
+                slot[i].ttl_remaining_ms = slot[i].ttl_remaining_ms.saturating_sub(elapsed_ms);
+                if slot[i].ttl_remaining_ms == 0 {
+                    let _ = slot.swap_remove(i);
+                } else {
+                    i += 1;
+                }
+            }
         }
     }
 }
@@ -307,10 +756,10 @@ where
 // Event handler trait
 // ---------------------------------------------------------------------------
 
-/// Receives events parsed by [`Client::run`].
+/// Receives events parsed by [`Client::tick`].
 ///
-/// All methods are sync — implementations must not block the run
-/// loop. Heavy processing should be queued to the application's
+/// All methods are sync — implementations must not block the tick
+/// call. Heavy processing should be queued to the application's
 /// own task.
 pub trait EventHandler<P> {
     /// Called for every received SOME/IP event matching a service
