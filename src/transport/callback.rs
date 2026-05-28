@@ -42,13 +42,15 @@ use crate::runtime::{AsyncUdpSocket, Clock, SocketFactory};
 // Configuration constants
 // ===========================================================================
 
-/// Largest UDP datagram the transport will accept. Sized to fit the
-/// `HWP1ScanCommand` request (10576 B payload + 16 B header). Larger
-/// datagrams are dropped at the on_rx boundary.
-pub const MAX_DATAGRAM: usize = 12 * 1024;
+/// Largest UDP datagram the transport will accept. Sized for typical
+/// SD + small-payload notifications; large request payloads (e.g.
+/// iris HWP1ScanCommand at ~10.5 KiB) exceed this and are dropped
+/// at the on_rx boundary. Bump per-deployment as the static memory
+/// budget allows.
+pub const MAX_DATAGRAM: usize = 2048;
 
 /// Number of distinct local ports the transport can serve concurrently.
-pub const MAX_SOCKETS: usize = 4;
+pub const MAX_SOCKETS: usize = 3;
 
 // ===========================================================================
 // Error type
@@ -143,7 +145,6 @@ struct SyncCell<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for SyncCell<T> {}
 
 static SLOTS: SyncCell<[PortSlot; MAX_SOCKETS]> = SyncCell(UnsafeCell::new([
-    PortSlot::empty(),
     PortSlot::empty(),
     PortSlot::empty(),
     PortSlot::empty(),
