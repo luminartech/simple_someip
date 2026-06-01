@@ -433,6 +433,7 @@ pub(super) async fn announce_loop<T, Tm>(
 
 /// Receive loop body — drives `recv_from` on both the unicast and SD
 /// sockets, dispatches SD messages to [`handle_sd_message`].
+#[allow(clippy::too_many_arguments)]
 async fn recv_loop<T, Sub>(
     config: &ServerConfig,
     unicast_socket: &T,
@@ -536,16 +537,20 @@ where
                             crate::log::warn!("Failed to parse SD message: {:?}", e);
                         }
                     }
-                } else if let Some(cb) = non_sd_observer {
+                } else if from_unicast {
                     // Surface non-SD unicast (method requests / fire-and-forget
                     // calls to offered services) via the registered callback.
                     // The full raw datagram is forwarded; the consumer is
                     // responsible for re-parsing and any E2E check.
-                    if let core::net::SocketAddr::V4(src_v4) = addr {
-                        cb(data, src_v4);
+                    if let Some(cb) = non_sd_observer {
+                        if let core::net::SocketAddr::V4(src_v4) = addr {
+                            cb(data, src_v4);
+                        }
+                    } else {
+                        crate::log::trace!("Non-SD unicast SOME/IP message, no observer registered — ignoring");
                     }
                 } else {
-                    crate::log::trace!("Non-SD SOME/IP message, ignoring");
+                    crate::log::trace!("Non-SD multicast SOME/IP message, ignoring");
                 }
             }
             Err(e) => {

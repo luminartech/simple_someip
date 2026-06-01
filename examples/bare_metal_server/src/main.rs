@@ -260,6 +260,7 @@ async fn main() {
                 timer: MockTimer,
                 e2e_registry: e2e,
                 subscriptions: subs,
+                non_sd_observer: None,
             },
             config,
             false, // multicast_loopback
