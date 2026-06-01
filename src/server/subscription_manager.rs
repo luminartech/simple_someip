@@ -492,21 +492,15 @@ pub mod bare_metal_subscription_impl {
     }
 
     impl SubscriptionHandle for StaticSubscriptionHandle {
-        // Futures are `Send` even though `SubscriptionManager` itself
-        // isn't `Sync` — the `embassy-sync`
-        // `CriticalSectionRawMutex` wrapping it IS `Sync`, and the
-        // future bodies have no `.await` points inside the lock
-        // closure (they capture only the `&'static` storage handle
-        // and the by-value args, all `Send`). Boxing with `+ Send`
-        // lets `Server::run`'s `Send` bound be satisfied. The
-        // `server` feature (required for `SubscriptionHandle` to be
-        // in scope) implies `_alloc`, so `Box::pin` is always
-        // available here.
-        type SubscribeFuture<'a> = core::pin::Pin<
-            alloc::boxed::Box<dyn Future<Output = Result<(), SubscribeError>> + Send + 'a>,
-        >;
-        type UnsubscribeFuture<'a> =
-            core::pin::Pin<alloc::boxed::Box<dyn Future<Output = ()> + Send + 'a>>;
+        // The lock closure is fully synchronous (no `.await` inside the
+        // critical section), so each operation completes immediately and
+        // the returned future is a concrete `core::future::Ready` — no
+        // heap, no `Box::pin`. This keeps the no-alloc bare-metal path
+        // free of `alloc` (the `server` feature no longer implies
+        // `_alloc`). `Ready<T>` is `Send` when `T: Send`, satisfying any
+        // `Send`-checked run path.
+        type SubscribeFuture<'a> = core::future::Ready<Result<(), SubscribeError>>;
+        type UnsubscribeFuture<'a> = core::future::Ready<()>;
 
         fn subscribe(
             &self,
@@ -516,16 +510,14 @@ pub mod bare_metal_subscription_impl {
             subscriber_addr: SocketAddrV4,
         ) -> Self::SubscribeFuture<'_> {
             let storage = self.0;
-            alloc::boxed::Box::pin(async move {
-                storage.lock(|cell| {
-                    cell.borrow_mut().subscribe(
-                        service_id,
-                        instance_id,
-                        event_group_id,
-                        subscriber_addr,
-                    )
-                })
-            })
+            core::future::ready(storage.lock(|cell| {
+                cell.borrow_mut().subscribe(
+                    service_id,
+                    instance_id,
+                    event_group_id,
+                    subscriber_addr,
+                )
+            }))
         }
 
         fn unsubscribe(
@@ -536,16 +528,15 @@ pub mod bare_metal_subscription_impl {
             subscriber_addr: SocketAddrV4,
         ) -> Self::UnsubscribeFuture<'_> {
             let storage = self.0;
-            alloc::boxed::Box::pin(async move {
-                storage.lock(|cell| {
-                    cell.borrow_mut().unsubscribe(
-                        service_id,
-                        instance_id,
-                        event_group_id,
-                        subscriber_addr,
-                    );
-                });
-            })
+            storage.lock(|cell| {
+                cell.borrow_mut().unsubscribe(
+                    service_id,
+                    instance_id,
+                    event_group_id,
+                    subscriber_addr,
+                );
+            });
+            core::future::ready(())
         }
 
         fn for_each_subscriber<'a, F>(
