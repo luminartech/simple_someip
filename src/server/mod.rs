@@ -286,6 +286,13 @@ where
     /// `Arc<RwLock<SubscriptionManager>>` for this; bare-metal callers
     /// supply their own [`SubscriptionHandle`] impl.
     pub subscriptions: Sub,
+    /// Optional callback invoked from the server's receive loop for every
+    /// non-SD **unicast** datagram (method requests / fire-and-forget calls
+    /// to offered services). `None` reproduces the historical
+    /// "non-SD ignored" behavior. The callback receives the full raw
+    /// datagram bytes and the source `SocketAddrV4`; the consumer is
+    /// responsible for re-parsing the SOME/IP header and any E2E check.
+    pub non_sd_observer: Option<NonSdRequestCallback>,
 }
 
 /// Tokio-defaulted constructor.
@@ -330,6 +337,7 @@ impl
             timer: crate::tokio_transport::TokioTimer,
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
+            non_sd_observer: None,
         }
     }
 }
@@ -354,6 +362,7 @@ where
             timer: self.timer,
             e2e_registry: self.e2e_registry,
             subscriptions: self.subscriptions,
+            non_sd_observer: self.non_sd_observer,
         }
     }
 
@@ -365,6 +374,7 @@ where
             timer,
             e2e_registry: self.e2e_registry,
             subscriptions: self.subscriptions,
+            non_sd_observer: self.non_sd_observer,
         }
     }
 
@@ -379,6 +389,7 @@ where
             timer: self.timer,
             e2e_registry,
             subscriptions: self.subscriptions,
+            non_sd_observer: self.non_sd_observer,
         }
     }
 
@@ -393,7 +404,18 @@ where
             timer: self.timer,
             e2e_registry: self.e2e_registry,
             subscriptions,
+            non_sd_observer: self.non_sd_observer,
         }
+    }
+
+    /// Register a callback invoked for every non-SD unicast datagram
+    /// (method requests / fire-and-forget calls to offered services).
+    /// Passing `None` (the default if unset) preserves the historical
+    /// "ignore non-SD" behavior.
+    #[must_use]
+    pub fn with_non_sd_observer(mut self, observer: Option<NonSdRequestCallback>) -> Self {
+        self.non_sd_observer = observer;
+        self
     }
 }
 
@@ -736,6 +758,7 @@ impl
             timer: crate::tokio_transport::TokioTimer,
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
+            non_sd_observer: None,
         };
         Self::new_with_deps(deps, config, multicast_loopback).await
     }
@@ -776,6 +799,7 @@ impl
             timer: crate::tokio_transport::TokioTimer,
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
+            non_sd_observer: None,
         };
         Self::new_passive_with_deps(deps, config).await
     }
@@ -829,6 +853,7 @@ where
             timer,
             e2e_registry,
             subscriptions,
+            non_sd_observer: deps_non_sd_observer,
         } = deps;
 
         // Bind unicast socket for receiving subscriptions, then wrap
@@ -885,7 +910,7 @@ where
             timer,
             is_passive: false,
             started: Arc::new(AtomicBool::new(false)),
-            non_sd_observer: None,
+            non_sd_observer: deps_non_sd_observer,
         };
         let handles = ServerHandles {
             publisher: server.publisher(),
@@ -921,6 +946,7 @@ where
             timer,
             e2e_registry,
             subscriptions,
+            non_sd_observer: deps_non_sd_observer,
         } = deps;
 
         // Bind unicast socket at the configured local_port.
@@ -968,7 +994,7 @@ where
             timer,
             is_passive: true,
             started: Arc::new(AtomicBool::new(false)),
-            non_sd_observer: None,
+            non_sd_observer: deps_non_sd_observer,
         };
         let handles = ServerHandles {
             publisher: server.publisher(),
@@ -1777,6 +1803,7 @@ mod tests {
             timer: TokioTimer,
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             subscriptions: subscriptions.clone(),
+            non_sd_observer: None,
         };
         let config = ServerConfig::new(0x5B, 1)
             .with_interface(Ipv4Addr::LOCALHOST)
