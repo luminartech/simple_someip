@@ -28,15 +28,22 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::Timer;
 use crate::e2e::{E2EKey, E2EProfile};
+#[cfg(feature = "_alloc")]
 use crate::protocol::sd;
 #[cfg(test)]
 use crate::protocol::sd::{Entry, Flags, ServiceEntry};
 use crate::transport::{
-    E2ERegistryHandle, SharedHandle, SocketOptions, TransportFactory, TransportSocket,
-    WrappableSharedHandle,
+    E2ERegistryHandle, SharedHandle, TransportFactory, TransportSocket,
 };
+#[cfg(feature = "_alloc")]
+use crate::transport::SocketOptions;
+#[cfg(feature = "_alloc")]
+use crate::transport::WrappableSharedHandle;
+#[cfg(feature = "_alloc")]
 use alloc::sync::Arc;
-use core::net::{Ipv4Addr, SocketAddrV4};
+use core::net::Ipv4Addr;
+#[cfg(feature = "_alloc")]
+use core::net::SocketAddrV4;
 #[cfg(test)]
 use std::vec::Vec;
 
@@ -483,6 +490,15 @@ where
     /// e2e)>`; for no-alloc, a `&'static EventPublisher<...>`
     /// declared externally.
     pub publisher: Hep,
+    /// First-poll run latch. On alloc builds, pass
+    /// `Arc::new(AtomicBool::new(false))`; on no-alloc bare metal, pass
+    /// a `&'static AtomicBool` (declared as a `static`). Prevents two
+    /// run-futures built from the same `Server` from racing the sockets
+    /// and SD session counter.
+    pub started: StartedLatch,
+    /// Optional callback for non-SD unicast datagrams (method requests).
+    /// `None` reproduces the default "non-SD ignored" behavior.
+    pub non_sd_observer: Option<NonSdRequestCallback>,
 }
 
 /// SOME/IP Server that can offer services and publish events.
@@ -504,14 +520,36 @@ where
 /// these as `TokioTransport` / `TokioTimer` / `Arc<Mutex<E2ERegistry>>`
 /// / `Arc<RwLock<SubscriptionManager>>`. Bare-metal callers use
 /// [`Self::new_with_deps`] (under `server`) and supply their own.
+/// Default shared-handle types for the `Server`'s `H` / `Hsd` / `Hep`
+/// generic parameters. `Arc<T>` when an allocator is present;
+/// `&'static T` on no-alloc bare metal (where the caller supplies the
+/// statics). Both satisfy `SharedHandle<T>`. These defaults are only
+/// materialized for callers that omit the handle parameters (the
+/// allocator-backed convenience constructors); no-alloc callers spell
+/// the handle types explicitly via `new_with_handles`.
+#[cfg(feature = "_alloc")]
+type DefaultSocketHandle<F> = Arc<<F as TransportFactory>::Socket>;
+#[cfg(not(feature = "_alloc"))]
+type DefaultSocketHandle<F> = &'static <F as TransportFactory>::Socket;
+
+#[cfg(feature = "_alloc")]
+type DefaultSdStateHandle = Arc<SdStateManager>;
+#[cfg(not(feature = "_alloc"))]
+type DefaultSdStateHandle = &'static SdStateManager;
+
+#[cfg(feature = "_alloc")]
+type DefaultEventPublisherHandle<R, Sub, H, T> = Arc<EventPublisher<R, Sub, H, T>>;
+#[cfg(not(feature = "_alloc"))]
+type DefaultEventPublisherHandle<R, Sub, H, T> = &'static EventPublisher<R, Sub, H, T>;
+
 pub struct Server<
     F,
     Tm,
     R,
     Sub,
-    H = Arc<<F as TransportFactory>::Socket>,
-    Hsd = Arc<SdStateManager>,
-    Hep = Arc<EventPublisher<R, Sub, H, <F as TransportFactory>::Socket>>,
+    H = DefaultSocketHandle<F>,
+    Hsd = DefaultSdStateHandle,
+    Hep = DefaultEventPublisherHandle<R, Sub, H, <F as TransportFactory>::Socket>,
 > where
     F: TransportFactory + 'static,
     F::Socket: 'static,
@@ -563,10 +601,33 @@ pub struct Server<
     /// constructor's tuple, [`Self::run`], or [`Self::run_with_buffers`])
     /// short-circuit with `Err(Error::InvalidUsage("server_already_running"))`
     /// rather than racing on the same SD/unicast sockets and session
-    /// counter. `Arc<AtomicBool>` because the run-future captures a
-    /// clone independent of `&self`'s lifetime.
-    started: Arc<AtomicBool>,
+    /// counter. Held behind [`StartedLatch`] — `Arc<AtomicBool>` when an
+    /// allocator is present, `&'static AtomicBool` on no-alloc bare metal
+    /// — because the run-future captures an owned copy independent of
+    /// `&self`'s lifetime, and both alternatives are `Clone + 'static`.
+    started: StartedLatch,
+    /// Optional callback invoked for non-SD unicast datagrams received
+    /// on the service's port (method requests / fire-and-forget calls).
+    /// `None` preserves the historical "ignore non-SD" behavior; `Some`
+    /// surfaces those datagrams to the consumer (used by halo's FFI to
+    /// dispatch HWP1 method requests).
+    non_sd_observer: Option<NonSdRequestCallback>,
 }
+
+/// Callback invoked by the server's `recv_loop` for every non-SD
+/// unicast datagram received on the service's port (i.e. method
+/// requests / fire-and-forget calls to the offered services). The
+/// payload is the full raw datagram bytes; the caller is responsible
+/// for re-parsing the SOME/IP header (and applying any E2E check) on
+/// the consumer side. `fn` pointers are `Copy + Send + Sync + 'static`,
+/// so they can be stored on the `Server` and captured by the
+/// run-future without adding a new generic.
+pub type NonSdRequestCallback = fn(data: &[u8], source: core::net::SocketAddrV4);
+
+#[cfg(feature = "_alloc")]
+type StartedLatch = Arc<AtomicBool>;
+#[cfg(not(feature = "_alloc"))]
+type StartedLatch = &'static AtomicBool;
 
 /// `Hep` resolved against the `server-tokio` convenience constructors'
 /// concrete defaults — the `EventPublisher` shape with all four
@@ -720,6 +781,7 @@ impl
     }
 }
 
+#[cfg(feature = "_alloc")]
 impl<F, Tm, R, Sub, H, Hsd, Hep> Server<F, Tm, R, Sub, H, Hsd, Hep>
 where
     F: TransportFactory + 'static,
@@ -823,6 +885,7 @@ where
             timer,
             is_passive: false,
             started: Arc::new(AtomicBool::new(false)),
+            non_sd_observer: None,
         };
         let handles = ServerHandles {
             publisher: server.publisher(),
@@ -905,6 +968,7 @@ where
             timer,
             is_passive: true,
             started: Arc::new(AtomicBool::new(false)),
+            non_sd_observer: None,
         };
         let handles = ServerHandles {
             publisher: server.publisher(),
@@ -988,7 +1052,8 @@ where
             factory: deps.factory,
             timer: deps.timer,
             is_passive: false,
-            started: Arc::new(AtomicBool::new(false)),
+            started: deps.started,
+            non_sd_observer: deps.non_sd_observer,
         })
     }
 
@@ -1053,7 +1118,8 @@ where
             factory: deps.factory,
             timer: deps.timer,
             is_passive: true,
-            started: Arc::new(AtomicBool::new(false)),
+            started: deps.started,
+            non_sd_observer: deps.non_sd_observer,
         })
     }
 
@@ -1159,6 +1225,8 @@ where
         let sd_state = self.sd_state.clone();
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
+        let non_sd_observer = self.non_sd_observer;
+        #[allow(noop_method_call)]
         let started = self.started.clone();
 
         async move {
@@ -1187,6 +1255,7 @@ where
                 is_passive,
                 unicast_buf,
                 sd_buf,
+                non_sd_observer,
             )
             .await
         }
@@ -1212,6 +1281,7 @@ where
     /// # Errors
     ///
     /// Same as [`Self::run_with_buffers`].
+    #[cfg(feature = "_alloc")]
     pub fn run(
         &self,
     ) -> impl core::future::Future<Output = Result<(), Error>>
@@ -1242,6 +1312,7 @@ where
     /// declared bound — callers should prefer `run` (Send-checked at
     /// the API boundary) or `run_with_buffers` (explicitly no `Send`
     /// requirement).
+    #[cfg(feature = "_alloc")]
     fn run_inner(
         &self,
     ) -> impl core::future::Future<Output = Result<(), Error>>
@@ -1254,6 +1325,7 @@ where
         let sd_state = self.sd_state.clone();
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
+        let non_sd_observer = self.non_sd_observer;
         let started = self.started.clone();
 
         async move {
@@ -1288,6 +1360,7 @@ where
                 is_passive,
                 &mut unicast_buf,
                 &mut sd_buf,
+                non_sd_observer,
             )
             .await
         }
@@ -1470,6 +1543,8 @@ mod tests {
             sd_socket,
             sd_state: Arc::new(SdStateManager::new()),
             publisher,
+            started: Arc::new(AtomicBool::new(false)),
+            non_sd_observer: None,
         };
         (handles, bound_port)
     }
