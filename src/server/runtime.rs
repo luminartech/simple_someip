@@ -441,6 +441,7 @@ async fn recv_loop<T, Sub>(
     subscriptions: &Sub,
     unicast_buf: &mut [u8],
     sd_buf: &mut [u8],
+    non_sd_observer: Option<super::NonSdRequestCallback>,
 ) -> Result<(), Error>
 where
     T: TransportSocket,
@@ -535,6 +536,14 @@ where
                             crate::log::warn!("Failed to parse SD message: {:?}", e);
                         }
                     }
+                } else if let Some(cb) = non_sd_observer {
+                    // Surface non-SD unicast (method requests / fire-and-forget
+                    // calls to offered services) via the registered callback.
+                    // The full raw datagram is forwarded; the consumer is
+                    // responsible for re-parsing and any E2E check.
+                    if let core::net::SocketAddr::V4(src_v4) = addr {
+                        cb(data, src_v4);
+                    }
                 } else {
                     crate::log::trace!("Non-SD SOME/IP message, ignoring");
                 }
@@ -560,6 +569,7 @@ where
 /// and only the receive loop drives — used by the dispatcher topology
 /// where a co-located `Client` emits `OfferService` on the server's
 /// behalf.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_combined<H, T, Sub, Hsd, Tm>(
     config: ServerConfig,
     unicast_socket: H,
@@ -570,6 +580,7 @@ pub(super) async fn run_combined<H, T, Sub, Hsd, Tm>(
     is_passive: bool,
     unicast_buf: &mut [u8],
     sd_buf: &mut [u8],
+    non_sd_observer: Option<super::NonSdRequestCallback>,
 ) -> Result<(), Error>
 where
     H: SharedHandle<T>,
@@ -593,7 +604,7 @@ where
     let sd = sd_socket.get();
     let sd_state_ref = sd_state.get();
 
-    let recv_fut = recv_loop(&config, unicast, sd, sd_state_ref, &subscriptions, unicast_buf, sd_buf);
+    let recv_fut = recv_loop(&config, unicast, sd, sd_state_ref, &subscriptions, unicast_buf, sd_buf, non_sd_observer);
 
     if config.announce {
         let announce_fut = announce_loop(&config, sd, sd_state_ref, &timer);
