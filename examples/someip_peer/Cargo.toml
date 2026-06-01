@@ -1,0 +1,24 @@
+[package]
+name = "someip_peer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Desktop peer that mirrors halo's iris catalog:
+#   - Subscribes to the sensor's three offered services (SVC_OBJECT,
+#     SVC_SYSTEM, SVC_SCAN) and logs every notification received.
+#   - Offers SVC_MODE_CTRL2 (0x005B / inst 0x0002 / eg 1) with E2E
+#     Profile 5 with-header (data_id=40046, data_length=1, max_delta=2)
+#     and publishes periodic notifications so halo's drain_client_rx
+#     can exercise its E2E check.
+#   - Periodically sends a HWP1SystemMode method request to the
+#     sensor's unicast port 10000 so halo's drain_unicast_rx fires.
+#
+# Build (host):       cargo run -p someip_peer -- <host-ip> [sensor-ip]
+# Build (Windows):    cargo build -p someip_peer --release --target x86_64-pc-windows-gnu
+
+[dependencies]
+simple-someip = { path = "../..", features = ["client-tokio", "server-tokio"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
