@@ -109,7 +109,14 @@ _alloc = []
 # bringing `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>` /
 # / `TokioTransport` / `TokioTimer` defaults into scope, and forces
 # `std`.
-server = ["dep:futures-util", "_alloc"]
+#
+# `server` itself is alloc-free: the no-alloc path is
+# `Server::new_with_handles` + `run_with_buffers` with static handles and
+# a `&'static AtomicBool` run latch. The allocator-backed conveniences
+# (`new_with_deps`/`new_passive_with_deps`, `run`/`run_inner`'s 64 KiB
+# buffers, the `Arc` `StartedLatch`) are gated behind `_alloc`, which
+# `std` / `server-tokio` / `embassy_channels` still pull in.
+server = ["dep:futures-util"]
 server-tokio = ["server", "std", "dep:tokio", "dep:socket2"]
 # Marks a build as intended for bare-metal / no_std consumption.
 # Activates embassy-sync as the channel backend, the `static_channels`
