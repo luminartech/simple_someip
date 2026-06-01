@@ -363,6 +363,7 @@ async fn client_receives_server_sd_announcement() {
         timer: MockTimer,
         e2e_registry: server_e2e,
         subscriptions: server_subs,
+        non_sd_observer: None,
     };
 
     let (_server, _handles, run): (
@@ -459,6 +460,7 @@ async fn client_send_request_server_runloop_stable() {
         timer: MockTimer,
         e2e_registry: server_e2e,
         subscriptions: server_subs,
+        non_sd_observer: None,
     };
 
     let (_server, _handles, run): (

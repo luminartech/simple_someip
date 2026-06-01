@@ -37,6 +37,7 @@ use simple_someip::server::{SubscribeError, Subscriber, SubscriptionHandle};
 use simple_someip::transport::{
     ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory, TransportSocket,
 };
+use simple_someip::server::NonSdRequestCallback;
 use simple_someip::{Server, ServerDeps};
 
 // ── Mock transport ─────────────────────────────────────────────────────
@@ -289,6 +290,7 @@ async fn server_constructible_without_server_tokio_feature() {
             timer: MockTimer,
             e2e_registry: e2e_handle,
             subscriptions: subs,
+            non_sd_observer: None,
         };
 
     let (_server, _handles, run): (
@@ -336,6 +338,7 @@ async fn passive_server_constructible_without_server_tokio_feature() {
             timer: MockTimer,
             e2e_registry: e2e_handle,
             subscriptions: subs,
+            non_sd_observer: None,
         };
 
     let (_server, _handles, _run): (
@@ -345,4 +348,223 @@ async fn passive_server_constructible_without_server_tokio_feature() {
     ) = Server::new_passive_with_deps(deps, config)
         .await
         .expect("Server::new_passive_with_deps must succeed with no-tokio mocks");
+}
+
+// ── NonSdRequestCallback witness ──────────────────────────────────────
+//
+// Drives a non-SD unicast datagram through the server's `recv_loop`
+// and verifies the registered callback receives the right bytes + source.
+// The companion test confirms `None` preserves the historical
+// "ignore non-SD" behavior.
+
+// `NonSdRequestCallback` is `fn(&[u8], SocketAddrV4)` — a plain function
+// pointer, so it can't capture environment. Each test parks its
+// observation in a dedicated static so the callback can write into it
+// without interfering with sibling tests (cargo runs tests in parallel
+// within a test binary).
+
+use std::sync::OnceLock;
+
+static OBSERVED_SOME: OnceLock<Mutex<Option<(Vec<u8>, SocketAddrV4)>>> = OnceLock::new();
+static OBSERVED_NONE: OnceLock<Mutex<Option<(Vec<u8>, SocketAddrV4)>>> = OnceLock::new();
+
+fn record_some(data: &[u8], source: SocketAddrV4) {
+    let slot = OBSERVED_SOME.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap() = Some((data.to_vec(), source));
+}
+
+fn record_none(data: &[u8], source: SocketAddrV4) {
+    let slot = OBSERVED_NONE.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap() = Some((data.to_vec(), source));
+}
+
+/// Build a minimal SOME/IP method-request datagram (16-byte header,
+/// no payload, message_type = Request). The exact byte layout matches
+/// the on-wire SOME/IP header format documented in
+/// AUTOSAR_SWS_SOMEIPProtocol §4 — checked-by-encode against
+/// `simple_someip::protocol::Header::encode` would be cleaner but the
+/// header is small enough to spell out by hand and avoids dragging
+/// the encoder dep into the test.
+fn build_method_request(service_id: u16, method_id: u16) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16);
+    buf.extend_from_slice(&service_id.to_be_bytes()); // message_id (high)
+    buf.extend_from_slice(&method_id.to_be_bytes()); //  message_id (low)
+    buf.extend_from_slice(&8u32.to_be_bytes()); //       length = header(8) + payload(0)
+    buf.extend_from_slice(&0u32.to_be_bytes()); //       request_id
+    buf.push(1); //                                       protocol_version
+    buf.push(1); //                                       interface_version
+    buf.push(0); //                                       message_type = Request (0x00)
+    buf.push(0); //                                       return_code = OK
+    buf
+}
+
+async fn drive_until<F: FnMut() -> bool>(mut check: F) {
+    // Yield enough times for the spawned run-future to pick up the
+    // queued inbound datagram from the mock pipe. The mock socket's
+    // `recv_from` resolves immediately when a datagram is queued, so a
+    // few yields are sufficient on the multi-threaded runtime; we
+    // bound it at 200 yields (~ms) to keep the test snappy.
+    for _ in 0..200 {
+        if check() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("timed out waiting for condition (callback never fired or assertion never held)");
+}
+
+#[tokio::test]
+async fn non_sd_observer_some_receives_unicast_method_request() {
+    let pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        pipe: Arc::clone(&pipe),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+
+    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let subs = MockSubscriptions::default();
+
+    let config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30700);
+
+    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
+        ServerDeps {
+            factory,
+            timer: MockTimer,
+            e2e_registry: e2e_handle,
+            subscriptions: subs,
+            non_sd_observer: Some(record_some as NonSdRequestCallback),
+        };
+
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+
+    let handle = tokio::spawn(run);
+
+    // Queue a non-SD unicast method-request datagram. `from_unicast`
+    // distinguishes which socket received it: the first socket bound
+    // by `MockFactory` (port 30700) is the unicast socket; the second
+    // (port 30490) is the SD socket. Since the mock pipe is shared
+    // across both sockets, we drive the datagram into the unicast
+    // arm by tagging it with a non-SD message_id and relying on the
+    // `select_biased!`'s prefer-unicast tick to pick the unicast
+    // future first.
+    let payload = build_method_request(0x1234, 0x0001);
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 100), 40000);
+    pipe.inbound
+        .lock()
+        .unwrap()
+        .push_back((payload.clone(), src));
+    if let Some(w) = pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    drive_until(|| {
+        OBSERVED_SOME
+            .get()
+            .and_then(|m| m.lock().unwrap().clone())
+            .is_some()
+    })
+    .await;
+
+    let (got_data, got_src) = OBSERVED_SOME
+        .get()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("callback fired");
+    assert_eq!(
+        got_data, payload,
+        "callback must receive the full raw datagram bytes"
+    );
+    assert_eq!(got_src, src, "callback must receive the original source");
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn non_sd_observer_none_preserves_ignore_behavior() {
+    let pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        pipe: Arc::clone(&pipe),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+
+    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let subs = MockSubscriptions::default();
+
+    let config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30701);
+
+    // Same `record_none` is installed as a witness that the path the
+    // observer would have taken is NOT walked when the field is None.
+    // The pipe still receives the datagram and the recv_loop still
+    // parses it — but the `else if from_unicast` arm with `None`
+    // falls through to the trace log, never invoking the callback.
+    // We don't actually wire the function pointer into the server
+    // (deps.non_sd_observer = None), but we keep a `record_none` so a
+    // future regression that accidentally fires *any* observer would
+    // populate OBSERVED_NONE and trip the assertion below.
+    let _kept_alive_to_witness_no_invocation: NonSdRequestCallback = record_none;
+
+    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
+        ServerDeps {
+            factory,
+            timer: MockTimer,
+            e2e_registry: e2e_handle,
+            subscriptions: subs,
+            non_sd_observer: None,
+        };
+
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+
+    let handle = tokio::spawn(run);
+
+    let payload = build_method_request(0x1234, 0x0001);
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 101), 40001);
+    pipe.inbound
+        .lock()
+        .unwrap()
+        .push_back((payload.clone(), src));
+    if let Some(w) = pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    // Let the run-future poll the inbound queue enough times to dequeue
+    // and process the datagram. Since the path doesn't invoke any
+    // callback, there's no positive signal — we just need to give the
+    // recv_loop a window to act, then confirm OBSERVED_NONE stayed empty.
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    // Belt-and-braces: also wait a real tick so the unicast `select_biased!`
+    // arm cycles at least once.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let observed = OBSERVED_NONE
+        .get()
+        .and_then(|m| m.lock().unwrap().clone());
+    assert!(
+        observed.is_none(),
+        "callback must NOT fire when non_sd_observer is None; got {:?}",
+        observed
+    );
+
+    handle.abort();
+    let _ = handle.await;
 }

@@ -177,5 +177,10 @@ name = "bare_metal_server"
 required-features = ["server", "bare_metal"]
 
 [[test]]
+name = "no_alloc_server_witness"
+required-features = ["server", "bare_metal"]
+harness = false
+
+[[test]]
 name = "bare_metal_e2e"
 required-features = ["client", "server", "bare_metal"]
