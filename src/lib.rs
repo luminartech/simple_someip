@@ -168,6 +168,11 @@ pub mod protocol;
 /// A general-purpose, heap-allocated [`PayloadWireFormat`] implementation.
 #[cfg(feature = "std")]
 mod raw_payload;
+/// no_std / no-alloc [`PayloadWireFormat`] mirroring [`raw_payload`]
+/// with `heapless::Vec`-backed storage. Available whenever the
+/// `bare_metal` feature is enabled.
+#[cfg(feature = "bare_metal")]
+pub mod heapless_payload;
 /// SOME/IP server for offering services and handling incoming requests.
 ///
 /// The engine is generic over [`transport::TransportFactory`] +
@@ -209,6 +214,8 @@ mod traits;
 pub mod transport;
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
+#[cfg(feature = "bare_metal")]
+pub use heapless_payload::{HeaplessPayload, HeaplessSdHeader};
 pub use traits::{OfferedEndpoint, PayloadWireFormat, WireFormat};
 
 #[cfg(feature = "client")]

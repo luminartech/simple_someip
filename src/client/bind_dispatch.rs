@@ -170,3 +170,41 @@ where
         )
     }
 }
+
+/// `BindDispatch` impl that refuses to bind. Used when the caller has
+/// already pre-bound every socket externally (typical of bare-metal
+/// embassy integrations) and wires them in via
+/// [`super::Inner::build_with_pre_bound`]. Any dynamic
+/// `subscribe_no_wait` to a port not pre-bound surfaces an
+/// [`Error::InvalidUsage`] instead of attempting a runtime bind.
+pub struct NoSpawnDispatch;
+
+impl<MD, C, R> BindDispatch<MD, C, R> for NoSpawnDispatch
+where
+    MD: PayloadWireFormat + Clone + core::fmt::Debug + Send + 'static,
+    C: ChannelFactory,
+    R: E2ERegistryHandle,
+    Result<super::socket_manager::ReceivedMessage<MD>, Error>:
+        crate::transport::BoundedPooled<C, 16>,
+    super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
+    Result<(), Error>: crate::transport::OneshotPooled<C>,
+{
+    fn bind_discovery(
+        &self,
+        _interface: Ipv4Addr,
+        _e2e_registry: R,
+        _session_id: u16,
+        _session_has_wrapped: bool,
+        _multicast_loopback: bool,
+    ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
+        async { Err(Error::Transport(crate::transport::TransportError::Unsupported)) }
+    }
+
+    fn bind_unicast(
+        &self,
+        _port: u16,
+        _e2e_registry: R,
+    ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
+        async { Err(Error::Transport(crate::transport::TransportError::Unsupported)) }
+    }
+}

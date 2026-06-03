@@ -245,17 +245,50 @@ where
         S: Spawner,
         R: E2ERegistryHandle,
     {
+        let (mgr, fut) = Self::bind_discovery_seeded_with_transport_unspawned(
+            factory,
+            interface,
+            e2e_registry,
+            session_id,
+            session_has_wrapped,
+            multicast_loopback,
+        )
+        .await?;
+        spawner.spawn(fut);
+        Ok(mgr)
+    }
+
+    /// Bind a discovery socket and return both the [`SocketManager`]
+    /// and the per-socket I/O loop future, **without spawning**. The
+    /// caller is responsible for driving the returned future on a
+    /// task; dropping it without polling will deadlock the same way
+    /// the [`Spawner`] trait's docstring warns about.
+    ///
+    /// Use this when integrating with a static-task executor
+    /// (`embassy_executor::raw::TaskPool` and friends) whose API is
+    /// not expressible as the [`Spawner`] trait's
+    /// `impl Future + Send + 'static`. Wire the returned future into
+    /// your executor's static task slot manually.
+    ///
+    /// All other parameters and semantics match
+    /// [`Self::bind_discovery_seeded_with_transport`].
+    #[allow(clippy::type_complexity)]
+    pub async fn bind_discovery_seeded_with_transport_unspawned<F, R>(
+        factory: &F,
+        interface: Ipv4Addr,
+        e2e_registry: R,
+        session_id: u16,
+        session_has_wrapped: bool,
+        multicast_loopback: bool,
+    ) -> Result<(Self, impl core::future::Future<Output = ()> + 'static), Error>
+    where
+        F: TransportFactory,
+        F::Socket: 'static,
+        R: E2ERegistryHandle,
+    {
         let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
         let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
 
-        // Control whether multicast packets sent by this socket are looped
-        // back to sockets on the same host — INCLUDING this socket itself.
-        // Disabled by default to avoid parsing self-sent OfferService /
-        // FindService entries as if they came from a peer. When enabled
-        // (e.g. for a same-host simulator + client setup), the kernel will
-        // deliver this socket's own SD multicasts back to it, so higher-level
-        // consumers must be prepared to see their own announcements surface
-        // as inbound discovery traffic.
         let options = {
             let mut o = SocketOptions::new();
             o.reuse_address = true;
@@ -270,14 +303,14 @@ where
         socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
 
         let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
-        spawner.spawn(fut);
-        Ok(Self {
+        let mgr = Self {
             receiver: rx_rx,
             sender: tx_tx,
             local_port: sd::MULTICAST_PORT,
             session_id: session_id.max(1),
             session_has_wrapped,
-        })
+        };
+        Ok((mgr, fut))
     }
 
     /// `!Send` counterpart to [`Self::bind_discovery_seeded_with_transport`].
@@ -366,6 +399,27 @@ where
         S: Spawner,
         R: E2ERegistryHandle,
     {
+        let (mgr, fut) = Self::bind_with_transport_unspawned(factory, port, e2e_registry).await?;
+        spawner.spawn(fut);
+        Ok(mgr)
+    }
+
+    /// Bind a unicast socket on `port` (0 = ephemeral) and return both
+    /// the [`SocketManager`] and the per-socket I/O loop future,
+    /// **without spawning**. Companion to
+    /// [`Self::bind_discovery_seeded_with_transport_unspawned`] — see
+    /// that method's docs for the embassy / static-task rationale.
+    #[allow(clippy::type_complexity)]
+    pub async fn bind_with_transport_unspawned<F, R>(
+        factory: &F,
+        port: u16,
+        e2e_registry: R,
+    ) -> Result<(Self, impl core::future::Future<Output = ()> + 'static), Error>
+    where
+        F: TransportFactory,
+        F::Socket: 'static,
+        R: E2ERegistryHandle,
+    {
         // Standardized to N=16 across both discovery and unicast bind
         // paths (was N=4 here historically — a tokio-conservative
         // choice). The trait's const-N now propagates to the GAT, so
@@ -387,14 +441,14 @@ where
         let socket = factory.bind(bind_addr, &options).await?;
         let port = socket.local_addr()?.port();
         let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
-        spawner.spawn(fut);
-        Ok(Self {
+        let mgr = Self {
             receiver: rx_rx,
             sender: tx_tx,
             local_port: port,
             session_id: 1,
             session_has_wrapped: false,
-        })
+        };
+        Ok((mgr, fut))
     }
 
     /// `!Send` counterpart to [`Self::bind_with_transport`].
