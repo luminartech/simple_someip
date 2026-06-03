@@ -1287,6 +1287,34 @@ where
         }
     }
 
+    /// Run *only* the SD `OfferService` announcement loop, without
+    /// driving the receive path. Use this on supplementary Servers
+    /// that share a `sd_socket` / `unicast_socket` handle (via
+    /// [`Self::new_with_handles`]) with a primary Server already
+    /// running [`Self::run_with_buffers`]: the primary owns the
+    /// inbound recv loops, supplementary Servers add their own
+    /// `OfferService` to the same SD multicast group without
+    /// competing for inbound datagrams.
+    ///
+    /// The returned future loops forever (1 s tick between
+    /// announcements); spawn it on your executor.
+    pub fn announce_only_future<'a>(
+        &self,
+    ) -> impl core::future::Future<Output = ()> + 'a + use<'a, F, Tm, R, Sub, H, Hsd, Hep>
+    where
+        Tm: 'a,
+        Hsd: 'a,
+        H: 'a,
+    {
+        let config = self.config.clone();
+        let sd_socket = self.sd_socket.clone();
+        let sd_state = self.sd_state.clone();
+        let timer = self.timer.clone();
+        async move {
+            runtime::announce_loop(&config, sd_socket.get(), sd_state.get(), &timer).await;
+        }
+    }
+
     /// Run the server event loop with heap-allocated 64 KiB receive
     /// buffers — the convenience entry point for std and alloc-using
     /// bare-metal builds. Drives both the receive loop and (unless
