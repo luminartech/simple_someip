@@ -1315,6 +1315,46 @@ where
         }
     }
 
+    /// Run *only* the inbound receive loop (unicast + SD), without
+    /// driving the SD announcement loop. The dual of
+    /// [`Self::announce_only_future`]: pair the two on executors that
+    /// cannot spawn the combined [`Self::run_with_buffers`] future
+    /// (e.g. TC4 IR cross-compile, where the combined future's state
+    /// machine exceeds what `TaskPool::spawn` can construct).
+    pub fn recv_only_future<'a>(
+        &self,
+        unicast_buf: &'a mut [u8],
+        sd_buf: &'a mut [u8],
+    ) -> impl core::future::Future<Output = Result<(), Error>>
+    + 'a
+    + use<'a, F, Tm, R, Sub, H, Hsd, Hep>
+    where
+        Tm: 'a,
+        Sub: 'a,
+        H: 'a,
+        Hsd: 'a,
+    {
+        let config = self.config.clone();
+        let unicast_socket = self.unicast_socket.clone();
+        let sd_socket = self.sd_socket.clone();
+        let subscriptions = self.subscriptions.clone();
+        let sd_state = self.sd_state.clone();
+        let non_sd_observer = self.non_sd_observer;
+        async move {
+            runtime::recv_loop(
+                &config,
+                unicast_socket.get(),
+                sd_socket.get(),
+                sd_state.get(),
+                &subscriptions,
+                unicast_buf,
+                sd_buf,
+                non_sd_observer,
+            )
+            .await
+        }
+    }
+
     /// Run the server event loop with heap-allocated 64 KiB receive
     /// buffers — the convenience entry point for std and alloc-using
     /// bare-metal builds. Drives both the receive loop and (unless

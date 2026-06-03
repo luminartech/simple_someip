@@ -434,7 +434,7 @@ pub(super) async fn announce_loop<T, Tm>(
 /// Receive loop body — drives `recv_from` on both the unicast and SD
 /// sockets, dispatches SD messages to [`handle_sd_message`].
 #[allow(clippy::too_many_arguments)]
-async fn recv_loop<T, Sub>(
+pub(super) async fn recv_loop<T, Sub>(
     config: &ServerConfig,
     unicast_socket: &T,
     sd_socket: &T,
