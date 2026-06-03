@@ -418,17 +418,56 @@ where
         C::UnboundedReceiver<ClientUpdate<PayloadDefinitions>>,
         impl core::future::Future<Output = ()> + 'static,
     ) {
+        Self::build_with_pre_bound(interface, e2e_registry, multicast_loopback, dispatch, timer, None, None)
+    }
+
+    /// Like [`Self::build`] but with optional pre-bound sockets.
+    ///
+    /// When a caller has already bound the discovery and / or one
+    /// unicast socket externally (typical of bare-metal embassy
+    /// integrations using
+    /// [`SocketManager::bind_discovery_seeded_with_transport_unspawned`]
+    /// / [`SocketManager::bind_with_transport_unspawned`]), the pre-bound
+    /// [`SocketManager`] handles can be threaded in here so the run-loop
+    /// never has to call `dispatch.bind_*` — letting callers wire the
+    /// crate without a [`crate::Spawner`] impl.
+    ///
+    /// `pre_bound_discovery` is set into `discovery_socket`;
+    /// `pre_bound_unicast` is inserted into `unicast_sockets` keyed by
+    /// its `local_port()`. After construction the run-loop's
+    /// `bind_discovery` / `bind_unicast` no-op when their target is
+    /// already set, so subsequent `subscribe_no_wait` calls flow without
+    /// invoking the dispatch.
+    #[allow(clippy::type_complexity)]
+    pub fn build_with_pre_bound(
+        interface: Ipv4Addr,
+        e2e_registry: R,
+        multicast_loopback: bool,
+        dispatch: D,
+        timer: Tm,
+        pre_bound_discovery: Option<super::socket_manager::SocketManager<PayloadDefinitions, C>>,
+        pre_bound_unicast: Option<super::socket_manager::SocketManager<PayloadDefinitions, C>>,
+    ) -> (
+        C::BoundedSender<ControlMessage<PayloadDefinitions, C>, 4>,
+        C::UnboundedReceiver<ClientUpdate<PayloadDefinitions>>,
+        impl core::future::Future<Output = ()> + 'static,
+    ) {
         info!("Initializing SOME/IP Client");
         let (control_sender, control_receiver) = C::bounded::<_, 4>();
         let (update_sender, update_receiver) = C::unbounded();
+        let mut unicast_sockets: FnvIndexMap<u16, super::socket_manager::SocketManager<PayloadDefinitions, C>, { UNICAST_SOCKETS_CAP }> = FnvIndexMap::new();
+        if let Some(mgr) = pre_bound_unicast {
+            let port = mgr.port();
+            let _ = unicast_sockets.insert(port, mgr);
+        }
         let inner = Self {
             control_receiver,
             request_queue: Deque::new(),
             pending_responses: FnvIndexMap::new(),
             update_sender,
             interface,
-            discovery_socket: None,
-            unicast_sockets: FnvIndexMap::new(),
+            discovery_socket: pre_bound_discovery,
+            unicast_sockets,
             session_tracker: SessionTracker::default(),
             service_registry: ServiceRegistry::default(),
             run: true,

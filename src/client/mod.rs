@@ -33,7 +33,7 @@ mod error;
 mod inner;
 mod service_registry;
 mod session;
-mod socket_manager;
+pub mod socket_manager;
 
 pub use error::Error;
 /// Internal control message exchanged between [`Client`] handles and
@@ -787,6 +787,79 @@ where
             multicast_loopback,
             dispatch,
             timer,
+        );
+        let client = Self {
+            interface,
+            control_sender,
+            e2e_registry,
+        };
+        let updates = ClientUpdates { update_receiver };
+        (client, updates, run_future)
+    }
+
+    /// Construct a Client that owns no spawner — caller has already
+    /// pre-bound the discovery and (optionally) one unicast socket
+    /// externally via
+    /// [`crate::client::SocketManager::bind_discovery_seeded_with_transport_unspawned`]
+    /// / [`crate::client::SocketManager::bind_with_transport_unspawned`]
+    /// and is driving each socket's I/O loop future on its own task.
+    ///
+    /// Use this on bare-metal targets whose executor (`embassy_executor`,
+    /// other static-task models) can't express the [`Spawner`] trait's
+    /// `impl Future + Send + 'static` contract — the
+    /// [`bind_dispatch::NoSpawnDispatch`] returns
+    /// `Err(Error::InvalidUsage)` on any runtime bind, so all sockets
+    /// the Client will ever use must come in pre-bound.
+    ///
+    /// `pre_bound_discovery_socket` becomes the Client's SD socket;
+    /// `pre_bound_unicast_socket` (if provided) seeds the unicast map
+    /// keyed by its `port()`. After construction, `subscribe_no_wait`
+    /// for the pre-bound port flows through normally; any subscribe
+    /// targeting a different port surfaces as
+    /// `Err(Error::InvalidUsage("no_spawn_dispatch_bind_unicast"))`
+    /// from the run-loop.
+    ///
+    /// Returns the Client + ClientUpdates + a single combined future
+    /// that the caller spawns. The future joins the control-loop with
+    /// the two socket I/O loops via `futures_util::select_biased!`.
+    ///
+    /// [`Spawner`]: crate::transport::Spawner
+    #[allow(clippy::type_complexity)]
+    #[must_use = "the returned run-loop future must be spawned for the client to make progress"]
+    pub fn new_with_pre_bound_handles_local<F, Tm>(
+        deps_factory: F,
+        timer: Tm,
+        e2e_registry: R,
+        interface: I,
+        multicast_loopback: bool,
+        pre_bound_discovery_socket: super::client::socket_manager::SocketManager<MessageDefinitions, C>,
+        pre_bound_unicast_socket: Option<super::client::socket_manager::SocketManager<MessageDefinitions, C>>,
+    ) -> (
+        Self,
+        ClientUpdates<MessageDefinitions, C>,
+        impl core::future::Future<Output = ()> + 'static,
+    )
+    where
+        F: TransportFactory + 'static,
+        F::Socket: 'static,
+        Tm: Timer + 'static,
+    {
+        let _ = deps_factory; // No-op dispatch; factory retained only for type symmetry / future use.
+        let initial_addr = interface.get();
+        let (control_sender, update_receiver, run_future) = Inner::<
+            MessageDefinitions,
+            Tm,
+            R,
+            C,
+            bind_dispatch::NoSpawnDispatch,
+        >::build_with_pre_bound(
+            initial_addr,
+            e2e_registry.clone(),
+            multicast_loopback,
+            bind_dispatch::NoSpawnDispatch,
+            timer,
+            Some(pre_bound_discovery_socket),
+            pre_bound_unicast_socket,
         );
         let client = Self {
             interface,
