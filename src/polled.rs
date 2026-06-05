@@ -271,8 +271,8 @@ pub fn parse_someip_sd_datagram(data: &[u8]) -> Option<SdHeaderView<'_>> {
 /// `(Unchecked, parsed.payload)` when no profile is registered for
 /// the `(service_id, method_id)` pair.
 #[must_use]
-pub fn check_parsed_e2e<'a>(
-    e2e: &StaticE2EHandle,
+pub fn check_parsed_e2e<'a, const E2E_CAP: usize>(
+    e2e: &StaticE2EHandle<E2E_CAP>,
     parsed: &ParsedDatagram<'a>,
 ) -> (E2ECheckStatus, &'a [u8]) {
     let key = E2EKey::from_message_id(MessageId::new_from_service_and_method(
@@ -436,13 +436,20 @@ impl Drop for DatagramRef {
 ///
 /// All three are `FnMut` so consumers can capture state in their
 /// closures.
-pub fn tick<FRecv, FSend, FDispatch>(
+pub fn tick<
+    const EG: usize,
+    const SUBS: usize,
+    const E2E_CAP: usize,
+    FRecv,
+    FSend,
+    FDispatch,
+>(
     now_ms: u32,
     config: &mut PolledConfig<'_>,
     server_state: &PeriodicState,
     client_state: &PeriodicState,
-    e2e: &StaticE2EHandle,
-    subs: &StaticSubscriptionHandle,
+    e2e: &StaticE2EHandle<E2E_CAP>,
+    subs: &StaticSubscriptionHandle<EG, SUBS>,
     mut recv: FRecv,
     mut send: FSend,
     mut dispatch: FDispatch,
@@ -488,10 +495,10 @@ pub fn emit_stop_offers<FSend>(
     }
 }
 
-fn drain_sd_inbox<FRecv, FSend>(
+fn drain_sd_inbox<const EG: usize, const SUBS: usize, FRecv, FSend>(
     config: &mut PolledConfig<'_>,
     server_state: &PeriodicState,
-    subs: &StaticSubscriptionHandle,
+    subs: &StaticSubscriptionHandle<EG, SUBS>,
     recv: &mut FRecv,
     send: &mut FSend,
 ) where
@@ -548,9 +555,9 @@ fn drain_offered_unicast_inboxes<FRecv, FDispatch>(
     }
 }
 
-fn drain_subscribed_event_inboxes<FRecv, FDispatch>(
+fn drain_subscribed_event_inboxes<const E2E_CAP: usize, FRecv, FDispatch>(
     subscriptions: &[Subscription],
-    e2e: &StaticE2EHandle,
+    e2e: &StaticE2EHandle<E2E_CAP>,
     recv: &mut FRecv,
     dispatch: &mut FDispatch,
 ) where
@@ -656,11 +663,11 @@ fn period_elapsed(now_ms: u32, last: &AtomicU32, period_ms: u32) -> bool {
 /// Subscribes that don't match an entry in `offers` are dropped
 /// silently — protects the subscription registry from accepting
 /// requests for services we don't offer.
-fn process_sd_inbound<FSend>(
+fn process_sd_inbound<const EG: usize, const SUBS: usize, FSend>(
     view: SdHeaderView<'_>,
     peer_sd: SocketAddrV4,
     offers: &[Offer],
-    subs: &StaticSubscriptionHandle,
+    subs: &StaticSubscriptionHandle<EG, SUBS>,
     sd_scratch: &mut [u8],
     ack_session: &AtomicU16,
     mut send: FSend,

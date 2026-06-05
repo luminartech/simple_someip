@@ -9,21 +9,25 @@ use std::sync::Arc;
 #[cfg(feature = "server-tokio")]
 use tokio::sync::RwLock;
 
-/// Max number of distinct `(service_id, instance_id, event_group_id)` event
-/// groups with active subscribers. Must be a power of two.
-const EVENT_GROUPS_CAP: usize = 32;
+/// Default max number of distinct `(service_id, instance_id,
+/// event_group_id)` event groups. Used when `SubscriptionManager` is
+/// instantiated without explicit const-generic parameters. Must be a
+/// power of two (heapless invariant).
+///
+/// Consumers wanting a tighter footprint instantiate
+/// `SubscriptionManager<EG, SUBS>` directly with values sized to their
+/// service catalog — see [`StaticSubscriptionStorage`] /
+/// [`StaticSubscriptionHandle`].
+pub const EVENT_GROUPS_CAP: usize = 32;
 
-/// Max number of subscribers per event group. Excess subscribers are dropped
-/// with a `warn!` log rather than silently.
-pub(crate) const SUBSCRIBERS_PER_GROUP: usize = 16;
+/// Default max number of subscribers per event group. Used when
+/// `SubscriptionManager` is instantiated without explicit const-generic
+/// parameters.
+pub const SUBSCRIBERS_PER_GROUP: usize = 16;
 
-// Compile-time invariants. Trip these at `cargo build` so that retuning
-// the constants above can't quietly produce a `subscribe` impl that
-// panics on first push (zero `SUBSCRIBERS_PER_GROUP`) or that fails the
-// `heapless::FnvIndexMap` build (non-power-of-two `EVENT_GROUPS_CAP`).
 const _: () = assert!(
     SUBSCRIBERS_PER_GROUP >= 1,
-    "SUBSCRIBERS_PER_GROUP must be >= 1: a value of 0 would crash subscribe() on first push"
+    "SUBSCRIBERS_PER_GROUP must be >= 1"
 );
 const _: () = assert!(
     EVENT_GROUPS_CAP.is_power_of_two(),
@@ -35,48 +39,51 @@ const _: () = assert!(
 /// use this to emit a `SubscribeNack` instead of a misleading `SubscribeAck`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscribeError {
-    /// The per-event-group subscriber list is already full
-    /// (`SUBSCRIBERS_PER_GROUP` entries). The caller's request was not
-    /// recorded.
-    SubscribersPerGroupFull,
-    /// The outer event-group map is already full (`EVENT_GROUPS_CAP`
-    /// distinct `(service_id, instance_id, event_group_id)` keys). The
+    /// The per-event-group subscriber list is already full. The
     /// caller's request was not recorded.
+    SubscribersPerGroupFull,
+    /// The outer event-group map is already full. The caller's request
+    /// was not recorded.
     EventGroupsFull,
 }
 
 impl core::fmt::Display for SubscribeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::SubscribersPerGroupFull => write!(
-                f,
-                "subscribers-per-group at capacity ({SUBSCRIBERS_PER_GROUP})"
-            ),
-            Self::EventGroupsFull => {
-                write!(f, "event-group map at capacity ({EVENT_GROUPS_CAP})")
-            }
+            Self::SubscribersPerGroupFull => write!(f, "subscribers-per-group at capacity"),
+            Self::EventGroupsFull => write!(f, "event-group map at capacity"),
         }
     }
 }
 
-type SubscribersList = HeaplessVec<Subscriber, SUBSCRIBERS_PER_GROUP>;
-
 /// Manages subscriptions to event groups.
 ///
-/// Capacity is bounded at compile time: up to `EVENT_GROUPS_CAP` distinct
-/// event groups, each with up to `SUBSCRIBERS_PER_GROUP` subscribers.
+/// Capacity is bounded at compile time by the const-generic parameters
+/// `EG` (max distinct event groups, must be a power of two) and `SUBS`
+/// (max subscribers per group). `FnvIndexMap`'s build check fires at
+/// monomorphization if `EG` violates the power-of-two invariant.
+/// Defaults to [`EVENT_GROUPS_CAP`] × [`SUBSCRIBERS_PER_GROUP`].
 #[derive(Debug)]
-pub struct SubscriptionManager {
+pub struct SubscriptionManager<
+    const EG: usize = EVENT_GROUPS_CAP,
+    const SUBS: usize = SUBSCRIBERS_PER_GROUP,
+> {
     /// Map of (`service_id`, `instance_id`, `event_group_id`) -> list of subscribers
-    subscriptions: FnvIndexMap<(u16, u16, u16), SubscribersList, EVENT_GROUPS_CAP>,
+    subscriptions: FnvIndexMap<(u16, u16, u16), HeaplessVec<Subscriber, SUBS>, EG>,
 }
 
-impl SubscriptionManager {
+impl<const EG: usize, const SUBS: usize> SubscriptionManager<EG, SUBS> {
     /// Create a new subscription manager. `const`-constructible so a
     /// `static` instance can be declared in firmware boot code (used by
     /// `StaticSubscriptionHandle` on bare-metal targets).
     #[must_use]
     pub const fn new() -> Self {
+        // Catch zero-cap misconfiguration at monomorphization rather
+        // than letting `subscribe` panic on first push. `EG` power-of-two
+        // is enforced by `heapless::FnvIndexMap`'s own build-time check.
+        const {
+            assert!(SUBS >= 1, "SUBSCRIBERS_PER_GROUP (SUBS) must be >= 1");
+        }
         Self {
             subscriptions: FnvIndexMap::new(),
         }
@@ -146,7 +153,7 @@ impl SubscriptionManager {
                 crate::log::warn!(
                     "Subscribers-per-group at capacity ({}); dropping new subscriber {} \
                      for service 0x{:04X}, instance {}, event group 0x{:04X}",
-                    SUBSCRIBERS_PER_GROUP,
+                    SUBS,
                     subscriber_addr,
                     service_id,
                     instance_id,
@@ -166,28 +173,22 @@ impl SubscriptionManager {
         }
 
         // New event group — allocate the list and insert.
-        let mut list = SubscribersList::new();
+        let mut list: HeaplessVec<Subscriber, SUBS> = HeaplessVec::new();
         // The first push into an empty heapless::Vec cannot fail as long
-        // as SUBSCRIBERS_PER_GROUP >= 1 (enforced by the constant's
-        // definition). Use `expect` here — a future refactor setting the
-        // cap to 0 would trip this at test time instead of silently
-        // dropping the only subscriber for a new event group.
+        // as SUBS >= 1 (enforced at monomorphization in `Self::new`).
         list.push(Subscriber::new(
             subscriber_addr,
             service_id,
             instance_id,
             event_group_id,
         ))
-        .expect(
-            "new SubscribersList must accept the first subscriber; \
-             SUBSCRIBERS_PER_GROUP must be >= 1",
-        );
+        .expect("new SubscribersList must accept the first subscriber; SUBS must be >= 1");
 
         if self.subscriptions.insert(key, list).is_err() {
             crate::log::warn!(
                 "Event-group map at capacity ({}); dropping subscriber {} for new group \
                  service 0x{:04X}, instance {}, event group 0x{:04X}",
-                EVENT_GROUPS_CAP,
+                EG,
                 subscriber_addr,
                 service_id,
                 instance_id,
@@ -269,7 +270,7 @@ impl SubscriptionManager {
     }
 }
 
-impl Default for SubscriptionManager {
+impl<const EG: usize, const SUBS: usize> Default for SubscriptionManager<EG, SUBS> {
     fn default() -> Self {
         Self::new()
     }
@@ -451,17 +452,20 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
 /// use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 /// use simple_someip::server::{StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager};
 ///
-/// // Place the storage in a `static` so the handle can borrow it for
-/// // `'static`. `SubscriptionManager::new()` is `const`, so no
-/// // `Box::leak` is needed.
-/// static SUBS: StaticSubscriptionStorage =
-///     Mutex::new(RefCell::new(SubscriptionManager::new()));
+/// // Pick caps sized to the consumer's catalog. `4, 2` here = up to
+/// // 4 event groups, 2 subscribers each — typical for compact embedded
+/// // workloads with a handful of services.
+/// static SUBS: StaticSubscriptionStorage<4, 2> =
+///     Mutex::new(RefCell::new(SubscriptionManager::<4, 2>::new()));
 ///
 /// let handle = StaticSubscriptionHandle::new(&SUBS);
 /// ```
 #[cfg(feature = "bare_metal")]
 pub mod bare_metal_subscription_impl {
-    use super::{SubscribeError, Subscriber, SubscriptionHandle, SubscriptionManager};
+    use super::{
+        EVENT_GROUPS_CAP, SUBSCRIBERS_PER_GROUP, SubscribeError, Subscriber, SubscriptionHandle,
+        SubscriptionManager,
+    };
     use core::cell::RefCell;
     use core::future::Future;
     use core::net::SocketAddrV4;
@@ -470,28 +474,48 @@ pub mod bare_metal_subscription_impl {
 
     /// Convenience type alias for the embassy-sync critical-section
     /// mutex backing [`StaticSubscriptionHandle`].
-    pub type StaticSubscriptionStorage =
-        Mutex<CriticalSectionRawMutex, RefCell<SubscriptionManager>>;
+    ///
+    /// Const-generic over event-group / per-group subscriber caps so
+    /// each consumer sizes the storage to their own service catalog.
+    pub type StaticSubscriptionStorage<
+        const EG: usize = EVENT_GROUPS_CAP,
+        const SUBS: usize = SUBSCRIBERS_PER_GROUP,
+    > = Mutex<CriticalSectionRawMutex, RefCell<SubscriptionManager<EG, SUBS>>>;
 
     /// No-alloc [`SubscriptionHandle`] backed by a `&'static`
     /// critical-section mutex.
     ///
     /// All clones are the same thin pointer. Construct via
-    /// [`Self::new`] and supply a `&'static StaticSubscriptionStorage`.
+    /// [`Self::new`] and supply a `&'static StaticSubscriptionStorage<EG, SUBS>`.
     /// Because [`SubscriptionManager::new`] is `const`, the storage can
     /// live in a plain `static` — no `Box::leak` required.
-    #[derive(Clone, Copy)]
-    pub struct StaticSubscriptionHandle(&'static StaticSubscriptionStorage);
+    pub struct StaticSubscriptionHandle<
+        const EG: usize = EVENT_GROUPS_CAP,
+        const SUBS: usize = SUBSCRIBERS_PER_GROUP,
+    >(&'static StaticSubscriptionStorage<EG, SUBS>);
 
-    impl StaticSubscriptionHandle {
+    // Manual Clone/Copy: `derive` on a const-generic struct holding a
+    // `&'static T<EG, SUBS>` is fine in current rustc, but spelling
+    // these out keeps the bounds unambiguous and the handle copy-cheap
+    // across rustc upgrades.
+    impl<const EG: usize, const SUBS: usize> Clone for StaticSubscriptionHandle<EG, SUBS> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+    impl<const EG: usize, const SUBS: usize> Copy for StaticSubscriptionHandle<EG, SUBS> {}
+
+    impl<const EG: usize, const SUBS: usize> StaticSubscriptionHandle<EG, SUBS> {
         /// Wraps a static reference to the backing mutex.
         #[must_use]
-        pub const fn new(storage: &'static StaticSubscriptionStorage) -> Self {
+        pub const fn new(storage: &'static StaticSubscriptionStorage<EG, SUBS>) -> Self {
             Self(storage)
         }
     }
 
-    impl SubscriptionHandle for StaticSubscriptionHandle {
+    impl<const EG: usize, const SUBS: usize> SubscriptionHandle
+        for StaticSubscriptionHandle<EG, SUBS>
+    {
         // The lock closure is fully synchronous (no `.await` inside the
         // critical section), so each operation completes immediately and
         // the returned future is a concrete `core::future::Ready` — no
@@ -580,7 +604,7 @@ mod tests {
 
     #[test]
     fn test_subscription_management() {
-        let mut manager = SubscriptionManager::new();
+        let mut manager: SubscriptionManager = SubscriptionManager::new();
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 8080);
 
         // Subscribe
@@ -599,7 +623,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_subscriber_refresh() {
-        let mut manager = SubscriptionManager::new();
+        let mut manager: SubscriptionManager = SubscriptionManager::new();
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 8080);
 
         manager.subscribe(0x5B, 1, 0x01, addr).unwrap();
@@ -612,7 +636,7 @@ mod tests {
 
     #[test]
     fn test_unsubscribe_nonexistent_key() {
-        let mut manager = SubscriptionManager::new();
+        let mut manager: SubscriptionManager = SubscriptionManager::new();
         let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9000);
 
         // Unsubscribe from empty manager — should not panic
@@ -622,19 +646,19 @@ mod tests {
 
     #[test]
     fn test_get_subscribers_empty() {
-        let manager = SubscriptionManager::new();
+        let manager: SubscriptionManager = SubscriptionManager::new();
         assert!(manager.get_subscribers(0x99, 1, 0x01).is_empty());
     }
 
     #[test]
     fn test_default_impl() {
-        let manager = SubscriptionManager::default();
+        let manager: SubscriptionManager = SubscriptionManager::default();
         assert_eq!(manager.subscription_count(), 0);
     }
 
     #[test]
     fn subscribers_per_group_capacity_overflow() {
-        let mut manager = SubscriptionManager::new();
+        let mut manager: SubscriptionManager = SubscriptionManager::new();
         // Fill one event group to capacity.
         for i in 0..SUBSCRIBERS_PER_GROUP {
             let addr =
@@ -658,7 +682,7 @@ mod tests {
 
     #[test]
     fn event_groups_capacity_overflow() {
-        let mut manager = SubscriptionManager::new();
+        let mut manager: SubscriptionManager = SubscriptionManager::new();
         let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8000);
         // Fill the outer map to capacity with distinct event groups.
         for i in 0..EVENT_GROUPS_CAP {
@@ -680,7 +704,7 @@ mod tests {
 
     #[test]
     fn unsubscribe_one_of_multiple_leaves_group_intact() {
-        let mut manager = SubscriptionManager::new();
+        let mut manager: SubscriptionManager = SubscriptionManager::new();
         let a1 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8001);
         let a2 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 8002);
 
@@ -698,7 +722,7 @@ mod tests {
 
     #[test]
     fn unsubscribe_address_not_in_existing_group_is_noop() {
-        let mut manager = SubscriptionManager::new();
+        let mut manager: SubscriptionManager = SubscriptionManager::new();
         let a1 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8001);
         let a2 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 8002);
 
@@ -711,7 +735,7 @@ mod tests {
 
     #[test]
     fn get_subscribers_returns_all_in_group() {
-        let mut manager = SubscriptionManager::new();
+        let mut manager: SubscriptionManager = SubscriptionManager::new();
         let addrs: Vec<SocketAddrV4> = (0..4)
             .map(|i| SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, i + 1), 8000 + u16::from(i)))
             .collect();
@@ -727,7 +751,7 @@ mod tests {
 
     #[test]
     fn subscription_count_spans_multiple_event_groups() {
-        let mut manager = SubscriptionManager::new();
+        let mut manager: SubscriptionManager = SubscriptionManager::new();
         let a = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8000);
         manager.subscribe(0x5B, 1, 0x01, a).unwrap();
         manager.subscribe(0x5B, 1, 0x02, a).unwrap();

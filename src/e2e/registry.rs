@@ -2,8 +2,9 @@
 //!
 //! Backed by [`heapless::index_map::FnvIndexMap`] so the registry is
 //! `no_std`-compatible and allocates no heap memory after construction.
-//! The capacity is bounded at compile time to [`E2E_REGISTRY_CAP`]; the
-//! registry rejects further registrations once that cap is reached
+//! The capacity is bounded at compile time by [`E2ERegistry`]'s `CAP`
+//! const-generic parameter (defaulting to [`E2E_REGISTRY_CAP`]);
+//! the registry rejects further registrations once that cap is reached
 //! rather than silently dropping or growing — see [`E2ERegistry::register`]
 //! and [`E2ERegistryFull`].
 
@@ -11,12 +12,14 @@ use heapless::index_map::FnvIndexMap;
 
 use super::{E2ECheckStatus, E2EKey, E2EProfile, E2EState, Error, e2e_check, e2e_protect};
 
-/// Maximum number of distinct `(key → profile)` bindings the registry
-/// can hold. Sized for typical workloads where a single service
-/// instance has at most a few dozen E2E-protected message types.
+/// Default max number of distinct `(key → profile)` bindings used when
+/// [`E2ERegistry`] is instantiated without an explicit const-generic
+/// `CAP`. Must be a power of two (heapless invariant).
 ///
-/// Must be a power of two for [`FnvIndexMap`]; the `const _` assertion
-/// below catches any future change that would violate the requirement.
+/// Consumers wanting a tighter footprint instantiate `E2ERegistry<CAP>`
+/// directly with a value sized to their E2E-protected message catalog —
+/// see [`crate::transport::StaticE2EStorage`] /
+/// [`crate::transport::StaticE2EHandle`].
 pub const E2E_REGISTRY_CAP: usize = 32;
 
 const _: () = assert!(
@@ -27,9 +30,8 @@ const _: () = assert!(
 /// Returned by [`E2ERegistry::register`] when the registry is at
 /// capacity.
 ///
-/// The contained value is the cap that was hit (i.e.
-/// [`E2E_REGISTRY_CAP`]); kept in the error so log lines and panic
-/// messages name the constant the user can adjust.
+/// The contained value is the cap that was hit; kept in the error so
+/// log lines name the actual capacity the user can adjust.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("e2e registry at capacity ({0})")]
 pub struct E2ERegistryFull(pub usize);
@@ -40,13 +42,17 @@ pub struct E2ERegistryFull(pub usize);
 /// `no_std`-friendly: backed by a fixed-capacity
 /// [`FnvIndexMap`] so construction and the entire lifetime of the
 /// registry are heap-free. Construction is `const`, so a `static`
-/// instance can be declared in firmware boot code.
+/// instance can be declared in firmware boot code. The const-generic
+/// `CAP` parameter (defaulting to [`DEFAULT_E2E_REGISTRY_CAP`]) lets
+/// each consumer size the registry to their own service catalog.
+/// `CAP` must be a power of two — `heapless::FnvIndexMap`'s build-time
+/// check catches violations at monomorphization.
 #[derive(Debug)]
-pub struct E2ERegistry {
-    map: FnvIndexMap<E2EKey, (E2EProfile, E2EState), E2E_REGISTRY_CAP>,
+pub struct E2ERegistry<const CAP: usize = E2E_REGISTRY_CAP> {
+    map: FnvIndexMap<E2EKey, (E2EProfile, E2EState), CAP>,
 }
 
-impl E2ERegistry {
+impl<const CAP: usize> E2ERegistry<CAP> {
     /// Create an empty registry. `const`-constructible so it can live
     /// in `static` storage on bare-metal targets.
     #[must_use]
@@ -60,9 +66,9 @@ impl E2ERegistry {
     ///
     /// Replacing the profile of an already-registered key always
     /// succeeds (the existing slot is reused). Adding a new key when
-    /// the registry already holds [`E2E_REGISTRY_CAP`] entries returns
+    /// the registry already holds `CAP` entries returns
     /// [`Err(E2ERegistryFull)`](E2ERegistryFull); the caller is
-    /// responsible for sizing the cap to its workload's high-water
+    /// responsible for sizing `CAP` to its workload's high-water
     /// mark.
     ///
     /// # Errors
@@ -76,7 +82,7 @@ impl E2ERegistry {
         // existing entry never overflows).
         match self.map.insert(key, (profile, state)) {
             Ok(_) => Ok(()),
-            Err(_) => Err(E2ERegistryFull(E2E_REGISTRY_CAP)),
+            Err(_) => Err(E2ERegistryFull(CAP)),
         }
     }
 
@@ -121,7 +127,7 @@ impl E2ERegistry {
     }
 }
 
-impl Default for E2ERegistry {
+impl<const CAP: usize> Default for E2ERegistry<CAP> {
     fn default() -> Self {
         Self::new()
     }
@@ -138,7 +144,7 @@ mod tests {
 
     #[test]
     fn register_and_check_profile4() {
-        let mut reg = E2ERegistry::new();
+        let mut reg: E2ERegistry = E2ERegistry::new();
         let key = make_key();
         let config = Profile4Config::new(0x12345678, 15);
         reg.register(key, E2EProfile::Profile4(config.clone()))
@@ -161,7 +167,7 @@ mod tests {
 
     #[test]
     fn register_and_check_profile5() {
-        let mut reg = E2ERegistry::new();
+        let mut reg: E2ERegistry = E2ERegistry::new();
         let key = make_key();
         let config = Profile5Config::new(0x1234, 20, 15);
         reg.register(key, E2EProfile::Profile5(config))
@@ -182,7 +188,7 @@ mod tests {
 
     #[test]
     fn unregistered_key_returns_none() {
-        let mut reg = E2ERegistry::new();
+        let mut reg: E2ERegistry = E2ERegistry::new();
         let key = make_key();
         assert!(!reg.contains_key(&key));
         assert!(reg.check(key, b"test", [0; 8]).is_none());
@@ -191,7 +197,7 @@ mod tests {
 
     #[test]
     fn unregister_removes_key() {
-        let mut reg = E2ERegistry::new();
+        let mut reg: E2ERegistry = E2ERegistry::new();
         let key = make_key();
         reg.register(key, E2EProfile::Profile4(Profile4Config::new(0, 15)))
             .expect("register fits within E2E_REGISTRY_CAP");
@@ -202,7 +208,7 @@ mod tests {
 
     #[test]
     fn default_is_empty() {
-        let reg = E2ERegistry::default();
+        let reg: E2ERegistry = E2ERegistry::default();
         assert!(!reg.contains_key(&make_key()));
     }
 
@@ -212,7 +218,7 @@ mod tests {
     /// branch.
     #[test]
     fn register_replacement_succeeds_when_full() {
-        let mut reg = E2ERegistry::new();
+        let mut reg: E2ERegistry = E2ERegistry::new();
         for i in 0..E2E_REGISTRY_CAP {
             let key = E2EKey::new(0x1000 + u16::try_from(i).unwrap(), 0);
             reg.register(key, E2EProfile::Profile4(Profile4Config::new(0, 15)))
@@ -233,7 +239,7 @@ mod tests {
     /// capacity contract documented on `register`.
     #[test]
     fn register_overflow_returns_err_and_does_not_mutate() {
-        let mut reg = E2ERegistry::new();
+        let mut reg: E2ERegistry = E2ERegistry::new();
         for i in 0..E2E_REGISTRY_CAP {
             reg.register(
                 E2EKey::new(0x2000 + u16::try_from(i).unwrap(), 0),

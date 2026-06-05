@@ -1083,7 +1083,8 @@ pub mod bare_metal_handle_impls {
 pub mod bare_metal_e2e_impl {
     use super::E2ERegistryHandle;
     use crate::e2e::{
-        E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, E2ERegistryFull, Error as E2EError,
+        E2E_REGISTRY_CAP, E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, E2ERegistryFull,
+        Error as E2EError,
     };
     use core::cell::RefCell;
     use embassy_sync::blocking_mutex::Mutex;
@@ -1091,25 +1092,38 @@ pub mod bare_metal_e2e_impl {
 
     /// Convenience type alias for the embassy-sync critical-section mutex
     /// backing [`StaticE2EHandle`].
-    pub type StaticE2EStorage = Mutex<CriticalSectionRawMutex, RefCell<E2ERegistry>>;
+    ///
+    /// Const-generic over the registry capacity so each consumer sizes
+    /// the storage to their own E2E-protected message catalog.
+    pub type StaticE2EStorage<const CAP: usize = E2E_REGISTRY_CAP> =
+        Mutex<CriticalSectionRawMutex, RefCell<E2ERegistry<CAP>>>;
 
     /// No-alloc [`E2ERegistryHandle`] backed by a `&'static` critical-section
     /// mutex.
     ///
     /// All clones are the same thin pointer. Construct via [`StaticE2EHandle::new`]
-    /// and supply a `&'static StaticE2EStorage` (typically obtained via
-    /// `Box::leak` during system init, since [`E2ERegistry::new`] is not const).
-    #[derive(Clone, Copy)]
-    pub struct StaticE2EHandle(&'static StaticE2EStorage);
+    /// and supply a `&'static StaticE2EStorage<CAP>`.
+    pub struct StaticE2EHandle<const CAP: usize = E2E_REGISTRY_CAP>(
+        &'static StaticE2EStorage<CAP>,
+    );
 
-    impl StaticE2EHandle {
+    // Manual Clone/Copy on the generic struct: a derive works but the
+    // explicit impl keeps the bounds unambiguous across rustc upgrades.
+    impl<const CAP: usize> Clone for StaticE2EHandle<CAP> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+    impl<const CAP: usize> Copy for StaticE2EHandle<CAP> {}
+
+    impl<const CAP: usize> StaticE2EHandle<CAP> {
         /// Wraps a static reference to the backing mutex.
-        pub const fn new(storage: &'static StaticE2EStorage) -> Self {
+        pub const fn new(storage: &'static StaticE2EStorage<CAP>) -> Self {
             Self(storage)
         }
     }
 
-    impl E2ERegistryHandle for StaticE2EHandle {
+    impl<const CAP: usize> E2ERegistryHandle for StaticE2EHandle<CAP> {
         fn register(&self, key: E2EKey, profile: E2EProfile) -> Result<(), E2ERegistryFull> {
             self.0.lock(|cell| cell.borrow_mut().register(key, profile))
         }

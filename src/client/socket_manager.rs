@@ -1057,7 +1057,7 @@ mod tests {
         // Register an E2E profile so the protect branch runs.
         let message_id = MessageId::new_from_service_and_method(0x1234, 0x5678);
         let key = E2EKey::from_message_id(message_id);
-        let mut reg = E2ERegistry::new();
+        let mut reg: E2ERegistry = E2ERegistry::new();
         reg.register(key, E2EProfile::Profile4(Profile4Config::new(0, 15)))
             .expect("E2E registry has capacity for one entry");
         let e2e_registry = Arc::new(Mutex::new(reg));
