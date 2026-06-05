@@ -7,8 +7,8 @@
 //! See `docs/polled-bare-metal-rationale.md` for the memory-cost
 //! comparison that motivates this module.
 
-use core::net::Ipv4Addr;
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::net::{Ipv4Addr, SocketAddrV4};
+use core::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
 use crate::E2ECheckStatus;
 use crate::E2EKey;
@@ -16,9 +16,10 @@ use crate::StaticE2EHandle;
 use crate::WireFormat;
 use crate::protocol::{HEADER_SIZE, Header, HeaderView, MessageId};
 use crate::protocol::sd::{
-    Entry, EventGroupEntry, Flags, Header as SdHeader, Options as SdOptions, OptionsCount,
-    RebootFlag, SdHeaderView, ServiceEntry, TransportProtocol,
+    Entry, EntryType, EventGroupEntry, Flags, Header as SdHeader, Options as SdOptions,
+    OptionsCount, RebootFlag, SdHeaderView, ServiceEntry, TransportProtocol,
 };
+use crate::server::{StaticSubscriptionHandle, SubscriptionHandle};
 use crate::transport::E2ERegistryHandle;
 
 /// SOME/IP header size, re-exported so callers can name the
@@ -283,3 +284,458 @@ pub fn check_parsed_e2e<'a>(
         None => (E2ECheckStatus::Unchecked, parsed.payload),
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Single-call orchestrator (`tick`)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Below: a higher-level API that lets a bare-metal consumer drive
+// the full polled SOME/IP integration from one call per scheduler
+// tick. The granular helpers above remain available for callers who
+// want finer control.
+
+/// One offered service entry. Drives both periodic `OfferService`
+/// announces and inbound `Subscribe` dispatch.
+#[derive(Clone, Copy, Debug)]
+pub struct Offer {
+    pub service_id: u16,
+    pub instance_id: u16,
+    pub event_group_id: u16,
+    pub major_version: u8,
+    /// `OfferService` TTL in seconds.
+    pub ttl_seconds: u32,
+    /// Local UDP port the service is bound to.
+    pub unicast_port: u16,
+}
+
+/// One subscription the consumer wants to maintain against a remote
+/// service.
+#[derive(Clone, Copy, Debug)]
+pub struct Subscription {
+    pub service_id: u16,
+    pub instance_id: u16,
+    pub event_group_id: u16,
+    pub major_version: u8,
+    /// Local UDP port the consumer listens on for event delivery.
+    pub local_rx_port: u16,
+    /// `SubscribeEventgroup` TTL in seconds (24-bit).
+    pub ttl_seconds: u32,
+}
+
+/// Mutable state owned by the consumer, threaded into every `tick`
+/// call. The two atomics inside cover the periodic-emit cadence and
+/// the AUTOSAR-SD session counter for outbound packets.
+#[derive(Debug, Default)]
+pub struct PeriodicState {
+    pub session: AtomicU16,
+    pub last_emit_ms: AtomicU32,
+}
+
+impl PeriodicState {
+    /// Initial state: session 1, last-emit 0 (fires on first tick).
+    pub const fn new() -> Self {
+        Self {
+            session: AtomicU16::new(1),
+            last_emit_ms: AtomicU32::new(0),
+        }
+    }
+}
+
+/// Configuration for [`tick`]. All fields are caller-owned;
+/// `sd_scratch` is borrowed mutably for the SD-send path.
+pub struct PolledConfig<'a> {
+    pub local_ip: Ipv4Addr,
+    pub sd_endpoint: SocketAddrV4,
+    pub offers: &'a [Offer],
+    pub subscriptions: &'a [Subscription],
+    pub offer_period_ms: u32,
+    pub subscribe_period_ms: u32,
+    /// Scratch buffer for outbound SD datagrams (Offers, Subscribes,
+    /// SubscribeAcks). One of these encodes at a time; ~256 B is
+    /// enough for a single-entry SD packet.
+    pub sd_scratch: &'a mut [u8],
+}
+
+/// Borrowed view over one pending inbound datagram pulled from the
+/// consumer's inbox.
+///
+/// Built by the consumer's `recv` closure (see
+/// [`DatagramRef::new`]). The `release`/`cookie` pair runs on drop
+/// to release the underlying inbox slot — typical use is to flip a
+/// `has_datagram` atomic so the slot can be reused.
+pub struct DatagramRef {
+    data_ptr: *const u8,
+    data_len: usize,
+    src: SocketAddrV4,
+    cookie: *mut (),
+    release: unsafe fn(*mut ()),
+}
+
+impl DatagramRef {
+    /// Construct a [`DatagramRef`] over caller-owned bytes.
+    ///
+    /// # Safety
+    /// - `data` must remain valid (no concurrent writes) until the
+    ///   returned [`DatagramRef`] is dropped.
+    /// - `release` must be safe to call exactly once with `cookie`,
+    ///   and must make the inbox slot reusable afterwards.
+    #[must_use]
+    pub unsafe fn new(
+        data: &[u8],
+        src: SocketAddrV4,
+        cookie: *mut (),
+        release: unsafe fn(*mut ()),
+    ) -> Self {
+        Self {
+            data_ptr: data.as_ptr(),
+            data_len: data.len(),
+            src,
+            cookie,
+            release,
+        }
+    }
+
+    /// Datagram payload bytes. The returned slice is tied to
+    /// `&self` and cannot outlive the [`DatagramRef`].
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        // SAFETY: `new`'s contract holds `data_ptr..len` valid for
+        // the lifetime of `self`.
+        unsafe { core::slice::from_raw_parts(self.data_ptr, self.data_len) }
+    }
+
+    /// Source `(IP, port)` the datagram was received from.
+    #[must_use]
+    pub fn src(&self) -> SocketAddrV4 {
+        self.src
+    }
+}
+
+impl Drop for DatagramRef {
+    fn drop(&mut self) {
+        // SAFETY: `new`'s contract holds `release(cookie)` safe.
+        unsafe { (self.release)(self.cookie) }
+    }
+}
+
+/// Drive one cycle of polled SOME/IP work: drain pending inbound
+/// datagrams on the SD / offered-service / subscribed-service
+/// ports, register subscribers + emit `SubscribeAck` for matching
+/// inbound Subscribes, dispatch unicast requests and E2E-checked
+/// events to `dispatch`, and emit periodic `OfferService` /
+/// `SubscribeEventgroup` packets if the configured periods have
+/// elapsed.
+///
+/// Callbacks:
+/// - `recv(port) -> Option<DatagramRef>` pulls one pending inbound
+///   datagram from the consumer's inbox for `port`; dropping the
+///   returned ref releases the underlying slot.
+/// - `send(buf, dst)` transmits a datagram to `dst`.
+/// - `dispatch(service_id, method_id, payload, e2e_status)`
+///   forwards a parsed inbound message to the consumer.
+///
+/// All three are `FnMut` so consumers can capture state in their
+/// closures.
+pub fn tick<FRecv, FSend, FDispatch>(
+    now_ms: u32,
+    config: &mut PolledConfig<'_>,
+    server_state: &PeriodicState,
+    client_state: &PeriodicState,
+    e2e: &StaticE2EHandle,
+    subs: &StaticSubscriptionHandle,
+    mut recv: FRecv,
+    mut send: FSend,
+    mut dispatch: FDispatch,
+) where
+    FRecv: FnMut(u16) -> Option<DatagramRef>,
+    FSend: FnMut(&[u8], SocketAddrV4),
+    FDispatch: FnMut(u16, u16, &[u8], u8),
+{
+    drain_sd_inbox(config, server_state, subs, &mut recv, &mut send);
+    drain_offered_unicast_inboxes(config.offers, &mut recv, &mut dispatch);
+    drain_subscribed_event_inboxes(config.subscriptions, e2e, &mut recv, &mut dispatch);
+    maybe_emit_offers(now_ms, config, server_state, &mut send);
+    maybe_emit_subscribes(now_ms, config, client_state, &mut send);
+}
+
+/// Emit a `StopOfferService` for every entry in `offers` (one
+/// packet per offer). Intended for shutdown — consumer typically
+/// calls this from its `deinit` path so peers drop the
+/// registration immediately instead of waiting for TTL.
+pub fn emit_stop_offers<FSend>(
+    config: &mut PolledConfig<'_>,
+    server_state: &PeriodicState,
+    mut send: FSend,
+) where
+    FSend: FnMut(&[u8], SocketAddrV4),
+{
+    for offer in config.offers {
+        let request = OfferServiceRequest {
+            service_id: offer.service_id,
+            instance_id: offer.instance_id,
+            major_version: offer.major_version,
+            minor_version: 0,
+            ttl: 0,
+            local_ip: config.local_ip,
+            unicast_port: offer.unicast_port,
+        };
+        let session = next_sd_session(&server_state.session);
+        if let Ok(len) =
+            build_stop_offer_service_datagram(config.sd_scratch, &request, session)
+        {
+            send(&config.sd_scratch[..len], config.sd_endpoint);
+        }
+    }
+}
+
+fn drain_sd_inbox<FRecv, FSend>(
+    config: &mut PolledConfig<'_>,
+    server_state: &PeriodicState,
+    subs: &StaticSubscriptionHandle,
+    recv: &mut FRecv,
+    send: &mut FSend,
+) where
+    FRecv: FnMut(u16) -> Option<DatagramRef>,
+    FSend: FnMut(&[u8], SocketAddrV4),
+{
+    while let Some(datagram) = recv(config.sd_endpoint.port()) {
+        if let Some(view) = parse_someip_sd_datagram(datagram.data()) {
+            process_sd_inbound(
+                view,
+                datagram.src(),
+                config.offers,
+                subs,
+                config.sd_scratch,
+                &server_state.session,
+                |buf, dst| send(buf, dst),
+            );
+        }
+        // `datagram` drops here -> slot released back to inbox.
+    }
+}
+
+fn drain_offered_unicast_inboxes<FRecv, FDispatch>(
+    offers: &[Offer],
+    recv: &mut FRecv,
+    dispatch: &mut FDispatch,
+) where
+    FRecv: FnMut(u16) -> Option<DatagramRef>,
+    FDispatch: FnMut(u16, u16, &[u8], u8),
+{
+    // Visit each unique unicast port once; multiple offers may
+    // share a port (one server, several services).
+    let mut visited: heapless::Vec<u16, MAX_UNIQUE_PORTS> = heapless::Vec::new();
+    for offer in offers {
+        if visited.iter().any(|&p| p == offer.unicast_port) {
+            continue;
+        }
+        // Best-effort push; if more unique ports than the cap, we
+        // drain what we can. (`MAX_UNIQUE_PORTS = 16` covers any
+        // sane catalog.)
+        let _ = visited.push(offer.unicast_port);
+        while let Some(datagram) = recv(offer.unicast_port) {
+            if let Some(parsed) = parse_someip_datagram(datagram.data()) {
+                // Unicast requests aren't E2E-protected in this
+                // module's contract — surface with `Unchecked`.
+                dispatch(
+                    parsed.service_id,
+                    parsed.method_id,
+                    parsed.payload,
+                    E2ECheckStatus::Unchecked.to_return_code(),
+                );
+            }
+        }
+    }
+}
+
+fn drain_subscribed_event_inboxes<FRecv, FDispatch>(
+    subscriptions: &[Subscription],
+    e2e: &StaticE2EHandle,
+    recv: &mut FRecv,
+    dispatch: &mut FDispatch,
+) where
+    FRecv: FnMut(u16) -> Option<DatagramRef>,
+    FDispatch: FnMut(u16, u16, &[u8], u8),
+{
+    // Same per-port dedup as the unicast drain.
+    let mut visited: heapless::Vec<u16, MAX_UNIQUE_PORTS> = heapless::Vec::new();
+    for sub in subscriptions {
+        if visited.iter().any(|&p| p == sub.local_rx_port) {
+            continue;
+        }
+        let _ = visited.push(sub.local_rx_port);
+        while let Some(datagram) = recv(sub.local_rx_port) {
+            if let Some(parsed) = parse_someip_datagram(datagram.data()) {
+                let (status, body) = check_parsed_e2e(e2e, &parsed);
+                dispatch(
+                    parsed.service_id,
+                    parsed.method_id,
+                    body,
+                    status.to_return_code(),
+                );
+            }
+        }
+    }
+}
+
+fn maybe_emit_offers<FSend>(
+    now_ms: u32,
+    config: &mut PolledConfig<'_>,
+    server_state: &PeriodicState,
+    send: &mut FSend,
+) where
+    FSend: FnMut(&[u8], SocketAddrV4),
+{
+    if !period_elapsed(now_ms, &server_state.last_emit_ms, config.offer_period_ms) {
+        return;
+    }
+    for offer in config.offers {
+        let request = OfferServiceRequest {
+            service_id: offer.service_id,
+            instance_id: offer.instance_id,
+            major_version: offer.major_version,
+            minor_version: 0,
+            ttl: offer.ttl_seconds,
+            local_ip: config.local_ip,
+            unicast_port: offer.unicast_port,
+        };
+        let session = next_sd_session(&server_state.session);
+        if let Ok(len) =
+            build_offer_service_datagram(config.sd_scratch, &request, session)
+        {
+            send(&config.sd_scratch[..len], config.sd_endpoint);
+        }
+    }
+}
+
+fn maybe_emit_subscribes<FSend>(
+    now_ms: u32,
+    config: &mut PolledConfig<'_>,
+    client_state: &PeriodicState,
+    send: &mut FSend,
+) where
+    FSend: FnMut(&[u8], SocketAddrV4),
+{
+    if !period_elapsed(now_ms, &client_state.last_emit_ms, config.subscribe_period_ms) {
+        return;
+    }
+    for sub in config.subscriptions {
+        let request = SubscribeEventgroupRequest {
+            service_id: sub.service_id,
+            instance_id: sub.instance_id,
+            major_version: sub.major_version,
+            event_group_id: sub.event_group_id,
+            ttl: sub.ttl_seconds,
+            local_ip: config.local_ip,
+            local_rx_port: sub.local_rx_port,
+        };
+        let session = next_sd_session(&client_state.session);
+        if let Ok(len) =
+            build_subscribe_eventgroup_datagram(config.sd_scratch, &request, session)
+        {
+            send(&config.sd_scratch[..len], config.sd_endpoint);
+        }
+    }
+}
+
+/// Returns `true` and updates `last` when `now_ms` is at least
+/// `period_ms` past the previous emit (wrapping `u32` arithmetic).
+fn period_elapsed(now_ms: u32, last: &AtomicU32, period_ms: u32) -> bool {
+    let prev = last.load(Ordering::Relaxed);
+    if now_ms.wrapping_sub(prev) < period_ms {
+        return false;
+    }
+    last.store(now_ms, Ordering::Relaxed);
+    true
+}
+
+/// Dispatch one inbound SOME/IP-SD payload: snapshot options,
+/// iterate Subscribe entries, register matching ones in `subs`,
+/// emit a SubscribeAck for each via `send`.
+///
+/// Subscribes that don't match an entry in `offers` are dropped
+/// silently — protects the subscription registry from accepting
+/// requests for services we don't offer.
+fn process_sd_inbound<FSend>(
+    view: SdHeaderView<'_>,
+    peer_sd: SocketAddrV4,
+    offers: &[Offer],
+    subs: &StaticSubscriptionHandle,
+    sd_scratch: &mut [u8],
+    ack_session: &AtomicU16,
+    mut send: FSend,
+) where
+    FSend: FnMut(&[u8], SocketAddrV4),
+{
+    // Typical SD packets carry ≤ 2 IPv4 endpoint options; cap at 8
+    // to leave headroom without blowing stack.
+    let mut options_buf: [Option<SdOptions>; MAX_INBOUND_SD_OPTIONS] =
+        [const { None }; MAX_INBOUND_SD_OPTIONS];
+    let mut opt_count: usize = 0;
+    for opt_view in view.options() {
+        if opt_count >= options_buf.len() {
+            break;
+        }
+        if let Ok(o) = opt_view.to_owned() {
+            options_buf[opt_count] = Some(o);
+            opt_count += 1;
+        }
+    }
+
+    for entry_view in view.entries() {
+        let Ok(et) = entry_view.entry_type() else { continue };
+        if et != EntryType::Subscribe {
+            continue;
+        }
+        let svc = entry_view.service_id();
+        let inst = entry_view.instance_id();
+        let eg = entry_view.event_group_id();
+        // Drop Subscribes that don't match anything in our offers
+        // table — otherwise we'd ack on behalf of services we
+        // never offered.
+        if !offers
+            .iter()
+            .any(|o| o.service_id == svc && o.instance_id == inst && o.event_group_id == eg)
+        {
+            continue;
+        }
+        let major = entry_view.major_version();
+        let ttl = entry_view.ttl();
+
+        // Subscriber's notification endpoint is the first IPv4
+        // endpoint option; fall back to the SD source if absent.
+        let subscriber_addr = options_buf[..opt_count]
+            .iter()
+            .find_map(|slot| match slot {
+                Some(SdOptions::IpV4Endpoint { ip, port, .. }) => {
+                    Some(SocketAddrV4::new(*ip, *port))
+                }
+                _ => None,
+            })
+            .unwrap_or(peer_sd);
+
+        // Register the subscriber. `StaticSubscriptionHandle`
+        // returns `core::future::Ready`, so `into_inner` extracts
+        // the result without polling.
+        let _ = subs.subscribe(svc, inst, eg, subscriber_addr).into_inner();
+
+        // Ack to the peer's SD endpoint.
+        let session = next_sd_session(ack_session);
+        let request = SubscribeAckRequest {
+            service_id: svc,
+            instance_id: inst,
+            event_group_id: eg,
+            major_version: major,
+            ttl,
+        };
+        if let Ok(len) = build_subscribe_ack_datagram(sd_scratch, &request, session) {
+            send(&sd_scratch[..len], peer_sd);
+        }
+    }
+}
+
+const MAX_INBOUND_SD_OPTIONS: usize = 8;
+/// Cap on unique inbox ports per drain pass. 16 covers any
+/// realistic catalog (offers + subscriptions); excess ports are
+/// silently skipped this tick and picked up next.
+const MAX_UNIQUE_PORTS: usize = 16;

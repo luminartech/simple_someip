@@ -143,7 +143,7 @@ embassy_channels = ["bare_metal", "_alloc"]
 # builders + datagram parsers) for bare-metal targets that drive
 # the protocol from a periodic tick. See
 # `docs/polled-bare-metal-rationale.md`.
-bare_metal_poll = ["bare_metal"]
+bare_metal_poll = ["bare_metal", "server"]
 
 [[test]]
 name = "client_server"
