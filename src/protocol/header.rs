@@ -3,6 +3,11 @@ use crate::{
     traits::WireFormat,
 };
 
+/// SOME/IP header size in bytes: `message_id(4) + length(4) +
+/// request_id(4) + protocol_version + interface_version +
+/// message_type + return_code = 16`.
+pub const HEADER_SIZE: usize = 16;
+
 /// SOME/IP header
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Header {
@@ -204,9 +209,9 @@ impl Header {
     }
 }
 
-/// Zero-copy view into a 16-byte SOME/IP header in a buffer.
+/// Zero-copy view into a [`HEADER_SIZE`]-byte SOME/IP header in a buffer.
 #[derive(Clone, Copy, Debug)]
-pub struct HeaderView<'a>(&'a [u8; 16]);
+pub struct HeaderView<'a>(&'a [u8; HEADER_SIZE]);
 
 impl<'a> HeaderView<'a> {
     /// Parse and validate a SOME/IP header from the beginning of `buf`.
@@ -221,10 +226,11 @@ impl<'a> HeaderView<'a> {
     ///
     /// Cannot panic — the `expect` is guarded by a length check above it.
     pub fn parse(buf: &'a [u8]) -> Result<(Self, &'a [u8]), Error> {
-        if buf.len() < 16 {
+        if buf.len() < HEADER_SIZE {
             return Err(Error::UnexpectedEof);
         }
-        let header_bytes: &[u8; 16] = buf[..16].try_into().expect("length checked above");
+        let header_bytes: &[u8; HEADER_SIZE] =
+            buf[..HEADER_SIZE].try_into().expect("length checked above");
         let view = Self(header_bytes);
 
         // Validate protocol version
@@ -237,7 +243,7 @@ impl<'a> HeaderView<'a> {
         // Validate return code
         ReturnCode::try_from(header_bytes[15])?;
 
-        Ok((view, &buf[16..]))
+        Ok((view, &buf[HEADER_SIZE..]))
     }
 
     /// Returns the message ID (service ID + method ID).
@@ -306,6 +312,19 @@ impl<'a> HeaderView<'a> {
         self.message_id().is_sd()
     }
 
+    /// Header bytes 8..16 (`request_id + protocol_version +
+    /// interface_version + message_type + return_code`).
+    ///
+    /// Consumed by E2E Profile 5's `UPPER-HEADER-BITS-TO-SHIFT`.
+    /// Zero-copy mirror of [`Header::upper_header_bytes`].
+    #[must_use]
+    pub const fn upper_header_bytes(&self) -> [u8; 8] {
+        [
+            self.0[8], self.0[9], self.0[10], self.0[11], self.0[12], self.0[13], self.0[14],
+            self.0[15],
+        ]
+    }
+
     /// Copies the view into an owned [`Header`].
     #[must_use]
     pub fn to_owned(&self) -> Header {
@@ -323,7 +342,7 @@ impl<'a> HeaderView<'a> {
 
 impl WireFormat for Header {
     fn required_size(&self) -> usize {
-        16
+        HEADER_SIZE
     }
 
     fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
@@ -334,7 +353,7 @@ impl WireFormat for Header {
         writer.write_u8(self.interface_version)?;
         writer.write_u8(u8::from(self.message_type))?;
         writer.write_u8(u8::from(self.return_code))?;
-        Ok(16)
+        Ok(HEADER_SIZE)
     }
 }
 

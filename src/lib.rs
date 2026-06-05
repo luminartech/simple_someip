@@ -199,6 +199,13 @@ pub mod embassy_channels;
 /// generates per-`T` `*Pooled<MyChannels>` impls against.
 #[cfg(feature = "bare_metal")]
 pub mod static_channels;
+/// Synchronous polled SOME/IP helpers (SD packet builders + SOMEIP
+/// datagram parsers) for bare-metal targets that drive the protocol
+/// from a periodic tick instead of the async `Client` / `Server`
+/// paths. Gated by `feature = "bare_metal_poll"`. See
+/// `docs/polled-bare-metal-rationale.md`.
+#[cfg(feature = "bare_metal_poll")]
+pub mod polled;
 mod traits;
 /// Executor-agnostic UDP transport abstraction used by the client and
 /// server modules. `no_std`-compatible; a default `std + tokio` backend

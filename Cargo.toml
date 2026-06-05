@@ -139,6 +139,11 @@ bare_metal = ["dep:embassy-sync"]
 # Implies `bare_metal` and pulls in `alloc` for `Arc<Channel<...>>`.
 # Useful for tests or early prototypes before sizing static pools.
 embassy_channels = ["bare_metal", "_alloc"]
+# `simple_someip::polled`: synchronous SOME/IP helpers (SD packet
+# builders + datagram parsers) for bare-metal targets that drive
+# the protocol from a periodic tick. See
+# `docs/polled-bare-metal-rationale.md`.
+bare_metal_poll = ["bare_metal"]
 
 [[test]]
 name = "client_server"
