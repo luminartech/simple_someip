@@ -836,7 +836,7 @@ impl<T: Send + 'static, const N: usize> core::fmt::Debug for StaticUnboundedRece
 /// embassy-sync-backed `EmbassySyncChannels::unbounded`. Each
 /// unbounded `T` declared in the macro gets its own `MpscPool`
 /// sized at `pool_size × UNBOUNDED_DEFAULT_CAP`.
-pub const UNBOUNDED_DEFAULT_CAP: usize = 128;
+pub const UNBOUNDED_DEFAULT_CAP: usize = 8;
 
 /// Generates a no-alloc [`ChannelFactory`] from a user-authored pool
 /// layout.
@@ -956,6 +956,10 @@ macro_rules! define_static_channels {
                     <$name as $crate::transport::ChannelFactory>::BoundedSender<Self, $bcap>,
                     <$name as $crate::transport::ChannelFactory>::BoundedReceiver<Self, $bcap>,
                 ) {
+                    // `.dlmu0_data` is flash-backed (linker copy_table
+                    // copies LMA→VMA at startup) so non-zero MpscPool
+                    // const-init survives boot. Frees DSPR0 BSS.
+                    #[unsafe(link_section = ".dlmu0_data")]
                     static POOL: $crate::static_channels::MpscPool<$bt, $bpool, $bcap> =
                         $crate::static_channels::MpscPool::new();
                     POOL.claim_bounded().expect(::core::concat!(

@@ -4,7 +4,11 @@ use super::Error;
 use crate::protocol::byte_order::WriteBytesExt;
 
 /// Maximum length of an SD configuration option string in bytes.
-pub const MAX_CONFIGURATION_STRING_LENGTH: usize = 256;
+/// Halo / bare-metal tight-BSS sizing: configuration option strings
+/// in real-world peer traffic are short; cap kept small so that the
+/// `Options::Configuration` variant doesn't bloat `HeaplessPayload`
+/// (and every BoundedPooled channel slot that holds one).
+pub const MAX_CONFIGURATION_STRING_LENGTH: usize = 16;
 
 // --- SD option wire-layout constants ---
 //
