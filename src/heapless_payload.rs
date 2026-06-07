@@ -38,7 +38,10 @@ pub const ENTRY_CAP: usize = 8;
 /// Max SD options in a single payload. See module-level docs.
 pub const OPT_CAP: usize = 8;
 /// Max raw (non-SD) payload byte length. See module-level docs.
-pub const PAYLOAD_CAP: usize = 2048;
+/// Halo / bare-metal tight-BSS sizing: 256 covers halo's expected
+/// inbound payload sizes and keeps `HeaplessPayload::Raw` from
+/// bloating BoundedPooled channel slots.
+pub const PAYLOAD_CAP: usize = 256;
 
 /// Owned SD header backed by heapless vectors.
 #[derive(Clone, Debug, Eq, PartialEq)]
