@@ -134,6 +134,76 @@ pub fn build_stop_offer_service_datagram(
     encode_service_entry_datagram(buf, request, session, /*stop=*/ true)
 }
 
+/// Encode a single SD datagram carrying one `OfferService` entry
+/// per element of `requests` (up to `N` entries). Each entry
+/// references its own IPv4 endpoint option; entries are placed in
+/// `requests` order.
+///
+/// Using one packet for all offered services is more efficient and
+/// matches how commercial SOME/IP stacks behave.
+///
+/// # Errors
+/// Returns [`BuildError::BufferTooSmall`] if `buf` is too short or
+/// if `requests.len()` exceeds the const cap `N`.
+pub fn build_multi_offer_service_datagram<const N: usize>(
+    buf: &mut [u8],
+    requests: &[OfferServiceRequest],
+    session: u16,
+) -> Result<usize, BuildError> {
+    build_multi_service_entry_datagram::<N>(buf, requests, session, /*stop=*/ false)
+}
+
+/// Encode a single SD datagram carrying one `StopOfferService` entry
+/// per element of `requests` (up to `N` entries).
+///
+/// # Errors
+/// See [`build_multi_offer_service_datagram`].
+pub fn build_multi_stop_offer_service_datagram<const N: usize>(
+    buf: &mut [u8],
+    requests: &[OfferServiceRequest],
+    session: u16,
+) -> Result<usize, BuildError> {
+    build_multi_service_entry_datagram::<N>(buf, requests, session, /*stop=*/ true)
+}
+
+fn build_multi_service_entry_datagram<const N: usize>(
+    buf: &mut [u8],
+    requests: &[OfferServiceRequest],
+    session: u16,
+    stop: bool,
+) -> Result<usize, BuildError> {
+    let mut entries: heapless::Vec<Entry, N> = heapless::Vec::new();
+    let mut options: heapless::Vec<SdOptions, N> = heapless::Vec::new();
+    for (i, req) in requests.iter().enumerate().take(N) {
+        let svc = ServiceEntry {
+            // Each entry owns exactly one option at position `i`
+            // in the flat options array.
+            index_first_options_run: i as u8,
+            index_second_options_run: 0,
+            options_count: OptionsCount::new(1, 0),
+            service_id: req.service_id,
+            instance_id: req.instance_id,
+            major_version: req.major_version,
+            ttl: if stop { 0 } else { req.ttl },
+            minor_version: req.minor_version,
+        };
+        let entry = if stop {
+            Entry::StopOfferService(svc)
+        } else {
+            Entry::OfferService(svc)
+        };
+        entries.push(entry).map_err(|_| BuildError::BufferTooSmall)?;
+        options
+            .push(SdOptions::IpV4Endpoint {
+                ip: req.local_ip,
+                port: req.unicast_port,
+                protocol: TransportProtocol::Udp,
+            })
+            .map_err(|_| BuildError::BufferTooSmall)?;
+    }
+    encode_sd_datagram(buf, &entries, &options, session)
+}
+
 /// Encode a `SubscribeAckEventgroup` datagram into `buf`. Caller
 /// transmits to the original `Subscribe` sender's SD endpoint.
 ///
@@ -476,8 +546,10 @@ pub fn emit_stop_offers<FSend>(
 ) where
     FSend: FnMut(&[u8], SocketAddrV4),
 {
-    for offer in config.offers {
-        let request = OfferServiceRequest {
+    let requests: heapless::Vec<OfferServiceRequest, MAX_OFFERS_PER_SD> = config
+        .offers
+        .iter()
+        .map(|offer| OfferServiceRequest {
             service_id: offer.service_id,
             instance_id: offer.instance_id,
             major_version: offer.major_version,
@@ -485,13 +557,13 @@ pub fn emit_stop_offers<FSend>(
             ttl: 0,
             local_ip: config.local_ip,
             unicast_port: offer.unicast_port,
-        };
-        let session = next_sd_session(&server_state.session);
-        if let Ok(len) =
-            build_stop_offer_service_datagram(config.sd_scratch, &request, session)
-        {
-            send(&config.sd_scratch[..len], config.sd_endpoint);
-        }
+        })
+        .collect();
+    let session = next_sd_session(&server_state.session);
+    if let Ok(len) =
+        build_multi_stop_offer_service_datagram::<MAX_OFFERS_PER_SD>(config.sd_scratch, &requests, session)
+    {
+        send(&config.sd_scratch[..len], config.sd_endpoint);
     }
 }
 
@@ -596,8 +668,11 @@ fn maybe_emit_offers<FSend>(
     if !period_elapsed(now_ms, &server_state.last_emit_ms, config.offer_period_ms) {
         return;
     }
-    for offer in config.offers {
-        let request = OfferServiceRequest {
+    // Build one SD packet that carries all OfferService entries.
+    let requests: heapless::Vec<OfferServiceRequest, MAX_OFFERS_PER_SD> = config
+        .offers
+        .iter()
+        .map(|offer| OfferServiceRequest {
             service_id: offer.service_id,
             instance_id: offer.instance_id,
             major_version: offer.major_version,
@@ -605,13 +680,13 @@ fn maybe_emit_offers<FSend>(
             ttl: offer.ttl_seconds,
             local_ip: config.local_ip,
             unicast_port: offer.unicast_port,
-        };
-        let session = next_sd_session(&server_state.session);
-        if let Ok(len) =
-            build_offer_service_datagram(config.sd_scratch, &request, session)
-        {
-            send(&config.sd_scratch[..len], config.sd_endpoint);
-        }
+        })
+        .collect();
+    let session = next_sd_session(&server_state.session);
+    if let Ok(len) =
+        build_multi_offer_service_datagram::<MAX_OFFERS_PER_SD>(config.sd_scratch, &requests, session)
+    {
+        send(&config.sd_scratch[..len], config.sd_endpoint);
     }
 }
 
@@ -742,6 +817,9 @@ fn process_sd_inbound<const EG: usize, const SUBS: usize, FSend>(
 }
 
 const MAX_INBOUND_SD_OPTIONS: usize = 8;
+/// Cap on the number of `OfferService` entries packed into one SD
+/// datagram. 16 comfortably covers any realistic service catalog.
+const MAX_OFFERS_PER_SD: usize = 16;
 /// Cap on unique inbox ports per drain pass. 16 covers any
 /// realistic catalog (offers + subscriptions); excess ports are
 /// silently skipped this tick and picked up next.
