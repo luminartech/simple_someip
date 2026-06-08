@@ -199,6 +199,11 @@ pub mod embassy_channels;
 /// generates per-`T` `*Pooled<MyChannels>` impls against.
 #[cfg(feature = "bare_metal")]
 pub mod static_channels;
+/// `RawMutex` selection for the `&'static` no-alloc static handles:
+/// a no-op single-context mutex for polled builds, the real
+/// critical-section mutex otherwise.
+#[cfg(feature = "bare_metal")]
+pub mod single_context_mutex;
 /// Synchronous polled SOME/IP helpers (SD packet builders + SOMEIP
 /// datagram parsers) for bare-metal targets that drive the protocol
 /// from a periodic tick instead of the async `Client` / `Server`

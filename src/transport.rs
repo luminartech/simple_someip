@@ -1086,20 +1086,22 @@ pub mod bare_metal_e2e_impl {
         E2E_REGISTRY_CAP, E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, E2ERegistryFull,
         Error as E2EError,
     };
+    use crate::single_context_mutex::StaticHandleRawMutex;
     use core::cell::RefCell;
     use embassy_sync::blocking_mutex::Mutex;
-    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
-    /// Convenience type alias for the embassy-sync critical-section mutex
-    /// backing [`StaticE2EHandle`].
+    /// Convenience type alias for the embassy-sync blocking mutex backing
+    /// [`StaticE2EHandle`]. The `RawMutex` is [`StaticHandleRawMutex`] —
+    /// no-op single-context on polled builds, critical-section otherwise.
     ///
     /// Const-generic over the registry capacity so each consumer sizes
     /// the storage to their own E2E-protected message catalog.
     pub type StaticE2EStorage<const CAP: usize = E2E_REGISTRY_CAP> =
-        Mutex<CriticalSectionRawMutex, RefCell<E2ERegistry<CAP>>>;
+        Mutex<StaticHandleRawMutex, RefCell<E2ERegistry<CAP>>>;
 
-    /// No-alloc [`E2ERegistryHandle`] backed by a `&'static` critical-section
-    /// mutex.
+    /// No-alloc [`E2ERegistryHandle`] backed by a `&'static`
+    /// [`StaticE2EStorage`] (critical-section mutex, or a no-op
+    /// single-context mutex on polled builds).
     ///
     /// All clones are the same thin pointer. Construct via [`StaticE2EHandle::new`]
     /// and supply a `&'static StaticE2EStorage<CAP>`.

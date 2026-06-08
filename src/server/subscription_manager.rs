@@ -466,24 +466,27 @@ pub mod bare_metal_subscription_impl {
         EVENT_GROUPS_CAP, SUBSCRIBERS_PER_GROUP, SubscribeError, Subscriber, SubscriptionHandle,
         SubscriptionManager,
     };
+    use crate::single_context_mutex::StaticHandleRawMutex;
     use core::cell::RefCell;
     use core::future::Future;
     use core::net::SocketAddrV4;
     use embassy_sync::blocking_mutex::Mutex;
-    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
-    /// Convenience type alias for the embassy-sync critical-section
-    /// mutex backing [`StaticSubscriptionHandle`].
+    /// Convenience type alias for the embassy-sync blocking mutex backing
+    /// [`StaticSubscriptionHandle`]. The `RawMutex` is
+    /// [`StaticHandleRawMutex`] — no-op single-context on polled builds,
+    /// critical-section otherwise.
     ///
     /// Const-generic over event-group / per-group subscriber caps so
     /// each consumer sizes the storage to their own service catalog.
     pub type StaticSubscriptionStorage<
         const EG: usize = EVENT_GROUPS_CAP,
         const SUBS: usize = SUBSCRIBERS_PER_GROUP,
-    > = Mutex<CriticalSectionRawMutex, RefCell<SubscriptionManager<EG, SUBS>>>;
+    > = Mutex<StaticHandleRawMutex, RefCell<SubscriptionManager<EG, SUBS>>>;
 
     /// No-alloc [`SubscriptionHandle`] backed by a `&'static`
-    /// critical-section mutex.
+    /// [`StaticSubscriptionStorage`] (critical-section mutex, or a no-op
+    /// single-context mutex on polled builds).
     ///
     /// All clones are the same thin pointer. Construct via
     /// [`Self::new`] and supply a `&'static StaticSubscriptionStorage<EG, SUBS>`.
