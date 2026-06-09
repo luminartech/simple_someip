@@ -141,8 +141,7 @@ bare_metal = ["dep:embassy-sync"]
 embassy_channels = ["bare_metal", "_alloc"]
 # `simple_someip::polled`: synchronous SOME/IP helpers (SD packet
 # builders + datagram parsers) for bare-metal targets that drive
-# the protocol from a periodic tick. See
-# `docs/polled-bare-metal-rationale.md`.
+# the protocol from a periodic tick.
 bare_metal_poll = ["bare_metal", "server"]
 
 [[test]]

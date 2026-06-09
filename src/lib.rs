@@ -207,8 +207,7 @@ pub mod single_context_mutex;
 /// Synchronous polled SOME/IP helpers (SD packet builders + SOMEIP
 /// datagram parsers) for bare-metal targets that drive the protocol
 /// from a periodic tick instead of the async `Client` / `Server`
-/// paths. Gated by `feature = "bare_metal_poll"`. See
-/// `docs/polled-bare-metal-rationale.md`.
+/// paths. Gated by `feature = "bare_metal_poll"`.
 #[cfg(feature = "bare_metal_poll")]
 pub mod polled;
 mod traits;
@@ -237,9 +236,7 @@ pub use client::{
 // `ClientChannelTypes` elaboration limit at the wrong call site.
 pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
-pub use server::{
-    NonSdRequestCallback, Server, ServerDeps, ServerHandles, ServerStorage, SubscriptionHandle,
-};
+pub use server::{Server, ServerDeps, ServerHandles, ServerStorage, SubscriptionHandle};
 #[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
 #[cfg(feature = "bare_metal")]

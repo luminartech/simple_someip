@@ -496,9 +496,6 @@ where
     /// run-futures built from the same `Server` from racing the sockets
     /// and SD session counter.
     pub started: StartedLatch,
-    /// Optional callback for non-SD unicast datagrams (method requests).
-    /// `None` reproduces the default "non-SD ignored" behavior.
-    pub non_sd_observer: Option<NonSdRequestCallback>,
 }
 
 /// SOME/IP Server that can offer services and publish events.
@@ -606,23 +603,7 @@ pub struct Server<
     /// — because the run-future captures an owned copy independent of
     /// `&self`'s lifetime, and both alternatives are `Clone + 'static`.
     started: StartedLatch,
-    /// Optional callback invoked for non-SD unicast datagrams received
-    /// on the service's port (method requests / fire-and-forget calls).
-    /// `None` preserves the historical "ignore non-SD" behavior; `Some`
-    /// surfaces those datagrams to the consumer (used by halo's FFI to
-    /// dispatch HWP1 method requests).
-    non_sd_observer: Option<NonSdRequestCallback>,
 }
-
-/// Callback invoked by the server's `recv_loop` for every non-SD
-/// unicast datagram received on the service's port (i.e. method
-/// requests / fire-and-forget calls to the offered services). The
-/// payload is the full raw datagram bytes; the caller is responsible
-/// for re-parsing the SOME/IP header (and applying any E2E check) on
-/// the consumer side. `fn` pointers are `Copy + Send + Sync + 'static`,
-/// so they can be stored on the `Server` and captured by the
-/// run-future without adding a new generic.
-pub type NonSdRequestCallback = fn(data: &[u8], source: core::net::SocketAddrV4);
 
 #[cfg(feature = "_alloc")]
 type StartedLatch = Arc<AtomicBool>;
@@ -885,7 +866,6 @@ where
             timer,
             is_passive: false,
             started: Arc::new(AtomicBool::new(false)),
-            non_sd_observer: None,
         };
         let handles = ServerHandles {
             publisher: server.publisher(),
@@ -968,7 +948,6 @@ where
             timer,
             is_passive: true,
             started: Arc::new(AtomicBool::new(false)),
-            non_sd_observer: None,
         };
         let handles = ServerHandles {
             publisher: server.publisher(),
@@ -1053,7 +1032,6 @@ where
             timer: deps.timer,
             is_passive: false,
             started: deps.started,
-            non_sd_observer: deps.non_sd_observer,
         })
     }
 
@@ -1119,7 +1097,6 @@ where
             timer: deps.timer,
             is_passive: true,
             started: deps.started,
-            non_sd_observer: deps.non_sd_observer,
         })
     }
 
@@ -1225,7 +1202,6 @@ where
         let sd_state = self.sd_state.clone();
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
-        let non_sd_observer = self.non_sd_observer;
         #[allow(noop_method_call)]
         let started = self.started.clone();
 
@@ -1255,7 +1231,6 @@ where
                 is_passive,
                 unicast_buf,
                 sd_buf,
-                non_sd_observer,
             )
             .await
         }
@@ -1325,7 +1300,6 @@ where
         let sd_state = self.sd_state.clone();
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
-        let non_sd_observer = self.non_sd_observer;
         let started = self.started.clone();
 
         async move {
@@ -1360,7 +1334,6 @@ where
                 is_passive,
                 &mut unicast_buf,
                 &mut sd_buf,
-                non_sd_observer,
             )
             .await
         }
@@ -1544,7 +1517,6 @@ mod tests {
             sd_state: Arc::new(SdStateManager::new()),
             publisher,
             started: Arc::new(AtomicBool::new(false)),
-            non_sd_observer: None,
         };
         (handles, bound_port)
     }

@@ -3,9 +3,6 @@
 //! Gated by `feature = "bare_metal_poll"`. Transport-agnostic SD
 //! packet builders + SOMEIP datagram parsers driven from a caller's
 //! periodic tick instead of the async `Client`/`Server` paths.
-//!
-//! See `docs/polled-bare-metal-rationale.md` for the memory-cost
-//! comparison that motivates this module.
 
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::{AtomicU16, AtomicU32, Ordering};
