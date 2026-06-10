@@ -231,11 +231,24 @@ tokio::spawn(run);  // receive only; co-located Client drives SD
 
 - **Crate version bumped to 0.8.0** — reflects the breaking changes above. Downstream `Cargo.toml` snippets in `README.md` were updated accordingly.
 - **Bare-metal compile gate is now literal.** `cargo build --target thumbv7em-none-eabihf --no-default-features --features client,server,bare_metal` succeeds; `client + bare_metal` is verified alloc-free (zero `__rust_alloc` references in the resulting rlib). CI runs this matrix on every PR. The cortex-m4f target is the closest no_std proxy mainline Rust supports — the project's actual production target (Infineon AURIX TriCore) requires HighTec's commercial Rust distribution because mainline Rust + LLVM don't have a TriCore backend; a TriCore CI runner is tracked in #117.
-- **Known limitation: `server` feature pulls `extern crate alloc`.** `Server` holds `Arc<EventPublisher>` and `EventPublisher` holds `Arc<F::Socket>`; both require an allocator. Pure no_std-without-allocator consumers can use the `client` feature alone (alloc-free) but will need a global allocator for the server side. A refactor to `&'static` borrows is tracked in #115.
+- **`server + bare_metal` is now alloc-free** (PR #124 closed the former known limitation): the `server` feature no longer pulls `extern crate alloc`; `Arc` defaults apply only under std/tokio configurations. CI audits the rlib for allocator symbols in both `client,bare_metal` and `server,bare_metal`.
 
 ### Test runner
 
 - `tests/client_server.rs` integration tests share the SD multicast port (30490) via `SO_REUSEPORT` and rely on Linux's reuseport hashing for traffic delivery. Under cargo's default parallel test runner cross-test Subscribe deliveries flake. The crate's `.config/nextest.toml` serializes `client_server` via the `serial-sd-port` test-group, so `cargo nextest run` (used by CI) gives stable results. For the legacy harness, pass `--test-threads=1`: `cargo test --test client_server -- --test-threads=1`.
+
+### Internal / Infrastructure
+
+- Future-size witness tests (host-arch proxies with +25% budgets) for the
+  client run/socket-loop futures and server run future, in tokio and
+  static-channel configurations (issue #125 measurement baseline, PR 0).
+- `tools/capture_type_sizes.sh`: host + thumbv7em `-Zprint-type-sizes`
+  capture; `tools/size_probe` now instantiates the client futures no_std.
+- `transport::probe`: public zero-behavior `Null*` dependency stubs
+  (promoted from test-private; layout probing + trait-conformance only).
+- CI: `-Zbuild-std=core` thumbv7em gate (halo's no-alloc-sysroot
+  certification) for client/server/combined bare_metal; `nm` alloc-symbol
+  audit extended to `server,bare_metal`.
 
 
 ## [0.6.0](https://github.com/luminartech/simple_someip/compare/v0.5.3...v0.6.0) - 2026-04-20
