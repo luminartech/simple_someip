@@ -96,8 +96,8 @@ client = ["dep:futures-util"]
 client-tokio = ["client", "std", "dep:tokio", "dep:socket2"]
 # Internal marker: features that need `extern crate alloc`. Pulls in
 # `alloc::sync::Arc` for `SharedHandle<T>` and `Arc<EventPublisher>`.
-# Not part of the public surface — implied by `server` /
-# `embassy_channels` / `std` and tied to the `extern crate alloc`
+# Not part of the public surface — implied by `std` /
+# `embassy_channels` and tied to the `extern crate alloc`
 # declaration in `lib.rs` so both sides of "alloc is available"
 # move in lockstep. Naming: `_`-prefix flags it as private.
 _alloc = []
