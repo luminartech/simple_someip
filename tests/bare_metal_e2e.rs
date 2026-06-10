@@ -43,6 +43,18 @@ use simple_someip::transport::{
 use simple_someip::{Client, ClientDeps, RawPayload, Server, ServerDeps};
 
 // ── Static-pool channel factory ───────────────────────────────────────
+//
+// Pool budget: each `Client::new_with_deps` claims one `ControlMessage`
+// bounded slot and one `ClientUpdate` unbounded slot for the lifetime
+// of the client. Both pools hold 4. A plain parallel `cargo test` runs
+// every test in this file in ONE process, so concurrent tests share
+// these pools — currently 3 client-constructing tests worst-case. If a
+// new test pushes that past 4, grow the two pool counts below or the
+// exhaustion panic will land in whichever test loses the race.
+//
+// NOTE: `tools/size_probe`'s `ProbeChannels` mirrors this entry list
+// for thumbv7em layout capture. If you change the entries here,
+// update the probe or its measured layouts silently drift.
 
 define_static_channels! {
     name: E2ETestChannels,
@@ -574,4 +586,107 @@ async fn client_send_request_server_runloop_stable() {
     // Cleanup
     run_handle.abort();
     client_run_handle.abort();
+}
+
+/// Host-arch PROXY budgets for the bare-metal-channel configuration
+/// (static pools + mock transport) — the closest host-side analog to
+/// the TC4 build. Same semantics/update procedure as the constants in
+/// src/client/mod.rs; authoritative numbers come from
+/// `tools/capture_type_sizes.sh` (thumbv7em).
+const BM_CLIENT_RUN_FUTURE_BUDGET: usize = 34048; // = ceil64(27208 × 1.25)
+const BM_CLIENT_SOCKET_LOOP_BUDGET: usize = 2816; // = ceil64(2224 × 1.25)
+const BM_SERVER_RUN_FUTURE_BUDGET: usize = 9664; // = ceil64(7696 × 1.25)
+
+#[tokio::test]
+async fn future_size_witness_bare_metal_channels() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct SizeRecordingSpawner {
+        max_spawned: Arc<AtomicUsize>,
+    }
+
+    impl Spawner for SizeRecordingSpawner {
+        fn spawn(&self, future: impl core::future::Future<Output = ()> + Send + 'static) {
+            self.max_spawned
+                .fetch_max(core::mem::size_of_val(&future), Ordering::SeqCst);
+            let _run_handle = tokio::spawn(future);
+        }
+    }
+
+    let network = SharedNetwork::new();
+
+    // ── Server (mirror client_receives_server_sd_announcement) ──
+    let server_factory = MockFactory {
+        tx_pipe: Arc::clone(&network.server_to_client),
+        rx_pipe: Arc::clone(&network.client_to_server),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+    let server_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let server_config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30600);
+    let server_deps = ServerDeps {
+        factory: server_factory,
+        timer: MockTimer,
+        e2e_registry: server_e2e,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: None,
+    };
+    let (_server, _handles, server_run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(server_deps, server_config, false)
+        .await
+        .expect("server creation");
+    let server_run_size = core::mem::size_of_val(&server_run);
+    drop(server_run); // not driven; witness only
+
+    // ── Client (static channel pools) ──
+    let client_factory = MockFactory {
+        tx_pipe: Arc::clone(&network.client_to_server),
+        rx_pipe: Arc::clone(&network.server_to_client),
+        next_port: Arc::new(Mutex::new(100)),
+    };
+    let max_spawned = Arc::new(AtomicUsize::new(0));
+    let client_deps = ClientDeps {
+        factory: client_factory,
+        spawner: SizeRecordingSpawner {
+            max_spawned: Arc::clone(&max_spawned),
+        },
+        timer: MockTimer,
+        e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+        interface: Arc::new(RwLock::new(Ipv4Addr::LOCALHOST)),
+    };
+    let (client, _updates, run_fut) = Client::<
+        RawPayload,
+        Arc<Mutex<E2ERegistry>>,
+        Arc<RwLock<Ipv4Addr>>,
+        E2ETestChannels,
+    >::new_with_deps(client_deps, false);
+
+    let run_size = core::mem::size_of_val(&run_fut);
+    let _run_handle = tokio::spawn(run_fut);
+    client.bind_discovery().await.expect("bind_discovery");
+    let loop_size = max_spawned.load(Ordering::SeqCst);
+
+    println!("FUTURE_SIZE bm_client_run_future {run_size}");
+    println!("FUTURE_SIZE bm_client_socket_loop {loop_size}");
+    println!("FUTURE_SIZE bm_server_run_future {server_run_size}");
+
+    assert!(loop_size > 0, "spawner never received the socket loop");
+    assert!(
+        run_size <= BM_CLIENT_RUN_FUTURE_BUDGET,
+        "client run future grew: {run_size} B > budget {BM_CLIENT_RUN_FUTURE_BUDGET} B"
+    );
+    assert!(
+        loop_size <= BM_CLIENT_SOCKET_LOOP_BUDGET,
+        "socket loop future grew: {loop_size} B > budget {BM_CLIENT_SOCKET_LOOP_BUDGET} B"
+    );
+    assert!(
+        server_run_size <= BM_SERVER_RUN_FUTURE_BUDGET,
+        "server run future grew: {server_run_size} B > budget {BM_SERVER_RUN_FUTURE_BUDGET} B"
+    );
+    client.shut_down();
 }
