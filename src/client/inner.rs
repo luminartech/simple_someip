@@ -29,14 +29,27 @@ use super::error::Error;
 /// Max depth of the internal control-message queue. Each entry is one
 /// in-flight `ControlMessage`. Must be generous enough to absorb bursts
 /// from `Client` callers between event-loop ticks.
-const REQUEST_QUEUE_CAP: usize = 32;
+///
+/// This `Deque<ControlMessage, _>` is stored inline in `Inner`, and
+/// `ControlMessage` embeds a whole `Message<P>` (~576 B for
+/// `HeaplessPayload`), so this depth is the single largest term in the
+/// `Inner` run-future that embassy holds in its task ARENA — at 32 it was
+/// ~18 KB by itself. The control *channel* feeding this queue is only
+/// depth 4, and the run loop drains the queue every iteration, so the
+/// queue never holds more than the channel can deliver between ticks.
+/// Sized to the control channel cap; a bursty multi-caller `Client` can
+/// raise it (storage scales linearly).
+const REQUEST_QUEUE_CAP: usize = 4;
 
 /// Max number of outstanding unicast request-response pairs. Each entry is
-/// a `request_id` awaiting a reply. Must be a power of two.
-const PENDING_RESPONSES_CAP: usize = 64;
+/// a `request_id` awaiting a reply. Must be a power of two. Inline in
+/// `Inner`; only the request-response (`SendToService`) path populates it.
+const PENDING_RESPONSES_CAP: usize = 8;
 
 /// Max number of bound unicast sockets tracked by port. Must be a power of
-/// two.
+/// two. Inline in `Inner` — but `SocketManager` is only ~56 B, so this is
+/// a minor term; left at 8 (halo uses 1) to keep the library's
+/// multi-socket routing tests within capacity.
 const UNICAST_SOCKETS_CAP: usize = 8;
 
 pub enum ControlMessage<P: PayloadWireFormat + 'static, C: ChannelFactory> {
