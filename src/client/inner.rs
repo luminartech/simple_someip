@@ -1,3 +1,4 @@
+use crate::log::{debug, error, info, trace, warn};
 use core::future;
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use core::task::Poll;
@@ -5,7 +6,6 @@ use futures_util::{FutureExt, pin_mut, select_biased};
 use heapless::{Deque, index_map::FnvIndexMap};
 #[cfg(all(test, feature = "client-tokio"))]
 use std::sync::{Arc, Mutex};
-use crate::log::{debug, error, info, trace, warn};
 
 #[cfg(all(test, feature = "client-tokio"))]
 use crate::e2e::E2ERegistry;

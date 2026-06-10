@@ -471,11 +471,9 @@ impl SubscriptionHandle for MockSubscriptions {
     // Boxed `!Send` futures — the `spawn_local` paths that exercise
     // this loopback don't need `Send` and the `Mutex` is only used
     // synchronously inside.
-    type SubscribeFuture<'a> = core::pin::Pin<
-        Box<dyn core::future::Future<Output = Result<(), SubscribeError>> + 'a>,
-    >;
-    type UnsubscribeFuture<'a> =
-        core::pin::Pin<Box<dyn core::future::Future<Output = ()> + 'a>>;
+    type SubscribeFuture<'a> =
+        core::pin::Pin<Box<dyn core::future::Future<Output = Result<(), SubscribeError>> + 'a>>;
+    type UnsubscribeFuture<'a> = core::pin::Pin<Box<dyn core::future::Future<Output = ()> + 'a>>;
 
     fn subscribe(
         &self,

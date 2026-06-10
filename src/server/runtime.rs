@@ -181,7 +181,7 @@ where
     Ok(())
 }
 
-/// Handle a Service Discovery message (Subscribe / FindService etc.).
+/// Handle a Service Discovery message (Subscribe / `FindService` etc.).
 #[allow(clippy::too_many_lines)]
 pub(super) async fn handle_sd_message<T, Sub>(
     config: &ServerConfig,
@@ -373,9 +373,7 @@ where
                         find_service_id,
                         config.service_id
                     );
-                    if let Err(e) =
-                        send_unicast_offer(config, sd_socket, sd_state, sender).await
-                    {
+                    if let Err(e) = send_unicast_offer(config, sd_socket, sd_state, sender).await {
                         crate::log::warn!("Unicast OfferService send failed: {e}");
                     }
                 } else {
@@ -547,7 +545,9 @@ where
                             cb(data, src_v4);
                         }
                     } else {
-                        crate::log::trace!("Non-SD unicast SOME/IP message, no observer registered — ignoring");
+                        crate::log::trace!(
+                            "Non-SD unicast SOME/IP message, no observer registered — ignoring"
+                        );
                     }
                 } else {
                     crate::log::trace!("Non-SD multicast SOME/IP message, ignoring");
@@ -609,7 +609,16 @@ where
     let sd = sd_socket.get();
     let sd_state_ref = sd_state.get();
 
-    let recv_fut = recv_loop(&config, unicast, sd, sd_state_ref, &subscriptions, unicast_buf, sd_buf, non_sd_observer);
+    let recv_fut = recv_loop(
+        &config,
+        unicast,
+        sd,
+        sd_state_ref,
+        &subscriptions,
+        unicast_buf,
+        sd_buf,
+        non_sd_observer,
+    );
 
     if config.announce {
         let announce_fut = announce_loop(&config, sd, sd_state_ref, &timer);

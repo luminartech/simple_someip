@@ -368,8 +368,9 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
     /// satisfiable. The `Box::pin` allocation happens at SD-rate
     /// (~1 Hz subscribes during steady state), small cost relative to
     /// the wire-side activity it gates.
-    type SubscribeFuture<'a> =
-        core::pin::Pin<alloc::boxed::Box<dyn Future<Output = Result<(), SubscribeError>> + Send + 'a>>;
+    type SubscribeFuture<'a> = core::pin::Pin<
+        alloc::boxed::Box<dyn Future<Output = Result<(), SubscribeError>> + Send + 'a>,
+    >;
     type UnsubscribeFuture<'a> =
         core::pin::Pin<alloc::boxed::Box<dyn Future<Output = ()> + Send + 'a>>;
 

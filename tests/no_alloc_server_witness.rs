@@ -131,10 +131,10 @@ fn poll_once_to_ready<F: Future>(mut fut: Pin<&mut F>) -> F::Output {
 // `SubscriptionManager::new()` is `const`, so the backing storage can
 // live in a plain `static` — no `Box::leak` needed.
 
-static SUBS: StaticSubscriptionStorage =
-    BlockingMutex::<CriticalSectionRawMutex, RefCell<SubscriptionManager>>::new(RefCell::new(
-        SubscriptionManager::new(),
-    ));
+static SUBS: StaticSubscriptionStorage = BlockingMutex::<
+    CriticalSectionRawMutex,
+    RefCell<SubscriptionManager>,
+>::new(RefCell::new(SubscriptionManager::new()));
 
 // ── Witnesses ─────────────────────────────────────────────────────────────
 

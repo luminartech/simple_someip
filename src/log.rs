@@ -31,13 +31,22 @@ macro_rules! noop {
     };
 }
 
+// `unused_imports` for the same macro-table reason as the `tracing`
+// branch above, plus: with `--no-default-features` (no client/server)
+// every call site is compiled out, so all five aliases count as
+// unused.
 #[cfg(not(feature = "tracing"))]
+#[allow(unused_imports)]
 pub(crate) use noop as debug;
 #[cfg(not(feature = "tracing"))]
+#[allow(unused_imports)]
 pub(crate) use noop as error;
 #[cfg(not(feature = "tracing"))]
+#[allow(unused_imports)]
 pub(crate) use noop as info;
 #[cfg(not(feature = "tracing"))]
+#[allow(unused_imports)]
 pub(crate) use noop as trace;
 #[cfg(not(feature = "tracing"))]
+#[allow(unused_imports)]
 pub(crate) use noop as warn;
