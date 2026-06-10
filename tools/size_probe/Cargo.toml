@@ -44,9 +44,10 @@ name = "size_probe"
 crate-type = ["staticlib"]
 
 [dependencies]
-# `client,bare_metal` — the audited alloc-free combo (no `server`,
-# which pulls `extern crate alloc` per the lib.rs feature table).
-# `bare_metal` covers the codec-only FFI surface (matches halo PR
+# `client,bare_metal` — an audited alloc-free combo (`server` is
+# alloc-free too since PR #124; the layout probe just targets the
+# client futures in PR 0 — server probing lands with PR 3's static
+# plumbing). `bare_metal` covers the codec-only FFI surface (matches halo PR
 # #4429); `client` adds the run-future instantiation used by the
 # `-Zprint-type-sizes` layout probe (PR 0, issue #125). The
 # `NullAllocator` in lib.rs stays as the link target for the

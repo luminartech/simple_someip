@@ -29,7 +29,7 @@
 //! | `std` | yes | Enables std-dependent helpers (`RawPayload`, `VecSdHeader`) and the `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<…>>` default lock-handle impls used by the tokio backends. |
 //! | `client` | no | Trait-surface client. Pure `no_std`-clean (does not pull `extern crate alloc`). Caller supplies `Spawner` / `Timer` / `ChannelFactory` / `TransportFactory` / `E2ERegistryHandle` / `InterfaceHandle` impls. |
 //! | `client-tokio` | no | Adds the `Client::new` / `TokioSpawner` / `TokioTransport` convenience defaults; implies `client` + std + tokio + socket2. |
-//! | `server` | no | Trait-surface server. Pulls `extern crate alloc` (for `Arc<EventPublisher>` / `Arc<F::Socket>`); on `no_std`, downstream consumers must provide a `#[global_allocator]`. |
+//! | `server` | no | Trait-surface server. Alloc-free since PR #124: the no-alloc path is `Server::new_with_handles` + `run_with_buffers` with static handles. The `Arc`-backed conveniences (`new_with_deps`, `run`) are gated behind the internal `_alloc` feature (pulled in by `std` / `embassy_channels`). |
 //! | `server-tokio` | no | Adds the `Server::new` / `TokioTransport` / `TokioTimer` convenience defaults; implies `server` + std + tokio + socket2. |
 //! | `bare_metal` | no | Activates embassy-sync, the `static_channels` module (no-alloc `ChannelFactory`), `AtomicInterfaceHandle`, `StaticE2EHandle`, and `StaticSubscriptionHandle`. All five are pure `no_std` (no allocator required). See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable bare-metal integration examples. |
 //! | `embassy_channels` | no | Heap-backed `EmbassySyncChannels` `ChannelFactory`. Implies `bare_metal` and pulls `extern crate alloc;` into the crate; **on `no_std`, downstream consumers must provide a `#[global_allocator]`**. Useful for tests / early prototypes before sizing static pools. |
@@ -112,11 +112,10 @@ extern crate std;
 // `alloc` is required by:
 // - `embassy_channels` — `EmbassySyncChannels` heap-allocates an
 //   `Arc<Channel<...>>` per oneshot/bounded/unbounded.
-// - `server` — `EventPublisher` and the `Server` struct hold
-//   `Arc<EventPublisher<...>>` / `Arc<F::Socket>` for sharing
-//   between the run loop and external publishing tasks. A
-//   the `&'static`-borrow refactor tracked in #115 would let
-//   server compile in pure no_std without an allocator.
+// - the allocator-backed server conveniences (`new_with_deps` /
+//   `new_passive_with_deps`, `run`/`run_inner`'s owned buffers, the
+//   `Arc` `StartedLatch`). The core `server` engine is alloc-free
+//   since PR #124 (`new_with_handles` + `run_with_buffers`).
 //
 // The `static_channels` module (under `bare_metal` alone) does
 // NOT need alloc — users wanting `client` + `bare_metal` without
@@ -124,7 +123,7 @@ extern crate std;
 // macro. Pure `bare_metal` without `client` / `server` /
 // `embassy_channels` also stays alloc-free.
 // Pulls `alloc` into scope. Gated on the internal `_alloc` feature
-// (implied by `server`, `embassy_channels`, and `std`). The
+// (implied by `std` and `embassy_channels`). The
 // `Arc<T>: SharedHandle<T>` impl in `transport.rs` shares the same
 // gate so they move in lockstep.
 #[cfg(feature = "_alloc")]
