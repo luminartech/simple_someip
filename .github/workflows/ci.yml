@@ -73,11 +73,13 @@ jobs:
     # is a separate `cargo build` so a failure surfaces the specific
     # feature combo that regressed.
     #
-    # `client + bare_metal` is verified alloc-free (no `__rust_alloc`
-    # symbols in the rlib); `server + bare_metal` and the combined
-    # build pull `extern crate alloc` for `Arc<EventPublisher>` /
-    # `Arc<F::Socket>` and so do reference allocator symbols — that's
-    # documented in `lib.rs` and tracked for a future refactor.
+    # Builds every bare-metal feature combo against the prebuilt
+    # thumbv7em sysroot, then audits the rlibs for allocator symbols.
+    # Since PR #124 BOTH `client + bare_metal` and `server +
+    # bare_metal` must be alloc-free; the build_std_core job below is
+    # the stronger sysroot-level certification, this audit is the
+    # cheap stable-toolchain tripwire that names the offending symbol
+    # when something regresses.
     name: no_std target build (thumbv7em-none-eabihf)
     needs: check
     runs-on: ubuntu-latest
@@ -93,9 +95,10 @@ jobs:
         run: cargo build --target thumbv7em-none-eabihf --no-default-features --features server,bare_metal
       - name: client + server + bare_metal
         run: cargo build --target thumbv7em-none-eabihf --no-default-features --features client,server,bare_metal
-      # `client + bare_metal` runs LAST so the rlib in
-      # target/thumbv7em-none-eabihf/debug/ comes from this exact
-      # feature set when the alloc-symbol audit reads it.
+      # Each audited combo below is a `cargo clean -p` + build
+      # immediately followed by its own alloc-symbol audit, so the
+      # rlib in target/thumbv7em-none-eabihf/debug/ is guaranteed to
+      # come from exactly that feature set when the audit reads it.
       - name: client + bare_metal
         run: |
           # Invalidate the cargo fingerprint for any prior `simple-someip`
@@ -111,9 +114,9 @@ jobs:
         # If `client + bare_metal` ever starts pulling `__rust_alloc`,
         # something inside the client engine has regressed onto an
         # allocator-bound primitive. Fail loudly so it gets caught in
-        # the PR rather than discovered downstream. (`server` and
-        # `client+server` builds DO reference alloc symbols via
-        # `Arc<EventPublisher>` — documented; not gated here.)
+        # the PR rather than discovered downstream. (`server +
+        # bare_metal` gets the same audit below; the combined
+        # `client+server` build is covered by the build_std_core job.)
         run: |
           # Pin to the exact rlib path. `find ... | head -1` was
           # nondeterministic and silently picked up stale debug-script
@@ -137,6 +140,56 @@ jobs:
             nm -A "$rlib" | grep -E '__rust_alloc|__rg_alloc' || true
             exit 1
           fi
+      - name: server + bare_metal rebuild for audit
+        run: |
+          # Same fingerprint-invalidation rationale as the client
+          # audit above: `cargo clean -p` guarantees the rlib below
+          # was built under exactly `server,bare_metal`.
+          cargo clean -p simple-someip --target thumbv7em-none-eabihf
+          cargo build --target thumbv7em-none-eabihf --no-default-features --features server,bare_metal
+      - name: alloc-symbol audit (server + bare_metal must be alloc-free)
+        # Alloc-free since PR #124 (phase 22). A regression here means
+        # something in the server engine reacquired an allocator-bound
+        # primitive — fail loudly and name the symbols.
+        run: |
+          rlib="target/thumbv7em-none-eabihf/debug/libsimple_someip.rlib"
+          if [ ! -f "$rlib" ]; then
+            echo "::error::expected rlib not found at $rlib"
+            ls -la target/thumbv7em-none-eabihf/debug/ || true
+            exit 1
+          fi
+          set -o pipefail
+          alloc_refs=$(nm -A "$rlib" | grep -c -E '__rust_alloc|__rg_alloc' || true)
+          echo "server+bare_metal alloc-symbol references: $alloc_refs"
+          if [ "$alloc_refs" -ne 0 ]; then
+            echo "::error::server+bare_metal must be alloc-free; found $alloc_refs alloc references."
+            nm -A "$rlib" | grep -E '__rust_alloc|__rg_alloc' || true
+            exit 1
+          fi
+
+  build_std_core:
+    # Halo's TC4 proxy compiles with `-Zbuild-std=core`: `alloc` is
+    # absent from the sysroot entirely. The prebuilt-sysroot thumb job
+    # above SHIPS alloc, so an `extern crate alloc` regression passes
+    # there and still breaks halo. This job is the halo-certification
+    # gate (phase 22 / measurement PR 0 — see
+    # docs/simple_someip/plans/2026-06-09-phase22-125-memory-reduction-design.md).
+    name: build-std core gate (no alloc in sysroot)
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: client + bare_metal
+        run: cargo +nightly build --no-default-features --features client,bare_metal -Zbuild-std=core --target thumbv7em-none-eabihf
+      - name: server + bare_metal
+        run: cargo +nightly build --no-default-features --features server,bare_metal -Zbuild-std=core --target thumbv7em-none-eabihf
+      - name: client + server + bare_metal
+        run: cargo +nightly build --no-default-features --features client,server,bare_metal -Zbuild-std=core --target thumbv7em-none-eabihf
 
   test:
     name: Build, Test & Coverage
