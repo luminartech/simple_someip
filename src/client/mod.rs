@@ -51,6 +51,7 @@ use crate::Timer;
 #[cfg(feature = "client-tokio")]
 use crate::e2e::E2ERegistry;
 use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile};
+use crate::log::info;
 #[cfg(feature = "client-tokio")]
 use crate::tokio_transport::{TokioChannels, TokioSpawner, TokioTimer};
 use crate::transport::{
@@ -62,7 +63,6 @@ use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use inner::Inner;
 #[cfg(feature = "client-tokio")]
 use std::sync::{Arc, Mutex, RwLock};
-use crate::log::info;
 
 /// Marker trait declaring the channel-pool entries a [`ChannelFactory`]
 /// must declare for [`Client`] to compile against it. End users do not
@@ -2152,6 +2152,70 @@ mod tests {
             count.load(Ordering::SeqCst)
         );
 
+        client.shut_down();
+    }
+
+    /// Host-arch PROXY budgets for the client's two dominant futures.
+    /// thumbv7em layouts differ (pointer width/alignment) — the
+    /// authoritative numbers come from `tools/capture_type_sizes.sh`.
+    /// Values are observed-at-capture × 1.25 rounded up to a multiple
+    /// of 64 (see docs/simple_someip/plans/baselines/pr0-size-baseline.md).
+    /// If this trips: run the capture script and compare against the
+    /// baseline before raising the budget — a layout regression in a PR
+    /// is exactly what this witness exists to catch.
+    const TOKIO_CLIENT_RUN_FUTURE_BUDGET: usize = 132736; // = ceil64(106152 × 1.25)
+    /// See [`TOKIO_CLIENT_RUN_FUTURE_BUDGET`] — same proxy-budget rules.
+    const TOKIO_CLIENT_SOCKET_LOOP_BUDGET: usize = 8768; // = ceil64(6968 × 1.25)
+
+    #[tokio::test]
+    async fn future_size_witness_tokio_client() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// Records the size of every future it is asked to spawn (the
+        /// per-socket I/O loops), then delegates to tokio so the client
+        /// still works.
+        #[derive(Clone)]
+        struct SizeRecordingSpawner {
+            max_spawned: Arc<AtomicUsize>,
+        }
+
+        impl Spawner for SizeRecordingSpawner {
+            fn spawn(&self, future: impl core::future::Future<Output = ()> + Send + 'static) {
+                self.max_spawned
+                    .fetch_max(core::mem::size_of_val(&future), Ordering::SeqCst);
+                let _run_handle = tokio::spawn(future);
+            }
+        }
+
+        let max_spawned = Arc::new(AtomicUsize::new(0));
+        let spawner = SizeRecordingSpawner {
+            max_spawned: Arc::clone(&max_spawned),
+        };
+
+        let (client, _updates, run_fut) =
+            TestClient::new_with_spawner_and_loopback(Ipv4Addr::LOCALHOST, false, spawner);
+
+        // Measure BEFORE tokio::spawn moves it.
+        let run_size = core::mem::size_of_val(&run_fut);
+        let _run_handle = tokio::spawn(run_fut);
+
+        // Binding the discovery socket forces one socket-loop spawn.
+        client.bind_discovery().await.expect("bind_discovery");
+        let loop_size = max_spawned.load(Ordering::SeqCst);
+
+        std::println!("FUTURE_SIZE tokio_client_run_future {run_size}");
+        std::println!("FUTURE_SIZE tokio_client_socket_loop {loop_size}");
+
+        assert!(loop_size > 0, "spawner never received the socket loop");
+        assert!(
+            run_size <= TOKIO_CLIENT_RUN_FUTURE_BUDGET,
+            "Inner::run_future grew: {run_size} B > budget {TOKIO_CLIENT_RUN_FUTURE_BUDGET} B"
+        );
+        assert!(
+            loop_size <= TOKIO_CLIENT_SOCKET_LOOP_BUDGET,
+            "socket loop future grew: {loop_size} B > budget {TOKIO_CLIENT_SOCKET_LOOP_BUDGET} B"
+        );
         client.shut_down();
     }
 }
