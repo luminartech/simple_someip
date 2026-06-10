@@ -1,14 +1,20 @@
-//! Phase-20-pre flash-size measurement probe.
+//! no_std measurement probes for `thumbv7em-none-eabihf`. Two live here:
 //!
-//! Mirrors halo PR #4429's `rust_simple_someip` C-callable FFI
-//! surface (header encode/decode + E2E protect/check round-trips)
-//! to get a realistic post-link flash-size floor on
-//! `thumbv7em-none-eabihf` for what a Halo TC4D `rust_simple_someip`
-//! staticlib would cost.
+//! 1. **Flash-size probe** (phase 20-pre): mirrors halo PR #4429's
+//!    `rust_simple_someip` C-callable FFI surface (header
+//!    encode/decode + E2E protect/check round-trips) to get a
+//!    realistic post-link flash-size floor for what a Halo TC4D
+//!    `rust_simple_someip` staticlib would cost.
+//! 2. **Client-future layout probe** (PR 0, issue #125): instantiates
+//!    the client run future with zero-behavior deps so
+//!    `-Zprint-type-sizes` reports its real on-target layout — see
+//!    `client_future_probe` below and `tools/capture_type_sizes.sh`.
 //!
 //! NOT production code. Exposes `#[no_mangle] extern "C"` entry
 //! points only so post-link DCE keeps what an actual FFI consumer
-//! would reach, and discards everything else.
+//! would reach, and discards everything else. Flash measurements that
+//! predate the layout probe only linked the codec symbols — see the
+//! comparability caveat in this crate's `Cargo.toml`.
 
 #![no_std]
 
@@ -21,8 +27,10 @@ use core::slice;
 /// transitive dep pulls `extern crate alloc` even with simple-someip's
 /// `default-features = false`, requiring a `#[global_allocator]`
 /// link target. The codec-only FFI surface (header encode + E2E
-/// protect/check) never actually allocates, so a `null_mut()` return
-/// is sound for the probe — if any code path ever does try to alloc,
+/// protect/check) never actually allocates, and the client layout
+/// probe rides the `client,bare_metal` combo certified alloc-free by
+/// the TC4 audit (CI's `nm` alloc-symbol gate), so a `null_mut()`
+/// return is sound for the probe — if any code path ever does try to alloc,
 /// the resulting null deref shows up at runtime as the FFI-design
 /// bug it is, rather than being papered over with hidden heap usage.
 /// (Named `NullAllocator` rather than `PanicAllocator` because it
@@ -222,4 +230,186 @@ pub unsafe extern "C" fn e2e_profile5_round_trip(
     out.counter = result.counter.unwrap_or(0);
     out.payload_match = i32::from(result.payload == Some(payload));
     out
+}
+
+// ── Client-future layout probe (PR 0, issue #125) ────────────────────
+//
+// Instantiates the client's run-future and (transitively) the
+// per-socket loop with zero-behavior deps so `-Zprint-type-sizes`
+// reports their REAL thumbv7em layouts during this crate's codegen.
+// The entry point is `extern "C"` + `#[unsafe(no_mangle)]` purely so
+// post-link DCE keeps the instantiation; nothing ever calls it on
+// hardware. The server probe is deferred to PR 3 (needs the no-alloc
+// `new_with_handles` static plumbing that PR 3 builds anyway).
+
+mod client_future_probe {
+    use simple_someip::client::Error as ClientError;
+    use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
+    use simple_someip::protocol::sd::RebootFlag;
+    use simple_someip::protocol::{MessageId, sd};
+    use simple_someip::transport::probe::{
+        NullE2ERegistry, NullFactory, NullInterface, NullSpawner, NullTimer,
+    };
+    use simple_someip::{Client, ClientDeps, PayloadWireFormat, WireFormat};
+
+    // `RawPayload` is std-gated (heap `Vec` SD storage), so the probe
+    // carries its own minimal no_std `PayloadWireFormat` impl —
+    // heapless 4-entry SD storage, mirroring the crate-internal
+    // `protocol::sd::test_support::TestPayload` (which is
+    // `pub(crate)` and unreachable from here). A real firmware build
+    // ships its own payload type the same way.
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct ProbeSdHeader {
+        flags: sd::Flags,
+        entries: heapless::Vec<sd::Entry, 4>,
+        options: heapless::Vec<sd::Options, 4>,
+    }
+
+    impl WireFormat for ProbeSdHeader {
+        fn required_size(&self) -> usize {
+            sd::Header::new(self.flags, &self.entries, &self.options).required_size()
+        }
+        fn encode<T: embedded_io::Write>(
+            &self,
+            writer: &mut T,
+        ) -> Result<usize, simple_someip::protocol::Error> {
+            sd::Header::new(self.flags, &self.entries, &self.options).encode(writer)
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct ProbePayload {
+        header: ProbeSdHeader,
+    }
+
+    impl PayloadWireFormat for ProbePayload {
+        type SdHeader = ProbeSdHeader;
+        fn message_id(&self) -> MessageId {
+            MessageId::SD
+        }
+        fn as_sd_header(&self) -> Option<&ProbeSdHeader> {
+            Some(&self.header)
+        }
+        fn from_payload_bytes(
+            message_id: MessageId,
+            payload: &[u8],
+        ) -> Result<Self, simple_someip::protocol::Error> {
+            match message_id {
+                MessageId::SD => {
+                    let view = sd::SdHeaderView::parse(payload)?;
+                    let mut entries = heapless::Vec::new();
+                    for ev in view.entries() {
+                        entries.push(ev.to_owned().unwrap()).ok();
+                    }
+                    let mut options = heapless::Vec::new();
+                    for ov in view.options() {
+                        options.push(ov.to_owned().unwrap()).ok();
+                    }
+                    Ok(Self {
+                        header: ProbeSdHeader {
+                            flags: view.flags(),
+                            entries,
+                            options,
+                        },
+                    })
+                }
+                _ => Err(simple_someip::protocol::Error::UnsupportedMessageID(
+                    message_id,
+                )),
+            }
+        }
+        fn new_sd_payload(header: &ProbeSdHeader) -> Self {
+            Self {
+                header: header.clone(),
+            }
+        }
+        fn sd_flags(&self) -> Option<sd::Flags> {
+            Some(self.header.flags)
+        }
+        fn required_size(&self) -> usize {
+            self.header.required_size()
+        }
+        fn encode<T: embedded_io::Write>(
+            &self,
+            writer: &mut T,
+        ) -> Result<usize, simple_someip::protocol::Error> {
+            self.header.encode(writer)
+        }
+        fn new_subscription_sd_header(
+            service_id: u16,
+            instance_id: u16,
+            major_version: u8,
+            ttl: u32,
+            event_group_id: u16,
+            client_ip: core::net::Ipv4Addr,
+            protocol: sd::TransportProtocol,
+            client_port: u16,
+            reboot_flag: sd::RebootFlag,
+        ) -> ProbeSdHeader {
+            let entry = sd::Entry::SubscribeEventGroup(sd::EventGroupEntry::new(
+                service_id,
+                instance_id,
+                major_version,
+                ttl,
+                event_group_id,
+            ));
+            let endpoint = sd::Options::IpV4Endpoint {
+                ip: client_ip,
+                protocol,
+                port: client_port,
+            };
+            let mut entries = heapless::Vec::new();
+            entries.push(entry).unwrap();
+            let mut options = heapless::Vec::new();
+            options.push(endpoint).unwrap();
+            ProbeSdHeader {
+                flags: sd::Flags::new_sd(reboot_flag),
+                entries,
+                options,
+            }
+        }
+        fn set_reboot_flag(header: &mut ProbeSdHeader, reboot: sd::RebootFlag) {
+            header.flags = sd::Flags::new(bool::from(reboot), header.flags.unicast());
+        }
+    }
+
+    // Entry list mirrors `tests/bare_metal_e2e.rs`'s `E2ETestChannels`
+    // (with `ProbePayload` standing in for the std-gated `RawPayload`)
+    // so the probed futures see the same channel shapes as the host
+    // capture.
+    simple_someip::define_static_channels! {
+        name: ProbeChannels,
+        oneshot: [
+            (Result<(), ClientError>, 16),
+            (Result<ProbePayload, ClientError>, 8),
+            (Result<RebootFlag, ClientError>, 8),
+        ],
+        bounded: [
+            ((ControlMessage<ProbePayload, ProbeChannels>, 4), 4),
+            ((SendMessage<ProbePayload, ProbeChannels>, 16), 8),
+            ((Result<ReceivedMessage<ProbePayload>, ClientError>, 16), 8),
+        ],
+        unbounded: [
+            (ClientUpdate<ProbePayload>, 4),
+        ],
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn probe_client_run_future_size() -> usize {
+        let deps = ClientDeps {
+            factory: NullFactory,
+            spawner: NullSpawner,
+            timer: NullTimer,
+            e2e_registry: NullE2ERegistry,
+            interface: NullInterface(core::net::Ipv4Addr::LOCALHOST),
+        };
+        let (_client, _updates, run_fut) = Client::<
+            ProbePayload,
+            NullE2ERegistry,
+            NullInterface,
+            ProbeChannels,
+        >::new_with_deps(deps, false);
+        core::mem::size_of_val(&run_fut)
+    }
 }
