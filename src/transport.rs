@@ -1360,12 +1360,168 @@ pub trait UnboundedPooled<C: ChannelFactory>: Send + Sized + 'static {
     fn unbounded_pair() -> (C::UnboundedSender<Self>, C::UnboundedReceiver<Self>);
 }
 
+/// Zero-behavior implementations of the client- and server-side
+/// dependency traits. Two uses: (1) compile-time proof the trait
+/// signatures are implementable without async machinery, (2)
+/// **layout probing** — `tools/size_probe` instantiates `Client`
+/// with these on `thumbv7em-none-eabihf` so `-Zprint-type-sizes`
+/// reports the real on-target future layouts (see
+/// `docs/simple_someip/plans/2026-06-09-phase22-125-memory-reduction-design.md`).
+///
+/// NOT for production use: sockets error, and the spawner panics
+/// outright — probe code is compiled, never executed, and a loud
+/// failure beats the silent deadlock a future-dropping spawner
+/// would cause in a driven `Client`.
+#[cfg(any(test, feature = "bare_metal"))]
+pub mod probe {
+    use super::{
+        E2ERegistryHandle, InterfaceHandle, ReceivedDatagram, SocketOptions, Spawner, Timer,
+        TransportError, TransportFactory, TransportSocket,
+    };
+    use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, Error as E2EError};
+    use core::future::Future;
+    use core::net::{Ipv4Addr, SocketAddrV4};
+    use core::time::Duration;
+
+    /// Socket whose I/O futures resolve immediately with
+    /// `TransportError::Unsupported`.
+    pub struct NullSocket {
+        addr: SocketAddrV4,
+    }
+
+    impl NullSocket {
+        #[must_use]
+        pub const fn new(addr: SocketAddrV4) -> Self {
+            Self { addr }
+        }
+    }
+
+    impl TransportSocket for NullSocket {
+        type SendFuture<'a> = core::future::Ready<Result<(), TransportError>>;
+        type RecvFuture<'a> = core::future::Ready<Result<ReceivedDatagram, TransportError>>;
+
+        fn send_to<'a>(&'a self, _buf: &'a [u8], _target: SocketAddrV4) -> Self::SendFuture<'a> {
+            core::future::ready(Err(TransportError::Unsupported))
+        }
+
+        fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+            core::future::ready(Err(TransportError::Unsupported))
+        }
+
+        fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
+            Ok(self.addr)
+        }
+
+        fn join_multicast_v4(
+            &self,
+            _group: Ipv4Addr,
+            _iface: Ipv4Addr,
+        ) -> Result<(), TransportError> {
+            Err(TransportError::Unsupported)
+        }
+
+        fn leave_multicast_v4(
+            &self,
+            _group: Ipv4Addr,
+            _iface: Ipv4Addr,
+        ) -> Result<(), TransportError> {
+            Err(TransportError::Unsupported)
+        }
+    }
+
+    /// Factory that "binds" a [`NullSocket`] at the requested addr.
+    pub struct NullFactory;
+
+    impl TransportFactory for NullFactory {
+        type Socket = NullSocket;
+        type BindFuture<'a> = core::future::Ready<Result<Self::Socket, TransportError>>;
+
+        fn bind<'a>(
+            &'a self,
+            addr: SocketAddrV4,
+            _options: &'a SocketOptions,
+        ) -> Self::BindFuture<'a> {
+            core::future::ready(Ok(NullSocket::new(addr)))
+        }
+    }
+
+    /// Timer whose sleeps resolve immediately.
+    pub struct NullTimer;
+
+    impl Timer for NullTimer {
+        type SleepFuture<'a> = core::future::Ready<()>;
+
+        fn sleep(&self, _duration: Duration) -> Self::SleepFuture<'_> {
+            core::future::ready(())
+        }
+    }
+
+    /// E2E registry handle that registers nothing and checks nothing.
+    #[derive(Clone)]
+    pub struct NullE2ERegistry;
+
+    impl E2ERegistryHandle for NullE2ERegistry {
+        fn register(
+            &self,
+            _key: E2EKey,
+            _profile: E2EProfile,
+        ) -> Result<(), crate::e2e::E2ERegistryFull> {
+            Ok(())
+        }
+        fn unregister(&self, _key: &E2EKey) {}
+        fn contains_key(&self, _key: &E2EKey) -> bool {
+            false
+        }
+        fn protect(
+            &self,
+            _key: E2EKey,
+            _payload: &[u8],
+            _upper_header: [u8; 8],
+            _output: &mut [u8],
+        ) -> Option<Result<usize, E2EError>> {
+            None
+        }
+        fn check<'a>(
+            &self,
+            _key: E2EKey,
+            _payload: &'a [u8],
+            _upper_header: [u8; 8],
+        ) -> Option<(E2ECheckStatus, &'a [u8])> {
+            None
+        }
+    }
+
+    /// Interface handle pinned to a fixed address.
+    #[derive(Clone)]
+    pub struct NullInterface(pub Ipv4Addr);
+
+    impl InterfaceHandle for NullInterface {
+        fn get(&self) -> Ipv4Addr {
+            self.0
+        }
+        fn set(&self, _addr: Ipv4Addr) {}
+    }
+
+    /// Spawner that PANICS if asked to spawn. Probe code only
+    /// constructs futures, never drives them — failing loudly beats
+    /// violating [`Spawner`]'s poll-to-completion contract by
+    /// silently dropping the future.
+    pub struct NullSpawner;
+
+    impl Spawner for NullSpawner {
+        fn spawn(&self, _future: impl Future<Output = ()> + Send + 'static) {
+            panic!("NullSpawner is layout-probe-only; it never polls");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The traits are pure interfaces — these tests only verify that
     //! trivial mock implementations compile and that defaults behave as
     //! documented.
 
+    use super::probe::{NullE2ERegistry, NullFactory, NullInterface, NullSocket, NullTimer};
     use super::*;
 
     /// `IoErrorKind::is_transient_recv` must classify the well-known
@@ -1423,73 +1579,6 @@ mod tests {
         assert_eq!(a.multicast_loop_v4, b.multicast_loop_v4);
     }
 
-    // A minimal `TransportSocket` + `TransportFactory` + `Timer`
-    // implementation. Exists purely to prove the trait signatures are
-    // implementable with zero `async` machinery — the futures are produced
-    // by `core::future` primitives, no executor involved. If this module
-    // compiles, any tokio / embassy / smoltcp adapter will also compile.
-    struct NullSocket {
-        addr: SocketAddrV4,
-    }
-
-    impl TransportSocket for NullSocket {
-        type SendFuture<'a> = core::future::Ready<Result<(), TransportError>>;
-        type RecvFuture<'a> = core::future::Ready<Result<ReceivedDatagram, TransportError>>;
-
-        fn send_to<'a>(&'a self, _buf: &'a [u8], _target: SocketAddrV4) -> Self::SendFuture<'a> {
-            core::future::ready(Err(TransportError::Unsupported))
-        }
-
-        fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
-            core::future::ready(Err(TransportError::Unsupported))
-        }
-
-        fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
-            Ok(self.addr)
-        }
-
-        fn join_multicast_v4(
-            &self,
-            _group: Ipv4Addr,
-            _iface: Ipv4Addr,
-        ) -> Result<(), TransportError> {
-            Err(TransportError::Unsupported)
-        }
-
-        fn leave_multicast_v4(
-            &self,
-            _group: Ipv4Addr,
-            _iface: Ipv4Addr,
-        ) -> Result<(), TransportError> {
-            Err(TransportError::Unsupported)
-        }
-    }
-
-    struct NullFactory;
-
-    impl TransportFactory for NullFactory {
-        type Socket = NullSocket;
-        type BindFuture<'a> = core::future::Ready<Result<Self::Socket, TransportError>>;
-
-        fn bind<'a>(
-            &'a self,
-            addr: SocketAddrV4,
-            _options: &'a SocketOptions,
-        ) -> Self::BindFuture<'a> {
-            core::future::ready(Ok(NullSocket { addr }))
-        }
-    }
-
-    struct NullTimer;
-
-    impl Timer for NullTimer {
-        type SleepFuture<'a> = core::future::Ready<()>;
-
-        fn sleep(&self, _duration: Duration) -> Self::SleepFuture<'_> {
-            core::future::ready(())
-        }
-    }
-
     #[test]
     fn null_factory_bind_resolves_with_addr() {
         let factory = NullFactory;
@@ -1501,9 +1590,7 @@ mod tests {
 
     #[test]
     fn max_datagram_size_default_is_udp_buffer_size() {
-        let sock = NullSocket {
-            addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
-        };
+        let sock = NullSocket::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
         assert_eq!(sock.max_datagram_size(), crate::UDP_BUFFER_SIZE);
     }
 
@@ -1541,52 +1628,6 @@ mod tests {
         let e = TransportError::Io(IoErrorKind::TimedOut);
         assert_eq!(e, TransportError::Io(IoErrorKind::TimedOut));
         assert_ne!(e, TransportError::AddressInUse);
-    }
-
-    // Minimal no-op implementations to verify that E2ERegistryHandle and
-    // InterfaceHandle are implementable without any executor machinery.
-    #[derive(Clone)]
-    struct NullE2ERegistry;
-
-    impl E2ERegistryHandle for NullE2ERegistry {
-        fn register(
-            &self,
-            _key: E2EKey,
-            _profile: E2EProfile,
-        ) -> Result<(), crate::e2e::E2ERegistryFull> {
-            Ok(())
-        }
-        fn unregister(&self, _key: &E2EKey) {}
-        fn contains_key(&self, _key: &E2EKey) -> bool {
-            false
-        }
-        fn protect(
-            &self,
-            _key: E2EKey,
-            _payload: &[u8],
-            _upper_header: [u8; 8],
-            _output: &mut [u8],
-        ) -> Option<Result<usize, E2EError>> {
-            None
-        }
-        fn check<'a>(
-            &self,
-            _key: E2EKey,
-            _payload: &'a [u8],
-            _upper_header: [u8; 8],
-        ) -> Option<(E2ECheckStatus, &'a [u8])> {
-            None
-        }
-    }
-
-    #[derive(Clone)]
-    struct NullInterface(Ipv4Addr);
-
-    impl InterfaceHandle for NullInterface {
-        fn get(&self) -> Ipv4Addr {
-            self.0
-        }
-        fn set(&self, _addr: Ipv4Addr) {}
     }
 
     #[test]
