@@ -53,8 +53,8 @@ define_static_channels! {
     ],
     bounded: [
         ((ControlMessage<RawPayload, E2ETestChannels>, 4), 4),
-        ((SendMessage<RawPayload, E2ETestChannels>, 16), 8),
-        ((Result<ReceivedMessage<RawPayload>, ClientError>, 16), 8),
+        ((SendMessage<RawPayload, E2ETestChannels>, 4), 8),
+        ((Result<ReceivedMessage<RawPayload>, ClientError>, 4), 8),
     ],
     unbounded: [
         (ClientUpdate<RawPayload>, 4),
