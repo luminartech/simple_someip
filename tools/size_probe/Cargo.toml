@@ -12,31 +12,51 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
-# Phase-20-pre flash-size measurement probe. Builds a `staticlib`
-# that exposes `extern "C"` shims around simple-someip's
-# Option-A-relevant entry points, so post-link dead-code-elimination
-# only keeps what an actual halo-style FFI consumer would call.
+# Two probes share this crate:
+#
+# 1. Phase-20-pre flash-size probe: `extern "C"` shims around
+#    simple-someip's Option-A-relevant entry points, so post-link
+#    dead-code-elimination only keeps what an actual halo-style FFI
+#    consumer would call.
+# 2. Client-future layout probe (PR 0, issue #125): instantiates the
+#    client run future so `-Zprint-type-sizes` reports real thumbv7em
+#    layouts. Driven by `tools/capture_type_sizes.sh`.
 #
 # Build:
 #   cd tools/size_probe && cargo build --release --target thumbv7em-none-eabihf
 #
-# Measure:
+# Measure (flash floor):
 #   llvm-size target/thumbv7em-none-eabihf/release/libsize_probe.a
 #
-# NOT a real production crate — exists purely to give us a flash-size
-# floor on the cortex-m4f target, since we don't have access to the
-# actual proxy LLVM-IR-TriCore toolchain locally.
+# CAVEAT: `llvm-size` on the staticlib does no DCE, so since the
+# layout probe landed the raw number also includes the client
+# run-future machinery + `ProbeChannels` pool `.bss` — it is NOT
+# comparable to the phase-20-pre flash-floor baseline. For a codec-only
+# flash floor, link only the three codec symbols and measure the
+# linked output.
+#
+# NOT a real production crate — exists purely for measurement, since
+# we don't have access to the actual proxy LLVM-IR-TriCore toolchain
+# locally.
 
 [lib]
 name = "size_probe"
 crate-type = ["staticlib"]
 
 [dependencies]
-# `bare_metal` only — no `server` (pulls `extern crate alloc` per
-# the lib.rs feature table). Codec-only FFI doesn't need server's
-# Server actor or Arc-shared state. `client` would be alloc-free
-# but not needed here either. Matches halo PR #4429's surface.
-simple-someip = { path = "../..", default-features = false, features = ["bare_metal"] }
+# `client,bare_metal` — the audited alloc-free combo (no `server`,
+# which pulls `extern crate alloc` per the lib.rs feature table).
+# `bare_metal` covers the codec-only FFI surface (matches halo PR
+# #4429); `client` adds the run-future instantiation used by the
+# `-Zprint-type-sizes` layout probe (PR 0, issue #125). The
+# `NullAllocator` in lib.rs stays as the link target for the
+# transitive `extern crate alloc`.
+simple-someip = { path = "../..", default-features = false, features = ["bare_metal", "client"] }
+# For the layout probe's `ProbePayload` (a no_std `PayloadWireFormat`
+# impl — `RawPayload` is std-gated). Versions track the parent
+# crate's own `heapless` / `embedded-io` dependencies.
+heapless = "0.9"
+embedded-io = { version = "0.7", default-features = false }
 
 [profile.release]
 opt-level = "z"   # optimize for size

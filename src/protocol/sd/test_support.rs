@@ -20,6 +20,10 @@ impl WireFormat for TestSdHeader {
     }
 }
 
+// NOTE: `tools/size_probe`'s `ProbePayload` mirrors this type
+// field-for-field for thumbv7em layout capture (it can't reach this
+// `pub(crate)` item). If you change `TestPayload`/`TestSdHeader`,
+// update the probe or its measured layouts silently drift.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TestPayload {
     pub header: TestSdHeader,
