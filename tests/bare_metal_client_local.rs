@@ -33,8 +33,8 @@ define_static_channels! {
     ],
     bounded: [
         ((ControlMessage<RawPayload, LocalChannels>, 4), 2),
-        ((SendMessage<RawPayload, LocalChannels>, 16), 2),
-        ((Result<ReceivedMessage<RawPayload>, ClientError>, 16), 2),
+        ((SendMessage<RawPayload, LocalChannels>, 4), 2),
+        ((Result<ReceivedMessage<RawPayload>, ClientError>, 4), 2),
     ],
     unbounded: [
         (ClientUpdate<RawPayload>, 2),

@@ -52,6 +52,7 @@ use crate::{
 };
 
 use super::error::Error;
+use super::CLIENT_SOCKET_CHANNEL_CAP;
 use crate::log::{debug, error, info, trace, warn};
 use core::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
@@ -123,8 +124,9 @@ where
 }
 
 pub struct SocketManager<PayloadDefinitions: Send + 'static, C: ChannelFactory> {
-    receiver: C::BoundedReceiver<Result<ReceivedMessage<PayloadDefinitions>, Error>, 16>,
-    sender: C::BoundedSender<SendMessage<PayloadDefinitions, C>, 16>,
+    receiver:
+        C::BoundedReceiver<Result<ReceivedMessage<PayloadDefinitions>, Error>, { CLIENT_SOCKET_CHANNEL_CAP }>,
+    sender: C::BoundedSender<SendMessage<PayloadDefinitions, C>, { CLIENT_SOCKET_CHANNEL_CAP }>,
     local_port: u16,
     session_id: u16,
     /// Set to true once `session_id` has wrapped from 0xFFFF → 1.
@@ -149,8 +151,9 @@ where
     MessageDefinitions: PayloadWireFormat + Send + 'static,
     C: ChannelFactory,
     Result<(), Error>: crate::transport::OneshotPooled<C>,
-    SendMessage<MessageDefinitions, C>: crate::transport::BoundedPooled<C, 16>,
-    Result<ReceivedMessage<MessageDefinitions>, Error>: crate::transport::BoundedPooled<C, 16>,
+    SendMessage<MessageDefinitions, C>: crate::transport::BoundedPooled<C, { CLIENT_SOCKET_CHANNEL_CAP }>,
+    Result<ReceivedMessage<MessageDefinitions>, Error>:
+        crate::transport::BoundedPooled<C, { CLIENT_SOCKET_CHANNEL_CAP }>,
 {
     /// Bind the SD multicast socket, seeding the session counter and wrap
     /// state from a previous socket when rebinding. Pass `(1, false)` for a
@@ -286,8 +289,10 @@ where
         F::Socket: 'static,
         R: E2ERegistryHandle,
     {
-        let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
-        let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
+        let (rx_tx, rx_rx) =
+            C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, { CLIENT_SOCKET_CHANNEL_CAP }>();
+        let (tx_tx, tx_rx) =
+            C::bounded::<SendMessage<MessageDefinitions, C>, { CLIENT_SOCKET_CHANNEL_CAP }>();
 
         let options = {
             let mut o = SocketOptions::new();
@@ -332,8 +337,10 @@ where
         S: LocalSpawner,
         R: E2ERegistryHandle,
     {
-        let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
-        let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
+        let (rx_tx, rx_rx) =
+            C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, { CLIENT_SOCKET_CHANNEL_CAP }>();
+        let (tx_tx, tx_rx) =
+            C::bounded::<SendMessage<MessageDefinitions, C>, { CLIENT_SOCKET_CHANNEL_CAP }>();
         let options = {
             let mut o = SocketOptions::new();
             o.reuse_address = true;
@@ -420,16 +427,17 @@ where
         F::Socket: 'static,
         R: E2ERegistryHandle,
     {
-        // Standardized to N=16 across both discovery and unicast bind
-        // paths (was N=4 here historically — a tokio-conservative
-        // choice). The trait's const-N now propagates to the GAT, so
-        // the stored receiver/sender types must commit to a single N;
-        // 16 matches what embassy-sync hardcodes and what discovery
-        // already used. Bumping the unicast capacity from 4 to 16 has
-        // no semantic effect — it just lets the channels absorb a
-        // brief burst before backpressure kicks in.
-        let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
-        let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
+        // Slot cap is `CLIENT_SOCKET_CHANNEL_CAP` across both discovery
+        // and unicast bind paths. The trait's const-N propagates to the
+        // GAT, so the stored receiver/sender types must commit to a
+        // single N; centralizing it in one const keeps all bind paths,
+        // struct fields, and `BoundedPooled` bounds in lockstep. The
+        // exact depth only changes how large a burst the channel absorbs
+        // before backpressure kicks in — no semantic effect.
+        let (rx_tx, rx_rx) =
+            C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, { CLIENT_SOCKET_CHANNEL_CAP }>();
+        let (tx_tx, tx_rx) =
+            C::bounded::<SendMessage<MessageDefinitions, C>, { CLIENT_SOCKET_CHANNEL_CAP }>();
 
         let options = {
             let mut o = SocketOptions::new();
@@ -471,8 +479,10 @@ where
         S: LocalSpawner,
         R: E2ERegistryHandle,
     {
-        let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
-        let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
+        let (rx_tx, rx_rx) =
+            C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, { CLIENT_SOCKET_CHANNEL_CAP }>();
+        let (tx_tx, tx_rx) =
+            C::bounded::<SendMessage<MessageDefinitions, C>, { CLIENT_SOCKET_CHANNEL_CAP }>();
         let options = {
             let mut o = SocketOptions::new();
             o.reuse_address = true;
@@ -604,8 +614,8 @@ where
     #[allow(clippy::too_many_lines)]
     async fn socket_loop_future<T, R>(
         socket: T,
-        rx_tx: C::BoundedSender<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>,
-        mut tx_rx: C::BoundedReceiver<SendMessage<MessageDefinitions, C>, 16>,
+        rx_tx: C::BoundedSender<Result<ReceivedMessage<MessageDefinitions>, Error>, { CLIENT_SOCKET_CHANNEL_CAP }>,
+        mut tx_rx: C::BoundedReceiver<SendMessage<MessageDefinitions, C>, { CLIENT_SOCKET_CHANNEL_CAP }>,
         e2e_registry: R,
     ) where
         T: TransportSocket + 'static,

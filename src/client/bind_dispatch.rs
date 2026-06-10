@@ -37,8 +37,9 @@ where
     C: ChannelFactory,
     R: E2ERegistryHandle,
     Result<super::socket_manager::ReceivedMessage<MD>, Error>:
-        crate::transport::BoundedPooled<C, 16>,
-    super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
+        crate::transport::BoundedPooled<C, { super::CLIENT_SOCKET_CHANNEL_CAP }>,
+    super::socket_manager::SendMessage<MD, C>:
+        crate::transport::BoundedPooled<C, { super::CLIENT_SOCKET_CHANNEL_CAP }>,
     Result<(), Error>: crate::transport::OneshotPooled<C>,
 {
     /// Bind a discovery socket and submit its I/O loop to the
@@ -80,8 +81,9 @@ where
     for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
     S: Spawner + Send + Sync + 'static,
     Result<super::socket_manager::ReceivedMessage<MD>, Error>:
-        crate::transport::BoundedPooled<C, 16>,
-    super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
+        crate::transport::BoundedPooled<C, { super::CLIENT_SOCKET_CHANNEL_CAP }>,
+    super::socket_manager::SendMessage<MD, C>:
+        crate::transport::BoundedPooled<C, { super::CLIENT_SOCKET_CHANNEL_CAP }>,
     Result<(), Error>: crate::transport::OneshotPooled<C>,
 {
     fn bind_discovery(
@@ -134,8 +136,9 @@ where
     F::Socket: 'static,
     S: LocalSpawner + 'static,
     Result<super::socket_manager::ReceivedMessage<MD>, Error>:
-        crate::transport::BoundedPooled<C, 16>,
-    super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
+        crate::transport::BoundedPooled<C, { super::CLIENT_SOCKET_CHANNEL_CAP }>,
+    super::socket_manager::SendMessage<MD, C>:
+        crate::transport::BoundedPooled<C, { super::CLIENT_SOCKET_CHANNEL_CAP }>,
     Result<(), Error>: crate::transport::OneshotPooled<C>,
 {
     fn bind_discovery(
@@ -185,8 +188,9 @@ where
     C: ChannelFactory,
     R: E2ERegistryHandle,
     Result<super::socket_manager::ReceivedMessage<MD>, Error>:
-        crate::transport::BoundedPooled<C, 16>,
-    super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
+        crate::transport::BoundedPooled<C, { super::CLIENT_SOCKET_CHANNEL_CAP }>,
+    super::socket_manager::SendMessage<MD, C>:
+        crate::transport::BoundedPooled<C, { super::CLIENT_SOCKET_CHANNEL_CAP }>,
     Result<(), Error>: crate::transport::OneshotPooled<C>,
 {
     fn bind_discovery(

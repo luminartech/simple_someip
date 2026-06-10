@@ -389,9 +389,9 @@ where
     Result<crate::protocol::sd::RebootFlag, Error>: crate::transport::OneshotPooled<C>,
     ControlMessage<PayloadDefinitions, C>: crate::transport::BoundedPooled<C, 4>,
     super::socket_manager::SendMessage<PayloadDefinitions, C>:
-        crate::transport::BoundedPooled<C, 16>,
+        crate::transport::BoundedPooled<C, { super::CLIENT_SOCKET_CHANNEL_CAP }>,
     Result<super::socket_manager::ReceivedMessage<PayloadDefinitions>, Error>:
-        crate::transport::BoundedPooled<C, 16>,
+        crate::transport::BoundedPooled<C, { super::CLIENT_SOCKET_CHANNEL_CAP }>,
     super::ClientUpdate<PayloadDefinitions>: crate::transport::UnboundedPooled<C>,
 {
     /// Construct an `Inner` and return the control/update channels plus
