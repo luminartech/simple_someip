@@ -32,13 +32,11 @@ use crate::e2e::{E2EKey, E2EProfile};
 use crate::protocol::sd;
 #[cfg(test)]
 use crate::protocol::sd::{Entry, Flags, ServiceEntry};
-use crate::transport::{
-    E2ERegistryHandle, SharedHandle, TransportFactory, TransportSocket,
-};
 #[cfg(feature = "_alloc")]
 use crate::transport::SocketOptions;
 #[cfg(feature = "_alloc")]
 use crate::transport::WrappableSharedHandle;
+use crate::transport::{E2ERegistryHandle, SharedHandle, TransportFactory, TransportSocket};
 #[cfg(feature = "_alloc")]
 use alloc::sync::Arc;
 use core::net::Ipv4Addr;
@@ -1235,9 +1233,7 @@ where
         &self,
         unicast_buf: &'a mut [u8],
         sd_buf: &'a mut [u8],
-    ) -> impl core::future::Future<Output = Result<(), Error>>
-    + 'a
-    + use<'a, F, Tm, R, Sub, H, Hsd, Hep>
+    ) -> impl core::future::Future<Output = Result<(), Error>> + 'a + use<'a, F, Tm, R, Sub, H, Hsd, Hep>
     where
         Tm: 'a,
         Sub: 'a,
@@ -1369,9 +1365,8 @@ where
     #[cfg(feature = "_alloc")]
     fn run_inner(
         &self,
-    ) -> impl core::future::Future<Output = Result<(), Error>>
-    + 'static
-    + use<F, Tm, R, Sub, H, Hsd, Hep> {
+    ) -> impl core::future::Future<Output = Result<(), Error>> + 'static + use<F, Tm, R, Sub, H, Hsd, Hep>
+    {
         let config = self.config.clone();
         let unicast_socket = self.unicast_socket.clone();
         let sd_socket = self.sd_socket.clone();
@@ -1497,7 +1492,10 @@ mod tests {
         );
 
         let suppressed = default_cfg.clone().with_announce(false);
-        assert!(!suppressed.announce, "with_announce(false) must clear the field");
+        assert!(
+            !suppressed.announce,
+            "with_announce(false) must clear the field"
+        );
 
         let restored = suppressed.with_announce(true);
         assert!(
@@ -1700,8 +1698,7 @@ mod tests {
         let config = ServerConfig::new(0xFE15, 1)
             .with_interface(Ipv4Addr::LOCALHOST)
             .with_local_port(0);
-        let server =
-            TestServer::new_passive_with_handles(handles, config).expect("passive ctor");
+        let server = TestServer::new_passive_with_handles(handles, config).expect("passive ctor");
         let mut unicast_buf = vec![0u8; 1500];
         let mut sd_buf = vec![0u8; 1500];
         let result = server.run_with_buffers(&mut unicast_buf, &mut sd_buf).await;
@@ -1838,13 +1835,10 @@ mod tests {
             .with_local_port(0);
         // Explicit `Arc<FailingSocket>` H so the compiler doesn't have
         // to invent it across the deps-bundle indirection.
-        let (server, _handles, _run): (
-            Server<_, _, _, _, Arc<FailingSocket>>,
-            _,
-            _,
-        ) = Server::new_with_deps(deps, config, false)
-            .await
-            .expect("create failing-socket server");
+        let (server, _handles, _run): (Server<_, _, _, _, Arc<FailingSocket>>, _, _) =
+            Server::new_with_deps(deps, config, false)
+                .await
+                .expect("create failing-socket server");
 
         // Build a valid Subscribe; our service id/instance/major
         // match the config's defaults, so the only failure point
@@ -1865,7 +1859,15 @@ mod tests {
 
         // The H3 fix: handle_sd_message must NOT bubble the ACK send
         // failure as Err — it logs and continues.
-        let result = runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, sender).await;
+        let result = runtime::handle_sd_message(
+            &server.config,
+            server.sd_socket.get(),
+            server.sd_state.get(),
+            &server.subscriptions,
+            &sd_view,
+            sender,
+        )
+        .await;
         assert!(
             result.is_ok(),
             "handle_sd_message must not propagate transient SD-socket I/O errors; got {result:?}"
@@ -2027,7 +2029,16 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(
+                &server.config,
+                server.sd_socket.get(),
+                server.sd_state.get(),
+                &server.subscriptions,
+                &sd_view,
+                addr,
+            )
+            .await
+            .unwrap();
 
             // Check subscription was added
             let subs = server.subscriptions.read().await;
@@ -2081,7 +2092,16 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(
+                &server.config,
+                server.sd_socket.get(),
+                server.sd_state.get(),
+                &server.subscriptions,
+                &sd_view,
+                addr,
+            )
+            .await
+            .unwrap();
 
             // No subscription should have been added
             let subs = server.subscriptions.read().await;
@@ -2132,7 +2152,16 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(
+                &server.config,
+                server.sd_socket.get(),
+                server.sd_state.get(),
+                &server.subscriptions,
+                &sd_view,
+                addr,
+            )
+            .await
+            .unwrap();
 
             let subs = server.subscriptions.read().await;
             assert_eq!(subs.subscription_count(), 0);
@@ -2181,7 +2210,16 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(
+                &server.config,
+                server.sd_socket.get(),
+                server.sd_state.get(),
+                &server.subscriptions,
+                &sd_view,
+                addr,
+            )
+            .await
+            .unwrap();
         });
 
         // Receive the unicast OfferService response
@@ -2233,7 +2271,16 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(
+                &server.config,
+                server.sd_socket.get(),
+                server.sd_state.get(),
+                &server.subscriptions,
+                &sd_view,
+                addr,
+            )
+            .await
+            .unwrap();
         });
 
         let mut resp_buf = vec![0u8; 65535];
@@ -2282,7 +2329,16 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(
+                &server.config,
+                server.sd_socket.get(),
+                server.sd_state.get(),
+                &server.subscriptions,
+                &sd_view,
+                addr,
+            )
+            .await
+            .unwrap();
         });
 
         // Should NOT receive any response (short timeout)
@@ -2324,7 +2380,16 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(
+                &server.config,
+                server.sd_socket.get(),
+                server.sd_state.get(),
+                &server.subscriptions,
+                &sd_view,
+                addr,
+            )
+            .await
+            .unwrap();
 
             // No subscription should have been added
             let subs = server.subscriptions.read().await;
@@ -2583,7 +2648,16 @@ mod tests {
             let data = &buf[..len];
             let view = MessageView::parse(data).unwrap();
             let sd_view = view.sd_header().unwrap();
-            runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, addr).await.unwrap();
+            runtime::handle_sd_message(
+                &server.config,
+                server.sd_socket.get(),
+                server.sd_state.get(),
+                &server.subscriptions,
+                &sd_view,
+                addr,
+            )
+            .await
+            .unwrap();
 
             // Subscription should have been added
             let subs = server.subscriptions.read().await;
@@ -2666,7 +2740,10 @@ mod tests {
     #[test]
     fn extract_endpoint_zero_options_in_both_runs_returns_none() {
         let iter = sd::OptionIter::new(&[]);
-        assert_eq!(runtime::extract_subscriber_endpoint(&iter, 0, 0, 0, 0), None);
+        assert_eq!(
+            runtime::extract_subscriber_endpoint(&iter, 0, 0, 0, 0),
+            None
+        );
     }
 
     #[test]
@@ -2678,7 +2755,10 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 2, 30100);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        assert_eq!(runtime::extract_subscriber_endpoint(&iter, 1, 0, 0, 0), None);
+        assert_eq!(
+            runtime::extract_subscriber_endpoint(&iter, 1, 0, 0, 0),
+            None
+        );
     }
 
     #[test]
@@ -2779,7 +2859,10 @@ mod tests {
         offset += write_load_balancing_option(&mut buf[offset..], 3, 4);
         let iter = sd::OptionIter::new(&buf[..offset]);
 
-        assert_eq!(runtime::extract_subscriber_endpoint(&iter, 0, 2, 0, 0), None);
+        assert_eq!(
+            runtime::extract_subscriber_endpoint(&iter, 0, 2, 0, 0),
+            None
+        );
     }
 
     #[test]
@@ -2880,7 +2963,16 @@ mod tests {
         let sender = core::net::SocketAddr::V4(datagram.source);
         let view = MessageView::parse(&buf[..len]).unwrap();
         let sd_view = view.sd_header().unwrap();
-        runtime::handle_sd_message(&server.config, server.sd_socket.get(), server.sd_state.get(), &server.subscriptions, &sd_view, sender).await.unwrap();
+        runtime::handle_sd_message(
+            &server.config,
+            server.sd_socket.get(),
+            server.sd_state.get(),
+            &server.subscriptions,
+            &sd_view,
+            sender,
+        )
+        .await
+        .unwrap();
 
         // The server must have registered exactly one subscriber, and
         // its endpoint must be the SubscribeEventGroup entry's options[1]
@@ -3368,7 +3460,10 @@ mod tests {
         with_default(subscriber, || {
             // 0 endpoints → warn! "No IPv4 endpoint" branch.
             let iter_empty = sd::OptionIter::new(&[]);
-            assert_eq!(runtime::extract_subscriber_endpoint(&iter_empty, 0, 0, 0, 0), None);
+            assert_eq!(
+                runtime::extract_subscriber_endpoint(&iter_empty, 0, 0, 0, 0),
+                None
+            );
 
             // 1 endpoint → trace! "Found IPv4 endpoint" branch.
             let mut buf_one = [0u8; 32];
@@ -3470,5 +3565,26 @@ mod tests {
             .expect("announcement_loop should emit at least one OfferService within 2s");
         announce_handle.abort();
         let _ = announce_handle.await;
+    }
+
+    /// Host-arch PROXY budget — see the twin constant in
+    /// src/client/mod.rs for semantics and the update procedure.
+    const TOKIO_SERVER_RUN_FUTURE_BUDGET: usize = 9728; // = ceil64(7744 × 1.25)
+
+    #[tokio::test]
+    async fn future_size_witness_tokio_server() {
+        // Port 0: kernel-assigned, back-filled by the constructor —
+        // avoids collisions with sibling tests running in parallel.
+        let config = ServerConfig::new(0x5B, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(0);
+        let (_server, _handles, run) = TestServer::new(config).await.expect("Server::new");
+
+        let run_size = core::mem::size_of_val(&run);
+        std::println!("FUTURE_SIZE tokio_server_run_future {run_size}");
+        assert!(
+            run_size <= TOKIO_SERVER_RUN_FUTURE_BUDGET,
+            "server run future grew: {run_size} B > budget {TOKIO_SERVER_RUN_FUTURE_BUDGET} B"
+        );
     }
 }
