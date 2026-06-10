@@ -160,9 +160,9 @@ pub const UDP_BUFFER_SIZE: usize = 1500;
 /// SOME/IP client for discovering services and exchanging messages.
 #[cfg(feature = "client")]
 pub mod client;
-mod log;
 /// End-to-end (E2E) protection utilities for SOME/IP payloads.
 pub mod e2e;
+mod log;
 /// SOME/IP protocol primitives: headers, messages, return codes, and service discovery.
 pub mod protocol;
 /// A general-purpose, heap-allocated [`PayloadWireFormat`] implementation.

@@ -32,12 +32,12 @@ use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
 use simple_someip::e2e::E2ERegistry;
+use simple_someip::server::NonSdRequestCallback;
 use simple_someip::server::ServerConfig;
 use simple_someip::server::{SubscribeError, Subscriber, SubscriptionHandle};
 use simple_someip::transport::{
     ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory, TransportSocket,
 };
-use simple_someip::server::NonSdRequestCallback;
 use simple_someip::{Server, ServerDeps};
 
 // ── Mock transport ─────────────────────────────────────────────────────
@@ -556,9 +556,7 @@ async fn non_sd_observer_none_preserves_ignore_behavior() {
     // arm cycles at least once.
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    let observed = OBSERVED_NONE
-        .get()
-        .and_then(|m| m.lock().unwrap().clone());
+    let observed = OBSERVED_NONE.get().and_then(|m| m.lock().unwrap().clone());
     assert!(
         observed.is_none(),
         "callback must NOT fire when non_sd_observer is None; got {:?}",

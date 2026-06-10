@@ -342,8 +342,11 @@ async fn main() {
     let stack_b = build_stack(drv_b, IP_B, SEED_B);
 
     let local = tokio::task::LocalSet::new();
+    // Box::pin: the combined setup future is ~16 KiB
+    // (clippy::large_futures); park it on the heap instead of main's
+    // stack frame.
     local
-        .run_until(async move {
+        .run_until(Box::pin(async move {
             tokio::task::spawn_local(async move { stack_a.run().await });
             tokio::task::spawn_local(async move { stack_b.run().await });
 
@@ -367,7 +370,9 @@ async fn main() {
                 Box::leak(Box::new(SocketPool::new()));
             let server_factory = EmbassyNetFactory::new(stack_a, server_pool);
             let server_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
-            let server_config = ServerConfig::new(SERVICE_ID, INSTANCE_ID).with_interface(IP_A).with_local_port(30500);
+            let server_config = ServerConfig::new(SERVICE_ID, INSTANCE_ID)
+                .with_interface(IP_A)
+                .with_local_port(30500);
 
             let server_deps = ServerDeps {
                 factory: server_factory,
@@ -385,17 +390,14 @@ async fn main() {
             // the `run`-future `!Send`; ignoring it and re-building
             // via `run_with_buffers` keeps us on the `spawn_local`
             // path.
-            let (server, _handles, _run): (
-                Server<_, _, _, _, Arc<EmbassyNetSocket>>,
-                _,
-                _,
-            ) = Server::new_with_deps(server_deps, server_config, false)
-                .await
-                .expect("server construction over embassy-net");
+            let (server, _handles, _run): (Server<_, _, _, _, Arc<EmbassyNetSocket>>, _, _) =
+                Server::new_with_deps(server_deps, server_config, false)
+                    .await
+                    .expect("server construction over embassy-net");
 
             tokio::task::spawn_local(server.run_with_buffers(
-                Box::leak(Box::new([0u8; 65535])),
-                Box::leak(Box::new([0u8; 65535])),
+                Box::leak(vec![0u8; 65535].into_boxed_slice()),
+                Box::leak(vec![0u8; 65535].into_boxed_slice()),
             ));
             println!(
                 "[server] run loop spawned, emitting OfferService(0x{SERVICE_ID:04X}) every 1s"
@@ -449,6 +451,6 @@ async fn main() {
                 Ok(false) => println!("[example] update stream closed before SD arrived"),
                 Err(_) => println!("[example] TIMEOUT — no SD message in 5s"),
             }
-        })
+        }))
         .await;
 }
