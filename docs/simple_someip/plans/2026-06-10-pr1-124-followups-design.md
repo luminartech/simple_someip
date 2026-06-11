@@ -29,7 +29,7 @@ pub type NonSdRequestCallback =
 - Storage everywhere becomes `Option<(NonSdRequestCallback, usize)>`
   — a plain tuple, no wrapper struct: the `Server` field,
   `ServerDeps.non_sd_observer`, and
-  `ServerConfig::with_non_sd_observer`. `recv_loop` threads the pair
+  `ServerDeps::with_non_sd_observer`. `recv_loop` threads the pair
   down and invokes `cb(ctx, data, src)`.
 - Rationale (recorded on the type alias's doc comment): a stored
   `*mut c_void` makes `Server` `!Send` and breaks `Server::run`'s
@@ -122,7 +122,10 @@ for the new signature and asserts the ctx value round-trips.
 Verified false during PR 0 review (2026-06-10): `send_ack`
 (`src/server/runtime.rs`) builds into a stack
 `[0u8; crate::UDP_BUFFER_SIZE]`, and the `server,bare_metal` rlib
-audits to zero allocator symbols. The constant's rustdoc paragraph
+audits to zero allocator symbols. The Vec-to-stack conversion was
+the phase-21 per-event-allocation cleanup (`7c58649`, PR #114
+stack), not #124 — the rustdoc claim was stale even before #124,
+which never touched those paths. The constant's rustdoc paragraph
 claiming announcement builders / `SubscribeAck`/`Nack` "still use
 heap `Vec` buffers — known gap" is rewritten: all outbound SD paths
 are stack-buffered and capped by `UDP_BUFFER_SIZE`.
