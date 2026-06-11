@@ -120,6 +120,29 @@ let (_server, _handles, run) = Server::new(config).await?;
 tokio::spawn(run);  // receive only; co-located Client drives SD
 ```
 
+#### Breaking — `NonSdRequestCallback` gains an opaque `ctx: usize` first argument
+
+```rust
+// before
+pub type NonSdRequestCallback = fn(data: &[u8], source: SocketAddrV4);
+// after
+pub type NonSdRequestCallback = fn(ctx: usize, data: &[u8], source: SocketAddrV4);
+```
+
+The observer is now registered as a `(callback, ctx)` pair
+(`ServerDeps::non_sd_observer: Option<(NonSdRequestCallback, usize)>`),
+and `ctx` is passed back verbatim on every invocation. FFI consumers
+stash their state pointer as `usize`; pure-Rust callers pass `0`.
+`usize` (rather than a stored `*mut c_void`) keeps `Server: Send` —
+and therefore `Server::run`'s declared `+ Send` bound — with no
+`unsafe` in this crate; the pointer cast lives in the consumer's
+callback body.
+
+##### Migration
+
+`non_sd_observer: Some(my_cb)` → `non_sd_observer: Some((my_cb, 0))`,
+and add the leading `ctx: usize` parameter to the callback.
+
 #### Removed
 
 - **`Server::announcement_loop` / `Server::announcement_loop_local`** — folded into the combined run-future. The `announcement_loop_started: AtomicBool` latch that protected against two simultaneously-driven announcement futures is gone with them (single entry point makes the failure mode structurally impossible).
