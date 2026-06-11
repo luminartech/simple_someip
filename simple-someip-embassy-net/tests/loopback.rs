@@ -605,6 +605,7 @@ async fn client_receives_server_sd_announcement() {
                 timer: LocalTimer,
                 e2e_registry: server_e2e,
                 subscriptions: server_subs,
+                non_sd_observer: None,
             };
 
             // Default `H = Arc<F::Socket>`. `Arc<T>:
@@ -728,6 +729,7 @@ async fn client_send_request_server_runloop_stable() {
                 timer: LocalTimer,
                 e2e_registry: server_e2e,
                 subscriptions: server_subs,
+                non_sd_observer: None,
             };
 
             // Explicit `Arc<EmbassyNetSocket>` `H` so the compiler
