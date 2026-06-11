@@ -631,7 +631,7 @@ pub struct Server<
     /// — because the run-future captures an owned copy independent of
     /// `&self`'s lifetime, and both alternatives are `Clone + 'static`.
     started: StartedLatch,
-    /// Optional callback invoked for non-SD unicast datagrams received
+    /// Optional `(callback, ctx)` pair invoked for non-SD unicast datagrams received
     /// on the service's port (method requests / fire-and-forget calls).
     /// `None` preserves the historical "ignore non-SD" behavior; `Some`
     /// surfaces those datagrams to the consumer (used by halo's FFI to
@@ -1309,6 +1309,15 @@ where
     /// inbound recv loops, supplementary Servers add their own
     /// `OfferService` to the same SD multicast group without
     /// competing for inbound datagrams.
+    ///
+    /// Design note: this partially reintroduces the split-future shape
+    /// phase 21 removed — deliberately. An announce-only future never
+    /// touches the receive path, so the invariant that motivated the
+    /// phase-21 combined run-future (no two futures racing the same
+    /// sockets and SD session counter) is preserved: the [`Self::run`]
+    /// path is still guarded by the first-poll `started` latch, and
+    /// supplementary announce loops only ever *send* on the shared SD
+    /// socket.
     ///
     /// The returned future loops forever (1 s tick between
     /// announcements); spawn it on your executor.
