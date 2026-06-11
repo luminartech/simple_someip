@@ -181,6 +181,101 @@ where
     Ok(())
 }
 
+/// Register a subscriber for an accepted `SubscribeEventGroup` entry and
+/// ack it; roll the registration back if the ack send fails, and NACK on
+/// a full registry or a missing endpoint option. Shared by the primary
+/// service and any co-offered service in [`ServerConfig::accepted_offers`]
+/// — both reach this only after acceptance is decided, so this body never
+/// re-checks service identity.
+async fn accept_subscribe<T, Sub>(
+    config: &ServerConfig,
+    sd_socket: &T,
+    sd_state: &SdStateManager,
+    subscriptions: &Sub,
+    sd_view: &sd::SdHeaderView<'_>,
+    entry_view: &sd::EntryView<'_>,
+    sender: core::net::SocketAddr,
+) -> Result<(), Error>
+where
+    T: TransportSocket,
+    Sub: SubscriptionHandle,
+{
+    let first_index = entry_view.index_first_options_run() as usize;
+    let first_count = entry_view.options_count().first_options_count as usize;
+    let second_index = entry_view.index_second_options_run() as usize;
+    let second_count = entry_view.options_count().second_options_count as usize;
+    let Some(endpoint_addr) = extract_subscriber_endpoint(
+        &sd_view.options(),
+        first_index,
+        first_count,
+        second_index,
+        second_count,
+    ) else {
+        crate::log::warn!("No endpoint found in Subscribe message options");
+        if let Err(e) = send_subscribe_nack_from_view(
+            config,
+            sd_socket,
+            sd_state,
+            entry_view,
+            sender,
+            "no_endpoint_in_options",
+        )
+        .await
+        {
+            crate::log::warn!("SubscribeNack send failed: {e}");
+        }
+        return Ok(());
+    };
+
+    let subscribe_result = subscriptions
+        .subscribe(
+            entry_view.service_id(),
+            entry_view.instance_id(),
+            entry_view.event_group_id(),
+            endpoint_addr,
+        )
+        .await;
+
+    match subscribe_result {
+        Ok(()) => {
+            if let Err(e) =
+                send_subscribe_ack_from_view(config, sd_socket, sd_state, entry_view, sender).await
+            {
+                crate::log::warn!(
+                    "SubscribeAck send failed; rolling back subscription \
+                     (service_id=0x{:04X}, instance_id={}, \
+                     event_group_id=0x{:04X}, error={e})",
+                    entry_view.service_id(),
+                    entry_view.instance_id(),
+                    entry_view.event_group_id(),
+                );
+                subscriptions
+                    .unsubscribe(
+                        entry_view.service_id(),
+                        entry_view.instance_id(),
+                        entry_view.event_group_id(),
+                        endpoint_addr,
+                    )
+                    .await;
+            }
+        }
+        Err(e) => {
+            let reason: &'static str = match e {
+                SubscribeError::SubscribersPerGroupFull => "subscribers_per_group_full",
+                SubscribeError::EventGroupsFull => "event_groups_full",
+            };
+            crate::log::debug!("Subscription rejected: {reason}");
+            if let Err(e) =
+                send_subscribe_nack_from_view(config, sd_socket, sd_state, entry_view, sender, reason)
+                    .await
+            {
+                crate::log::warn!("SubscribeNack send failed: {e}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Handle a Service Discovery message (Subscribe / FindService etc.).
 #[allow(clippy::too_many_lines)]
 pub(super) async fn handle_sd_message<T, Sub>(
@@ -209,7 +304,20 @@ where
                     entry_view.event_group_id()
                 );
 
-                if entry_view.service_id() != config.service_id {
+                // A shared-socket provider runs one receive loop fronting
+                // several co-offered services (the rest are announce-only).
+                // Accept subscribes for any registered co-offer up front, so
+                // the siblings aren't NACKed as "wrong service". The ack and
+                // subscriber record are keyed off the entry itself, so a
+                // cross-service accept is wire-correct.
+                if config.accepts_offer(
+                    entry_view.service_id(),
+                    entry_view.instance_id(),
+                    entry_view.event_group_id(),
+                ) {
+                    accept_subscribe(config, sd_socket, sd_state, subscriptions, sd_view, &entry_view, sender)
+                        .await?;
+                } else if entry_view.service_id() != config.service_id {
                     crate::log::warn!(
                         "Subscribe for wrong service: expected 0x{:04X}, got 0x{:04X}",
                         config.service_id,
@@ -276,92 +384,8 @@ where
                         crate::log::warn!("SubscribeNack send failed: {e}");
                     }
                 } else {
-                    let first_index = entry_view.index_first_options_run() as usize;
-                    let first_count = entry_view.options_count().first_options_count as usize;
-                    let second_index = entry_view.index_second_options_run() as usize;
-                    let second_count = entry_view.options_count().second_options_count as usize;
-                    if let Some(endpoint_addr) = extract_subscriber_endpoint(
-                        &sd_view.options(),
-                        first_index,
-                        first_count,
-                        second_index,
-                        second_count,
-                    ) {
-                        let subscribe_result = subscriptions
-                            .subscribe(
-                                entry_view.service_id(),
-                                entry_view.instance_id(),
-                                entry_view.event_group_id(),
-                                endpoint_addr,
-                            )
-                            .await;
-
-                        match subscribe_result {
-                            Ok(()) => {
-                                if let Err(e) = send_subscribe_ack_from_view(
-                                    config,
-                                    sd_socket,
-                                    sd_state,
-                                    &entry_view,
-                                    sender,
-                                )
-                                .await
-                                {
-                                    crate::log::warn!(
-                                        "SubscribeAck send failed; rolling back subscription \
-                                         (service_id=0x{:04X}, instance_id={}, \
-                                         event_group_id=0x{:04X}, error={e})",
-                                        entry_view.service_id(),
-                                        entry_view.instance_id(),
-                                        entry_view.event_group_id(),
-                                    );
-                                    subscriptions
-                                        .unsubscribe(
-                                            entry_view.service_id(),
-                                            entry_view.instance_id(),
-                                            entry_view.event_group_id(),
-                                            endpoint_addr,
-                                        )
-                                        .await;
-                                }
-                            }
-                            Err(e) => {
-                                let reason: &'static str = match e {
-                                    SubscribeError::SubscribersPerGroupFull => {
-                                        "subscribers_per_group_full"
-                                    }
-                                    SubscribeError::EventGroupsFull => "event_groups_full",
-                                };
-                                crate::log::debug!("Subscription rejected: {reason}");
-                                if let Err(e) = send_subscribe_nack_from_view(
-                                    config,
-                                    sd_socket,
-                                    sd_state,
-                                    &entry_view,
-                                    sender,
-                                    reason,
-                                )
-                                .await
-                                {
-                                    crate::log::warn!("SubscribeNack send failed: {e}");
-                                }
-                            }
-                        }
-                    } else {
-                        crate::log::warn!("No endpoint found in Subscribe message options");
-                        if let Err(e) = send_subscribe_nack_from_view(
-                            config,
-                            sd_socket,
-                            sd_state,
-                            &entry_view,
-                            sender,
-                            "no_endpoint_in_options",
-                        )
-                        .await
-                        {
-                            crate::log::warn!("SubscribeNack send failed: {e}");
-                        }
-                    }
+                    accept_subscribe(config, sd_socket, sd_state, subscriptions, sd_view, &entry_view, sender)
+                        .await?;
                 }
             }
             sd::EntryType::FindService => {
