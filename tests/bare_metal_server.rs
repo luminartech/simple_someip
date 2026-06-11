@@ -357,25 +357,26 @@ async fn passive_server_constructible_without_server_tokio_feature() {
 // The companion test confirms `None` preserves the historical
 // "ignore non-SD" behavior.
 
-// `NonSdRequestCallback` is `fn(&[u8], SocketAddrV4)` — a plain function
-// pointer, so it can't capture environment. Each test parks its
-// observation in a dedicated static so the callback can write into it
-// without interfering with sibling tests (cargo runs tests in parallel
-// within a test binary).
+// `NonSdRequestCallback` is `fn(service_id, method_id, payload, e2e_status)`
+// — a plain function pointer (the SOME/IP header is parsed in `recv_loop`),
+// so it can't capture environment. Each test parks its observation in a
+// dedicated static so the callback can write into it without interfering
+// with sibling tests (cargo runs tests in parallel within a test binary).
 
 use std::sync::OnceLock;
 
-static OBSERVED_SOME: OnceLock<Mutex<Option<(Vec<u8>, SocketAddrV4)>>> = OnceLock::new();
-static OBSERVED_NONE: OnceLock<Mutex<Option<(Vec<u8>, SocketAddrV4)>>> = OnceLock::new();
+type Observation = (u16, u16, Vec<u8>, u8);
+static OBSERVED_SOME: OnceLock<Mutex<Option<Observation>>> = OnceLock::new();
+static OBSERVED_NONE: OnceLock<Mutex<Option<Observation>>> = OnceLock::new();
 
-fn record_some(data: &[u8], source: SocketAddrV4) {
+fn record_some(service_id: u16, method_id: u16, payload: &[u8], e2e_status: u8) {
     let slot = OBSERVED_SOME.get_or_init(|| Mutex::new(None));
-    *slot.lock().unwrap() = Some((data.to_vec(), source));
+    *slot.lock().unwrap() = Some((service_id, method_id, payload.to_vec(), e2e_status));
 }
 
-fn record_none(data: &[u8], source: SocketAddrV4) {
+fn record_none(service_id: u16, method_id: u16, payload: &[u8], e2e_status: u8) {
     let slot = OBSERVED_NONE.get_or_init(|| Mutex::new(None));
-    *slot.lock().unwrap() = Some((data.to_vec(), source));
+    *slot.lock().unwrap() = Some((service_id, method_id, payload.to_vec(), e2e_status));
 }
 
 /// Build a minimal SOME/IP method-request datagram (16-byte header,
@@ -473,18 +474,20 @@ async fn non_sd_observer_some_receives_unicast_method_request() {
     })
     .await;
 
-    let (got_data, got_src) = OBSERVED_SOME
+    let (got_service, got_method, got_payload, got_e2e) = OBSERVED_SOME
         .get()
         .unwrap()
         .lock()
         .unwrap()
         .clone()
         .expect("callback fired");
-    assert_eq!(
-        got_data, payload,
-        "callback must receive the full raw datagram bytes"
+    assert_eq!(got_service, 0x1234, "callback must receive parsed service_id");
+    assert_eq!(got_method, 0x0001, "callback must receive parsed method_id");
+    assert!(
+        got_payload.is_empty(),
+        "method request had no payload; callback payload must be empty"
     );
-    assert_eq!(got_src, src, "callback must receive the original source");
+    assert_eq!(got_e2e, 0, "server-side requests are dispatched unchecked");
 
     handle.abort();
     let _ = handle.await;

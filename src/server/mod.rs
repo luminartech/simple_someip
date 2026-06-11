@@ -737,12 +737,14 @@ pub struct Server<
 /// Callback invoked by the server's `recv_loop` for every non-SD
 /// unicast datagram received on the service's port (i.e. method
 /// requests / fire-and-forget calls to the offered services). The
-/// payload is the full raw datagram bytes; the caller is responsible
-/// for re-parsing the SOME/IP header (and applying any E2E check) on
-/// the consumer side. `fn` pointers are `Copy + Send + Sync + 'static`,
-/// so they can be stored on the `Server` and captured by the
-/// run-future without adding a new generic.
-pub type NonSdRequestCallback = fn(data: &[u8], source: core::net::SocketAddrV4);
+/// SOME/IP header is parsed in `recv_loop` and the callback receives the
+/// decoded `(service_id, method_id, payload, e2e_status)` — the consumer
+/// does not parse bytes. `e2e_status` is `0` (unchecked); server-side
+/// request E2E is not applied here today. `fn` pointers are
+/// `Copy + Send + Sync + 'static`, so they can be stored on the `Server`
+/// and captured by the run-future without adding a new generic.
+pub type NonSdRequestCallback =
+    fn(service_id: u16, method_id: u16, payload: &[u8], e2e_status: u8);
 
 #[cfg(feature = "_alloc")]
 type StartedLatch = Arc<AtomicBool>;
