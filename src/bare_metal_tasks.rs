@@ -124,6 +124,129 @@ pub async fn event_rx_dispatch_future<'a, S, R>(
     }
 }
 
+/// Cap on `OfferService` entries packed into the combined announce
+/// datagram inside [`run_someip`]. Covers any realistic catalog.
+const RUN_OFFER_CAP: usize = 16;
+
+/// Everything [`run_someip`] needs besides the server receive future:
+/// the shared SD socket (for announce + subscribe), the client RX socket,
+/// timer, E2E handle, and the per-future config/state/scratch. All borrows
+/// share one lifetime; the scratch buffers must be distinct (no aliasing).
+pub struct SomeipRun<'a, S, Tm, R>
+where
+    S: TransportSocket,
+    Tm: Timer,
+    R: E2ERegistryHandle,
+{
+    /// SD socket used to send offers and subscribes (send-only here).
+    pub sd_socket: &'a S,
+    /// Unicast socket the client receives notifications on.
+    pub rx_socket: &'a S,
+    pub timer: &'a Tm,
+    pub e2e: &'a R,
+    /// SD multicast endpoint (offers + subscribes are sent here).
+    pub sd_multicast: SocketAddrV4,
+    /// Re-announce / re-subscribe period (the node SD TTL).
+    pub period: Duration,
+    /// Offered services packed into one combined `OfferService`.
+    pub offers: &'a [OfferServiceRequest],
+    pub offer_session: &'a AtomicU16,
+    pub offer_scratch: &'a mut [u8],
+    /// `Some` to run the notification-only client (subscribe + RX);
+    /// `None` for a provider-only node.
+    pub subscribe: Option<SubscribeEventgroupRequest>,
+    pub sub_session: &'a AtomicU16,
+    pub sub_scratch: &'a mut [u8],
+    pub sub_reboot: RebootFlag,
+    /// One-shot delay before the first subscribe, to phase it off the
+    /// offer announce (both run at `period`).
+    pub sub_offset: Duration,
+    pub sub_e2e_enabled: bool,
+    pub rx_buf: &'a mut [u8],
+    pub dispatch: fn(service_id: u16, method_id: u16, payload: &[u8], e2e_status: u8),
+}
+
+/// Drive the full bare-metal SOME/IP integration as ONE future: the
+/// caller-supplied server receive future (`recv`, typically
+/// `Server::recv_only_future`) concurrently with the combined-offer
+/// announce, the proactive subscribe (offset off the announce), and the
+/// notification RX+dispatch. Spawn this from a single
+/// `#[embassy_executor::task]` so the firmware holds no per-future task
+/// glue.
+///
+/// `recv` is taken as an opaque `Future` so this stays generic over just
+/// `S/Tm/R` instead of the receive server's full bound set. The future
+/// never resolves (every branch loops forever); spawn and forget.
+pub async fn run_someip<'a, S, Tm, R, RecvFut>(recv: RecvFut, cfg: SomeipRun<'a, S, Tm, R>)
+where
+    S: TransportSocket,
+    Tm: Timer,
+    R: E2ERegistryHandle,
+    RecvFut: Future,
+{
+    let SomeipRun {
+        sd_socket,
+        rx_socket,
+        timer,
+        e2e,
+        sd_multicast,
+        period,
+        offers,
+        offer_session,
+        offer_scratch,
+        subscribe,
+        sub_session,
+        sub_scratch,
+        sub_reboot,
+        sub_offset,
+        sub_e2e_enabled,
+        rx_buf,
+        dispatch,
+    } = cfg;
+
+    let announce = announce_offers_future::<_, _, RUN_OFFER_CAP>(
+        sd_socket,
+        timer,
+        offers,
+        sd_multicast,
+        offer_session,
+        period,
+        offer_scratch,
+    );
+
+    // Subscribe (phased off the announce) + RX run only for a consumer
+    // node; for a provider-only node they idle forever so the join arity
+    // stays fixed.
+    let subscribe_fut = async move {
+        if let Some(request) = subscribe {
+            timer.sleep(sub_offset).await;
+            subscribe_announce_future(
+                sd_socket,
+                timer,
+                request,
+                sd_multicast,
+                sub_session,
+                sub_reboot,
+                period,
+                sub_scratch,
+            )
+            .await;
+        } else {
+            core::future::pending::<()>().await;
+        }
+    };
+    let rx_fut = async move {
+        if subscribe.is_some() {
+            event_rx_dispatch_future(rx_socket, e2e, sub_e2e_enabled, dispatch, rx_buf).await;
+        } else {
+            core::future::pending::<()>().await;
+        }
+    };
+
+    // All four loop forever; the join never resolves.
+    futures_util::join!(recv, announce, subscribe_fut, rx_fut);
+}
+
 // No-op waker to drive the synchronous `for_each_subscriber` future in
 // `publish_notification` to completion. `StaticSubscriptionHandle`
 // resolves it on the first poll (its body is a synchronous storage
