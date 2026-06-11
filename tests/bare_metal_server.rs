@@ -49,16 +49,19 @@ struct MockPipe {
     inbound_waker: Mutex<Option<core::task::Waker>>,
 }
 
+/// Per-socket pipes routed by bind options: with a single shared
+/// queue, whichever `select_biased!` arm polled first stole the
+/// datagram, so `recv_loop`'s `from_unicast` flag depended on the
+/// alternating bias — per-socket queues make routing deterministic.
 #[derive(Clone)]
 struct MockFactory {
     /// Handed to sockets bound WITHOUT multicast options — the
     /// server's unicast service socket.
     unicast_pipe: Arc<MockPipe>,
     /// Handed to sockets bound WITH `multicast_if_v4` set — the
-    /// server's SD socket. Per-socket queues make `recv_loop`'s
-    /// `from_unicast` flag deterministic: with a single shared queue,
-    /// whichever select arm polled first stole the datagram, so
-    /// routing depended on the alternating `select_biased!` bias.
+    /// active server's SD socket. NOTE: passive servers bind their SD
+    /// placeholder without multicast options, so BOTH passive sockets
+    /// share `unicast_pipe` and this pipe goes unused.
     sd_pipe: Arc<MockPipe>,
     next_port: Arc<Mutex<u16>>,
 }
@@ -283,11 +286,9 @@ impl SubscriptionHandle for MockSubscriptions {
 
 #[tokio::test]
 async fn server_constructible_without_server_tokio_feature() {
-    let _unicast_pipe = Arc::new(MockPipe::default());
-    let _sd_pipe = Arc::new(MockPipe::default());
     let factory = MockFactory {
-        unicast_pipe: Arc::clone(&_unicast_pipe),
-        sd_pipe: Arc::clone(&_sd_pipe),
+        unicast_pipe: Arc::new(MockPipe::default()),
+        sd_pipe: Arc::new(MockPipe::default()),
         next_port: Arc::new(Mutex::new(0)),
     };
 
@@ -333,11 +334,9 @@ async fn server_constructible_without_server_tokio_feature() {
 
 #[tokio::test]
 async fn passive_server_constructible_without_server_tokio_feature() {
-    let _unicast_pipe = Arc::new(MockPipe::default());
-    let _sd_pipe = Arc::new(MockPipe::default());
     let factory = MockFactory {
-        unicast_pipe: Arc::clone(&_unicast_pipe),
-        sd_pipe: Arc::clone(&_sd_pipe),
+        unicast_pipe: Arc::new(MockPipe::default()),
+        sd_pipe: Arc::new(MockPipe::default()),
         next_port: Arc::new(Mutex::new(0)),
     };
 
@@ -368,16 +367,18 @@ async fn passive_server_constructible_without_server_tokio_feature() {
 
 // ── NonSdRequestCallback witness ──────────────────────────────────────
 //
-// Drives a non-SD unicast datagram through the server's `recv_loop`
-// and verifies the registered callback receives the right bytes + source.
-// The companion test confirms `None` preserves the historical
-// "ignore non-SD" behavior.
-
-// `NonSdRequestCallback` is `fn(&[u8], SocketAddrV4)` — a plain function
-// pointer, so it can't capture environment. Each test parks its
-// observation in a dedicated static so the callback can write into it
-// without interfering with sibling tests (cargo runs tests in parallel
-// within a test binary).
+// Drives datagrams through the server's `recv_loop` and checks the
+// observer contract: `NonSdRequestCallback` is
+// `fn(ctx: usize, data: &[u8], source: SocketAddrV4)` — a plain
+// function pointer, so it can't capture environment. Each test parks
+// its observation in a dedicated `OnceLock`-backed static to avoid
+// interference under parallel `cargo test`.
+//
+// Positive test: registered observer fires for non-SD unicast.
+// Negative tests: registered observer must NOT fire for SD messages
+// (regardless of socket) or for non-SD datagrams on the SD socket.
+// None test: with no observer registered, a non-SD unicast is processed
+// without panicking (no callback to witness — just a no-panic guarantee).
 
 use std::sync::OnceLock;
 
@@ -385,6 +386,21 @@ static OBSERVED_SOME: OnceLock<Mutex<Option<(usize, Vec<u8>, SocketAddrV4)>>> = 
 
 fn record_some(ctx: usize, data: &[u8], source: SocketAddrV4) {
     let slot = OBSERVED_SOME.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap() = Some((ctx, data.to_vec(), source));
+}
+
+static OBSERVED_SD_UNICAST: OnceLock<Mutex<Option<(usize, Vec<u8>, SocketAddrV4)>>> =
+    OnceLock::new();
+static OBSERVED_MULTICAST: OnceLock<Mutex<Option<(usize, Vec<u8>, SocketAddrV4)>>> =
+    OnceLock::new();
+
+fn record_sd_unicast(ctx: usize, data: &[u8], source: SocketAddrV4) {
+    let slot = OBSERVED_SD_UNICAST.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap() = Some((ctx, data.to_vec(), source));
+}
+
+fn record_multicast(ctx: usize, data: &[u8], source: SocketAddrV4) {
+    let slot = OBSERVED_MULTICAST.get_or_init(|| Mutex::new(None));
     *slot.lock().unwrap() = Some((ctx, data.to_vec(), source));
 }
 
@@ -408,6 +424,28 @@ fn build_method_request(service_id: u16, method_id: u16) -> Vec<u8> {
     buf
 }
 
+/// Build a minimal, well-formed SOME/IP-SD datagram: SD message id
+/// (0xFFFF / 0x8100), then an SD payload with flags + reserved and
+/// ZERO entries / options. Routing-wise a legitimate (if vacuous) SD
+/// message — `recv_loop` must hand it to SD handling, never to the
+/// non-SD observer, regardless of which socket it arrived on.
+fn build_sd_message() -> Vec<u8> {
+    let mut buf = Vec::with_capacity(28);
+    buf.extend_from_slice(&0xFFFFu16.to_be_bytes()); // message_id (high): SD service
+    buf.extend_from_slice(&0x8100u16.to_be_bytes()); // message_id (low): SD method
+    buf.extend_from_slice(&20u32.to_be_bytes()); //     length = header(8) + sd payload(12)
+    buf.extend_from_slice(&0u32.to_be_bytes()); //      request_id
+    buf.push(1); //                                      protocol_version
+    buf.push(1); //                                      interface_version
+    buf.push(2); //                                      message_type = Notification (0x02)
+    buf.push(0); //                                      return_code = OK
+    buf.push(0x80); //                                   SD flags: reboot
+    buf.extend_from_slice(&[0, 0, 0]); //                reserved
+    buf.extend_from_slice(&0u32.to_be_bytes()); //       entries array length = 0
+    buf.extend_from_slice(&0u32.to_be_bytes()); //       options array length = 0
+    buf
+}
+
 async fn drive_until<F: FnMut() -> bool>(mut check: F) {
     // Yield enough times for the spawned run-future to pick up the
     // queued inbound datagram from the mock pipe. The mock socket's
@@ -426,10 +464,9 @@ async fn drive_until<F: FnMut() -> bool>(mut check: F) {
 #[tokio::test]
 async fn non_sd_observer_some_receives_unicast_method_request() {
     let unicast_pipe = Arc::new(MockPipe::default());
-    let _sd_pipe = Arc::new(MockPipe::default());
     let factory = MockFactory {
         unicast_pipe: Arc::clone(&unicast_pipe),
-        sd_pipe: Arc::clone(&_sd_pipe),
+        sd_pipe: Arc::new(MockPipe::default()),
         next_port: Arc::new(Mutex::new(0)),
     };
 
@@ -502,7 +539,199 @@ async fn non_sd_observer_some_receives_unicast_method_request() {
     let _ = handle.await;
 }
 
+/// A registered observer must NOT fire for an SD message arriving on
+/// the unicast socket — SD-formatted unicast traffic (e.g. unicast
+/// FindService) routes to SD handling. Unlike the pre-PR-1 negative
+/// test, the witness callback IS registered, so a routing regression
+/// (SD datagrams leaking to the observer) trips the assertion.
+#[tokio::test]
+async fn non_sd_observer_ignores_sd_message_on_unicast_socket() {
+    let unicast_pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        unicast_pipe: Arc::clone(&unicast_pipe),
+        sd_pipe: Arc::new(MockPipe::default()),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+
+    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30702);
+
+    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
+        ServerDeps {
+            factory,
+            timer: MockTimer,
+            e2e_registry: e2e_handle,
+            subscriptions: MockSubscriptions::default(),
+            non_sd_observer: Some((record_sd_unicast as NonSdRequestCallback, 7)),
+        };
+
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+    let handle = tokio::spawn(run);
+
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 102), 40002);
+    unicast_pipe
+        .inbound
+        .lock()
+        .unwrap()
+        .push_back((build_sd_message(), src));
+    if let Some(w) = unicast_pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    // Deterministic completion signal: wait until the run-future has
+    // consumed the datagram from the pipe, then yield once more. The
+    // observer path has no await point between dequeue and callback,
+    // so any leaked invocation has already happened by now.
+    drive_until(|| unicast_pipe.inbound.lock().unwrap().is_empty()).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !handle.is_finished(),
+        "run-future must still be alive after processing the datagram"
+    );
+
+    let observed = OBSERVED_SD_UNICAST
+        .get()
+        .and_then(|m| m.lock().unwrap().clone());
+    assert!(
+        observed.is_none(),
+        "observer must NOT fire for SD messages; got {observed:?}"
+    );
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// A registered observer must NOT fire for a non-SD datagram arriving
+/// on the SD/multicast socket — the observer contract is unicast-only
+/// (`from_unicast == true`).
+#[tokio::test]
+async fn non_sd_observer_ignores_non_sd_on_multicast_socket() {
+    let sd_pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        unicast_pipe: Arc::new(MockPipe::default()),
+        sd_pipe: Arc::clone(&sd_pipe),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+
+    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30703);
+
+    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
+        ServerDeps {
+            factory,
+            timer: MockTimer,
+            e2e_registry: e2e_handle,
+            subscriptions: MockSubscriptions::default(),
+            non_sd_observer: Some((record_multicast as NonSdRequestCallback, 9)),
+        };
+
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+    let handle = tokio::spawn(run);
+
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 103), 40003);
+    sd_pipe
+        .inbound
+        .lock()
+        .unwrap()
+        .push_back((build_method_request(0x1234, 0x0001), src));
+    if let Some(w) = sd_pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    // Deterministic completion signal: wait until the run-future has
+    // consumed the datagram from the pipe, then yield once more. The
+    // observer path has no await point between dequeue and callback,
+    // so any leaked invocation has already happened by now.
+    drive_until(|| sd_pipe.inbound.lock().unwrap().is_empty()).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !handle.is_finished(),
+        "run-future must still be alive after processing the datagram"
+    );
+
+    let observed = OBSERVED_MULTICAST
+        .get()
+        .and_then(|m| m.lock().unwrap().clone());
+    assert!(
+        observed.is_none(),
+        "observer must NOT fire for non-unicast datagrams; got {observed:?}"
+    );
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// With `non_sd_observer: None`, a non-SD unicast datagram is processed
+/// without panicking (historical "ignore" behavior). This is all the
+/// `None` case can actually prove — there is no callback to witness.
 #[tokio::test]
 async fn non_sd_observer_none_preserves_ignore_behavior() {
-    let _ = ();
+    let unicast_pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        unicast_pipe: Arc::clone(&unicast_pipe),
+        sd_pipe: Arc::new(MockPipe::default()),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+
+    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30701);
+
+    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
+        ServerDeps {
+            factory,
+            timer: MockTimer,
+            e2e_registry: e2e_handle,
+            subscriptions: MockSubscriptions::default(),
+            non_sd_observer: None,
+        };
+
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+    let handle = tokio::spawn(run);
+
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 101), 40001);
+    unicast_pipe
+        .inbound
+        .lock()
+        .unwrap()
+        .push_back((build_method_request(0x1234, 0x0001), src));
+    if let Some(w) = unicast_pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    // Deterministic completion signal: wait until the run-future has
+    // consumed the datagram from the pipe, then yield once more. The
+    // observer path has no await point between dequeue and callback,
+    // so any leaked invocation has already happened by now.
+    drive_until(|| unicast_pipe.inbound.lock().unwrap().is_empty()).await;
+    tokio::task::yield_now().await;
+
+    assert!(
+        !handle.is_finished(),
+        "run-future must keep running (no panic / no error) after \
+         ignoring a non-SD datagram with no observer registered"
+    );
+    handle.abort();
+    let _ = handle.await;
 }
