@@ -104,6 +104,11 @@
 //! - [Open SOME/IP Specification](https://github.com/some-ip-com/open-someip-spec)
 
 #![no_std]
+// embassy-executor's `nightly` feature expands `#[embassy_executor::task]`
+// to a `static TaskPool` whose `type Fut = impl Future` requires this. Only
+// enabled with `bare-metal-runtime` (which owns the executor + task); the
+// crate otherwise builds on stable.
+#![cfg_attr(feature = "bare-metal-runtime", feature(impl_trait_in_assoc_type))]
 #![warn(clippy::pedantic)]
 
 #[cfg(feature = "std")]
@@ -209,6 +214,11 @@ pub mod static_channels;
 /// and the spawnable futures in [`bare_metal_tasks`].
 #[cfg(any(feature = "bare_metal", feature = "server"))]
 pub mod sd_codec;
+/// Reusable bare-metal SOME/IP runtime: callback-driven transport + RX
+/// mailbox (and, in later submodules, the embassy executor + task) so a
+/// platform integrates by supplying only its catalog + I/O callbacks.
+#[cfg(feature = "bare_metal")]
+pub mod bare_metal_runtime;
 /// Spawnable, embassy-agnostic async futures (offer announce, subscribe
 /// announce, event RX+dispatch) plus a sync publish helper, so a
 /// bare-metal firmware only spawns futures and provides socket I/O.
