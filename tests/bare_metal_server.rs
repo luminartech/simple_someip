@@ -51,7 +51,15 @@ struct MockPipe {
 
 #[derive(Clone)]
 struct MockFactory {
-    pipe: Arc<MockPipe>,
+    /// Handed to sockets bound WITHOUT multicast options — the
+    /// server's unicast service socket.
+    unicast_pipe: Arc<MockPipe>,
+    /// Handed to sockets bound WITH `multicast_if_v4` set — the
+    /// server's SD socket. Per-socket queues make `recv_loop`'s
+    /// `from_unicast` flag deterministic: with a single shared queue,
+    /// whichever select arm polled first stole the datagram, so
+    /// routing depended on the alternating `select_biased!` bias.
+    sd_pipe: Arc<MockPipe>,
     next_port: Arc<Mutex<u16>>,
 }
 
@@ -59,8 +67,12 @@ impl TransportFactory for MockFactory {
     type Socket = MockSocket;
     type BindFuture<'a> =
         core::pin::Pin<Box<dyn Future<Output = Result<Self::Socket, TransportError>> + Send + 'a>>;
-    fn bind<'a>(&'a self, addr: SocketAddrV4, _options: &'a SocketOptions) -> Self::BindFuture<'a> {
-        let pipe = Arc::clone(&self.pipe);
+    fn bind<'a>(&'a self, addr: SocketAddrV4, options: &'a SocketOptions) -> Self::BindFuture<'a> {
+        let pipe = if options.multicast_if_v4.is_some() {
+            Arc::clone(&self.sd_pipe)
+        } else {
+            Arc::clone(&self.unicast_pipe)
+        };
         // Mock: assign port deterministically. If caller asked for 0,
         // hand out an incrementing fake ephemeral port.
         let port = if addr.port() == 0 {
@@ -271,9 +283,11 @@ impl SubscriptionHandle for MockSubscriptions {
 
 #[tokio::test]
 async fn server_constructible_without_server_tokio_feature() {
-    let pipe = Arc::new(MockPipe::default());
+    let _unicast_pipe = Arc::new(MockPipe::default());
+    let _sd_pipe = Arc::new(MockPipe::default());
     let factory = MockFactory {
-        pipe: Arc::clone(&pipe),
+        unicast_pipe: Arc::clone(&_unicast_pipe),
+        sd_pipe: Arc::clone(&_sd_pipe),
         next_port: Arc::new(Mutex::new(0)),
     };
 
@@ -319,9 +333,11 @@ async fn server_constructible_without_server_tokio_feature() {
 
 #[tokio::test]
 async fn passive_server_constructible_without_server_tokio_feature() {
-    let pipe = Arc::new(MockPipe::default());
+    let _unicast_pipe = Arc::new(MockPipe::default());
+    let _sd_pipe = Arc::new(MockPipe::default());
     let factory = MockFactory {
-        pipe: Arc::clone(&pipe),
+        unicast_pipe: Arc::clone(&_unicast_pipe),
+        sd_pipe: Arc::clone(&_sd_pipe),
         next_port: Arc::new(Mutex::new(0)),
     };
 
@@ -409,9 +425,11 @@ async fn drive_until<F: FnMut() -> bool>(mut check: F) {
 
 #[tokio::test]
 async fn non_sd_observer_some_receives_unicast_method_request() {
-    let pipe = Arc::new(MockPipe::default());
+    let unicast_pipe = Arc::new(MockPipe::default());
+    let _sd_pipe = Arc::new(MockPipe::default());
     let factory = MockFactory {
-        pipe: Arc::clone(&pipe),
+        unicast_pipe: Arc::clone(&unicast_pipe),
+        sd_pipe: Arc::clone(&_sd_pipe),
         next_port: Arc::new(Mutex::new(0)),
     };
 
@@ -441,21 +459,17 @@ async fn non_sd_observer_some_receives_unicast_method_request() {
 
     let handle = tokio::spawn(run);
 
-    // Queue a non-SD unicast method-request datagram. `from_unicast`
-    // distinguishes which socket received it: the first socket bound
-    // by `MockFactory` (port 30700) is the unicast socket; the second
-    // (port 30490) is the SD socket. Since the mock pipe is shared
-    // across both sockets, we drive the datagram into the unicast
-    // arm by tagging it with a non-SD message_id and relying on the
-    // `select_biased!`'s prefer-unicast tick to pick the unicast
-    // future first.
+    // Queue a non-SD unicast method-request datagram on the unicast
+    // socket's own pipe; per-socket pipes make `from_unicast = true`
+    // deterministic.
     let payload = build_method_request(0x1234, 0x0001);
     let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 100), 40000);
-    pipe.inbound
+    unicast_pipe
+        .inbound
         .lock()
         .unwrap()
         .push_back((payload.clone(), src));
-    if let Some(w) = pipe.inbound_waker.lock().unwrap().take() {
+    if let Some(w) = unicast_pipe.inbound_waker.lock().unwrap().take() {
         w.wake();
     }
 
