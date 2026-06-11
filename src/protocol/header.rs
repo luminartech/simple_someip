@@ -266,6 +266,17 @@ impl<'a> HeaderView<'a> {
         self.length() as usize - 8
     }
 
+    /// Returns header bytes 8..16 (request ID + protocol/interface
+    /// version + message type + return code). E2E Profile 5
+    /// with-header CRC covers these bytes.
+    #[must_use]
+    pub const fn upper_header_bytes(&self) -> [u8; 8] {
+        [
+            self.0[8], self.0[9], self.0[10], self.0[11], self.0[12], self.0[13], self.0[14],
+            self.0[15],
+        ]
+    }
+
     /// Returns the protocol version.
     #[must_use]
     pub fn protocol_version(&self) -> u8 {

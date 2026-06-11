@@ -204,6 +204,16 @@ pub mod embassy_channels;
 /// generates per-`T` `*Pooled<MyChannels>` impls against.
 #[cfg(feature = "bare_metal")]
 pub mod static_channels;
+/// Pure, no-alloc SOME/IP + SD datagram codec: transport-agnostic
+/// builders/parsers used by the server receive loop, the firmware shim,
+/// and the spawnable futures in [`bare_metal_tasks`].
+#[cfg(any(feature = "bare_metal", feature = "server"))]
+pub mod sd_codec;
+/// Spawnable, embassy-agnostic async futures (offer announce, subscribe
+/// announce, event RX+dispatch) plus a sync publish helper, so a
+/// bare-metal firmware only spawns futures and provides socket I/O.
+#[cfg(all(feature = "bare_metal", feature = "server"))]
+pub mod bare_metal_tasks;
 mod traits;
 /// Executor-agnostic UDP transport abstraction used by the client and
 /// server modules. `no_std`-compatible; a default `std + tokio` backend
