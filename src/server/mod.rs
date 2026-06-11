@@ -284,13 +284,14 @@ where
     /// `Arc<RwLock<SubscriptionManager>>` for this; bare-metal callers
     /// supply their own [`SubscriptionHandle`] impl.
     pub subscriptions: Sub,
-    /// Optional callback invoked from the server's receive loop for every
-    /// non-SD **unicast** datagram (method requests / fire-and-forget calls
-    /// to offered services). `None` reproduces the historical
-    /// "non-SD ignored" behavior. The callback receives the full raw
-    /// datagram bytes and the source `SocketAddrV4`; the consumer is
-    /// responsible for re-parsing the SOME/IP header and any E2E check.
-    pub non_sd_observer: Option<NonSdRequestCallback>,
+    /// Optional `(callback, ctx)` pair invoked from the server's receive
+    /// loop for every non-SD **unicast** datagram (method requests /
+    /// fire-and-forget calls to offered services). `None` reproduces the
+    /// historical "non-SD ignored" behavior. The callback receives the
+    /// opaque `ctx` word back verbatim, plus the full raw datagram bytes
+    /// and the source `SocketAddrV4`; the consumer is responsible for
+    /// re-parsing the SOME/IP header and any E2E check.
+    pub non_sd_observer: Option<(NonSdRequestCallback, usize)>,
 }
 
 /// Tokio-defaulted constructor.
@@ -406,12 +407,15 @@ where
         }
     }
 
-    /// Register a callback invoked for every non-SD unicast datagram
-    /// (method requests / fire-and-forget calls to offered services).
-    /// Passing `None` (the default if unset) preserves the historical
-    /// "ignore non-SD" behavior.
+    /// Register a `(callback, ctx)` pair invoked for every non-SD unicast
+    /// datagram (method requests / fire-and-forget calls to offered
+    /// services). The opaque `ctx` word is passed back verbatim on every
+    /// invocation — FFI callers stash a pointer here as `usize`;
+    /// pure-Rust callers that need no context pass `0`. Passing `None`
+    /// (the default if unset) preserves the historical "ignore non-SD"
+    /// behavior.
     #[must_use]
-    pub fn with_non_sd_observer(mut self, observer: Option<NonSdRequestCallback>) -> Self {
+    pub fn with_non_sd_observer(mut self, observer: Option<(NonSdRequestCallback, usize)>) -> Self {
         self.non_sd_observer = observer;
         self
     }
@@ -516,9 +520,10 @@ where
     /// run-futures built from the same `Server` from racing the sockets
     /// and SD session counter.
     pub started: StartedLatch,
-    /// Optional callback for non-SD unicast datagrams (method requests).
-    /// `None` reproduces the default "non-SD ignored" behavior.
-    pub non_sd_observer: Option<NonSdRequestCallback>,
+    /// Optional `(callback, ctx)` pair for non-SD unicast datagrams
+    /// (method requests). `None` reproduces the default "non-SD
+    /// ignored" behavior.
+    pub non_sd_observer: Option<(NonSdRequestCallback, usize)>,
 }
 
 /// SOME/IP Server that can offer services and publish events.
@@ -631,7 +636,7 @@ pub struct Server<
     /// `None` preserves the historical "ignore non-SD" behavior; `Some`
     /// surfaces those datagrams to the consumer (used by halo's FFI to
     /// dispatch HWP1 method requests).
-    non_sd_observer: Option<NonSdRequestCallback>,
+    non_sd_observer: Option<(NonSdRequestCallback, usize)>,
 }
 
 /// Callback invoked by the server's `recv_loop` for every non-SD
@@ -639,10 +644,23 @@ pub struct Server<
 /// requests / fire-and-forget calls to the offered services). The
 /// payload is the full raw datagram bytes; the caller is responsible
 /// for re-parsing the SOME/IP header (and applying any E2E check) on
-/// the consumer side. `fn` pointers are `Copy + Send + Sync + 'static`,
-/// so they can be stored on the `Server` and captured by the
-/// run-future without adding a new generic.
-pub type NonSdRequestCallback = fn(data: &[u8], source: core::net::SocketAddrV4);
+/// the consumer side.
+///
+/// `ctx` is an opaque caller-owned context word, registered alongside
+/// the callback as a `(NonSdRequestCallback, usize)` pair and passed
+/// back verbatim on every invocation. It is deliberately `usize`
+/// rather than `*mut c_void`: a stored raw pointer would make
+/// [`Server`] `!Send` and break [`Server::run`]'s declared `+ Send`
+/// bound, while `usize` is trivially `Send + Sync` and matches the
+/// `uintptr_t` an FFI caller holds anyway. No `unsafe` enters this
+/// crate — the cast back to a pointer (and its safety justification)
+/// lives in the consumer's callback body, the only place that knows
+/// the pointee's lifetime and thread-safety. Rust-native users that
+/// need no context pass `0`. `fn` pointers are
+/// `Copy + Send + Sync + 'static`, so the pair can be stored on the
+/// `Server` and captured by the run-future without adding a new
+/// generic.
+pub type NonSdRequestCallback = fn(ctx: usize, data: &[u8], source: core::net::SocketAddrV4);
 
 #[cfg(feature = "_alloc")]
 type StartedLatch = Arc<AtomicBool>;

@@ -440,7 +440,7 @@ async fn recv_loop<T, Sub>(
     subscriptions: &Sub,
     unicast_buf: &mut [u8],
     sd_buf: &mut [u8],
-    non_sd_observer: Option<super::NonSdRequestCallback>,
+    non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
 ) -> Result<(), Error>
 where
     T: TransportSocket,
@@ -540,9 +540,9 @@ where
                     // calls to offered services) via the registered callback.
                     // The full raw datagram is forwarded; the consumer is
                     // responsible for re-parsing and any E2E check.
-                    if let Some(cb) = non_sd_observer {
+                    if let Some((cb, ctx)) = non_sd_observer {
                         if let core::net::SocketAddr::V4(src_v4) = addr {
-                            cb(data, src_v4);
+                            cb(ctx, data, src_v4);
                         }
                     } else {
                         crate::log::trace!(
@@ -585,7 +585,7 @@ pub(super) async fn run_combined<H, T, Sub, Hsd, Tm>(
     is_passive: bool,
     unicast_buf: &mut [u8],
     sd_buf: &mut [u8],
-    non_sd_observer: Option<super::NonSdRequestCallback>,
+    non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
 ) -> Result<(), Error>
 where
     H: SharedHandle<T>,
