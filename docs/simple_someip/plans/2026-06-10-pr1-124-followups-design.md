@@ -21,9 +21,23 @@ shape (stack-plan gate 2 — user action, still open as of
 Decision (2026-06-10): **`ctx: usize`**, over an unsafe-Send
 `*mut c_void` newtype and over a generic observer type parameter.
 
+Revised 2026-06-11: a parallel branch (`feat/embassy-mem-channel-cap`)
+independently reshaped the callback to a library-parsed
+`(service_id, method_id, payload, e2e_status)` contract. The
+reconciled contract is the union of both — ctx + source + decoded
+fields — keeping parse/E2E in the audited crate (MISRA/ASIL) rather
+than in N C consumers. `e2e_status` is 0 (unchecked) on the server
+path today; `source` is future-proofing (unused by halo and dft).
+
 ```rust
-pub type NonSdRequestCallback =
-    fn(ctx: usize, data: &[u8], source: core::net::SocketAddrV4);
+pub type NonSdRequestCallback = fn(
+    ctx: usize,
+    source: core::net::SocketAddrV4,
+    service_id: u16,
+    method_id: u16,
+    payload: &[u8],
+    e2e_status: u8,
+);
 ```
 
 - Storage everywhere becomes `Option<(NonSdRequestCallback, usize)>`
