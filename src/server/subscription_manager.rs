@@ -322,6 +322,12 @@ pub trait SubscriptionHandle: Clone + 'static {
     /// Idempotent: if the subscriber is already present, this is a no-op
     /// returning `Ok(())`. Returns `Err(SubscribeError)` if a capacity
     /// limit would be exceeded.
+    ///
+    /// Timing note: implementations whose critical section is fully
+    /// synchronous (e.g. `StaticSubscriptionHandle`) may perform the
+    /// mutation when the future is *constructed*, deferring only the
+    /// result delivery to the poll. Callers must not assume that
+    /// constructing the returned future is free of side effects.
     fn subscribe(
         &self,
         service_id: u16,
@@ -331,6 +337,8 @@ pub trait SubscriptionHandle: Clone + 'static {
     ) -> Self::SubscribeFuture<'_>;
 
     /// Remove a subscriber from an event group.
+    ///
+    /// Same construction-time-mutation caveat as [`Self::subscribe`].
     fn unsubscribe(
         &self,
         service_id: u16,
@@ -500,6 +508,11 @@ pub mod bare_metal_subscription_impl {
         // free of `alloc` (the `server` feature no longer implies
         // `_alloc`). `Ready<T>` is `Send` when `T: Send`, satisfying any
         // `Send`-checked run path.
+        // Consequence (documented on the trait): the mutation runs
+        // eagerly at future construction; only the result is delivered
+        // through the poll. The in-tree caller awaits immediately, so
+        // the difference from the lazy boxed impls is unobservable
+        // there.
         type SubscribeFuture<'a> = core::future::Ready<Result<(), SubscribeError>>;
         type UnsubscribeFuture<'a> = core::future::Ready<()>;
 
