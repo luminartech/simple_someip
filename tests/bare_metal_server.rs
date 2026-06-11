@@ -369,10 +369,12 @@ async fn passive_server_constructible_without_server_tokio_feature() {
 //
 // Drives datagrams through the server's `recv_loop` and checks the
 // observer contract: `NonSdRequestCallback` is
-// `fn(ctx: usize, data: &[u8], source: SocketAddrV4)` — a plain
-// function pointer, so it can't capture environment. Each test parks
-// its observation in a dedicated `OnceLock`-backed static to avoid
-// interference under parallel `cargo test`.
+// `fn(ctx: usize, source: SocketAddrV4, service_id: u16, method_id: u16,
+//     payload: &[u8], e2e_status: u8)` — a plain function pointer, so
+// it can't capture environment. `recv_loop` parses the SOME/IP header
+// and passes decoded fields; the consumer never sees raw datagram bytes.
+// Each test parks its observation in a dedicated `OnceLock`-backed
+// static to avoid interference under parallel `cargo test`.
 //
 // Positive test: registered observer fires for non-SD unicast.
 // Negative tests: registered observer must NOT fire for SD messages
@@ -382,26 +384,69 @@ async fn passive_server_constructible_without_server_tokio_feature() {
 
 use std::sync::OnceLock;
 
-static OBSERVED_SOME: OnceLock<Mutex<Option<(usize, Vec<u8>, SocketAddrV4)>>> = OnceLock::new();
+static OBSERVED_SOME: OnceLock<Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, u8)>>> =
+    OnceLock::new();
 
-fn record_some(ctx: usize, data: &[u8], source: SocketAddrV4) {
+fn record_some(
+    ctx: usize,
+    source: SocketAddrV4,
+    service_id: u16,
+    method_id: u16,
+    payload: &[u8],
+    e2e_status: u8,
+) {
     let slot = OBSERVED_SOME.get_or_init(|| Mutex::new(None));
-    *slot.lock().unwrap() = Some((ctx, data.to_vec(), source));
+    *slot.lock().unwrap() = Some((
+        ctx,
+        source,
+        service_id,
+        method_id,
+        payload.to_vec(),
+        e2e_status,
+    ));
 }
 
-static OBSERVED_SD_UNICAST: OnceLock<Mutex<Option<(usize, Vec<u8>, SocketAddrV4)>>> =
+static OBSERVED_SD_UNICAST: OnceLock<Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, u8)>>> =
     OnceLock::new();
-static OBSERVED_MULTICAST: OnceLock<Mutex<Option<(usize, Vec<u8>, SocketAddrV4)>>> =
+static OBSERVED_MULTICAST: OnceLock<Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, u8)>>> =
     OnceLock::new();
 
-fn record_sd_unicast(ctx: usize, data: &[u8], source: SocketAddrV4) {
+fn record_sd_unicast(
+    ctx: usize,
+    source: SocketAddrV4,
+    service_id: u16,
+    method_id: u16,
+    payload: &[u8],
+    e2e_status: u8,
+) {
     let slot = OBSERVED_SD_UNICAST.get_or_init(|| Mutex::new(None));
-    *slot.lock().unwrap() = Some((ctx, data.to_vec(), source));
+    *slot.lock().unwrap() = Some((
+        ctx,
+        source,
+        service_id,
+        method_id,
+        payload.to_vec(),
+        e2e_status,
+    ));
 }
 
-fn record_multicast(ctx: usize, data: &[u8], source: SocketAddrV4) {
+fn record_multicast(
+    ctx: usize,
+    source: SocketAddrV4,
+    service_id: u16,
+    method_id: u16,
+    payload: &[u8],
+    e2e_status: u8,
+) {
     let slot = OBSERVED_MULTICAST.get_or_init(|| Mutex::new(None));
-    *slot.lock().unwrap() = Some((ctx, data.to_vec(), source));
+    *slot.lock().unwrap() = Some((
+        ctx,
+        source,
+        service_id,
+        method_id,
+        payload.to_vec(),
+        e2e_status,
+    ));
 }
 
 /// Build a minimal SOME/IP method-request datagram (16-byte header,
@@ -411,16 +456,17 @@ fn record_multicast(ctx: usize, data: &[u8], source: SocketAddrV4) {
 /// `simple_someip::protocol::Header::encode` would be cleaner but the
 /// header is small enough to spell out by hand and avoids dragging
 /// the encoder dep into the test.
-fn build_method_request(service_id: u16, method_id: u16) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(16);
+fn build_method_request(service_id: u16, method_id: u16, payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16 + payload.len());
     buf.extend_from_slice(&service_id.to_be_bytes()); // message_id (high)
     buf.extend_from_slice(&method_id.to_be_bytes()); //  message_id (low)
-    buf.extend_from_slice(&8u32.to_be_bytes()); //       length = header(8) + payload(0)
+    buf.extend_from_slice(&(8u32 + payload.len() as u32).to_be_bytes()); // length = header(8) + payload
     buf.extend_from_slice(&0u32.to_be_bytes()); //       request_id
     buf.push(1); //                                       protocol_version
     buf.push(1); //                                       interface_version
     buf.push(0); //                                       message_type = Request (0x00)
     buf.push(0); //                                       return_code = OK
+    buf.extend_from_slice(payload);
     buf
 }
 
@@ -499,13 +545,13 @@ async fn non_sd_observer_some_receives_unicast_method_request() {
     // Queue a non-SD unicast method-request datagram on the unicast
     // socket's own pipe; per-socket pipes make `from_unicast = true`
     // deterministic.
-    let payload = build_method_request(0x1234, 0x0001);
+    let datagram = build_method_request(0x1234, 0x0001, &[0xDE, 0xAD, 0xBE, 0xEF]);
     let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 100), 40000);
     unicast_pipe
         .inbound
         .lock()
         .unwrap()
-        .push_back((payload.clone(), src));
+        .push_back((datagram.clone(), src));
     if let Some(w) = unicast_pipe.inbound_waker.lock().unwrap().take() {
         w.wake();
     }
@@ -518,7 +564,7 @@ async fn non_sd_observer_some_receives_unicast_method_request() {
     })
     .await;
 
-    let (got_ctx, got_data, got_src) = OBSERVED_SOME
+    let (got_ctx, got_src, got_service, got_method, got_payload, got_e2e) = OBSERVED_SOME
         .get()
         .unwrap()
         .lock()
@@ -529,11 +575,15 @@ async fn non_sd_observer_some_receives_unicast_method_request() {
         got_ctx, 0xC0FF_EE00,
         "callback must receive the registered ctx word verbatim"
     );
-    assert_eq!(
-        got_data, payload,
-        "callback must receive the full raw datagram bytes"
-    );
     assert_eq!(got_src, src, "callback must receive the original source");
+    assert_eq!(got_service, 0x1234, "decoded service id");
+    assert_eq!(got_method, 0x0001, "decoded method id");
+    assert_eq!(
+        got_payload,
+        [0xDE, 0xAD, 0xBE, 0xEF],
+        "payload must be the bytes after the 16-byte header"
+    );
+    assert_eq!(got_e2e, 0, "server-side requests are not E2E-checked today");
 
     handle.abort();
     let _ = handle.await;
@@ -648,7 +698,7 @@ async fn non_sd_observer_ignores_non_sd_on_multicast_socket() {
         .inbound
         .lock()
         .unwrap()
-        .push_back((build_method_request(0x1234, 0x0001), src));
+        .push_back((build_method_request(0x1234, 0x0001, &[]), src));
     if let Some(w) = sd_pipe.inbound_waker.lock().unwrap().take() {
         w.wake();
     }
@@ -715,7 +765,7 @@ async fn non_sd_observer_none_preserves_ignore_behavior() {
         .inbound
         .lock()
         .unwrap()
-        .push_back((build_method_request(0x1234, 0x0001), src));
+        .push_back((build_method_request(0x1234, 0x0001, &[]), src));
     if let Some(w) = unicast_pipe.inbound_waker.lock().unwrap().take() {
         w.wake();
     }

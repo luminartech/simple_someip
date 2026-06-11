@@ -538,11 +538,20 @@ where
                 } else if from_unicast {
                     // Surface non-SD unicast (method requests / fire-and-forget
                     // calls to offered services) via the registered callback.
-                    // The full raw datagram is forwarded; the consumer is
-                    // responsible for re-parsing and any E2E check.
+                    // The SOME/IP header is parsed here; the consumer receives
+                    // decoded fields and never hand-rolls parsing.
                     if let Some((cb, ctx)) = non_sd_observer {
                         if let core::net::SocketAddr::V4(src_v4) = addr {
-                            cb(ctx, data, src_v4);
+                            let id = view.header().message_id();
+                            // Server-side requests are not E2E-checked today.
+                            cb(
+                                ctx,
+                                src_v4,
+                                id.service_id(),
+                                id.method_id(),
+                                view.payload_bytes(),
+                                0,
+                            );
                         }
                     } else {
                         crate::log::trace!(

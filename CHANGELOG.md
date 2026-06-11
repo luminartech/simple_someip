@@ -120,28 +120,42 @@ let (_server, _handles, run) = Server::new(config).await?;
 tokio::spawn(run);  // receive only; co-located Client drives SD
 ```
 
-#### Breaking — `NonSdRequestCallback` gains an opaque `ctx: usize` first argument
+#### Breaking — `NonSdRequestCallback` is now a parsed, ctx-carrying callback
 
 ```rust
 // before
 pub type NonSdRequestCallback = fn(data: &[u8], source: SocketAddrV4);
 // after
-pub type NonSdRequestCallback = fn(ctx: usize, data: &[u8], source: SocketAddrV4);
+pub type NonSdRequestCallback = fn(
+    ctx: usize,
+    source: core::net::SocketAddrV4,
+    service_id: u16,
+    method_id: u16,
+    payload: &[u8],
+    e2e_status: u8,
+);
 ```
 
 The observer is now registered as a `(callback, ctx)` pair
 (`ServerDeps::non_sd_observer: Option<(NonSdRequestCallback, usize)>`),
-and `ctx` is passed back verbatim on every invocation. FFI consumers
-stash their state pointer as `usize`; pure-Rust callers pass `0`.
-`usize` (rather than a stored `*mut c_void`) keeps `Server: Send` —
-and therefore `Server::run`'s declared `+ Send` bound — with no
-`unsafe` in this crate; the pointer cast lives in the consumer's
-callback body.
+and `ctx` is passed back verbatim on every invocation. `recv_loop`
+parses the SOME/IP header so consumers receive decoded
+`(service_id, method_id, payload)` and never hand-roll parsing — the
+parse stays in the audited crate per MISRA/ASIL rather than being
+replicated in N C consumers. `payload` is the bytes after the 16-byte
+header. `e2e_status` is `0` (unchecked) — server-side request E2E is
+not applied today. `usize` (rather than a stored `*mut c_void`) keeps
+`Server: Send` — and therefore `Server::run`'s declared `+ Send` bound
+— with no `unsafe` in this crate; the pointer cast lives in the
+consumer's callback body. FFI consumers stash their state pointer as
+`usize`; pure-Rust callers pass `0`.
 
 ##### Migration
 
 `non_sd_observer: Some(my_cb)` → `non_sd_observer: Some((my_cb, 0))`,
-and add the leading `ctx: usize` parameter to the callback.
+and replace the leading `ctx: usize` parameter plus manual header parsing
+with the decoded arguments `(ctx, source, service_id, method_id, payload,
+e2e_status)`. Registration becomes `Some((my_cb, 0))`.
 
 #### Removed
 
