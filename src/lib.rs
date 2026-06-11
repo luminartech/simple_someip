@@ -143,10 +143,11 @@ extern crate alloc;
 /// `server::Error::Capacity("udp_buffer")`, depending on the path.
 /// Paths that return early before
 /// attempting serialization (e.g. `publish_event` when there are no
-/// subscribers) are not affected. Other outbound SD paths (announcement
-/// builders, `SubscribeAck` / `SubscribeNack`) currently still use
-/// heap `Vec` buffers and are not capped by this constant — that is a
-/// known gap, planned alongside the bare-metal `no_alloc` refactor.
+/// subscribers) are not affected. The remaining outbound SD paths
+/// (`OfferService` announcements, `SubscribeAck` / `SubscribeNack`)
+/// serialize into stack buffers of this same size — the phase-21
+/// per-event-allocation cleanup (`7c58649`) removed the former heap
+/// `Vec` buffers, so every outbound path is capped by this constant.
 ///
 /// Note that this is an application-level UDP payload limit, not an
 /// Ethernet-MTU-safe size: a 1500-byte UDP payload exceeds a 1500-byte
