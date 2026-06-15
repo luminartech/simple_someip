@@ -310,4 +310,48 @@ mod tests {
         let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 2, CONT);
         assert_eq!(verdict, SessionVerdict::Ok);
     }
+
+    #[test]
+    fn interleaved_transports_for_same_instance_do_not_false_reboot() {
+        // A sensor keeps independent SD session-id domains per transport
+        // (multicast ~1468, unicast ~739). Tracked under distinct keys they
+        // never look like a reboot when interleaved; a real counter reset
+        // within one domain still does.
+        let mut t = SessionTracker::default();
+        let a = addr(30490);
+        assert_eq!(
+            t.check(a, TransportKind::Multicast, SVC, INST, 1468, RB),
+            SessionVerdict::Initial
+        );
+        assert_eq!(
+            t.check(a, TransportKind::Unicast, SVC, INST, 739, RB),
+            SessionVerdict::Initial
+        );
+        assert_eq!(
+            t.check(a, TransportKind::Multicast, SVC, INST, 1469, RB),
+            SessionVerdict::Ok
+        );
+        assert_eq!(
+            t.check(a, TransportKind::Unicast, SVC, INST, 740, RB),
+            SessionVerdict::Ok
+        );
+        assert_eq!(
+            t.check(a, TransportKind::Multicast, SVC, INST, 3, RB),
+            SessionVerdict::Reboot
+        );
+    }
+
+    #[test]
+    fn same_transport_mis_tag_false_reboots() {
+        // Documents the caller bug this fix targets: a unicast datagram
+        // mis-tagged Multicast collapses two domains onto one key, so its low
+        // session id looks like a decrease and is wrongly reported as a reboot.
+        let mut t = SessionTracker::default();
+        let a = addr(30490);
+        t.check(a, TransportKind::Multicast, SVC, INST, 1468, RB);
+        assert_eq!(
+            t.check(a, TransportKind::Multicast, SVC, INST, 739, RB),
+            SessionVerdict::Reboot
+        );
+    }
 }
