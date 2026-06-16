@@ -123,6 +123,10 @@ where
     /// the multicast one, which prevents the interleaved-counter false-reboot
     /// bug. No multicast group join; outgoing SD still goes via the multicast
     /// discovery socket, so this socket only ever receives.
+    ///
+    /// The returned `SocketManager` still carries a send half and session
+    /// counter for type uniformity, but the discovery layer never drives them
+    /// for this socket: it is receive-only *by usage*, not by type.
     pub fn bind_discovery_unicast(
         interface: Ipv4Addr,
         e2e_registry: Arc<Mutex<E2ERegistry>>,
@@ -398,7 +402,6 @@ mod tests {
         use std::vec::Vec;
 
         let group = crate::protocol::sd::MULTICAST_IP;
-        let port = 51900u16; // test-only; not the real SD port
 
         let bind_reuse = |addr: SocketAddr| -> std::io::Result<socket2::Socket> {
             let s = socket2::Socket::new(
@@ -426,7 +429,7 @@ mod tests {
         // group address) + joined. Tagged Multicast. The more-specific
         // interface-IP unicast socket below must divert unicast away from it.
         let mc: UdpSocket = match (|| -> std::io::Result<UdpSocket> {
-            let s = bind_reuse(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))?;
+            let s = bind_reuse(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
             s.set_multicast_loop_v4(true)?;
             let s: UdpSocket = s.into();
             s.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)?;
@@ -435,6 +438,16 @@ mod tests {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("SKIP dual_socket_splits: multicast setup failed ({e})");
+                return;
+            }
+        };
+        // Reuse the OS-assigned ephemeral port for the unicast socket and the
+        // sender target too, so the test never collides with a fixed port that
+        // happens to be in use on a shared CI runner.
+        let port = match mc.local_addr() {
+            Ok(SocketAddr::V4(a)) => a.port(),
+            _ => {
+                eprintln!("SKIP dual_socket_splits: multicast socket has no IPv4 local addr");
                 return;
             }
         };
@@ -464,8 +477,17 @@ mod tests {
             .into();
         let _ = tx.set_multicast_loop_v4(true);
         let _ = tx.set_multicast_ttl_v4(1);
-        let _ = tx.send_to(b"MCAST", SocketAddrV4::new(group, port));
-        let _ = tx.send_to(b"UCAST", SocketAddrV4::new(local_ip, port));
+        // A send failure here is an environment issue (no route / permissions),
+        // not a logic regression — surface it as a visible SKIP rather than
+        // letting an empty drain quietly pass the test.
+        if let Err(e) = tx.send_to(b"MCAST", SocketAddrV4::new(group, port)) {
+            eprintln!("SKIP dual_socket_splits: multicast send failed ({e})");
+            return;
+        }
+        if let Err(e) = tx.send_to(b"UCAST", SocketAddrV4::new(local_ip, port)) {
+            eprintln!("SKIP dual_socket_splits: unicast send failed ({e})");
+            return;
+        }
         std::thread::sleep(Duration::from_millis(60));
 
         let mc_got = drain(&mc);
@@ -481,7 +503,7 @@ mod tests {
         );
         assert!(
             !mc_got.iter().any(|p| p == b"UCAST"),
-            "mc socket (bound to group addr) must NOT get the unicast"
+            "mc socket (bound to INADDR_ANY) must NOT get the unicast"
         );
         assert!(
             uc_got.iter().any(|p| p == b"UCAST"),
