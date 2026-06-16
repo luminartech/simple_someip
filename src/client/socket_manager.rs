@@ -339,6 +339,113 @@ mod tests {
         Arc::new(Mutex::new(E2ERegistry::new()))
     }
 
+    /// Spike for the per-transport SD fix: prove the kernel splits SD
+    /// multicast from unicast across two sockets sharing the SD port —
+    /// one bound to the group address (joined), one bound to INADDR_ANY
+    /// (not joined). The reboot fix relies on this so each transport's
+    /// session counter lands on its own `SessionTracker` key instead of
+    /// colliding. Skips if the host has no usable multicast route (e.g.
+    /// `lo`-only CI) — the authoritative check is the live-sensor run.
+    #[test]
+    fn dual_socket_splits_multicast_from_unicast() {
+        use std::eprintln;
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+        use std::time::Duration;
+        use std::vec::Vec;
+
+        let group = crate::protocol::sd::MULTICAST_IP;
+        let port = 51900u16; // test-only; not the real SD port
+
+        let bind_reuse = |addr: SocketAddr| -> std::io::Result<socket2::Socket> {
+            let s = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )?;
+            s.set_reuse_address(true)?;
+            s.set_reuse_port(true)?;
+            s.bind(&addr.into())?;
+            s.set_read_timeout(Some(Duration::from_millis(400)))?;
+            Ok(s)
+        };
+        let drain = |s: &UdpSocket| -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 64];
+            while let Ok((n, _)) = s.recv_from(&mut buf) {
+                out.push(buf[..n].to_vec());
+            }
+            out
+        };
+
+        // Multicast socket: bound to the GROUP address, joined, loopback on.
+        let mc: UdpSocket = match (|| -> std::io::Result<UdpSocket> {
+            let s = bind_reuse(SocketAddr::from((group, port)))?;
+            s.set_multicast_loop_v4(true)?;
+            let s: UdpSocket = s.into();
+            s.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)?;
+            Ok(s)
+        })() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("SKIP dual_socket_splits: multicast setup failed ({e})");
+                return;
+            }
+        };
+        // This host's egress IPv4 for the multicast route — the analogue of
+        // the real `interface` arg the discovery socket is bound against.
+        let local_ip = {
+            let probe = UdpSocket::bind("0.0.0.0:0").expect("probe bind");
+            let _ = probe.connect(SocketAddrV4::new(group, port));
+            match probe.local_addr() {
+                Ok(SocketAddr::V4(a)) => *a.ip(),
+                _ => Ipv4Addr::UNSPECIFIED,
+            }
+        };
+        if local_ip.is_unspecified() {
+            eprintln!("SKIP dual_socket_splits: no egress IPv4");
+            return;
+        }
+
+        // Unicast socket: bound to the SPECIFIC host IP (not wildcard), NOT
+        // joined to the group — so it must not receive the group multicast.
+        let uc: UdpSocket = bind_reuse(SocketAddr::from((local_ip, port)))
+            .expect("bind unicast socket")
+            .into();
+
+        let tx: UdpSocket = bind_reuse(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .expect("bind sender")
+            .into();
+        let _ = tx.set_multicast_loop_v4(true);
+        let _ = tx.set_multicast_ttl_v4(1);
+        let _ = tx.send_to(b"MCAST", SocketAddrV4::new(group, port));
+        let _ = tx.send_to(b"UCAST", SocketAddrV4::new(local_ip, port));
+        std::thread::sleep(Duration::from_millis(60));
+
+        let mc_got = drain(&mc);
+        let uc_got = drain(&uc);
+
+        if mc_got.is_empty() {
+            eprintln!("SKIP dual_socket_splits: no multicast route on this host");
+            return;
+        }
+        assert!(
+            mc_got.iter().any(|p| p == b"MCAST"),
+            "mc socket must get the multicast"
+        );
+        assert!(
+            !mc_got.iter().any(|p| p == b"UCAST"),
+            "mc socket (bound to group addr) must NOT get the unicast"
+        );
+        assert!(
+            uc_got.iter().any(|p| p == b"UCAST"),
+            "uc socket must get the unicast"
+        );
+        assert!(
+            !uc_got.iter().any(|p| p == b"MCAST"),
+            "uc socket (never joined the group) must NOT get the multicast"
+        );
+    }
+
     #[tokio::test]
     async fn test_bind_ephemeral_port() {
         let sm = TestSocketManager::bind(0, test_registry()).unwrap();
