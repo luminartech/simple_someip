@@ -407,6 +407,7 @@ mod tests {
                 Some(socket2::Protocol::UDP),
             )?;
             s.set_reuse_address(true)?;
+            #[cfg(unix)]
             s.set_reuse_port(true)?;
             s.bind(&addr.into())?;
             s.set_read_timeout(Some(Duration::from_millis(400)))?;
