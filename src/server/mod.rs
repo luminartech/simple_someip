@@ -1862,10 +1862,15 @@ mod tests {
         // datagram. We drive `handle_sd_message` directly rather than
         // `server.run()` so we can assert state after the call.
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let sd_addr = match server.sd_socket.local_addr().unwrap() {
-            std::net::SocketAddr::V4(v4) => v4,
+        // The SD socket binds the wildcard (`0.0.0.0`) to receive multicast,
+        // so `local_addr()` reports `0.0.0.0:<port>`. Sending unicast to
+        // `0.0.0.0` loops back on Linux but is dropped on Windows — target
+        // loopback explicitly with the bound port so the test is portable.
+        let sd_port = match server.sd_socket.local_addr().unwrap() {
+            std::net::SocketAddr::V4(v4) => v4.port(),
             std::net::SocketAddr::V6(_) => panic!("expected v4 sd socket"),
         };
+        let sd_addr = std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, sd_port);
         client_socket.send_to(&message, sd_addr).await.unwrap();
 
         let mut buf = vec![0u8; 65_535];
