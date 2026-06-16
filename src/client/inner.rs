@@ -246,8 +246,14 @@ pub(super) struct Inner<PayloadDefinitions: PayloadWireFormat> {
     update_sender: mpsc::UnboundedSender<ClientUpdate<PayloadDefinitions>>,
     /// Target interface for sockets
     interface: Ipv4Addr,
-    /// Socket manager for service discovery if bound
+    /// Socket manager for service discovery if bound (multicast: `INADDR_ANY`
+    /// + group join; also sends outgoing SD)
     discovery_socket: Option<SocketManager<PayloadDefinitions>>,
+    /// Receive-only UNICAST service-discovery socket (interface-IP bound) if
+    /// bound. Diverts the sensor's unicast SD off `discovery_socket` so the
+    /// unicast and multicast SD session domains get separate `SessionTracker`
+    /// keys (prevents interleaved-counter false reboots).
+    discovery_unicast_socket: Option<SocketManager<PayloadDefinitions>>,
     /// Socket managers for unicast messages, keyed by local port
     unicast_sockets: HashMap<u16, SocketManager<PayloadDefinitions>>,
     /// Per-sender SD session state for reboot detection
@@ -284,6 +290,85 @@ impl<PayloadDefinitions: PayloadWireFormat> std::fmt::Debug for Inner<PayloadDef
     }
 }
 
+/// Process one received SD datagram: feed every service-instance entry to the
+/// reboot [`SessionTracker`] under `transport`, refresh the service registry,
+/// and emit `SenderRebooted` / `DiscoveryUpdated`. Shared by the multicast and
+/// unicast discovery receive arms so each transport's SD session counter is
+/// tracked on its own key — without this split the sensor's interleaved
+/// multicast/unicast session counters look like perpetual reboots.
+fn process_discovery<P>(
+    source: SocketAddr,
+    transport: TransportKind,
+    someip_header: protocol::Header,
+    sd_header: <P as PayloadWireFormat>::SdHeader,
+    session_tracker: &mut SessionTracker,
+    service_registry: &mut ServiceRegistry,
+    update_sender: &mpsc::UnboundedSender<ClientUpdate<P>>,
+) where
+    P: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
+{
+    // Session ID from the SOME/IP request_id (lower 16 bits).
+    let session_id = (someip_header.request_id() & 0xFFFF) as u16;
+    let sd_payload = P::new_sd_payload(&sd_header);
+    let reboot_flag = sd_payload.sd_flags().map_or(
+        crate::protocol::sd::RebootFlag::Continuous,
+        crate::protocol::sd::Flags::reboot,
+    );
+
+    // Track sender session/reboot state for every SD entry that identifies a
+    // service instance, keyed per transport so multicast and unicast domains
+    // don't collide.
+    let mut rebooted = false;
+    for (svc_id, inst_id) in sd_payload.service_instances() {
+        let verdict =
+            session_tracker.check(source, transport, svc_id, inst_id, session_id, reboot_flag);
+        if verdict == SessionVerdict::Reboot {
+            rebooted = true;
+        }
+    }
+
+    // Auto-populate the service registry from offer / stop-offer entries.
+    for ep in sd_payload.offered_endpoints() {
+        let id = ServiceInstanceId {
+            service_id: ep.service_id,
+            instance_id: ep.instance_id,
+        };
+        if ep.is_offer {
+            if let Some(addr) = ep.addr {
+                service_registry.insert(
+                    id,
+                    ServiceEndpointInfo {
+                        addr,
+                        local_port: 0,
+                        major_version: ep.major_version,
+                        minor_version: ep.minor_version,
+                    },
+                );
+                trace!(
+                    "Registry: added 0x{:04X}.0x{:04X} -> {}",
+                    ep.service_id, ep.instance_id, addr,
+                );
+            }
+        } else {
+            service_registry.remove(id);
+            trace!(
+                "Registry: removed 0x{:04X}.0x{:04X}",
+                ep.service_id, ep.instance_id,
+            );
+        }
+    }
+
+    if rebooted {
+        let _ = update_sender.send(ClientUpdate::SenderRebooted(source));
+    }
+    let discovery_msg = DiscoveryMessage {
+        source,
+        someip_header,
+        sd_header,
+    };
+    let _ = update_sender.send(ClientUpdate::DiscoveryUpdated(discovery_msg));
+}
+
 impl<PayloadDefinitions> Inner<PayloadDefinitions>
 where
     PayloadDefinitions: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
@@ -306,6 +391,7 @@ where
             update_sender,
             interface,
             discovery_socket: None,
+            discovery_unicast_socket: None,
             unicast_sockets: HashMap::new(),
             session_tracker: SessionTracker::default(),
             service_registry: ServiceRegistry::default(),
@@ -334,6 +420,17 @@ where
                 self.multicast_loopback,
             )?;
             self.discovery_socket = Some(socket);
+            // Receive-only unicast SD socket bound to the interface IP — see
+            // `discovery_unicast_socket`. Best-effort: if the unicast bind
+            // fails, multicast discovery still works (we just lose the
+            // unicast-domain split), so don't fail the whole bind.
+            match SocketManager::bind_discovery_unicast(
+                self.interface,
+                Arc::clone(&self.e2e_registry),
+            ) {
+                Ok(unicast) => self.discovery_unicast_socket = Some(unicast),
+                Err(e) => error!("Failed to bind unicast discovery socket: {e}"),
+            }
             Ok(())
         }
     }
@@ -345,6 +442,9 @@ where
             self.sd_session_id = socket.session_id();
             self.sd_session_has_wrapped =
                 socket.reboot_flag() == crate::protocol::sd::RebootFlag::Continuous;
+            socket.shut_down().await;
+        }
+        if let Some(socket) = self.discovery_unicast_socket.take() {
             socket.shut_down().await;
         }
     }
@@ -732,6 +832,7 @@ where
                     control_receiver,
                     pending_responses,
                     discovery_socket,
+                    discovery_unicast_socket,
                     unicast_sockets,
                     update_sender,
                     request_queue,
@@ -757,81 +858,40 @@ where
                         trace!("Received discovery message: {:?}", discovery);
                         match discovery {
                             Ok((source, someip_header, sd_header)) => {
-                                // Extract session ID from SOME/IP request_id (lower 16 bits)
-                                let session_id = (someip_header.request_id() & 0xFFFF) as u16;
-                                let sd_payload = PayloadDefinitions::new_sd_payload(&sd_header);
-                                // Extract reboot flag from the SD payload flags
-                                let reboot_flag = sd_payload
-                                    .sd_flags()
-                                    .map_or(crate::protocol::sd::RebootFlag::Continuous, |f| {
-                                        f.reboot()
-                                    });
-
-                                // Track sender session/reboot state for every SD entry
-                                // that identifies a service instance, not only
-                                // offer/stop-offer entries. This ensures reboot
-                                // detection works for all SD traffic (FindService,
-                                // Subscribe, SubscribeAck, etc.).
-                                let mut rebooted = false;
-                                for (svc_id, inst_id) in sd_payload.service_instances() {
-                                    let verdict = session_tracker.check(
-                                        source,
-                                        TransportKind::Multicast,
-                                        svc_id,
-                                        inst_id,
-                                        session_id,
-                                        reboot_flag,
-                                    );
-                                    if verdict == SessionVerdict::Reboot {
-                                        rebooted = true;
-                                    }
-                                }
-
-                                // Auto-populate service registry from offer/stop-offer
-                                // SD entries.
-                                for ep in sd_payload.offered_endpoints() {
-                                    let id = ServiceInstanceId {
-                                        service_id: ep.service_id,
-                                        instance_id: ep.instance_id,
-                                    };
-                                    if ep.is_offer {
-                                        if let Some(addr) = ep.addr {
-                                            service_registry.insert(
-                                                id,
-                                                ServiceEndpointInfo {
-                                                    addr,
-                                                    local_port: 0,
-                                                    major_version: ep.major_version,
-                                                    minor_version: ep.minor_version,
-                                                },
-                                            );
-                                            trace!(
-                                                "Registry: added 0x{:04X}.0x{:04X} -> {}",
-                                                ep.service_id, ep.instance_id, addr,
-                                            );
-                                        }
-                                    } else {
-                                        service_registry.remove(id);
-                                        trace!(
-                                            "Registry: removed 0x{:04X}.0x{:04X}",
-                                            ep.service_id, ep.instance_id,
-                                        );
-                                    }
-                                }
-
-                                if rebooted {
-                                    let _ = update_sender.send(ClientUpdate::SenderRebooted(source));
-                                }
-
-                                let discovery_msg = DiscoveryMessage {
+                                process_discovery::<PayloadDefinitions>(
                                     source,
+                                    TransportKind::Multicast,
                                     someip_header,
                                     sd_header,
-                                };
-                                let _ = update_sender.send(ClientUpdate::DiscoveryUpdated(discovery_msg));
+                                    session_tracker,
+                                    service_registry,
+                                    update_sender,
+                                );
                             }
                             Err(err) => {
                                 error!("Error receiving discovery message: {:?}", err);
+                                let _ = update_sender.send(ClientUpdate::Error(err));
+                            }
+                        }
+                     }
+                    // Unicast SD arrives on the interface-IP-bound socket (the
+                    // sensor's separate unicast SD session domain).
+                    unicast_discovery = Inner::receive_discovery(discovery_unicast_socket) => {
+                        trace!("Received unicast discovery message: {:?}", unicast_discovery);
+                        match unicast_discovery {
+                            Ok((source, someip_header, sd_header)) => {
+                                process_discovery::<PayloadDefinitions>(
+                                    source,
+                                    TransportKind::Unicast,
+                                    someip_header,
+                                    sd_header,
+                                    session_tracker,
+                                    service_registry,
+                                    update_sender,
+                                );
+                            }
+                            Err(err) => {
+                                error!("Error receiving unicast discovery message: {:?}", err);
                                 let _ = update_sender.send(ClientUpdate::Error(err));
                             }
                         }

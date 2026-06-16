@@ -115,6 +115,45 @@ where
         })
     }
 
+    /// Bind a receive-only UNICAST service-discovery socket on the SD port,
+    /// bound to the specific `interface` IP — more specific than the multicast
+    /// discovery socket's `INADDR_ANY` bind, so the kernel diverts the sensor's
+    /// unicast SD datagrams here ("most-specific bind wins"). This keeps the
+    /// unicast SD session domain on its own `SessionTracker` key, separate from
+    /// the multicast one, which prevents the interleaved-counter false-reboot
+    /// bug. No multicast group join; outgoing SD still goes via the multicast
+    /// discovery socket, so this socket only ever receives.
+    pub fn bind_discovery_unicast(
+        interface: Ipv4Addr,
+        e2e_registry: Arc<Mutex<E2ERegistry>>,
+    ) -> Result<Self, Error> {
+        let (rx_tx, rx_rx) = mpsc::channel(16);
+        let (tx_tx, tx_rx) = mpsc::channel(16);
+        let bind_addr = std::net::SocketAddr::new(IpAddr::V4(interface), sd::MULTICAST_PORT);
+
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        socket.set_reuse_address(true)?;
+        #[cfg(unix)]
+        socket.set_reuse_port(true)?;
+        socket.bind(&bind_addr.into())?;
+        socket.set_nonblocking(true)?;
+        let socket: std::net::UdpSocket = socket.into();
+        let socket = UdpSocket::from_std(socket)?;
+
+        Self::spawn_socket_loop(socket, rx_tx, tx_rx, e2e_registry);
+        Ok(Self {
+            receiver: rx_rx,
+            sender: tx_tx,
+            local_port: sd::MULTICAST_PORT,
+            session_id: 1,
+            session_has_wrapped: false,
+        })
+    }
+
     pub fn bind(port: u16, e2e_registry: Arc<Mutex<E2ERegistry>>) -> Result<Self, Error> {
         let (rx_tx, rx_rx) = mpsc::channel(4);
         let (tx_tx, tx_rx) = mpsc::channel(4);
