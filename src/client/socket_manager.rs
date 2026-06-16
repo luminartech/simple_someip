@@ -340,12 +340,17 @@ mod tests {
     }
 
     /// Spike for the per-transport SD fix: prove the kernel splits SD
-    /// multicast from unicast across two sockets sharing the SD port —
-    /// one bound to the group address (joined), one bound to INADDR_ANY
-    /// (not joined). The reboot fix relies on this so each transport's
-    /// session counter lands on its own `SessionTracker` key instead of
-    /// colliding. Skips if the host has no usable multicast route (e.g.
-    /// `lo`-only CI) — the authoritative check is the live-sensor run.
+    /// multicast from unicast across two sockets sharing the SD port — the
+    /// multicast socket bound to `INADDR_ANY` + joined (Windows-portable, and
+    /// what the real discovery socket already does), and a more-specific
+    /// socket bound to the host interface IP (not joined). "Most-specific bind
+    /// wins" must divert the sensor's unicast SD to the interface-IP socket,
+    /// leaving the wildcard multicast socket seeing only multicast — so each
+    /// transport's session counter lands on its own `SessionTracker` key
+    /// instead of colliding (the false-reboot bug). No bind-to-group (Windows
+    /// rejects it) and no send-path change required. Skips if the host has no
+    /// usable multicast route (e.g. `lo`-only CI) — the authoritative check is
+    /// the live-sensor run.
     #[test]
     fn dual_socket_splits_multicast_from_unicast() {
         use std::eprintln;
@@ -377,9 +382,11 @@ mod tests {
             out
         };
 
-        // Multicast socket: bound to the GROUP address, joined, loopback on.
+        // Multicast socket: bound to INADDR_ANY (Windows-portable; NOT the
+        // group address) + joined. Tagged Multicast. The more-specific
+        // interface-IP unicast socket below must divert unicast away from it.
         let mc: UdpSocket = match (|| -> std::io::Result<UdpSocket> {
-            let s = bind_reuse(SocketAddr::from((group, port)))?;
+            let s = bind_reuse(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))?;
             s.set_multicast_loop_v4(true)?;
             let s: UdpSocket = s.into();
             s.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)?;
