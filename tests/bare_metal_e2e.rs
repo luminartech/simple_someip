@@ -601,8 +601,8 @@ async fn client_send_request_server_runloop_stable() {
 /// the TC4 build. Same semantics/update procedure as the constants in
 /// src/client/mod.rs; authoritative numbers come from
 /// `tools/capture_type_sizes.sh` (thumbv7em).
-const BM_CLIENT_RUN_FUTURE_BUDGET: usize = 34048; // = ceil64(27208 × 1.25)
-const BM_CLIENT_SOCKET_LOOP_BUDGET: usize = 2816; // = ceil64(2224 × 1.25)
+const BM_CLIENT_RUN_FUTURE_BUDGET: usize = 34048; // = ceil64(27224 × 1.25)
+const BM_CLIENT_SOCKET_LOOP_BUDGET: usize = 1024; // = ceil64(776 × 1.25); receive buffer moved to BufferProvider pool (Tasks 3+4)
 const BM_SERVER_RUN_FUTURE_BUDGET: usize = 9664; // = ceil64(7696 × 1.25)
 
 #[tokio::test]
