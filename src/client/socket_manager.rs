@@ -115,6 +115,49 @@ where
         })
     }
 
+    /// Bind a receive-only UNICAST service-discovery socket on the SD port,
+    /// bound to the specific `interface` IP — more specific than the multicast
+    /// discovery socket's `INADDR_ANY` bind, so the kernel diverts the sensor's
+    /// unicast SD datagrams here ("most-specific bind wins"). This keeps the
+    /// unicast SD session domain on its own `SessionTracker` key, separate from
+    /// the multicast one, which prevents the interleaved-counter false-reboot
+    /// bug. No multicast group join; outgoing SD still goes via the multicast
+    /// discovery socket, so this socket only ever receives.
+    ///
+    /// The returned `SocketManager` still carries a send half and session
+    /// counter for type uniformity, but the discovery layer never drives them
+    /// for this socket: it is receive-only *by usage*, not by type.
+    pub fn bind_discovery_unicast(
+        interface: Ipv4Addr,
+        e2e_registry: Arc<Mutex<E2ERegistry>>,
+    ) -> Result<Self, Error> {
+        let (rx_tx, rx_rx) = mpsc::channel(16);
+        let (tx_tx, tx_rx) = mpsc::channel(16);
+        let bind_addr = std::net::SocketAddr::new(IpAddr::V4(interface), sd::MULTICAST_PORT);
+
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        socket.set_reuse_address(true)?;
+        #[cfg(unix)]
+        socket.set_reuse_port(true)?;
+        socket.bind(&bind_addr.into())?;
+        socket.set_nonblocking(true)?;
+        let socket: std::net::UdpSocket = socket.into();
+        let socket = UdpSocket::from_std(socket)?;
+
+        Self::spawn_socket_loop(socket, rx_tx, tx_rx, e2e_registry);
+        Ok(Self {
+            receiver: rx_rx,
+            sender: tx_tx,
+            local_port: sd::MULTICAST_PORT,
+            session_id: 1,
+            session_has_wrapped: false,
+        })
+    }
+
     pub fn bind(port: u16, e2e_registry: Arc<Mutex<E2ERegistry>>) -> Result<Self, Error> {
         let (rx_tx, rx_rx) = mpsc::channel(4);
         let (tx_tx, tx_rx) = mpsc::channel(4);
@@ -337,6 +380,139 @@ mod tests {
 
     fn test_registry() -> Arc<Mutex<E2ERegistry>> {
         Arc::new(Mutex::new(E2ERegistry::new()))
+    }
+
+    /// Spike for the per-transport SD fix: prove the kernel splits SD
+    /// multicast from unicast across two sockets sharing the SD port — the
+    /// multicast socket bound to `INADDR_ANY` + joined (Windows-portable, and
+    /// what the real discovery socket already does), and a more-specific
+    /// socket bound to the host interface IP (not joined). "Most-specific bind
+    /// wins" must divert the sensor's unicast SD to the interface-IP socket,
+    /// leaving the wildcard multicast socket seeing only multicast — so each
+    /// transport's session counter lands on its own `SessionTracker` key
+    /// instead of colliding (the false-reboot bug). No bind-to-group (Windows
+    /// rejects it) and no send-path change required. Skips if the host has no
+    /// usable multicast route (e.g. `lo`-only CI) — the authoritative check is
+    /// the live-sensor run.
+    #[test]
+    fn dual_socket_splits_multicast_from_unicast() {
+        use std::eprintln;
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+        use std::time::Duration;
+        use std::vec::Vec;
+
+        let group = crate::protocol::sd::MULTICAST_IP;
+
+        let bind_reuse = |addr: SocketAddr| -> std::io::Result<socket2::Socket> {
+            let s = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )?;
+            s.set_reuse_address(true)?;
+            #[cfg(unix)]
+            s.set_reuse_port(true)?;
+            s.bind(&addr.into())?;
+            s.set_read_timeout(Some(Duration::from_millis(400)))?;
+            Ok(s)
+        };
+        let drain = |s: &UdpSocket| -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 64];
+            while let Ok((n, _)) = s.recv_from(&mut buf) {
+                out.push(buf[..n].to_vec());
+            }
+            out
+        };
+
+        // Multicast socket: bound to INADDR_ANY (Windows-portable; NOT the
+        // group address) + joined. Tagged Multicast. The more-specific
+        // interface-IP unicast socket below must divert unicast away from it.
+        let mc: UdpSocket = match (|| -> std::io::Result<UdpSocket> {
+            let s = bind_reuse(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
+            s.set_multicast_loop_v4(true)?;
+            let s: UdpSocket = s.into();
+            s.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)?;
+            Ok(s)
+        })() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("SKIP dual_socket_splits: multicast setup failed ({e})");
+                return;
+            }
+        };
+        // Reuse the OS-assigned ephemeral port for the unicast socket and the
+        // sender target too, so the test never collides with a fixed port that
+        // happens to be in use on a shared CI runner.
+        let port = match mc.local_addr() {
+            Ok(SocketAddr::V4(a)) => a.port(),
+            _ => {
+                eprintln!("SKIP dual_socket_splits: multicast socket has no IPv4 local addr");
+                return;
+            }
+        };
+        // This host's egress IPv4 for the multicast route — the analogue of
+        // the real `interface` arg the discovery socket is bound against.
+        let local_ip = {
+            let probe = UdpSocket::bind("0.0.0.0:0").expect("probe bind");
+            let _ = probe.connect(SocketAddrV4::new(group, port));
+            match probe.local_addr() {
+                Ok(SocketAddr::V4(a)) => *a.ip(),
+                _ => Ipv4Addr::UNSPECIFIED,
+            }
+        };
+        if local_ip.is_unspecified() {
+            eprintln!("SKIP dual_socket_splits: no egress IPv4");
+            return;
+        }
+
+        // Unicast socket: bound to the SPECIFIC host IP (not wildcard), NOT
+        // joined to the group — so it must not receive the group multicast.
+        let uc: UdpSocket = bind_reuse(SocketAddr::from((local_ip, port)))
+            .expect("bind unicast socket")
+            .into();
+
+        let tx: UdpSocket = bind_reuse(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .expect("bind sender")
+            .into();
+        let _ = tx.set_multicast_loop_v4(true);
+        let _ = tx.set_multicast_ttl_v4(1);
+        // A send failure here is an environment issue (no route / permissions),
+        // not a logic regression — surface it as a visible SKIP rather than
+        // letting an empty drain quietly pass the test.
+        if let Err(e) = tx.send_to(b"MCAST", SocketAddrV4::new(group, port)) {
+            eprintln!("SKIP dual_socket_splits: multicast send failed ({e})");
+            return;
+        }
+        if let Err(e) = tx.send_to(b"UCAST", SocketAddrV4::new(local_ip, port)) {
+            eprintln!("SKIP dual_socket_splits: unicast send failed ({e})");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(60));
+
+        let mc_got = drain(&mc);
+        let uc_got = drain(&uc);
+
+        if mc_got.is_empty() {
+            eprintln!("SKIP dual_socket_splits: no multicast route on this host");
+            return;
+        }
+        assert!(
+            mc_got.iter().any(|p| p == b"MCAST"),
+            "mc socket must get the multicast"
+        );
+        assert!(
+            !mc_got.iter().any(|p| p == b"UCAST"),
+            "mc socket (bound to INADDR_ANY) must NOT get the unicast"
+        );
+        assert!(
+            uc_got.iter().any(|p| p == b"UCAST"),
+            "uc socket must get the unicast"
+        );
+        assert!(
+            !uc_got.iter().any(|p| p == b"MCAST"),
+            "uc socket (never joined the group) must NOT get the multicast"
+        );
     }
 
     #[tokio::test]

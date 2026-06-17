@@ -1857,26 +1857,20 @@ mod tests {
         );
         let message = build_sd_message(&sd_header);
 
-        // Send the combined SD message to the server's SD socket from a
-        // fresh client socket and have the server handle exactly one
-        // datagram. We drive `handle_sd_message` directly rather than
-        // `server.run()` so we can assert state after the call.
-        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let sd_addr = match server.sd_socket.local_addr().unwrap() {
-            std::net::SocketAddr::V4(v4) => v4,
-            std::net::SocketAddr::V6(_) => panic!("expected v4 sd socket"),
-        };
-        client_socket.send_to(&message, sd_addr).await.unwrap();
-
-        let mut buf = vec![0u8; 65_535];
-        let (len, sender) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            server.sd_socket.recv_from(&mut buf),
-        )
-        .await
-        .expect("timeout receiving combined SD packet")
-        .unwrap();
-        let view = MessageView::parse(&buf[..len]).unwrap();
+        // Parse the combined SD datagram in-memory and drive
+        // `handle_sd_message` directly rather than `server.run()`, so we can
+        // assert state after the call.
+        //
+        // This previously round-tripped `message` through the server's SD
+        // socket to obtain the sender addr. But every test server binds the
+        // same fixed `127.0.0.1:30490` with `SO_REUSEADDR`; under parallel test
+        // execution Windows delivers the unicast to a different bound socket, so
+        // the `recv_from` timed out. The sender addr is not asserted here (the
+        // subscriber endpoint must come from the SubscribeEventGroup's
+        // `options[1]`), so a synthetic sender keeps the test hermetic and
+        // cross-platform.
+        let sender = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 54321));
+        let view = MessageView::parse(&message).unwrap();
         let sd_view = view.sd_header().unwrap();
         server.handle_sd_message(&sd_view, sender).await.unwrap();
 
