@@ -606,7 +606,7 @@ async fn client_send_request_server_runloop_stable() {
 /// `tools/capture_type_sizes.sh` (thumbv7em).
 const BM_CLIENT_RUN_FUTURE_BUDGET: usize = 34048; // = ceil64(27224 × 1.25)
 const BM_CLIENT_SOCKET_LOOP_BUDGET: usize = 1024; // = ceil64(776 × 1.25); receive buffer moved to BufferProvider pool (Tasks 3+4)
-const BM_SERVER_RUN_FUTURE_BUDGET: usize = 9664; // = ceil64(7696 × 1.25)
+const BM_SERVER_RUN_FUTURE_BUDGET: usize = 4416; // = ceil64(3528 × 1.25); send buffers moved to caller scratch (PR3 T2+T3)
 
 #[tokio::test]
 async fn future_size_witness_bare_metal_channels() {
@@ -992,7 +992,7 @@ async fn binding_sockets_claims_one_buffer_each_until_pool_exhausted() {
 /// - Buffer slot: 40 bytes.
 ///
 /// Pre-guard (unprotected) : 36 ≤ 40 → passes.
-/// Post-protect guard (before fix): 48 > UDP_BUFFER_SIZE (1400) → false → no guard fires.
+/// Post-protect guard (before fix): 48 > UDP_BUFFER_SIZE (1500) → false → no guard fires.
 /// `copy_from_slice` into buf[16..48] on a 40-byte buf → out-of-bounds panic (RED).
 ///
 /// Post-protect guard (after fix): 48 > 40 → true → `Capacity` error returned (GREEN).
@@ -1124,7 +1124,7 @@ fn empty_vec_sd_header() -> simple_someip::VecSdHeader {
 /// - Both scratch buffers: 40 bytes each.
 ///
 /// Pre-guard (unprotected) : 36 ≤ 40 → passes.
-/// Post-protect guard (before fix): 48 > UDP_BUFFER_SIZE (1400) → false → no guard fires.
+/// Post-protect guard (before fix): 48 > UDP_BUFFER_SIZE (1500) → false → no guard fires.
 /// `copy_from_slice` into msg_buf[16..48] on a 40-byte buf → out-of-bounds panic (RED).
 ///
 /// Post-protect guard (after fix): 48 > 40 → true → `Capacity` returned (GREEN).
