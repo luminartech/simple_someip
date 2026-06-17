@@ -184,3 +184,7 @@ harness = false
 [[test]]
 name = "bare_metal_e2e"
 required-features = ["client", "server", "bare_metal"]
+
+[[test]]
+name = "buffer_pool"
+required-features = ["bare_metal"]
