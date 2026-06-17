@@ -58,7 +58,8 @@ use simple_someip::define_static_channels;
 use simple_someip::e2e::E2ERegistry;
 use simple_someip::protocol::sd::RebootFlag;
 use simple_someip::server::{ServerConfig, SubscribeError, Subscriber, SubscriptionHandle};
-use simple_someip::transport::{LocalSpawner, Timer};
+use simple_someip::static_channels::BufferPool;
+use simple_someip::transport::{LocalSpawner, StaticBufferProvider, Timer};
 use simple_someip::{Client, ClientDeps, RawPayload, Server, ServerDeps};
 use simple_someip_embassy_net::{EmbassyNetFactory, EmbassyNetSocket, LINK_MTU, SocketPool};
 
@@ -410,12 +411,15 @@ async fn main() {
             let client_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
             let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(IP_B));
 
+            let buf_pool: &'static BufferPool<8, LINK_MTU> =
+                Box::leak(Box::new(BufferPool::new()));
             let client_deps = ClientDeps {
                 factory: client_factory,
                 spawner: LocalTokioSpawner,
                 timer: LocalTimer,
                 e2e_registry: client_e2e,
                 interface: client_iface,
+                buffer_provider: StaticBufferProvider(buf_pool),
             };
 
             let (client, mut updates, run_fut) = Client::<
