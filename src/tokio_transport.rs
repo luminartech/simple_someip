@@ -549,6 +549,39 @@ impl<T: Send + 'static> crate::transport::UnboundedPooled<TokioChannels> for T {
     }
 }
 
+// ── TokioBufferProvider ───────────────────────────────────────────────────
+
+use std::boxed::Box;
+
+use crate::buffer_pool::{BufferLease, BufferPool};
+use crate::transport::BufferProvider;
+
+/// Tokio-path buffer provider: a single leaked `BufferPool` sized at
+/// `UNICAST_SOCKETS_CAP + 1` × `UDP_BUFFER_SIZE` (one per possible socket
+/// plus discovery). Leaking is fine — a client process holds one for its
+/// lifetime; the API hides it entirely from callers.
+#[derive(Clone, Copy, Debug)]
+pub struct TokioBufferProvider(&'static BufferPool<9, { crate::UDP_BUFFER_SIZE }>);
+
+impl TokioBufferProvider {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Box::leak(Box::new(BufferPool::new())))
+    }
+}
+
+impl Default for TokioBufferProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BufferProvider for TokioBufferProvider {
+    fn claim(&self) -> Option<BufferLease> {
+        self.0.claim()
+    }
+}
+
 // ── EmbassySyncChannels (extracted) ──────────────────────────────────────
 //
 // The bare-metal `ChannelFactory` impl previously lived here as a sub-

@@ -1360,6 +1360,33 @@ pub trait UnboundedPooled<C: ChannelFactory>: Send + Sized + 'static {
     fn unbounded_pair() -> (C::UnboundedSender<Self>, C::UnboundedReceiver<Self>);
 }
 
+// ── BufferProvider ────────────────────────────────────────────────────────
+
+use crate::buffer_pool::{BufferLease, BufferPool};
+
+/// Source of `&'static mut [u8]` receive/scratch buffers for the client's
+/// socket loops. Mirrors [`ChannelFactory`]'s role for channels: the
+/// bare-metal path is backed by a consumer-declared `static BufferPool`;
+/// the tokio path is heap-backed and provisioned internally.
+pub trait BufferProvider: Clone + Send + Sync + 'static {
+    /// Claim one buffer, or `None` when the pool is exhausted.
+    fn claim(&self) -> Option<BufferLease>;
+}
+
+/// `BufferProvider` backed by a `'static` [`BufferPool`] (bare-metal path).
+#[derive(Clone, Copy, Debug)]
+pub struct StaticBufferProvider<const SLOTS: usize, const LEN: usize>(
+    pub &'static BufferPool<SLOTS, LEN>,
+);
+
+impl<const SLOTS: usize, const LEN: usize> BufferProvider
+    for StaticBufferProvider<SLOTS, LEN>
+{
+    fn claim(&self) -> Option<BufferLease> {
+        self.0.claim()
+    }
+}
+
 /// Zero-behavior implementations of the client- and server-side
 /// dependency traits. Two uses: (1) compile-time proof the trait
 /// signatures are implementable without async machinery, (2)

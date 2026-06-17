@@ -48,8 +48,10 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-mod buffer_pool;
-pub use buffer_pool::{BufferLease, BufferPool};
+// `BufferPool` and `BufferLease` live in `crate::buffer_pool` (ungated, so
+// the tokio path can reach them without the `bare_metal` feature). Re-export
+// them here so existing `static_channels::BufferPool` paths keep working.
+pub use crate::buffer_pool::{BufferLease, BufferPool};
 
 use core::cell::{Cell, RefCell};
 use core::future::{Future, poll_fn};
