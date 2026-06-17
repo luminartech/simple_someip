@@ -551,24 +551,28 @@ impl<T: Send + 'static> crate::transport::UnboundedPooled<TokioChannels> for T {
 
 // ── TokioBufferProvider ───────────────────────────────────────────────────
 
-// `Box` is not in scope by default: the crate is `#![no_std]`, so std-gated
-// modules still import it explicitly (it is NOT a redundant import).
-use std::boxed::Box;
+use std::sync::Arc;
 
 use crate::buffer_pool::{BufferLease, BufferPool};
 use crate::transport::BufferProvider;
 
-/// Tokio-path buffer provider: a single leaked `BufferPool` sized at
-/// `UNICAST_SOCKETS_CAP + 1` × `UDP_BUFFER_SIZE` (one per possible socket
-/// plus discovery). Leaking is fine — a client process holds one for its
-/// lifetime; the API hides it entirely from callers.
-#[derive(Clone, Copy, Debug)]
-pub struct TokioBufferProvider(&'static BufferPool<9, { crate::UDP_BUFFER_SIZE }>);
+/// Tokio-path buffer provider: a single `Arc`-backed `BufferPool` sized at
+/// 10 × `UDP_BUFFER_SIZE`. That is `UNICAST_SOCKETS_CAP (8) + 1 discovery + 1`
+/// release-lag slot: the unicast-eviction path frees a buffer lease
+/// asynchronously (when the spawned loop future drops), lagging the
+/// synchronous registry removal, so an evict-then-immediate-rebind can
+/// transiently need one extra slot. The pool is reference-counted, not leaked
+/// — it is freed when the last [`BufferLease`] and the last provider clone
+/// drop. Cloning a provider shares the same `Arc` (one provider per `Client`).
+#[derive(Clone, Debug)]
+pub struct TokioBufferProvider(Arc<BufferPool<10, { crate::UDP_BUFFER_SIZE }>>);
 
 impl TokioBufferProvider {
     #[must_use]
     pub fn new() -> Self {
-        Self(Box::leak(Box::new(BufferPool::new())))
+        // One heap allocation for the pool; no leak. Frees when the last
+        // lease + provider drop.
+        Self(Arc::new(BufferPool::new()))
     }
 }
 
@@ -580,7 +584,7 @@ impl Default for TokioBufferProvider {
 
 impl BufferProvider for TokioBufferProvider {
     fn claim(&self) -> Option<BufferLease> {
-        self.0.claim()
+        self.0.claim_arc()
     }
 }
 
