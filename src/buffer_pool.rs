@@ -92,6 +92,15 @@ impl<const SLOTS: usize, const LEN: usize> Default for BufferPool<SLOTS, LEN> {
     }
 }
 
+impl<const SLOTS: usize, const LEN: usize> core::fmt::Debug for BufferPool<SLOTS, LEN> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BufferPool")
+            .field("slots", &SLOTS)
+            .field("len", &LEN)
+            .finish_non_exhaustive()
+    }
+}
+
 /// RAII handle to one claimed buffer from a [`BufferPool`].
 ///
 /// Derefs to `[u8]` for read/write access. Returns the slot to its pool on

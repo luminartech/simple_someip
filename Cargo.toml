@@ -187,4 +187,3 @@ required-features = ["client", "server", "bare_metal"]
 
 [[test]]
 name = "buffer_pool"
-required-features = ["bare_metal"]

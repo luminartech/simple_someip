@@ -1,4 +1,5 @@
-use simple_someip::static_channels::BufferPool;
+use simple_someip::buffer_pool::BufferPool;
+use simple_someip::transport::{BufferProvider, StaticBufferProvider};
 
 // One pool per test: a shared `static` would let libtest's parallel threads
 // race (one test claiming both slots makes the other's claim spuriously fail).
@@ -21,4 +22,14 @@ fn dropping_a_lease_returns_its_slot() {
     let a = POOL_RETURN.claim().expect("slot");
     drop(a);
     assert!(POOL_RETURN.claim().is_some(), "slot must be reusable after the lease drops");
+}
+
+static PROV_POOL: BufferPool<2, 8> = BufferPool::new();
+
+#[test]
+fn static_provider_claims_through_a_shared_pool() {
+    let prov = StaticBufferProvider(&PROV_POOL);
+    let _a = prov.claim().expect("first");
+    let _b = prov.claim().expect("second");
+    assert!(prov.claim().is_none(), "provider exposes the pool's capacity");
 }
