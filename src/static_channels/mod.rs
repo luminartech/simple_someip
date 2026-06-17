@@ -48,6 +48,9 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+mod buffer_pool;
+pub use buffer_pool::{BufferLease, BufferPool};
+
 use core::cell::{Cell, RefCell};
 use core::future::{Future, poll_fn};
 use core::pin::Pin;
