@@ -1230,7 +1230,7 @@ where
     /// 1-Hz `OfferService` announcement loop. The two are combined
     /// into a single future so callers cannot forget to spawn the
     /// announcement side; passing
-    /// [`ServerConfig::with_announce`]`(false)` suppresses the
+    /// [`ServerConfig::with_announce`] with `false` suppresses the
     /// announcement arm for dispatcher topologies where a co-located
     /// `Client` drives SD on the server's behalf.
     ///

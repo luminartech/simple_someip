@@ -341,10 +341,11 @@ impl
     /// Build a `ClientDeps` with the tokio defaults.
     ///
     /// `buffer_provider` is a single `TokioBufferProvider::new()`
-    /// constructed here exactly once. `TokioBufferProvider::new()` does
-    /// a `Box::leak`, so it MUST be one-per-client and never called on a
-    /// per-bind / hot path — this constructor is the canonical single
-    /// call site for the tokio path.
+    /// constructed here exactly once. It is `Arc`-backed (the pool is freed
+    /// when the last provider/lease drops — not leaked); keeping it
+    /// one-per-client shares that pool and avoids a fresh heap allocation on
+    /// every bind, so it should not be reconstructed on a per-bind / hot
+    /// path — this constructor is the canonical single call site.
     #[must_use]
     pub fn tokio(interface: Ipv4Addr) -> Self {
         Self {
@@ -691,8 +692,10 @@ where
                 interface: Arc::new(RwLock::new(interface)),
                 spawner,
                 // One `TokioBufferProvider::new()` per client construction.
-                // It `Box::leak`s internally, so it must not be moved to a
-                // per-bind path; this single call covers every `bind_*`.
+                // It is `Arc`-backed (freed when the last provider/lease
+                // drops); keeping it one-per-client shares the pool and
+                // avoids a per-bind heap allocation. This single call
+                // covers every `bind_*`.
                 buffer_provider: crate::tokio_transport::TokioBufferProvider::new(),
             },
             multicast_loopback,

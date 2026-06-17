@@ -879,9 +879,9 @@ mod tests {
     }
 
     /// Claim a single socket-loop buffer for a direct `bind_with_transport`
-    /// call in these unit tests. Each call leaks one small `BufferPool`
-    /// (acceptable in a test); production paths claim from one shared
-    /// provider per client.
+    /// call in these unit tests. Each call builds a fresh `Arc`-backed
+    /// `TokioBufferProvider` (the pool is freed when the lease drops — no
+    /// leak); production paths claim from one shared provider per client.
     fn test_buf() -> crate::buffer_pool::BufferLease {
         use crate::tokio_transport::TokioBufferProvider;
         use crate::transport::BufferProvider;

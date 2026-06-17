@@ -289,17 +289,19 @@ use crate::static_channels::{BufferLease, BufferPool};
 use crate::transport::BufferProvider;
 use crate::UDP_BUFFER_SIZE;
 
-/// Tokio-path buffer provider: a single leaked `BufferPool` sized at
-/// `UNICAST_SOCKETS_CAP + 1` × `UDP_BUFFER_SIZE` (one per possible socket
-/// plus discovery). Leaking is fine — a client process holds one for its
-/// lifetime; the API hides it entirely from callers.
-#[derive(Clone, Copy, Debug)]
-pub struct TokioBufferProvider(&'static BufferPool<9, UDP_BUFFER_SIZE>);
+/// Tokio-path buffer provider: a single `Arc`-backed `BufferPool` sized at
+/// `UNICAST_SOCKETS_CAP + 1 (discovery) + 1 (release-lag slack)` ×
+/// `UDP_BUFFER_SIZE`. `Arc`-backed, NOT leaked — the pool is freed when the
+/// last provider/lease drops; the API hides it entirely from callers.
+/// (Rev: the original sketch used `Box::leak`; the merged implementation is
+/// `Arc`-backed so dynamically-created clients don't leak a pool each.)
+#[derive(Clone, Debug)]
+pub struct TokioBufferProvider(alloc::sync::Arc<BufferPool<10, UDP_BUFFER_SIZE>>);
 
 impl TokioBufferProvider {
     #[must_use]
     pub fn new() -> Self {
-        Self(Box::leak(Box::new(BufferPool::new())))
+        Self(alloc::sync::Arc::new(BufferPool::new()))
     }
 }
 

@@ -1277,6 +1277,22 @@ async fn publish_raw_event_with_undersized_buf_returns_capacity_not_panic() {
         matches!(result, Err(ServerError::Capacity("udp_buffer"))),
         "expected Err(Capacity(\"udp_buffer\")), got {result:?}"
     );
+
+    // #133 review: empty payload + sub-header buffer must ALSO return
+    // Capacity (not a protocol I/O error). The `payload.len() >
+    // buf.len() - 16` guard saturates to `0 > 0` = false here, so this
+    // path relies on the explicit `buf.len() < 16` guard.
+    let mut tiny = [0u8; 10];
+    let empty: [u8; 0] = [];
+    let result = publisher
+        .publish_raw_event_with_buffers(
+            0xABCD, 1, 0x01, 0x8001, 0x0001_0001, 1, 1, &empty, &mut tiny,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(ServerError::Capacity("udp_buffer"))),
+        "sub-16 buffer + empty payload must Capacity, got {result:?}"
+    );
 }
 
 /// Task 4 future-size witness: measure the size of a `publish_event_with_buffers`

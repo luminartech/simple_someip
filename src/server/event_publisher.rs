@@ -365,6 +365,19 @@ where
         // larger than `u32::MAX as usize - 8`. The `16` here is the
         // SOME/IP header size in bytes. Guard is keyed off `buf.len()`
         // (not `UDP_BUFFER_SIZE`) — the PR-2 lesson applied here too.
+        //
+        // Guard `buf.len() < 16` explicitly: with an empty payload and a
+        // sub-header buffer, the `payload.len() > buf.len() - 16` check
+        // below (saturating to 0) would not fire, and `encode_to_slice`
+        // would then surface a protocol I/O error instead of the typed
+        // `Capacity`. (#133 review.)
+        if buf.len() < 16 {
+            crate::log::error!(
+                "raw event buffer ({} bytes) too small for the 16-byte SOME/IP header; dropping publish",
+                buf.len()
+            );
+            return Err(Error::Capacity("udp_buffer"));
+        }
         if payload.len() > buf.len().saturating_sub(16) {
             crate::log::error!(
                 "raw event payload ({} bytes) + 16-byte header exceeds buf.len() ({}); dropping publish",
