@@ -966,6 +966,105 @@ async fn binding_sockets_claims_one_buffer_each_until_pool_exhausted() {
     run_handle.abort();
 }
 
+/// Task 5 (regression): E2E-protected send whose expanded payload exceeds the
+/// leased buffer (but not `UDP_BUFFER_SIZE`) must return
+/// `Err(Error::Capacity("udp_buffer"))`, not panic.
+///
+/// # Why the window is deterministic
+///
+/// Profile 4 protect prepends a 12-byte E2E header.  With a 20-byte payload:
+/// - Unprotected SOME/IP frame: 16 (header) + 20 (payload) = 36 bytes.
+/// - Post-protect SOME/IP frame: 16 (header) + (12 + 20) (P4 output) = 48 bytes.
+/// - Buffer slot: 40 bytes.
+///
+/// Pre-guard (unprotected) : 36 ≤ 40 → passes.
+/// Post-protect guard (before fix): 48 > UDP_BUFFER_SIZE (1400) → false → no guard fires.
+/// `copy_from_slice` into buf[16..48] on a 40-byte buf → out-of-bounds panic (RED).
+///
+/// Post-protect guard (after fix): 48 > 40 → true → `Capacity` error returned (GREEN).
+#[tokio::test]
+async fn e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_error() {
+    // 40-byte slots: big enough for the 36-byte unprotected frame but not
+    // for the 48-byte post-P4-protect frame.
+    const BUF_LEN: usize = 40;
+    static POOL: BufferPool<4, BUF_LEN> = BufferPool::new();
+
+    let network = SharedNetwork::new();
+    let client_factory = MockFactory {
+        tx_pipe: Arc::clone(&network.client_to_server),
+        rx_pipe: Arc::clone(&network.server_to_client),
+        next_port: Arc::new(Mutex::new(200)),
+    };
+
+    let client_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(Ipv4Addr::LOCALHOST));
+    let deps = ClientDeps {
+        factory: client_factory,
+        spawner: TokioBackedSpawner,
+        timer: MockTimer,
+        e2e_registry: client_e2e,
+        interface: client_iface,
+        buffer_provider: StaticBufferProvider(&POOL),
+    };
+    let (client, _updates, run_fut) = Client::<
+        RawPayload,
+        Arc<Mutex<E2ERegistry>>,
+        Arc<RwLock<Ipv4Addr>>,
+        E2ETestChannels,
+    >::new_with_deps(deps, false);
+    let run_handle = tokio::spawn(run_fut);
+
+    // Register E2E Profile 4 for service 0xABCD, method 0x0001.
+    // Profile 4 adds 12 bytes of header to every protected payload.
+    let service_id: u16 = 0xABCD;
+    let method_id: u16 = 0x0001;
+    let e2e_key = simple_someip::E2EKey::new(service_id, method_id);
+    client
+        .register_e2e(
+            e2e_key,
+            simple_someip::E2EProfile::Profile4(simple_someip::e2e::Profile4Config::new(
+                0xDEAD_BEEF,
+                15,
+            )),
+        )
+        .expect("register E2E key");
+
+    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30800);
+    client
+        .add_endpoint(service_id, 1, server_addr, 42000)
+        .await
+        .expect("add_endpoint");
+
+    // 20-byte payload: unprotected frame = 36 B ≤ 40 B (fits buf), but
+    // post-protect frame = 48 B > 40 B (exceeds buf).
+    let payload_bytes = [0x55u8; 20];
+    let msg_id = MessageId::new_from_service_and_method(service_id, method_id);
+    let payload = RawPayload::from_payload_bytes(msg_id, &payload_bytes).expect("create payload");
+    let request = Message::<RawPayload>::new(
+        Header::new(
+            msg_id,
+            0x0001_0001,
+            1,
+            1,
+            MessageTypeField::new(MessageType::Request, false),
+            ReturnCode::Ok,
+            payload_bytes.len(),
+        ),
+        payload,
+    );
+
+    let result = client.send_to_service(service_id, 1, request).await;
+
+    // Must return typed Capacity error — not panic.
+    assert!(
+        matches!(result, Err(ClientError::Capacity("udp_buffer"))),
+        "expected Err(Capacity(\"udp_buffer\")), got {result:?}"
+    );
+
+    client.shut_down();
+    run_handle.abort();
+}
+
 /// An empty `VecSdHeader` for building a minimal valid SD message.
 fn empty_vec_sd_header() -> simple_someip::VecSdHeader {
     use simple_someip::protocol::sd::{Flags, RebootFlag};
