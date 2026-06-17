@@ -26,7 +26,12 @@ use super::{Error, ServerConfig};
 
 /// Send a unicast `OfferService` to a specific address (typically in
 /// response to a `FindService`).
+///
+/// `buf` is a caller-provided scratch buffer used for encoding the outgoing
+/// frame. Returns [`Error::Capacity`]`("udp_buffer")` if the encoded frame
+/// does not fit in `buf`.
 pub(super) async fn send_unicast_offer<T>(
+    buf: &mut [u8],
     config: &ServerConfig,
     sd_socket: &T,
     sd_state: &SdStateManager,
@@ -60,14 +65,24 @@ where
     let (sid, reboot_flag) = sd_state.next_session_id_with_reboot_flag();
     let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &options);
 
-    let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
-    let sd_data_len = sd_payload.encode_to_slice(&mut buffer[16..])?;
-    let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
-    someip_header.encode_to_slice(&mut buffer[..16])?;
+    // Guard: SOME/IP header needs 16 bytes; SD payload needs the rest.
+    if buf.len() < 16 {
+        return Err(Error::Capacity("udp_buffer"));
+    }
+    let sd_data_len = sd_payload
+        .encode_to_slice(&mut buf[16..])
+        .map_err(|_| Error::Capacity("udp_buffer"))?;
     let total_len = 16 + sd_data_len;
+    if total_len > buf.len() {
+        return Err(Error::Capacity("udp_buffer"));
+    }
+    let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
+    someip_header
+        .encode_to_slice(&mut buf[..16])
+        .map_err(|_| Error::Capacity("udp_buffer"))?;
 
     let target_v4 = socket_addr_v4(target)?;
-    sd_socket.send_to(&buffer[..total_len], target_v4).await?;
+    sd_socket.send_to(&buf[..total_len], target_v4).await?;
     crate::log::debug!(
         "Sent unicast OfferService to {} for service 0x{:04X}",
         target,
@@ -78,7 +93,12 @@ where
 }
 
 /// Send `SubscribeAck` derived from a peer's `Subscribe` entry view.
+///
+/// `buf` is a caller-provided scratch buffer used for encoding the outgoing
+/// frame. Returns [`Error::Capacity`]`("udp_buffer")` if the encoded frame
+/// does not fit in `buf`.
 pub(super) async fn send_subscribe_ack_from_view<T>(
+    buf: &mut [u8],
     config: &ServerConfig,
     sd_socket: &T,
     sd_state: &SdStateManager,
@@ -107,15 +127,25 @@ where
     let (sid, reboot_flag) = sd_state.next_session_id_with_reboot_flag();
     let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &[]);
 
-    let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
-    let sd_data_len = sd_payload.encode_to_slice(&mut buffer[16..])?;
-    let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
-    someip_header.encode_to_slice(&mut buffer[..16])?;
+    // Guard: SOME/IP header needs 16 bytes; SD payload needs the rest.
+    if buf.len() < 16 {
+        return Err(Error::Capacity("udp_buffer"));
+    }
+    let sd_data_len = sd_payload
+        .encode_to_slice(&mut buf[16..])
+        .map_err(|_| Error::Capacity("udp_buffer"))?;
     let total_len = 16 + sd_data_len;
+    if total_len > buf.len() {
+        return Err(Error::Capacity("udp_buffer"));
+    }
+    let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
+    someip_header
+        .encode_to_slice(&mut buf[..16])
+        .map_err(|_| Error::Capacity("udp_buffer"))?;
 
     let subscriber_v4 = socket_addr_v4(subscriber)?;
     sd_socket
-        .send_to(&buffer[..total_len], subscriber_v4)
+        .send_to(&buf[..total_len], subscriber_v4)
         .await?;
 
     crate::log::debug!(
@@ -129,7 +159,12 @@ where
 }
 
 /// Send `SubscribeNack` (`SubscribeAckEventGroup` with `ttl = 0`).
+///
+/// `buf` is a caller-provided scratch buffer used for encoding the outgoing
+/// frame. Returns [`Error::Capacity`]`("udp_buffer")` if the encoded frame
+/// does not fit in `buf`.
 pub(super) async fn send_subscribe_nack_from_view<T>(
+    buf: &mut [u8],
     _config: &ServerConfig,
     sd_socket: &T,
     sd_state: &SdStateManager,
@@ -159,15 +194,25 @@ where
     let (sid, reboot_flag) = sd_state.next_session_id_with_reboot_flag();
     let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &[]);
 
-    let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
-    let sd_data_len = sd_payload.encode_to_slice(&mut buffer[16..])?;
-    let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
-    someip_header.encode_to_slice(&mut buffer[..16])?;
+    // Guard: SOME/IP header needs 16 bytes; SD payload needs the rest.
+    if buf.len() < 16 {
+        return Err(Error::Capacity("udp_buffer"));
+    }
+    let sd_data_len = sd_payload
+        .encode_to_slice(&mut buf[16..])
+        .map_err(|_| Error::Capacity("udp_buffer"))?;
     let total_len = 16 + sd_data_len;
+    if total_len > buf.len() {
+        return Err(Error::Capacity("udp_buffer"));
+    }
+    let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
+    someip_header
+        .encode_to_slice(&mut buf[..16])
+        .map_err(|_| Error::Capacity("udp_buffer"))?;
 
     let subscriber_v4 = socket_addr_v4(subscriber)?;
     sd_socket
-        .send_to(&buffer[..total_len], subscriber_v4)
+        .send_to(&buf[..total_len], subscriber_v4)
         .await?;
 
     crate::log::warn!(
@@ -197,6 +242,13 @@ where
 {
     crate::log::trace!("Handling SD message from {}", sender);
 
+    // TASK 3 will thread the real caller-owned scratch buffer through
+    // `recv_loop` into this function. Until then a single local scratch
+    // is reused across every SD send below — one `[u8; UDP_BUFFER_SIZE]`
+    // in the future frame, matching the pre-Task-1 footprint (each helper
+    // previously owned its own copy, but only ever one at a time).
+    let mut scratch = [0u8; crate::UDP_BUFFER_SIZE];
+
     for entry_view in sd_view.entries() {
         let entry_type = entry_view.entry_type()?;
         match entry_type {
@@ -215,7 +267,9 @@ where
                         config.service_id,
                         entry_view.service_id()
                     );
+                    // TASK 3 will thread the real scratch buffer from recv_loop.
                     send_subscribe_nack_from_view(
+                        &mut scratch,
                         config,
                         sd_socket,
                         sd_state,
@@ -230,7 +284,9 @@ where
                         config.instance_id,
                         entry_view.instance_id()
                     );
+                    // TASK 3 will thread the real scratch buffer from recv_loop.
                     send_subscribe_nack_from_view(
+                        &mut scratch,
                         config,
                         sd_socket,
                         sd_state,
@@ -245,7 +301,9 @@ where
                         config.major_version,
                         entry_view.major_version()
                     );
+                    // TASK 3 will thread the real scratch buffer from recv_loop.
                     if let Err(e) = send_subscribe_nack_from_view(
+                        &mut scratch,
                         config,
                         sd_socket,
                         sd_state,
@@ -263,7 +321,9 @@ where
                         entry_view.event_group_id(),
                         entry_view.service_id()
                     );
+                    // TASK 3 will thread the real scratch buffer from recv_loop.
                     if let Err(e) = send_subscribe_nack_from_view(
+                        &mut scratch,
                         config,
                         sd_socket,
                         sd_state,
@@ -298,7 +358,9 @@ where
 
                         match subscribe_result {
                             Ok(()) => {
+                                // TASK 3 will thread the real scratch buffer from recv_loop.
                                 if let Err(e) = send_subscribe_ack_from_view(
+                                    &mut scratch,
                                     config,
                                     sd_socket,
                                     sd_state,
@@ -333,7 +395,9 @@ where
                                     SubscribeError::EventGroupsFull => "event_groups_full",
                                 };
                                 crate::log::debug!("Subscription rejected: {reason}");
+                                // TASK 3 will thread the real scratch buffer from recv_loop.
                                 if let Err(e) = send_subscribe_nack_from_view(
+                                    &mut scratch,
                                     config,
                                     sd_socket,
                                     sd_state,
@@ -349,7 +413,9 @@ where
                         }
                     } else {
                         crate::log::warn!("No endpoint found in Subscribe message options");
+                        // TASK 3 will thread the real scratch buffer from recv_loop.
                         if let Err(e) = send_subscribe_nack_from_view(
+                            &mut scratch,
                             config,
                             sd_socket,
                             sd_state,
@@ -373,7 +439,16 @@ where
                         find_service_id,
                         config.service_id
                     );
-                    if let Err(e) = send_unicast_offer(config, sd_socket, sd_state, sender).await {
+                    // TASK 3 will thread the real scratch buffer from recv_loop.
+                    if let Err(e) = send_unicast_offer(
+                        &mut scratch,
+                        config,
+                        sd_socket,
+                        sd_state,
+                        sender,
+                    )
+                    .await
+                    {
                         crate::log::warn!("Unicast OfferService send failed: {e}");
                     }
                 } else {
@@ -710,5 +785,291 @@ pub(super) fn extract_subscriber_endpoint(
             );
             Some(ep)
         }
+    }
+}
+
+// ── Unit tests for SD send helpers ───────────────────────────────────────────
+//
+// These tests live in `runtime.rs` (rather than `tests/bare_metal_e2e.rs`)
+// because the three helpers are `pub(super)` and are not reachable from
+// integration-test crates.  Task 3 will expose a public surface (via
+// `run_with_buffers` threading the real scratch) that integration tests can
+// exercise end-to-end; until then, the helper-level contract is verified here.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use core::net::{Ipv4Addr, SocketAddrV4};
+
+    use crate::transport::{ReceivedDatagram, TransportError, TransportSocket};
+
+    // ── Minimal no-op mock socket ─────────────────────────────────────────
+
+    struct NullSocket;
+
+    struct NullSend;
+    impl core::future::Future for NullSend {
+        type Output = Result<(), TransportError>;
+        fn poll(
+            self: core::pin::Pin<&mut Self>,
+            _cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<Self::Output> {
+            core::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    struct NullRecv;
+    impl core::future::Future for NullRecv {
+        type Output = Result<ReceivedDatagram, TransportError>;
+        fn poll(
+            self: core::pin::Pin<&mut Self>,
+            _cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<Self::Output> {
+            core::task::Poll::Pending
+        }
+    }
+
+    impl TransportSocket for NullSocket {
+        type SendFuture<'a> = NullSend;
+        type RecvFuture<'a> = NullRecv;
+
+        fn send_to<'a>(&'a self, _buf: &'a [u8], _target: SocketAddrV4) -> Self::SendFuture<'a> {
+            NullSend
+        }
+        fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+            NullRecv
+        }
+        fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
+            Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        }
+        fn join_multicast_v4(
+            &self,
+            _group: Ipv4Addr,
+            _iface: Ipv4Addr,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn leave_multicast_v4(
+            &self,
+            _group: Ipv4Addr,
+            _iface: Ipv4Addr,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    fn make_config() -> ServerConfig {
+        ServerConfig::new(0x1234, 1)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(30500)
+    }
+
+    fn make_sd_state() -> SdStateManager {
+        SdStateManager::new()
+    }
+
+    fn subscriber_addr() -> core::net::SocketAddr {
+        core::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 40000))
+    }
+
+    // ── Task 1 RED/GREEN: undersized buf rejects with Capacity, not panic ─
+
+    /// `send_unicast_offer` with a 24-byte buf (fits 16-byte header but
+    /// not the SD payload) must return `Err(Capacity("udp_buffer"))`.
+    #[tokio::test]
+    async fn send_unicast_offer_undersized_buf_returns_capacity() {
+        let config = make_config();
+        let sd_state = make_sd_state();
+        let socket = NullSocket;
+        let target = subscriber_addr();
+
+        let result =
+            send_unicast_offer(&mut [0u8; 24], &config, &socket, &sd_state, target).await;
+
+        assert!(
+            matches!(result, Err(Error::Capacity("udp_buffer"))),
+            "expected Capacity(\"udp_buffer\"), got {result:?}"
+        );
+    }
+
+    /// `send_unicast_offer` with a buf shorter than the 16-byte SOME/IP
+    /// header must return `Err(Capacity("udp_buffer"))`.
+    #[tokio::test]
+    async fn send_unicast_offer_buf_shorter_than_header_returns_capacity() {
+        let config = make_config();
+        let sd_state = make_sd_state();
+        let socket = NullSocket;
+        let target = subscriber_addr();
+
+        let result =
+            send_unicast_offer(&mut [0u8; 8], &config, &socket, &sd_state, target).await;
+
+        assert!(
+            matches!(result, Err(Error::Capacity("udp_buffer"))),
+            "expected Capacity(\"udp_buffer\"), got {result:?}"
+        );
+    }
+
+    /// `send_unicast_offer` with a full-size buf must succeed (no regression).
+    #[tokio::test]
+    async fn send_unicast_offer_full_size_buf_succeeds() {
+        let config = make_config();
+        let sd_state = make_sd_state();
+        let socket = NullSocket;
+        let target = subscriber_addr();
+
+        let result = send_unicast_offer(
+            &mut [0u8; crate::UDP_BUFFER_SIZE],
+            &config,
+            &socket,
+            &sd_state,
+            target,
+        )
+        .await;
+
+        assert!(result.is_ok(), "full-size buf must succeed, got {result:?}");
+    }
+
+    // ── send_subscribe_ack_from_view: build a minimal EntryView via wire bytes
+
+    /// Encode a minimal Subscribe SD payload and return `(wire_bytes, sd_len)` so
+    /// callers can parse an `SdHeaderView` and extract an `EntryView`.
+    fn subscribe_wire_bytes() -> ([u8; 512], usize) {
+        use crate::traits::WireFormat;
+
+        let entry = sd::Entry::SubscribeEventGroup(sd::EventGroupEntry {
+            index_first_options_run: 0,
+            index_second_options_run: 0,
+            options_count: sd::OptionsCount::new(1, 0),
+            service_id: 0x1234,
+            instance_id: 1,
+            major_version: 1,
+            ttl: 3,
+            counter: 0,
+            event_group_id: 0x0001,
+        });
+        let option = sd::Options::IpV4Endpoint {
+            ip: Ipv4Addr::LOCALHOST,
+            port: 40000,
+            protocol: sd::TransportProtocol::Udp,
+        };
+        let entries = [entry];
+        let options = [option];
+        let sd_payload =
+            sd::Header::new(sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted), &entries, &options);
+
+        let mut wire = [0u8; 512];
+        let sd_len = sd_payload.encode_to_slice(&mut wire).expect("encode");
+        (wire, sd_len)
+    }
+
+    /// `send_subscribe_ack_from_view` with a 24-byte buf must return
+    /// `Err(Capacity("udp_buffer"))` without panicking.
+    #[tokio::test]
+    async fn send_subscribe_ack_undersized_buf_returns_capacity_not_panic() {
+        let config = make_config();
+        let sd_state = make_sd_state();
+        let socket = NullSocket;
+        let subscriber = subscriber_addr();
+
+        let (wire, sd_len) = subscribe_wire_bytes();
+        let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+        let entry_view = sd_view.entries().next().expect("one entry");
+
+        let result = send_subscribe_ack_from_view(
+            &mut [0u8; 24],
+            &config,
+            &socket,
+            &sd_state,
+            &entry_view,
+            subscriber,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(Error::Capacity("udp_buffer"))),
+            "expected Capacity(\"udp_buffer\"), got {result:?}"
+        );
+    }
+
+    /// `send_subscribe_ack_from_view` with a full-size buf must succeed.
+    #[tokio::test]
+    async fn send_subscribe_ack_full_size_buf_succeeds() {
+        let config = make_config();
+        let sd_state = make_sd_state();
+        let socket = NullSocket;
+        let subscriber = subscriber_addr();
+
+        let (wire, sd_len) = subscribe_wire_bytes();
+        let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+        let entry_view = sd_view.entries().next().expect("one entry");
+
+        let result = send_subscribe_ack_from_view(
+            &mut [0u8; crate::UDP_BUFFER_SIZE],
+            &config,
+            &socket,
+            &sd_state,
+            &entry_view,
+            subscriber,
+        )
+        .await;
+
+        assert!(result.is_ok(), "full-size buf must succeed, got {result:?}");
+    }
+
+    /// `send_subscribe_nack_from_view` with a 24-byte buf must return
+    /// `Err(Capacity("udp_buffer"))` without panicking.
+    #[tokio::test]
+    async fn send_subscribe_nack_undersized_buf_returns_capacity_not_panic() {
+        let config = make_config();
+        let sd_state = make_sd_state();
+        let socket = NullSocket;
+        let subscriber = subscriber_addr();
+
+        let (wire, sd_len) = subscribe_wire_bytes();
+        let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+        let entry_view = sd_view.entries().next().expect("one entry");
+
+        let result = send_subscribe_nack_from_view(
+            &mut [0u8; 24],
+            &config,
+            &socket,
+            &sd_state,
+            &entry_view,
+            subscriber,
+            "test_reason",
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(Error::Capacity("udp_buffer"))),
+            "expected Capacity(\"udp_buffer\"), got {result:?}"
+        );
+    }
+
+    /// `send_subscribe_nack_from_view` with a full-size buf must succeed.
+    #[tokio::test]
+    async fn send_subscribe_nack_full_size_buf_succeeds() {
+        let config = make_config();
+        let sd_state = make_sd_state();
+        let socket = NullSocket;
+        let subscriber = subscriber_addr();
+
+        let (wire, sd_len) = subscribe_wire_bytes();
+        let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+        let entry_view = sd_view.entries().next().expect("one entry");
+
+        let result = send_subscribe_nack_from_view(
+            &mut [0u8; crate::UDP_BUFFER_SIZE],
+            &config,
+            &socket,
+            &sd_state,
+            &entry_view,
+            subscriber,
+            "test_reason",
+        )
+        .await;
+
+        assert!(result.is_ok(), "full-size buf must succeed, got {result:?}");
     }
 }
