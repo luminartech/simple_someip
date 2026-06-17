@@ -299,11 +299,14 @@ async fn main() {
             timer: MockTimer,
             e2e_registry: e2e,
             interface: iface,
-            // Caller-declared static buffer pool (#125): one slot per
-            // possible socket. On real firmware this is a `static`; here it
-            // is a function-local `static` for the example.
+            // Caller-declared static buffer pool (#125): UNICAST_SOCKETS_CAP
+            // (8) + 1 discovery + 1 release-lag slack = 10 slots. An evicted
+            // socket's lease frees asynchronously, so size one above the max
+            // live socket count to avoid a transient Capacity("udp_buffer")
+            // on evict-then-rebind. On real firmware this is a `static`; here
+            // it is a function-local `static` for the example.
             buffer_provider: {
-                static POOL: BufferPool<9, UDP_BUFFER_SIZE> = BufferPool::new();
+                static POOL: BufferPool<10, UDP_BUFFER_SIZE> = BufferPool::new();
                 StaticBufferProvider(&POOL)
             },
         },
