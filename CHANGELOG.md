@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/luminartech/simple_someip/compare/v0.7.0...v0.7.1) - 2026-06-17
+
+### Fixed
+
+- *(client)* per-transport SD session tracking via dual discovery sockets
+
+### Other
+
+- *(client_server)* drain until the Unicast event, not just the next update
+- *(client_server)* describe discovery-socket reuse as cross-platform
+- Revert the deterministic loopback divert test (CI interference hazard)
+- *(socket_manager)* deterministic loopback divert test + SD spelling fix
+- *(client_server)* put server on a distinct loopback IP to avoid SD-port self-collision
+- *(client)* address Copilot review on dual-socket divert test
+- scope Windows job to build-all + run lib tests
+- *(server)* make combined-SD test hermetic (in-memory parse) for Windows
+- *(server)* target loopback in combined-SD test for Windows portability
+- *(socket_manager)* gate set_reuse_port behind cfg(unix) in dual-socket test
+- add Windows job to exercise dual-socket SD bind portability
+- *(socket_manager)* use Windows-portable dual-socket split (INADDR_ANY mc + interface-IP unicast)
+- *(socket_manager)* spike — dual-socket multicast/unicast SD split
+- *(session)* lock per-transport keying; document caller mis-tag bug
+
 ### Changed
 
 - **`std` is now the default feature** — the crate enables `std` (with `thiserror` and `tracing`) by default. Users targeting `no_std` environments must set `default-features = false` in their `Cargo.toml`.
