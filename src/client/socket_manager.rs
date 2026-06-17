@@ -466,6 +466,11 @@ where
         // message. Without this, an oversize encode would surface as a
         // protocol-level I/O error from inside the socket loop.
         let required = message.required_size();
+        // Coarse fail-fast: `send()` has no leased buffer in scope, so
+        // UDP_BUFFER_SIZE is the only bound available here.  The socket
+        // loop's `buf.len()` check is the authoritative guard; E2E
+        // protection can still expand a frame that passes this pre-filter
+        // beyond the leased buffer, and that case is caught there.
         if required > UDP_BUFFER_SIZE {
             warn!(
                 "outgoing message size {required} exceeds UDP_BUFFER_SIZE ({UDP_BUFFER_SIZE}); rejecting with Capacity(\"udp_buffer\")"
@@ -675,11 +680,11 @@ where
                             );
                             match result {
                                 Some(Ok(protected_len)) => {
-                                    if 16 + protected_len > UDP_BUFFER_SIZE {
+                                    if 16 + protected_len > buf.len() {
                                         error!(
-                                            "E2E-protected payload ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping send",
+                                            "E2E-protected payload ({} bytes) exceeds claimed buffer ({}); rejecting send",
                                             16 + protected_len,
-                                            UDP_BUFFER_SIZE
+                                            buf.len()
                                         );
                                         let _ = send_message
                                             .response
