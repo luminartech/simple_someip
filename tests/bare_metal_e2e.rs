@@ -812,6 +812,17 @@ impl TransportSocket for ScriptSocket {
 /// must survive, and a subsequent in-budget datagram must still be
 /// delivered. Driven through the public `Client` discovery socket because
 /// `socket_loop_future` / `SocketManager` are private.
+///
+/// **Scope note:** this test exercises the `bytes_received > buf.len()`
+/// guard *mechanism* using a synthetic `ScriptSocket` that reports an
+/// unclamped length. No shipped backend currently feeds the guard via
+/// that exact shape:
+/// - tokio: the kernel silently truncates to `buf.len()` — an oversize
+///   datagram is silently truncated+parsed (pre-existing #119 behavior;
+///   a `MSG_TRUNC` fix is a tracked follow-up).
+/// - embassy-net: `RecvError::Truncated` is mapped to
+///   `IoErrorKind::Truncated` (transient recv), so the loop drops and
+///   continues without the `bytes_received > buf.len()` branch firing.
 #[tokio::test]
 async fn inbound_datagram_larger_than_claimed_buffer_is_dropped_not_fatal() {
     // Claim buffers of exactly 64 bytes: big enough for a small SD message

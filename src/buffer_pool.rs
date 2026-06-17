@@ -1,7 +1,9 @@
-//! Fixed-capacity pool of `&'static mut [u8]` buffers with claim/release
-//! semantics, mirroring the channel pools in this module. A `BufferPool`
-//! is declared as a `static` by the consumer; each `claim()` hands out one
-//! slot as a `BufferLease` that returns the slot to the pool on drop.
+//! Fixed-capacity pool of byte buffers with claim/release semantics,
+//! mirroring the channel pools in this module. A `BufferPool` is declared as
+//! a `static` (bare-metal) or held behind an `Arc` (std/tokio) by the
+//! consumer; each claim hands out one slot as a `BufferLease` (a raw
+//! `NonNull` slice whose exclusivity is enforced by the per-slot
+//! `AtomicBool`, not the borrow checker) that returns the slot on drop.
 //!
 //! Synchronization uses per-slot `AtomicBool` compare-exchange so the same
 //! code is valid on the bare-metal target and on std without requiring a
@@ -37,8 +39,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// `store(false, Release)`. No global lock is taken; claim and release are
 /// individually linearizable.
 pub struct BufferPool<const SLOTS: usize, const LEN: usize> {
-    // `UnsafeCell` because `claim()` hands out `&'static mut` slices into
-    // this store. The `claimed` flags ensure at most one live `&mut` per slot.
+    // `UnsafeCell` because claims hand out raw `NonNull` slices into this
+    // store; the per-slot `claimed` AtomicBool (not the borrow checker) is
+    // what guarantees at most one live lease per slot.
     store: UnsafeCell<[[u8; LEN]; SLOTS]>,
     // One atomic flag per slot; `true` = slot is currently claimed.
     claimed: [AtomicBool; SLOTS],
