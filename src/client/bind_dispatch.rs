@@ -26,7 +26,8 @@ use super::error::Error;
 use super::socket_manager::SocketManager;
 use crate::traits::PayloadWireFormat;
 use crate::transport::{
-    ChannelFactory, E2ERegistryHandle, LocalSpawner, Spawner, TransportFactory, TransportSocket,
+    BufferProvider, ChannelFactory, E2ERegistryHandle, LocalSpawner, Spawner, TransportFactory,
+    TransportSocket,
 };
 
 /// Crate-private bind-and-spawn abstraction shared by Send and `!Send`
@@ -43,6 +44,10 @@ where
 {
     /// Bind a discovery socket and submit its I/O loop to the
     /// configured task executor.
+    // `async move` body (rather than `async fn`) is required: the trait
+    // method returns `impl Future`, and the block must capture `&self` to
+    // claim a buffer (#125) before delegating to `SocketManager::bind_*`.
+    #[allow(clippy::manual_async_fn)]
     fn bind_discovery(
         &self,
         interface: Ipv4Addr,
@@ -63,12 +68,18 @@ where
 
 /// `BindDispatch` for the multi-threaded path: requires a
 /// [`Spawner`] and a `Send + Sync` transport socket.
-pub(super) struct SpawnerDispatch<F, S> {
+///
+/// Carries a [`BufferProvider`] (`#125`): each `bind_*` claims one
+/// socket-loop buffer from it and moves the lease into the spawned loop
+/// future. The lease frees its pool slot when that future drops (i.e. when
+/// the socket closes), so no explicit release is needed at eviction.
+pub(super) struct SpawnerDispatch<F, S, BP> {
     pub factory: F,
     pub spawner: S,
+    pub buffer_provider: BP,
 }
 
-impl<MD, C, R, F, S> BindDispatch<MD, C, R> for SpawnerDispatch<F, S>
+impl<MD, C, R, F, S, BP> BindDispatch<MD, C, R> for SpawnerDispatch<F, S, BP>
 where
     MD: PayloadWireFormat + Clone + core::fmt::Debug + Send + 'static,
     C: ChannelFactory,
@@ -79,11 +90,16 @@ where
     for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
     for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
     S: Spawner + Send + Sync + 'static,
+    BP: BufferProvider,
     Result<super::socket_manager::ReceivedMessage<MD>, Error>:
         crate::transport::BoundedPooled<C, 16>,
     super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
     Result<(), Error>: crate::transport::OneshotPooled<C>,
 {
+    // `async move` body (rather than `async fn`) is required: the trait
+    // method returns `impl Future`, and the block must capture `&self` to
+    // claim a buffer (#125) before delegating to `SocketManager::bind_*`.
+    #[allow(clippy::manual_async_fn)]
     fn bind_discovery(
         &self,
         interface: Ipv4Addr,
@@ -92,40 +108,62 @@ where
         session_has_wrapped: bool,
         multicast_loopback: bool,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
-        SocketManager::<MD, C>::bind_discovery_seeded_with_transport(
-            &self.factory,
-            &self.spawner,
-            interface,
-            e2e_registry,
-            session_id,
-            session_has_wrapped,
-            multicast_loopback,
-        )
+        async move {
+            let buf = self
+                .buffer_provider
+                .claim()
+                .ok_or(Error::Capacity("udp_buffer"))?;
+            SocketManager::<MD, C>::bind_discovery_seeded_with_transport(
+                &self.factory,
+                &self.spawner,
+                interface,
+                e2e_registry,
+                session_id,
+                session_has_wrapped,
+                multicast_loopback,
+                buf,
+            )
+            .await
+        }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn bind_unicast(
         &self,
         port: u16,
         e2e_registry: R,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
-        SocketManager::<MD, C>::bind_with_transport(
-            &self.factory,
-            &self.spawner,
-            port,
-            e2e_registry,
-        )
+        async move {
+            let buf = self
+                .buffer_provider
+                .claim()
+                .ok_or(Error::Capacity("udp_buffer"))?;
+            SocketManager::<MD, C>::bind_with_transport(
+                &self.factory,
+                &self.spawner,
+                port,
+                e2e_registry,
+                buf,
+            )
+            .await
+        }
     }
 }
 
 /// `BindDispatch` for the single-threaded path: requires a
 /// [`LocalSpawner`] and `'static` transport socket. The socket and its
 /// GAT futures are not required to be `Send`.
-pub(super) struct LocalSpawnerDispatch<F, S> {
+///
+/// Carries a [`BufferProvider`] for the same reason as [`SpawnerDispatch`]:
+/// each `bind_*` claims one socket-loop buffer and moves the lease into the
+/// spawned loop future, which frees the slot on drop.
+pub(super) struct LocalSpawnerDispatch<F, S, BP> {
     pub factory: F,
     pub spawner: S,
+    pub buffer_provider: BP,
 }
 
-impl<MD, C, R, F, S> BindDispatch<MD, C, R> for LocalSpawnerDispatch<F, S>
+impl<MD, C, R, F, S, BP> BindDispatch<MD, C, R> for LocalSpawnerDispatch<F, S, BP>
 where
     MD: PayloadWireFormat + Clone + core::fmt::Debug + Send + 'static,
     C: ChannelFactory,
@@ -133,11 +171,16 @@ where
     F: TransportFactory + 'static,
     F::Socket: 'static,
     S: LocalSpawner + 'static,
+    BP: BufferProvider,
     Result<super::socket_manager::ReceivedMessage<MD>, Error>:
         crate::transport::BoundedPooled<C, 16>,
     super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
     Result<(), Error>: crate::transport::OneshotPooled<C>,
 {
+    // `async move` body (rather than `async fn`) is required: the trait
+    // method returns `impl Future`, and the block must capture `&self` to
+    // claim a buffer (#125) before delegating to `SocketManager::bind_*`.
+    #[allow(clippy::manual_async_fn)]
     fn bind_discovery(
         &self,
         interface: Ipv4Addr,
@@ -146,27 +189,44 @@ where
         session_has_wrapped: bool,
         multicast_loopback: bool,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
-        SocketManager::<MD, C>::bind_discovery_seeded_with_transport_local(
-            &self.factory,
-            &self.spawner,
-            interface,
-            e2e_registry,
-            session_id,
-            session_has_wrapped,
-            multicast_loopback,
-        )
+        async move {
+            let buf = self
+                .buffer_provider
+                .claim()
+                .ok_or(Error::Capacity("udp_buffer"))?;
+            SocketManager::<MD, C>::bind_discovery_seeded_with_transport_local(
+                &self.factory,
+                &self.spawner,
+                interface,
+                e2e_registry,
+                session_id,
+                session_has_wrapped,
+                multicast_loopback,
+                buf,
+            )
+            .await
+        }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn bind_unicast(
         &self,
         port: u16,
         e2e_registry: R,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
-        SocketManager::<MD, C>::bind_with_transport_local(
-            &self.factory,
-            &self.spawner,
-            port,
-            e2e_registry,
-        )
+        async move {
+            let buf = self
+                .buffer_provider
+                .claim()
+                .ok_or(Error::Capacity("udp_buffer"))?;
+            SocketManager::<MD, C>::bind_with_transport_local(
+                &self.factory,
+                &self.spawner,
+                port,
+                e2e_registry,
+                buf,
+            )
+            .await
+        }
     }
 }

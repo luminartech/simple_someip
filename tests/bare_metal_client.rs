@@ -44,11 +44,12 @@ use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendM
 use simple_someip::define_static_channels;
 use simple_someip::e2e::E2ERegistry;
 use simple_someip::protocol::sd::RebootFlag;
+use simple_someip::static_channels::BufferPool;
 use simple_someip::transport::{
-    ReceivedDatagram, SocketOptions, Spawner, Timer, TransportError, TransportFactory,
-    TransportSocket,
+    ReceivedDatagram, SocketOptions, Spawner, StaticBufferProvider, Timer, TransportError,
+    TransportFactory, TransportSocket,
 };
-use simple_someip::{Client, ClientDeps, RawPayload};
+use simple_someip::{Client, ClientDeps, RawPayload, UDP_BUFFER_SIZE};
 
 // ── Static-pool channel factory declared via the macro ────────────────
 //
@@ -249,6 +250,8 @@ async fn client_constructible_without_client_tokio_feature() {
         Arc::new(std::sync::RwLock::new(Ipv4Addr::LOCALHOST));
     let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
 
+    static POOL: BufferPool<9, UDP_BUFFER_SIZE> = BufferPool::new();
+
     let (client, _updates, run_fut) = Client::<
         RawPayload,
         Arc<Mutex<E2ERegistry>>,
@@ -261,6 +264,7 @@ async fn client_constructible_without_client_tokio_feature() {
             timer: MockTimer,
             e2e_registry: e2e_handle,
             interface: interface_handle,
+            buffer_provider: StaticBufferProvider(&POOL),
         },
         false,
     );

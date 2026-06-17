@@ -42,7 +42,10 @@ use std::sync::{Arc, Mutex};
 use embassy_net::driver::{Capabilities, Driver, HardwareAddress, LinkState, RxToken, TxToken};
 use embassy_net::{Config, Stack, StackResources, StaticConfigV4};
 
-use simple_someip::transport::{SocketOptions, TransportFactory, TransportSocket};
+use simple_someip::static_channels::BufferPool;
+use simple_someip::transport::{
+    SocketOptions, StaticBufferProvider, TransportFactory, TransportSocket,
+};
 use simple_someip_embassy_net::{EmbassyNetFactory, LINK_MTU, SocketPool};
 
 // ── LoopbackDriver pair ──────────────────────────────────────────────
@@ -640,12 +643,15 @@ async fn client_receives_server_sd_announcement() {
                 Arc::new(std::sync::Mutex::new(E2ERegistry::new()));
             let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(IP_B));
 
+            let buf_pool: &'static BufferPool<2, LINK_MTU> =
+                Box::leak(Box::new(BufferPool::new()));
             let client_deps = ClientDeps {
                 factory: client_factory,
                 spawner: LocalTokioSpawner,
                 timer: LocalTimer,
                 e2e_registry: client_e2e,
                 interface: client_iface,
+                buffer_provider: StaticBufferProvider(buf_pool),
             };
 
             let (client, mut updates, run_fut) =
@@ -762,12 +768,15 @@ async fn client_send_request_server_runloop_stable() {
                 Arc::new(std::sync::Mutex::new(E2ERegistry::new()));
             let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(IP_B));
 
+            let buf_pool: &'static BufferPool<8, LINK_MTU> =
+                Box::leak(Box::new(BufferPool::new()));
             let client_deps = ClientDeps {
                 factory: client_factory,
                 spawner: LocalTokioSpawner,
                 timer: LocalTimer,
                 e2e_registry: client_e2e,
                 interface: client_iface,
+                buffer_provider: StaticBufferProvider(buf_pool),
             };
 
             let (client, _updates, run_fut) = Client::<

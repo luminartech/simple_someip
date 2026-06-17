@@ -42,6 +42,7 @@
 
 use crate::{
     UDP_BUFFER_SIZE,
+    buffer_pool::BufferLease,
     e2e::{E2ECheckStatus, E2EKey},
     protocol::{Message, MessageView, sd},
     traits::{PayloadWireFormat, WireFormat},
@@ -182,7 +183,11 @@ where
         session_has_wrapped: bool,
         multicast_loopback: bool,
     ) -> Result<Self, Error> {
-        use crate::tokio_transport::{TokioSpawner, TokioTransport};
+        use crate::tokio_transport::{TokioBufferProvider, TokioSpawner, TokioTransport};
+        use crate::transport::BufferProvider;
+        let buf = TokioBufferProvider::new()
+            .claim()
+            .ok_or(Error::Capacity("udp_buffer"))?;
         Self::bind_discovery_seeded_with_transport(
             &TokioTransport,
             &TokioSpawner,
@@ -191,6 +196,7 @@ where
             session_id,
             session_has_wrapped,
             multicast_loopback,
+            buf,
         )
         .await
     }
@@ -228,6 +234,7 @@ where
     /// (e.g. wrapping `embassy_net::udp::UdpSocket`) as long as it is
     /// `Send + Sync + 'static` and its `SendFuture` / `RecvFuture` GAT
     /// projections are `Send` for every borrow lifetime.
+    #[allow(clippy::too_many_arguments)] // +1 for the #125 caller-provided buffer lease
     pub async fn bind_discovery_seeded_with_transport<F, S, R>(
         factory: &F,
         spawner: &S,
@@ -236,6 +243,7 @@ where
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
+        buf: BufferLease,
     ) -> Result<Self, Error>
     where
         F: TransportFactory,
@@ -269,7 +277,7 @@ where
         let socket = factory.bind(bind_addr, &options).await?;
         socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
 
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
         spawner.spawn(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -284,6 +292,7 @@ where
     ///
     /// Called by [`super::bind_dispatch::LocalSpawnerDispatch`] which is
     /// wired through [`super::Client::new_with_deps_local`].
+    #[allow(clippy::too_many_arguments)] // +1 for the #125 caller-provided buffer lease
     pub async fn bind_discovery_seeded_with_transport_local<F, S, R>(
         factory: &F,
         spawner: &S,
@@ -292,6 +301,7 @@ where
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
+        buf: BufferLease,
     ) -> Result<Self, Error>
     where
         F: TransportFactory,
@@ -312,7 +322,7 @@ where
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, sd::MULTICAST_PORT);
         let socket = factory.bind(bind_addr, &options).await?;
         socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
         spawner.spawn_local(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -337,8 +347,12 @@ where
     /// behind it.
     #[cfg(all(test, feature = "client-tokio"))]
     pub async fn bind<R: E2ERegistryHandle>(port: u16, e2e_registry: R) -> Result<Self, Error> {
-        use crate::tokio_transport::{TokioSpawner, TokioTransport};
-        Self::bind_with_transport(&TokioTransport, &TokioSpawner, port, e2e_registry).await
+        use crate::tokio_transport::{TokioBufferProvider, TokioSpawner, TokioTransport};
+        use crate::transport::BufferProvider;
+        let buf = TokioBufferProvider::new()
+            .claim()
+            .ok_or(Error::Capacity("udp_buffer"))?;
+        Self::bind_with_transport(&TokioTransport, &TokioSpawner, port, e2e_registry, buf).await
     }
 
     /// Variant of [`Self::bind`] that constructs the underlying socket
@@ -357,6 +371,7 @@ where
         spawner: &S,
         port: u16,
         e2e_registry: R,
+        buf: BufferLease,
     ) -> Result<Self, Error>
     where
         F: TransportFactory,
@@ -386,7 +401,7 @@ where
 
         let socket = factory.bind(bind_addr, &options).await?;
         let port = socket.local_addr()?.port();
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
         spawner.spawn(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -410,6 +425,7 @@ where
         spawner: &S,
         port: u16,
         e2e_registry: R,
+        buf: BufferLease,
     ) -> Result<Self, Error>
     where
         F: TransportFactory,
@@ -427,7 +443,7 @@ where
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
         let socket = factory.bind(bind_addr, &options).await?;
         let port = socket.local_addr()?.port();
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
         spawner.spawn_local(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -553,6 +569,7 @@ where
         rx_tx: C::BoundedSender<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>,
         mut tx_rx: C::BoundedReceiver<SendMessage<MessageDefinitions, C>, 16>,
         e2e_registry: R,
+        mut buf: BufferLease,
     ) where
         T: TransportSocket + 'static,
         R: E2ERegistryHandle,
@@ -566,7 +583,11 @@ where
         // tight `error!` log loop with no exit; this counter caps that.
         const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 16;
         let mut consecutive_recv_errors: u32 = 0;
-        let mut buf = [0u8; UDP_BUFFER_SIZE];
+        // The receive/scratch buffer is now leased from a caller-provided
+        // `BufferProvider` (see `#125`): on bare-metal it is a slot of a
+        // consumer-declared `static BufferPool`; on tokio it is heap-backed.
+        // The lease is owned by this future and frees its pool slot on drop
+        // when the loop exits.
         // Iteration counter used solely to flip `select_biased!` arm
         // priority each turn so a sustained one-sided load (only-send
         // or only-recv) cannot starve the other arm. We can't use
@@ -585,7 +606,7 @@ where
             // below runs, so the body can re-borrow `buf` freely.
             let outcome: Outcome<MessageDefinitions, C> = {
                 let send_fut = MpscRecv::recv(&mut tx_rx).fuse();
-                let recv_fut = socket.recv_from(&mut buf).fuse();
+                let recv_fut = socket.recv_from(&mut buf[..]).fuse();
                 pin_mut!(send_fut, recv_fut);
                 if prefer_recv_first {
                     select_biased! {
@@ -604,8 +625,24 @@ where
             match outcome {
                 Outcome::Send(Some(send_message)) => {
                     trace!("Sending: {:?}", &send_message);
+                    // Oversize-send rejection keys off the claimed buffer's
+                    // length (`#125`), not the compile-time `UDP_BUFFER_SIZE`:
+                    // a caller-sized bare-metal pool may hand out a buffer
+                    // smaller than `UDP_BUFFER_SIZE`, and the message must fit
+                    // the buffer we actually encode into.
+                    let required = send_message.message.required_size();
+                    if required > buf.len() {
+                        warn!(
+                            "outgoing message size {required} exceeds claimed buffer ({}); rejecting with Capacity(\"udp_buffer\")",
+                            buf.len()
+                        );
+                        let _ = send_message
+                            .response
+                            .send(Err(Error::Capacity("udp_buffer")));
+                        continue;
+                    }
                     let mut message_length =
-                        match send_message.message.encode(&mut buf.as_mut_slice()) {
+                        match send_message.message.encode(&mut &mut buf[..]) {
                             Ok(length) => length,
                             Err(e) => {
                                 error!("Failed to encode message: {:?}", e);
@@ -707,6 +744,18 @@ where
                     truncated,
                 })) => {
                     consecutive_recv_errors = 0;
+                    if bytes_received > buf.len() {
+                        // A backend reported a datagram larger than the
+                        // claimed buffer. Parsing `&buf[..bytes_received]`
+                        // would index out of bounds (and the bytes past
+                        // `buf.len()` were never written), so drop it
+                        // rather than parse a truncated buffer.
+                        warn!(
+                            "inbound datagram ({bytes_received} B) exceeds claimed buffer ({} B); dropping",
+                            buf.len()
+                        );
+                        continue;
+                    }
                     if truncated {
                         // A truncated datagram cannot be parsed reliably;
                         // the length field in the SOME/IP header will not
@@ -807,6 +856,16 @@ mod tests {
 
     fn test_registry() -> Arc<Mutex<E2ERegistry>> {
         Arc::new(Mutex::new(E2ERegistry::new()))
+    }
+
+    /// Claim a single socket-loop buffer for a direct `bind_with_transport`
+    /// call in these unit tests. Each call leaks one small `BufferPool`
+    /// (acceptable in a test); production paths claim from one shared
+    /// provider per client.
+    fn test_buf() -> crate::buffer_pool::BufferLease {
+        use crate::tokio_transport::TokioBufferProvider;
+        use crate::transport::BufferProvider;
+        TokioBufferProvider::new().claim().expect("fresh pool slot")
     }
 
     async fn bind_ephemeral_spawned() -> TestSocketManager {
@@ -1132,10 +1191,15 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
 
-        let sm =
-            TestSocketManager::bind_with_transport(&factory, &TokioSpawner, 0, test_registry())
-                .await
-                .expect("bind via custom factory");
+        let sm = TestSocketManager::bind_with_transport(
+            &factory,
+            &TokioSpawner,
+            0,
+            test_registry(),
+            test_buf(),
+        )
+        .await
+        .expect("bind via custom factory");
         assert_eq!(
             factory.calls.load(Ordering::SeqCst),
             1,
@@ -1184,6 +1248,7 @@ mod tests {
             &TokioSpawner,
             0,
             test_registry(),
+            test_buf(),
         )
         .await
         .expect("bind via custom factory");
@@ -1297,6 +1362,7 @@ mod tests {
             &TokioSpawner,
             0,
             test_registry(),
+            test_buf(),
         )
         .await
         .expect("bind via wrapping factory");
@@ -1355,6 +1421,7 @@ mod tests {
             &TokioSpawner,
             0,
             test_registry(),
+            test_buf(),
         )
         .await
         .expect_err("factory returned Err, bind must surface it");

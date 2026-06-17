@@ -275,12 +275,13 @@ impl<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory>
 ///
 /// All five fields are public so callers can construct the struct
 /// inline; there's no builder ceremony beyond the field assignments.
-pub struct ClientDeps<F, Tm, R, I, Sp>
+pub struct ClientDeps<F, Tm, R, I, Sp, BP>
 where
     F: TransportFactory,
     Tm: Timer,
     R: E2ERegistryHandle,
     I: InterfaceHandle,
+    BP: crate::transport::BufferProvider,
 {
     /// Transport factory used by `bind_*` to construct sockets.
     pub factory: F,
@@ -293,6 +294,11 @@ where
     pub interface: I,
     /// Task-spawner used by `bind_*` to drive per-socket I/O loops.
     pub spawner: Sp,
+    /// Source of `&'static mut [u8]` socket-loop buffers (`#125`):
+    /// caller-sized on bare-metal (a `static BufferPool`), internally
+    /// heap-provisioned on the tokio path. One provider per client,
+    /// reused for every `bind_*`.
+    pub buffer_provider: BP,
 }
 
 /// Tokio-defaulted constructor.
@@ -323,9 +329,16 @@ impl
         Arc<Mutex<E2ERegistry>>,
         Arc<RwLock<Ipv4Addr>>,
         TokioSpawner,
+        crate::tokio_transport::TokioBufferProvider,
     >
 {
     /// Build a `ClientDeps` with the tokio defaults.
+    ///
+    /// `buffer_provider` is a single `TokioBufferProvider::new()`
+    /// constructed here exactly once. `TokioBufferProvider::new()` does
+    /// a `Box::leak`, so it MUST be one-per-client and never called on a
+    /// per-bind / hot path — this constructor is the canonical single
+    /// call site for the tokio path.
     #[must_use]
     pub fn tokio(interface: Ipv4Addr) -> Self {
         Self {
@@ -334,6 +347,7 @@ impl
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             interface: Arc::new(RwLock::new(interface)),
             spawner: TokioSpawner,
+            buffer_provider: crate::tokio_transport::TokioBufferProvider::new(),
         }
     }
 }
@@ -358,34 +372,40 @@ impl
 /// # let _ = deps;
 /// # }
 /// ```
-impl<F, Tm, R, I, Sp> ClientDeps<F, Tm, R, I, Sp>
+impl<F, Tm, R, I, Sp, BP> ClientDeps<F, Tm, R, I, Sp, BP>
 where
     F: TransportFactory,
     Tm: Timer,
     R: E2ERegistryHandle,
     I: InterfaceHandle,
+    BP: crate::transport::BufferProvider,
 {
     /// Replace the `factory` field, returning a `ClientDeps` over the
     /// new factory type.
-    pub fn with_factory<F2: TransportFactory>(self, factory: F2) -> ClientDeps<F2, Tm, R, I, Sp> {
+    pub fn with_factory<F2: TransportFactory>(
+        self,
+        factory: F2,
+    ) -> ClientDeps<F2, Tm, R, I, Sp, BP> {
         ClientDeps {
             factory,
             timer: self.timer,
             e2e_registry: self.e2e_registry,
             interface: self.interface,
             spawner: self.spawner,
+            buffer_provider: self.buffer_provider,
         }
     }
 
     /// Replace the `timer` field, returning a `ClientDeps` over the new
     /// timer type.
-    pub fn with_timer<Tm2: Timer>(self, timer: Tm2) -> ClientDeps<F, Tm2, R, I, Sp> {
+    pub fn with_timer<Tm2: Timer>(self, timer: Tm2) -> ClientDeps<F, Tm2, R, I, Sp, BP> {
         ClientDeps {
             factory: self.factory,
             timer,
             e2e_registry: self.e2e_registry,
             interface: self.interface,
             spawner: self.spawner,
+            buffer_provider: self.buffer_provider,
         }
     }
 
@@ -394,13 +414,14 @@ where
     pub fn with_e2e_registry<R2: E2ERegistryHandle>(
         self,
         e2e_registry: R2,
-    ) -> ClientDeps<F, Tm, R2, I, Sp> {
+    ) -> ClientDeps<F, Tm, R2, I, Sp, BP> {
         ClientDeps {
             factory: self.factory,
             timer: self.timer,
             e2e_registry,
             interface: self.interface,
             spawner: self.spawner,
+            buffer_provider: self.buffer_provider,
         }
     }
 
@@ -409,13 +430,14 @@ where
     pub fn with_interface<I2: InterfaceHandle>(
         self,
         interface: I2,
-    ) -> ClientDeps<F, Tm, R, I2, Sp> {
+    ) -> ClientDeps<F, Tm, R, I2, Sp, BP> {
         ClientDeps {
             factory: self.factory,
             timer: self.timer,
             e2e_registry: self.e2e_registry,
             interface,
             spawner: self.spawner,
+            buffer_provider: self.buffer_provider,
         }
     }
 
@@ -427,13 +449,14 @@ where
     /// [`Client::new_with_deps_local`] expects a `LocalSpawner` and
     /// the bound is enforced here at the builder call site rather
     /// than deferred to construction.
-    pub fn with_spawner<Sp2: Spawner>(self, spawner: Sp2) -> ClientDeps<F, Tm, R, I, Sp2> {
+    pub fn with_spawner<Sp2: Spawner>(self, spawner: Sp2) -> ClientDeps<F, Tm, R, I, Sp2, BP> {
         ClientDeps {
             factory: self.factory,
             timer: self.timer,
             e2e_registry: self.e2e_registry,
             interface: self.interface,
             spawner,
+            buffer_provider: self.buffer_provider,
         }
     }
 
@@ -446,13 +469,32 @@ where
     pub fn with_local_spawner<Sp2: crate::transport::LocalSpawner>(
         self,
         spawner: Sp2,
-    ) -> ClientDeps<F, Tm, R, I, Sp2> {
+    ) -> ClientDeps<F, Tm, R, I, Sp2, BP> {
         ClientDeps {
             factory: self.factory,
             timer: self.timer,
             e2e_registry: self.e2e_registry,
             interface: self.interface,
             spawner,
+            buffer_provider: self.buffer_provider,
+        }
+    }
+
+    /// Replace the `buffer_provider` field, returning a `ClientDeps`
+    /// over the new provider type. Bare-metal callers use this to supply
+    /// a [`StaticBufferProvider`](crate::transport::StaticBufferProvider)
+    /// backed by a consumer-declared `static BufferPool`.
+    pub fn with_buffer_provider<BP2: crate::transport::BufferProvider>(
+        self,
+        buffer_provider: BP2,
+    ) -> ClientDeps<F, Tm, R, I, Sp, BP2> {
+        ClientDeps {
+            factory: self.factory,
+            timer: self.timer,
+            e2e_registry: self.e2e_registry,
+            interface: self.interface,
+            spawner: self.spawner,
+            buffer_provider,
         }
     }
 }
@@ -642,6 +684,10 @@ where
                 e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
                 interface: Arc::new(RwLock::new(interface)),
                 spawner,
+                // One `TokioBufferProvider::new()` per client construction.
+                // It `Box::leak`s internally, so it must not be moved to a
+                // per-bind path; this single call covers every `bind_*`.
+                buffer_provider: crate::tokio_transport::TokioBufferProvider::new(),
             },
             multicast_loopback,
         )
@@ -691,8 +737,8 @@ where
     /// `LocalSet`-style spawner shim.
     #[allow(clippy::type_complexity)]
     #[must_use = "the returned run-loop future must be spawned (e.g. via the Spawner) for the client to make progress"]
-    pub fn new_with_deps<F, Tm, Sp>(
-        deps: ClientDeps<F, Tm, R, I, Sp>,
+    pub fn new_with_deps<F, Tm, Sp, BP>(
+        deps: ClientDeps<F, Tm, R, I, Sp, BP>,
         multicast_loopback: bool,
     ) -> (
         Self,
@@ -708,6 +754,7 @@ where
         Sp: Spawner + Send + Sync + 'static,
         Tm: Timer + Send + Sync + 'static,
         for<'a> Tm::SleepFuture<'a>: Send,
+        BP: crate::transport::BufferProvider,
     {
         let ClientDeps {
             factory,
@@ -715,11 +762,16 @@ where
             e2e_registry,
             interface,
             spawner,
+            buffer_provider,
         } = deps;
         let initial_addr = interface.get();
-        let dispatch = bind_dispatch::SpawnerDispatch { factory, spawner };
+        let dispatch = bind_dispatch::SpawnerDispatch {
+            factory,
+            spawner,
+            buffer_provider,
+        };
         let (control_sender, update_receiver, run_future) =
-            Inner::<MessageDefinitions, Tm, R, C, bind_dispatch::SpawnerDispatch<F, Sp>>::build(
+            Inner::<MessageDefinitions, Tm, R, C, bind_dispatch::SpawnerDispatch<F, Sp, BP>>::build(
                 initial_addr,
                 e2e_registry.clone(),
                 multicast_loopback,
@@ -752,8 +804,8 @@ where
     /// [`Spawner`]: crate::transport::Spawner
     #[allow(clippy::type_complexity)]
     #[must_use = "the returned run-loop future must be spawned (e.g. via the LocalSpawner) for the client to make progress"]
-    pub fn new_with_deps_local<F, Tm, Sp>(
-        deps: ClientDeps<F, Tm, R, I, Sp>,
+    pub fn new_with_deps_local<F, Tm, Sp, BP>(
+        deps: ClientDeps<F, Tm, R, I, Sp, BP>,
         multicast_loopback: bool,
     ) -> (
         Self,
@@ -765,6 +817,7 @@ where
         F::Socket: 'static,
         Sp: crate::transport::LocalSpawner + 'static,
         Tm: Timer + 'static,
+        BP: crate::transport::BufferProvider,
     {
         let ClientDeps {
             factory,
@@ -772,15 +825,20 @@ where
             e2e_registry,
             interface,
             spawner,
+            buffer_provider,
         } = deps;
         let initial_addr = interface.get();
-        let dispatch = bind_dispatch::LocalSpawnerDispatch { factory, spawner };
+        let dispatch = bind_dispatch::LocalSpawnerDispatch {
+            factory,
+            spawner,
+            buffer_provider,
+        };
         let (control_sender, update_receiver, run_future) = Inner::<
             MessageDefinitions,
             Tm,
             R,
             C,
-            bind_dispatch::LocalSpawnerDispatch<F, Sp>,
+            bind_dispatch::LocalSpawnerDispatch<F, Sp, BP>,
         >::build(
             initial_addr,
             e2e_registry.clone(),

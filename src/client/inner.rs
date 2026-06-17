@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 #[cfg(all(test, feature = "client-tokio"))]
 use crate::e2e::E2ERegistry;
 #[cfg(all(test, feature = "client-tokio"))]
-use crate::tokio_transport::{TokioChannels, TokioSpawner, TokioTimer, TokioTransport};
+use crate::tokio_transport::{
+    TokioBufferProvider, TokioChannels, TokioSpawner, TokioTimer, TokioTransport,
+};
 use crate::{
     Timer,
     client::{
@@ -650,6 +652,10 @@ where
                 }
             }
             for port in &dead_ports {
+                // Removing the `SocketManager` drops its channel ends, so the
+                // spawned socket-loop future returns and is dropped. That drop
+                // releases its `BufferLease` (#125), freeing the pool slot for
+                // the next bind — no explicit buffer release is needed here.
                 unicast_sockets.remove(port);
                 crate::log::warn!("Unicast socket on port {port} closed; evicted from registry");
             }
@@ -1270,6 +1276,7 @@ mod tests {
         crate::client::bind_dispatch::SpawnerDispatch<
             crate::tokio_transport::TokioTransport,
             TokioSpawner,
+            crate::tokio_transport::TokioBufferProvider,
         >,
     >;
 
@@ -1442,6 +1449,7 @@ mod tests {
             dispatch: crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             timer: TokioTimer,
             phantom: core::marker::PhantomData,
@@ -1661,7 +1669,11 @@ mod tests {
             TokioTimer,
             Arc<Mutex<E2ERegistry>>,
             TokioChannels,
-            crate::client::bind_dispatch::SpawnerDispatch<TokioTransport, CountingSpawner>,
+            crate::client::bind_dispatch::SpawnerDispatch<
+                TokioTransport,
+                CountingSpawner,
+                TokioBufferProvider,
+            >,
         > = Inner {
             control_receiver,
             request_queue: Deque::new(),
@@ -1682,6 +1694,7 @@ mod tests {
             dispatch: crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             timer: TokioTimer,
             phantom: core::marker::PhantomData,
@@ -1713,6 +1726,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -1758,6 +1772,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -1780,6 +1795,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -1802,6 +1818,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -1826,6 +1843,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -1861,6 +1879,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -1937,6 +1956,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -1960,6 +1980,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -1982,6 +2003,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -2014,6 +2036,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -2034,6 +2057,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -2059,6 +2083,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -2085,6 +2110,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -2115,6 +2141,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -2151,6 +2178,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -2181,6 +2209,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -2205,6 +2234,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -2245,6 +2275,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -2268,6 +2299,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -2298,6 +2330,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -2334,6 +2367,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );
@@ -2386,6 +2420,7 @@ mod tests {
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
             },
             TokioTimer,
         );

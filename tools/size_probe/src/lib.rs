@@ -247,10 +247,12 @@ mod client_future_probe {
     use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
     use simple_someip::protocol::sd::RebootFlag;
     use simple_someip::protocol::{MessageId, sd};
+    use simple_someip::static_channels::BufferPool;
+    use simple_someip::transport::StaticBufferProvider;
     use simple_someip::transport::probe::{
         NullE2ERegistry, NullFactory, NullInterface, NullSpawner, NullTimer,
     };
-    use simple_someip::{Client, ClientDeps, PayloadWireFormat, WireFormat};
+    use simple_someip::{Client, ClientDeps, PayloadWireFormat, UDP_BUFFER_SIZE, WireFormat};
 
     // `RawPayload` is std-gated (heap `Vec` SD storage), so the probe
     // carries its own minimal no_std `PayloadWireFormat` impl —
@@ -397,12 +399,14 @@ mod client_future_probe {
 
     #[unsafe(no_mangle)]
     pub extern "C" fn probe_client_run_future_size() -> usize {
+        static POOL: BufferPool<9, UDP_BUFFER_SIZE> = BufferPool::new();
         let deps = ClientDeps {
             factory: NullFactory,
             spawner: NullSpawner,
             timer: NullTimer,
             e2e_registry: NullE2ERegistry,
             interface: NullInterface(core::net::Ipv4Addr::LOCALHOST),
+            buffer_provider: StaticBufferProvider(&POOL),
         };
         let (_client, _updates, run_fut) = Client::<
             ProbePayload,
