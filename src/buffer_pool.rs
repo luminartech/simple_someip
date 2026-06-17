@@ -1,7 +1,7 @@
 //! Fixed-capacity pool of `&'static mut [u8]` buffers with claim/release
 //! semantics, mirroring the channel pools in this module. A `BufferPool`
 //! is declared as a `static` by the consumer; each `claim()` hands out one
-//! slot as a [`BufferLease`] that returns the slot to the pool on drop.
+//! slot as a `BufferLease` that returns the slot to the pool on drop.
 //!
 //! Synchronization uses per-slot `AtomicBool` compare-exchange so the same
 //! code is valid on the bare-metal target and on std without requiring a
