@@ -750,11 +750,26 @@ where
                 })) => {
                     consecutive_recv_errors = 0;
                     if bytes_received > buf.len() {
-                        // A backend reported a datagram larger than the
-                        // claimed buffer. Parsing `&buf[..bytes_received]`
-                        // would index out of bounds (and the bytes past
-                        // `buf.len()` were never written), so drop it
-                        // rather than parse a truncated buffer.
+                        // A backend reported a received length larger than
+                        // the buffer it was given. Parsing
+                        // `&buf[..bytes_received]` would index out of
+                        // bounds (bytes past `buf.len()` were never
+                        // written), so drop this datagram rather than
+                        // parse a truncated buffer.
+                        //
+                        // Backend notes:
+                        // - **tokio**: the kernel silently clamps the copy
+                        //   to `buf.len()` (POSIX truncation). The true
+                        //   datagram length is never reported here, so
+                        //   oversize datagrams are silently truncated and
+                        //   parsed rather than dropped. A `MSG_TRUNC` fix
+                        //   is tracked as follow-up issue #119.
+                        // - **embassy-net**: `RecvError::Truncated` is now
+                        //   mapped to `IoErrorKind::Truncated` (a transient
+                        //   recv error) so the socket loop drops the
+                        //   datagram and continues without this guard
+                        //   firing. The guard below therefore does NOT
+                        //   engage for embassy-net oversize datagrams.
                         warn!(
                             "inbound datagram ({bytes_received} B) exceeds claimed buffer ({} B); dropping",
                             buf.len()
@@ -1103,56 +1118,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn send_e2e_protected_payload_exceeding_udp_buffer_returns_capacity_error() {
-        use crate::RawPayload;
-        use crate::e2e::{E2EProfile, Profile4Config};
-        use crate::protocol::{Header, MessageId, MessageType, MessageTypeField, ReturnCode};
-
-        // Craft a message whose raw-encoded size fits UDP_BUFFER_SIZE (16-byte
-        // SOME/IP header + payload <= cap) but whose E2E-protected size
-        // does not — Profile 4 adds `PROFILE4_HEADER_SIZE = 12` bytes,
-        // so a payload of `UDP_BUFFER_SIZE - 16 - 4` exactly fits raw and
-        // overflows by 8 once protected. Derive both fixture sizes from
-        // `UDP_BUFFER_SIZE` so this stays correct if the constant moves.
-        const SOMEIP_HEADER_SIZE: usize = 16;
-        const PAYLOAD_LEN: usize = UDP_BUFFER_SIZE - SOMEIP_HEADER_SIZE - 4;
-
-        // Register an E2E profile so the protect branch runs.
-        let message_id = MessageId::new_from_service_and_method(0x1234, 0x5678);
-        let key = E2EKey::from_message_id(message_id);
-        let mut reg = E2ERegistry::new();
-        reg.register(key, E2EProfile::Profile4(Profile4Config::new(0, 15)))
-            .expect("E2E registry has capacity for one entry");
-        let e2e_registry = Arc::new(Mutex::new(reg));
-
-        let mut sm = SocketManager::<RawPayload, TokioChannels>::bind(0, e2e_registry)
-            .await
-            .unwrap();
-
-        let payload_bytes = [0u8; PAYLOAD_LEN];
-        let payload = RawPayload::from_payload_bytes(message_id, &payload_bytes).unwrap();
-        let header = Header::new(
-            message_id,
-            0x0001_0001,
-            0x01,
-            0x01,
-            MessageTypeField::new(MessageType::Request, false),
-            ReturnCode::Ok,
-            payload_bytes.len(),
-        );
-        let message = Message::new(header, payload);
-
-        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
-        let err = sm
-            .send(target, message)
-            .await
-            .expect_err("E2E-protected oversize message must error");
-        match err {
-            Error::Capacity(tag) => assert_eq!(tag, "udp_buffer"),
-            other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
-        }
-    }
+    // `send_e2e_protected_payload_exceeding_udp_buffer_returns_capacity_error`
+    // was deleted (vacuous — it bound a full `UDP_BUFFER_SIZE` send buffer, so
+    // the E2E-overflow guard it claimed to test (`16 + protected_len >
+    // buf.len()`) coincided with `required > UDP_BUFFER_SIZE` and passed
+    // against both old and new code without exercising the smaller-buffer
+    // path that the bare-metal pool unlocks). The authoritative coverage lives
+    // in `tests/bare_metal_e2e.rs::
+    // e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_error`,
+    // which supplies a pool whose buffer is genuinely smaller than
+    // `UDP_BUFFER_SIZE` and verifies the `buf.len()`-keyed guard fires.
 
     /// Proves the public `bind_with_transport` entry point accepts an
     /// alternative `TransportFactory` implementation. The factory here is

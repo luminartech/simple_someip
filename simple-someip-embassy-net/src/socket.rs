@@ -150,21 +150,19 @@ impl Future for EmbassyNetRecvFut<'_> {
                 }
             },
             Poll::Ready(Err(RecvError::Truncated)) => {
-                // CONTRACT NOTE: simple-someip's `TransportSocket::
-                // recv_from` documents that "a datagram whose payload
-                // exceeds `buf` is **not** an error; it is returned
-                // with [`ReceivedDatagram::truncated`] set to `true`."
-                //
                 // embassy-net 0.4's `poll_recv_from` returns
-                // `RecvError::Truncated` and (a) does not deliver any
-                // bytes when the datagram doesn't fit and (b) does
-                // not surface the original datagram length. We can't
-                // honor the trait's `truncated: true` semantics
-                // truthfully — there's no copied prefix to return and
-                // no original-length to record. This adapter
-                // therefore treats truncation as a fatal *operator*
-                // configuration error, mapped to `IoErrorKind::Other`
-                // so it shows up distinctly in logs.
+                // `RecvError::Truncated` when the datagram does not fit
+                // the receive buffer. It delivers NO bytes and does NOT
+                // surface the original datagram length, so we cannot
+                // fulfill the `TransportSocket::recv_from` contract
+                // (`truncated: true` with a partial prefix).
+                //
+                // The datagram is therefore dropped. We signal this via
+                // `IoErrorKind::Truncated`, which `is_transient_recv`
+                // classifies as a drop-and-continue condition: the
+                // socket loop survives and does NOT count this toward
+                // the consecutive-error kill cap. `IoErrorKind::Other`
+                // (genuine I/O errors) retains its fatal classification.
                 //
                 // The caller-side fix is to size `SocketPool`'s
                 // `RX_BUF` ≥ link MTU (typically 1500). With
@@ -172,7 +170,7 @@ impl Future for EmbassyNetRecvFut<'_> {
                 // at 28 B, and `simple-someip::UDP_BUFFER_SIZE`
                 // already at 1500, this branch should never fire
                 // under correct configuration.
-                Poll::Ready(Err(TransportError::Io(IoErrorKind::Other)))
+                Poll::Ready(Err(TransportError::Io(IoErrorKind::Truncated)))
             }
         }
     }

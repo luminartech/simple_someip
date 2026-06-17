@@ -264,6 +264,15 @@ pub enum IoErrorKind {
     /// fatal.
     #[error("would block")]
     WouldBlock,
+    /// An inbound datagram was truncated because it exceeded the receive
+    /// buffer. The datagram is discarded; the socket loop survives.
+    ///
+    /// Backends that receive this signal MUST drop the datagram and continue
+    /// polling — it does NOT count toward the consecutive-error kill cap.
+    /// This variant is distinct from [`Self::Other`] so that genuine I/O
+    /// errors are still counted as potentially-fatal.
+    #[error("inbound datagram truncated (exceeded buffer)")]
+    Truncated,
     /// Any error that does not fit a more specific variant.
     #[error("i/o error")]
     Other,
@@ -281,7 +290,11 @@ impl IoErrorKind {
     /// - [`Self::WouldBlock`] — by definition, retry-on-readiness;
     /// - [`Self::Interrupted`] — a signal interrupted the syscall;
     /// - [`Self::TimedOut`] — caller-driven timeout, not a socket
-    ///   failure.
+    ///   failure;
+    /// - [`Self::Truncated`] — an inbound datagram was truncated because
+    ///   it exceeded the receive buffer; the datagram is dropped and the
+    ///   loop continues (distinct from [`Self::Other`] so genuine I/O
+    ///   errors are still counted as potentially-fatal).
     ///
     /// All other kinds (including [`Self::Other`]) are treated as
     /// potentially-fatal and DO count toward the cap.
@@ -293,7 +306,8 @@ impl IoErrorKind {
                 | Self::NetworkUnreachable
                 | Self::WouldBlock
                 | Self::Interrupted
-                | Self::TimedOut,
+                | Self::TimedOut
+                | Self::Truncated,
         )
     }
 }
