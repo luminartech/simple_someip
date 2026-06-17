@@ -2,32 +2,19 @@
 //!
 //! # Memory footprint
 //!
-//! The client's internal `Inner` state is allocated inline rather than on
-//! the heap. With the default capacity constants declared in `inner.rs` —
-//! `REQUEST_QUEUE_CAP=32`, `PENDING_RESPONSES_CAP=64`, `UNICAST_SOCKETS_CAP=8`,
-//! and `SESSION_CAP=64` — `Inner<P>` occupies on the order of **8–12 KiB**,
-//! depending on `sizeof::<P>()` and `sizeof::<SocketManager<P>>()`.
+//! The client's `Inner` state is allocated inline. The per-socket
+//! `UDP_BUFFER_SIZE` receive buffers are **not** part of the spawned
+//! socket-loop futures: each loop claims a `&'static mut [u8]` from a
+//! [`BufferProvider`](crate::transport::BufferProvider) at bind and releases
+//! it when the socket closes. On the bare-metal path the consumer declares
+//! the backing `BufferPool` as a `static`, choosing both the slot count and
+//! the per-slot length (e.g. 2 × 512 B), so the buffer budget lives in
+//! `.bss` and is sized by the caller rather than fixed at
+//! `UNICAST_SOCKETS_CAP × UDP_BUFFER_SIZE`. On `std + tokio` the provider
+//! is heap-backed and provisioned internally (`UDP_BUFFER_SIZE`-sized slots),
+//! invisible to callers.
 //!
-//! In addition, each `SocketManager`'s spawn loop holds a persistent
-//! `[u8; UDP_BUFFER_SIZE]` receive/send buffer. When the send path needs
-//! E2E protection (i.e. the destination key is registered in the
-//! `E2ERegistry`), it transiently allocates a second
-//! `[u8; UDP_BUFFER_SIZE]` on the stack for the protected output; sends
-//! without E2E protection do not pay this cost. So an active
-//! socket-loop future carries one always-live `UDP_BUFFER_SIZE` buffer
-//! plus up to one additional `UDP_BUFFER_SIZE` buffer during E2E sends.
-//! With `UNICAST_SOCKETS_CAP=8` sockets bound, the total per-client
-//! buffer budget scales as `UNICAST_SOCKETS_CAP * UDP_BUFFER_SIZE`
-//! always-live, up to `2 * UNICAST_SOCKETS_CAP * UDP_BUFFER_SIZE` at
-//! peak during concurrent E2E-protected sends on every socket. At the
-//! current default of `UDP_BUFFER_SIZE = 1500`, that is ~12 KiB
-//! always-live / ~24 KiB peak per client.
-//!
-//! On `std + tokio`, all of this is allocated on the heap when each future
-//! is spawned, so the overhead is invisible to callers. On the bare-metal
-//! port (future), whoever drives the futures must arrange storage for them
-//! (either a `static` or a heap allocator); the capacity constants plus
-//! [`crate::UDP_BUFFER_SIZE`] are the knobs for trimming this footprint.
+//! See `docs/simple_someip/plans/2026-06-09-phase22-125-memory-reduction-design.md`.
 mod bind_dispatch;
 mod error;
 mod inner;
