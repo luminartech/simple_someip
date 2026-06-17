@@ -258,7 +258,7 @@ impl ServerConfig {
     }
 }
 
-/// Bundle of pluggable infrastructure passed to [`Server::new_with_deps`].
+/// Bundle of pluggable infrastructure passed to `Server::new_with_deps`.
 /// Mirrors `crate::ClientDeps` (under `client`) but with the server's
 /// smaller surface
 /// — no `Spawner` (server has no internal task spawning), no
@@ -344,7 +344,7 @@ impl
 /// Field-by-field fluent builder. Each `with_*` returns a new
 /// `ServerDeps` with that single field replaced (and its corresponding
 /// generic parameter updated). Lets callers start from
-/// [`ServerDeps::tokio`] and override individual fields without
+/// `ServerDeps::tokio` and override individual fields without
 /// spelling out the full struct literal.
 impl<F, Tm, R, Sub> ServerDeps<F, Tm, R, Sub>
 where
@@ -425,10 +425,10 @@ where
 /// the other constructor variants) alongside the [`Server`] handle and
 /// the combined run-future.
 ///
-/// Mirrors `crate::ClientUpdates`'s role on the [`Client`](crate::Client)
+/// Mirrors `crate::ClientUpdates`'s role on the `Client`
 /// side: a place to hang things the caller will reach for once
 /// construction completes (today: just the
-/// [`EventPublisher`](crate::server::EventPublisher) handle; future
+/// [`EventPublisher`] handle; future
 /// fields are reserved for forward-compat). Existing
 /// `Server::publisher()` accessor is unchanged — the field on this
 /// struct is the more discoverable path now that `Server::new` returns
@@ -538,7 +538,7 @@ where
 ///
 /// The generic order mirrors [`ServerDeps`] (and, for the shared
 /// infrastructure parameters `F`, `Tm`, `R`, the order is also shared
-/// with [`crate::ClientDeps`]).
+/// with `crate::ClientDeps`).
 ///
 /// The convenience constructors `Self::new` / `Self::new_with_loopback`
 /// / `Self::new_passive` (under the `server-tokio` feature) instantiate
@@ -611,7 +611,7 @@ pub struct Server<
     /// On `server-tokio` builds this is a zero-sized `TokioTransport`.
     #[allow(dead_code)]
     factory: F,
-    /// Async sleep primitive used by [`Self::announcement_loop`]'s
+    /// Async sleep primitive used by `announcement_loop`'s
     /// 1-second tick. On `server-tokio` builds this is `TokioTimer`
     /// (wrapping `tokio::time::sleep`).
     timer: Tm,
@@ -653,7 +653,7 @@ pub struct Server<
 /// the callback as a `(NonSdRequestCallback, usize)` pair and passed
 /// back verbatim on every invocation. It is deliberately `usize`
 /// rather than `*mut c_void`: a stored raw pointer would make
-/// [`Server`] `!Send` and break [`Server::run`]'s declared `+ Send`
+/// [`Server`] `!Send` and break `Server::run`'s declared `+ Send`
 /// bound, while `usize` is trivially `Send + Sync` and matches the
 /// `uintptr_t` an FFI caller holds anyway. No `unsafe` enters this
 /// crate — the cast back to a pointer (and its safety justification)
@@ -804,7 +804,7 @@ impl
     /// incoming `SubscribeEventGroup` / `FindService` messages and routes
     /// them to the right `EventPublisher` via
     /// [`EventPublisher::register_subscriber`]). Do **not** call
-    /// [`Server::announcement_loop`] or spawn [`Server::run`] on a passive
+    /// `announcement_loop` or spawn [`Server::run`] on a passive
     /// server — the external dispatcher owns those responsibilities.
     ///
     /// # Errors
@@ -950,7 +950,7 @@ where
     /// Passive servers bind a unicast socket as usual but bind their SD
     /// socket to an ephemeral port (port 0) instead of the SOME/IP SD
     /// port — see `Server::new_passive` under `server-tokio` for the
-    /// full explanation. Calling [`Self::announcement_loop`] or
+    /// full explanation. Calling `announcement_loop` or
     /// [`Self::run`] on the result is a programming error.
     ///
     /// # Errors
@@ -1043,7 +1043,7 @@ where
 {
     /// Construct a `Server` from pre-built dependencies + storage
     /// handles. The bare-metal-no-alloc counterpart to
-    /// [`Self::new_with_deps`].
+    /// `Self::new_with_deps`.
     ///
     /// Unlike `new_with_deps`, this constructor does NOT call
     /// `factory.bind(...)` and does NOT join any multicast group.
@@ -1112,8 +1112,8 @@ where
     /// Passive-server counterpart to [`Self::new_with_handles`].
     ///
     /// Same shape; the resulting server is marked
-    /// `is_passive = true` so [`Self::announcement_loop`] /
-    /// [`Self::announcement_loop_local`] / [`Self::run`] /
+    /// `is_passive = true` so `announcement_loop` /
+    /// `announcement_loop_local` / `Self::run` /
     /// [`Self::run_with_buffers`] return
     /// `Err(Error::InvalidUsage(...))` rather than driving the SD
     /// loop. The caller is expected to handle SD externally
@@ -1230,7 +1230,7 @@ where
     /// 1-Hz `OfferService` announcement loop. The two are combined
     /// into a single future so callers cannot forget to spawn the
     /// announcement side; passing
-    /// [`ServerConfig::with_announce(false)`] suppresses the
+    /// [`ServerConfig::with_announce`]`(false)` suppresses the
     /// announcement arm for dispatcher topologies where a co-located
     /// `Client` drives SD on the server's behalf.
     ///
@@ -1239,7 +1239,7 @@ where
     /// (~1500 bytes) and ideally up to the IP datagram limit
     /// (64 KiB - 1). On bare-metal targets, callers typically place
     /// these in `static` storage; on std (or any alloc-using
-    /// target), [`Self::run`] is the convenience shim that
+    /// target), `Self::run` is the convenience shim that
     /// heap-allocates 64 KiB buffers and delegates here.
     ///
     /// The returned future is independent of `&self` — the cheap
@@ -1324,7 +1324,7 @@ where
     /// phase 21 removed — deliberately. An announce-only future never
     /// touches the receive path, so the invariant that motivated the
     /// phase-21 combined run-future (no two futures racing the same
-    /// sockets and SD session counter) is preserved: the [`Self::run`]
+    /// sockets and SD session counter) is preserved: the `Self::run`
     /// path is still guarded by the first-poll `started` latch, and
     /// supplementary announce loops only ever *send* on the shared SD
     /// socket.
@@ -3522,7 +3522,7 @@ mod tests {
         });
     }
 
-    /// Smoke test for [`Server::announcement_loop`]: a loopback server
+    /// Smoke test for `announcement_loop`: a loopback server
     /// with `multicast_loop` enabled should emit at least one
     /// `OfferService` on the SD multicast group within a couple of
     /// seconds.

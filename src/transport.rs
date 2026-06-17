@@ -103,12 +103,16 @@
 //! # fn wrapper() {
 //! use core::future::Future;
 //! use core::net::{Ipv4Addr, SocketAddrV4};
+//! use core::pin::Pin;
 //! use core::time::Duration;
-//! use futures::future::BoxFuture;
 //! use simple_someip::transport::{
 //!     IoErrorKind, ReceivedDatagram, SocketOptions, Timer, TransportError,
 //!     TransportFactory, TransportSocket,
 //! };
+//!
+//! // A boxed future alias keeps this sketch short without pulling in the
+//! // `futures` crate (the engine itself depends only on `futures-util`).
+//! type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 //!
 //! struct TokioTransport;
 //!
@@ -118,17 +122,18 @@
 //!
 //! impl TransportFactory for TokioTransport {
 //!     type Socket = TokioSocket;
-//!     fn bind(
-//!         &self,
+//!     type BindFuture<'a> = BoxFuture<'a, Result<Self::Socket, TransportError>>;
+//!     fn bind<'a>(
+//!         &'a self,
 //!         addr: SocketAddrV4,
-//!         _options: &SocketOptions,
-//!     ) -> impl Future<Output = Result<Self::Socket, TransportError>> + Send {
-//!         async move {
+//!         _options: &'a SocketOptions,
+//!     ) -> Self::BindFuture<'a> {
+//!         Box::pin(async move {
 //!             let inner = tokio::net::UdpSocket::bind(addr)
 //!                 .await
 //!                 .map_err(|_| TransportError::Io(IoErrorKind::Other))?;
 //!             Ok(TokioSocket { inner })
-//!         }
+//!         })
 //!     }
 //! }
 //!
@@ -203,8 +208,11 @@
 //!
 //! struct TokioTimer;
 //! impl Timer for TokioTimer {
-//!     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send {
-//!         tokio::time::sleep(duration)
+//!     // `tokio::time::Sleep` is `!Send`; box it behind a non-`Send`
+//!     // future so this sketch stays backend-agnostic.
+//!     type SleepFuture<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
+//!     fn sleep(&self, duration: Duration) -> Self::SleepFuture<'_> {
+//!         Box::pin(tokio::time::sleep(duration))
 //!     }
 //! }
 //! # }
