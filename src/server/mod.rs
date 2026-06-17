@@ -1261,6 +1261,8 @@ where
         &self,
         unicast_buf: &'a mut [u8],
         sd_buf: &'a mut [u8],
+        recv_send_buf: &'a mut [u8],
+        announce_send_buf: &'a mut [u8],
     ) -> impl core::future::Future<Output = Result<(), Error>> + 'a + use<'a, F, Tm, R, Sub, H, Hsd, Hep>
     where
         Tm: 'a,
@@ -1305,6 +1307,8 @@ where
                 is_passive,
                 unicast_buf,
                 sd_buf,
+                recv_send_buf,
+                announce_send_buf,
                 non_sd_observer,
             )
             .await
@@ -1344,7 +1348,21 @@ where
         let sd_state = self.sd_state.clone();
         let timer = self.timer.clone();
         async move {
-            runtime::announce_loop(&config, sd_socket.get(), sd_state.get(), &timer).await;
+            // This is a standalone future (not the concurrent
+            // recv+announce `run_combined`), so a single future-local
+            // send scratch is sound — only one announce send is ever in
+            // flight. Bare-metal supplementary servers that cannot park
+            // a `[u8; UDP_BUFFER_SIZE]` in the future should drive
+            // `announce_loop` directly with their own buffer.
+            let mut announce_send_buf = [0u8; crate::UDP_BUFFER_SIZE];
+            runtime::announce_loop(
+                &config,
+                sd_socket.get(),
+                sd_state.get(),
+                &timer,
+                &mut announce_send_buf,
+            )
+            .await;
         }
     }
 
@@ -1436,6 +1454,13 @@ where
 
             let mut unicast_buf = alloc::vec![0u8; 65535];
             let mut sd_buf = alloc::vec![0u8; 65535];
+            // Two DISTINCT send-scratch buffers — `recv_loop` and
+            // `announce_loop` run concurrently and can each be parked at a
+            // `send_to().await`, so a shared buffer would mutably alias.
+            // Heap-backed here (this is the `_alloc` path); bare-metal
+            // callers pass their own via `run_with_buffers`.
+            let mut recv_send_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
+            let mut announce_send_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
             runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm>(
                 config,
                 unicast_socket,
@@ -1446,6 +1471,8 @@ where
                 is_passive,
                 &mut unicast_buf,
                 &mut sd_buf,
+                &mut recv_send_buf,
+                &mut announce_send_buf,
                 non_sd_observer,
             )
             .await
@@ -1738,7 +1765,16 @@ mod tests {
         let server = TestServer::new_passive_with_handles(handles, config).expect("passive ctor");
         let mut unicast_buf = vec![0u8; 1500];
         let mut sd_buf = vec![0u8; 1500];
-        let result = server.run_with_buffers(&mut unicast_buf, &mut sd_buf).await;
+        let mut recv_send_buf = vec![0u8; 1500];
+        let mut announce_send_buf = vec![0u8; 1500];
+        let result = server
+            .run_with_buffers(
+                &mut unicast_buf,
+                &mut sd_buf,
+                &mut recv_send_buf,
+                &mut announce_send_buf,
+            )
+            .await;
         match result {
             Err(Error::InvalidUsage(tag)) => assert_eq!(tag, "passive_server_run"),
             other => {
@@ -1903,6 +1939,7 @@ mod tests {
             &server.subscriptions,
             &sd_view,
             sender,
+            &mut [0u8; crate::UDP_BUFFER_SIZE],
         )
         .await;
         assert!(
@@ -2073,6 +2110,7 @@ mod tests {
                 &server.subscriptions,
                 &sd_view,
                 addr,
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
             )
             .await
             .unwrap();
@@ -2136,6 +2174,7 @@ mod tests {
                 &server.subscriptions,
                 &sd_view,
                 addr,
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
             )
             .await
             .unwrap();
@@ -2196,6 +2235,7 @@ mod tests {
                 &server.subscriptions,
                 &sd_view,
                 addr,
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
             )
             .await
             .unwrap();
@@ -2254,6 +2294,7 @@ mod tests {
                 &server.subscriptions,
                 &sd_view,
                 addr,
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
             )
             .await
             .unwrap();
@@ -2315,6 +2356,7 @@ mod tests {
                 &server.subscriptions,
                 &sd_view,
                 addr,
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
             )
             .await
             .unwrap();
@@ -2373,6 +2415,7 @@ mod tests {
                 &server.subscriptions,
                 &sd_view,
                 addr,
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
             )
             .await
             .unwrap();
@@ -2424,6 +2467,7 @@ mod tests {
                 &server.subscriptions,
                 &sd_view,
                 addr,
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
             )
             .await
             .unwrap();
@@ -2655,6 +2699,7 @@ mod tests {
             &server.subscriptions,
             &sd_view,
             "127.0.0.1:12345".parse().unwrap(),
+            &mut [0u8; crate::UDP_BUFFER_SIZE],
         )
         .await;
         assert!(result.is_ok());
@@ -2695,6 +2740,7 @@ mod tests {
                 &server.subscriptions,
                 &sd_view,
                 addr,
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
             )
             .await
             .unwrap();
@@ -3010,6 +3056,7 @@ mod tests {
             &server.subscriptions,
             &sd_view,
             sender,
+            &mut [0u8; crate::UDP_BUFFER_SIZE],
         )
         .await
         .unwrap();
@@ -3179,7 +3226,16 @@ mod tests {
         // Same gate on `run_with_buffers`.
         let mut unicast_buf = vec![0u8; 1500];
         let mut sd_buf = vec![0u8; 1500];
-        let third = server.run_with_buffers(&mut unicast_buf, &mut sd_buf).await;
+        let mut recv_send_buf = vec![0u8; 1500];
+        let mut announce_send_buf = vec![0u8; 1500];
+        let third = server
+            .run_with_buffers(
+                &mut unicast_buf,
+                &mut sd_buf,
+                &mut recv_send_buf,
+                &mut announce_send_buf,
+            )
+            .await;
         match third {
             Err(Error::InvalidUsage(tag)) => {
                 assert_eq!(tag, "server_already_running");
