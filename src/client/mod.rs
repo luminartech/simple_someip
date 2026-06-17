@@ -11,8 +11,29 @@
 //! the per-slot length (e.g. 2 × 512 B), so the buffer budget lives in
 //! `.bss` and is sized by the caller rather than fixed at
 //! `UNICAST_SOCKETS_CAP × UDP_BUFFER_SIZE`. On `std + tokio` the provider
-//! is heap-backed and provisioned internally (`UDP_BUFFER_SIZE`-sized slots),
-//! invisible to callers.
+//! is heap-backed (a single reference-counted `BufferPool`, freed when the
+//! last lease and provider drop — not leaked) and provisioned internally
+//! (`UDP_BUFFER_SIZE`-sized slots), invisible to callers.
+//!
+//! ## Sizing the pool
+//!
+//! Bare-metal callers should size their pool at **`(max concurrent sockets)
+//! + 1`** slots, not exactly the socket count. The unicast-eviction path
+//! frees a buffer lease asynchronously (when the spawned loop future drops),
+//! lagging the synchronous registry removal, so an evict-then-immediate-rebind
+//! can transiently need one extra slot; without the `+ 1` slack that surfaces
+//! as a spurious `Capacity("udp_buffer")`. The tokio provider already bakes
+//! this in (it sizes its pool at 10 = `UNICAST_SOCKETS_CAP (8) + 1 discovery
+//! + 1 release-lag`).
+//!
+//! ## Minimum slot length
+//!
+//! A pool slot must be at least 16 bytes — the SOME/IP header size — or the
+//! client silently drops all inbound and rejects all sends; `BufferPool::new`
+//! enforces this floor with a compile-time `const` assertion. 16 is only the
+//! absolute header minimum: the practical floor is the largest expected
+//! message (header + payload), realistically one full UDP datagram
+//! ([`UDP_BUFFER_SIZE`](crate::UDP_BUFFER_SIZE)).
 //!
 //! See `docs/simple_someip/plans/2026-06-09-phase22-125-memory-reduction-design.md`.
 mod bind_dispatch;
