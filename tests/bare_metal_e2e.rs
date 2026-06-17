@@ -30,19 +30,22 @@ use simple_someip::PayloadWireFormat;
 use simple_someip::client::Error as ClientError;
 use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::define_static_channels;
-use simple_someip::e2e::E2ERegistry;
+use simple_someip::e2e::{E2EProfile, E2ERegistry, Profile4Config};
 use simple_someip::protocol::sd::RebootFlag;
 use simple_someip::protocol::{
     Header, Message, MessageId, MessageType, MessageTypeField, ReturnCode,
 };
-use simple_someip::server::{ServerConfig, SubscribeError, Subscriber, SubscriptionHandle};
+use simple_someip::server::{
+    Error as ServerError, EventPublisher, ServerConfig, SubscribeError, Subscriber,
+    SubscriptionHandle,
+};
 use simple_someip::WireFormat;
 use simple_someip::static_channels::BufferPool;
 use simple_someip::transport::{
-    ReceivedDatagram, SocketOptions, Spawner, StaticBufferProvider, Timer, TransportError,
-    TransportFactory, TransportSocket,
+    E2ERegistryHandle, ReceivedDatagram, SocketOptions, Spawner, StaticBufferProvider, Timer,
+    TransportError, TransportFactory, TransportSocket,
 };
-use simple_someip::{Client, ClientDeps, RawPayload, Server, ServerDeps, UDP_BUFFER_SIZE};
+use simple_someip::{Client, ClientDeps, E2EKey, RawPayload, Server, ServerDeps, UDP_BUFFER_SIZE};
 
 // ── Static-pool channel factory ───────────────────────────────────────
 //
@@ -1104,4 +1107,194 @@ fn empty_vec_sd_header() -> simple_someip::VecSdHeader {
         entries: vec![],
         options: vec![],
     }
+}
+
+// ── Task 4 (PR 3, #125): server EventPublisher publish paths take caller scratch ─
+
+/// Task 4 regression (server-side PR-2 lesson): E2E-protected publish whose
+/// expanded payload exceeds the caller-provided `msg_buf` / `protected_buf`
+/// must return `Err(ServerError::Capacity("udp_buffer"))`, NOT panic from
+/// an out-of-bounds copy.
+///
+/// # Why the window is deterministic
+///
+/// Profile 4 protect prepends a 12-byte E2E header.  With a 20-byte payload:
+/// - Unprotected SOME/IP frame: 16 (header) + 20 (payload) = 36 bytes.
+/// - Post-protect SOME/IP frame: 16 (header) + (12 + 20) (P4 output) = 48 bytes.
+/// - Both scratch buffers: 40 bytes each.
+///
+/// Pre-guard (unprotected) : 36 ≤ 40 → passes.
+/// Post-protect guard (before fix): 48 > UDP_BUFFER_SIZE (1400) → false → no guard fires.
+/// `copy_from_slice` into msg_buf[16..48] on a 40-byte buf → out-of-bounds panic (RED).
+///
+/// Post-protect guard (after fix): 48 > 40 → true → `Capacity` returned (GREEN).
+#[tokio::test]
+async fn e2e_publish_with_undersized_scratch_returns_capacity_not_panic() {
+    // Construct a bare-metal EventPublisher using mock infrastructure from
+    // this test file (MockSocket / MockSubscriptions / Arc<Mutex<E2ERegistry>>).
+
+    // ── Build a MockSocket that discards sends (we never reach the send step) ──
+    let network = SharedNetwork::new();
+    let server_factory = MockFactory {
+        tx_pipe: Arc::clone(&network.server_to_client),
+        rx_pipe: Arc::clone(&network.client_to_server),
+        next_port: Arc::new(Mutex::new(50)),
+    };
+    let socket = server_factory
+        .bind(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+            &SocketOptions::new(),
+        )
+        .await
+        .expect("bind mock socket");
+    let socket = Arc::new(socket);
+
+    // ── Subscription: one subscriber so we don't short-circuit on "no subs" ──
+    let subs = MockSubscriptions::default();
+    let subscriber_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 39999);
+    subs.subscribe(0xABCD, 1, 0x01, subscriber_addr)
+        .await
+        .expect("subscribe");
+
+    // ── E2E: register Profile 4 for service 0xABCD, method 0x0001 ──
+    let registry: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_key = E2EKey::new(0xABCD, 0x0001);
+    registry
+        .register(e2e_key, E2EProfile::Profile4(Profile4Config::new(0, 15)))
+        .expect("register E2E key");
+
+    let publisher: EventPublisher<
+        Arc<Mutex<E2ERegistry>>,
+        MockSubscriptions,
+        Arc<MockSocket>,
+        MockSocket,
+    > = EventPublisher::new(subs, socket, registry);
+
+    // ── Build the SOME/IP message with 20-byte payload ──
+    // Unprotected: 16 + 20 = 36 B ≤ 40 B (fits msg_buf).
+    // Post-P4-protect: 16 + 12 + 20 = 48 B > 40 B (exceeds msg_buf) → must Capacity.
+    let service_id: u16 = 0xABCD;
+    let method_id: u16 = 0x0001;
+    let payload_bytes = [0x55u8; 20];
+    let msg_id = MessageId::new_from_service_and_method(service_id, method_id);
+    let payload = RawPayload::from_payload_bytes(msg_id, &payload_bytes).expect("create payload");
+    let message = Message::<RawPayload>::new(
+        Header::new_event(
+            service_id,
+            method_id,
+            0x0001_0001,
+            1,
+            1,
+            payload_bytes.len(),
+        ),
+        payload,
+    );
+
+    // ── 40-byte scratch buffers: fits unprotected (36 B), too small for P4 (48 B) ──
+    let mut msg_buf = [0u8; 40];
+    let mut protected_buf = [0u8; 40];
+
+    let result = publisher
+        .publish_event_with_buffers(
+            service_id,
+            1,
+            0x01,
+            &message,
+            &mut msg_buf,
+            &mut protected_buf,
+        )
+        .await;
+
+    // Must return typed Capacity error — NOT panic from out-of-bounds copy.
+    assert!(
+        matches!(result, Err(ServerError::Capacity("udp_buffer"))),
+        "expected Err(Capacity(\"udp_buffer\")), got {result:?}"
+    );
+}
+
+/// Task 4 future-size witness: measure the size of a `publish_event_with_buffers`
+/// future constructed with bare-metal channel / mock infrastructure + caller
+/// buffers. This is the app's future (separate from `run_combined`), so it does
+/// NOT appear in the `bm_server_run_future` witness.
+///
+/// The budget is `ceil64(measured × 1.25)`. Update this constant when the
+/// implementation changes (and verify on thumbv7em with `tools/capture_type_sizes.sh`).
+///
+/// # Budget rationale
+///
+/// With caller-provided scratch (PR-3 #125), the future no longer holds
+/// two `[u8; UDP_BUFFER_SIZE]` arrays — those live in the app's stack frame
+/// instead. The future retains only the subscriber snapshot
+/// (`HeaplessVec<SocketAddrV4, SUBSCRIBERS_PER_GROUP>`) and the E2E + socket
+/// handle clones, which are pointer-sized.
+/// Budget: ceil64(320 B × 1.25) = 448 B (x86-64 host measurement).
+/// Before PR-3 #125 scratch-extraction, the future held two `[u8; 1500]` arrays
+/// in-future: ~3320 B. After: caller holds the arrays; future is ~320 B (host).
+const BM_SERVER_PUBLISH_FUTURE_BUDGET: usize = 448; // = ceil64(320 × 1.25)
+
+#[tokio::test]
+async fn future_size_witness_bm_server_publish_future() {
+    // ── Build minimal bare-metal-flavored infrastructure ──
+    let network = SharedNetwork::new();
+    let server_factory = MockFactory {
+        tx_pipe: Arc::clone(&network.server_to_client),
+        rx_pipe: Arc::clone(&network.client_to_server),
+        next_port: Arc::new(Mutex::new(60)),
+    };
+    let socket = server_factory
+        .bind(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+            &SocketOptions::new(),
+        )
+        .await
+        .expect("bind mock socket");
+    let socket = Arc::new(socket);
+
+    let subs = MockSubscriptions::default();
+    let registry: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+
+    let publisher: EventPublisher<
+        Arc<Mutex<E2ERegistry>>,
+        MockSubscriptions,
+        Arc<MockSocket>,
+        MockSocket,
+    > = EventPublisher::new(subs, socket, registry);
+
+    // ── Build the message payload ──
+    let service_id: u16 = 0x1234;
+    let method_id: u16 = 0x0001;
+    let payload_bytes = [0u8; 20];
+    let msg_id = MessageId::new_from_service_and_method(service_id, method_id);
+    let payload = RawPayload::from_payload_bytes(msg_id, &payload_bytes).expect("create payload");
+    let message = Message::<RawPayload>::new(
+        Header::new_event(service_id, method_id, 0x0001_0001, 1, 1, payload_bytes.len()),
+        payload,
+    );
+
+    // ── Caller-provided scratch buffers (simulate app-side static arrays) ──
+    let mut msg_buf = [0u8; UDP_BUFFER_SIZE];
+    let mut protected_buf = [0u8; UDP_BUFFER_SIZE];
+
+    // Construct the future WITHOUT awaiting it so we can measure its size.
+    let publish_future = publisher.publish_event_with_buffers(
+        service_id,
+        1,
+        0x01,
+        &message,
+        &mut msg_buf,
+        &mut protected_buf,
+    );
+
+    let future_size = core::mem::size_of_val(&publish_future);
+    // Drop the future (do not drive it — no real subscribers in this witness).
+    drop(publish_future);
+
+    println!("FUTURE_SIZE bm_server_publish_future {future_size}");
+
+    assert!(
+        future_size <= BM_SERVER_PUBLISH_FUTURE_BUDGET,
+        "publish future grew: {future_size} B > budget {BM_SERVER_PUBLISH_FUTURE_BUDGET} B — \
+         update BM_SERVER_PUBLISH_FUTURE_BUDGET in tests/bare_metal_e2e.rs after verifying \
+         the new size is acceptable"
+    );
 }

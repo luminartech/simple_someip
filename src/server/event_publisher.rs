@@ -2,7 +2,6 @@
 
 use super::Error;
 use super::subscription_manager::{SUBSCRIBERS_PER_GROUP, SubscriptionHandle};
-use crate::UDP_BUFFER_SIZE;
 use crate::e2e::E2EKey;
 use crate::protocol::{Header, Message};
 use crate::traits::{PayloadWireFormat, WireFormat};
@@ -84,29 +83,48 @@ where
         }
     }
 
-    /// Publish an event to all subscribers of an event group
+    /// Publish an event to all subscribers of an event group using caller-provided scratch.
+    ///
+    /// The `msg_buf` and `protected_buf` slices are the two scratch areas
+    /// needed for the send path:
+    ///
+    /// - `msg_buf` — receives the serialized SOME/IP frame (including any
+    ///   post-E2E copy-back). Must be large enough to hold the full
+    ///   protected datagram: at minimum `16 + E2E_header_overhead + payload_len`.
+    ///   On the bare-metal path, callers typically supply a `static [u8; N]`.
+    ///
+    /// - `protected_buf` — temporary scratch for the E2E protect output
+    ///   (`E2ERegistry::protect` requires disjoint in/out slices). Must be
+    ///   at least as large as the protected payload. Ignored when no E2E key
+    ///   is registered for the message.
     ///
     /// # Arguments
     /// * `service_id` - Service ID
     /// * `instance_id` - Instance ID
     /// * `event_group_id` - Event group ID
     /// * `message` - The SOME/IP message to send (must be a notification/event)
+    /// * `msg_buf` - Caller-supplied scratch for the outgoing datagram
+    /// * `protected_buf` - Caller-supplied scratch for E2E protect output
     ///
     /// # Errors
     ///
-    /// Returns an error if the message fails to serialize.
+    /// Returns an error if the message fails to serialize, or
+    /// [`Error::Capacity("udp_buffer")`] if either scratch buffer is too small
+    /// for the encoded or E2E-protected frame.
     ///
     /// # Panics
     ///
     /// May panic if the underlying [`E2ERegistryHandle`](crate::transport::E2ERegistryHandle)
     /// implementation panics (e.g., `Arc<Mutex<E2ERegistry>>` on mutex poison).
     #[allow(clippy::too_many_lines)]
-    pub async fn publish_event<P: PayloadWireFormat>(
+    pub async fn publish_event_with_buffers<P: PayloadWireFormat>(
         &self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
         message: &Message<P>,
+        msg_buf: &mut [u8],
+        protected_buf: &mut [u8],
     ) -> Result<usize, Error> {
         // Snapshot subscriber addresses into a stack-allocated buffer so
         // we can release the subscription read lock before doing async
@@ -141,52 +159,51 @@ where
         // when it runs out of buffer. Matches the raw-event path below
         // and the client socket_manager path.
         let required_size = message.required_size();
-        if required_size > UDP_BUFFER_SIZE {
+        if required_size > msg_buf.len() {
             crate::log::error!(
-                "Message size ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping publish",
+                "Message size ({} bytes) exceeds msg_buf.len() ({}); dropping publish",
                 required_size,
-                UDP_BUFFER_SIZE
+                msg_buf.len()
             );
             return Err(Error::Capacity("udp_buffer"));
         }
 
-        // Serialize the message into a fixed-size buffer of
-        // `UDP_BUFFER_SIZE` bytes. (In this `async fn` the buffer lives
-        // in the future state, not literally on the stack; "MTU-sized"
-        // is a misleading description since the cap is a UDP payload
-        // limit, not an Ethernet MTU — see `UDP_BUFFER_SIZE` docs.)
-        let mut buffer = [0u8; UDP_BUFFER_SIZE];
-        let mut message_length = message.encode_to_slice(&mut buffer)?;
+        // Serialize the message into the caller-provided buffer.
+        // (PR-3 #125 change: no longer uses an in-future `[u8; UDP_BUFFER_SIZE]`;
+        // the caller decides the buffer size and lifetime.)
+        let mut message_length = message.encode_to_slice(msg_buf)?;
 
-        // Apply E2E protect if configured. The `protected` stack buffer is
-        // disjoint from `buffer`, so we can read the unprotected payload
-        // directly out of `buffer[16..]` without a separate copy.
+        // Apply E2E protect if configured. `protected_buf` is disjoint from
+        // `msg_buf`, so we can read the unprotected payload directly out of
+        // `msg_buf[16..]` without a separate copy. The guard is keyed off
+        // `msg_buf.len()` (not `UDP_BUFFER_SIZE`) — the PR-2 lesson applied
+        // to the server publish path.
         {
             let key = E2EKey::from_message_id(message.header().message_id());
             if self.e2e_registry.contains_key(&key) {
-                let upper_header: [u8; 8] = buffer[8..16].try_into().expect("upper header slice");
-                let mut protected = [0u8; UDP_BUFFER_SIZE];
+                let upper_header: [u8; 8] = msg_buf[8..16].try_into().expect("upper header slice");
                 let result = self.e2e_registry.protect(
                     key,
-                    &buffer[16..message_length],
+                    &msg_buf[16..message_length],
                     upper_header,
-                    &mut protected,
+                    protected_buf,
                 );
                 match result {
                     Some(Ok(protected_len)) => {
-                        if 16 + protected_len > UDP_BUFFER_SIZE {
+                        if 16 + protected_len > msg_buf.len() {
                             crate::log::error!(
                                 "E2E-protected datagram ({} bytes, header + protected payload) \
-                                 exceeds UDP_BUFFER_SIZE ({}); dropping publish",
+                                 exceeds msg_buf.len() ({}); dropping publish",
                                 16 + protected_len,
-                                UDP_BUFFER_SIZE
+                                msg_buf.len()
                             );
                             return Err(Error::Capacity("udp_buffer"));
                         }
                         #[allow(clippy::cast_possible_truncation)]
                         let new_length: u32 = 8 + protected_len as u32;
-                        buffer[4..8].copy_from_slice(&new_length.to_be_bytes());
-                        buffer[16..16 + protected_len].copy_from_slice(&protected[..protected_len]);
+                        msg_buf[4..8].copy_from_slice(&new_length.to_be_bytes());
+                        msg_buf[16..16 + protected_len]
+                            .copy_from_slice(&protected_buf[..protected_len]);
                         message_length = 16 + protected_len;
                     }
                     Some(Err(e)) => {
@@ -205,7 +222,7 @@ where
             }
         }
 
-        let datagram = &buffer[..message_length];
+        let datagram = &msg_buf[..message_length];
 
         // Send to all snapshotted subscribers. Track the last
         // transport error so we can surface "every send failed" as
@@ -249,15 +266,67 @@ where
         Ok(sent_count)
     }
 
-    /// Publish raw event data (already serialized with E2E protection)
+    /// Publish an event to all subscribers of an event group.
     ///
-    /// This is useful when you've already applied E2E protection to the payload
+    /// Convenience wrapper over [`Self::publish_event_with_buffers`] that
+    /// internally allocates the two scratch [`Vec`]s required for the send
+    /// path. Available only when an allocator is present (`_alloc` feature).
+    /// Bare-metal callers without an allocator must supply their own
+    /// scratch via [`Self::publish_event_with_buffers`] directly.
+    ///
+    /// Existing `server-tokio` callers — which call `publish_event(...)` via
+    /// an `Arc<EventPublisher<…>>` handle — are unchanged by the PR-3 #125
+    /// scratch-extraction refactor: the allocation is invisible at the call
+    /// site and the signature is identical to the pre-refactor version.
+    ///
+    /// # Arguments
+    /// * `service_id` - Service ID
+    /// * `instance_id` - Instance ID
+    /// * `event_group_id` - Event group ID
+    /// * `message` - The SOME/IP message to send
     ///
     /// # Errors
     ///
-    /// Returns an error if the SOME/IP header fails to serialize.
+    /// Returns an error if serialization fails or the message exceeds
+    /// [`crate::UDP_BUFFER_SIZE`].
+    #[cfg(feature = "_alloc")]
+    pub async fn publish_event<P: PayloadWireFormat>(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+        message: &Message<P>,
+    ) -> Result<usize, Error> {
+        let mut msg_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
+        let mut protected_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
+        self.publish_event_with_buffers(
+            service_id,
+            instance_id,
+            event_group_id,
+            message,
+            &mut msg_buf,
+            &mut protected_buf,
+        )
+        .await
+    }
+
+    /// Publish raw event data using a caller-provided scratch buffer.
+    ///
+    /// The `buf` slice receives the serialized SOME/IP header + payload
+    /// datagram before being sent to each subscriber. The caller must
+    /// supply a buffer large enough to hold `16 + payload.len()` bytes;
+    /// [`Error::Capacity("udp_buffer")`] is returned if the buffer is
+    /// too small, without writing any bytes. On the bare-metal path,
+    /// callers typically supply a `static [u8; N]`.
+    ///
+    /// This is useful when you've already applied E2E protection to the payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SOME/IP header fails to serialize, or
+    /// [`Error::Capacity("udp_buffer")`] if `buf` is too small for the frame.
     #[allow(clippy::too_many_arguments)]
-    pub async fn publish_raw_event(
+    pub async fn publish_raw_event_with_buffers(
         &self,
         service_id: u16,
         instance_id: u16,
@@ -267,9 +336,10 @@ where
         protocol_version: u8,
         interface_version: u8,
         payload: &[u8],
+        buf: &mut [u8],
     ) -> Result<usize, Error> {
         // Snapshot subscriber addresses into a stack buffer (see
-        // publish_event for rationale).
+        // publish_event_with_buffers for rationale).
         let mut subscribers: HeaplessVec<SocketAddrV4, SUBSCRIBERS_PER_GROUP> = HeaplessVec::new();
         let _total = self
             .subscriptions
@@ -284,16 +354,14 @@ where
 
         // Pre-build size check. Fail fast with `Error::Capacity` BEFORE
         // calling `Header::new_event`, which `assert!`s on payloads
-        // larger than `u32::MAX as usize - 8`. The earlier
-        // `checked_add(header_len, payload.len())` guard below was dead
-        // for that reason; keeping it for defence-in-depth on platforms
-        // where `Header::SIZE + payload` could overflow `usize`. The
-        // `16` here is the SOME/IP header size in bytes.
-        if payload.len() > UDP_BUFFER_SIZE.saturating_sub(16) {
+        // larger than `u32::MAX as usize - 8`. The `16` here is the
+        // SOME/IP header size in bytes. Guard is keyed off `buf.len()`
+        // (not `UDP_BUFFER_SIZE`) — the PR-2 lesson applied here too.
+        if payload.len() > buf.len().saturating_sub(16) {
             crate::log::error!(
-                "raw event payload ({} bytes) + 16-byte header exceeds UDP_BUFFER_SIZE ({}); dropping publish",
+                "raw event payload ({} bytes) + 16-byte header exceeds buf.len() ({}); dropping publish",
                 payload.len(),
-                UDP_BUFFER_SIZE
+                buf.len()
             );
             return Err(Error::Capacity("udp_buffer"));
         }
@@ -308,10 +376,9 @@ where
             payload.len(),
         );
 
-        // Serialize header + payload into a fixed-size buffer of
-        // `UDP_BUFFER_SIZE` bytes. See note in `publish_event` above.
-        let mut buffer = [0u8; UDP_BUFFER_SIZE];
-        let header_len = header.encode_to_slice(&mut buffer)?;
+        // Serialize header + payload into the caller-provided buffer.
+        // (PR-3 #125 change: no longer uses an in-future `[u8; UDP_BUFFER_SIZE]`.)
+        let header_len = header.encode_to_slice(buf)?;
         let Some(total_len) = header_len.checked_add(payload.len()) else {
             crate::log::error!(
                 "raw event length computation overflowed usize (header_len={}, payload.len()={}); dropping publish",
@@ -324,20 +391,20 @@ where
         // oversize payloads, but a future caller adding optional
         // post-encode tail bytes (e.g. another protect profile) would
         // need this branch. Cheap to keep.
-        if total_len > UDP_BUFFER_SIZE {
+        if total_len > buf.len() {
             crate::log::error!(
-                "raw event ({} bytes) exceeds UDP_BUFFER_SIZE ({}); dropping publish",
+                "raw event ({} bytes) exceeds buf.len() ({}); dropping publish",
                 total_len,
-                UDP_BUFFER_SIZE
+                buf.len()
             );
             return Err(Error::Capacity("udp_buffer"));
         }
-        buffer[header_len..total_len].copy_from_slice(payload);
-        let datagram = &buffer[..total_len];
+        buf[header_len..total_len].copy_from_slice(payload);
+        let datagram = &buf[..total_len];
 
         // Send to all snapshotted subscribers; surface total-failure
         // as `Err(Transport(_))` rather than `Ok(0)` (see
-        // `publish_event`).
+        // `publish_event_with_buffers`).
         let mut sent_count = 0usize;
         let mut last_err: Option<crate::transport::TransportError> = None;
         for addr in &subscribers {
@@ -358,6 +425,50 @@ where
             ));
         }
         Ok(sent_count)
+    }
+
+    /// Publish raw event data (already serialized with E2E protection).
+    ///
+    /// Convenience wrapper over [`Self::publish_raw_event_with_buffers`] that
+    /// internally allocates the scratch [`Vec`] required for the send path.
+    /// Available only when an allocator is present (`_alloc` feature).
+    /// Bare-metal callers without an allocator must supply their own scratch
+    /// via [`Self::publish_raw_event_with_buffers`] directly.
+    ///
+    /// Existing `server-tokio` callers are unchanged by the PR-3 #125
+    /// scratch-extraction refactor — the allocation is invisible at the call
+    /// site and the signature is identical to the pre-refactor version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SOME/IP header fails to serialize or the
+    /// frame exceeds [`crate::UDP_BUFFER_SIZE`].
+    #[cfg(feature = "_alloc")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_raw_event(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+        event_id: u16,
+        request_id: u32,
+        protocol_version: u8,
+        interface_version: u8,
+        payload: &[u8],
+    ) -> Result<usize, Error> {
+        let mut buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
+        self.publish_raw_event_with_buffers(
+            service_id,
+            instance_id,
+            event_group_id,
+            event_id,
+            request_id,
+            protocol_version,
+            interface_version,
+            payload,
+            &mut buf,
+        )
+        .await
     }
 
     /// Check if there are any active subscribers for a specific event group
@@ -479,6 +590,7 @@ where
 #[cfg(all(test, feature = "server-tokio"))]
 mod tests {
     use super::*;
+    use crate::UDP_BUFFER_SIZE;
     use crate::e2e::E2ERegistry;
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
     use crate::server::SubscriptionManager;
