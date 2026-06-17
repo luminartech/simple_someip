@@ -1212,6 +1212,73 @@ async fn e2e_publish_with_undersized_scratch_returns_capacity_not_panic() {
     );
 }
 
+/// Task 4 regression (raw event path): `publish_raw_event_with_buffers` with a
+/// buffer too small to hold `16 + payload` must return
+/// `Err(ServerError::Capacity("udp_buffer"))`, NOT panic.
+///
+/// # Why the window is deterministic
+///
+/// SOME/IP header is 16 bytes. With a 10-byte payload:
+/// - Frame: 16 + 10 = 26 bytes.
+/// - Buffer: 20 bytes.
+///
+/// `16 + 10 = 26 > 20` → `Error::Capacity` (RED before guard, GREEN after).
+#[tokio::test]
+async fn publish_raw_event_with_undersized_buf_returns_capacity_not_panic() {
+    let network = SharedNetwork::new();
+    let server_factory = MockFactory {
+        tx_pipe: Arc::clone(&network.server_to_client),
+        rx_pipe: Arc::clone(&network.client_to_server),
+        next_port: Arc::new(Mutex::new(70)),
+    };
+    let socket = server_factory
+        .bind(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+            &SocketOptions::new(),
+        )
+        .await
+        .expect("bind mock socket");
+    let socket = Arc::new(socket);
+
+    let subs = MockSubscriptions::default();
+    let subscriber_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 39998);
+    subs.subscribe(0xABCD, 1, 0x01, subscriber_addr)
+        .await
+        .expect("subscribe");
+
+    let registry: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+
+    let publisher: EventPublisher<
+        Arc<Mutex<E2ERegistry>>,
+        MockSubscriptions,
+        Arc<MockSocket>,
+        MockSocket,
+    > = EventPublisher::new(subs, socket, registry);
+
+    // 20-byte buf, 10-byte payload: 16 + 10 = 26 > 20 → must Capacity.
+    let mut buf = [0u8; 20];
+    let payload = [0xAA_u8; 10];
+
+    let result = publisher
+        .publish_raw_event_with_buffers(
+            0xABCD,
+            1,
+            0x01,
+            0x8001,
+            0x0001_0001,
+            1,
+            1,
+            &payload,
+            &mut buf,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(ServerError::Capacity("udp_buffer"))),
+        "expected Err(Capacity(\"udp_buffer\")), got {result:?}"
+    );
+}
+
 /// Task 4 future-size witness: measure the size of a `publish_event_with_buffers`
 /// future constructed with bare-metal channel / mock infrastructure + caller
 /// buffers. This is the app's future (separate from `run_combined`), so it does

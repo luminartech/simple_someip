@@ -1315,14 +1315,30 @@ where
         }
     }
 
-    /// Run *only* the SD `OfferService` announcement loop, without
-    /// driving the receive path. Use this on supplementary Servers
-    /// that share a `sd_socket` / `unicast_socket` handle (via
-    /// [`Self::new_with_handles`]) with a primary Server already
-    /// running [`Self::run_with_buffers`]: the primary owns the
-    /// inbound recv loops, supplementary Servers add their own
-    /// `OfferService` to the same SD multicast group without
+    /// Run *only* the SD `OfferService` announcement loop with a
+    /// caller-provided scratch buffer. Use this on bare-metal
+    /// supplementary Servers that share a `sd_socket` /
+    /// `unicast_socket` handle (via [`Self::new_with_handles`]) with a
+    /// primary Server already running [`Self::run_with_buffers`]: the
+    /// primary owns the inbound recv loops, supplementary Servers add
+    /// their own `OfferService` to the same SD multicast group without
     /// competing for inbound datagrams.
+    ///
+    /// The caller provides the send scratch `announce_send_buf` so the
+    /// future does NOT park a `[u8; UDP_BUFFER_SIZE]` (≈ 1500 B) in
+    /// its own state. Bare-metal callers typically supply a
+    /// `static [u8; N]`:
+    ///
+    /// ```ignore
+    /// static mut ANNOUNCE_BUF: [u8; simple_someip::UDP_BUFFER_SIZE] =
+    ///     [0u8; simple_someip::UDP_BUFFER_SIZE];
+    /// // SAFETY: only one future accesses this buffer concurrently.
+    /// let fut = server.announce_only_with_buffer(unsafe { &mut ANNOUNCE_BUF });
+    /// executor.spawn(fut);
+    /// ```
+    ///
+    /// std / alloc callers can use `Self::announce_only_future`
+    /// instead, which heap-allocates the buffer internally.
     ///
     /// Design note: this partially reintroduces the split-future shape
     /// phase 21 removed — deliberately. An announce-only future never
@@ -1335,6 +1351,59 @@ where
     ///
     /// The returned future loops forever (1 s tick between
     /// announcements); spawn it on your executor.
+    pub fn announce_only_with_buffer<'a>(
+        &self,
+        announce_send_buf: &'a mut [u8],
+    ) -> impl core::future::Future<Output = ()> + 'a + use<'a, F, Tm, R, Sub, H, Hsd, Hep>
+    where
+        Tm: 'a,
+        Hsd: 'a,
+        H: 'a,
+    {
+        let config = self.config.clone();
+        let sd_socket = self.sd_socket.clone();
+        let sd_state = self.sd_state.clone();
+        let timer = self.timer.clone();
+        async move {
+            runtime::announce_loop(
+                &config,
+                sd_socket.get(),
+                sd_state.get(),
+                &timer,
+                announce_send_buf,
+            )
+            .await;
+        }
+    }
+
+    /// Run *only* the SD `OfferService` announcement loop, without
+    /// driving the receive path. Use this on supplementary Servers
+    /// that share a `sd_socket` / `unicast_socket` handle (via
+    /// [`Self::new_with_handles`]) with a primary Server already
+    /// running [`Self::run_with_buffers`]: the primary owns the
+    /// inbound recv loops, supplementary Servers add their own
+    /// `OfferService` to the same SD multicast group without
+    /// competing for inbound datagrams.
+    ///
+    /// This is the `_alloc` convenience wrapper — it heap-allocates
+    /// the send scratch internally. Bare-metal callers that cannot
+    /// park a `[u8; UDP_BUFFER_SIZE]` (≈ 1500 B) on the heap should
+    /// use [`Self::announce_only_with_buffer`] instead, which accepts
+    /// a caller-provided buffer so the heap allocation is avoided
+    /// entirely.
+    ///
+    /// Design note: this partially reintroduces the split-future shape
+    /// phase 21 removed — deliberately. An announce-only future never
+    /// touches the receive path, so the invariant that motivated the
+    /// phase-21 combined run-future (no two futures racing the same
+    /// sockets and SD session counter) is preserved: the `Self::run`
+    /// path is still guarded by the first-poll `started` latch, and
+    /// supplementary announce loops only ever *send* on the shared SD
+    /// socket.
+    ///
+    /// The returned future loops forever (1 s tick between
+    /// announcements); spawn it on your executor.
+    #[cfg(feature = "_alloc")]
     pub fn announce_only_future<'a>(
         &self,
     ) -> impl core::future::Future<Output = ()> + 'a + use<'a, F, Tm, R, Sub, H, Hsd, Hep>
@@ -1348,13 +1417,11 @@ where
         let sd_state = self.sd_state.clone();
         let timer = self.timer.clone();
         async move {
-            // This is a standalone future (not the concurrent
-            // recv+announce `run_combined`), so a single future-local
-            // send scratch is sound — only one announce send is ever in
-            // flight. Bare-metal supplementary servers that cannot park
-            // a `[u8; UDP_BUFFER_SIZE]` in the future should drive
-            // `announce_loop` directly with their own buffer.
-            let mut announce_send_buf = [0u8; crate::UDP_BUFFER_SIZE];
+            // Heap-allocate the send scratch here so the caller does
+            // not need to manage the buffer lifetime. Bare-metal callers
+            // that cannot use the allocator should call
+            // `announce_only_with_buffer` with a static scratch buffer.
+            let mut announce_send_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
             runtime::announce_loop(
                 &config,
                 sd_socket.get(),
