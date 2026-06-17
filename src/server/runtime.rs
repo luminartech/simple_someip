@@ -73,9 +73,10 @@ where
         .encode_to_slice(&mut buf[16..])
         .map_err(|_| Error::Capacity("udp_buffer"))?;
     let total_len = 16 + sd_data_len;
-    if total_len > buf.len() {
-        return Err(Error::Capacity("udp_buffer"));
-    }
+    // The `< 16` guard plus `encode_to_slice`'s own over-capacity error
+    // already cover the fit; this stays as a debug-only sanity check
+    // rather than a live (dead) branch.
+    debug_assert!(total_len <= buf.len());
     let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
     someip_header
         .encode_to_slice(&mut buf[..16])
@@ -135,9 +136,10 @@ where
         .encode_to_slice(&mut buf[16..])
         .map_err(|_| Error::Capacity("udp_buffer"))?;
     let total_len = 16 + sd_data_len;
-    if total_len > buf.len() {
-        return Err(Error::Capacity("udp_buffer"));
-    }
+    // The `< 16` guard plus `encode_to_slice`'s own over-capacity error
+    // already cover the fit; this stays as a debug-only sanity check
+    // rather than a live (dead) branch.
+    debug_assert!(total_len <= buf.len());
     let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
     someip_header
         .encode_to_slice(&mut buf[..16])
@@ -202,9 +204,10 @@ where
         .encode_to_slice(&mut buf[16..])
         .map_err(|_| Error::Capacity("udp_buffer"))?;
     let total_len = 16 + sd_data_len;
-    if total_len > buf.len() {
-        return Err(Error::Capacity("udp_buffer"));
-    }
+    // The `< 16` guard plus `encode_to_slice`'s own over-capacity error
+    // already cover the fit; this stays as a debug-only sanity check
+    // rather than a live (dead) branch.
+    debug_assert!(total_len <= buf.len());
     let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
     someip_header
         .encode_to_slice(&mut buf[..16])
@@ -235,6 +238,7 @@ pub(super) async fn handle_sd_message<T, Sub>(
     subscriptions: &Sub,
     sd_view: &sd::SdHeaderView<'_>,
     sender: core::net::SocketAddr,
+    send_buf: &mut [u8],
 ) -> Result<(), Error>
 where
     T: TransportSocket,
@@ -242,12 +246,11 @@ where
 {
     crate::log::trace!("Handling SD message from {}", sender);
 
-    // TASK 3 will thread the real caller-owned scratch buffer through
-    // `recv_loop` into this function. Until then a single local scratch
-    // is reused across every SD send below — one `[u8; UDP_BUFFER_SIZE]`
-    // in the future frame, matching the pre-Task-1 footprint (each helper
-    // previously owned its own copy, but only ever one at a time).
-    let mut scratch = [0u8; crate::UDP_BUFFER_SIZE];
+    // `send_buf` is the caller-owned send scratch threaded down from
+    // `recv_loop` (which holds exactly one — only one inbound SD message
+    // is handled at a time, so only one helper send is ever in flight).
+    // It replaces the former future-resident `[u8; UDP_BUFFER_SIZE]`,
+    // keeping that buffer out of the run future's frame.
 
     for entry_view in sd_view.entries() {
         let entry_type = entry_view.entry_type()?;
@@ -267,9 +270,8 @@ where
                         config.service_id,
                         entry_view.service_id()
                     );
-                    // TASK 3 will thread the real scratch buffer from recv_loop.
                     send_subscribe_nack_from_view(
-                        &mut scratch,
+                        send_buf,
                         config,
                         sd_socket,
                         sd_state,
@@ -284,9 +286,8 @@ where
                         config.instance_id,
                         entry_view.instance_id()
                     );
-                    // TASK 3 will thread the real scratch buffer from recv_loop.
                     send_subscribe_nack_from_view(
-                        &mut scratch,
+                        send_buf,
                         config,
                         sd_socket,
                         sd_state,
@@ -301,9 +302,8 @@ where
                         config.major_version,
                         entry_view.major_version()
                     );
-                    // TASK 3 will thread the real scratch buffer from recv_loop.
                     if let Err(e) = send_subscribe_nack_from_view(
-                        &mut scratch,
+                        send_buf,
                         config,
                         sd_socket,
                         sd_state,
@@ -321,9 +321,8 @@ where
                         entry_view.event_group_id(),
                         entry_view.service_id()
                     );
-                    // TASK 3 will thread the real scratch buffer from recv_loop.
                     if let Err(e) = send_subscribe_nack_from_view(
-                        &mut scratch,
+                        send_buf,
                         config,
                         sd_socket,
                         sd_state,
@@ -358,9 +357,8 @@ where
 
                         match subscribe_result {
                             Ok(()) => {
-                                // TASK 3 will thread the real scratch buffer from recv_loop.
                                 if let Err(e) = send_subscribe_ack_from_view(
-                                    &mut scratch,
+                                    send_buf,
                                     config,
                                     sd_socket,
                                     sd_state,
@@ -395,9 +393,8 @@ where
                                     SubscribeError::EventGroupsFull => "event_groups_full",
                                 };
                                 crate::log::debug!("Subscription rejected: {reason}");
-                                // TASK 3 will thread the real scratch buffer from recv_loop.
                                 if let Err(e) = send_subscribe_nack_from_view(
-                                    &mut scratch,
+                                    send_buf,
                                     config,
                                     sd_socket,
                                     sd_state,
@@ -413,9 +410,8 @@ where
                         }
                     } else {
                         crate::log::warn!("No endpoint found in Subscribe message options");
-                        // TASK 3 will thread the real scratch buffer from recv_loop.
                         if let Err(e) = send_subscribe_nack_from_view(
-                            &mut scratch,
+                            send_buf,
                             config,
                             sd_socket,
                             sd_state,
@@ -439,9 +435,8 @@ where
                         find_service_id,
                         config.service_id
                     );
-                    // TASK 3 will thread the real scratch buffer from recv_loop.
                     if let Err(e) = send_unicast_offer(
-                        &mut scratch,
+                        send_buf,
                         config,
                         sd_socket,
                         sd_state,
@@ -474,13 +469,17 @@ pub(super) async fn announce_loop<T, Tm>(
     sd_socket: &T,
     sd_state: &SdStateManager,
     timer: &Tm,
+    announce_send_buf: &mut [u8],
 ) where
     T: TransportSocket,
     Tm: Timer,
 {
     let mut announcement_count = 0u32;
     loop {
-        match sd_state.send_offer_service(config, sd_socket).await {
+        match sd_state
+            .send_offer_service(announce_send_buf, config, sd_socket)
+            .await
+        {
             Ok(()) => {
                 announcement_count += 1;
                 if announcement_count == 1 {
@@ -515,6 +514,7 @@ async fn recv_loop<T, Sub>(
     subscriptions: &Sub,
     unicast_buf: &mut [u8],
     sd_buf: &mut [u8],
+    send_buf: &mut [u8],
     non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
 ) -> Result<(), Error>
 where
@@ -603,6 +603,7 @@ where
                                 subscriptions,
                                 &sd_view,
                                 addr,
+                                send_buf,
                             )
                             .await?;
                         }
@@ -669,6 +670,8 @@ pub(super) async fn run_combined<H, T, Sub, Hsd, Tm>(
     is_passive: bool,
     unicast_buf: &mut [u8],
     sd_buf: &mut [u8],
+    recv_send_buf: &mut [u8],
+    announce_send_buf: &mut [u8],
     non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
 ) -> Result<(), Error>
 where
@@ -701,11 +704,16 @@ where
         &subscriptions,
         unicast_buf,
         sd_buf,
+        recv_send_buf,
         non_sd_observer,
     );
 
     if config.announce {
-        let announce_fut = announce_loop(&config, sd, sd_state_ref, &timer);
+        // Two DISTINCT send buffers: `recv_loop` and `announce_loop` run
+        // concurrently under the `select` below, and both can be suspended
+        // at a `send_to().await` simultaneously. Sharing one buffer would
+        // mutably alias it across the two live futures — UB / corruption.
+        let announce_fut = announce_loop(&config, sd, sd_state_ref, &timer, announce_send_buf);
         pin_mut!(recv_fut, announce_fut);
         match futures_util::future::select(recv_fut, announce_fut).await {
             Either::Left((recv_result, _)) => recv_result,

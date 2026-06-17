@@ -182,8 +182,13 @@ impl SdStateManager {
     }
 
     /// Send a multicast `OfferService` announcement for the given config.
+    ///
+    /// `buf` is a caller-provided scratch buffer used for encoding the
+    /// outgoing frame. Returns [`Error::Capacity`]`("udp_buffer")` if the
+    /// encoded frame does not fit in `buf`.
     pub(super) async fn send_offer_service<T: TransportSocket>(
         &self,
+        buf: &mut [u8],
         config: &ServerConfig,
         socket: &T,
     ) -> Result<(), Error> {
@@ -216,14 +221,24 @@ impl SdStateManager {
         let (sid, reboot_flag) = self.next_session_id_with_reboot_flag();
         let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &options);
 
-        // Stack-allocated send buffer — alloc-free per-tick path.
-        // 16-byte SOME/IP header + the SD payload, capped at the UDP
-        // datagram limit.
-        let mut buffer = [0u8; crate::UDP_BUFFER_SIZE];
-        let sd_data_len = sd_payload.encode_to_slice(&mut buffer[16..])?;
-        let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
-        someip_header.encode_to_slice(&mut buffer[..16])?;
+        // Caller-provided send scratch — keeps the per-tick path
+        // alloc-free without parking a `[u8; UDP_BUFFER_SIZE]` in the
+        // announce future. 16-byte SOME/IP header + the SD payload.
+        if buf.len() < 16 {
+            return Err(Error::Capacity("udp_buffer"));
+        }
+        let sd_data_len = sd_payload
+            .encode_to_slice(&mut buf[16..])
+            .map_err(|_| Error::Capacity("udp_buffer"))?;
         let total_len = 16 + sd_data_len;
+        // The `< 16` guard plus `encode_to_slice`'s own over-capacity
+        // error already cover the fit; this stays as a debug-only
+        // sanity check rather than a live branch.
+        debug_assert!(total_len <= buf.len());
+        let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
+        someip_header
+            .encode_to_slice(&mut buf[..16])
+            .map_err(|_| Error::Capacity("udp_buffer"))?;
 
         let multicast_addr = SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT);
 
@@ -234,9 +249,9 @@ impl SdStateManager {
             config.local_port,
             total_len
         );
-        crate::log::trace!("OfferService data: {:02X?}", &buffer[..total_len.min(64)]);
+        crate::log::trace!("OfferService data: {:02X?}", &buf[..total_len.min(64)]);
 
-        socket.send_to(&buffer[..total_len], multicast_addr).await?;
+        socket.send_to(&buf[..total_len], multicast_addr).await?;
         crate::log::trace!("Sent to {}", multicast_addr);
 
         Ok(())
@@ -582,7 +597,7 @@ mod tests {
         let sock = CapturingSocket::new();
 
         sd_state
-            .send_offer_service(&config, &sock)
+            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
             .await
             .expect("send_offer_service should succeed against the mock");
 
@@ -608,8 +623,8 @@ mod tests {
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = CapturingSocket::new();
 
-        sd_state.send_offer_service(&config, &sock).await.unwrap();
-        sd_state.send_offer_service(&config, &sock).await.unwrap();
+        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock).await.unwrap();
+        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock).await.unwrap();
 
         let sent = sock.drain_sent();
         assert_eq!(sent.len(), 2);
@@ -629,8 +644,8 @@ mod tests {
         // (Continuous).
         let sd_state = SdStateManager::with_initial(0xFFFE);
         let sock = CapturingSocket::new();
-        sd_state.send_offer_service(&config, &sock).await.unwrap();
-        sd_state.send_offer_service(&config, &sock).await.unwrap();
+        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock).await.unwrap();
+        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock).await.unwrap();
 
         let sent = sock.drain_sent();
         assert_eq!(sent.len(), 2);
@@ -662,7 +677,7 @@ mod tests {
         config.ttl = 0;
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = CapturingSocket::new();
-        sd_state.send_offer_service(&config, &sock).await.unwrap();
+        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock).await.unwrap();
 
         let sent = sock.drain_sent();
         let view = MessageView::parse(&sent[0].1).unwrap();
@@ -677,7 +692,7 @@ mod tests {
             .with_local_port(TEST_ADVERTISED_PORT);
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = FailingSocket;
-        let result = sd_state.send_offer_service(&config, &sock).await;
+        let result = sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock).await;
         // Narrow assertion: the error must specifically be the
         // `Io(NetworkUnreachable)` propagated from `FailingSocket::send_to`.
         // `Err(_)` would also pass on unrelated regressions (encoding
@@ -893,7 +908,7 @@ mod tests {
         // Seed with a recognisable value so on-wire session_id is exact.
         let sd_state = SdStateManager::with_initial(0x1233);
         sd_state
-            .send_offer_service(&config, &tx)
+            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx)
             .await
             .expect("send_offer_service should succeed on a configured socket");
 
@@ -918,8 +933,8 @@ mod tests {
         let (rx, tx) = mcast_rx_tx().await;
 
         let sd_state = SdStateManager::with_initial(0x1233);
-        sd_state.send_offer_service(&config, &tx).await.unwrap();
-        sd_state.send_offer_service(&config, &tx).await.unwrap();
+        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx).await.unwrap();
+        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx).await.unwrap();
 
         let first = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
         let second = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
@@ -941,8 +956,8 @@ mod tests {
         let (rx, tx) = mcast_rx_tx().await;
 
         let sd_state = SdStateManager::with_initial(0xFFFE);
-        sd_state.send_offer_service(&config, &tx).await.unwrap();
-        sd_state.send_offer_service(&config, &tx).await.unwrap();
+        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx).await.unwrap();
+        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx).await.unwrap();
 
         let first = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
         let second = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
@@ -983,7 +998,7 @@ mod tests {
         let (rx, tx) = mcast_rx_tx().await;
 
         let sd_state = SdStateManager::with_initial(0x1233);
-        sd_state.send_offer_service(&config, &tx).await.unwrap();
+        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx).await.unwrap();
 
         let offer = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
         assert_offer_matches(&offer, &config, 0x0000_1234, RebootFlag::RecentlyRebooted);
