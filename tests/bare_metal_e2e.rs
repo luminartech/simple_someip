@@ -888,7 +888,7 @@ async fn inbound_datagram_larger_than_claimed_buffer_is_dropped_not_fatal() {
 /// close, so the integration test here focuses on the claim + exhaustion
 /// contract, which is the new bind-path behavior #125 introduces.
 #[tokio::test]
-async fn each_bound_socket_claims_one_buffer_and_releases_on_close() {
+async fn binding_sockets_claims_one_buffer_each_until_pool_exhausted() {
     // Exactly 2 slots so the 3rd concurrent unicast bind exhausts the pool.
     static POOL: BufferPool<2, UDP_BUFFER_SIZE> = BufferPool::new();
 
