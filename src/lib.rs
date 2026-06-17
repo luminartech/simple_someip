@@ -162,6 +162,7 @@ pub const UDP_BUFFER_SIZE: usize = 1500;
 /// both the bare-metal and std/tokio paths can reach [`buffer_pool::BufferPool`]
 /// and [`buffer_pool::BufferLease`].
 pub mod buffer_pool;
+
 /// SOME/IP client for discovering services and exchanging messages.
 #[cfg(feature = "client")]
 pub mod client;

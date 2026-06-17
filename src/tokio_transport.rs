@@ -551,6 +551,8 @@ impl<T: Send + 'static> crate::transport::UnboundedPooled<TokioChannels> for T {
 
 // ── TokioBufferProvider ───────────────────────────────────────────────────
 
+// `Box` is not in scope by default: the crate is `#![no_std]`, so std-gated
+// modules still import it explicitly (it is NOT a redundant import).
 use std::boxed::Box;
 
 use crate::buffer_pool::{BufferLease, BufferPool};
