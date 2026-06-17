@@ -20,7 +20,7 @@ type TestClient = Client<RawPayload>;
 /// distinct loopback IP from the client (which stays on `127.0.0.1`) so the
 /// client's receive-only unicast discovery socket (`interface:30490`,
 /// `SO_REUSEPORT`) does not collide with the server's SD socket on the same
-/// `IP:30490` and steal the client's own SubscribeEventgroup. This mirrors
+/// `IP:30490` and steal the client's own SubscribeEventGroup. This mirrors
 /// production, where a full SD-announcing server is a remote sensor on its own
 /// IP (the co-located server in `iris_someip_client` is `new_passive`, which
 /// never binds 30490). See the discussion on PR #130.

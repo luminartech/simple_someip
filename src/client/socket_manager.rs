@@ -515,6 +515,71 @@ mod tests {
         );
     }
 
+    /// Deterministic companion to `dual_socket_splits_multicast_from_unicast`.
+    /// That test needs a live multicast route and SKIPs on a `lo`-only host
+    /// (CI), which leaves the divert mechanism — the load-bearing part of the
+    /// per-transport SD fix — unexercised in coverage and vulnerable to the
+    /// vacuous-skip trap. This proves the same "most-specific bind wins"
+    /// divert with pure unicast on loopback, so it never skips: a datagram
+    /// sent to the interface IP must land on the interface-bound socket, never
+    /// the wildcard socket sharing the same port.
+    ///
+    /// Unix-only: it leans on `SO_REUSEPORT` to bind both sockets to one port
+    /// (the discovery socket's own `#[cfg(unix)]` reuse path). The bind's
+    /// cross-platform compilation is covered by the build-all CI job.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn most_specific_bind_diverts_unicast_on_loopback() {
+        use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+        use std::time::Duration;
+
+        let bind_reuse = |addr: SocketAddr| -> std::io::Result<UdpSocket> {
+            let s = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )?;
+            s.set_reuse_address(true)?;
+            s.set_reuse_port(true)?;
+            s.bind(&addr.into())?;
+            s.set_read_timeout(Some(Duration::from_millis(400)))?;
+            Ok(s.into())
+        };
+
+        // Wildcard socket takes an OS-assigned ephemeral port (so this never
+        // collides with the fixed SD port other tests use); the more-specific
+        // interface socket then shares that exact port — the divert under test.
+        let wildcard =
+            bind_reuse(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).expect("bind wildcard socket");
+        let port = match wildcard.local_addr().expect("wildcard local addr") {
+            SocketAddr::V4(a) => a.port(),
+            SocketAddr::V6(_) => unreachable!("bound IPv4"),
+        };
+        let specific = bind_reuse(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+            .expect("bind interface-specific socket");
+
+        let tx = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        tx.send_to(b"UCAST", SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+            .expect("send unicast");
+        std::thread::sleep(Duration::from_millis(60));
+
+        let mut buf = [0u8; 64];
+        // The interface bind is more specific than the wildcard, so the kernel
+        // delivers the unicast there — not load-balanced, because the binds
+        // differ in specificity.
+        let got = specific.recv_from(&mut buf);
+        assert!(
+            matches!(got, Ok((n, _)) if &buf[..n] == b"UCAST"),
+            "interface-bound socket must receive the unicast (most-specific bind wins), got {got:?}"
+        );
+        // The wildcard must not have stolen it.
+        let stolen = wildcard.recv_from(&mut buf);
+        assert!(
+            stolen.is_err(),
+            "wildcard socket must NOT receive the diverted unicast, got {stolen:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_bind_ephemeral_port() {
         let sm = TestSocketManager::bind(0, test_registry()).unwrap();
