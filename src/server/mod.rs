@@ -1201,7 +1201,7 @@ where
 
     /// Register an E2E profile for the given key.
     ///
-    /// Once registered, outgoing events published via [`EventPublisher::publish_event`]
+    /// Once registered, outgoing events published via `EventPublisher::publish_event`
     /// will have E2E protection applied automatically.
     ///
     /// # Errors

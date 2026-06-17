@@ -109,7 +109,7 @@ where
     /// # Errors
     ///
     /// Returns an error if the message fails to serialize, or
-    /// [`Error::Capacity("udp_buffer")`] if either scratch buffer is too small
+    /// [`Error::Capacity`]`("udp_buffer")` if either scratch buffer is too small
     /// for the encoded or E2E-protected frame.
     ///
     /// # Panics
@@ -269,7 +269,7 @@ where
     /// Publish an event to all subscribers of an event group.
     ///
     /// Convenience wrapper over [`Self::publish_event_with_buffers`] that
-    /// internally allocates the two scratch [`Vec`]s required for the send
+    /// internally allocates the two scratch `Vec`s required for the send
     /// path. Available only when an allocator is present (`_alloc` feature).
     /// Bare-metal callers without an allocator must supply their own
     /// scratch via [`Self::publish_event_with_buffers`] directly.
@@ -315,7 +315,7 @@ where
     /// The `buf` slice receives the serialized SOME/IP header + payload
     /// datagram before being sent to each subscriber. The caller must
     /// supply a buffer large enough to hold `16 + payload.len()` bytes;
-    /// [`Error::Capacity("udp_buffer")`] is returned if the buffer is
+    /// [`Error::Capacity`]`("udp_buffer")` is returned if the buffer is
     /// too small, without writing any bytes. On the bare-metal path,
     /// callers typically supply a `static [u8; N]`.
     ///
@@ -324,7 +324,7 @@ where
     /// # Errors
     ///
     /// Returns an error if the SOME/IP header fails to serialize, or
-    /// [`Error::Capacity("udp_buffer")`] if `buf` is too small for the frame.
+    /// [`Error::Capacity`]`("udp_buffer")` if `buf` is too small for the frame.
     #[allow(clippy::too_many_arguments)]
     pub async fn publish_raw_event_with_buffers(
         &self,
@@ -430,7 +430,7 @@ where
     /// Publish raw event data (already serialized with E2E protection).
     ///
     /// Convenience wrapper over [`Self::publish_raw_event_with_buffers`] that
-    /// internally allocates the scratch [`Vec`] required for the send path.
+    /// internally allocates the scratch `Vec` required for the send path.
     /// Available only when an allocator is present (`_alloc` feature).
     /// Bare-metal callers without an allocator must supply their own scratch
     /// via [`Self::publish_raw_event_with_buffers`] directly.
