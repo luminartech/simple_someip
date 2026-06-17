@@ -71,6 +71,9 @@ impl<const SLOTS: usize, const LEN: usize> BufferPool<SLOTS, LEN> {
                 // the lifetime of the `BufferPool` `static`.
                 let slot_ptr =
                     unsafe { self.store.get().cast::<[u8; LEN]>().add(idx) };
+                // `'static` is sound because `self: &'static BufferPool`, so the
+                // backing store outlives the lease; the annotation, not a
+                // transmute, carries the lifetime.
                 let slot: &'static mut [u8] = unsafe { (*slot_ptr).as_mut_slice() };
                 slot.fill(0);
                 return Some(BufferLease {
