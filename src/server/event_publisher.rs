@@ -206,16 +206,21 @@ where
                             .copy_from_slice(&protected_buf[..protected_len]);
                         message_length = 16 + protected_len;
                     }
-                    Some(Err(e)) => {
-                        // Surface protect failures as `Err(Error::E2e(_))`
-                        // rather than logging-and-falling-through, which
-                        // would silently send the UNPROTECTED payload
-                        // claiming an E2E-protected channel and break the
-                        // receiver's CRC/counter checks. Counter
-                        // exhaustion, key-lookup races, and similar
-                        // backend errors all funnel here.
-                        crate::log::error!("E2E protect error: {:?}; dropping publish", e);
-                        return Err(Error::E2e(e));
+                    Some(Err(e @ crate::e2e::Error::BufferTooSmall { .. })) => {
+                        // `protect` returned `BufferTooSmall`, meaning the
+                        // caller-supplied `protected_buf` was too short.
+                        // Map to `Capacity("udp_buffer")` for symmetry with
+                        // the pre-encode and post-protect `msg_buf` guards
+                        // above — the PR-3 contract is "undersized scratch →
+                        // `Error::Capacity`". If `crate::e2e::Error` gains
+                        // new variants in the future, they should be mapped
+                        // here explicitly (new variants would require a
+                        // new arm or the exhaustiveness check will catch it).
+                        crate::log::error!(
+                            "E2E protect error (buffer too small): {:?}; dropping publish",
+                            e
+                        );
+                        return Err(Error::Capacity("udp_buffer"));
                     }
                     None => unreachable!("contains_key was true"),
                 }
@@ -287,8 +292,11 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error if serialization fails or the message exceeds
-    /// [`crate::UDP_BUFFER_SIZE`].
+    /// Returns an error if serialization fails or the serialized frame
+    /// exceeds the internally-allocated scratch buffer (which is sized
+    /// to `crate::UDP_BUFFER_SIZE`). Callers that need to control the
+    /// buffer length must use [`Self::publish_event_with_buffers`]
+    /// directly.
     #[cfg(feature = "_alloc")]
     pub async fn publish_event<P: PayloadWireFormat>(
         &self,
@@ -442,7 +450,10 @@ where
     /// # Errors
     ///
     /// Returns an error if the SOME/IP header fails to serialize or the
-    /// frame exceeds [`crate::UDP_BUFFER_SIZE`].
+    /// frame exceeds the internally-allocated scratch buffer (which is
+    /// sized to `crate::UDP_BUFFER_SIZE`). Callers that need to control
+    /// the buffer length must use [`Self::publish_raw_event_with_buffers`]
+    /// directly.
     #[cfg(feature = "_alloc")]
     #[allow(clippy::too_many_arguments)]
     pub async fn publish_raw_event(

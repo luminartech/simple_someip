@@ -2,6 +2,33 @@
 
 ## [0.8.0]
 
+### Breaking — bare-metal server buffer extraction (PR #125 / PR 3)
+
+These changes are free before the 0.8.0 release — no published version
+exposes the pre-refactor API.
+
+- **`Server::run_with_buffers` takes two additional send-scratch buffers** —
+  the signature now requires `recv_send_buf: &mut [u8]` and
+  `announce_send_buf: &mut [u8]` after the existing `unicast_buf` / `sd_buf`
+  receive buffers. Callers that used the pre-refactor four-buffer form must
+  add two more `static [u8; N]` arguments (or equivalent heap slices). The
+  `_alloc` convenience `Server::run` is unchanged.
+
+- **New `Server::announce_only_with_buffer`** — bare-metal supplementary
+  servers that need *only* the SD `OfferService` announcement loop (no recv)
+  now call this method instead of `announce_only_future`. It accepts a
+  caller-owned `&mut [u8]` scratch so the future does NOT park a
+  `[u8; UDP_BUFFER_SIZE]` (≈ 1500 B) in its own state.
+  `announce_only_future` (alloc-only) now delegates to this method internally
+  and carries a `#[cfg(feature = "_alloc")]` gate.
+
+- **`EventPublisher::publish_event_with_buffers` /
+  `publish_raw_event_with_buffers` take caller scratch** — the two methods
+  now accept explicit `msg_buf: &mut [u8]` / `protected_buf: &mut [u8]`
+  slices. The future no longer parks two `[u8; UDP_BUFFER_SIZE]` arrays;
+  bare-metal callers supply `static` buffers. The `_alloc` wrappers
+  `publish_event` / `publish_raw_event` are unchanged.
+
 ### Client/Server API symmetry & ergonomics
 
 The 0.8.0 ergonomics pass aligning the public Client and Server surfaces, removing the tokio-only `Server::new` cliff, and improving discoverability for bare-metal adopters. Six bundled changes: generic-parameter alignment, tokio-defaulted `Deps` builders, channel-types rustdoc, `ServerConfig` fluent builder, `Server::new` constructor reshape (the one breaking change in this set), and `SubscriptionHandle` GAT promotion. Migration shapes below are written against the previous published version (0.7.0); `cargo build` will surface every remaining call-site.
