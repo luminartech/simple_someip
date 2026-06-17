@@ -3,7 +3,9 @@
 use simple_someip::e2e::{E2ECheckStatus, E2EKey, E2EProfile, Profile4Config};
 use simple_someip::protocol::{Header, Message, MessageId, sd};
 use simple_someip::server::ServerConfig;
-use simple_someip::{Client, ClientUpdate, PayloadWireFormat, RawPayload, Server, VecSdHeader};
+use simple_someip::{
+    Client, ClientUpdate, ClientUpdates, PayloadWireFormat, RawPayload, Server, VecSdHeader,
+};
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 fn empty_sd_header() -> VecSdHeader {
@@ -59,6 +61,26 @@ async fn wait_for_subscribers(
     false
 }
 
+/// Drain a client's update stream until the published `Unicast` event arrives,
+/// skipping interleaved discovery traffic. A `SubscribeAck` now reaches the
+/// client via the unicast SD socket (the per-transport fix in this PR) and can
+/// land on the channel just before the event, so a single `recv()` that expects
+/// the event outright is racy — especially under the slower coverage build.
+/// Panics on timeout or a closed channel; returns the `Unicast` update so
+/// callers can inspect fields like `e2e_status`.
+async fn recv_unicast(updates: &mut ClientUpdates<RawPayload>) -> ClientUpdate<RawPayload> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, updates.recv()).await {
+            Ok(Some(update @ ClientUpdate::Unicast { .. })) => return update,
+            // Discovery ack / reboot notice — keep waiting for the event.
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("update channel closed before the Unicast event"),
+            Err(_) => panic!("timed out waiting for the Unicast event"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_client_server_subscribe_and_receive_event() {
     // Start server on ephemeral port
@@ -89,13 +111,7 @@ async fn test_client_server_subscribe_and_receive_event() {
     assert_eq!(sent, 1);
 
     // Client receives the unicast event
-    let update = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv())
-        .await
-        .expect("timeout waiting for Unicast");
-    assert!(
-        matches!(update, Some(ClientUpdate::Unicast { .. })),
-        "expected Unicast, got {update:?}"
-    );
+    recv_unicast(&mut updates).await;
 
     // Tear down
     client.unbind_discovery().await.unwrap();
@@ -197,13 +213,7 @@ async fn test_add_endpoint_and_send_to_service() {
     assert_eq!(sent, 1);
 
     // Client receives the unicast event
-    let update = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv())
-        .await
-        .expect("timeout waiting for Unicast");
-    assert!(
-        matches!(update, Some(ClientUpdate::Unicast { .. })),
-        "expected Unicast, got {update:?}"
-    );
+    recv_unicast(&mut updates).await;
 
     // Remove the endpoint and verify send_to_service returns ServiceNotFound
     client.remove_endpoint(0x5B, 1).await.unwrap();
@@ -251,13 +261,7 @@ async fn test_subscribe_auto_binds_discovery() {
         .expect("publish_event failed");
     assert_eq!(sent, 1);
 
-    let update = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv())
-        .await
-        .expect("timeout waiting for Unicast");
-    assert!(
-        matches!(update, Some(ClientUpdate::Unicast { .. })),
-        "expected Unicast, got {update:?}"
-    );
+    recv_unicast(&mut updates).await;
 
     client.shut_down();
     server_handle.abort();
@@ -363,11 +367,8 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
     assert_eq!(sent, 1);
 
     // Client receives the unicast event with E2E status
-    let update = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv())
-        .await
-        .expect("timeout waiting for Unicast");
-    match update {
-        Some(ClientUpdate::Unicast { e2e_status, .. }) => {
+    match recv_unicast(&mut updates).await {
+        ClientUpdate::Unicast { e2e_status, .. } => {
             assert!(
                 e2e_status.is_some(),
                 "expected e2e_status to be populated when E2E is configured"
@@ -378,7 +379,7 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
                 "E2E check should pass for correctly protected message"
             );
         }
-        other => panic!("expected Unicast with e2e_status, got {other:?}"),
+        other => unreachable!("recv_unicast only returns Unicast, got {other:?}"),
     }
 
     client.shut_down();
@@ -429,22 +430,9 @@ async fn test_multiple_subscribers_receive_events() {
         .expect("publish_event failed");
     assert!(sent >= 2, "expected sent >= 2, got {sent}");
 
-    // Both clients should receive the event
-    let u1 = tokio::time::timeout(std::time::Duration::from_secs(2), updates1.recv())
-        .await
-        .expect("timeout on client1");
-    assert!(
-        matches!(u1, Some(ClientUpdate::Unicast { .. })),
-        "client1 expected Unicast, got {u1:?}"
-    );
-
-    let u2 = tokio::time::timeout(std::time::Duration::from_secs(2), updates2.recv())
-        .await
-        .expect("timeout on client2");
-    assert!(
-        matches!(u2, Some(ClientUpdate::Unicast { .. })),
-        "client2 expected Unicast, got {u2:?}"
-    );
+    // Both clients should receive the event (skipping any interleaved acks).
+    recv_unicast(&mut updates1).await;
+    recv_unicast(&mut updates2).await;
 
     client1.shut_down();
     client2.shut_down();
