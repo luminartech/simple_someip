@@ -16,9 +16,19 @@ fn empty_sd_header() -> VecSdHeader {
 
 type TestClient = Client<RawPayload>;
 
+/// The full `Server` binds the SD port (30490) on its interface. Keep it on a
+/// distinct loopback IP from the client (which stays on `127.0.0.1`) so the
+/// client's receive-only unicast discovery socket (`interface:30490`,
+/// `SO_REUSEPORT`) does not collide with the server's SD socket on the same
+/// `IP:30490` and steal the client's own SubscribeEventgroup. This mirrors
+/// production, where a full SD-announcing server is a remote sensor on its own
+/// IP (the co-located server in `iris_someip_client` is `new_passive`, which
+/// never binds 30490). See the discussion on PR #130.
+const SERVER_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+
 /// Create a server on an ephemeral unicast port, returning (Server, actual_port).
 async fn create_server(service_id: u16, instance_id: u16) -> (Server, u16) {
-    let config = ServerConfig::new(Ipv4Addr::LOCALHOST, 0, service_id, instance_id);
+    let config = ServerConfig::new(SERVER_IP, 0, service_id, instance_id);
     let mut server: Server = Server::new(config).await.expect("Server::new failed");
     let port = match server.unicast_local_addr().expect("local_addr failed") {
         std::net::SocketAddr::V4(a) => a.port(),
@@ -57,7 +67,7 @@ async fn test_client_server_subscribe_and_receive_event() {
 
     // Create client and subscribe to the server's event group
     let (client, mut updates) = TestClient::new(Ipv4Addr::LOCALHOST);
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
 
@@ -113,7 +123,7 @@ async fn test_client_send_sd_auto_binds_discovery() {
             port: 12345,
         }],
     };
-    let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let target = SocketAddrV4::new(SERVER_IP, server_port);
     client
         .send_sd_message(target, sd_header)
         .await
@@ -134,7 +144,7 @@ async fn test_client_bind_unbind_lifecycle_with_server() {
 
     // Bind discovery, subscribe, then unbind and rebind
     client.bind_discovery().await.unwrap();
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
 
@@ -162,7 +172,7 @@ async fn test_add_endpoint_and_send_to_service() {
     client.bind_discovery().await.unwrap();
 
     // Register the server's endpoint manually (simulating non-broadcasting service)
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
 
     // Subscribe to server's event group (auto-binds unicast internally)
@@ -219,7 +229,7 @@ async fn test_subscribe_auto_binds_discovery() {
 
     // Create client — do NOT bind discovery manually
     let (client, mut updates) = TestClient::new(Ipv4Addr::LOCALHOST);
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     // Subscribe should auto-bind discovery internally
     client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
@@ -261,7 +271,7 @@ async fn test_client_request_resolves_via_unicast_reply() {
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, mut updates) = TestClient::new(Ipv4Addr::LOCALHOST);
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
 
@@ -326,7 +336,7 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
     // Register matching E2E profile on client
     client.register_e2e(key, profile);
 
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
 
@@ -382,7 +392,7 @@ async fn test_multiple_subscribers_receive_events() {
     let publisher = server.publisher();
     let server_handle = tokio::spawn(async move { server.run().await });
 
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
 
     // Client 1
     let (client1, mut updates1) = TestClient::new(Ipv4Addr::LOCALHOST);
@@ -462,7 +472,7 @@ async fn test_cloned_client_works() {
     let client2 = client.clone();
 
     // Both clones can send commands
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
     client2.subscribe(0x5B, 1, 1, 3, 0x01, 0).await.unwrap();
 
@@ -479,7 +489,7 @@ async fn test_subscribe_specific_port_reuse() {
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, _updates) = TestClient::new(Ipv4Addr::LOCALHOST);
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
 
     // Use specific port
