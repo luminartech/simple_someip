@@ -2457,7 +2457,10 @@ mod tests {
         let recv_addr = receiver.local_addr().unwrap();
 
         let (server, _) = create_test_server(0x5B, 1).await;
+        // PR3/#125 Task 1: the SD send helpers now take a caller-provided
+        // scratch buffer (was a future-resident `[u8; UDP_BUFFER_SIZE]`).
         runtime::send_unicast_offer(
+            &mut [0u8; crate::UDP_BUFFER_SIZE],
             &server.config,
             server.sd_socket.get(),
             server.sd_state.get(),

@@ -1076,6 +1076,26 @@ async fn e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_err
     run_handle.abort();
 }
 
+// ── Task 1 (PR 3, #125): SD send-helper buf.len() rejection ──────────────────
+//
+// The three SD send helpers (`send_unicast_offer`, `send_subscribe_ack_from_view`,
+// `send_subscribe_nack_from_view`) are `pub(super)` and therefore not reachable
+// from this integration-test crate.  The helper-level RED/GREEN tests live in
+// `src/server/runtime.rs` under `mod tests`:
+//
+//   - `send_unicast_offer_undersized_buf_returns_capacity`
+//   - `send_unicast_offer_buf_shorter_than_header_returns_capacity`
+//   - `send_unicast_offer_full_size_buf_succeeds`
+//   - `send_subscribe_ack_undersized_buf_returns_capacity_not_panic`
+//   - `send_subscribe_ack_full_size_buf_succeeds`
+//   - `send_subscribe_nack_undersized_buf_returns_capacity_not_panic`
+//   - `send_subscribe_nack_full_size_buf_succeeds`
+//
+// Task 3 will thread the real caller-owned scratch buffer through `recv_loop`
+// → `handle_sd_message` → the helpers, at which point an end-to-end
+// integration test here can drive a Subscribe through the server harness with
+// a tiny SD send-scratch and assert `Error::Capacity("udp_buffer")`.
+
 /// An empty `VecSdHeader` for building a minimal valid SD message.
 fn empty_vec_sd_header() -> simple_someip::VecSdHeader {
     use simple_someip::protocol::sd::{Flags, RebootFlag};
