@@ -451,7 +451,7 @@ async fn someip_task() {
         local_ip: Ipv4Addr::from(IFACE.load(Ordering::Acquire).to_be_bytes()),
         local_rx_port: s.local_rx_port,
     });
-    let sub_e2e_enabled = sub.map_or(false, |s| s.e2e_enabled);
+    let sub_e2e_enabled = sub.is_some_and(|s| s.e2e_enabled);
     let period = Duration::from_secs(node_sd_ttl_secs());
 
     run_someip(
@@ -486,6 +486,11 @@ async fn someip_task() {
 /// Stand up the runtime from `config`, build the server, register E2E, and
 /// spawn the composed task. Returns 0 on success.
 #[allow(clippy::missing_panics_doc)]
+// By-value is required, not incidental: `config.buffers` is a `&'static mut`
+// reborrowed into `BUFS` (`ptr::from_mut`), which a shared `&RuntimeConfig`
+// could not yield. This is also the FFI ownership-transfer boundary — the
+// platform hands the runtime its config and buffer memory.
+#[allow(clippy::needless_pass_by_value)]
 pub fn init(config: RuntimeConfig) -> i32 {
     if EXECUTOR_INIT.load(Ordering::Acquire) {
         return 0;
@@ -668,7 +673,7 @@ pub unsafe fn publish(
     )
 }
 
-/// Best-effort StopOfferService (one combined datagram) so peers drop us
+/// Best-effort `StopOfferService` (one combined datagram) so peers drop us
 /// immediately. Idempotent.
 pub fn deinit() {
     if !RUN_READY.swap(false, Ordering::AcqRel) {

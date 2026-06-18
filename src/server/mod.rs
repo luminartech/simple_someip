@@ -94,8 +94,8 @@ pub struct ServerConfig {
     /// SD/unicast socket run a *single* receive loop (the others are
     /// announce-only and have no receive path). That loop must accept
     /// subscriptions for every co-offered service, not just its own —
-    /// otherwise subscribes for the siblings are NACKed and their events
-    /// never reach a subscriber. Populate via [`Self::with_accepted_offer`];
+    /// otherwise subscribes for the siblings get a `SubscribeNack` and their
+    /// events never reach a subscriber. Populate via [`Self::with_accepted_offer`];
     /// empty preserves single-service behaviour.
     pub accepted_offers: heapless::Vec<AcceptedOffer, { ServerConfig::ACCEPTED_OFFERS_CAP }>,
 }
@@ -237,6 +237,10 @@ impl ServerConfig {
     ///
     /// Returns the unmodified config (in `Err`) if registering would exceed
     /// [`Self::ACCEPTED_OFFERS_CAP`].
+    // Fallible-builder pattern: the `Err` returns the config itself so the
+    // caller can recover it. `ServerConfig` is large by design (inline
+    // heapless Vecs), so a large `Err` is inherent, not a smell.
+    #[allow(clippy::result_large_err)]
     #[must_use = "the returned `Result` carries the (possibly-modified) config — drop is silent"]
     pub fn try_with_accepted_offer(
         mut self,
@@ -331,6 +335,10 @@ impl ServerConfig {
     ///
     /// Returns the unmodified config (in `Err`) if registering would
     /// exceed [`Self::EVENT_GROUP_IDS_CAP`].
+    // Large `Err` is inherent to the fallible-builder pattern (the config is
+    // returned for recovery); surfaced here once `accepted_offers` grew
+    // `ServerConfig` past the lint threshold.
+    #[allow(clippy::result_large_err)]
     #[must_use = "the returned `Result` carries the (possibly-modified) config — drop is silent"]
     pub fn try_with_event_group(mut self, event_group_id: u16) -> Result<Self, Self> {
         if self.event_group_ids.push(event_group_id).is_ok() {

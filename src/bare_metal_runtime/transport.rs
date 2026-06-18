@@ -233,8 +233,12 @@ impl Future for CbSleepFuture {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let now = (self.now_ms)();
-        // i32 diff stays correct across 32-bit wraparound.
-        if self.deadline_ms.wrapping_sub(now) as i32 <= 0 {
+        // Wrap-aware: reinterpreting the unsigned difference as i32 keeps the
+        // "deadline reached?" test correct across the clock's 32-bit
+        // wraparound. The wrap is the mechanism, not a hazard.
+        #[allow(clippy::cast_possible_wrap)]
+        let reached = self.deadline_ms.wrapping_sub(now) as i32 <= 0;
+        if reached {
             Poll::Ready(())
         } else {
             cx.waker().wake_by_ref();
