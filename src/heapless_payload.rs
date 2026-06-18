@@ -40,7 +40,7 @@ pub const OPT_CAP: usize = 8;
 /// Max raw (non-SD) payload byte length. See module-level docs.
 /// Halo / bare-metal tight-BSS sizing: 256 covers halo's expected
 /// inbound payload sizes and keeps `HeaplessPayload::Raw` from
-/// bloating BoundedPooled channel slots.
+/// bloating `BoundedPooled` channel slots.
 pub const PAYLOAD_CAP: usize = 256;
 
 /// Owned SD header backed by heapless vectors.
@@ -65,6 +65,10 @@ impl WireFormat for HeaplessSdHeader {
 }
 
 /// Inner representation of [`HeaplessPayload`].
+// The `Raw` variant inlines a `PAYLOAD_CAP`-byte buffer, dwarfing the `Sd`
+// variant — but this is a no-alloc target, so boxing the large variant
+// (clippy's usual remedy) is not an option. The inline size is intentional.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum HeaplessPayloadKind {
     /// Service-discovery payload.
@@ -73,7 +77,7 @@ enum HeaplessPayloadKind {
     Raw(HVec<u8, PAYLOAD_CAP>),
 }
 
-/// No_std / no-alloc concrete [`PayloadWireFormat`]. Counterpart of
+/// `no_std` / no-alloc concrete [`PayloadWireFormat`]. Counterpart of
 /// [`crate::RawPayload`] for bare-metal targets.
 ///
 /// SD messages are stored as a [`HeaplessSdHeader`]; all other

@@ -62,6 +62,9 @@ pub async fn announce_offers_future<'a, S, Tm, const N: usize>(
 /// endpoint, re-sent every `period`. Subscribing proactively (rather
 /// than waiting for an `OfferService`) supports providers that don't
 /// announce cyclically. `reboot` is carried in each datagram's SD flags.
+// One SD-request shape spread across distinct scalars + borrows; bundling
+// them into a struct would just move the argument list to the call site.
+#[allow(clippy::too_many_arguments)]
 pub async fn subscribe_announce_future<'a, S, Tm>(
     sd_socket: &'a S,
     timer: &'a Tm,
@@ -198,7 +201,7 @@ where
 /// `recv` is taken as an opaque `Future` so this stays generic over just
 /// `S/Tm/R` instead of the receive server's full bound set. The future
 /// never resolves (every branch loops forever); spawn and forget.
-pub async fn run_someip<'a, S, Tm, R, RecvFut>(recv: RecvFut, cfg: SomeipRun<'a, S, Tm, R>)
+pub async fn run_someip<S, Tm, R, RecvFut>(recv: RecvFut, cfg: SomeipRun<'_, S, Tm, R>)
 where
     S: TransportSocket,
     Tm: Timer,
@@ -296,6 +299,10 @@ const NOOP_RAW_WAKER: RawWaker = {
 /// buffer (no per-call stack buffer). Returns the number of subscribers
 /// sent to (`>= 0`), or a negative error: `-2` if `scratch` is too small
 /// for the header + payload.
+// A SOME/IP notification's full addressing (service/instance/eg/method/
+// session) plus payload, scratch, and send sink; a params struct would
+// only relocate the list.
+#[allow(clippy::too_many_arguments)]
 pub fn publish_notification<Sub, FSend>(
     subscriptions: &Sub,
     service_id: u16,
@@ -311,10 +318,9 @@ where
     Sub: SubscriptionHandle,
     FSend: FnMut(&[u8], SocketAddrV4),
 {
-    let total = match build_notification_datagram(scratch, service_id, method_id, session, payload)
-    {
-        Ok(n) => n,
-        Err(_) => return -2,
+    let Ok(total) = build_notification_datagram(scratch, service_id, method_id, session, payload)
+    else {
+        return -2;
     };
     let datagram = &scratch[..total];
 
