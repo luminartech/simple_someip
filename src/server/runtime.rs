@@ -146,9 +146,7 @@ where
         .map_err(|_| Error::Capacity("udp_buffer"))?;
 
     let subscriber_v4 = socket_addr_v4(subscriber)?;
-    sd_socket
-        .send_to(&buf[..total_len], subscriber_v4)
-        .await?;
+    sd_socket.send_to(&buf[..total_len], subscriber_v4).await?;
 
     crate::log::debug!(
         "Sent SubscribeAck to {} for service 0x{:04X}, eventgroup 0x{:04X}",
@@ -214,9 +212,7 @@ where
         .map_err(|_| Error::Capacity("udp_buffer"))?;
 
     let subscriber_v4 = socket_addr_v4(subscriber)?;
-    sd_socket
-        .send_to(&buf[..total_len], subscriber_v4)
-        .await?;
+    sd_socket.send_to(&buf[..total_len], subscriber_v4).await?;
 
     crate::log::warn!(
         "Sent SubscribeNack to {} for service 0x{:04X}, eventgroup 0x{:04X} (reason: {})",
@@ -264,7 +260,20 @@ where
                     entry_view.event_group_id()
                 );
 
-                if entry_view.service_id() != config.service_id {
+                // A co-offered `(service, instance, event_group)` registered
+                // via `with_accepted_offer` is accepted on this shared recv
+                // loop even though it is not the primary service — its tuple
+                // is fully validated by the `accepts_offer` match, so the
+                // four single-service guards below are skipped for it. Empty
+                // `accepted_offers` ⇒ `co_offered` is always false ⇒ exact
+                // single-service behaviour.
+                let co_offered = config.accepts_offer(
+                    entry_view.service_id(),
+                    entry_view.instance_id(),
+                    entry_view.event_group_id(),
+                );
+
+                if !co_offered && entry_view.service_id() != config.service_id {
                     crate::log::warn!(
                         "Subscribe for wrong service: expected 0x{:04X}, got 0x{:04X}",
                         config.service_id,
@@ -280,7 +289,7 @@ where
                         "wrong_service_id",
                     )
                     .await?;
-                } else if entry_view.instance_id() != config.instance_id {
+                } else if !co_offered && entry_view.instance_id() != config.instance_id {
                     crate::log::warn!(
                         "Subscribe for wrong instance: expected {}, got {}",
                         config.instance_id,
@@ -296,7 +305,7 @@ where
                         "wrong_instance_id",
                     )
                     .await?;
-                } else if entry_view.major_version() != config.major_version {
+                } else if !co_offered && entry_view.major_version() != config.major_version {
                     crate::log::warn!(
                         "Subscribe for wrong major_version: expected {}, got {}",
                         config.major_version,
@@ -315,7 +324,7 @@ where
                     {
                         crate::log::warn!("SubscribeNack send failed: {e}");
                     }
-                } else if !config.accepts_event_group(entry_view.event_group_id()) {
+                } else if !co_offered && !config.accepts_event_group(entry_view.event_group_id()) {
                     crate::log::warn!(
                         "Subscribe for unknown event_group_id 0x{:04X} (service 0x{:04X})",
                         entry_view.event_group_id(),
@@ -435,14 +444,8 @@ where
                         find_service_id,
                         config.service_id
                     );
-                    if let Err(e) = send_unicast_offer(
-                        send_buf,
-                        config,
-                        sd_socket,
-                        sd_state,
-                        sender,
-                    )
-                    .await
+                    if let Err(e) =
+                        send_unicast_offer(send_buf, config, sd_socket, sd_state, sender).await
                     {
                         crate::log::warn!("Unicast OfferService send failed: {e}");
                     }
@@ -891,8 +894,7 @@ mod tests {
         let socket = NullSocket;
         let target = subscriber_addr();
 
-        let result =
-            send_unicast_offer(&mut [0u8; 24], &config, &socket, &sd_state, target).await;
+        let result = send_unicast_offer(&mut [0u8; 24], &config, &socket, &sd_state, target).await;
 
         assert!(
             matches!(result, Err(Error::Capacity("udp_buffer"))),
@@ -909,8 +911,7 @@ mod tests {
         let socket = NullSocket;
         let target = subscriber_addr();
 
-        let result =
-            send_unicast_offer(&mut [0u8; 8], &config, &socket, &sd_state, target).await;
+        let result = send_unicast_offer(&mut [0u8; 8], &config, &socket, &sd_state, target).await;
 
         assert!(
             matches!(result, Err(Error::Capacity("udp_buffer"))),
@@ -963,8 +964,11 @@ mod tests {
         };
         let entries = [entry];
         let options = [option];
-        let sd_payload =
-            sd::Header::new(sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted), &entries, &options);
+        let sd_payload = sd::Header::new(
+            sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+            &entries,
+            &options,
+        );
 
         let mut wire = [0u8; 512];
         let sd_len = sd_payload.encode_to_slice(&mut wire).expect("encode");
