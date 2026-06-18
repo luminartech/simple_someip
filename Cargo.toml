@@ -38,6 +38,16 @@ crc = "3.4"
 # are satisfiable on the Infineon AURIX TriCore target (HighTec toolchain)
 # per the bare_metal_plan_v2 TriCore delta.
 embassy-sync = { version = "0.6", optional = true }
+# Stock embassy-executor (raw::Executor + the `nightly` static task-pool
+# storage) for the `bare-metal-runtime` feature: the reusable runtime owns
+# the executor + the single composed task so platforms don't. `nightly`
+# makes `#[task]` emit a `static TaskPool` in `.bss` (link-time sized)
+# instead of the runtime arena, and needs `impl_trait_in_assoc_type` at the
+# crate root (gated in lib.rs). No arch feature — the platform tick-polls
+# the raw executor and we provide `__pender`.
+embassy-executor = { version = "0.6", default-features = false, features = [
+    "nightly",
+], optional = true }
 embedded-io = { version = "0.7" }
 # `futures` pulls in `futures-util` which provides the executor-agnostic
 # `select!` macro and `FutureExt::fuse` / `pin_mut!` helpers — used by
@@ -135,6 +145,12 @@ server-tokio = ["server", "std", "dep:tokio", "dep:socket2"]
 # With `bare_metal` enabled, `static_channels` and `define_static_channels!`
 # are available as the no-alloc `ChannelFactory` impl.
 bare_metal = ["dep:embassy-sync"]
+# Reusable bare-metal SOME/IP runtime: callback transport + RX mailbox +
+# the embassy executor and the single composed task. A platform supplies
+# its catalog + I/O callbacks and tick-polls; everything else lives here.
+# Pulls embassy-executor (`nightly` static task storage) and forces the
+# crate-root `impl_trait_in_assoc_type` feature (see lib.rs).
+bare-metal-runtime = ["bare_metal", "server", "dep:embassy-executor"]
 # Heap-backed embassy-sync channel backend (`EmbassySyncChannels`).
 # Implies `bare_metal` and pulls in `alloc` for `Arc<Channel<...>>`.
 # Useful for tests or early prototypes before sizing static pools.
