@@ -86,6 +86,31 @@ pub struct ServerConfig {
     /// stay silent on SD. Has no effect on passive servers, which never
     /// announce.
     pub announce: bool,
+    /// Additional co-offered `(service, instance, event_group)` tuples this
+    /// receive loop accepts `SubscribeEventGroup` for, beyond its own
+    /// `(service_id, instance_id, event_group_ids)`.
+    ///
+    /// Bare-metal providers that co-offer several services over one shared
+    /// SD/unicast socket run a *single* receive loop (the others are
+    /// announce-only and have no receive path). That loop must accept
+    /// subscriptions for every co-offered service, not just its own —
+    /// otherwise subscribes for the siblings are NACKed and their events
+    /// never reach a subscriber. Populate via [`Self::with_accepted_offer`];
+    /// empty preserves single-service behaviour.
+    pub accepted_offers: heapless::Vec<AcceptedOffer, { ServerConfig::ACCEPTED_OFFERS_CAP }>,
+}
+
+/// A `(service, instance, event_group)` tuple a receive loop will accept
+/// `SubscribeEventGroup` for in addition to its primary service. See
+/// [`ServerConfig::accepted_offers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptedOffer {
+    /// Offered service ID.
+    pub service_id: u16,
+    /// Offered instance ID.
+    pub instance_id: u16,
+    /// Offered event-group ID.
+    pub event_group_id: u16,
 }
 
 impl ServerConfig {
@@ -93,6 +118,12 @@ impl ServerConfig {
     /// [`Self::event_group_ids`]. Matches `EVENT_GROUPS_CAP` in the
     /// subscription manager.
     pub const EVENT_GROUP_IDS_CAP: usize = 32;
+
+    /// Maximum number of co-offered `(service, instance, event_group)`
+    /// tuples a single receive loop can accept subscriptions for via
+    /// [`Self::accepted_offers`]. Covers any realistic shared-socket
+    /// provider catalog.
+    pub const ACCEPTED_OFFERS_CAP: usize = 16;
 
     /// Create a new server configuration with sane defaults for
     /// development.
@@ -142,6 +173,7 @@ impl ServerConfig {
             ttl: 3, // 3 seconds is typical for SOME/IP
             event_group_ids: heapless::Vec::new(),
             announce: true,
+            accepted_offers: heapless::Vec::new(),
         }
     }
 
@@ -171,6 +203,71 @@ impl ServerConfig {
     #[must_use]
     pub fn accepts_event_group(&self, event_group_id: u16) -> bool {
         self.event_group_ids.is_empty() || self.event_group_ids.contains(&event_group_id)
+    }
+
+    /// Register an additional co-offered `(service, instance, event_group)`
+    /// this receive loop will accept `SubscribeEventGroup` for. See
+    /// [`Self::accepted_offers`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if more than [`Self::ACCEPTED_OFFERS_CAP`] offers have been
+    /// registered. Use [`Self::try_with_accepted_offer`] for the fallible
+    /// variant.
+    #[must_use]
+    pub fn with_accepted_offer(
+        mut self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+    ) -> Self {
+        self.accepted_offers
+            .push(AcceptedOffer {
+                service_id,
+                instance_id,
+                event_group_id,
+            })
+            .expect("accepted_offers capacity exceeded");
+        self
+    }
+
+    /// Fallible counterpart to [`Self::with_accepted_offer`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the unmodified config (in `Err`) if registering would exceed
+    /// [`Self::ACCEPTED_OFFERS_CAP`].
+    #[must_use = "the returned `Result` carries the (possibly-modified) config — drop is silent"]
+    pub fn try_with_accepted_offer(
+        mut self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+    ) -> Result<Self, Self> {
+        if self
+            .accepted_offers
+            .push(AcceptedOffer {
+                service_id,
+                instance_id,
+                event_group_id,
+            })
+            .is_ok()
+        {
+            Ok(self)
+        } else {
+            Err(self)
+        }
+    }
+
+    /// Returns `true` if `(service_id, instance_id, event_group_id)` is
+    /// registered in [`Self::accepted_offers`].
+    #[must_use]
+    pub fn accepts_offer(&self, service_id: u16, instance_id: u16, event_group_id: u16) -> bool {
+        self.accepted_offers.iter().any(|o| {
+            o.service_id == service_id
+                && o.instance_id == instance_id
+                && o.event_group_id == event_group_id
+        })
     }
 
     // ── Fluent builder ───────────────────────────────────────────────
