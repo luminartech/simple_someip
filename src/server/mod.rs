@@ -481,14 +481,24 @@ impl Server {
     /// Once registered, outgoing events published via [`EventPublisher::publish_event`]
     /// will have E2E protection applied automatically.
     ///
+    /// # Errors
+    ///
+    /// Returns [`crate::e2e::E2ERegistryFull`] if the registry is at capacity
+    /// and `key` is not already registered. Replacing an existing key's
+    /// profile always succeeds.
+    ///
     /// # Panics
     ///
     /// Panics if the E2E registry mutex is poisoned.
-    pub fn register_e2e(&self, key: E2EKey, profile: E2EProfile) {
+    pub fn register_e2e(
+        &self,
+        key: E2EKey,
+        profile: E2EProfile,
+    ) -> Result<(), crate::e2e::E2ERegistryFull> {
         self.e2e_registry
             .lock()
             .expect("e2e registry lock poisoned")
-            .register(key, profile);
+            .register(key, profile)
     }
 
     /// Remove E2E configuration for the given key.

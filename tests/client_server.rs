@@ -1,6 +1,6 @@
 //! Integration tests exercising the Client and Server together on localhost.
 
-use simple_someip::e2e::{E2ECheckStatus, E2EKey, E2EProfile, Profile4Config};
+use simple_someip::e2e::{CheckStatus, E2EKey, E2EProfile, Profile4Config};
 use simple_someip::protocol::{Header, Message, MessageId, sd};
 use simple_someip::server::ServerConfig;
 use simple_someip::{
@@ -332,14 +332,14 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
         method_or_event_id: 0x0001,
     };
     let profile = E2EProfile::Profile4(Profile4Config::new(0x12345678, 15));
-    server.register_e2e(key, profile.clone());
+    server.register_e2e(key, profile.clone()).expect("register");
 
     let server_handle = tokio::spawn(async move { server.run().await });
 
     let (client, mut updates) = TestClient::new(Ipv4Addr::LOCALHOST);
 
     // Register matching E2E profile on client
-    client.register_e2e(key, profile);
+    client.register_e2e(key, profile).expect("register");
 
     let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client.add_endpoint(0x5B, 1, server_addr, 0).await.unwrap();
@@ -373,10 +373,9 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
                 e2e_status.is_some(),
                 "expected e2e_status to be populated when E2E is configured"
             );
-            assert_eq!(
-                e2e_status.unwrap(),
-                E2ECheckStatus::Ok,
-                "E2E check should pass for correctly protected message"
+            assert!(
+                e2e_status.as_ref().is_some_and(CheckStatus::is_ok),
+                "E2E check should pass for correctly protected message, got {e2e_status:?}",
             );
         }
         other => unreachable!("recv_unicast only returns Unicast, got {other:?}"),

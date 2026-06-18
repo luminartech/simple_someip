@@ -29,6 +29,19 @@
 
 - **`std` is now the default feature** — the crate enables `std` (with `thiserror` and `tracing`) by default. Users targeting `no_std` environments must set `default-features = false` in their `Cargo.toml`.
 - **`thiserror` and `tracing` use `default-features = false`** — both dependencies are always included but their `std` features are only enabled when the crate's `std` feature is active. This removes the need for `#[cfg(feature = "std")]` gating on error types and logging macros.
+- **E2E module folded into the `simple_e2e` crate.** The CRC tables, profile types, state machines, and registry storage all now live in `simple_e2e`; `simple_someip::e2e` becomes a thin shim re-exporting them, retaining only the SOME/IP-specific [`E2EKey`] (service+method-or-event) and the [`CheckStatus`] owned snapshot type used by `ReceivedMessage`. Eliminates ~2000 lines of duplicated implementation and ends the parallel taxonomy that forced downstream crates (notably `iris_someip_messages`) to ship a `compat` bridge with `got: 0, expected: 0` placeholder hazards.
+- Add MIT + Apache-2.0 LICENSE files materializing the SPDX declaration.
+
+### Breaking
+
+- `simple_someip::e2e::E2ECheckStatus` is removed. Use [`simple_someip::e2e::CheckStatus`] (profile-discriminated, carries the rich underlying `simple_e2e::profile4::CheckStatus` / `profile5::CheckStatus` including real `got` / `expected` fields for CRC and length mismatches).
+- `simple_someip::e2e::E2EProfile::Profile5WithHeader(config)` is replaced by `E2EProfile::Profile5 { config, include_upper_header: IncludeUpperHeader::Yes }`. The header-inclusion choice is now a per-binding option, not a third protocol variant.
+- `simple_someip::e2e::Error` now aliases `simple_e2e::registry::ProtectError`. Wire-validation errors (`TooShort`, `LengthMismatch`, `DataIdMismatch`, `CrcMismatch`) surface via [`CheckStatus::Invalid(_)`] rather than the error chain — they aren't failures of the check operation itself, they're outcomes of it.
+- `Client::register_e2e` and `Server::register_e2e` now return `Result<(), E2ERegistryFull>` instead of `()`. The previous silent-drop-on-full behavior was a footgun; callers must handle capacity explicitly.
+
+### Added
+
+- `simple_e2e` is a new path/version dependency (currently `path = "../simple_e2e"` during development; this will be swapped to `version = "0.1"` before publishing simple_someip 0.8.0).
 
 
 ## [0.6.0](https://github.com/luminartech/simple_someip/compare/v0.5.3...v0.6.0) - 2026-04-20
