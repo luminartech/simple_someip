@@ -104,6 +104,11 @@
 //! - [Open SOME/IP Specification](https://github.com/some-ip-com/open-someip-spec)
 
 #![no_std]
+// embassy-executor's `nightly` feature expands `#[embassy_executor::task]`
+// to a `static TaskPool` whose `type Fut = impl Future` requires this. Only
+// enabled with `bare-metal-runtime` (which owns the executor + task); the
+// crate otherwise builds on stable.
+#![cfg_attr(feature = "bare-metal-runtime", feature(impl_trait_in_assoc_type))]
 #![warn(clippy::pedantic)]
 
 #[cfg(feature = "std")]
@@ -168,6 +173,11 @@ pub mod buffer_pool;
 pub mod client;
 /// End-to-end (E2E) protection utilities for SOME/IP payloads.
 pub mod e2e;
+/// no_std / no-alloc [`PayloadWireFormat`] mirroring [`raw_payload`]
+/// with `heapless::Vec`-backed storage. Available whenever the
+/// `bare_metal` feature is enabled.
+#[cfg(feature = "bare_metal")]
+pub mod heapless_payload;
 mod log;
 /// SOME/IP protocol primitives: headers, messages, return codes, and service discovery.
 pub mod protocol;
@@ -193,12 +203,27 @@ pub mod server;
 #[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 pub mod tokio_transport;
 
+/// Reusable bare-metal SOME/IP runtime: callback-driven transport + RX
+/// mailbox + the embassy executor and single composed task, so a
+/// platform integrates by supplying only its catalog + I/O callbacks.
+#[cfg(feature = "bare_metal")]
+pub mod bare_metal_runtime;
+/// Spawnable, embassy-agnostic async futures (offer announce, subscribe
+/// announce, event RX+dispatch) plus a sync publish helper, so a
+/// bare-metal firmware only spawns futures and provides socket I/O.
+#[cfg(all(feature = "bare_metal", feature = "server"))]
+pub mod bare_metal_tasks;
 /// `embassy-sync`-backed implementation of [`transport::ChannelFactory`].
 /// Available whenever the `embassy_channels` feature is enabled. Uses
 /// heap allocation (`Arc<Channel<...>>`) — for no-alloc, use
 /// [`static_channels`] instead.
 #[cfg(feature = "embassy_channels")]
 pub mod embassy_channels;
+/// Pure, no-alloc SOME/IP + SD datagram codec: transport-agnostic
+/// builders/parsers used by the server receive loop, the firmware shim,
+/// and the spawnable futures in [`bare_metal_tasks`].
+#[cfg(any(feature = "bare_metal", feature = "server"))]
+pub mod sd_codec;
 /// Static-pool no-alloc primitives for [`transport::ChannelFactory`].
 /// Backs the consumer-declared static `OneshotPool` / `MpscPool`
 /// instances that the [`define_static_channels!`] macro
@@ -213,6 +238,8 @@ mod traits;
 /// because the target module is feature-gated and would break
 /// default-feature rustdoc builds.
 pub mod transport;
+#[cfg(feature = "bare_metal")]
+pub use heapless_payload::{HeaplessPayload, HeaplessSdHeader};
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
 pub use traits::{OfferedEndpoint, PayloadWireFormat, WireFormat};
