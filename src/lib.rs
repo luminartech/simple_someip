@@ -111,6 +111,21 @@
 #![cfg_attr(feature = "bare-metal-runtime", feature(impl_trait_in_assoc_type))]
 #![warn(clippy::pedantic)]
 
+// `bare-metal-runtime` is a no-alloc feature (it uses the no-alloc server
+// handles, e.g. `started: &'static AtomicBool`) and pulls a nightly-only
+// crate feature. It is therefore mutually exclusive with the alloc features
+// (`std` / `_alloc` / `embassy_channels` / the `*-tokio` features that imply
+// `std`). Combining them — e.g. `--all-features` — otherwise fails deep in
+// the runtime with a cryptic type error; surface the real reason here. Build
+// the runtime on its own: `--no-default-features --features bare-metal-runtime`
+// (plus `client` / `server`). CI runs it in a dedicated nightly lane.
+#[cfg(all(feature = "bare-metal-runtime", feature = "_alloc"))]
+compile_error!(
+    "feature `bare-metal-runtime` is no-alloc and cannot be combined with the alloc \
+     features (`std`, `_alloc`, `embassy_channels`, or any `*-tokio`); build it with \
+     `--no-default-features --features bare-metal-runtime[,client|,server]`"
+);
+
 #[cfg(feature = "std")]
 extern crate std;
 

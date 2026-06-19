@@ -7,6 +7,16 @@ on:
     branches: [main]
   merge_group:
 
+# Every public feature EXCEPT `bare-metal-runtime`. That feature is no-alloc
+# and pulls a nightly-only crate feature (`impl_trait_in_assoc_type`), so it
+# is mutually exclusive with the alloc features (`std` / `_alloc` /
+# `embassy_channels`) and cannot share a `--all-features` build — it gets its
+# own nightly job (`bare-metal-runtime`). This list replaces the former
+# `--all-features` invocations on the alloc/host lane; keep it in sync when a
+# feature is added (or switch to `cargo hack --exclude-features bare-metal-runtime`).
+env:
+  ALLOC_FEATURES: std,tracing,client,client-tokio,server,server-tokio,bare_metal,embassy_channels
+
 jobs:
   check:
     name: Format & Lint
@@ -28,11 +38,42 @@ jobs:
       # under the feature combos we actually ship, so a feature-set
       # regression surfaces against its responsible feature flag
       # rather than as workspace-wide noise.
-      - run: cargo clippy --workspace --all-features -- -D warnings -D clippy::pedantic
+      #
+      # `$ALLOC_FEATURES` is every feature except `bare-metal-runtime` (which
+      # is no-alloc + nightly and runs in the `bare-metal-runtime` job); it
+      # replaces the former `--all-features` pass, which can no longer build
+      # once a no-alloc-only feature exists.
+      - run: cargo clippy --workspace --no-default-features --features $ALLOC_FEATURES -- -D warnings -D clippy::pedantic
       - run: cargo clippy --no-default-features -- -D warnings -D clippy::pedantic
       - run: cargo clippy -p simple-someip --no-default-features --features client,bare_metal -- -D warnings -D clippy::pedantic
       - run: cargo clippy -p simple-someip --no-default-features --features server,bare_metal -- -D warnings -D clippy::pedantic
       - run: cargo clippy -p simple-someip --no-default-features --features client,server,bare_metal -- -D warnings -D clippy::pedantic
+
+  bare-metal-runtime:
+    name: Bare-metal runtime (nightly)
+    runs-on: ubuntu-latest
+    # The `bare-metal-runtime` feature is no-alloc and pulls the nightly-only
+    # `impl_trait_in_assoc_type` crate feature (embassy's static task pool), so
+    # it cannot be built on stable or alongside the alloc features the
+    # `check`/coverage jobs cover. Its own nightly lane: clippy under the
+    # feature combos it ships, plus a real no_std target build via build-std.
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rust-src
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p simple-someip --no-default-features --features bare-metal-runtime,client -- -D warnings -D clippy::pedantic
+      - run: cargo clippy -p simple-someip --no-default-features --features bare-metal-runtime,server -- -D warnings -D clippy::pedantic
+      # Compile for a real no_std target (no prebuilt core) — the gate that
+      # proves the runtime stays no_std / no-alloc.
+      - run: cargo build -Z build-std=core --target thumbv7em-none-eabihf --no-default-features --features bare-metal-runtime,client
+      - run: cargo build -Z build-std=core --target thumbv7em-none-eabihf --no-default-features --features bare-metal-runtime,server
+      - name: Doc — bare-metal-runtime
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --no-default-features --features bare-metal-runtime,client
 
   linear-history:
     name: Linear PR History
@@ -218,7 +259,8 @@ jobs:
         run: |
           cargo doc --no-deps --no-default-features --features client
           cargo doc --no-deps --no-default-features --features server,bare_metal
-          cargo doc --no-deps --all-features
+          # alloc/host lane (bare-metal-runtime docs build in its nightly job)
+          cargo doc --no-deps --no-default-features --features $ALLOC_FEATURES
       - name: No-alloc witness (explicit gate)
         run: cargo test --features client,bare_metal --test no_alloc_witness
       - name: SD wire-format conformance (TX direction)
@@ -235,7 +277,10 @@ jobs:
               --test vsomeip_sd_compat \
               tx_announcement_loop_emits_wire_format_offer \
               -- --ignored --exact --nocapture
-      - run: cargo llvm-cov nextest --all-features --lcov --output-path ./target/lcov.info
+      # alloc/host lane: bare-metal-runtime has no host tests (its target build
+      # is gated in the nightly `bare-metal-runtime` job), so coverage uses the
+      # alloc feature set rather than the invalid `--all-features`.
+      - run: cargo llvm-cov nextest --no-default-features --features $ALLOC_FEATURES --lcov --output-path ./target/lcov.info
       - name: Upload Coverage report
         uses: codecov/codecov-action@v5
         with:
