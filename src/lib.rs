@@ -188,9 +188,9 @@ pub mod buffer_pool;
 pub mod client;
 /// End-to-end (E2E) protection utilities for SOME/IP payloads.
 pub mod e2e;
-/// no_std / no-alloc [`PayloadWireFormat`] mirroring [`raw_payload`]
-/// with `heapless::Vec`-backed storage. Available whenever the
-/// `bare_metal` feature is enabled.
+/// no_std / no-alloc [`PayloadWireFormat`] mirroring the std-only
+/// `RawPayload` with `heapless::Vec`-backed storage. Available whenever
+/// the `bare_metal` feature is enabled.
 #[cfg(feature = "bare_metal")]
 pub mod heapless_payload;
 mod log;

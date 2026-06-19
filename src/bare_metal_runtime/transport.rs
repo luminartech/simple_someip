@@ -5,7 +5,7 @@
 //! which `#[embassy_executor::task]` can't accept) it supplies plain C-ABI
 //! **function pointers** at runtime: send a UDP datagram, and read the
 //! monotonic millisecond clock. Inbound datagrams are delivered out-of-band
-//! into an [`RxMailbox`] the project owns. This makes the whole runtime
+//! into an [`crate::bare_metal_runtime::RxMailbox`] the project owns. This makes the whole runtime
 //! concrete, so it can live in this library and be reused by any platform.
 //!
 //! The poll-futures mirror a typical lwIP integration: send is synchronous

@@ -11,7 +11,7 @@
 //! when the caller passes `'static` borrows (the pattern an
 //! `#[embassy_executor::task]` body relies on). The server's inbound
 //! path (SD subscribe-accept + request dispatch) is handled by
-//! [`crate::server::Server::recv_only_future`] and is not duplicated
+//! [`crate::server::Server::run_with_buffers`] and is not duplicated
 //! here; these cover the announce, the notification-only client, and the
 //! synchronous publish.
 
@@ -192,7 +192,7 @@ where
 
 /// Drive the full bare-metal SOME/IP integration as ONE future: the
 /// caller-supplied server receive future (`recv`, typically
-/// `Server::recv_only_future`) concurrently with the combined-offer
+/// `Server::run_with_buffers`) concurrently with the combined-offer
 /// announce, the proactive subscribe (offset off the announce), and the
 /// notification RX+dispatch. Spawn this from a single
 /// `#[embassy_executor::task]` so the firmware holds no per-future task
