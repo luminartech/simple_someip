@@ -6,7 +6,7 @@
 //! - **platform callbacks**: send a UDP datagram, read a ms clock, and a
 //!   dispatch sink for inbound messages,
 //! - **RX delivery**: the platform's receive path pushes datagrams into an
-//!   [`RxMailbox`] this runtime polls, and
+//!   [`crate::bare_metal_runtime::RxMailbox`] this runtime polls, and
 //! - **buffer memory** it owns (so the platform controls link placement).
 //!
 //! Everything else — the SD codec, subscribe-accept, the combined-offer

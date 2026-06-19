@@ -1,6 +1,6 @@
 //! A no_std, alloc-free [`PayloadWireFormat`] implementation.
 //!
-//! Mirrors [`crate::raw_payload::RawPayload`] but swaps every `Vec`
+//! Mirrors the std-only `RawPayload` but swaps every `Vec`
 //! for a `heapless::Vec<_, CAP>` so the type is usable on targets
 //! without an allocator. Suitable as the `MessageDefinitions`
 //! parameter for `Client<MessageDefinitions, _, _, _>` /
@@ -78,7 +78,7 @@ enum HeaplessPayloadKind {
 }
 
 /// `no_std` / no-alloc concrete [`PayloadWireFormat`]. Counterpart of
-/// [`crate::RawPayload`] for bare-metal targets.
+/// the std-only `RawPayload` for bare-metal targets.
 ///
 /// SD messages are stored as a [`HeaplessSdHeader`]; all other
 /// messages are stored as opaque bytes in a `heapless::Vec`.
