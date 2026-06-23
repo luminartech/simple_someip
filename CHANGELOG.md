@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.7.2](https://github.com/luminartech/simple_someip/compare/v0.7.1...v0.7.2) - 2026-06-23
+
+### Added
+
+- *(server)* `EventPublisher::publish_raw_event_to` — publish a raw (already-serialized) event to a SINGLE subscriber by endpoint, instead of the fan-out `publish_raw_event`. Enables per-recipient delivery when several subscribers share a `(service, instance, event_group)` key but bind distinct endpoints (e.g. multiple devices on one subnet sharing a fixed instance id). Returns `1` if the target is a current subscriber and the datagram was sent, `0` otherwise.
+- *(server)* `EventPublisher::subscriber_addresses` — return the endpoint addresses currently subscribed to an event group, so a caller can map a known receiver to its subscriber endpoint for a targeted `publish_raw_event_to`.
+
 ## [0.7.1](https://github.com/luminartech/simple_someip/compare/v0.7.0...v0.7.1) - 2026-06-17
 
 ### Fixed
