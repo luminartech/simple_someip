@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.7.3](https://github.com/luminartech/simple_someip/compare/v0.7.2...v0.7.3) - 2026-06-23
+
+### Added
+
+- *(client)* `ClientUpdate::Unicast` now carries the sender's `source: SocketAddr`. The SOME/IP header has no instance id, so on a shared subnet the source address is the only way to attribute a unicast event to a specific device. The source was already received but previously discarded before forwarding.
+
+### Fixed
+
+- *(e2e)* Receive E2E counter state is now keyed per source address. Previously a single per-`(service, method)` counter was shared across all senders, so several devices sending the same event under one fixed instance id collided their interleaved counters into spurious `WrongSequence` results. Profile configuration stays endpoint-agnostic; transmit (`protect`) state is unchanged. A rebooted sender's receive state is reset so its first post-reboot frame is not flagged out-of-sequence.
+
 ## [0.7.2](https://github.com/luminartech/simple_someip/compare/v0.7.1...v0.7.2) - 2026-06-23
 
 ### Added
