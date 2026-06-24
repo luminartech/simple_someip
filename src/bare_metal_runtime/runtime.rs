@@ -41,6 +41,17 @@ const MAX_OFFERS: usize = 8;
 const MAX_SUBS: usize = 4;
 const SD_SCRATCH_CAP: usize = 512;
 const SUB_SCRATCH_CAP: usize = 128;
+/// Capacity of the API-only send scratch (`RuntimeBuffers::publish_scratch`),
+/// shared by `publish` and `deinit`. Sized for modest events rather than a
+/// full MTU to keep the always-resident static footprint small (+512 B, not
+/// +`RX_CAP`); it caps `publish` payloads at `API_SCRATCH_CAP - 16`. Bump it
+/// (with the FW team's RAM sign-off) if a node must emit larger notifications.
+/// Must be `>= SD_SCRATCH_CAP` so `deinit`'s combined `StopOffer` datagram fits.
+const API_SCRATCH_CAP: usize = 512;
+const _: () = assert!(
+    API_SCRATCH_CAP >= SD_SCRATCH_CAP,
+    "publish_scratch must hold deinit's StopOffer datagram"
+);
 
 const DEFAULT_SD_PORT: u16 = 30490;
 const DEFAULT_SD_MCAST: u32 = 0xEFFF_00FF; // 239.255.0.255
@@ -121,6 +132,17 @@ pub struct RuntimeBuffers {
     pub tx_scratch: [u8; RX_CAP],
     pub offer_scratch: [u8; SD_SCRATCH_CAP],
     pub sub_scratch: [u8; SUB_SCRATCH_CAP],
+    /// Scratch reserved for the synchronous public API (`publish` /
+    /// `deinit`). Kept disjoint from the buffers the spawned `someip_task`
+    /// borrows for its entire (never-resolving) lifetime: `publish`/`deinit`
+    /// run from the platform's service task and would otherwise take a
+    /// second `&mut` to `tx_scratch` / `offer_scratch` while the task still
+    /// holds the first — aliasing UB. `publish` and `deinit` never run
+    /// concurrently (single serial caller), so they share this one buffer.
+    /// Sized at [`API_SCRATCH_CAP`] (512 B), not `RX_CAP`, to keep the static
+    /// footprint small; it caps the max `publish` payload at
+    /// `API_SCRATCH_CAP - 16`.
+    pub publish_scratch: [u8; API_SCRATCH_CAP],
 }
 
 impl Default for RuntimeBuffers {
@@ -140,6 +162,7 @@ impl RuntimeBuffers {
             tx_scratch: [0; RX_CAP],
             offer_scratch: [0; SD_SCRATCH_CAP],
             sub_scratch: [0; SUB_SCRATCH_CAP],
+            publish_scratch: [0; API_SCRATCH_CAP],
         }
     }
 }
@@ -229,7 +252,16 @@ static SEND_FN: AtomicUsize = AtomicUsize::new(0); // SendFn as usize
 static NOW_FN: AtomicUsize = AtomicUsize::new(0); // NowMsFn as usize
 
 static mut EXECUTOR: MaybeUninit<Executor> = MaybeUninit::uninit();
+/// Set once the `EXECUTOR` slot is written and the task is spawned — the
+/// gate `poll()` checks. Stays false through all of `init`'s fallible work
+/// so `poll()` never touches an uninitialized executor.
 static EXECUTOR_INIT: AtomicBool = AtomicBool::new(false);
+/// Claimed atomically at the top of `init` to make it idempotent and
+/// re-entrancy-safe: only the first caller proceeds; a second concurrent or
+/// repeat call is rejected (it must NOT adopt the new config or it would
+/// silently leak the platform's freshly-handed `&'static mut` buffers).
+/// Reset on `init`'s failure paths so a corrected retry can proceed.
+static INIT_CLAIMED: AtomicBool = AtomicBool::new(false);
 static RUN_READY: AtomicBool = AtomicBool::new(false);
 
 /// embassy's pender — we tick-poll, so wakes are a no-op.
@@ -419,19 +451,30 @@ const CLIENT_SUB_OFFSET_SECS: u64 = 1;
 /// proactive subscribe + notification RX/dispatch.
 #[embassy_executor::task]
 async fn someip_task() {
-    // SAFETY: `init` wrote SERVER + BUFS + MAILBOX before spawning.
+    // SAFETY: `init` wrote SERVER + BUFS + MAILBOX before spawning. Each
+    // buffer is reborrowed individually through a raw pointer to its own
+    // field — deliberately NOT via a whole-struct `&mut *BUFS`. A
+    // whole-struct `&mut` would retag every byte of `RuntimeBuffers`
+    // (including `publish_scratch`) and stay live for this task's entire
+    // never-resolving lifetime, so the synchronous `publish`/`deinit` API
+    // taking `&mut (*BUFS).publish_scratch` would alias it (UB). Per-field
+    // reborrows retag only their own disjoint byte ranges, leaving
+    // `publish_scratch` untouched here and free for the API to borrow.
     let server: &'static RtServer = unsafe { (*core::ptr::addr_of!(SERVER)).assume_init_ref() };
-    let bufs: &'static mut RuntimeBuffers = unsafe { &mut *BUFS };
+    let unicast: &'static mut [u8; RX_CAP] = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).unicast) };
+    let sd: &'static mut [u8; RX_CAP] = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).sd) };
+    let tx_scratch: &'static mut [u8; RX_CAP] =
+        unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).tx_scratch) };
+    let offer_scratch: &'static mut [u8; SD_SCRATCH_CAP] =
+        unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).offer_scratch) };
+    let sub_scratch: &'static mut [u8; SUB_SCRATCH_CAP] =
+        unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).sub_scratch) };
+    let rx: &'static mut [u8; RX_CAP] = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).rx) };
     // Recv-only: `with_announce(false)` makes `run_with_buffers` skip its
     // announce arm (the runtime announces all offers itself), so the
     // announce_send_buf is never touched — pass an empty slice. Recv +
     // SubscribeAck use unicast/sd/tx_scratch.
-    let recv = server.run_with_buffers(
-        &mut bufs.unicast,
-        &mut bufs.sd,
-        &mut bufs.tx_scratch,
-        &mut [],
-    );
+    let recv = server.run_with_buffers(unicast, sd, tx_scratch, &mut []);
 
     let mut reqs = [DEFAULT_OFFER_REQUEST; MAX_OFFERS];
     let n_offers = offer_requests(&mut reqs);
@@ -472,14 +515,14 @@ async fn someip_task() {
             period,
             offers: &reqs[..n_offers],
             offer_session: &OFFER_SESSION,
-            offer_scratch: &mut bufs.offer_scratch,
+            offer_scratch,
             subscribe,
             sub_session: &SUB_SESSION,
-            sub_scratch: &mut bufs.sub_scratch,
+            sub_scratch,
             sub_reboot: RebootFlag::RecentlyRebooted,
             sub_offset: Duration::from_secs(CLIENT_SUB_OFFSET_SECS),
             sub_e2e_enabled,
-            rx_buf: &mut bufs.rx,
+            rx_buf: rx,
             dispatch,
             // The trampoline injects DISPATCH_CTX itself; pass 0 here.
             dispatch_ctx: 0,
@@ -491,7 +534,13 @@ async fn someip_task() {
 // ── Public runtime API (the platform's C-FFI forwards to these) ──────────
 
 /// Stand up the runtime from `config`, build the server, register E2E, and
-/// spawn the composed task. Returns 0 on success.
+/// spawn the composed task.
+///
+/// Returns `0` on success, or a negative error code: `-1` server build
+/// failed, `-2` task spawn failed, `-4` the runtime is already initialized
+/// (a repeat or re-entrant `init` — the passed `config` and its buffers are
+/// NOT adopted). The `-1`/`-2` paths release the init claim so a corrected
+/// retry can proceed; `-4` does not (a runtime is already live).
 #[allow(clippy::missing_panics_doc)]
 // By-value is required, not incidental: `config.buffers` is a `&'static mut`
 // reborrowed into `BUFS` (`ptr::from_mut`), which a shared `&RuntimeConfig`
@@ -499,8 +548,15 @@ async fn someip_task() {
 // platform hands the runtime its config and buffer memory.
 #[allow(clippy::needless_pass_by_value)]
 pub fn init(config: RuntimeConfig) -> i32 {
-    if EXECUTOR_INIT.load(Ordering::Acquire) {
-        return 0;
+    // Atomically claim init: only the first caller proceeds. Closes the
+    // window the old `load`-then-store-at-end guard left open (a re-entrant
+    // `init` via a `bind`/`send` callback, or a repeat call) during which a
+    // second caller would re-alias `BUFS` and silently leak its buffers.
+    if INIT_CLAIMED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return -4;
     }
     IFACE.store(config.interface, Ordering::Release);
     SD_PORT.store(
@@ -586,18 +642,23 @@ pub fn init(config: RuntimeConfig) -> i32 {
     }
 
     if !build_server() {
+        // Release the claim so the platform can retry after fixing config.
+        INIT_CLAIMED.store(false, Ordering::Release);
         return -1;
     }
 
-    // SAFETY: single-init guarded by EXECUTOR_INIT.
+    // SAFETY: single-init guarded by INIT_CLAIMED (claimed above).
     let spawner = unsafe {
         let slot = &mut *core::ptr::addr_of_mut!(EXECUTOR);
         slot.write(Executor::new(core::ptr::null_mut()));
         slot.assume_init_ref().spawner()
     };
     if spawner.spawn(someip_task()).is_err() {
+        INIT_CLAIMED.store(false, Ordering::Release);
         return -2;
     }
+    // Publish the poll gate LAST: `poll()` must never touch `EXECUTOR`
+    // before the slot above is written and the task is spawned.
     EXECUTOR_INIT.store(true, Ordering::Release);
     RUN_READY.store(true, Ordering::Release);
     0
@@ -642,7 +703,9 @@ pub unsafe fn publish(
         return -3;
     };
     let src_port = offer.unicast_port;
-    if len > RX_CAP - 16 {
+    // The notification is framed into `publish_scratch` (header + payload),
+    // so the payload must fit `API_SCRATCH_CAP - SOMEIP_HEADER_LEN`.
+    if len > API_SCRATCH_CAP - 16 {
         return -2;
     }
     if len > 0 && payload.is_null() {
@@ -655,9 +718,13 @@ pub unsafe fn publish(
     };
     let subs_handle = StaticSubscriptionHandle::new(&SUBS_STORAGE);
     let plat = platform();
-    // SAFETY: publish is called from the platform's service task; the TX
-    // scratch in BUFS has no other concurrent user.
-    let scratch = unsafe { &mut (*BUFS).tx_scratch };
+    // SAFETY: `publish_scratch` is reserved for the synchronous API and is
+    // never borrowed by the spawned `someip_task` (which borrows only its
+    // own disjoint fields), so this `&mut` has no aliasing borrower. `publish`
+    // and `deinit` are the only users and run serially from the platform's
+    // single service task. Reborrowed through `addr_of_mut!` to retag only
+    // this field's bytes.
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).publish_scratch) };
     publish_notification(
         &subs_handle,
         service_id,
@@ -692,8 +759,11 @@ pub fn deinit() {
         return;
     }
     let plat = platform();
-    // SAFETY: deinit runs after RUN_READY=false; no task polls concurrently.
-    let scratch = unsafe { &mut (*BUFS).offer_scratch };
+    // SAFETY: `publish_scratch` is the API-reserved buffer (see `publish`),
+    // never borrowed by `someip_task`; `deinit` is terminal and serial with
+    // `publish`. RX_CAP >= SD_SCRATCH_CAP, so it holds the StopOffer datagram.
+    // Reborrowed through `addr_of_mut!` to retag only this field's bytes.
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).publish_scratch) };
     let session = next_sd_session(&STOP_SESSION);
     if let Ok(total) =
         build_multi_stop_offer_service_datagram::<MAX_OFFERS>(scratch, &reqs[..n], session)
