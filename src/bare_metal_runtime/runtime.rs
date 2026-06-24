@@ -73,7 +73,8 @@ pub type DispatchFn = fn(
     method_id: u16,
     payload: &[u8],
     e2e_status: u8,
-);
+    response_out: &mut [u8],
+) -> i32;
 
 /// Bind a platform UDP socket / PCB for `port` and register its receive
 /// path (which must call [`on_rx`]). `is_sd` requests the SD multicast
@@ -295,10 +296,11 @@ fn dispatch(
     method_id: u16,
     payload: &[u8],
     e2e_status: u8,
-) {
+    response_out: &mut [u8],
+) -> i32 {
     let raw = DISPATCH.load(Ordering::Acquire);
     if raw == 0 {
-        return;
+        return -1;
     }
     // SAFETY: stored from a valid DispatchFn in `init`.
     let f: DispatchFn = unsafe { core::mem::transmute::<usize, DispatchFn>(raw) };
@@ -309,7 +311,8 @@ fn dispatch(
         method_id,
         payload,
         e2e_status,
-    );
+        response_out,
+    )
 }
 
 fn offer_requests(out: &mut [OfferServiceRequest; MAX_OFFERS]) -> usize {

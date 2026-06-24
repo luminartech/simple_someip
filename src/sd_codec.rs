@@ -16,7 +16,7 @@ use crate::protocol::sd::{
     Entry, EventGroupEntry, Flags, Header as SdHeader, Options as SdOptions, OptionsCount,
     RebootFlag, SdHeaderView, ServiceEntry, TransportProtocol,
 };
-use crate::protocol::{Header, HeaderView, MessageId};
+use crate::protocol::{Header, HeaderView, MessageId, MessageType, MessageTypeField, ReturnCode};
 use crate::transport::E2ERegistryHandle;
 use crate::{E2ECheckStatus, E2EKey};
 
@@ -316,6 +316,41 @@ pub fn build_notification_datagram(
     buf[15] = 0x00; // return code: ok
     buf[SOMEIP_HEADER_LEN..total].copy_from_slice(payload);
     Ok(total)
+}
+
+/// Write the RESPONSE header for a reply into `buf[..SOMEIP_HEADER_LEN]`:
+/// echoes the request's message/request id and protocol/interface versions,
+/// with message type RESPONSE and return code OK. Only the header is written
+/// — the `payload_len`-byte payload is assumed already in place after it.
+///
+/// # Errors
+/// [`BuildError::BufferTooSmall`] if `buf` is shorter than the header;
+/// [`BuildError::EncodeFailed`] if header encoding fails.
+pub fn encode_response_header(
+    buf: &mut [u8],
+    service_id: u16,
+    method_id: u16,
+    request_id: u32,
+    protocol_version: u8,
+    interface_version: u8,
+    payload_len: usize,
+) -> Result<(), BuildError> {
+    if buf.len() < SOMEIP_HEADER_LEN {
+        return Err(BuildError::BufferTooSmall);
+    }
+    let header = Header::new(
+        MessageId::new_from_service_and_method(service_id, method_id),
+        request_id,
+        protocol_version,
+        interface_version,
+        MessageTypeField::new(MessageType::Response, false),
+        ReturnCode::Ok,
+        payload_len,
+    );
+    header
+        .encode_to_slice(&mut buf[..SOMEIP_HEADER_LEN])
+        .map_err(|_| BuildError::EncodeFailed)?;
+    Ok(())
 }
 
 /// Increment `counter` and return the next non-zero session ID. AUTOSAR

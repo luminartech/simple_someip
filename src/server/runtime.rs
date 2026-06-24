@@ -18,7 +18,7 @@ use futures_util::{FutureExt, future::Either, pin_mut, select_biased};
 
 use crate::Timer;
 use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
-use crate::transport::{SharedHandle, TransportSocket};
+use crate::transport::{E2ERegistryHandle, SharedHandle, TransportSocket};
 
 use super::sd_state::SdStateManager;
 use super::subscription_manager::{SubscribeError, SubscriptionHandle};
@@ -506,15 +506,77 @@ pub(super) async fn announce_loop<T, Tm>(
     }
 }
 
+/// Dispatch a non-SD unicast request (a method call to an offered service)
+/// to the observer. If the observer produces a getter response (a
+/// non-negative length), frame the SOME/IP RESPONSE — echoing the request's
+/// id and protocol/interface versions — and send it back to `source`.
+/// `send_buf` must be distinct from the buffer `view` borrows: the handler
+/// writes its response payload after the header slot, so they don't alias.
+async fn dispatch_non_sd_request<T: TransportSocket, R: E2ERegistryHandle>(
+    unicast_socket: &T,
+    observer: (super::NonSdRequestCallback, usize),
+    e2e: &R,
+    view: &crate::protocol::MessageView<'_>,
+    source: core::net::SocketAddrV4,
+    send_buf: &mut [u8],
+) {
+    let (cb, ctx) = observer;
+    let hdr = view.header();
+    let id = hdr.message_id();
+    let (service_id, method_id) = (id.service_id(), id.method_id());
+    // Run the same E2E check the notification path uses: a request whose
+    // (service, method) has a registered profile is validated and its E2E
+    // header stripped; one with no profile passes through unchecked (status
+    // 0).
+    let parsed = crate::sd_codec::ParsedDatagram {
+        service_id,
+        method_id,
+        upper_header: hdr.upper_header_bytes(),
+        payload: view.payload_bytes(),
+    };
+    let (status, body) = crate::sd_codec::check_parsed_e2e(e2e, &parsed);
+    let resp_len = cb(
+        ctx,
+        source,
+        service_id,
+        method_id,
+        body,
+        crate::sd_codec::e2e_status_code(status),
+        &mut send_buf[crate::sd_codec::SOMEIP_HEADER_LEN..],
+    );
+    // A negative length means "no response" (a setter / fire-and-forget).
+    let Ok(payload_len) = usize::try_from(resp_len) else {
+        return;
+    };
+    if crate::sd_codec::encode_response_header(
+        send_buf,
+        service_id,
+        method_id,
+        hdr.request_id(),
+        hdr.protocol_version(),
+        hdr.interface_version(),
+        payload_len,
+    )
+    .is_ok()
+    {
+        let total = crate::sd_codec::SOMEIP_HEADER_LEN + payload_len;
+        if let Err(e) = unicast_socket.send_to(&send_buf[..total], source).await {
+            crate::log::warn!("non-SD response send failed: {:?}", e);
+        }
+    }
+}
+
 /// Receive loop body — drives `recv_from` on both the unicast and SD
-/// sockets, dispatches SD messages to [`handle_sd_message`].
+/// sockets, dispatches SD messages to [`handle_sd_message`] and non-SD
+/// unicast requests to [`dispatch_non_sd_request`].
 #[allow(clippy::too_many_arguments)]
-async fn recv_loop<T, Sub>(
+async fn recv_loop<T, Sub, R>(
     config: &ServerConfig,
     unicast_socket: &T,
     sd_socket: &T,
     sd_state: &SdStateManager,
     subscriptions: &Sub,
+    e2e: &R,
     unicast_buf: &mut [u8],
     sd_buf: &mut [u8],
     send_buf: &mut [u8],
@@ -523,6 +585,7 @@ async fn recv_loop<T, Sub>(
 where
     T: TransportSocket,
     Sub: SubscriptionHandle,
+    R: E2ERegistryHandle,
 {
     use crate::protocol::MessageView;
 
@@ -615,22 +678,18 @@ where
                         }
                     }
                 } else if from_unicast {
-                    // Surface non-SD unicast (method requests / fire-and-forget
-                    // calls to offered services) via the registered callback.
-                    // The SOME/IP header is parsed here; the consumer receives
-                    // decoded fields and never hand-rolls parsing.
-                    if let Some((cb, ctx)) = non_sd_observer {
+                    // Non-SD unicast = a method request to an offered service.
+                    if let Some(observer) = non_sd_observer {
                         if let core::net::SocketAddr::V4(src_v4) = addr {
-                            let id = view.header().message_id();
-                            // Server-side requests are not E2E-checked today.
-                            cb(
-                                ctx,
+                            dispatch_non_sd_request(
+                                unicast_socket,
+                                observer,
+                                e2e,
+                                &view,
                                 src_v4,
-                                id.service_id(),
-                                id.method_id(),
-                                view.payload_bytes(),
-                                0,
-                            );
+                                send_buf,
+                            )
+                            .await;
                         }
                     } else {
                         crate::log::trace!(
@@ -663,12 +722,13 @@ where
 /// where a co-located `Client` emits `OfferService` on the server's
 /// behalf.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_combined<H, T, Sub, Hsd, Tm>(
+pub(super) async fn run_combined<H, T, Sub, Hsd, Tm, R>(
     config: ServerConfig,
     unicast_socket: H,
     sd_socket: H,
     subscriptions: Sub,
     sd_state: Hsd,
+    e2e: R,
     timer: Tm,
     is_passive: bool,
     unicast_buf: &mut [u8],
@@ -683,6 +743,7 @@ where
     Sub: SubscriptionHandle,
     Hsd: SharedHandle<SdStateManager>,
     Tm: Timer,
+    R: E2ERegistryHandle,
 {
     if is_passive {
         crate::log::warn!(
@@ -705,6 +766,7 @@ where
         sd,
         sd_state_ref,
         &subscriptions,
+        &e2e,
         unicast_buf,
         sd_buf,
         recv_send_buf,
