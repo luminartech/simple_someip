@@ -80,6 +80,10 @@ pub enum ClientUpdate<P: PayloadWireFormat> {
         message: Message<P>,
         /// E2E check status, if E2E was configured for this message.
         e2e_status: Option<E2ECheckStatus>,
+        /// The sender's source address. On a shared subnet this is the only
+        /// way to attribute a unicast event to a specific device, since the
+        /// SOME/IP header carries no instance id.
+        source: SocketAddr,
     },
     /// The client encountered an error.
     Error(Error),
@@ -93,10 +97,12 @@ impl<P: PayloadWireFormat> std::fmt::Debug for ClientUpdate<P> {
             Self::Unicast {
                 message,
                 e2e_status,
+                source,
             } => f
                 .debug_struct("Unicast")
                 .field("message", message)
                 .field("e2e_status", e2e_status)
+                .field("source", source)
                 .finish(),
             Self::Error(err) => f.debug_tuple("Error").field(err).finish(),
         }
@@ -692,6 +698,7 @@ mod tests {
         let update: ClientUpdate<TestPayload> = ClientUpdate::Unicast {
             message: msg,
             e2e_status: None,
+            source: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 30640),
         };
         let debug_str = format!("{update:?}");
         assert!(debug_str.contains("Unicast"));
@@ -700,6 +707,21 @@ mod tests {
         let update: ClientUpdate<TestPayload> = ClientUpdate::Error(Error::ServiceNotFound);
         let debug_str = format!("{update:?}");
         assert!(debug_str.contains("Error"));
+    }
+
+    #[test]
+    fn unicast_update_carries_source() {
+        let src = SocketAddr::new(Ipv4Addr::new(192, 168, 11, 101).into(), 30640);
+        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
+        let update: ClientUpdate<TestPayload> = ClientUpdate::Unicast {
+            message: msg,
+            e2e_status: None,
+            source: src,
+        };
+        match update {
+            ClientUpdate::Unicast { source, .. } => assert_eq!(source, src),
+            _ => panic!("expected Unicast"),
+        }
     }
 
     #[tokio::test]

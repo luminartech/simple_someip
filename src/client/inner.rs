@@ -900,7 +900,7 @@ where
                          trace!("Received unicast message: {:?}", unicast);
                          match unicast {
                              Ok(received) => {
-                                 let ReceivedMessage { message: received_message, e2e_status, .. } = received;
+                                 let ReceivedMessage { message: received_message, e2e_status, source } = received;
                                  // Check if this matches a pending request-response by request_id
                                  let request_id = received_message.header().request_id();
                                  if let Some(sender) = pending_responses.remove(&request_id) {
@@ -908,7 +908,7 @@ where
                                      continue;
                                  }
                                  // Not a response — forward as ClientUpdate::Unicast
-                                 let _ = update_sender.send(ClientUpdate::Unicast { message: received_message, e2e_status });
+                                 let _ = update_sender.send(ClientUpdate::Unicast { message: received_message, e2e_status, source });
                              }
                              Err(err) => {
                                  let _ = update_sender.send(ClientUpdate::Error(err));
