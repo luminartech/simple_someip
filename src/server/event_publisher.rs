@@ -602,6 +602,193 @@ where
             .for_each_subscriber(service_id, instance_id, event_group_id, |_| {})
             .await
     }
+
+    /// Publish raw (already-serialized, already-E2E-protected) event data to a
+    /// SINGLE subscriber, addressed by endpoint, using caller-provided scratch.
+    ///
+    /// Unlike [`Self::publish_raw_event_with_buffers`], which fans out to every
+    /// subscriber of the event group, this targets one — the caller chooses
+    /// which subscriber (by its subscribed endpoint) receives the event. This
+    /// is what enables per-recipient delivery when several receivers share the
+    /// same `(service_id, instance_id, event_group_id)` key but bind distinct
+    /// endpoints (e.g. multiple sensors on one subnet that share a fixed
+    /// instance id).
+    ///
+    /// `buf` receives the serialized SOME/IP header + payload before the send,
+    /// exactly as in [`Self::publish_raw_event_with_buffers`]; the caller must
+    /// supply at least `16 + payload.len()` bytes.
+    ///
+    /// Returns `Ok(1)` when `target` is a current subscriber of the event group
+    /// and the datagram was sent, and `Ok(0)` when `target` is not subscribed
+    /// (mirroring the fan-out path's "0 == no eligible recipient" semantics).
+    /// When `target` IS subscribed but the send fails, the underlying transport
+    /// error is surfaced as `Err(Error::Transport(_))` rather than masked as
+    /// `Ok(0)` — matching the fan-out path, which reports an all-sends-failed
+    /// publish as an error so the caller can distinguish it from "nothing to
+    /// send".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Capacity`]`("udp_buffer")` if `buf` is too small for the
+    /// 16-byte SOME/IP header plus `payload`, [`Error::Transport`] if `target`
+    /// is subscribed but the send fails, or a serialization error if the header
+    /// fails to encode.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_raw_event_to_with_buffers(
+        &self,
+        target: SocketAddrV4,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+        event_id: u16,
+        request_id: u32,
+        protocol_version: u8,
+        interface_version: u8,
+        payload: &[u8],
+        buf: &mut [u8],
+    ) -> Result<usize, Error> {
+        // Only deliver to a currently-subscribed endpoint, so a caller cannot
+        // address a receiver that has not subscribed.
+        let mut is_subscribed = false;
+        self.subscriptions
+            .for_each_subscriber(service_id, instance_id, event_group_id, |sub| {
+                if sub.address == target {
+                    is_subscribed = true;
+                }
+            })
+            .await;
+        if !is_subscribed {
+            return Ok(0);
+        }
+
+        // Buffer guards, keyed off `buf.len()` (see
+        // `publish_raw_event_with_buffers` for the `buf.len() < 16` rationale).
+        if buf.len() < 16 {
+            crate::log::error!(
+                "raw event buffer ({} bytes) too small for the 16-byte SOME/IP header; dropping publish",
+                buf.len()
+            );
+            return Err(Error::Capacity("udp_buffer"));
+        }
+        if payload.len() > buf.len().saturating_sub(16) {
+            crate::log::error!(
+                "raw event payload ({} bytes) + 16-byte header exceeds buf.len() ({}); dropping publish",
+                payload.len(),
+                buf.len()
+            );
+            return Err(Error::Capacity("udp_buffer"));
+        }
+
+        let header = Header::new_event(
+            service_id,
+            event_id,
+            request_id,
+            protocol_version,
+            interface_version,
+            payload.len(),
+        );
+
+        let header_len = header.encode_to_slice(buf)?;
+        let Some(total_len) = header_len.checked_add(payload.len()) else {
+            crate::log::error!(
+                "raw event length computation overflowed usize (header_len={}, payload.len()={}); dropping publish",
+                header_len,
+                payload.len()
+            );
+            return Err(Error::Capacity("udp_buffer"));
+        };
+        if total_len > buf.len() {
+            crate::log::error!(
+                "raw event ({} bytes) exceeds buf.len() ({}); dropping publish",
+                total_len,
+                buf.len()
+            );
+            return Err(Error::Capacity("udp_buffer"));
+        }
+        buf[header_len..total_len].copy_from_slice(payload);
+        let datagram = &buf[..total_len];
+
+        match self.socket.get().send_to(datagram, target).await {
+            Ok(()) => Ok(1),
+            Err(e) => {
+                crate::log::error!("Failed to send raw event to {}: {:?}", target, e);
+                Err(Error::Transport(e))
+            }
+        }
+    }
+
+    /// Publish raw event data to a SINGLE subscriber, addressed by endpoint.
+    ///
+    /// Convenience wrapper over [`Self::publish_raw_event_to_with_buffers`] that
+    /// internally allocates the scratch `Vec` required for the send path.
+    /// Available only when an allocator is present (`_alloc` feature).
+    /// Bare-metal callers without an allocator must supply their own scratch
+    /// via [`Self::publish_raw_event_to_with_buffers`] directly.
+    ///
+    /// See [`Self::publish_raw_event_to_with_buffers`] for the targeted-delivery
+    /// semantics and return values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SOME/IP header fails to serialize, the frame
+    /// exceeds the internally-allocated scratch buffer (sized to
+    /// `crate::UDP_BUFFER_SIZE`), or the send to a subscribed `target` fails
+    /// ([`Error::Transport`]). Callers that need to control the buffer length
+    /// must use [`Self::publish_raw_event_to_with_buffers`] directly.
+    #[cfg(feature = "_alloc")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_raw_event_to(
+        &self,
+        target: SocketAddrV4,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+        event_id: u16,
+        request_id: u32,
+        protocol_version: u8,
+        interface_version: u8,
+        payload: &[u8],
+    ) -> Result<usize, Error> {
+        let mut buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
+        self.publish_raw_event_to_with_buffers(
+            target,
+            service_id,
+            instance_id,
+            event_group_id,
+            event_id,
+            request_id,
+            protocol_version,
+            interface_version,
+            payload,
+            &mut buf,
+        )
+        .await
+    }
+
+    /// Return the endpoint addresses currently subscribed to an event group.
+    ///
+    /// Lets a caller map a known receiver IP to its subscriber endpoint so it
+    /// can target that endpoint with [`Self::publish_raw_event_to`] /
+    /// [`Self::publish_raw_event_to_with_buffers`]. Addresses are collected into
+    /// a stack buffer (no heap allocation) capped at [`SUBSCRIBERS_PER_GROUP`] —
+    /// the same per-group cap the [`super::SubscriptionManager`] enforces, so
+    /// the collection can never overflow.
+    pub async fn subscriber_addresses(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        event_group_id: u16,
+    ) -> HeaplessVec<SocketAddrV4, SUBSCRIBERS_PER_GROUP> {
+        let mut addrs: HeaplessVec<SocketAddrV4, SUBSCRIBERS_PER_GROUP> = HeaplessVec::new();
+        self.subscriptions
+            .for_each_subscriber(service_id, instance_id, event_group_id, |sub| {
+                // push() can never fail: this buffer's cap equals the manager's
+                // per-group cap, so it will never feed us more than fits.
+                let _ = addrs.push(sub.address);
+            })
+            .await;
+        addrs
+    }
 }
 
 // `EventPublisherHandle<R, S, H>` /
@@ -1256,5 +1443,89 @@ mod tests {
             .unwrap();
 
         assert_eq!(publisher.subscriber_count(0x5B, 1, 0x01).await, 1);
+    }
+
+    // ── publish_raw_event_to / subscriber_addresses ──────────────────────
+    //
+    // Targeted single-subscriber delivery: when several receivers share the
+    // same (service, instance, event_group) key but bind distinct endpoints.
+
+    #[tokio::test]
+    async fn test_publish_raw_event_to_targets_one_subscriber() {
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+
+        // Two receivers subscribed under the SAME key — the multi-sensor /
+        // shared-instance-id case.
+        let rx_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let core::net::SocketAddr::V4(addr_a) = rx_a.local_addr().unwrap() else {
+            panic!("expected v4");
+        };
+        let core::net::SocketAddr::V4(addr_b) = rx_b.local_addr().unwrap() else {
+            panic!("expected v4");
+        };
+        {
+            let mut mgr = subscriptions.write().await;
+            mgr.subscribe(0x5B, 2, 0x01, addr_a).unwrap();
+            mgr.subscribe(0x5B, 2, 0x01, addr_b).unwrap();
+        }
+
+        let (publisher, _) = make_publisher(subscriptions).await;
+        let payload = [0xAB, 0xCD];
+        let sent = publisher
+            .publish_raw_event_to(addr_a, 0x5B, 2, 0x01, 0x8001, 0x0001, 0x01, 0x01, &payload)
+            .await
+            .unwrap();
+        assert_eq!(sent, 1);
+
+        // addr_a receives exactly the targeted datagram...
+        let mut buf = [0u8; 64];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx_a.recv_from(&mut buf))
+                .await
+                .expect("addr_a should receive")
+                .unwrap();
+        assert_eq!(len, 18);
+        assert_eq!(&buf[16..18], &payload);
+
+        // ...and addr_b receives NOTHING (the fan-out path would hit both).
+        let nothing = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            rx_b.recv_from(&mut buf),
+        )
+        .await;
+        assert!(
+            nothing.is_err(),
+            "addr_b must not receive a targeted publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_raw_event_to_unsubscribed_target_sends_nothing() {
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let (publisher, _) = make_publisher(subscriptions).await;
+        let bogus = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999);
+        let sent = publisher
+            .publish_raw_event_to(bogus, 0x5B, 2, 0x01, 0x8001, 0x0001, 0x01, 0x01, &[0u8])
+            .await
+            .unwrap();
+        assert_eq!(sent, 0);
+    }
+
+    #[tokio::test]
+    async fn test_subscriber_addresses_lists_all_under_key() {
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let a = SocketAddrV4::new(Ipv4Addr::new(192, 168, 11, 101), 30682);
+        let b = SocketAddrV4::new(Ipv4Addr::new(192, 168, 11, 102), 30682);
+        {
+            let mut mgr = subscriptions.write().await;
+            mgr.subscribe(0x5B, 2, 0x01, a).unwrap();
+            mgr.subscribe(0x5B, 2, 0x01, b).unwrap();
+        }
+        let (publisher, _) = make_publisher(subscriptions).await;
+        let addrs = publisher.subscriber_addresses(0x5B, 2, 0x01).await;
+        assert_eq!(addrs.len(), 2);
+        assert!(addrs.contains(&a));
+        assert!(addrs.contains(&b));
     }
 }
