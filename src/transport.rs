@@ -227,7 +227,7 @@
 //! outside this trait.
 
 use core::future::Future;
-use core::net::{Ipv4Addr, SocketAddrV4};
+use core::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use core::time::Duration;
 
 use crate::e2e::Error as E2EError;
@@ -805,20 +805,33 @@ pub trait E2ERegistryHandle: Clone + Send + Sync + 'static {
         output: &mut [u8],
     ) -> Option<Result<usize, E2EError>>;
 
-    /// Run E2E check for `key` if configured.
+    /// Run E2E check for `key` against `source`'s receive counter state,
+    /// if configured.
     ///
     /// Returns `None` if no profile is registered for `key`. Otherwise
     /// returns the check status and the effective payload slice — the
     /// E2E header is stripped on success; the original bytes are returned
     /// on check failure so the caller can decide how to handle it.
     ///
+    /// `source` keys the receive counter state: on a shared subnet several
+    /// devices send the same `(service, method)` under one instance id, so
+    /// each sender's sequence counter must be tracked independently. See
+    /// [`crate::e2e::E2ERegistry`].
+    ///
     /// The returned slice borrows from `payload`, not from this handle.
     fn check<'a>(
         &self,
+        source: IpAddr,
         key: E2EKey,
         payload: &'a [u8],
         upper_header: [u8; 8],
     ) -> Option<(E2ECheckStatus, &'a [u8])>;
+
+    /// Drop all per-source receive counter state for `source` (e.g. when
+    /// its reboot is detected via Service Discovery), so its next frame
+    /// starts a fresh sequence. Configuration and transmit state are
+    /// untouched.
+    fn reset_source(&self, source: IpAddr);
 }
 
 /// Shared handle to the local interface address.
@@ -937,7 +950,7 @@ mod std_handle_impls {
     use super::{E2ERegistryHandle, InterfaceHandle};
     use crate::e2e::Error as E2EError;
     use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, E2ERegistryFull};
-    use core::net::Ipv4Addr;
+    use core::net::{IpAddr, Ipv4Addr};
     use std::sync::{Arc, Mutex, RwLock};
 
     impl E2ERegistryHandle for Arc<Mutex<E2ERegistry>> {
@@ -976,13 +989,20 @@ mod std_handle_impls {
 
         fn check<'a>(
             &self,
+            source: IpAddr,
             key: E2EKey,
             payload: &'a [u8],
             upper_header: [u8; 8],
         ) -> Option<(E2ECheckStatus, &'a [u8])> {
             self.lock()
                 .expect("e2e registry lock poisoned")
-                .check(key, payload, upper_header)
+                .check(source, key, payload, upper_header)
+        }
+
+        fn reset_source(&self, source: IpAddr) {
+            self.lock()
+                .expect("e2e registry lock poisoned")
+                .reset_source(source);
         }
     }
 
@@ -1108,6 +1128,7 @@ pub mod bare_metal_e2e_impl {
         E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, E2ERegistryFull, Error as E2EError,
     };
     use core::cell::RefCell;
+    use core::net::IpAddr;
     use embassy_sync::blocking_mutex::Mutex;
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
@@ -1159,12 +1180,17 @@ pub mod bare_metal_e2e_impl {
 
         fn check<'a>(
             &self,
+            source: IpAddr,
             key: E2EKey,
             payload: &'a [u8],
             upper_header: [u8; 8],
         ) -> Option<(E2ECheckStatus, &'a [u8])> {
             self.0
-                .lock(|cell| cell.borrow_mut().check(key, payload, upper_header))
+                .lock(|cell| cell.borrow_mut().check(source, key, payload, upper_header))
+        }
+
+        fn reset_source(&self, source: IpAddr) {
+            self.0.lock(|cell| cell.borrow_mut().reset_source(source));
         }
     }
 }
@@ -1429,7 +1455,7 @@ pub mod probe {
     };
     use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, Error as E2EError};
     use core::future::Future;
-    use core::net::{Ipv4Addr, SocketAddrV4};
+    use core::net::{IpAddr, Ipv4Addr, SocketAddrV4};
     use core::time::Duration;
 
     /// Socket whose I/O futures resolve immediately with
@@ -1532,12 +1558,14 @@ pub mod probe {
         }
         fn check<'a>(
             &self,
+            _source: IpAddr,
             _key: E2EKey,
             _payload: &'a [u8],
             _upper_header: [u8; 8],
         ) -> Option<(E2ECheckStatus, &'a [u8])> {
             None
         }
+        fn reset_source(&self, _source: IpAddr) {}
     }
 
     /// Interface handle pinned to a fixed address.
@@ -1689,7 +1717,11 @@ mod tests {
         )
         .expect("NullE2ERegistry::register is infallible");
         assert!(!r.contains_key(&key));
-        assert!(r.check(key, b"hello", [0; 8]).is_none());
+        assert!(
+            r.check(Ipv4Addr::LOCALHOST.into(), key, b"hello", [0; 8])
+                .is_none()
+        );
+        r.reset_source(Ipv4Addr::LOCALHOST.into()); // no-op in null impl
     }
 
     #[test]

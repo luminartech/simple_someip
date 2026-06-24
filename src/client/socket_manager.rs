@@ -794,9 +794,16 @@ where
                             let key = E2EKey::from_message_id(header.message_id());
                             let payload_bytes = view.payload_bytes();
 
-                            // Apply E2E check if configured
+                            // Apply E2E check if configured. The source IP keys
+                            // the receive counter state so interleaved senders
+                            // on a shared subnet don't collide (see `E2ERegistry`).
                             let (e2e_status, effective_payload) =
-                                match e2e_registry.check(key, payload_bytes, upper_header) {
+                                match e2e_registry.check(
+                                    source_address.ip(),
+                                    key,
+                                    payload_bytes,
+                                    upper_header,
+                                ) {
                                     Some((status, stripped)) => (Some(status), stripped),
                                     None => (None, payload_bytes),
                                 };

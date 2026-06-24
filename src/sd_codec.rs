@@ -8,7 +8,7 @@
 //! [`crate::bare_metal_tasks`] and the firmware's publish/deinit FFI, so
 //! that no SOME/IP byte-encoding or header-parsing lives in the firmware.
 
-use core::net::Ipv4Addr;
+use core::net::{IpAddr, Ipv4Addr};
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use crate::WireFormat;
@@ -402,20 +402,26 @@ pub fn parse_someip_sd_datagram(data: &[u8]) -> Option<SdHeaderView<'_>> {
     SdHeaderView::parse(sd_payload).ok()
 }
 
-/// Run an E2E check for `parsed` against `e2e`. Returns
+/// Run an E2E check for `parsed` against `e2e`, keyed by `source`. Returns
 /// `(Unchecked, parsed.payload)` when no profile is registered for the
 /// `(service_id, method_id)` pair. Generic over [`E2ERegistryHandle`] so
 /// it works with any handle (the bare-metal `StaticE2EHandle` included).
+///
+/// `source` is the sender's IP: receive E2E counter state is tracked per
+/// source so several devices sending the same `(service, method)` on a
+/// shared subnet don't collide into spurious sequence errors. See
+/// [`crate::e2e::E2ERegistry`].
 #[must_use]
 pub fn check_parsed_e2e<'a, R: E2ERegistryHandle>(
     e2e: &R,
+    source: IpAddr,
     parsed: &ParsedDatagram<'a>,
 ) -> (E2ECheckStatus, &'a [u8]) {
     let key = E2EKey::from_message_id(MessageId::new_from_service_and_method(
         parsed.service_id,
         parsed.method_id,
     ));
-    match e2e.check(key, parsed.payload, parsed.upper_header) {
+    match e2e.check(source, key, parsed.payload, parsed.upper_header) {
         Some((status, body)) => (status, body),
         None => (E2ECheckStatus::Unchecked, parsed.payload),
     }
