@@ -260,16 +260,18 @@ where
                     entry_view.event_group_id()
                 );
 
-                // A co-offered `(service, instance, event_group)` registered
-                // via `with_accepted_offer` is accepted on this shared recv
-                // loop even though it is not the primary service — its tuple
-                // is fully validated by the `accepts_offer` match, so the
-                // four single-service guards below are skipped for it. Empty
+                // A co-offered `(service, instance, major_version,
+                // event_group)` registered via `with_accepted_offer` is
+                // accepted on this shared recv loop even though it is not the
+                // primary service — its tuple (major version included) is
+                // fully validated by the `accepts_offer` match, so the four
+                // single-service guards below are skipped for it. Empty
                 // `accepted_offers` ⇒ `co_offered` is always false ⇒ exact
                 // single-service behaviour.
                 let co_offered = config.accepts_offer(
                     entry_view.service_id(),
                     entry_view.instance_id(),
+                    entry_view.major_version(),
                     entry_view.event_group_id(),
                 );
 
@@ -548,6 +550,20 @@ async fn dispatch_non_sd_request<T: TransportSocket, R: E2ERegistryHandle>(
     let Ok(payload_len) = usize::try_from(resp_len) else {
         return;
     };
+    // The callback was handed `&mut send_buf[SOMEIP_HEADER_LEN..]`, so a
+    // response claiming more than that slice holds is a contract violation.
+    // Drop it rather than slice `send_buf[..SOMEIP_HEADER_LEN + payload_len]`
+    // out of bounds: the callback is consumer/FFI code, and on the bare-metal
+    // runtime the panic would unwind across the `extern "C"` boundary (UB).
+    let usable = send_buf.len() - crate::sd_codec::SOMEIP_HEADER_LEN;
+    if payload_len > usable {
+        crate::log::warn!(
+            "non-SD response length {} exceeds {}-byte response buffer; dropped",
+            payload_len,
+            usable
+        );
+        return;
+    }
     if crate::sd_codec::encode_response_header(
         send_buf,
         service_id,
