@@ -381,8 +381,12 @@ fn build_server() -> bool {
         // primary service would be announced twice.
         .with_announce(false);
     for entry in o {
-        config =
-            config.with_accepted_offer(entry.service_id, entry.instance_id, entry.event_group_id);
+        config = config.with_accepted_offer(
+            entry.service_id,
+            entry.instance_id,
+            entry.major_version,
+            entry.event_group_id,
+        );
     }
 
     // SAFETY: storages initialized just above / are 'static.

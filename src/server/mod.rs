@@ -109,6 +109,9 @@ pub struct AcceptedOffer {
     pub service_id: u16,
     /// Offered instance ID.
     pub instance_id: u16,
+    /// Offered major version. A `SubscribeEventgroup` whose major version
+    /// does not match is rejected, mirroring the primary service's guard.
+    pub major_version: u8,
     /// Offered event-group ID.
     pub event_group_id: u16,
 }
@@ -219,12 +222,14 @@ impl ServerConfig {
         mut self,
         service_id: u16,
         instance_id: u16,
+        major_version: u8,
         event_group_id: u16,
     ) -> Self {
         self.accepted_offers
             .push(AcceptedOffer {
                 service_id,
                 instance_id,
+                major_version,
                 event_group_id,
             })
             .expect("accepted_offers capacity exceeded");
@@ -246,6 +251,7 @@ impl ServerConfig {
         mut self,
         service_id: u16,
         instance_id: u16,
+        major_version: u8,
         event_group_id: u16,
     ) -> Result<Self, Self> {
         if self
@@ -253,6 +259,7 @@ impl ServerConfig {
             .push(AcceptedOffer {
                 service_id,
                 instance_id,
+                major_version,
                 event_group_id,
             })
             .is_ok()
@@ -263,13 +270,20 @@ impl ServerConfig {
         }
     }
 
-    /// Returns `true` if `(service_id, instance_id, event_group_id)` is
-    /// registered in [`Self::accepted_offers`].
+    /// Returns `true` if `(service_id, instance_id, major_version,
+    /// event_group_id)` is registered in [`Self::accepted_offers`].
     #[must_use]
-    pub fn accepts_offer(&self, service_id: u16, instance_id: u16, event_group_id: u16) -> bool {
+    pub fn accepts_offer(
+        &self,
+        service_id: u16,
+        instance_id: u16,
+        major_version: u8,
+        event_group_id: u16,
+    ) -> bool {
         self.accepted_offers.iter().any(|o| {
             o.service_id == service_id
                 && o.instance_id == instance_id
+                && o.major_version == major_version
                 && o.event_group_id == event_group_id
         })
     }

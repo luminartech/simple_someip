@@ -791,3 +791,316 @@ async fn non_sd_observer_none_preserves_ignore_behavior() {
     handle.abort();
     let _ = handle.await;
 }
+
+// ── Responder (getter) path ───────────────────────────────────────────
+//
+// A non-negative return from `NonSdRequestCallback` means "I wrote a
+// `len`-byte response into `response_out`"; the server frames a SOME/IP
+// RESPONSE (echoing the request id) and sends it back to the source.
+// `record_*` above all return -1, so these two tests are the only
+// coverage of the framing branch and its length-guard.
+
+/// Build a method request with an explicit `request_id` so the response
+/// path's id-echo can be asserted. Mirrors `build_method_request` but
+/// threads `request_id` instead of hardcoding 0.
+fn build_method_request_with_id(
+    service_id: u16,
+    method_id: u16,
+    request_id: u32,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16 + payload.len());
+    buf.extend_from_slice(&service_id.to_be_bytes());
+    buf.extend_from_slice(&method_id.to_be_bytes());
+    buf.extend_from_slice(&(8u32 + payload.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&request_id.to_be_bytes());
+    buf.push(1); // protocol_version
+    buf.push(1); // interface_version
+    buf.push(0); // message_type = Request
+    buf.push(0); // return_code = OK
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// Getter responder: writes a fixed 3-byte body into `response_out` and
+/// returns its length.
+fn respond_with_body(
+    _ctx: usize,
+    _source: SocketAddrV4,
+    _service_id: u16,
+    _method_id: u16,
+    _payload: &[u8],
+    _e2e_status: u8,
+    response_out: &mut [u8],
+) -> i32 {
+    let body = [0x11u8, 0x22, 0x33];
+    response_out[..body.len()].copy_from_slice(&body);
+    body.len() as i32
+}
+
+/// Contract-violating responder: claims more bytes than the buffer it
+/// was handed actually holds. The server must reject this without
+/// panicking or emitting a datagram, not slice out of bounds.
+fn respond_oversized(
+    _ctx: usize,
+    _source: SocketAddrV4,
+    _service_id: u16,
+    _method_id: u16,
+    _payload: &[u8],
+    _e2e_status: u8,
+    response_out: &mut [u8],
+) -> i32 {
+    (response_out.len() + 100) as i32
+}
+
+/// A non-negative responder return frames a SOME/IP RESPONSE — message
+/// type 0x80, request id echoed, the written body as payload — and sends
+/// it back to the requester.
+#[tokio::test]
+async fn non_sd_responder_frames_and_sends_response() {
+    let unicast_pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        unicast_pipe: Arc::clone(&unicast_pipe),
+        sd_pipe: Arc::new(MockPipe::default()),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+
+    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30702);
+
+    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
+        ServerDeps {
+            factory,
+            timer: MockTimer,
+            e2e_registry: e2e_handle,
+            subscriptions: MockSubscriptions::default(),
+            non_sd_observer: Some((respond_with_body as NonSdRequestCallback, 0)),
+        };
+
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+    let handle = tokio::spawn(run);
+
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 110), 40010);
+    let request_id = 0xABCD_1234u32;
+    unicast_pipe.inbound.lock().unwrap().push_back((
+        build_method_request_with_id(0x1234, 0x0001, request_id, &[0xDE, 0xAD]),
+        src,
+    ));
+    if let Some(w) = unicast_pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    drive_until(|| !unicast_pipe.sent.lock().unwrap().is_empty()).await;
+
+    let (resp, target) = unicast_pipe
+        .sent
+        .lock()
+        .unwrap()
+        .pop_front()
+        .expect("a RESPONSE datagram must be sent");
+    assert_eq!(target, src, "response goes back to the requester");
+    assert!(resp.len() >= 16, "response has a full SOME/IP header");
+    assert_eq!(&resp[0..2], &0x1234u16.to_be_bytes(), "service id");
+    assert_eq!(&resp[2..4], &0x0001u16.to_be_bytes(), "method id");
+    assert_eq!(
+        &resp[4..8],
+        &(8u32 + 3).to_be_bytes(),
+        "length = 8 (upper header) + 3-byte body"
+    );
+    assert_eq!(
+        &resp[8..12],
+        &request_id.to_be_bytes(),
+        "request id echoed verbatim"
+    );
+    assert_eq!(resp[14], 0x80, "message type = Response");
+    assert_eq!(&resp[16..], &[0x11, 0x22, 0x33], "body the callback wrote");
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// A responder that returns a length larger than the buffer it was given
+/// (a contract violation, but the callback is consumer/FFI code) must be
+/// rejected: no datagram sent, run-future still alive — never an
+/// out-of-bounds slice panic.
+#[tokio::test]
+async fn non_sd_responder_oversized_length_is_rejected_not_panicked() {
+    let unicast_pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        unicast_pipe: Arc::clone(&unicast_pipe),
+        sd_pipe: Arc::new(MockPipe::default()),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+
+    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30703);
+
+    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
+        ServerDeps {
+            factory,
+            timer: MockTimer,
+            e2e_registry: e2e_handle,
+            subscriptions: MockSubscriptions::default(),
+            non_sd_observer: Some((respond_oversized as NonSdRequestCallback, 0)),
+        };
+
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+    let handle = tokio::spawn(run);
+
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 111), 40011);
+    unicast_pipe
+        .inbound
+        .lock()
+        .unwrap()
+        .push_back((build_method_request(0x1234, 0x0001, &[]), src));
+    if let Some(w) = unicast_pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    // Drive until the request is consumed, then yield once more to let
+    // any (buggy) response attempt happen.
+    drive_until(|| unicast_pipe.inbound.lock().unwrap().is_empty()).await;
+    tokio::task::yield_now().await;
+
+    assert!(
+        unicast_pipe.sent.lock().unwrap().is_empty(),
+        "an over-range response length must be dropped, not framed/sent"
+    );
+    assert!(
+        !handle.is_finished(),
+        "run-future must survive a contract-violating response length \
+         (no out-of-bounds slice panic)"
+    );
+    handle.abort();
+    let _ = handle.await;
+}
+
+// ── Co-offered SubscribeEventgroup acceptance ─────────────────────────
+//
+// A service registered via `with_accepted_offer` is accepted on the
+// shared recv loop even though it is not the primary service. The
+// accepted-offer tuple includes the major version, so a Subscribe whose
+// major version does not match the registered co-offer must be rejected
+// — the same contract the primary service enforces — not silently
+// accepted by skipping the version guard for co-offered tuples.
+
+/// Drive one `SubscribeEventgroup` for co-offered service `0x5678`
+/// (registered with major version 2) carrying `subscribe_major`, and
+/// return whatever subscriptions the server recorded.
+async fn drive_co_offer_subscribe(local_port: u16, subscribe_major: u8) -> Vec<SubKey> {
+    use simple_someip::protocol::sd::RebootFlag;
+    use simple_someip::sd_codec::{build_subscribe_eventgroup_datagram, SubscribeEventgroupRequest};
+
+    let unicast_pipe = Arc::new(MockPipe::default());
+    let sd_pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        unicast_pipe: Arc::clone(&unicast_pipe),
+        sd_pipe: Arc::clone(&sd_pipe),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let subs_log: Arc<Mutex<Vec<SubKey>>> = Arc::new(Mutex::new(Vec::new()));
+    let subs = MockSubscriptions(subs_log.clone());
+
+    // Primary service 0x1234 (major 1); co-offer service 0x5678 at major 2.
+    let config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(local_port)
+        .with_accepted_offer(0x5678, 1, 2, 0x0001);
+
+    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
+        ServerDeps {
+            factory,
+            timer: MockTimer,
+            e2e_registry: e2e_handle,
+            subscriptions: subs,
+            non_sd_observer: None,
+        };
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+    let handle = tokio::spawn(run);
+
+    let req = SubscribeEventgroupRequest {
+        service_id: 0x5678,
+        instance_id: 1,
+        major_version: subscribe_major,
+        event_group_id: 0x0001,
+        ttl: 0x00FF_FFFF,
+        local_ip: Ipv4Addr::new(192, 0, 2, 200),
+        local_rx_port: 45_000,
+    };
+    let mut buf = [0u8; 256];
+    let n = build_subscribe_eventgroup_datagram(&mut buf, &req, 1, RebootFlag::RecentlyRebooted)
+        .expect("encode subscribe");
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 200), 45_000);
+    sd_pipe
+        .inbound
+        .lock()
+        .unwrap()
+        .push_back((buf[..n].to_vec(), src));
+    if let Some(w) = sd_pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    // Drive until the SD datagram is consumed, then yield enough times for
+    // the subscribe future (and any Ack/Nack send) to settle.
+    drive_until(|| sd_pipe.inbound.lock().unwrap().is_empty()).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+
+    handle.abort();
+    let _ = handle.await;
+    let recorded = subs_log.lock().unwrap().clone();
+    recorded
+}
+
+/// A co-offered Subscribe whose major version matches the registered
+/// co-offer is accepted.
+#[tokio::test]
+async fn co_offered_subscribe_with_matching_major_version_is_accepted() {
+    let recorded = drive_co_offer_subscribe(30710, 2).await;
+    assert_eq!(
+        recorded.len(),
+        1,
+        "co-offered subscribe with the registered major version must be accepted"
+    );
+    assert_eq!(
+        recorded[0].0, 0x5678,
+        "subscription recorded for the co-offered service"
+    );
+}
+
+/// A co-offered Subscribe whose major version does NOT match the
+/// registered co-offer must be rejected — the version guard applies to
+/// co-offered tuples, not only the primary service.
+#[tokio::test]
+async fn co_offered_subscribe_with_wrong_major_version_is_rejected() {
+    let recorded = drive_co_offer_subscribe(30711, 99).await;
+    assert!(
+        recorded.is_empty(),
+        "co-offered subscribe with a mismatched major version must be rejected, \
+         not silently accepted by skipping the version guard"
+    );
+}
