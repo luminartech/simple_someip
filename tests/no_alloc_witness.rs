@@ -201,7 +201,12 @@ fn witness_static_e2e_handle_reads() {
     assert_no_alloc("StaticE2EHandle::check (absent key → None)", || {
         assert!(
             handle
-                .check(E2EKey::new(0xFFFF, 0x0000), b"payload", [0u8; 8])
+                .check(
+                    Ipv4Addr::LOCALHOST.into(),
+                    E2EKey::new(0xFFFF, 0x0000),
+                    b"payload",
+                    [0u8; 8]
+                )
                 .is_none()
         );
     });
@@ -245,7 +250,7 @@ fn witness_static_e2e_handle_protect_check() {
                 .expect("profile registered")
                 .expect("protect succeeded");
             let (status, stripped) = handle
-                .check(key, &protected[..len], [0u8; 8])
+                .check(Ipv4Addr::LOCALHOST.into(), key, &protected[..len], [0u8; 8])
                 .expect("profile registered");
             assert_eq!(status, simple_someip::E2ECheckStatus::Ok);
             assert_eq!(stripped, payload);
@@ -262,7 +267,7 @@ fn witness_static_e2e_handle_protect_check() {
                 .expect("profile registered")
                 .expect("protect succeeded");
             let (status, stripped) = handle
-                .check(key5, &protected5[..len], [0u8; 8])
+                .check(Ipv4Addr::LOCALHOST.into(), key5, &protected5[..len], [0u8; 8])
                 .expect("profile registered");
             assert_eq!(status, simple_someip::E2ECheckStatus::Ok);
             assert_eq!(stripped, payload);

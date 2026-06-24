@@ -536,7 +536,8 @@ async fn dispatch_non_sd_request<T: TransportSocket, R: E2ERegistryHandle>(
         upper_header: hdr.upper_header_bytes(),
         payload: view.payload_bytes(),
     };
-    let (status, body) = crate::sd_codec::check_parsed_e2e(e2e, &parsed);
+    let (status, body) =
+        crate::sd_codec::check_parsed_e2e(e2e, core::net::IpAddr::V4(*source.ip()), &parsed);
     let resp_len = cb(
         ctx,
         source,

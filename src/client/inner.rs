@@ -1071,6 +1071,7 @@ where
                     request_queue,
                     session_tracker,
                     service_registry,
+                    e2e_registry,
                     run,
                     timer,
                     ..
@@ -1208,6 +1209,11 @@ where
                             });
 
                             if rebooted {
+                                // A rebooted sender restarts its E2E counter at
+                                // zero, so drop our stored per-source receive
+                                // state for it; otherwise its first post-reboot
+                                // frame would read as out-of-sequence.
+                                e2e_registry.reset_source(source.ip());
                                 let _ = update_sender.send_now(ClientUpdate::SenderRebooted(source));
                             }
 

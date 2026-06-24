@@ -131,7 +131,7 @@ pub async fn event_rx_dispatch_future<'a, S, R>(
             continue;
         };
         let (status, body) = if e2e_enabled {
-            check_parsed_e2e(e2e, &parsed)
+            check_parsed_e2e(e2e, core::net::IpAddr::V4(*source.ip()), &parsed)
         } else {
             (E2ECheckStatus::Unchecked, parsed.payload)
         };
