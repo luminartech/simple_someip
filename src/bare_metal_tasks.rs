@@ -32,6 +32,22 @@ use crate::sd_codec::{
 use crate::server::{Subscriber, SubscriptionHandle};
 use crate::transport::{E2ERegistryHandle, Timer, TransportSocket};
 
+/// Handler for one decoded inbound request. A getter fills `response_out`
+/// and returns the response length; a setter / fire-and-forget returns `<0`.
+/// Args: `ctx`, sender, `(service, method, payload)`, E2E status,
+/// `response_out`. Same signature as the runtime's `DispatchFn` and
+/// [`crate::server::NonSdRequestCallback`]; kept as a local alias so this
+/// module needs no `bare-metal-runtime` dependency.
+pub type RequestDispatchFn = fn(
+    ctx: usize,
+    source: SocketAddrV4,
+    service_id: u16,
+    method_id: u16,
+    payload: &[u8],
+    e2e_status: u8,
+    response_out: &mut [u8],
+) -> i32;
+
 /// Periodically multicast one combined `OfferService` SD datagram
 /// carrying every entry in `offers` (each with its own endpoint option,
 /// a single session stream), re-sent every `period`. `N` bounds the
@@ -99,14 +115,7 @@ pub async fn event_rx_dispatch_future<'a, S, R>(
     rx_socket: &'a S,
     e2e: &'a R,
     e2e_enabled: bool,
-    dispatch: fn(
-        ctx: usize,
-        source: SocketAddrV4,
-        service_id: u16,
-        method_id: u16,
-        payload: &[u8],
-        e2e_status: u8,
-    ),
+    dispatch: RequestDispatchFn,
     ctx: usize,
     buf: &'a mut [u8],
 ) where
@@ -126,13 +135,17 @@ pub async fn event_rx_dispatch_future<'a, S, R>(
         } else {
             (E2ECheckStatus::Unchecked, parsed.payload)
         };
-        dispatch(
+        // Notifications received on the client RX socket are events, not
+        // requests — there is no reply, so pass an empty response buffer and
+        // ignore the (always-negative) return.
+        let _ = dispatch(
             ctx,
             source,
             parsed.service_id,
             parsed.method_id,
             body,
             e2e_status_code(status),
+            &mut [],
         );
     }
 }
@@ -176,14 +189,7 @@ where
     pub sub_offset: Duration,
     pub sub_e2e_enabled: bool,
     pub rx_buf: &'a mut [u8],
-    pub dispatch: fn(
-        ctx: usize,
-        source: SocketAddrV4,
-        service_id: u16,
-        method_id: u16,
-        payload: &[u8],
-        e2e_status: u8,
-    ),
+    pub dispatch: RequestDispatchFn,
     /// Opaque context word forwarded verbatim as `dispatch`'s first arg.
     /// The reusable runtime passes `0` (its trampoline injects the real
     /// ctx); a direct caller passes its own.

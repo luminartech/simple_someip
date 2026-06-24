@@ -768,6 +768,12 @@ pub struct Server<
 /// `Copy + Send + Sync + 'static`, so the pair can be stored on the
 /// `Server` and captured by the run-future without adding a new
 /// generic.
+///
+/// The callback writes a getter's response payload into `response_out`
+/// (sized by the caller) and returns its length; the server then frames a
+/// SOME/IP RESPONSE (echoing the request id) and sends it back to `source`.
+/// A negative return means "no response" — a setter or fire-and-forget
+/// request the consumer handled as a side effect.
 pub type NonSdRequestCallback = fn(
     ctx: usize,
     source: core::net::SocketAddrV4,
@@ -775,7 +781,8 @@ pub type NonSdRequestCallback = fn(
     method_id: u16,
     payload: &[u8],
     e2e_status: u8,
-);
+    response_out: &mut [u8],
+) -> i32;
 
 #[cfg(feature = "_alloc")]
 type StartedLatch = Arc<AtomicBool>;
@@ -1379,6 +1386,7 @@ where
         let unicast_socket = self.unicast_socket.clone();
         let sd_socket = self.sd_socket.clone();
         let subscriptions = self.subscriptions.clone();
+        let e2e_registry = self.e2e_registry.clone();
         let sd_state = self.sd_state.clone();
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
@@ -1402,12 +1410,13 @@ where
                 return Err(Error::InvalidUsage("server_already_running"));
             }
 
-            runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm>(
+            runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm, R>(
                 config,
                 unicast_socket,
                 sd_socket,
                 subscriptions,
                 sd_state,
+                e2e_registry,
                 timer,
                 is_passive,
                 unicast_buf,
@@ -1598,6 +1607,7 @@ where
         let unicast_socket = self.unicast_socket.clone();
         let sd_socket = self.sd_socket.clone();
         let subscriptions = self.subscriptions.clone();
+        let e2e_registry = self.e2e_registry.clone();
         let sd_state = self.sd_state.clone();
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
@@ -1633,12 +1643,13 @@ where
             // callers pass their own via `run_with_buffers`.
             let mut recv_send_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
             let mut announce_send_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
-            runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm>(
+            runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm, R>(
                 config,
                 unicast_socket,
                 sd_socket,
                 subscriptions,
                 sd_state,
+                e2e_registry,
                 timer,
                 is_passive,
                 &mut unicast_buf,

@@ -394,7 +394,8 @@ fn record_some(
     method_id: u16,
     payload: &[u8],
     e2e_status: u8,
-) {
+    _response_out: &mut [u8],
+) -> i32 {
     let slot = OBSERVED_SOME.get_or_init(|| Mutex::new(None));
     *slot.lock().unwrap() = Some((
         ctx,
@@ -404,6 +405,7 @@ fn record_some(
         payload.to_vec(),
         e2e_status,
     ));
+    -1 // observer only — no response
 }
 
 static OBSERVED_SD_UNICAST: OnceLock<Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, u8)>>> =
@@ -418,7 +420,8 @@ fn record_sd_unicast(
     method_id: u16,
     payload: &[u8],
     e2e_status: u8,
-) {
+    _response_out: &mut [u8],
+) -> i32 {
     let slot = OBSERVED_SD_UNICAST.get_or_init(|| Mutex::new(None));
     *slot.lock().unwrap() = Some((
         ctx,
@@ -428,6 +431,7 @@ fn record_sd_unicast(
         payload.to_vec(),
         e2e_status,
     ));
+    -1 // observer only — no response
 }
 
 fn record_multicast(
@@ -437,7 +441,8 @@ fn record_multicast(
     method_id: u16,
     payload: &[u8],
     e2e_status: u8,
-) {
+    _response_out: &mut [u8],
+) -> i32 {
     let slot = OBSERVED_MULTICAST.get_or_init(|| Mutex::new(None));
     *slot.lock().unwrap() = Some((
         ctx,
@@ -447,6 +452,7 @@ fn record_multicast(
         payload.to_vec(),
         e2e_status,
     ));
+    -1 // observer only — no response
 }
 
 /// Build a minimal SOME/IP method-request datagram (16-byte header,
