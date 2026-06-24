@@ -296,6 +296,7 @@ impl<PayloadDefinitions: PayloadWireFormat> std::fmt::Debug for Inner<PayloadDef
 /// unicast discovery receive arms so each transport's SD session counter is
 /// tracked on its own key — without this split the sensor's interleaved
 /// multicast/unicast session counters look like perpetual reboots.
+#[allow(clippy::too_many_arguments)]
 fn process_discovery<P>(
     source: SocketAddr,
     transport: TransportKind,
@@ -303,6 +304,7 @@ fn process_discovery<P>(
     sd_header: <P as PayloadWireFormat>::SdHeader,
     session_tracker: &mut SessionTracker,
     service_registry: &mut ServiceRegistry,
+    e2e_registry: &Arc<Mutex<E2ERegistry>>,
     update_sender: &mpsc::UnboundedSender<ClientUpdate<P>>,
 ) where
     P: PayloadWireFormat + Clone + std::fmt::Debug + 'static,
@@ -359,6 +361,13 @@ fn process_discovery<P>(
     }
 
     if rebooted {
+        // A rebooted sender restarts its E2E counter at zero, so drop our
+        // stored per-source state for it; otherwise the first post-reboot
+        // frame would read as out-of-sequence.
+        e2e_registry
+            .lock()
+            .expect("e2e registry lock poisoned")
+            .reset_source(source.ip());
         let _ = update_sender.send(ClientUpdate::SenderRebooted(source));
     }
     let discovery_msg = DiscoveryMessage {
@@ -838,6 +847,7 @@ where
                     request_queue,
                     session_tracker,
                     service_registry,
+                    e2e_registry,
                     run,
                     ..
                 } = &mut self;
@@ -865,6 +875,7 @@ where
                                     sd_header,
                                     session_tracker,
                                     service_registry,
+                                    e2e_registry,
                                     update_sender,
                                 );
                             }
@@ -887,6 +898,7 @@ where
                                     sd_header,
                                     session_tracker,
                                     service_registry,
+                                    e2e_registry,
                                     update_sender,
                                 );
                             }

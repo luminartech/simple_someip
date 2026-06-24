@@ -271,7 +271,7 @@ where
                                         // Apply E2E check if configured
                                         let (e2e_status, effective_payload) = {
                                             let mut registry = e2e_registry.lock().expect("e2e registry lock poisoned");
-                                            match registry.check(key, payload_bytes, upper_header) {
+                                            match registry.check(source_address.ip(), key, payload_bytes, upper_header) {
                                                 Some((status, stripped)) => (Some(status), stripped),
                                                 None => (None, payload_bytes),
                                             }
