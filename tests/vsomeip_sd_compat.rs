@@ -564,6 +564,12 @@ async fn tx_announcement_loop_emits_wire_format_offer() {
         )
         .expect("socket2 create");
         raw.set_reuse_address(true).expect("set_reuse_address");
+        // `SO_REUSEPORT` is Unix-only in socket2; the call doesn't compile on
+        // Windows. This whole test is `#[ignore]`'d (needs a vsomeip docker
+        // container + multicast `lo`) and only ever runs on Linux CI, so the
+        // Windows build just needs it to compile — matches the `#[cfg(unix)]`
+        // guard on every `set_reuse_port` call in `src/`.
+        #[cfg(unix)]
         raw.set_reuse_port(true).expect("set_reuse_port");
         raw.set_multicast_loop_v4(true)
             .expect("set_multicast_loop_v4");
