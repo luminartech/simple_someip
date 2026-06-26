@@ -151,8 +151,8 @@ pub async fn event_rx_dispatch_future<'a, S, R>(
 }
 
 /// Cap on `OfferService` entries packed into the combined announce
-/// datagram inside [`run_someip`]. Covers any realistic catalog.
-const RUN_OFFER_CAP: usize = 16;
+/// datagram inside [`run_someip`].
+const RUN_OFFER_CAP: usize = crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_OFFERS"), 4);
 
 /// Everything [`run_someip`] needs besides the server receive future:
 /// the shared SD socket (for announce + subscribe), the client RX socket,
