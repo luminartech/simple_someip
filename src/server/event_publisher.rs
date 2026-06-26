@@ -768,9 +768,9 @@ where
     /// Return the endpoint addresses currently subscribed to an event group.
     ///
     /// Lets a caller map a known receiver IP to its subscriber endpoint so it
-    /// can target that endpoint with [`Self::publish_raw_event_to`] /
+    /// can target that endpoint with `publish_raw_event_to` /
     /// [`Self::publish_raw_event_to_with_buffers`]. Addresses are collected into
-    /// a stack buffer (no heap allocation) capped at [`SUBSCRIBERS_PER_GROUP`] —
+    /// a stack buffer (no heap allocation) capped at `SUBSCRIBERS_PER_GROUP` —
     /// the same per-group cap the [`super::SubscriptionManager`] enforces, so
     /// the collection can never overflow.
     pub async fn subscriber_addresses(

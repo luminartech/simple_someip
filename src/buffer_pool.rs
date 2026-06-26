@@ -67,7 +67,12 @@ impl<const SLOTS: usize, const LEN: usize> BufferPool<SLOTS, LEN> {
         // Compile-time floor: a slot must hold at least a SOME/IP header.
         // Placed in `const {}` so it is evaluated during const-eval of every
         // monomorphization that constructs a pool (e.g. the `static` init).
-        const { assert!(LEN >= 16, "BufferPool slot must hold at least a 16-byte SOME/IP header") };
+        const {
+            assert!(
+                LEN >= 16,
+                "BufferPool slot must hold at least a 16-byte SOME/IP header"
+            );
+        };
         Self {
             store: UnsafeCell::new([[0u8; LEN]; SLOTS]),
             claimed: [const { AtomicBool::new(false) }; SLOTS],

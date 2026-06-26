@@ -623,8 +623,14 @@ mod tests {
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = CapturingSocket::new();
 
-        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock).await.unwrap();
-        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock).await.unwrap();
+        sd_state
+            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
+            .await
+            .unwrap();
+        sd_state
+            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
+            .await
+            .unwrap();
 
         let sent = sock.drain_sent();
         assert_eq!(sent.len(), 2);
@@ -644,8 +650,14 @@ mod tests {
         // (Continuous).
         let sd_state = SdStateManager::with_initial(0xFFFE);
         let sock = CapturingSocket::new();
-        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock).await.unwrap();
-        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock).await.unwrap();
+        sd_state
+            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
+            .await
+            .unwrap();
+        sd_state
+            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
+            .await
+            .unwrap();
 
         let sent = sock.drain_sent();
         assert_eq!(sent.len(), 2);
@@ -677,7 +689,10 @@ mod tests {
         config.ttl = 0;
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = CapturingSocket::new();
-        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock).await.unwrap();
+        sd_state
+            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
+            .await
+            .unwrap();
 
         let sent = sock.drain_sent();
         let view = MessageView::parse(&sent[0].1).unwrap();
@@ -692,7 +707,9 @@ mod tests {
             .with_local_port(TEST_ADVERTISED_PORT);
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = FailingSocket;
-        let result = sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock).await;
+        let result = sd_state
+            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
+            .await;
         // Narrow assertion: the error must specifically be the
         // `Io(NetworkUnreachable)` propagated from `FailingSocket::send_to`.
         // `Err(_)` would also pass on unrelated regressions (encoding
@@ -933,8 +950,14 @@ mod tests {
         let (rx, tx) = mcast_rx_tx().await;
 
         let sd_state = SdStateManager::with_initial(0x1233);
-        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx).await.unwrap();
-        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx).await.unwrap();
+        sd_state
+            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx)
+            .await
+            .unwrap();
+        sd_state
+            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx)
+            .await
+            .unwrap();
 
         let first = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
         let second = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
@@ -956,8 +979,14 @@ mod tests {
         let (rx, tx) = mcast_rx_tx().await;
 
         let sd_state = SdStateManager::with_initial(0xFFFE);
-        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx).await.unwrap();
-        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx).await.unwrap();
+        sd_state
+            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx)
+            .await
+            .unwrap();
+        sd_state
+            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx)
+            .await
+            .unwrap();
 
         let first = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
         let second = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
@@ -998,7 +1027,10 @@ mod tests {
         let (rx, tx) = mcast_rx_tx().await;
 
         let sd_state = SdStateManager::with_initial(0x1233);
-        sd_state.send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx).await.unwrap();
+        sd_state
+            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx)
+            .await
+            .unwrap();
 
         let offer = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
         assert_offer_matches(&offer, &config, 0x0000_1234, RebootFlag::RecentlyRebooted);

@@ -87,7 +87,7 @@ impl core::fmt::Debug for MessageId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "Message Id: {{ service_id: {:#02X}, method_id: {:#02X} }}",
+            "Message Id: {{ service_id: {:#06X}, method_id: {:#06X} }}",
             self.service_id(),
             self.method_id(),
         )

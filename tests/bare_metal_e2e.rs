@@ -27,6 +27,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};
 
 use simple_someip::PayloadWireFormat;
+use simple_someip::WireFormat;
 use simple_someip::client::Error as ClientError;
 use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::define_static_channels;
@@ -39,7 +40,6 @@ use simple_someip::server::{
     Error as ServerError, EventPublisher, ServerConfig, SubscribeError, Subscriber,
     SubscriptionHandle,
 };
-use simple_someip::WireFormat;
 use simple_someip::static_channels::BufferPool;
 use simple_someip::transport::{
     E2ERegistryHandle, ReceivedDatagram, SocketOptions, Spawner, StaticBufferProvider, Timer,
@@ -746,7 +746,10 @@ impl TransportFactory for ScriptFactory {
         core::pin::Pin<Box<dyn Future<Output = Result<Self::Socket, TransportError>> + Send + 'a>>;
     fn bind<'a>(&'a self, addr: SocketAddrV4, _options: &'a SocketOptions) -> Self::BindFuture<'a> {
         let rx = Arc::clone(&self.rx);
-        let local = SocketAddrV4::new(*addr.ip(), if addr.port() == 0 { 41000 } else { addr.port() });
+        let local = SocketAddrV4::new(
+            *addr.ip(),
+            if addr.port() == 0 { 41000 } else { addr.port() },
+        );
         Box::pin(async move { Ok(ScriptSocket { rx, local }) })
     }
 }
@@ -835,7 +838,9 @@ async fn inbound_datagram_larger_than_claimed_buffer_is_dropped_not_fatal() {
     static POOL: BufferPool<2, BUF_LEN> = BufferPool::new();
 
     let rx = Arc::new(ScriptPipe::default());
-    let factory = ScriptFactory { rx: Arc::clone(&rx) };
+    let factory = ScriptFactory {
+        rx: Arc::clone(&rx),
+    };
     let source = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 30490);
 
     // Oversized datagram first: 256 reported bytes into a 64-byte buffer.
@@ -845,7 +850,10 @@ async fn inbound_datagram_larger_than_claimed_buffer_is_dropped_not_fatal() {
     let sd_msg = Message::<RawPayload>::new_sd(1, &empty_vec_sd_header());
     let mut wire = vec![0u8; BUF_LEN];
     let len = sd_msg.encode(&mut wire.as_mut_slice()).expect("encode sd");
-    assert!(len <= BUF_LEN, "valid SD message must fit the claimed buffer");
+    assert!(
+        len <= BUF_LEN,
+        "valid SD message must fit the claimed buffer"
+    );
     rx.push(wire[..len].to_vec(), len, source);
 
     let client_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
@@ -1286,7 +1294,15 @@ async fn publish_raw_event_with_undersized_buf_returns_capacity_not_panic() {
     let empty: [u8; 0] = [];
     let result = publisher
         .publish_raw_event_with_buffers(
-            0xABCD, 1, 0x01, 0x8001, 0x0001_0001, 1, 1, &empty, &mut tiny,
+            0xABCD,
+            1,
+            0x01,
+            0x8001,
+            0x0001_0001,
+            1,
+            1,
+            &empty,
+            &mut tiny,
         )
         .await;
     assert!(
@@ -1350,7 +1366,14 @@ async fn future_size_witness_bm_server_publish_future() {
     let msg_id = MessageId::new_from_service_and_method(service_id, method_id);
     let payload = RawPayload::from_payload_bytes(msg_id, &payload_bytes).expect("create payload");
     let message = Message::<RawPayload>::new(
-        Header::new_event(service_id, method_id, 0x0001_0001, 1, 1, payload_bytes.len()),
+        Header::new_event(
+            service_id,
+            method_id,
+            0x0001_0001,
+            1,
+            1,
+            payload_bytes.len(),
+        ),
         payload,
     );
 

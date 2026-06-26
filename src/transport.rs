@@ -994,9 +994,12 @@ mod std_handle_impls {
             payload: &'a [u8],
             upper_header: [u8; 8],
         ) -> Option<(E2ECheckStatus, &'a [u8])> {
-            self.lock()
-                .expect("e2e registry lock poisoned")
-                .check(source, key, payload, upper_header)
+            self.lock().expect("e2e registry lock poisoned").check(
+                source,
+                key,
+                payload,
+                upper_header,
+            )
         }
 
         fn reset_source(&self, source: IpAddr) {
@@ -1427,9 +1430,7 @@ pub struct StaticBufferProvider<const SLOTS: usize, const LEN: usize>(
     pub &'static BufferPool<SLOTS, LEN>,
 );
 
-impl<const SLOTS: usize, const LEN: usize> BufferProvider
-    for StaticBufferProvider<SLOTS, LEN>
-{
+impl<const SLOTS: usize, const LEN: usize> BufferProvider for StaticBufferProvider<SLOTS, LEN> {
     fn claim(&self) -> Option<BufferLease> {
         self.0.claim()
     }

@@ -785,14 +785,19 @@ where
             spawner,
             buffer_provider,
         };
-        let (control_sender, update_receiver, run_future) =
-            Inner::<MessageDefinitions, Tm, R, C, bind_dispatch::SpawnerDispatch<F, Sp, BP>>::build(
-                initial_addr,
-                e2e_registry.clone(),
-                multicast_loopback,
-                dispatch,
-                timer,
-            );
+        let (control_sender, update_receiver, run_future) = Inner::<
+            MessageDefinitions,
+            Tm,
+            R,
+            C,
+            bind_dispatch::SpawnerDispatch<F, Sp, BP>,
+        >::build(
+            initial_addr,
+            e2e_registry.clone(),
+            multicast_loopback,
+            dispatch,
+            timer,
+        );
         let client = Self {
             interface,
             control_sender,

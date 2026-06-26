@@ -645,8 +645,7 @@ async fn client_receives_server_sd_announcement() {
                 Arc::new(std::sync::Mutex::new(E2ERegistry::new()));
             let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(IP_B));
 
-            let buf_pool: &'static BufferPool<2, LINK_MTU> =
-                Box::leak(Box::new(BufferPool::new()));
+            let buf_pool: &'static BufferPool<2, LINK_MTU> = Box::leak(Box::new(BufferPool::new()));
             let client_deps = ClientDeps {
                 factory: client_factory,
                 spawner: LocalTokioSpawner,
@@ -770,8 +769,7 @@ async fn client_send_request_server_runloop_stable() {
                 Arc::new(std::sync::Mutex::new(E2ERegistry::new()));
             let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(IP_B));
 
-            let buf_pool: &'static BufferPool<8, LINK_MTU> =
-                Box::leak(Box::new(BufferPool::new()));
+            let buf_pool: &'static BufferPool<8, LINK_MTU> = Box::leak(Box::new(BufferPool::new()));
             let client_deps = ClientDeps {
                 factory: client_factory,
                 spawner: LocalTokioSpawner,

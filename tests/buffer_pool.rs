@@ -41,7 +41,10 @@ fn static_provider_claims_through_a_shared_pool() {
     let prov = StaticBufferProvider(&PROV_POOL);
     let _a = prov.claim().expect("first");
     let _b = prov.claim().expect("second");
-    assert!(prov.claim().is_none(), "provider exposes the pool's capacity");
+    assert!(
+        prov.claim().is_none(),
+        "provider exposes the pool's capacity"
+    );
 }
 
 /// Concurrent-claim regression (mirrors the channel pools'

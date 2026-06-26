@@ -267,7 +267,12 @@ fn witness_static_e2e_handle_protect_check() {
                 .expect("profile registered")
                 .expect("protect succeeded");
             let (status, stripped) = handle
-                .check(Ipv4Addr::LOCALHOST.into(), key5, &protected5[..len], [0u8; 8])
+                .check(
+                    Ipv4Addr::LOCALHOST.into(),
+                    key5,
+                    &protected5[..len],
+                    [0u8; 8],
+                )
                 .expect("profile registered");
             assert_eq!(status, simple_someip::E2ECheckStatus::Ok);
             assert_eq!(stripped, payload);

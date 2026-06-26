@@ -1005,7 +1005,9 @@ async fn non_sd_responder_oversized_length_is_rejected_not_panicked() {
 /// return whatever subscriptions the server recorded.
 async fn drive_co_offer_subscribe(local_port: u16, subscribe_major: u8) -> Vec<SubKey> {
     use simple_someip::protocol::sd::RebootFlag;
-    use simple_someip::sd_codec::{build_subscribe_eventgroup_datagram, SubscribeEventgroupRequest};
+    use simple_someip::sd_codec::{
+        SubscribeEventgroupRequest, build_subscribe_eventgroup_datagram,
+    };
 
     let unicast_pipe = Arc::new(MockPipe::default());
     let sd_pipe = Arc::new(MockPipe::default());

@@ -139,7 +139,7 @@ pub struct RuntimeBuffers {
     /// second `&mut` to `tx_scratch` / `offer_scratch` while the task still
     /// holds the first — aliasing UB. `publish` and `deinit` never run
     /// concurrently (single serial caller), so they share this one buffer.
-    /// Sized at [`API_SCRATCH_CAP`] (512 B), not `RX_CAP`, to keep the static
+    /// Sized at `API_SCRATCH_CAP` (512 B), not `RX_CAP`, to keep the static
     /// footprint small; it caps the max `publish` payload at
     /// `API_SCRATCH_CAP - 16`.
     pub publish_scratch: [u8; API_SCRATCH_CAP],
@@ -461,7 +461,8 @@ async fn someip_task() {
     // reborrows retag only their own disjoint byte ranges, leaving
     // `publish_scratch` untouched here and free for the API to borrow.
     let server: &'static RtServer = unsafe { (*core::ptr::addr_of!(SERVER)).assume_init_ref() };
-    let unicast: &'static mut [u8; RX_CAP] = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).unicast) };
+    let unicast: &'static mut [u8; RX_CAP] =
+        unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).unicast) };
     let sd: &'static mut [u8; RX_CAP] = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).sd) };
     let tx_scratch: &'static mut [u8; RX_CAP] =
         unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).tx_scratch) };

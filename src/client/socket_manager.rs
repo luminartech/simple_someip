@@ -737,20 +737,19 @@ where
                             .send(Err(Error::Capacity("udp_buffer")));
                         continue;
                     }
-                    let mut message_length =
-                        match send_message.message.encode(&mut &mut buf[..]) {
-                            Ok(length) => length,
-                            Err(e) => {
-                                error!("Failed to encode message: {:?}", e);
-                                // If the sender is already closed we can't send the error back, so we shut everything down
-                                if let Ok(()) = send_message.response.send(Err(e.into())) {
-                                    // Successfully sent error back to sender, carry on
-                                    continue;
-                                }
-                                error!("Socket owner closed channel unexpectedly, closing socket.");
-                                break;
+                    let mut message_length = match send_message.message.encode(&mut &mut buf[..]) {
+                        Ok(length) => length,
+                        Err(e) => {
+                            error!("Failed to encode message: {:?}", e);
+                            // If the sender is already closed we can't send the error back, so we shut everything down
+                            if let Ok(()) = send_message.response.send(Err(e.into())) {
+                                // Successfully sent error back to sender, carry on
+                                continue;
                             }
-                        };
+                            error!("Socket owner closed channel unexpectedly, closing socket.");
+                            break;
+                        }
+                    };
 
                     // Apply E2E protect if configured. `protected`
                     // is a disjoint stack buffer, so the input can
@@ -888,16 +887,15 @@ where
                             // Apply E2E check if configured. The source IP keys
                             // the receive counter state so interleaved senders
                             // on a shared subnet don't collide (see `E2ERegistry`).
-                            let (e2e_status, effective_payload) =
-                                match e2e_registry.check(
-                                    source_address.ip(),
-                                    key,
-                                    payload_bytes,
-                                    upper_header,
-                                ) {
-                                    Some((status, stripped)) => (Some(status), stripped),
-                                    None => (None, payload_bytes),
-                                };
+                            let (e2e_status, effective_payload) = match e2e_registry.check(
+                                source_address.ip(),
+                                key,
+                                payload_bytes,
+                                upper_header,
+                            ) {
+                                Some((status, stripped)) => (Some(status), stripped),
+                                None => (None, payload_bytes),
+                            };
 
                             let payload = MessageDefinitions::from_payload_bytes(
                                 header.message_id(),

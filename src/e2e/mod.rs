@@ -39,7 +39,7 @@ pub use e2e_protector::{
     protect_profile5_with_header,
 };
 pub use error::Error;
-pub use registry::{E2E_REGISTRY_CAP, E2ERegistry, E2ERegistryFull};
+pub use registry::{E2E_REGISTRY_CAP, E2E_RX_STATE_CAP, E2ERegistry, E2ERegistryFull};
 pub use state::{Profile4State, Profile5State};
 
 /// Status result from E2E check operations.

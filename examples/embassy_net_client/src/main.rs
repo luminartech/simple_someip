@@ -413,8 +413,7 @@ async fn main() {
             let client_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
             let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(IP_B));
 
-            let buf_pool: &'static BufferPool<8, LINK_MTU> =
-                Box::leak(Box::new(BufferPool::new()));
+            let buf_pool: &'static BufferPool<8, LINK_MTU> = Box::leak(Box::new(BufferPool::new()));
             let client_deps = ClientDeps {
                 factory: client_factory,
                 spawner: LocalTokioSpawner,

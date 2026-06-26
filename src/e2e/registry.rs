@@ -296,7 +296,8 @@ mod tests {
 
         // A sender produces two frames carrying counters 0 then 1.
         let mut sender = E2ERegistry::new();
-        sender.register(key, make_profile5())
+        sender
+            .register(key, make_profile5())
             .expect("register fits within E2E_REGISTRY_CAP");
         let mut b0 = [0u8; 64];
         let l0 = protect_next(&mut sender, key, &mut b0);
@@ -336,7 +337,8 @@ mod tests {
         let key = make_key();
 
         let mut sender = E2ERegistry::new();
-        sender.register(key, make_profile5())
+        sender
+            .register(key, make_profile5())
             .expect("register fits within E2E_REGISTRY_CAP");
         let mut b0 = [0u8; 64];
         let l0 = protect_next(&mut sender, key, &mut b0);
