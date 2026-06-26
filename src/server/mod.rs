@@ -52,6 +52,11 @@ use std::sync::Mutex;
 #[cfg(feature = "server-tokio")]
 use tokio::sync::RwLock;
 
+const _SERVER_EVENT_GROUP_IDS_CAP: usize =
+    crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_SUBS"), 1);
+const _SERVER_ACCEPTED_OFFERS_CAP: usize =
+    crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_OFFERS"), 4);
+
 /// Configuration for a SOME/IP service provider
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -120,13 +125,13 @@ impl ServerConfig {
     /// Maximum number of event-group IDs trackable in
     /// [`Self::event_group_ids`]. Matches `EVENT_GROUPS_CAP` in the
     /// subscription manager.
-    pub const EVENT_GROUP_IDS_CAP: usize = 32;
+    pub const EVENT_GROUP_IDS_CAP: usize = _SERVER_EVENT_GROUP_IDS_CAP;
 
     /// Maximum number of co-offered `(service, instance, event_group)`
     /// tuples a single receive loop can accept subscriptions for via
     /// [`Self::accepted_offers`]. Covers any realistic shared-socket
     /// provider catalog.
-    pub const ACCEPTED_OFFERS_CAP: usize = 16;
+    pub const ACCEPTED_OFFERS_CAP: usize = _SERVER_ACCEPTED_OFFERS_CAP;
 
     /// Create a new server configuration with sane defaults for
     /// development.

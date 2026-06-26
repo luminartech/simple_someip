@@ -37,8 +37,8 @@ pub const RX_SLOTS: usize = 2;
 /// Per-slot / per-buffer capacity. One Ethernet-MTU-ish datagram; SOME/IP
 /// single datagrams stay under this (TP segmentation not used here).
 pub const RX_CAP: usize = 1500;
-const MAX_OFFERS: usize = 8;
-const MAX_SUBS: usize = 4;
+const MAX_OFFERS: usize = crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_OFFERS"), 4);
+const MAX_SUBS: usize = crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_SUBS"), 1);
 const SD_SCRATCH_CAP: usize = 512;
 const SUB_SCRATCH_CAP: usize = 128;
 /// Capacity of the API-only send scratch (`RuntimeBuffers::publish_scratch`),
