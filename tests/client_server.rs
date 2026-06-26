@@ -30,7 +30,8 @@ use simple_someip::e2e::{E2ECheckStatus, E2EKey, E2EProfile, Profile4Config};
 use simple_someip::protocol::{Header, Message, MessageId, sd};
 use simple_someip::server::ServerConfig;
 use simple_someip::{
-    Client, ClientUpdate, PayloadWireFormat, RawPayload, Server, TokioChannels, VecSdHeader,
+    Client, ClientUpdate, ClientUpdates, PayloadWireFormat, RawPayload, Server, TokioChannels,
+    VecSdHeader,
 };
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -85,9 +86,18 @@ type TestEventPublisher = simple_someip::server::EventPublisher<
 /// kernel-assigned port via `unicast_local_addr`, and don't spawn
 /// the run future from this helper — the few tests that need it call
 /// `server.run()` directly after receiving the `Server` handle.
+/// The full `Server` binds the SD port (30490) on its interface. Keep it on a
+/// distinct loopback IP from the client (which stays on `127.0.0.1`) so the
+/// client's receive-only unicast discovery socket (`interface:30490`,
+/// `SO_REUSEPORT`) does not collide with the server's SD socket on the same
+/// `IP:30490` and steal the client's own SubscribeEventgroup. This mirrors
+/// production, where a full SD-announcing server is a remote sensor on its own
+/// IP. See the #130 forward-port discussion.
+const SERVER_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+
 async fn create_server(service_id: u16, instance_id: u16) -> (TestServer, u16) {
     let config = ServerConfig::new(service_id, instance_id)
-        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_interface(SERVER_IP)
         .with_local_port(0);
     let (server, _handles, _run): (TestServer, _, _) =
         TestServer::new(config).await.expect("Server::new failed");
@@ -122,12 +132,14 @@ async fn wait_for_subscribers(
 
 /// Drain a client's update stream until the published `Unicast` event arrives,
 /// skipping interleaved discovery traffic. A `SubscribeAck` now reaches the
-/// client via the unicast SD socket (the per-transport fix in this PR) and can
-/// land on the channel just before the event, so a single `recv()` that expects
-/// the event outright is racy — especially under the slower coverage build.
-/// Panics on timeout or a closed channel; returns the `Unicast` update so
-/// callers can inspect fields like `e2e_status`.
-async fn recv_unicast(updates: &mut ClientUpdates<RawPayload>) -> ClientUpdate<RawPayload> {
+/// client via the unicast SD socket (the #130 per-transport fix) and can land
+/// on the channel just before the event, so a single `recv()` that expects the
+/// event outright is racy — especially under the slower coverage build. Panics
+/// on timeout or a closed channel; returns the `Unicast` update so callers can
+/// inspect fields like `e2e_status`.
+async fn recv_unicast(
+    updates: &mut ClientUpdates<RawPayload, TokioChannels>,
+) -> ClientUpdate<RawPayload> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         match tokio::time::timeout_at(deadline, updates.recv()).await {
@@ -151,7 +163,7 @@ async fn test_client_server_subscribe_and_receive_event() {
     // Create client and subscribe to the server's event group
     let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
     let _run_handle = tokio::spawn(run_fut);
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
         .add_endpoint(service_id, 1, server_addr, 0)
         .await
@@ -178,7 +190,11 @@ async fn test_client_server_subscribe_and_receive_event() {
     assert_eq!(sent, 1);
 
     // Client receives the unicast event
-    recv_unicast(&mut updates).await;
+    let update = recv_unicast(&mut updates).await;
+    assert!(
+        matches!(update, ClientUpdate::Unicast { .. }),
+        "expected Unicast, got {update:?}"
+    );
 
     // Tear down
     client.unbind_discovery().await.unwrap();
@@ -232,7 +248,7 @@ async fn test_client_bind_unbind_lifecycle_with_server() {
 
     // Bind discovery, subscribe, then unbind and rebind
     client.bind_discovery().await.unwrap();
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
         .add_endpoint(service_id, 1, server_addr, 0)
         .await
@@ -268,7 +284,7 @@ async fn test_add_endpoint_and_send_to_service() {
     client.bind_discovery().await.unwrap();
 
     // Register the server's endpoint manually (simulating non-broadcasting service)
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
         .add_endpoint(service_id, 1, server_addr, 0)
         .await
@@ -298,7 +314,11 @@ async fn test_add_endpoint_and_send_to_service() {
     assert_eq!(sent, 1);
 
     // Client receives the unicast event
-    recv_unicast(&mut updates).await;
+    let update = recv_unicast(&mut updates).await;
+    assert!(
+        matches!(update, ClientUpdate::Unicast { .. }),
+        "expected Unicast, got {update:?}"
+    );
 
     // Remove the endpoint and verify send_to_service returns ServiceNotFound
     client.remove_endpoint(service_id, 1).await.unwrap();
@@ -327,7 +347,7 @@ async fn test_subscribe_auto_binds_discovery() {
     // Create client — do NOT bind discovery manually
     let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
     let _run_handle = tokio::spawn(run_fut);
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
         .add_endpoint(service_id, 1, server_addr, 0)
         .await
@@ -354,7 +374,11 @@ async fn test_subscribe_auto_binds_discovery() {
         .expect("publish_event failed");
     assert_eq!(sent, 1);
 
-    recv_unicast(&mut updates).await;
+    let update = recv_unicast(&mut updates).await;
+    assert!(
+        matches!(update, ClientUpdate::Unicast { .. }),
+        "expected Unicast, got {update:?}"
+    );
 
     client.shut_down();
     server_handle.abort();
@@ -371,7 +395,7 @@ async fn test_client_request_resolves_via_unicast_reply() {
 
     let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
     let _run_handle = tokio::spawn(run_fut);
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
         .add_endpoint(service_id, 1, server_addr, 0)
         .await
@@ -448,7 +472,7 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
         .register_e2e(key, profile)
         .expect("E2E registry has capacity for one entry");
 
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
         .add_endpoint(service_id, 1, server_addr, 0)
         .await
@@ -480,7 +504,8 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
     assert_eq!(sent, 1);
 
     // Client receives the unicast event with E2E status
-    match recv_unicast(&mut updates).await {
+    let update = recv_unicast(&mut updates).await;
+    match update {
         ClientUpdate::Unicast { e2e_status, .. } => {
             assert!(
                 e2e_status.is_some(),
@@ -558,9 +583,18 @@ async fn test_multiple_subscribers_receive_events() {
         .expect("publish_event failed");
     assert!(sent >= 2, "expected sent >= 2, got {sent}");
 
-    // Both clients should receive the event (skipping any interleaved acks).
-    recv_unicast(&mut updates1).await;
-    recv_unicast(&mut updates2).await;
+    // Both clients should receive the event
+    let u1 = recv_unicast(&mut updates1).await;
+    assert!(
+        matches!(u1, ClientUpdate::Unicast { .. }),
+        "client1 expected Unicast, got {u1:?}"
+    );
+
+    let u2 = recv_unicast(&mut updates2).await;
+    assert!(
+        matches!(u2, ClientUpdate::Unicast { .. }),
+        "client2 expected Unicast, got {u2:?}"
+    );
 
     client1.shut_down();
     client2.shut_down();
@@ -592,7 +626,7 @@ async fn test_cloned_client_works() {
     let client2 = client.clone();
 
     // Both clones can send commands
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
         .add_endpoint(service_id, 1, server_addr, 0)
         .await
@@ -617,7 +651,7 @@ async fn test_subscribe_specific_port_reuse() {
 
     let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
     let _run_handle = tokio::spawn(run_fut);
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
         .add_endpoint(service_id, 1, server_addr, 0)
         .await

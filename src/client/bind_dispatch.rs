@@ -64,6 +64,17 @@ where
         port: u16,
         e2e_registry: R,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_;
+
+    /// Bind a receive-only unicast service-discovery socket on the
+    /// `interface` IP and submit its I/O loop. Diverts the sensor's
+    /// unicast SD off the multicast discovery socket so the two SD
+    /// session domains track on separate keys.
+    #[allow(clippy::manual_async_fn)]
+    fn bind_discovery_unicast(
+        &self,
+        interface: Ipv4Addr,
+        e2e_registry: R,
+    ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_;
 }
 
 /// `BindDispatch` for the multi-threaded path: requires a
@@ -148,6 +159,28 @@ where
             .await
         }
     }
+
+    #[allow(clippy::manual_async_fn)]
+    fn bind_discovery_unicast(
+        &self,
+        interface: Ipv4Addr,
+        e2e_registry: R,
+    ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
+        async move {
+            let buf = self
+                .buffer_provider
+                .claim()
+                .ok_or(Error::Capacity("udp_buffer"))?;
+            SocketManager::<MD, C>::bind_discovery_unicast_with_transport(
+                &self.factory,
+                &self.spawner,
+                interface,
+                e2e_registry,
+                buf,
+            )
+            .await
+        }
+    }
 }
 
 /// `BindDispatch` for the single-threaded path: requires a
@@ -223,6 +256,28 @@ where
                 &self.factory,
                 &self.spawner,
                 port,
+                e2e_registry,
+                buf,
+            )
+            .await
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn bind_discovery_unicast(
+        &self,
+        interface: Ipv4Addr,
+        e2e_registry: R,
+    ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
+        async move {
+            let buf = self
+                .buffer_provider
+                .claim()
+                .ok_or(Error::Capacity("udp_buffer"))?;
+            SocketManager::<MD, C>::bind_discovery_unicast_with_transport_local(
+                &self.factory,
+                &self.spawner,
+                interface,
                 e2e_registry,
                 buf,
             )

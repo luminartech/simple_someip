@@ -2233,10 +2233,13 @@ mod tests {
             .await
             .expect("second bind_discovery is idempotent");
 
+        // `bind_discovery` spawns TWO socket loops: the multicast SD socket
+        // and the receive-only unicast SD socket (the #130 per-transport
+        // split). Both route through the injected `Spawner`.
         assert_eq!(
             count.load(Ordering::SeqCst),
-            1,
-            "expected exactly one spawn for the SD socket loop, \
+            2,
+            "expected two spawns (multicast + unicast SD socket loops), \
              got {}",
             count.load(Ordering::SeqCst)
         );

@@ -3226,25 +3226,18 @@ mod tests {
         );
         let message = build_sd_message(&sd_header);
 
-        // Send the combined SD message to the server's SD socket from a
-        // fresh client socket and have the server handle exactly one
-        // datagram. We drive `handle_sd_message` directly rather than
-        // `server.run()` so we can assert state after the call.
-        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let sd_addr = server.sd_socket.local_addr().unwrap();
-        client_socket.send_to(&message, sd_addr).await.unwrap();
-
-        let mut buf = vec![0u8; 65_535];
-        let datagram = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            server.sd_socket.recv_from(&mut buf),
-        )
-        .await
-        .expect("timeout receiving combined SD packet")
-        .unwrap();
-        let len = datagram.bytes_received;
-        let sender = core::net::SocketAddr::V4(datagram.source);
-        let view = MessageView::parse(&buf[..len]).unwrap();
+        // Parse the combined SD datagram in-memory and drive
+        // `handle_sd_message` directly rather than round-tripping `message`
+        // through the server's SD socket. Every test server binds the same
+        // fixed SD port with `SO_REUSEADDR`/`SO_REUSEPORT`; under parallel test
+        // execution the unicast datagram can be delivered to a different bound
+        // socket (worsened by the #130 per-transport unicast SD socket, which
+        // adds a second binder on that port), timing out the `recv_from`. The
+        // sender addr is not asserted here (the subscriber endpoint must come
+        // from the SubscribeEventGroup's `options[1]`), so a synthetic sender
+        // keeps the test hermetic and cross-platform.
+        let sender = core::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 54_321));
+        let view = MessageView::parse(&message).unwrap();
         let sd_view = view.sd_header().unwrap();
         runtime::handle_sd_message(
             &server.config,
