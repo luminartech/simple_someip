@@ -16,6 +16,14 @@ on:
 # feature is added (or switch to `cargo hack --exclude-features bare-metal-runtime`).
 env:
   ALLOC_FEATURES: std,tracing,client,client-tokio,server,server-tokio,bare_metal,embassy_channels
+  # Host/std feature set: `$ALLOC_FEATURES` minus the bare-metal flags
+  # (`bare_metal` + `embassy_channels`, which implies `bare_metal`). The
+  # server's runtime caps (`SUBSCRIBERS_PER_GROUP` etc.) share one set of
+  # consts whose *default* is tight under `bare_metal` and generous
+  # otherwise, so the std host tests must build WITHOUT `bare_metal` to get
+  # the generous defaults; the bare-metal-gated tests run separately at the
+  # tight defaults. The two default regimes cannot be unified into one build.
+  HOST_FEATURES: std,tracing,client,client-tokio,server,server-tokio
 
 jobs:
   check:
@@ -285,10 +293,20 @@ jobs:
               --test vsomeip_sd_compat \
               tx_announcement_loop_emits_wire_format_offer \
               -- --ignored --exact --nocapture
-      # alloc/host lane: bare-metal-runtime has no host tests (its target build
-      # is gated in the nightly `bare-metal-runtime` job), so coverage uses the
-      # alloc feature set rather than the invalid `--all-features`.
-      - run: cargo llvm-cov nextest --no-default-features --features $ALLOC_FEATURES --lcov --output-path ./target/lcov.info
+      # Coverage is split so the std-default and bare-metal-default cap regimes
+      # are each exercised under their own feature config (they share one set of
+      # consts and cannot be unified into a single build — see `HOST_FEATURES`):
+      #  1. the host/std surface at the generous std default caps, and
+      #  2. the bare-metal-gated test binaries at the tight bare-metal defaults
+      #     (those binaries only build under the full alloc feature set).
+      # `--no-report` accumulates both into one profile; `report` emits the
+      # merged lcov. (`bare-metal-runtime` has no host tests — its target build
+      # is gated in the nightly `bare-metal-runtime` job.) The bare-metal run
+      # goes first so the host run's `junit.xml` (the comprehensive suite) is
+      # the one the test-results upload below picks up.
+      - run: cargo llvm-cov --no-report nextest --no-default-features --features $ALLOC_FEATURES -E 'binary(bare_metal_e2e) | binary(bare_metal_client_local) | binary(static_channels_alloc_witness)'
+      - run: cargo llvm-cov --no-report nextest --no-default-features --features $HOST_FEATURES
+      - run: cargo llvm-cov report --lcov --output-path ./target/lcov.info
       - name: Upload Coverage report
         uses: codecov/codecov-action@v5
         with:
@@ -327,13 +345,14 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # `bare-metal-runtime` is no-alloc + nightly and rejects the alloc
-      # features at compile time, so `--all-features` cannot build (same
-      # reason the host lanes above use `$ALLOC_FEATURES`). `shell: bash`
-      # so `$ALLOC_FEATURES` expands on the Windows runner (default pwsh
-      # would not). The dual-socket divert assertion lives in the `--lib`
-      # unit tests, which `$ALLOC_FEATURES` (client) still builds.
-      - run: cargo test --no-default-features --features $ALLOC_FEATURES --no-run
+      # Use `$HOST_FEATURES` (no `bare_metal`): this is a std/host portability
+      # check, and the server cap consts default tight under `bare_metal` —
+      # building with it would cap the `--lib` server tests to one subscriber
+      # per group and fail them. The dual-socket divert assertion lives in the
+      # `--lib` unit tests, which `$HOST_FEATURES` (client) still builds.
+      # `shell: bash` so `$HOST_FEATURES` expands on the Windows runner
+      # (default pwsh would not).
+      - run: cargo test --no-default-features --features $HOST_FEATURES --no-run
         shell: bash
-      - run: cargo test --no-default-features --features $ALLOC_FEATURES --lib
+      - run: cargo test --no-default-features --features $HOST_FEATURES --lib
         shell: bash
