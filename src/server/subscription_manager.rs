@@ -25,9 +25,11 @@ const DEFAULT_SUBSCRIBERS: usize = 16;
 
 /// Max number of distinct `(service_id, instance_id, event_group_id)` event
 /// groups with active subscribers. Must be a power of two.
-const EVENT_GROUPS_CAP: usize =
-    crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_OFFERS"), DEFAULT_EVENT_GROUPS)
-        .next_power_of_two();
+const EVENT_GROUPS_CAP: usize = crate::from_env_or(
+    option_env!("SIMPLE_SOMEIP_MAX_OFFERS"),
+    DEFAULT_EVENT_GROUPS,
+)
+.next_power_of_two();
 
 /// Max number of subscribers per event group. Excess subscribers are dropped
 /// with a `warn!` log rather than silently.

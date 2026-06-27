@@ -64,10 +64,14 @@ const _DEFAULT_ACCEPTED_OFFERS: usize = 4;
 #[cfg(not(feature = "bare_metal"))]
 const _DEFAULT_ACCEPTED_OFFERS: usize = 16;
 
-const _SERVER_EVENT_GROUP_IDS_CAP: usize =
-    crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_SUBS"), _DEFAULT_EVENT_GROUP_IDS);
-const _SERVER_ACCEPTED_OFFERS_CAP: usize =
-    crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_OFFERS"), _DEFAULT_ACCEPTED_OFFERS);
+const _SERVER_EVENT_GROUP_IDS_CAP: usize = crate::from_env_or(
+    option_env!("SIMPLE_SOMEIP_MAX_SUBS"),
+    _DEFAULT_EVENT_GROUP_IDS,
+);
+const _SERVER_ACCEPTED_OFFERS_CAP: usize = crate::from_env_or(
+    option_env!("SIMPLE_SOMEIP_MAX_OFFERS"),
+    _DEFAULT_ACCEPTED_OFFERS,
+);
 
 /// Configuration for a SOME/IP service provider
 #[derive(Debug, Clone)]
