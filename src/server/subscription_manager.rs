@@ -9,15 +9,30 @@ use std::sync::Arc;
 #[cfg(feature = "server-tokio")]
 use tokio::sync::RwLock;
 
+// Fallback caps used when no `SIMPLE_SOMEIP_MAX_*` env var is injected at build
+// time. Bare-metal builds default *tight* (the host build system injects the
+// exact catalog size via the env vars, so the unconfigured fallback only needs
+// to compile); std/host builds keep the historical generous defaults so plain
+// std consumers — who never inject the env vars — are not silently capped.
+#[cfg(feature = "bare_metal")]
+const DEFAULT_EVENT_GROUPS: usize = 4;
+#[cfg(not(feature = "bare_metal"))]
+const DEFAULT_EVENT_GROUPS: usize = 32;
+#[cfg(feature = "bare_metal")]
+const DEFAULT_SUBSCRIBERS: usize = 1;
+#[cfg(not(feature = "bare_metal"))]
+const DEFAULT_SUBSCRIBERS: usize = 16;
+
 /// Max number of distinct `(service_id, instance_id, event_group_id)` event
 /// groups with active subscribers. Must be a power of two.
 const EVENT_GROUPS_CAP: usize =
-    crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_OFFERS"), 4).next_power_of_two();
+    crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_OFFERS"), DEFAULT_EVENT_GROUPS)
+        .next_power_of_two();
 
 /// Max number of subscribers per event group. Excess subscribers are dropped
 /// with a `warn!` log rather than silently.
 pub(crate) const SUBSCRIBERS_PER_GROUP: usize =
-    crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_SUBS"), 1);
+    crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_SUBS"), DEFAULT_SUBSCRIBERS);
 
 // Compile-time invariants. Trip these at `cargo build` so that retuning
 // the constants above can't quietly produce a `subscribe` impl that

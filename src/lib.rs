@@ -291,10 +291,14 @@ pub use transport::{StaticE2EHandle, StaticE2EStorage};
 /// Parse a decimal `usize` from a compile-time optional env var string.
 ///
 /// Used to size internal constants from `SIMPLE_SOMEIP_MAX_*` env vars
-/// injected by the host build system (e.g. CMake via `.cargo/config.toml`).
+/// injected by the host build system (e.g. `CMake` via `.cargo/config.toml`).
 /// Returns `default` when the variable is absent or empty.
 /// Panics at compile time if the string contains a non-digit character.
-#[cfg(any(feature = "bare_metal", feature = "server"))]
+///
+/// Gated on `server`: every caller lives in the server module or in the
+/// `bare-metal-runtime` runtime (which itself implies `server`), so a
+/// `client`-only / `bare_metal`-only build would otherwise see it as dead code.
+#[cfg(feature = "server")]
 pub(crate) const fn from_env_or(var: Option<&'static str>, default: usize) -> usize {
     match var {
         None => default,
@@ -306,11 +310,14 @@ pub(crate) const fn from_env_or(var: Option<&'static str>, default: usize) -> us
             let mut n = 0usize;
             let mut i = 0;
             while i < b.len() {
-                let digit = (b[i] as i32) - (b'0' as i32);
-                if digit < 0 || digit > 9 {
-                    panic!("SIMPLE_SOMEIP_MAX_* env var contains a non-digit character");
-                }
-                n = n * 10 + digit as usize;
+                let byte = b[i];
+                assert!(
+                    byte.is_ascii_digit(),
+                    "SIMPLE_SOMEIP_MAX_* env var contains a non-digit character"
+                );
+                // `byte - b'0'` is in 0..=9; u8 -> usize is lossless. `as` is
+                // required here because `usize::from` is not a `const fn`.
+                n = n * 10 + (byte - b'0') as usize;
                 i += 1;
             }
             n

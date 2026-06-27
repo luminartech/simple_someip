@@ -52,10 +52,22 @@ use std::sync::Mutex;
 #[cfg(feature = "server-tokio")]
 use tokio::sync::RwLock;
 
+// Fallback caps mirror `subscription_manager`: tight on bare-metal (host build
+// injects exact values via the env vars), generous on std/host so plain std
+// consumers that never inject the env vars keep the historical capacities.
+#[cfg(feature = "bare_metal")]
+const _DEFAULT_EVENT_GROUP_IDS: usize = 1;
+#[cfg(not(feature = "bare_metal"))]
+const _DEFAULT_EVENT_GROUP_IDS: usize = 32;
+#[cfg(feature = "bare_metal")]
+const _DEFAULT_ACCEPTED_OFFERS: usize = 4;
+#[cfg(not(feature = "bare_metal"))]
+const _DEFAULT_ACCEPTED_OFFERS: usize = 16;
+
 const _SERVER_EVENT_GROUP_IDS_CAP: usize =
-    crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_SUBS"), 1);
+    crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_SUBS"), _DEFAULT_EVENT_GROUP_IDS);
 const _SERVER_ACCEPTED_OFFERS_CAP: usize =
-    crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_OFFERS"), 4);
+    crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_OFFERS"), _DEFAULT_ACCEPTED_OFFERS);
 
 /// Configuration for a SOME/IP service provider
 #[derive(Debug, Clone)]
@@ -132,6 +144,13 @@ impl ServerConfig {
     /// [`Self::accepted_offers`]. Covers any realistic shared-socket
     /// provider catalog.
     pub const ACCEPTED_OFFERS_CAP: usize = _SERVER_ACCEPTED_OFFERS_CAP;
+
+    /// Maximum number of subscribers tracked per event group. Matches
+    /// `SUBSCRIBERS_PER_GROUP` in the subscription manager (sized via
+    /// `SIMPLE_SOMEIP_MAX_SUBS`; defaults to 1 on bare-metal, 16 on std).
+    /// Exposed so callers and tests can adapt to the build-time capacity
+    /// rather than assuming a fixed value.
+    pub const SUBSCRIBERS_PER_GROUP_CAP: usize = subscription_manager::SUBSCRIBERS_PER_GROUP;
 
     /// Create a new server configuration with sane defaults for
     /// development.
