@@ -33,7 +33,7 @@ use super::transport::{CallbackFactory, CallbackSocket, CallbackTimer, NowMsFn, 
 
 // ── Fixed runtime sizing (catalog-agnostic) ──────────────────────────────
 /// RX mailbox slots.
-pub const RX_SLOTS: usize = 2;
+pub const RX_SLOTS: usize = crate::from_env_or(option_env!("SIMPLE_SOMEIP_RX_SLOTS"), 2);
 /// Per-slot / per-buffer capacity. One Ethernet-MTU-ish datagram; SOME/IP
 /// single datagrams stay under this (TP segmentation not used here).
 pub const RX_CAP: usize = 1500;
