@@ -83,6 +83,17 @@ impl MessageId {
     }
 }
 
+impl core::fmt::Debug for MessageId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "Message Id: {{ service_id: {:#06X}, method_id: {:#06X} }}",
+            self.service_id(),
+            self.method_id(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,16 +189,5 @@ mod tests {
         write!(buf, "{mid:?}").unwrap();
         assert!(buf.contains("service_id"));
         assert!(buf.contains("method_id"));
-    }
-}
-
-impl core::fmt::Debug for MessageId {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "Message Id: {{ service_id: {:#02X}, method_id: {:#02X} }}",
-            self.service_id(),
-            self.method_id(),
-        )
     }
 }

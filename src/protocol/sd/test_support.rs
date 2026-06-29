@@ -20,6 +20,10 @@ impl WireFormat for TestSdHeader {
     }
 }
 
+// NOTE: `tools/size_probe`'s `ProbePayload` mirrors this type
+// field-for-field for thumbv7em layout capture (it can't reach this
+// `pub(crate)` item). If you change `TestPayload`/`TestSdHeader`,
+// update the probe or its measured layouts silently drift.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TestPayload {
     pub header: TestSdHeader,
@@ -76,14 +80,13 @@ impl PayloadWireFormat for TestPayload {
     ) -> Result<usize, crate::protocol::Error> {
         self.header.encode(writer)
     }
-    #[cfg(feature = "std")]
     fn new_subscription_sd_header(
         service_id: u16,
         instance_id: u16,
         major_version: u8,
         ttl: u32,
         event_group_id: u16,
-        client_ip: std::net::Ipv4Addr,
+        client_ip: core::net::Ipv4Addr,
         protocol: sd::TransportProtocol,
         client_port: u16,
         reboot_flag: sd::RebootFlag,
@@ -110,7 +113,6 @@ impl PayloadWireFormat for TestPayload {
             options,
         }
     }
-    #[cfg(feature = "std")]
     fn set_reboot_flag(header: &mut TestSdHeader, reboot: sd::RebootFlag) {
         header.flags = sd::Flags::new(bool::from(reboot), header.flags.unicast());
     }

@@ -1,0 +1,87 @@
+[package]
+name = "simple-someip-embassy-net"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "embassy-net `TransportFactory` / `TransportSocket` adapter for the simple-someip crate"
+repository = "https://github.com/luminartech/simple_someip"
+readme = "README.md"
+
+# This crate is the reference no_std backend for `simple-someip`'s
+# trait surface. It depends on `simple-someip` with
+# `default-features = false, features = ["client", "server", "bare_metal"]`
+# — no std, no tokio, no socket2 — and provides a thin adapter from
+# embassy-net's `UdpSocket` API to simple-someip's
+# `TransportSocket` / `TransportFactory` traits.
+#
+# Sized for: bare-metal Rust embedded targets running embassy-net +
+# embassy-executor (cortex-m, RISC-V). Does not require alloc.
+#
+
+[dependencies]
+simple-someip = { path = "..", version = "0.8", default-features = false, features = [
+    "client",
+    "server",
+    "bare_metal",
+] }
+# Pinned to embassy-net 0.4.x. NOTE: this does NOT unify the
+# `embassy-sync` version across the resolved graph — embassy-net
+# 0.4 itself depends on `embassy-sync 0.5.x`, while
+# `simple-someip` (and this crate) use `embassy-sync 0.6`. So the
+# resolved Cargo.lock already carries both versions in parallel,
+# which costs some binary size on firmware targets. We accept
+# that today because the alternative is worse: newer embassy-net
+# releases (0.5+) move on to embassy-sync 0.7+, widening the
+# split further unless the whole embassy stack is upgraded
+# together. Unifying on a single embassy-sync version is a
+# future phase that requires coordinated dep bumps across
+# embassy-{sync,net,executor,time}.
+embassy-net = { version = "0.4", default-features = false, features = [
+    "udp",
+    "proto-ipv4",
+    "igmp",
+    # smoltcp (embassy-net's underlying TCP/IP stack) requires at
+    # least one network-medium feature to be enabled. We enable both
+    # `medium-ethernet` (the common case for SOME/IP on automotive
+    # Ethernet) and `medium-ip` (for raw IP backends like SLIP / lwIP
+    # tap devices). `medium-ieee802154` is intentionally not enabled
+    # — SOME/IP-over-802.15.4 is not in scope for this adapter.
+    "medium-ethernet",
+    "medium-ip",
+] }
+embassy-sync = "0.6"
+heapless = "0.9"
+
+[dev-dependencies]
+# Re-pin `simple-someip` with `std` enabled for the host-side test
+# harness. Production builds of this adapter still pull in
+# `simple-someip` with `default-features = false`, so the adapter
+# library itself stays no_std. The dev-dep override only widens
+# what the *tests* can import — `RawPayload`, `VecSdHeader`, and
+# the `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<…>>` default
+# handle impls — all of which are gated on `feature = "std"` in
+# the parent crate.
+simple-someip = { path = "..", default-features = false, features = [
+    "client",
+    "server",
+    "bare_metal",
+    "std",
+] }
+# Host-side tests run two embassy-net stacks bridged by a software
+# `LoopbackDriver` pair (no kernel TUN, no privilege requirement).
+# `critical-section/std` provides a host platform impl so embassy-sync
+# / embassy-net link on host; firmware supplies its own.
+critical-section = { version = "1", features = ["std"] }
+embassy-executor = { version = "0.6", features = [
+    "arch-std",
+    "executor-thread",
+] }
+embassy-time = { version = "0.3", features = ["std", "generic-queue-8"] }
+# Tokio drives the test harness — `#[tokio::test]` for setup,
+# `tokio::spawn` for the per-stack `Stack::run()` futures, and
+# `tokio::time::timeout` for bounded assertions. Same shape as the
+# parent crate's `tests/bare_metal_e2e.rs` harness.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# `futures` brings `select_biased!` / `FusedFuture` / `pin_mut!` into
+# scope for the test driver.
+futures = "0.3"

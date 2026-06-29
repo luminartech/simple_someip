@@ -266,6 +266,17 @@ impl<'a> HeaderView<'a> {
         self.length() as usize - 8
     }
 
+    /// Returns header bytes 8..16: the request ID, protocol and interface
+    /// versions, message type, and return code. E2E Profile 5 with-header
+    /// CRC covers these bytes.
+    #[must_use]
+    pub const fn upper_header_bytes(&self) -> [u8; 8] {
+        [
+            self.0[8], self.0[9], self.0[10], self.0[11], self.0[12], self.0[13], self.0[14],
+            self.0[15],
+        ]
+    }
+
     /// Returns the protocol version.
     #[must_use]
     pub fn protocol_version(&self) -> u8 {
@@ -318,6 +329,23 @@ impl<'a> HeaderView<'a> {
             message_type: self.message_type(),
             return_code: self.return_code(),
         }
+    }
+}
+
+impl WireFormat for Header {
+    fn required_size(&self) -> usize {
+        16
+    }
+
+    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
+        writer.write_u32_be(self.message_id.message_id())?;
+        writer.write_u32_be(self.length)?;
+        writer.write_u32_be(self.request_id)?;
+        writer.write_u8(self.protocol_version)?;
+        writer.write_u8(self.interface_version)?;
+        writer.write_u8(u8::from(self.message_type))?;
+        writer.write_u8(u8::from(self.return_code))?;
+        Ok(16)
     }
 }
 
@@ -589,22 +617,5 @@ mod tests {
         assert_eq!(buf.len(), 16);
         let (view, _) = HeaderView::parse(&buf).unwrap();
         assert_eq!(view.to_owned(), h);
-    }
-}
-
-impl WireFormat for Header {
-    fn required_size(&self) -> usize {
-        16
-    }
-
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
-        writer.write_u32_be(self.message_id.message_id())?;
-        writer.write_u32_be(self.length)?;
-        writer.write_u32_be(self.request_id)?;
-        writer.write_u8(self.protocol_version)?;
-        writer.write_u8(self.interface_version)?;
-        writer.write_u8(u8::from(self.message_type))?;
-        writer.write_u8(u8::from(self.return_code))?;
-        Ok(16)
     }
 }

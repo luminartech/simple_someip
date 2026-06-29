@@ -1,34 +1,318 @@
 # Changelog
 
-## [Unreleased]
+## [0.8.0]
 
-## [0.7.1](https://github.com/luminartech/simple_someip/compare/v0.7.0...v0.7.1) - 2026-06-17
+### Breaking — bare-metal server buffer extraction (PR #125 / PR 3)
 
-### Fixed
+These changes are free before the 0.8.0 release — no published version
+exposes the pre-refactor API.
 
-- *(client)* per-transport SD session tracking via dual discovery sockets
+- **`Server::run_with_buffers` takes two additional send-scratch buffers** —
+  the signature now requires `recv_send_buf: &mut [u8]` and
+  `announce_send_buf: &mut [u8]` after the existing `unicast_buf` / `sd_buf`
+  receive buffers. Callers that used the pre-refactor four-buffer form must
+  add two more `static [u8; N]` arguments (or equivalent heap slices). The
+  `_alloc` convenience `Server::run` is unchanged.
 
-### Other
+- **New `Server::announce_only_with_buffer`** — bare-metal supplementary
+  servers that need *only* the SD `OfferService` announcement loop (no recv)
+  now call this method instead of `announce_only_future`. It accepts a
+  caller-owned `&mut [u8]` scratch so the future does NOT park a
+  `[u8; UDP_BUFFER_SIZE]` (≈ 1500 B) in its own state.
+  `announce_only_future` (alloc-only) now delegates to this method internally
+  and carries a `#[cfg(feature = "_alloc")]` gate.
 
-- *(client_server)* drain until the Unicast event, not just the next update
-- *(client_server)* describe discovery-socket reuse as cross-platform
-- Revert the deterministic loopback divert test (CI interference hazard)
-- *(socket_manager)* deterministic loopback divert test + SD spelling fix
-- *(client_server)* put server on a distinct loopback IP to avoid SD-port self-collision
-- *(client)* address Copilot review on dual-socket divert test
-- scope Windows job to build-all + run lib tests
-- *(server)* make combined-SD test hermetic (in-memory parse) for Windows
-- *(server)* target loopback in combined-SD test for Windows portability
-- *(socket_manager)* gate set_reuse_port behind cfg(unix) in dual-socket test
-- add Windows job to exercise dual-socket SD bind portability
-- *(socket_manager)* use Windows-portable dual-socket split (INADDR_ANY mc + interface-IP unicast)
-- *(socket_manager)* spike — dual-socket multicast/unicast SD split
-- *(session)* lock per-transport keying; document caller mis-tag bug
+- **`EventPublisher::publish_event_with_buffers` /
+  `publish_raw_event_with_buffers` take caller scratch** — the two methods
+  now accept explicit `msg_buf: &mut [u8]` / `protected_buf: &mut [u8]`
+  slices. The future no longer parks two `[u8; UDP_BUFFER_SIZE]` arrays;
+  bare-metal callers supply `static` buffers. The `_alloc` wrappers
+  `publish_event` / `publish_raw_event` are unchanged.
 
-### Changed
+### Client/Server API symmetry & ergonomics
 
-- **`std` is now the default feature** — the crate enables `std` (with `thiserror` and `tracing`) by default. Users targeting `no_std` environments must set `default-features = false` in their `Cargo.toml`.
-- **`thiserror` and `tracing` use `default-features = false`** — both dependencies are always included but their `std` features are only enabled when the crate's `std` feature is active. This removes the need for `#[cfg(feature = "std")]` gating on error types and logging macros.
+The 0.8.0 ergonomics pass aligning the public Client and Server surfaces, removing the tokio-only `Server::new` cliff, and improving discoverability for bare-metal adopters. Six bundled changes: generic-parameter alignment, tokio-defaulted `Deps` builders, channel-types rustdoc, `ServerConfig` fluent builder, `Server::new` constructor reshape (the one breaking change in this set), and `SubscriptionHandle` GAT promotion. Migration shapes below are written against the previous published version (0.7.0); `cargo build` will surface every remaining call-site.
+
+#### Breaking — `SubscriptionHandle::SubscribeFuture` / `UnsubscribeFuture` are now [generic associated types]
+
+The `subscribe` and `unsubscribe` methods on `SubscriptionHandle` previously returned `impl Future<…> + '_` (return-position impl Trait). They are now named GATs:
+
+```rust
+pub trait SubscriptionHandle: Clone + 'static {
+    type SubscribeFuture<'a>: Future<Output = Result<(), SubscribeError>> + 'a where Self: 'a;
+    type UnsubscribeFuture<'a>: Future<Output = ()> + 'a where Self: 'a;
+
+    fn subscribe(...) -> Self::SubscribeFuture<'_>;
+    fn unsubscribe(...) -> Self::UnsubscribeFuture<'_>;
+    // for_each_subscriber stayed RPIT — no Server::run-side bound needs it.
+}
+```
+
+Implementors must now spell their concrete return type (typically `Pin<Box<dyn Future<Output = …> + Send + 'a>>`). All four in-tree implementations (`Arc<RwLock<SubscriptionManager>>`, `StaticSubscriptionHandle`, the example `InMemorySubscriptions`, three test `MockSubscriptions` variants) were converted; downstream implementors will hit a compile error that names the missing associated types verbatim.
+
+Why this is worth a breaking change: it lets [`Server::run`]'s where clause spell `for<'a> Sub::SubscribeFuture<'a>: Send`, which in turn lets the function declare `+ Send` on its return type instead of relying on auto-trait inference. Compile errors for `tokio::spawn`-vs-`!Send`-handle mismatches now surface at the library boundary instead of deep inside `tokio::spawn`'s bound check.
+
+[generic associated types]: https://blog.rust-lang.org/2022/10/28/gats-stabilization.html
+
+##### Migration
+
+Before:
+
+```rust
+impl SubscriptionHandle for MyHandle {
+    fn subscribe(&self, ...) -> impl Future<Output = Result<(), SubscribeError>> + '_ {
+        async move { /* … */ }
+    }
+    fn unsubscribe(&self, ...) -> impl Future<Output = ()> + '_ {
+        async move { /* … */ }
+    }
+}
+```
+
+After:
+
+```rust
+impl SubscriptionHandle for MyHandle {
+    type SubscribeFuture<'a> =
+        Pin<Box<dyn Future<Output = Result<(), SubscribeError>> + Send + 'a>>;
+    type UnsubscribeFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    fn subscribe(&self, ...) -> Self::SubscribeFuture<'_> {
+        Box::pin(async move { /* … */ })
+    }
+    fn unsubscribe(&self, ...) -> Self::UnsubscribeFuture<'_> {
+        Box::pin(async move { /* … */ })
+    }
+}
+```
+
+Drop `+ Send` from the type aliases on `!Send` handles (rare). The `Box::pin` allocation happens at SD-rate (typically ≤ 1 Hz subscribes during steady-state SD churn), small cost relative to the wire activity it gates.
+
+
+
+#### Breaking — `Server::new` now returns a `(Server, ServerHandles, run-future)` tuple
+
+`Server::new` (and the `new_with_loopback`, `new_passive`, `new_with_deps`, `new_passive_with_deps` variants) now mirrors `Client::new`'s shape: the constructor returns a three-tuple of `(Server, ServerHandles, impl Future + 'static)` instead of just `Server`. The single returned run-future drives the receive loop *and* the SD `OfferService` announcement loop concurrently, so callers no longer have to remember to spawn `announcement_loop` separately. The runtime check that used to live on `Server::announcement_loop` ("called on passive server" → `Err`) is now structurally impossible because the announcement loop has no separate entry point. The dispatcher topology where a co-located `Client` drives SD announcements is now opted into via [`ServerConfig::with_announce(false)`] instead of "just don't call this method".
+
+`Server::new_with_handles` and `Server::new_passive_with_handles` are unchanged — bare-metal callers still get back `Self` and call `server.run_with_buffers(unicast, sd)` directly with their own static buffers. The combined receive + announce select runs in `run_with_buffers` too.
+
+The previous `ServerHandles` type (the no-alloc deps bundle accepted by `new_with_handles`) was renamed to **`ServerStorage`** to free the `ServerHandles` name for the new post-construction accessor struct returned from `Server::new`. The eight fields are unchanged.
+
+##### Migration
+
+Before:
+
+```rust
+let mut server = Server::new(config).await?;
+let publisher = server.publisher();
+tokio::spawn(server.announcement_loop()?);
+tokio::spawn(async move {
+    if let Err(e) = server.run().await { /* … */ }
+});
+```
+
+After:
+
+```rust
+let (_server, handles, run) = Server::new(config).await?;
+let publisher = handles.publisher;
+tokio::spawn(async move {
+    if let Err(e) = run.await { /* … */ }
+});
+```
+
+Bare-metal-no-alloc, before:
+
+```rust
+let server = Server::new_with_handles(deps, config)?;
+let announce = server.announcement_loop_local()?;
+spawn_local(announce);
+spawn_local(server.run_with_buffers(unicast_buf, sd_buf));
+```
+
+After:
+
+```rust
+let server = Server::new_with_handles(deps, config)?;
+spawn_local(server.run_with_buffers(unicast_buf, sd_buf));
+```
+
+(`run_with_buffers` is now the combined receive + announce future.)
+
+Dispatcher topology (was: implicit "just don't call announcement_loop") becomes explicit:
+
+```rust
+let config = ServerConfig::new(svc, inst).with_announce(false);
+let (_server, _handles, run) = Server::new(config).await?;
+tokio::spawn(run);  // receive only; co-located Client drives SD
+```
+
+#### Breaking — `NonSdRequestCallback` is now a parsed, ctx-carrying callback
+
+```rust
+// before
+pub type NonSdRequestCallback = fn(data: &[u8], source: SocketAddrV4);
+// after
+pub type NonSdRequestCallback = fn(
+    ctx: usize,
+    source: core::net::SocketAddrV4,
+    service_id: u16,
+    method_id: u16,
+    payload: &[u8],
+    e2e_status: u8,
+);
+```
+
+The observer is now registered as a `(callback, ctx)` pair
+(`ServerDeps::non_sd_observer: Option<(NonSdRequestCallback, usize)>`),
+and `ctx` is passed back verbatim on every invocation. `recv_loop`
+parses the SOME/IP header so consumers receive decoded
+`(service_id, method_id, payload)` and never hand-roll parsing — the
+parse stays in the audited crate per MISRA/ASIL rather than being
+replicated in N C consumers. `payload` is the bytes after the 16-byte
+header. `e2e_status` is `0` (unchecked) — server-side request E2E is
+not applied today. `usize` (rather than a stored `*mut c_void`) keeps
+`Server: Send` — and therefore `Server::run`'s declared `+ Send` bound
+— with no `unsafe` in this crate; the pointer cast lives in the
+consumer's callback body. FFI consumers stash their state pointer as
+`usize`; pure-Rust callers pass `0`.
+
+##### Migration
+
+`non_sd_observer: Some(my_cb)` → `non_sd_observer: Some((my_cb, 0))`,
+and replace the leading `ctx: usize` parameter plus manual header parsing
+with the decoded arguments `(ctx, source, service_id, method_id, payload,
+e2e_status)`. Registration becomes `Some((my_cb, 0))`.
+
+#### Removed
+
+- **`Server::announcement_loop` / `Server::announcement_loop_local`** — folded into the combined run-future. The `announcement_loop_started: AtomicBool` latch that protected against two simultaneously-driven announcement futures is gone with them (single entry point makes the failure mode structurally impossible).
+- **`Server::set_local_port`** — vestigial. The bind-time back-fill on `new_with_deps` / `new_with_handles` already records the kernel-assigned port into `config.local_port` before `Server::new` returns, and mutating it post-construction would lie to peers about an endpoint the unicast socket isn't actually bound to (the same failure mode `new_with_handles` rejects with `local_port_mismatch`). Both in-tree call sites were no-ops.
+
+#### Added (additive — no migration)
+
+- **`ServerHandles<Hep>`** — post-construction accessor bundle returned alongside `Server` from `Server::new`. Single public field today: `publisher`. Reserved for future fields (e.g. a `BindCompleted` oneshot if a real adopter asks).
+- **`ServerConfig::announce: bool`** + **`with_announce(bool)`** fluent setter. Defaults to `true`. Set to `false` for the dispatcher topology.
+- **`ServerStorage<F, Tm, R, Sub, H, Hsd, Hep>`** (replaces the old `ServerHandles` deps bundle name).
+- **21a — generic-parameter alignment** across `Client`, `Server`, `ClientDeps`, `ServerDeps`. Letter-collisions between Spawner (`S` on Client) and SubscriptionHandle (`S` on Server) resolved (`Sp` and `Sub` respectively).
+- **21c — tokio-defaulted `Deps` builders.** `ClientDeps::tokio()` and `ServerDeps::tokio()` produce a fully-defaulted bundle; chain `with_factory` / `with_timer` / `with_e2e_registry` / `with_subscriptions` / `with_spawner` / `with_local_spawner` to override individual fields without spelling the rest out.
+- **21d — discoverable channel types.** New `ClientChannelTypes` trait alias surfaces the set of channel types that `define_static_channels!` must populate; `client::channels` re-exports the relevant types with rustdoc that names each as "channel type for `define_static_channels!`."
+- **21e — `ServerConfig` fluent builder.** Existing struct-literal route stays open; `ServerConfig::new(svc, inst).with_interface(…).with_local_port(…).with_ttl(…).with_event_group(…).with_announce(…)` is the recommended path in docs.
+
+### Added — correctness & no_std cleanup
+
+- **`simple-someip-embassy-net::LINK_MTU`** — `pub const usize = 1500` shared by the loopback driver and example consumers for sizing `SocketPool` RX/TX buffers and `Capabilities::max_transmission_unit`. Distinct from `simple_someip::UDP_BUFFER_SIZE` (an *application*-payload cap) — they coincide at 1500 today but are conceptually orthogonal.
+- **Per-package pedantic clippy CI gates** for `simple-someip` under `client+bare_metal`, `server+bare_metal`, and `client+server+bare_metal`. The pre-existing `--workspace --all-features` gate is feature-unified and could mask feature-set regressions; per-package gates surface a regression against its responsible feature flag.
+
+### Changed — correctness & no_std cleanup
+
+- **`SocketOptions` docs** — explicit Linux-side guidance that the SD socket needs both `SO_REUSEADDR` and `SO_REUSEPORT` (Linux ties multicast-group membership to the REUSEPORT group).
+- **`SdStateManager::with_initial` and `next_session_id_with_reboot_flag`** lifted from `pub(super)` to `pub` so external test harnesses can pre-seed counter state and validate wrap-around behaviour without a full Server lifecycle. The remaining racy accessors stay `pub(super) + cfg(test)`.
+- **`Server::new_with_handles` / `new_passive_with_handles`** — back-fill `config.local_port` only when the caller passed `0`; return `Error::InvalidUsage` on a non-zero mismatch with the unicast socket's bound port. Matches `new_with_deps`'s back-fill-only-on-zero discipline.
+- **`SubscriptionManager::get_subscribers`** — cfg widened from `feature = "std"` to internal `feature = "_alloc"` and return type from `std::vec::Vec` to `alloc::vec::Vec`. Reachable in `embassy_channels` and pure-`server,bare_metal` builds where alloc is in scope.
+- **`OfferedEndpoint`** — re-exported unconditionally (previously `cfg(feature = "std")`). The trait method `PayloadWireFormat::for_each_offered_endpoint` that surfaces it is unconditional.
+- **`tokio_transport::TokioSpawner::spawn`** — single tokio task per spawn (was 2: work future + JoinHandle watcher). Panic logging now lives inside `PanicLoggingFut` via `std::panic::catch_unwind`.
+- **`Server::run_with_buffers` doc example** — replaced unsound `&mut UNICAST_BUF` on `static mut` (hard error in Rust 2024) with a `static UnsafeCell<[u8; …]>` + `unsafe impl Sync` pattern.
+- **Three event-loop sites** (`client/inner.rs`, `client/socket_manager.rs`, `server/mod.rs`) — comments referenced `select!` while the code used `select_biased!`. Server and socket_manager's 2-arm selects now flip arm priority each iteration to approximate the fairness `select!` would give without pulling `std`. Comments rewritten to match.
+
+### Fixed — correctness & no_std cleanup
+
+- **`tools/size_probe::someip_header_encode`** — `MessageType::try_from(byte & 0xBF)` masked off bit 6 before validation (`0x40` silently coerced to `Request`); switched to `MessageTypeField::try_from(byte)`. The encoder also ignored the caller's `length` field and hardcoded `payload_len = 0`; now derives `payload_len = length - 8` with `checked_sub`.
+- **`simple-someip-embassy-net::EmbassyNetFactory`** — dropped a bogus `'pool` lifetime parameter and an identity-only `mem::transmute<&SocketPool, &'static>`. Factory now takes `&'static SocketPool` directly. Marked `!Send + !Sync` via `PhantomData<*const ()>` because embassy-net's `Stack` interior `RefCell` is not safe to drive `bind()` on from multiple threads.
+- **`simple-someip-embassy-net::EmbassyNetSocket::local_addr`** / `EmbassyNetFactory::bind` — `bind()` now honours `addr.ip()` (previously ignored) and reads the actual bound port back from `socket.endpoint()` post-bind, so port-0 ephemeral binds report the real port instead of `:0`.
+- **`tools/size_probe`** — excluded from `[workspace]`, given its own empty `[workspace]` table. `cargo clippy --workspace --all-features` no longer trips `E0152` against the probe's `#[panic_handler]` / `#[global_allocator]`.
+- **`extern crate alloc` cfg** — tied to a single internal `_alloc` feature implied by `server`, `embassy_channels`, and `std`. The previous `cfg(any(feature = "embassy_channels", feature = "server"))` was right by accident and silently omitted std-only flavours.
+- **CI alloc-symbol audit** — pinned the rlib path (was nondeterministic via `find | head`); replaced `rm -f` of the rlib (which doesn't invalidate cargo's fingerprint cache) with `cargo clean -p simple-someip --target …`; dropped `nm 2>/dev/null` so a tool failure stops surfacing as `0` alloc references.
+- **vsomeip TX-conformance test** — captures TWO consecutive announcements; asserts exact TTL (3 s default), session-ID monotonicity, `RebootFlag::RecentlyRebooted` on both announcements (the flag stays `RecentlyRebooted` until the session counter wraps `0xFFFF→0x0001`, which two announcements don't reach — the wrap transition itself is covered by the `SdStateManager` unit tests), exactly one SD entry / one SD option / `(first_options, second_options) == (1, 0)` per OfferService entry. Previously asserted only `ttl > 0`.
+- **vsomeip RX-conformance test** — verifies vsomeip's OfferService carries an IPv4 endpoint option with the expected `(port=30509, UDP)`. A parser regression dropping options would have passed the old entry-only check.
+- **`tests/data/vsomeip-offerer/subscriber.json`** — `clients[].unreliable` was 30509, mirroring offerer.json instead of matching the simple-someip Server's `ADVERTISED_PORT = 30500` that subscriber.json is paired with. Fixed to 30500.
+- **vsomeip module docs** — referred to multicast group `224.0.23.0` (vsomeip spec default) while simple-someip and offerer.json both use `239.255.0.255`. Updated.
+- **`SocketAddrV4` IP wildcard handling in embassy-net adapter** — `socket.bind(addr.port())` was passing only the port, ignoring caller's IP. Now passes a full `IpListenEndpoint` with `addr: None` for `0.0.0.0` (smoltcp's wildcard) or the explicit IPv4 otherwise.
+- **`RecvError::Truncated` → `Err(Io(Other))` mapping** — documented at the call site why this is a deliberate adapter choice (embassy-net 0.4 doesn't deliver bytes on truncation and doesn't surface the original datagram length, so we can't honour the trait's `truncated: true` contract truthfully).
+- **Doc-link rot** — `Self::reboot_flag` (cfg(test)-only), `Self::for_each_subscriber` (lives on the trait), `EventPublisherHandle` (collapsed into `SharedHandle` in 19f / 20e), `E2ERegistryFull` (needs `crate::e2e::` prefix), `futures::future::BoxFuture` (futures crate not a direct dep). All `cargo doc --no-deps` partial-feature gates clean.
+- **Embassy-net loopback test rename pretext** — `client_send_request_server_runloop_stable` was vacuous (passive server's `run()` returns `Err(InvalidUsage)` immediately). Removed the no-op spawn and rewrote the doc to honestly describe what the test verifies (the client's send path).
+- **Adversarial-pass micro-issues**: `payload_len + 12` / `payload_len + 4` 32-bit wrap in size_probe (now `checked_add`); `PanicAllocator` → `NullAllocator` (it returns null, doesn't panic); `EmbassyNetBindFuture::poll` panicked on second poll (now wraps `core::future::Ready` for stdlib panic message + standard semantics); `EventPublisher`'s `PhantomData<T>` → `PhantomData<fn() -> T>` (no redundant `Send + Sync` re-imposition).
+
+### Added — 0.7.0 → 0.8.0 surface baseline
+
+- **`client::Error::Capacity(&'static str)`** — new variant returned when a fixed-capacity internal structure is full. Current tags: `"unicast_sockets"`, `"udp_buffer"`, `"pending_responses"`, `"request_queue"`. Because `client::Error` is not `#[non_exhaustive]`, this is a breaking change for downstream crates that match the enum exhaustively.
+- **`client::Error::Transport(crate::transport::TransportError)`** — new variant surfacing failures from the pluggable transport backend (`#[from]`-converted, displays transparently). Same exhaustive-match caveat as above.
+- **`client::Error::Shutdown`** — new variant returned by every `Client` method when the control channel is closed (run-loop future was dropped, cancelled, or exited). Replaces the previous `.unwrap()`-on-closed-channel panic path.
+- **`server::SubscribeError`** — new public enum (`SubscribersPerGroupFull`, `EventGroupsFull`) returned by `SubscriptionManager::subscribe` and `EventPublisher::register_subscriber` when a bounded capacity rejects a subscription. Re-exported from `server::mod`.
+- **`Client::new_with_loopback(interface, multicast_loopback)`** — constructor that exposes the previously-internal `multicast_loopback` knob for same-host integration tests.
+- **`Client::new_with_spawner_and_loopback(interface, multicast_loopback, spawner)`** — executor-agnostic constructor that accepts a caller-supplied `Spawner` impl. Bare-metal callers swap `TokioSpawner` for their own task pool.
+- **`Client::new_with_deps_local`** — constructor for single-threaded / `!Send` executors. Accepts a `LocalSpawner` instead of `Spawner` and relaxes the `Send` bound on the transport socket.
+- **`transport::Spawner` trait** (re-exported as `simple_someip::Spawner`) — executor-agnostic task-spawn abstraction. `tokio_transport::TokioSpawner` is the default `std + tokio` impl.
+- **`transport::LocalSpawner` trait** — single-threaded task-spawn abstraction for `!Send` futures. Enables use on runtimes like `tokio::LocalSet` or embassy's single-threaded executor.
+- **`transport::TransportSocket` / `TransportFactory` / `Timer` traits** — executor-agnostic UDP transport abstraction. Default `tokio_transport::TokioTransport` / `TokioSocket` / `TokioTimer` impls available behind the `client-tokio` / `server-tokio` features.
+- **`bare_metal` cargo feature** — activates embassy-sync as the channel backend and enables the `static_channels` module, `AtomicInterfaceHandle`, `StaticE2EHandle`, and `StaticSubscriptionHandle` types. All four are pure `no_std` (no allocator required). The heap-backed `EmbassySyncChannels` factory is separately gated by the `embassy_channels` feature (which implies `bare_metal`). See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable integration examples. Validate with `cargo build -p bare_metal_client` / `cargo build -p bare_metal_server`, NOT `cargo build --workspace` (workspace builds may unify features and mask regressions).
+- **`SubscriptionManager::subscribe` returning a `Result`** — see "Changed" below; the regression test list now exercises the major-version mismatch path explicitly.
+- **`StaticSubscriptionHandle` + `StaticSubscriptionStorage`** — no-alloc `SubscriptionHandle` impl backed by `&'static BlockingMutex<CriticalSectionRawMutex, RefCell<SubscriptionManager>>`. The bare-metal counterpart to `Arc<RwLock<SubscriptionManager>>`. `SubscriptionManager::new()` is now `const`, so the storage can live in a plain `static` (no `Box::leak`). Gated on `feature = "bare_metal"`, re-exported from `server::*`.
+- **`server::Error::InvalidUsage(&'static str)`** — new variant for `Server` API misuse paths. Currently emitted with the tags `"passive_server_announcement_loop"`, `"announcement_loop_already_started"`, and `"passive_server_run"`. Replaces the previous `Error::Io(std::io::Error::new(InvalidInput, ..))` paths so these errors are reachable on no_std builds.
+- **`E2ERegistryFull`** — new typed error returned by `E2ERegistry::register` (and propagated through `E2ERegistryHandle::register` / `Client::register_e2e` / `Server::register_e2e`) when the fixed-capacity registry is at its `E2E_REGISTRY_CAP` limit. Replacing an already-registered key still always succeeds.
+- **`PayloadWireFormat::for_each_offered_endpoint` / `for_each_service_instance`** — visitor-pattern methods replacing the previous `Vec`-returning `offered_endpoints` / `service_instances`. Lets the `Client` run loop iterate SD entries without per-message heap allocation, which was the last bare-metal blocker on the receive path. The `Vec`-returning forms are preserved as `cfg(feature = "std")` convenience wrappers that delegate to the visitors, so std consumers keep the original ergonomic shape.
+
+### Changed — 0.7.0 → 0.8.0 surface baseline
+
+- **Breaking: `Client::new(interface)` return shape** — previously returned `(Client, ClientUpdates)`; now returns `(Client, ClientUpdates, impl Future<Output = ()> + Send + 'static)`. The third element is the run-loop future, which the caller MUST drive (typically via `tokio::spawn`) for any `Client` method to make progress. Migration: change destructuring to a 3-tuple and spawn or otherwise actively poll the future.
+- **Breaking: `Server::start_announcing` removed → `Server::announcement_loop`** — the new method returns `Result<impl Future<Output = ()> + Send + 'static, Error>` (annotated `#[must_use]`). Spawn the returned future to fire announcements; calling and dropping the future is a silent no-op.
+- **Breaking: `Client::start_sd_announcements` renamed to `Client::sd_announcements_loop`** — same semantic shift as `announcement_loop`: returns an `impl Future` instead of spawning internally, so the caller drives execution.
+- **Breaking: `Client::reboot_flag(&self)` now returns `Result<protocol::sd::RebootFlag, Error>`** — previously returned the bare flag and could panic if the run-loop had exited. All other public `Client` methods migrated to the same `Err(Error::Shutdown)` policy in this release; `reboot_flag` is now consistent.
+- **Breaking: `server::SubscriptionManager::subscribe` signature change** — now returns `Result<(), server::SubscribeError>` instead of `()`. Previously, capacity rejections were silently dropped with only a `warn!` log, which let the server emit a `SubscribeAck` for a subscription that had not been recorded. Callers must now handle the `Err` path (the server's own SD loop emits `SubscribeNack` on `Err`).
+- **Breaking: `server::EventPublisher::register_subscriber` signature change** — now returns `Result<(), server::SubscribeError>` instead of `()`, surfacing the same capacity-rejection signal to externally managed subscription dispatchers.
+- **Breaking: `Server::unicast_local_addr` return type changed** — previously returned `Result<std::net::SocketAddr, std::io::Error>`; now returns `Result<std::net::SocketAddr, server::Error>`. Callers that pattern-matched on `std::io::Error` must update to `server::Error::Transport(e)` and access the inner `TransportError` from there.
+- **Breaking: default features changed `default = []` → `default = ["std"]`** — previously `embedded-io/std`, `thiserror/std`, and `tracing/std` were always-on; they are now gated behind the new `std` feature. Downstream consumers building with `default-features = false` who relied on the implicit `std` propagation must add `features = ["std"]` (or one of `client` / `server`, which both imply `std`).
+- **Breaking: `Client::new` type signature now `Client::<M, R, I, C>::new`** — the `Client` struct gained three additional type parameters for the executor traits (`R: TransportFactory`, `I: InterfaceHandle`, `C: ChannelFactory`). The tokio-default convenience constructor is now gated behind the `client-tokio` feature (was `client`). Migration: add `features = ["client-tokio"]` to continue using `Client::new`; trait-surface consumers use `Client::new_with_deps`.
+- **Breaking: `Server::new` type signature now `Server::<R, S, F, Tm>::new`** — the `Server` struct gained type parameters for the pluggable backends. The tokio-default convenience constructor is now gated behind the `server-tokio` feature (was `server`). Migration: add `features = ["server-tokio"]` to continue using `Server::new`; trait-surface consumers use `Server::new_with_deps`.
+- **Breaking: `SubscriptionHandle` trait redesigned** — the previous `get_subscribers(&self, …) -> impl Future<Output = Vec<Subscriber>>` method has been replaced with `for_each_subscriber(&self, …, f: FnMut)` visitor pattern. This allows `EventPublisher::publish_event` to copy subscriber addresses into a stack buffer (`heapless::Vec<_, 16>`) instead of allocating per-event. Implementors of custom `SubscriptionHandle` must migrate.
+- **Breaking: `SubscriptionHandle` RPITIT futures no longer `+ Send`** — the `subscribe`, `unsubscribe`, and `for_each_subscriber` methods now return `impl Future<…>` without a `+ Send` bound. This enables single-threaded lock-free implementations on bare-metal targets, but means `SubscriptionHandle` trait objects cannot be held across `.await` points in multi-threaded executors. Direct usage with the default `Arc<RwLock<SubscriptionManager>>` is unaffected.
+- **Breaking: `client` and `server` features no longer imply `std`** — previously `client = ["std", "dep:futures"]` and `server = ["std", "dep:futures"]`; now `client = ["dep:futures-util"]` and `server = ["dep:futures-util"]`. The `std` feature moved to `client-tokio` / `server-tokio`, which is where it belongs (the tokio backends genuinely require std). Bare-metal trait-surface consumers (`features = ["client", "bare_metal"]`) compile in pure no_std now. `server` still pulls `extern crate alloc` because `Server` holds `Arc<EventPublisher>` and `EventPublisher` holds `Arc<F::Socket>` — documented in `lib.rs`; refactor to `&'static` borrows is tracked in #115.
+- **Breaking: optional dep `futures` replaced with `futures-util`** — direct dependency on `futures-util` with features `["async-await", "async-await-macro"]`. The `futures` umbrella crate's `select!` macro re-export is gated on its `std` feature, which transitively pulls `slab` / `memchr` / `futures-io` and breaks no_std cross-compiles. `futures-util` provides `select_biased!`, `pin_mut!`, and `FutureExt` under just `async-await(-macro)`.
+- **Breaking: internal `select!` → `select_biased!`** — `Inner::run_future`, `socket_loop_future`, and `server::run` now poll their select arms top-first instead of pseudo-randomly. For these workloads the bias gives slightly better behavior (control messages, sends, and unicast recvs get priority over their lower-priority siblings) and there is no genuine starvation path because the higher-priority arms are sporadic. The change is observable only under contrived workloads where every arm is permanently ready simultaneously.
+- **Breaking: `PayloadWireFormat::offered_endpoints` / `service_instances` replaced by visitor-pattern methods** — see `for_each_offered_endpoint` / `for_each_service_instance` in "Added" above. Implementors of custom `PayloadWireFormat` types must override the visitors instead of the `Vec`-returning forms. The `Vec`-returning forms remain as default-implemented `cfg(feature = "std")` convenience wrappers, so std callers' code keeps compiling unchanged.
+- **Breaking: `PayloadWireFormat::new_subscription_sd_header` parameter type** — `client_ip` is now `core::net::Ipv4Addr` (was `std::net::Ipv4Addr`). The two are the same underlying type; the change unblocks no_std builds. Dropping the `#[cfg(feature = "std")]` gate on the method itself makes it reachable in pure no_std.
+- **Breaking: `PayloadWireFormat::set_reboot_flag` no longer `cfg(feature = "std")`** — the method is now always available on the trait. Its default impl is still a no-op; downstream payload types that participate in SD reboot tracking must override it.
+- **Breaking: `OfferedEndpoint` no longer `cfg(feature = "std")`** — type is always available; its `addr` field is `Option<core::net::SocketAddrV4>` (was `Option<std::net::SocketAddrV4>`). Same underlying type; allows no_std consumers to receive offered-endpoint visits.
+- **Breaking: `server::Error::Io(std::io::Error)` now `cfg(feature = "std")`** — the variant is gated on `feature = "std"` because `std::io::Error` is itself std-only. No-std consumers receive transport failures via `Error::Transport(TransportError)` which carries the portable `IoErrorKind`.
+- **Breaking: misuse paths on `Server::announcement_loop` / `Server::run` return `Error::InvalidUsage(...)`** — previously these returned `Error::Io(std::io::Error::new(InvalidInput, ..))` with a formatted message. The new variant is no_std-friendly and carries a machine-readable `&'static str` tag (`"passive_server_announcement_loop"`, `"announcement_loop_already_started"`, `"passive_server_run"`); the diagnostic moves to `tracing::warn!`.
+- **Breaking: `server::SubscriptionManager::get_subscribers` now `cfg(feature = "std")`** — convenience accessor returning a heap `Vec<Subscriber>`. Production code paths use `for_each_subscriber` (visitor) since 0.8.0; this accessor remains for std consumers' tests and ad-hoc tooling. No_std consumers must use `for_each_subscriber`.
+- **Breaking: `server::ServiceInfo` / `server::EventGroupInfo` now `cfg(feature = "std")`** — both types' `pub` fields hold `Vec<...>`. Bare-metal consumers don't construct these types today; if the use case emerges, a port to `heapless::Vec` is tracked in #116. `Subscriber` is unaffected and stays no_std.
+- **Breaking: `E2ERegistry` API change** — backing storage migrated from `std::collections::HashMap` to `heapless::index_map::FnvIndexMap` (cap = `E2E_REGISTRY_CAP = 32`, exposed). `E2ERegistry::register` now returns `Result<(), E2ERegistryFull>`; replacing an already-registered key always succeeds, adding a new key past the cap returns `Err`. `E2ERegistry::new()` is now `const`. The module is no longer `cfg(feature = "std")` — `E2ERegistry` works in pure no_std.
+- **Breaking: `E2ERegistryHandle::register` trait method now returns `Result<(), E2ERegistryFull>`** — propagates the new typed overflow from `E2ERegistry::register` through every handle impl. Callers (`Client::register_e2e`, `Server::register_e2e`) lift the `Result` through to their public surface.
+- `client::Error::Transport` adopts `#[error(transparent)]` Display delegation (the previous wrapping with `{:?}` debug-formatted the inner `TransportError`); user-facing error strings are now stable.
+- Subscribe-NACK reason strings normalized to `snake_case` for log consistency: `wrong_service_id`, `wrong_instance_id`, `wrong_major_version`, `no_endpoint_in_options`, `subscribers_per_group_full`, `event_groups_full`. Wire format is unchanged (NACK is signalled by `TTL=0`).
+
+### Fixed — 0.7.0 → 0.8.0 surface baseline
+
+- **`server::EventPublisher::publish_event` no longer silently sends UNPROTECTED payloads on E2E protect failure** — counter exhaustion / key-lookup races etc. now surface as `Err(Error::E2e(_))` rather than logging and falling through (which had been emitting an unprotected message claiming an E2E-protected channel).
+- **SD `Subscribe` with mismatched `major_version` is now NACKed** — previously an Ack would be returned and the subscription registered, leaving the application stack to silently mis-decode incompatible-version traffic.
+- **`SocketManager::send` no longer panics on a dropped response oneshot** — user-supplied `Spawner` made this path reachable; failures now return `Err(Error::SocketClosedUnexpectedly)`.
+- **`client::Inner` request-queue overflow no longer drops control messages silently** — full queue now invokes `reject_with_capacity("request_queue")` on the rejected message, so callers see a typed `Err(Error::Capacity("request_queue"))` instead of a `RecvError` mapped to `Error::Shutdown`.
+- **Per-socket recv-error hot loop bounded** — `SocketManager`'s socket loop now closes after `MAX_CONSECUTIVE_RECV_ERRORS = 16` consecutive `recv_from` failures rather than spinning indefinitely on a permanently broken fd.
+- **`Client::send` fails fast on oversize messages** — pre-encode size check returns `Err(Error::Capacity("udp_buffer"))` for messages whose `required_size()` exceeds `UDP_BUFFER_SIZE`. Mirrors the existing `EventPublisher::publish_event` capacity guard.
+
+### Notes
+
+- **Crate version bumped to 0.8.0** — reflects the breaking changes above. Downstream `Cargo.toml` snippets in `README.md` were updated accordingly.
+- **Bare-metal compile gate is now literal.** `cargo build --target thumbv7em-none-eabihf --no-default-features --features client,server,bare_metal` succeeds; `client + bare_metal` is verified alloc-free (zero `__rust_alloc` references in the resulting rlib). CI runs this matrix on every PR. The cortex-m4f target is the closest no_std proxy mainline Rust supports — the project's actual production target (Infineon AURIX TriCore) requires HighTec's commercial Rust distribution because mainline Rust + LLVM don't have a TriCore backend; a TriCore CI runner is tracked in #117.
+- **`server + bare_metal` is now alloc-free** (PR #124 closed the former known limitation): the `server` feature no longer pulls `extern crate alloc`; `Arc` defaults apply only under std/tokio configurations. CI audits the rlib for allocator symbols in both `client,bare_metal` and `server,bare_metal`.
+
+### Test runner
+
+- `tests/client_server.rs` integration tests share the SD multicast port (30490) via `SO_REUSEPORT` and rely on Linux's reuseport hashing for traffic delivery. Under cargo's default parallel test runner cross-test Subscribe deliveries flake. The crate's `.config/nextest.toml` serializes `client_server` via the `serial-sd-port` test-group, so `cargo nextest run` (used by CI) gives stable results. For the legacy harness, pass `--test-threads=1`: `cargo test --test client_server -- --test-threads=1`.
+
+### Internal / Infrastructure
+
+- Future-size witness tests (host-arch proxies with +25% budgets) for the
+  client run/socket-loop futures and server run future, in tokio and
+  static-channel configurations (issue #125 measurement baseline, PR 0).
+- `tools/capture_type_sizes.sh`: host + thumbv7em `-Zprint-type-sizes`
+  capture; `tools/size_probe` now instantiates the client futures no_std.
+- `transport::probe`: public zero-behavior `Null*` dependency stubs
+  (promoted from test-private; layout probing + trait-conformance only).
+- CI: `-Zbuild-std=core` thumbv7em gate (halo's no-alloc-sysroot
+  certification) for client/server/combined bare_metal; `nm` alloc-symbol
+  audit extended to `server,bare_metal`.
 
 
 ## [0.6.0](https://github.com/luminartech/simple_someip/compare/v0.5.3...v0.6.0) - 2026-04-20

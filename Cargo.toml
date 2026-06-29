@@ -1,9 +1,30 @@
 [workspace]
-members = [".", "examples/discovery_client", "examples/client_server"]
+members = [
+    ".",
+    "examples/bare_metal_client",
+    "examples/bare_metal_server",
+    "examples/client_server",
+    "examples/discovery_client",
+    "examples/embassy_net_client",
+    "simple-someip-embassy-net",
+]
+# `tools/size_probe` is a `no_std` `staticlib` with its own
+# `#[panic_handler]` and `#[global_allocator]` — including it as a
+# workspace member triggers `E0152` when the workspace is checked
+# under a host target (`cargo clippy --workspace --all-features`),
+# because `simple-someip` brings in `std`'s panic_impl through its
+# transitive deps. Excluding keeps the probe usable via its own
+# `cd tools/size_probe && cargo build --release --target thumbv7em-none-eabihf`
+# invocation (it's a flash-size measurement tool, not a publishable
+# crate) without poisoning the host workspace lint gate. Note: a
+# `cargo build -p size_probe` from the workspace root no longer
+# resolves because the probe is excluded; build it through its own
+# manifest.
+exclude = ["tools/size_probe"]
 
 [package]
 name = "simple-someip"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A lightweight SOME/IP serialization and communication library"
@@ -11,7 +32,37 @@ repository = "https://github.com/luminartech/simple_someip"
 
 [dependencies]
 crc = "3.4"
+# embassy-sync provides no_std-compatible bounded channels used as the
+# channel backend when the `bare_metal` feature is active. The
+# `critical-section` and `portable-atomic` deps ship with embassy-sync and
+# are satisfiable on the Infineon AURIX TriCore target (HighTec toolchain)
+# per the bare_metal_plan_v2 TriCore delta.
+embassy-sync = { version = "0.6", optional = true }
+# Stock embassy-executor (raw::Executor + the `nightly` static task-pool
+# storage) for the `bare-metal-runtime` feature: the reusable runtime owns
+# the executor + the single composed task so platforms don't. `nightly`
+# makes `#[task]` emit a `static TaskPool` in `.bss` (link-time sized)
+# instead of the runtime arena, and needs `impl_trait_in_assoc_type` at the
+# crate root (gated in lib.rs). No arch feature — the platform tick-polls
+# the raw executor and we provide `__pender`.
+embassy-executor = { version = "0.6", default-features = false, features = [
+    "nightly",
+], optional = true }
 embedded-io = { version = "0.7" }
+# `futures` pulls in `futures-util` which provides the executor-agnostic
+# `select!` macro and `FutureExt::fuse` / `pin_mut!` helpers — used by
+# the client/server event loops in place of `tokio::select!`. Default
+# features disabled so we only pull in the parts we use.
+# `futures-util` (not the `futures` umbrella) because the umbrella
+# gates the `select!` macro re-export behind its `std` feature, and
+# pulling that feature drags in `slab` / `memchr` / `futures-io` etc.
+# which do not compile on no_std targets. `futures-util` itself
+# provides `select!`, `pin_mut!`, `FutureExt::fuse`, and friends
+# under just `async-await` (which is alloc-friendly, no_std-clean).
+futures-util = { version = "0.3", default-features = false, features = [
+    "async-await",
+    "async-await-macro",
+], optional = true }
 heapless = "0.9"
 socket2 = { version = "0.5", optional = true, features = ["all"] }
 thiserror = { version = "2", default-features = false }
@@ -22,18 +73,133 @@ tokio = { version = "1", default-features = false, features = [
     "sync",
     "time",
 ], optional = true }
-tracing = { version = "0.1", default-features = false }
+tracing = { version = "0.1", default-features = false, optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread"] }
+# `critical-section/std` provides a host-platform impl so integration
+# tests that exercise `EmbassySyncChannels` (which depends on
+# `embassy-sync`'s critical-section calls) can link on host. This is
+# test-only; firmware builds supply their own platform impl.
+critical-section = { version = "1", features = ["std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing-subscriber = "0.3"
 
 [features]
 default = ["std"]
-std = ["embedded-io/std", "thiserror/std", "tracing/std"]
-client = ["std", "dep:tokio", "dep:socket2"]
-server = ["std", "dep:tokio", "dep:socket2"]
+# `tracing` pulls in `tracing-core`, which (since 0.1.33) declares
+# `extern crate alloc` unconditionally and therefore requires the
+# `alloc` crate to be present in the target sysroot. Bare-metal
+# targets that ship a `core`-only sysroot (e.g. the AURIX TriCore
+# LLVM-IR proxy used by the halo build) cannot satisfy this. Gate
+# tracing behind a feature so those builds can opt out; std users
+# pick it up automatically through the `std` feature below.
+tracing = ["dep:tracing"]
+std = ["embedded-io/std", "thiserror/std", "tracing", "tracing/std", "_alloc"]
+# Feature split: `client` exposes the protocol/trait-surface client
+# (no tokio, no socket2); `client-tokio` layers the tokio + socket2
+# convenience defaults on top. Consumers of the bare-metal trait surface
+# enable `client` only (and supply their own `Spawner` / `Timer` /
+# `ChannelFactory` / `TransportFactory` impls). Consumers who want the
+# `Client::new` shortcut (defaulting to `TokioSpawner` / `TokioTimer` /
+# `TokioChannels` / `TokioTransport`) enable `client-tokio`.
+client = ["dep:futures-util"]
+client-tokio = ["client", "std", "dep:tokio", "dep:socket2"]
+# Internal marker: features that need `extern crate alloc`. Pulls in
+# `alloc::sync::Arc` for `SharedHandle<T>` and `Arc<EventPublisher>`.
+# Not part of the public surface — implied by `std` /
+# `embassy_channels` and tied to the `extern crate alloc`
+# declaration in `lib.rs` so both sides of "alloc is available"
+# move in lockstep. Naming: `_`-prefix flags it as private.
+_alloc = []
+# Feature split (matches the client side): `server` exposes the
+# trait-surface server (no tokio, no socket2, no std). The engine
+# itself uses `futures::select!` so `dep:futures` lives here.
+# `server-tokio` adds the tokio + socket2 convenience defaults
+# (`Server::new`, `Server::new_with_loopback`, `Server::new_passive`),
+# bringing `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>` /
+# / `TokioTransport` / `TokioTimer` defaults into scope, and forces
+# `std`.
+#
+# `server` itself is alloc-free: the no-alloc path is
+# `Server::new_with_handles` + `run_with_buffers` with static handles and
+# a `&'static AtomicBool` run latch. The allocator-backed conveniences
+# (`new_with_deps`/`new_passive_with_deps`, `run`/`run_inner`'s 64 KiB
+# buffers, the `Arc` `StartedLatch`) are gated behind `_alloc`, which
+# `std` / `server-tokio` / `embassy_channels` still pull in.
+server = ["dep:futures-util"]
+server-tokio = ["server", "std", "dep:tokio", "dep:socket2"]
+# Marks a build as intended for bare-metal / no_std consumption.
+# Activates embassy-sync as the channel backend, the `static_channels`
+# module, `AtomicInterfaceHandle`, and `StaticE2EHandle`.
+#
+# **To demonstrate the bare-metal trait surface, use the
+# `examples/bare_metal_client` / `examples/bare_metal_server` workspace
+# members directly:** `cargo build -p bare_metal_client`. Those workspace
+# members depend on `simple-someip` with `default-features = false,
+# features = ["bare_metal", "client"]` / `["bare_metal", "server"]`,
+# so they exercise the actual bare-metal configuration.
+#
+# Enabling `bare_metal` on its own does NOT make the crate
+# bare-metal-complete: the `client` and `server` feature paths still
+# require a user-provided `Spawner` impl and `TransportFactory` impl.
+# With `bare_metal` enabled, `static_channels` and `define_static_channels!`
+# are available as the no-alloc `ChannelFactory` impl.
+bare_metal = ["dep:embassy-sync"]
+# Reusable bare-metal SOME/IP runtime: callback transport + RX mailbox +
+# the embassy executor and the single composed task. A platform supplies
+# its catalog + I/O callbacks and tick-polls; everything else lives here.
+# Pulls embassy-executor (`nightly` static task storage) and forces the
+# crate-root `impl_trait_in_assoc_type` feature (see lib.rs).
+bare-metal-runtime = ["bare_metal", "server", "dep:embassy-executor"]
+# Heap-backed embassy-sync channel backend (`EmbassySyncChannels`).
+# Implies `bare_metal` and pulls in `alloc` for `Arc<Channel<...>>`.
+# Useful for tests or early prototypes before sizing static pools.
+embassy_channels = ["bare_metal", "_alloc"]
 
 [[test]]
 name = "client_server"
-required-features = ["client", "server"]
+required-features = ["client-tokio", "server-tokio"]
+
+[[test]]
+# Without `required-features`, `cargo test` would silently report
+# "0 tests" when client-tokio/server-tokio aren't enabled — the
+# vsomeip-conformance file is unconditionally compiled but every
+# function inside it depends on `Client::new_with_loopback` /
+# `Server::new_with_loopback` (tokio path) and on
+# `tracing-subscriber` / `socket2`. Pinning the required-features
+# makes the test cleanly skipped under the wrong feature set.
+name = "vsomeip_sd_compat"
+required-features = ["client-tokio", "server-tokio"]
+
+[[test]]
+name = "bare_metal_client"
+required-features = ["client", "bare_metal"]
+
+[[test]]
+name = "bare_metal_client_local"
+required-features = ["client", "bare_metal"]
+
+[[test]]
+name = "static_channels_alloc_witness"
+required-features = ["client", "bare_metal"]
+
+[[test]]
+name = "no_alloc_witness"
+required-features = ["client", "bare_metal"]
+harness = false
+
+[[test]]
+name = "bare_metal_server"
+required-features = ["server", "bare_metal"]
+
+[[test]]
+name = "no_alloc_server_witness"
+required-features = ["server", "bare_metal"]
+harness = false
+
+[[test]]
+name = "bare_metal_e2e"
+required-features = ["client", "server", "bare_metal"]
+
+[[test]]
+name = "buffer_pool"

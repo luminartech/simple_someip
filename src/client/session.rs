@@ -1,5 +1,12 @@
 use crate::protocol::sd::RebootFlag;
-use std::{collections::HashMap, net::SocketAddr};
+use core::net::SocketAddr;
+use heapless::index_map::FnvIndexMap;
+
+/// Max number of distinct `(sender, transport, service, instance)` tuples tracked
+/// for reboot detection. Must be a power of two (heapless `FnvIndexMap`
+/// requirement). Sized for a small fleet of peers each offering several
+/// services; bare-metal builds with more peers may need to edit this constant.
+const SESSION_CAP: usize = 64;
 
 /// Distinguishes multicast vs unicast transport for per-sender session tracking.
 /// The AUTOSAR spec requires separate session ID tracking per transport.
@@ -28,8 +35,9 @@ struct SessionState {
 pub enum SessionVerdict {
     /// Session is valid (normal increment or first message with matching state).
     Ok,
-    /// Sender has rebooted (reboot flag 0→1 transition, or session ID decreased
-    /// while reboot flag remains 1 within the same service instance stream).
+    /// Sender has rebooted (reboot flag transitioned `Continuous → RecentlyRebooted`,
+    /// or session ID decreased while the reboot flag remains `RecentlyRebooted`
+    /// within the same service instance stream).
     Reboot,
     /// First message ever seen from this service instance on this transport.
     Initial,
@@ -39,20 +47,63 @@ pub enum SessionVerdict {
 ///
 /// A reboot is detected when, for a given `(sender, transport, service_id,
 /// instance_id)` tuple:
-/// - The reboot flag transitions from 0 to 1, **or**
-/// - The session ID decreases while the reboot flag remains 1
+/// - The reboot flag transitions from `Continuous` to `RecentlyRebooted`, **or**
+/// - The session ID decreases while the reboot flag remains `RecentlyRebooted`
 ///
 /// Tracking per service instance (rather than per sender) avoids false
 /// positives when a sensor interleaves SD offers for multiple services
 /// with independent session counters on the same source address.
-#[derive(Debug, Default)]
+///
+/// Capacity is bounded at compile time by [`SESSION_CAP`].
+/// When the map is full, new sender entries are dropped with a `warn!` log
+/// and reboot detection for those senders is disabled.
+///
+/// # Security posture
+///
+/// The backing map uses FNV hashing rather than the DoS-resistant hasher used
+/// by `std::collections::HashMap`. For SOME/IP on isolated automotive or
+/// sensor networks this is not a concern. Deployments where `SessionKey`
+/// inputs (notably `SocketAddr`) are adversary-controlled should be aware
+/// that an attacker can craft keys to force collisions and degrade lookup
+/// cost; the blast radius is bounded by [`SESSION_CAP`].
+#[derive(Debug)]
 pub struct SessionTracker {
-    state: HashMap<SessionKey, SessionState>,
+    state: FnvIndexMap<SessionKey, SessionState, SESSION_CAP>,
+    /// Set after the first saturation warning. Prevents the saturated-map
+    /// log from firing on every `check()` for every new key once capacity
+    /// is reached — which would spam the log at the packet rate.
+    saturation_warned: bool,
+}
+
+impl Default for SessionTracker {
+    fn default() -> Self {
+        Self {
+            state: FnvIndexMap::new(),
+            saturation_warned: false,
+        }
+    }
 }
 
 impl SessionTracker {
     /// Check the session ID and reboot flag for a specific service instance
-    /// and return a verdict. Always updates the stored state after the check.
+    /// and return a verdict.
+    ///
+    /// On the normal (non-saturated) path, the stored state is updated
+    /// after the check so subsequent calls see the latest session id and
+    /// reboot flag for the key.
+    ///
+    /// # Capacity behavior
+    ///
+    /// The tracker is backed by a `heapless::FnvIndexMap` bounded by
+    /// [`SESSION_CAP`]. If the map is already full and the incoming key
+    /// is new, the insert fails and stored state is **not** updated for
+    /// that key — subsequent `check()` calls with the same new key will
+    /// continue to return [`SessionVerdict::Initial`] until an existing
+    /// key is evicted or capacity is raised. A single `warn!` fires the
+    /// first time saturation is hit (further saturation drops are
+    /// suppressed to avoid log spam at the packet rate). For existing
+    /// keys under saturation the update still succeeds, because
+    /// `FnvIndexMap::insert` replaces in place.
     ///
     /// Call this once per service entry in an SD message (not once per message),
     /// so each service instance gets its own session counter.
@@ -89,13 +140,31 @@ impl SessionTracker {
                 }
             }
         };
-        self.state.insert(
-            key,
-            SessionState {
-                last_session_id: session_id,
-                last_reboot_flag: reboot_flag,
-            },
-        );
+        let new_state = SessionState {
+            last_session_id: session_id,
+            last_reboot_flag: reboot_flag,
+        };
+        if self.state.insert(key, new_state).is_err() {
+            // Map at capacity and key is new — silently dropping the update
+            // would lose reboot-detection state. Log the first time we hit
+            // the wall so bare-metal users can size `SESSION_CAP` up, then
+            // suppress further warnings so a saturated tracker does not
+            // spam the log at the incoming-packet rate.
+            if !self.saturation_warned {
+                crate::log::warn!(
+                    "SessionTracker at capacity ({}); dropping new sender state for \
+                     sender={} transport={:?} svc=0x{:04X} inst=0x{:04X}. Reboot \
+                     detection disabled for this entry and any further new entries \
+                     (subsequent drops not logged).",
+                    SESSION_CAP,
+                    sender,
+                    transport,
+                    service_id,
+                    instance_id
+                );
+                self.saturation_warned = true;
+            }
+        }
         verdict
     }
 }
@@ -309,6 +378,59 @@ mod tests {
         tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 1, CONT);
         let verdict = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 2, CONT);
         assert_eq!(verdict, SessionVerdict::Ok);
+    }
+
+    #[test]
+    fn capacity_overflow_drops_new_entries_but_keeps_existing_tracking() {
+        // Fill the tracker to capacity with unique (sender, service) tuples.
+        let mut tracker = SessionTracker::default();
+        for i in 0..super::SESSION_CAP {
+            let port = 1000 + u16::try_from(i).unwrap();
+            let v = tracker.check(addr(port), TransportKind::Multicast, SVC, INST, 1, RB);
+            assert_eq!(v, SessionVerdict::Initial);
+        }
+
+        // One more insert — map is full, new entry dropped. The verdict is
+        // still Initial (no prior state for this key), but the state is
+        // never stored so a follow-up is also Initial.
+        let overflow_addr = addr(9999);
+        let v = tracker.check(overflow_addr, TransportKind::Multicast, SVC, INST, 1, RB);
+        assert_eq!(v, SessionVerdict::Initial);
+        // Because the insert failed, a second call with the same key still
+        // sees no stored state.
+        let v = tracker.check(overflow_addr, TransportKind::Multicast, SVC, INST, 2, RB);
+        assert_eq!(v, SessionVerdict::Initial);
+
+        // Previously-tracked senders continue to work normally.
+        let v = tracker.check(addr(1000), TransportKind::Multicast, SVC, INST, 2, RB);
+        assert_eq!(v, SessionVerdict::Ok);
+    }
+
+    #[test]
+    fn capacity_overflow_warns_only_on_first_hit() {
+        // `saturation_warned` is the latch that guards the crate::log::warn!
+        // call in `check()`. It must flip false → true on the first
+        // rejected insert and stay true for subsequent hits — otherwise
+        // a saturated tracker spams the log at the packet rate.
+        let mut tracker = SessionTracker::default();
+        for i in 0..super::SESSION_CAP {
+            let port = 1000 + u16::try_from(i).unwrap();
+            tracker.check(addr(port), TransportKind::Multicast, SVC, INST, 1, RB);
+        }
+        assert!(
+            !tracker.saturation_warned,
+            "filling to exactly capacity must not trip the warn flag",
+        );
+
+        // First overflowing key: flag flips to true.
+        tracker.check(addr(9001), TransportKind::Multicast, SVC, INST, 1, RB);
+        assert!(tracker.saturation_warned);
+
+        // Subsequent overflows leave the flag true; the flag is what the
+        // implementation checks before emitting a fresh warn!.
+        tracker.check(addr(9002), TransportKind::Multicast, SVC, INST, 1, RB);
+        tracker.check(addr(9003), TransportKind::Multicast, SVC, INST, 1, RB);
+        assert!(tracker.saturation_warned);
     }
 
     #[test]

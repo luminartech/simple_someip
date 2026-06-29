@@ -62,10 +62,21 @@ impl MessageTypeField {
     /// Creates a new message type field from a [`MessageType`] and TP flag.
     #[must_use]
     pub const fn new(msg_type: MessageType, tp: bool) -> Self {
+        // Map to the SOME/IP *wire* encoding — NOT `msg_type as u8`, which
+        // is the enum discriminant and only coincides with the wire byte
+        // for Request/RequestNoReturn/Notification (0/1/2). Response and
+        // Error diverge (discriminant 3/4 vs wire 0x80/0x81).
+        let base = match msg_type {
+            MessageType::Request => 0x00,
+            MessageType::RequestNoReturn => 0x01,
+            MessageType::Notification => 0x02,
+            MessageType::Response => 0x80,
+            MessageType::Error => 0x81,
+        };
         let message_type_byte = if tp {
-            msg_type as u8 | MESSAGE_TYPE_TP_FLAG
+            base | MESSAGE_TYPE_TP_FLAG
         } else {
-            msg_type as u8
+            base
         };
         MessageTypeField(message_type_byte)
     }
@@ -146,6 +157,31 @@ mod tests {
         let field = MessageTypeField::new_sd();
         assert_eq!(field.message_type(), MessageType::Notification);
         assert!(!field.is_tp());
+    }
+
+    /// `new` must emit the SOME/IP *wire* byte for every variant — not the
+    /// enum discriminant. `Response`/`Error` are the variants where the two
+    /// diverge (discriminant 3/4 vs wire 0x80/0x81); the others coincide.
+    #[test]
+    fn new_emits_wire_byte_for_all_variants() {
+        for (mt, wire) in [
+            (MessageType::Request, 0x00u8),
+            (MessageType::RequestNoReturn, 0x01),
+            (MessageType::Notification, 0x02),
+            (MessageType::Response, 0x80),
+            (MessageType::Error, 0x81),
+        ] {
+            let field = MessageTypeField::new(mt, false);
+            assert_eq!(u8::from(field), wire, "wire byte for {mt:?}");
+            assert_eq!(field.message_type(), mt, "round-trips back to {mt:?}");
+            let tp = MessageTypeField::new(mt, true);
+            assert_eq!(
+                u8::from(tp),
+                wire | MESSAGE_TYPE_TP_FLAG,
+                "wire byte for {mt:?} with TP flag"
+            );
+            assert_eq!(tp.message_type(), mt, "TP variant round-trips for {mt:?}");
+        }
     }
 
     // --- exhaustive u8 ---

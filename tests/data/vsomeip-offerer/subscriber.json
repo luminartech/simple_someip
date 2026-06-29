@@ -1,0 +1,36 @@
+{
+    "_comment": "vsomeip configuration for the phase-20h conformance subscriber. Mirror of offerer.json but registers as a `clients` consumer of service 0x1234 instance 0x0001 instead of `services` provider. Used to verify simple-someip's TX-direction SD wire format: simple-someip's Server::announcement_loop emits OfferService broadcasts, vsomeip subscribes, and its availability handler fires when the offer is recognized.",
+
+    "_unicast_comment": "Templated at container start by entrypoint.sh from VSOMEIP_UNICAST env var (same gotcha as offerer.json: Linux's lo lacks the MULTICAST flag, so SD multicast can't traverse it; pick a real interface IP).",
+    "unicast": "VSOMEIP_UNICAST_PLACEHOLDER",
+    "netmask": "255.255.255.0",
+    "logging": {
+        "level": "debug",
+        "console": "true"
+    },
+    "applications": [
+        { "name": "subscriber", "id": "0x1278" }
+    ],
+    "_clients_comment": "Port matches the simple-someip Server's `ADVERTISED_PORT` (30500 in tests/vsomeip_sd_compat.rs). subscriber.json is paired with the simple-someip Server in the TX-direction conformance test, NOT with offerer.json — offerer.json offers on its own port (30509) and is paired with simple-someip's Client in the RX direction. The two configs are independent.",
+    "clients": [
+        {
+            "service": "0x1234",
+            "instance": "0x0001",
+            "unreliable": [30500]
+        }
+    ],
+    "routing": "subscriber",
+    "service-discovery": {
+        "enable": "true",
+        "_multicast_comment": "Must match offerer.json and simple-someip's hardcoded MULTICAST_IP (239.255.0.255 in src/protocol/sd/mod.rs). vsomeip's spec default is 224.0.23.0 — we override here so the subscriber joins the group simple-someip actually broadcasts to. Future: make simple-someip's multicast group configurable so we can test against spec-default vsomeip.",
+        "multicast": "239.255.0.255",
+        "port": "30490",
+        "protocol": "udp",
+        "initial_delay_min": "10",
+        "initial_delay_max": "100",
+        "repetitions_base_delay": "200",
+        "repetitions_max": "3",
+        "ttl": "5",
+        "cyclic_offer_delay": "1000"
+    }
+}

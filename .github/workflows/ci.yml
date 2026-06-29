@@ -7,6 +7,24 @@ on:
     branches: [main]
   merge_group:
 
+# Every public feature EXCEPT `bare-metal-runtime`. That feature is no-alloc
+# and pulls a nightly-only crate feature (`impl_trait_in_assoc_type`), so it
+# is mutually exclusive with the alloc features (`std` / `_alloc` /
+# `embassy_channels`) and cannot share a `--all-features` build — it gets its
+# own nightly job (`bare-metal-runtime`). This list replaces the former
+# `--all-features` invocations on the alloc/host lane; keep it in sync when a
+# feature is added (or switch to `cargo hack --exclude-features bare-metal-runtime`).
+env:
+  ALLOC_FEATURES: std,tracing,client,client-tokio,server,server-tokio,bare_metal,embassy_channels
+  # Host/std feature set: `$ALLOC_FEATURES` minus the bare-metal flags
+  # (`bare_metal` + `embassy_channels`, which implies `bare_metal`). The
+  # server's runtime caps (`SUBSCRIBERS_PER_GROUP` etc.) share one set of
+  # consts whose *default* is tight under `bare_metal` and generous
+  # otherwise, so the std host tests must build WITHOUT `bare_metal` to get
+  # the generous defaults; the bare-metal-gated tests run separately at the
+  # tight defaults. The two default regimes cannot be unified into one build.
+  HOST_FEATURES: std,tracing,client,client-tokio,server,server-tokio
+
 jobs:
   check:
     name: Format & Lint
@@ -18,8 +36,52 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-features -- -D warnings -D clippy::pedantic
+      # `--workspace --all-features` activates every feature on every
+      # workspace member through cargo's feature unification, which
+      # gives strong "max coverage" but means that, e.g., a clippy
+      # regression triggered only by smoltcp's `proto-ipv6` (pulled in
+      # transitively via the embassy-net adapter under all-features)
+      # blocks merges on the parent simple-someip crate. The explicit
+      # per-feature passes below run clippy on `simple-someip` alone
+      # under the feature combos we actually ship, so a feature-set
+      # regression surfaces against its responsible feature flag
+      # rather than as workspace-wide noise.
+      #
+      # `$ALLOC_FEATURES` is every feature except `bare-metal-runtime` (which
+      # is no-alloc + nightly and runs in the `bare-metal-runtime` job); it
+      # replaces the former `--all-features` pass, which can no longer build
+      # once a no-alloc-only feature exists.
+      - run: cargo clippy --workspace --no-default-features --features $ALLOC_FEATURES -- -D warnings -D clippy::pedantic
       - run: cargo clippy --no-default-features -- -D warnings -D clippy::pedantic
+      - run: cargo clippy -p simple-someip --no-default-features --features client,bare_metal -- -D warnings -D clippy::pedantic
+      - run: cargo clippy -p simple-someip --no-default-features --features server,bare_metal -- -D warnings -D clippy::pedantic
+      - run: cargo clippy -p simple-someip --no-default-features --features client,server,bare_metal -- -D warnings -D clippy::pedantic
+
+  bare-metal-runtime:
+    name: Bare-metal runtime (nightly)
+    runs-on: ubuntu-latest
+    # The `bare-metal-runtime` feature is no-alloc and pulls the nightly-only
+    # `impl_trait_in_assoc_type` crate feature (embassy's static task pool), so
+    # it cannot be built on stable or alongside the alloc features the
+    # `check`/coverage jobs cover. Its own nightly lane: clippy under the
+    # feature combos it ships, plus a real no_std target build via build-std.
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rust-src
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p simple-someip --no-default-features --features bare-metal-runtime,client -- -D warnings -D clippy::pedantic
+      - run: cargo clippy -p simple-someip --no-default-features --features bare-metal-runtime,server -- -D warnings -D clippy::pedantic
+      # Compile for a real no_std target (no prebuilt core) — the gate that
+      # proves the runtime stays no_std / no-alloc.
+      - run: cargo build -Z build-std=core --target thumbv7em-none-eabihf --no-default-features --features bare-metal-runtime,client
+      - run: cargo build -Z build-std=core --target thumbv7em-none-eabihf --no-default-features --features bare-metal-runtime,server
+      - name: Doc — bare-metal-runtime
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --no-default-features --features bare-metal-runtime,client
 
   linear-history:
     name: Linear PR History
@@ -49,7 +111,142 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Scope to the alloc/host feature set: the default `all-features`
+      # group pulls `bare-metal-runtime`, which is no-alloc + nightly and
+      # fails to build (and document) alongside the alloc features, so
+      # rustdoc — and thus the whole check — aborts. The host API is what
+      # we semver-gate; the bare-metal lane is nightly-only.
       - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: only-explicit-features
+          features: std,tracing,client,client-tokio,server,server-tokio,bare_metal,embassy_channels
+
+  no_std_target:
+    # Cross-build for a true no_std target (cortex-m4f, no allocator,
+    # no std). This is the literal phase-18 gate from
+    # `bare_metal_plan_v3.md`: phases 4–17 shipped the trait surface
+    # and no-alloc primitives, but until this job is green the crate
+    # cannot actually be consumed on cortex-m. Each combination here
+    # is a separate `cargo build` so a failure surfaces the specific
+    # feature combo that regressed.
+    #
+    # Builds every bare-metal feature combo against the prebuilt
+    # thumbv7em sysroot, then audits the rlibs for allocator symbols.
+    # Since PR #124 BOTH `client + bare_metal` and `server +
+    # bare_metal` must be alloc-free; the build_std_core job below is
+    # the stronger sysroot-level certification, this audit is the
+    # cheap stable-toolchain tripwire that names the offending symbol
+    # when something regresses.
+    name: no_std target build (thumbv7em-none-eabihf)
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: bare_metal alone
+        run: cargo build --target thumbv7em-none-eabihf --no-default-features --features bare_metal
+      - name: server + bare_metal
+        run: cargo build --target thumbv7em-none-eabihf --no-default-features --features server,bare_metal
+      - name: client + server + bare_metal
+        run: cargo build --target thumbv7em-none-eabihf --no-default-features --features client,server,bare_metal
+      # Each audited combo below is a `cargo clean -p` + build
+      # immediately followed by its own alloc-symbol audit, so the
+      # rlib in target/thumbv7em-none-eabihf/debug/ is guaranteed to
+      # come from exactly that feature set when the audit reads it.
+      - name: client + bare_metal
+        run: |
+          # Invalidate the cargo fingerprint for any prior `simple-someip`
+          # rlib in this target so the audit step sees an artifact built
+          # under exactly `client,bare_metal` and not a leftover from
+          # `bare_metal alone` / `server + bare_metal` / `client + server +
+          # bare_metal` — `rm -f` of just the rlib does NOT invalidate the
+          # fingerprint, so the next build would no-op without rewriting
+          # it. `cargo clean -p` does both in one step.
+          cargo clean -p simple-someip --target thumbv7em-none-eabihf
+          cargo build --target thumbv7em-none-eabihf --no-default-features --features client,bare_metal
+      - name: alloc-symbol audit (client + bare_metal must be alloc-free)
+        # If `client + bare_metal` ever starts pulling `__rust_alloc`,
+        # something inside the client engine has regressed onto an
+        # allocator-bound primitive. Fail loudly so it gets caught in
+        # the PR rather than discovered downstream. (`server +
+        # bare_metal` gets the same audit below; the combined
+        # `client+server` build is covered by the build_std_core job.)
+        run: |
+          # Pin to the exact rlib path. `find ... | head -1` was
+          # nondeterministic and silently picked up stale debug-script
+          # artifacts. With `cargo clean -p` above, this path is
+          # guaranteed to be the artifact built by the previous step.
+          rlib="target/thumbv7em-none-eabihf/debug/libsimple_someip.rlib"
+          if [ ! -f "$rlib" ]; then
+            echo "::error::expected rlib not found at $rlib"
+            ls -la target/thumbv7em-none-eabihf/debug/ || true
+            exit 1
+          fi
+          # No `2>/dev/null` on `nm`: a tool failure (e.g. missing
+          # binutils, malformed rlib) used to swallow the error and
+          # report 0 alloc refs, silently letting a regression through.
+          # `set -o pipefail` plus visible stderr makes that loud.
+          set -o pipefail
+          alloc_refs=$(nm -A "$rlib" | grep -c -E '__rust_alloc|__rg_alloc' || true)
+          echo "client+bare_metal alloc-symbol references: $alloc_refs"
+          if [ "$alloc_refs" -ne 0 ]; then
+            echo "::error::client+bare_metal must be alloc-free; found $alloc_refs alloc references."
+            nm -A "$rlib" | grep -E '__rust_alloc|__rg_alloc' || true
+            exit 1
+          fi
+      - name: server + bare_metal rebuild for audit
+        run: |
+          # Same fingerprint-invalidation rationale as the client
+          # audit above: `cargo clean -p` guarantees the rlib below
+          # was built under exactly `server,bare_metal`.
+          cargo clean -p simple-someip --target thumbv7em-none-eabihf
+          cargo build --target thumbv7em-none-eabihf --no-default-features --features server,bare_metal
+      - name: alloc-symbol audit (server + bare_metal must be alloc-free)
+        # Alloc-free since PR #124 (phase 22). A regression here means
+        # something in the server engine reacquired an allocator-bound
+        # primitive — fail loudly and name the symbols.
+        run: |
+          rlib="target/thumbv7em-none-eabihf/debug/libsimple_someip.rlib"
+          if [ ! -f "$rlib" ]; then
+            echo "::error::expected rlib not found at $rlib"
+            ls -la target/thumbv7em-none-eabihf/debug/ || true
+            exit 1
+          fi
+          set -o pipefail
+          alloc_refs=$(nm -A "$rlib" | grep -c -E '__rust_alloc|__rg_alloc' || true)
+          echo "server+bare_metal alloc-symbol references: $alloc_refs"
+          if [ "$alloc_refs" -ne 0 ]; then
+            echo "::error::server+bare_metal must be alloc-free; found $alloc_refs alloc references."
+            nm -A "$rlib" | grep -E '__rust_alloc|__rg_alloc' || true
+            exit 1
+          fi
+
+  build_std_core:
+    # Halo's TC4 proxy compiles with `-Zbuild-std=core`: `alloc` is
+    # absent from the sysroot entirely. The prebuilt-sysroot thumb job
+    # above SHIPS alloc, so an `extern crate alloc` regression passes
+    # there and still breaks halo. This job is the halo-certification
+    # gate (phase 22 / measurement PR 0 — see
+    # docs/simple_someip/plans/2026-06-09-phase22-125-memory-reduction-design.md).
+    name: build-std core gate (no alloc in sysroot)
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: client + bare_metal
+        run: cargo +nightly build --no-default-features --features client,bare_metal -Zbuild-std=core --target thumbv7em-none-eabihf
+      - name: server + bare_metal
+        run: cargo +nightly build --no-default-features --features server,bare_metal -Zbuild-std=core --target thumbv7em-none-eabihf
+      - name: client + server + bare_metal
+        run: cargo +nightly build --no-default-features --features client,server,bare_metal -Zbuild-std=core --target thumbv7em-none-eabihf
 
   test:
     name: Build, Test & Coverage
@@ -65,7 +262,51 @@ jobs:
         with:
           tool: cargo-llvm-cov, cargo-nextest
       - run: cargo test --no-default-features
-      - run: cargo llvm-cov nextest --all-features --lcov --output-path ./target/lcov.info
+      - name: Build matrix — partial feature subsets
+        run: |
+          cargo build --no-default-features --features bare_metal
+          cargo build --no-default-features --features embassy_channels
+          cargo build --no-default-features --features client
+          cargo build --no-default-features --features server
+          cargo build --no-default-features --features client,server
+      - name: Doc — partial feature subsets (catch unresolved intra-doc links)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps --no-default-features --features client
+          cargo doc --no-deps --no-default-features --features server,bare_metal
+          # alloc/host lane (bare-metal-runtime docs build in its nightly job)
+          cargo doc --no-deps --no-default-features --features $ALLOC_FEATURES
+      - name: No-alloc witness (explicit gate)
+        run: cargo test --features client,bare_metal --test no_alloc_witness
+      - name: SD wire-format conformance (TX direction)
+        # `tx_announcement_loop_emits_wire_format_offer` is `#[ignore]`'d by
+        # default because it needs an interface with the `MULTICAST` link
+        # flag. CI's `lo` lacks it; flip it on, point the test at
+        # 127.0.0.1, and run just this one test (the rest of the file's
+        # ignored tests need an external vsomeip docker container — they
+        # stay skipped).
+        run: |
+          sudo ip link set lo multicast on
+          SIMPLE_SOMEIP_TEST_INTERFACE=127.0.0.1 \
+            cargo test --features client-tokio,server-tokio \
+              --test vsomeip_sd_compat \
+              tx_announcement_loop_emits_wire_format_offer \
+              -- --ignored --exact --nocapture
+      # Coverage is split so the std-default and bare-metal-default cap regimes
+      # are each exercised under their own feature config (they share one set of
+      # consts and cannot be unified into a single build — see `HOST_FEATURES`):
+      #  1. the host/std surface at the generous std default caps, and
+      #  2. the bare-metal-gated test binaries at the tight bare-metal defaults
+      #     (those binaries only build under the full alloc feature set).
+      # `--no-report` accumulates both into one profile; `report` emits the
+      # merged lcov. (`bare-metal-runtime` has no host tests — its target build
+      # is gated in the nightly `bare-metal-runtime` job.) The bare-metal run
+      # goes first so the host run's `junit.xml` (the comprehensive suite) is
+      # the one the test-results upload below picks up.
+      - run: cargo llvm-cov --no-report nextest --no-default-features --features $ALLOC_FEATURES -E 'binary(bare_metal_e2e) | binary(bare_metal_client_local) | binary(static_channels_alloc_witness)'
+      - run: cargo llvm-cov --no-report nextest --no-default-features --features $HOST_FEATURES
+      - run: cargo llvm-cov report --lcov --output-path ./target/lcov.info
       - name: Upload Coverage report
         uses: codecov/codecov-action@v5
         with:
@@ -104,5 +345,14 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features --no-run
-      - run: cargo test --all-features --lib
+      # Use `$HOST_FEATURES` (no `bare_metal`): this is a std/host portability
+      # check, and the server cap consts default tight under `bare_metal` —
+      # building with it would cap the `--lib` server tests to one subscriber
+      # per group and fail them. The dual-socket divert assertion lives in the
+      # `--lib` unit tests, which `$HOST_FEATURES` (client) still builds.
+      # `shell: bash` so `$HOST_FEATURES` expands on the Windows runner
+      # (default pwsh would not).
+      - run: cargo test --no-default-features --features $HOST_FEATURES --no-run
+        shell: bash
+      - run: cargo test --no-default-features --features $HOST_FEATURES --lib
+        shell: bash

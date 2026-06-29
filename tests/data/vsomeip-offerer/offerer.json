@@ -1,0 +1,35 @@
+{
+    "_comment": "vsomeip configuration for the phase-20f host-side conformance test offerer. Defaults follow the SOME/IP-SD spec (multicast 224.0.23.0:30490) so simple-someip's test-side Client picks up the broadcast without any non-default routing. The 'unicast' field is the vsomeip-side IP — 127.0.0.1 works on Linux Docker host-network mode because both sides share the loopback. For real-NIC testing, set unicast to the host interface IP and adjust the test's SIMPLE_SOMEIP_TEST_INTERFACE env var to match.",
+
+    "_unicast_comment": "Templated at container start by entrypoint.sh from VSOMEIP_UNICAST env var. Must be a non-loopback interface IP that has the MULTICAST flag (lo doesn't on Linux by default), so SD multicast 224.0.23.0 actually leaves the host. Pass via -e VSOMEIP_UNICAST=<your interface IP> on docker run.",
+    "unicast": "VSOMEIP_UNICAST_PLACEHOLDER",
+    "netmask": "255.255.255.0",
+    "logging": {
+        "level": "debug",
+        "console": "true"
+    },
+    "applications": [
+        { "name": "offerer", "id": "0x1277" }
+    ],
+    "services": [
+        {
+            "service": "0x1234",
+            "instance": "0x0001",
+            "unreliable": "30509"
+        }
+    ],
+    "routing": "offerer",
+    "service-discovery": {
+        "enable": "true",
+        "_multicast_comment": "simple-someip's default SD multicast is hardcoded to 239.255.0.255 (see src/protocol/sd/mod.rs:MULTICAST_IP — Luminar-internal-network style, predates spec-default alignment). vsomeip's default would be 224.0.23.0 (the SOME/IP-SD spec value). For these conformance tests we match simple-someip; future work should make simple-someip's multicast group configurable so we can test against spec-default vsomeip too.",
+        "multicast": "239.255.0.255",
+        "port": "30490",
+        "protocol": "udp",
+        "initial_delay_min": "10",
+        "initial_delay_max": "100",
+        "repetitions_base_delay": "200",
+        "repetitions_max": "3",
+        "ttl": "5",
+        "cyclic_offer_delay": "1000"
+    }
+}
