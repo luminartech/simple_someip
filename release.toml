@@ -1,4 +1,11 @@
+# Only `simple-someip` is ever released from this workspace. The examples and
+# `simple-someip-embassy-net` carry `publish = false` in their own manifests,
+# and CI publishes with `cargo release publish --package simple-someip` (see
+# .github/workflows/release.yml) — so `tag-name`/`tag-message` are unambiguous
+# and `shared-version = false` is safe (no second crate to collide tags with).
 shared-version = false
+# Disables auto-publish in the `cargo release <version>` bump+tag flow; the
+# actual publish is the deliberate, gated `cargo release publish` step in CI.
 publish = false
 registry = "crates-io"
 tag-name = "v{{version}}"
