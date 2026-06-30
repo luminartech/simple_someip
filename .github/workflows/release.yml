@@ -1,13 +1,17 @@
 name: Release
 
+# Tag-push only. Semver gating on PRs is already covered by
+# `CI / SemVer Check` in ci.yml (same action + feature set); this workflow's
+# job is the publish gate, so it only needs to run when a release tag lands.
 on:
   push:
     tags: ["v*"]
-  pull_request:
-    types: [opened, synchronize, reopened]
 
+# Read-only: no job creates tags/releases or pushes to the repo. semver-checks
+# only reads the tree; publish pushes to crates.io via CARGO_REGISTRY_TOKEN,
+# not the GITHUB_TOKEN.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   semver-checks:
