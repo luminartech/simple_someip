@@ -1,0 +1,62 @@
+name: Release
+
+# Tag-push only. Semver gating on PRs is already covered by
+# `CI / SemVer Check` in ci.yml (same action + feature set); this workflow's
+# job is the publish gate, so it only needs to run when a release tag lands.
+on:
+  push:
+    tags: ["v*"]
+
+# Read-only: no job creates tags/releases or pushes to the repo. semver-checks
+# only reads the tree; publish pushes to crates.io via CARGO_REGISTRY_TOKEN,
+# not the GITHUB_TOKEN.
+permissions:
+  contents: read
+
+jobs:
+  semver-checks:
+    name: Semver Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Scope to the alloc/host feature set, matching ci.yml's SemVer Check.
+      # The action's default `all-features` group unions `bare-metal-runtime`
+      # (no-alloc, nightly) with the alloc features, which trips the
+      # mutual-exclusion `compile_error!` in lib.rs — rustdoc fails to build
+      # and the whole check aborts. The host API is what we semver-gate; the
+      # bare-metal lane is nightly-only and checked elsewhere.
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: simple-someip
+          feature-group: only-explicit-features
+          features: std,tracing,client,client-tokio,server,server-tokio,bare_metal,embassy_channels
+
+  publish:
+    name: Publish to crates.io
+    needs: semver-checks
+    # GATED: enable by setting repo variable SIMPLE_SOMEIP_PUBLISH_ENABLED=true
+    # once the publish proxy is live and CARGO_REGISTRY_TOKEN exists in secrets.
+    if: github.event_name == 'push' && vars.SIMPLE_SOMEIP_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-release --version '^0.25' --locked
+      # --package simple-someip (NOT --workspace): `cargo release publish` is
+      # the explicit publish subcommand and does NOT honor the `publish = false`
+      # manifest flags on the examples / embassy-net member — `--workspace`
+      # makes it attempt to publish all 7 members and `cargo publish` then
+      # rejects the non-publishable ones. Only `simple-someip` is published.
+      # --allow-branch '*': a tag-push CI run is in detached-HEAD state, which
+      # cargo-release's branch check would otherwise reject. Publishing is
+      # already gated by the job `if:` above; this only relaxes the ref check.
+      - run: cargo release publish --package simple-someip --allow-branch '*' --no-confirm --execute
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

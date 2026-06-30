@@ -6,6 +6,7 @@ license = "MIT OR Apache-2.0"
 description = "embassy-net `TransportFactory` / `TransportSocket` adapter for the simple-someip crate"
 repository = "https://github.com/luminartech/simple_someip"
 readme = "README.md"
+publish = false
 
 # This crate is the reference no_std backend for `simple-someip`'s
 # trait surface. It depends on `simple-someip` with
