@@ -2597,4 +2597,147 @@ mod tests {
             "reboot_flag should be preserved across rebind"
         );
     }
+
+    /// Regression for ad515c3 (source-keyed registry): drives
+    /// `handle_discovery_datagram` — the production auto-registration
+    /// path — directly with real SD `OfferService` / `StopOfferService`
+    /// payloads (via `RawPayload`/`VecSdHeader`, which unlike the
+    /// `TestPayload` used elsewhere in this module actually implements
+    /// `for_each_offered_endpoint`), rather than poking the registry
+    /// map directly. Two devices offer the identical
+    /// `(service_id, instance_id)` — the fixed ECU-Extract-instance-id
+    /// scenario — and a `StopOfferService` from one device must evict
+    /// only that device's entry.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn handle_discovery_datagram_keys_offers_by_device_ip() {
+        use crate::RawPayload;
+        use crate::protocol::sd::{self, Entry, Options, OptionsCount, ServiceEntry};
+        use crate::traits::WireFormat;
+        use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+        type RawInner = Inner<
+            RawPayload,
+            TokioTimer,
+            Arc<Mutex<E2ERegistry>>,
+            TokioChannels,
+            crate::client::bind_dispatch::SpawnerDispatch<
+                TokioTransport,
+                TokioSpawner,
+                TokioBufferProvider,
+            >,
+        >;
+
+        const SERVICE_ID: u16 = 0x1234;
+        const INSTANCE_ID: u16 = 1;
+        const DEVICE_A: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 10);
+        const DEVICE_B: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 11);
+        const PORT_A: u16 = 30_509;
+        const PORT_B: u16 = 30_510;
+
+        fn offer_header(service_addr: SocketAddrV4, is_offer: bool) -> crate::VecSdHeader {
+            let service_entry = ServiceEntry {
+                index_first_options_run: 0,
+                index_second_options_run: 0,
+                options_count: OptionsCount::new(1, 0),
+                service_id: SERVICE_ID,
+                instance_id: INSTANCE_ID,
+                major_version: 1,
+                ttl: 3,
+                minor_version: 0,
+            };
+            let entry = if is_offer {
+                Entry::OfferService(service_entry)
+            } else {
+                Entry::StopOfferService(service_entry)
+            };
+            let endpoint = Options::IpV4Endpoint {
+                ip: *service_addr.ip(),
+                protocol: sd::TransportProtocol::Udp,
+                port: service_addr.port(),
+            };
+            crate::VecSdHeader {
+                flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+                entries: std::vec![entry],
+                options: std::vec![endpoint],
+            }
+        }
+
+        let mut session_tracker = SessionTracker::default();
+        let mut service_registry = ServiceRegistry::default();
+        let e2e_registry: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+        let (update_sender, _update_receiver) =
+            TokioChannels::unbounded::<ClientUpdate<RawPayload>>();
+
+        let addr_a = SocketAddrV4::new(DEVICE_A, PORT_A);
+        let addr_b = SocketAddrV4::new(DEVICE_B, PORT_B);
+
+        // Two OFFERs for the identical (service_id, instance_id) from two
+        // distinct device IPs — each arrives as its own SD datagram, exactly
+        // as real per-sender SD traffic does.
+        for (request_id, source_ip, service_addr) in
+            [(1u32, DEVICE_A, addr_a), (2u32, DEVICE_B, addr_b)]
+        {
+            let sd_header = offer_header(service_addr, true);
+            let someip_header = protocol::Header::new_sd(request_id, sd_header.required_size());
+            RawInner::handle_discovery_datagram(
+                SocketAddr::new(source_ip.into(), sd::MULTICAST_PORT),
+                TransportKind::Multicast,
+                someip_header,
+                sd_header,
+                &mut session_tracker,
+                &mut service_registry,
+                &e2e_registry,
+                &update_sender,
+            );
+        }
+
+        let key_a = ServiceEndpointKey {
+            service_id: SERVICE_ID,
+            instance_id: INSTANCE_ID,
+            source_ip: DEVICE_A,
+        };
+        let key_b = ServiceEndpointKey {
+            service_id: SERVICE_ID,
+            instance_id: INSTANCE_ID,
+            source_ip: DEVICE_B,
+        };
+        assert_eq!(
+            service_registry.get(key_a).map(|info| info.addr),
+            Some(addr_a),
+            "device A's offer must resolve to device A's address"
+        );
+        assert_eq!(
+            service_registry.get(key_b).map(|info| info.addr),
+            Some(addr_b),
+            "device A's second offer must not have shadowed device B's entry"
+        );
+
+        // StopOffer from device A only — device B's entry must survive.
+        // This is the exact "StopOffer evicts all" regression: before
+        // ad515c3, the registry was keyed by (service_id, instance_id)
+        // alone, so removing A's entry would have removed B's too.
+        let stop_header = offer_header(addr_a, false);
+        let someip_header = protocol::Header::new_sd(3, stop_header.required_size());
+        RawInner::handle_discovery_datagram(
+            SocketAddr::new(DEVICE_A.into(), sd::MULTICAST_PORT),
+            TransportKind::Multicast,
+            someip_header,
+            stop_header,
+            &mut session_tracker,
+            &mut service_registry,
+            &e2e_registry,
+            &update_sender,
+        );
+
+        assert!(
+            service_registry.get(key_a).is_none(),
+            "device A's entry must be evicted by its StopOffer"
+        );
+        assert_eq!(
+            service_registry.get(key_b).map(|info| info.addr),
+            Some(addr_b),
+            "device B's entry must survive device A's StopOffer"
+        );
+    }
 }
