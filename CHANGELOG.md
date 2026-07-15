@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.9.0]
+
+### Breaking
+- Client service registry is now keyed by `(service_id, instance_id, device IP)`
+  instead of `(service_id, instance_id)`, so multiple devices advertising the same
+  fixed instance id are tracked and addressed independently. `Client::subscribe`,
+  `subscribe_no_wait`, `send_to_service`, `remove_endpoint`, and `request` gain a
+  `target_ip: Ipv4Addr` parameter identifying the device. `add_endpoint` is
+  unchanged.
+
+### Added
+- `SIMPLE_SOMEIP_SERVICE_REGISTRY_CAP` build-time env override for the client
+  registry capacity (default 64).
+
 ## [0.8.0]
 
 ### Breaking — bare-metal server buffer extraction (PR #125 / PR 3)

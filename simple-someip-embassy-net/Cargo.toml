@@ -19,7 +19,7 @@ readme = "README.md"
 #
 
 [dependencies]
-simple-someip = { path = "..", version = "0.8", default-features = false, features = [
+simple-someip = { path = "..", version = "0.9", default-features = false, features = [
     "client",
     "server",
     "bare_metal",
