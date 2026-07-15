@@ -4,15 +4,22 @@ use heapless::index_map::FnvIndexMap;
 /// Maximum number of service-endpoint entries the registry can track.
 /// Must be a power of two ([`FnvIndexMap`] requirement). A real
 /// vehicle-side SOME/IP deployment typically tracks at most a few dozen
-/// services per ECU, so 32 is generous; bare-metal callers wanting a
+/// services per ECU, so 64 is generous; bare-metal callers wanting a
 /// tighter cap can fork. The cap exists so the registry is heap-free
 /// (`heapless::FnvIndexMap` stores entries inline).
-pub const SERVICE_REGISTRY_CAP: usize = 32;
+pub const SERVICE_REGISTRY_CAP: usize =
+    crate::from_env_or(option_env!("SIMPLE_SOMEIP_SERVICE_REGISTRY_CAP"), 64);
 
+/// Identifies one service instance ON A SPECIFIC DEVICE. The device IP is part
+/// of the key because a fixed (ECU-Extract) instance id is shared by every
+/// device on the subnet — keying without the source IP would collapse all of
+/// them onto one entry (last-writer-wins). Mirrors how `SessionTracker` keys
+/// per device by address.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ServiceInstanceId {
+pub struct ServiceEndpointKey {
     pub service_id: u16,
     pub instance_id: u16,
+    pub source_ip: core::net::Ipv4Addr,
 }
 
 #[derive(Clone, Debug)]
@@ -27,7 +34,7 @@ pub struct ServiceEndpointInfo {
 
 #[derive(Debug, Default)]
 pub struct ServiceRegistry {
-    endpoints: FnvIndexMap<ServiceInstanceId, ServiceEndpointInfo, SERVICE_REGISTRY_CAP>,
+    endpoints: FnvIndexMap<ServiceEndpointKey, ServiceEndpointInfo, SERVICE_REGISTRY_CAP>,
 }
 
 /// Returned by [`ServiceRegistry::insert`] when the registry is full.
@@ -35,27 +42,27 @@ pub struct ServiceRegistry {
 pub struct ServiceRegistryFull;
 
 impl ServiceRegistry {
-    /// Insert or replace the endpoint for `id`. Returns `Ok(())` whether
+    /// Insert or replace the endpoint for `key`. Returns `Ok(())` whether
     /// a previous value was replaced or this is a fresh entry. Returns
     /// `Err(ServiceRegistryFull)` if the registry is at
-    /// [`SERVICE_REGISTRY_CAP`] and `id` is not already present.
+    /// [`SERVICE_REGISTRY_CAP`] and `key` is not already present.
     pub fn insert(
         &mut self,
-        id: ServiceInstanceId,
+        key: ServiceEndpointKey,
         info: ServiceEndpointInfo,
     ) -> Result<(), ServiceRegistryFull> {
         self.endpoints
-            .insert(id, info)
+            .insert(key, info)
             .map(|_| ())
             .map_err(|_| ServiceRegistryFull)
     }
 
-    pub fn remove(&mut self, id: ServiceInstanceId) -> Option<ServiceEndpointInfo> {
-        self.endpoints.swap_remove(&id)
+    pub fn remove(&mut self, key: ServiceEndpointKey) -> Option<ServiceEndpointInfo> {
+        self.endpoints.swap_remove(&key)
     }
 
-    pub fn get(&self, id: ServiceInstanceId) -> Option<&ServiceEndpointInfo> {
-        self.endpoints.get(&id)
+    pub fn get(&self, key: ServiceEndpointKey) -> Option<&ServiceEndpointInfo> {
+        self.endpoints.get(&key)
     }
 }
 
@@ -64,61 +71,77 @@ mod tests {
     use super::*;
     use core::net::Ipv4Addr;
 
-    fn test_id(service: u16, instance: u16) -> ServiceInstanceId {
-        ServiceInstanceId {
+    fn key(service: u16, instance: u16, ip: Ipv4Addr) -> ServiceEndpointKey {
+        ServiceEndpointKey {
             service_id: service,
             instance_id: instance,
+            source_ip: ip,
         }
     }
-
-    fn test_info(port: u16) -> ServiceEndpointInfo {
+    fn info(ip: Ipv4Addr, port: u16) -> ServiceEndpointInfo {
         ServiceEndpointInfo {
-            addr: SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), port),
+            addr: SocketAddrV4::new(ip, port),
             local_port: 0,
             major_version: 1,
             minor_version: 0,
         }
     }
+    const A: Ipv4Addr = Ipv4Addr::LOCALHOST;
+    const B: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 
     #[test]
     fn insert_and_get() {
         let mut reg = ServiceRegistry::default();
-        let id = test_id(0x1234, 0x0001);
-        reg.insert(id, test_info(30000)).unwrap();
-        let info = reg.get(id).unwrap();
-        assert_eq!(info.addr.port(), 30000);
-        assert_eq!(info.major_version, 1);
+        reg.insert(key(0x47, 54, A), info(A, 30000)).unwrap();
+        assert_eq!(reg.get(key(0x47, 54, A)).unwrap().addr.port(), 30000);
     }
 
     #[test]
-    fn remove_returns_info() {
+    fn two_devices_same_service_instance_coexist() {
+        // The regression: identical (service, instance) from different device IPs
+        // must both persist and resolve independently.
         let mut reg = ServiceRegistry::default();
-        let id = test_id(0x1234, 0x0001);
-        reg.insert(id, test_info(30000)).unwrap();
-        let removed = reg.remove(id).unwrap();
-        assert_eq!(removed.addr.port(), 30000);
-        assert!(reg.get(id).is_none());
+        reg.insert(key(0x47, 54, A), info(A, 30001)).unwrap();
+        reg.insert(key(0x47, 54, B), info(B, 30002)).unwrap();
+        assert_eq!(
+            reg.get(key(0x47, 54, A)).unwrap().addr,
+            SocketAddrV4::new(A, 30001)
+        );
+        assert_eq!(
+            reg.get(key(0x47, 54, B)).unwrap().addr,
+            SocketAddrV4::new(B, 30002)
+        );
     }
 
     #[test]
-    fn overwrite_replaces_info() {
+    fn reinsert_same_key_replaces_in_place() {
         let mut reg = ServiceRegistry::default();
-        let id = test_id(0x1234, 0x0001);
-        reg.insert(id, test_info(30000)).unwrap();
-        reg.insert(id, test_info(40000)).unwrap();
-        assert_eq!(reg.get(id).unwrap().addr.port(), 40000);
+        reg.insert(key(0x47, 54, A), info(A, 30000)).unwrap();
+        reg.insert(key(0x47, 54, A), info(A, 40000)).unwrap();
+        assert_eq!(reg.get(key(0x47, 54, A)).unwrap().addr.port(), 40000);
+    }
+
+    #[test]
+    fn remove_one_device_leaves_the_other() {
+        // Regression for "StopOffer from one device evicted all".
+        let mut reg = ServiceRegistry::default();
+        reg.insert(key(0x47, 54, A), info(A, 30001)).unwrap();
+        reg.insert(key(0x47, 54, B), info(B, 30002)).unwrap();
+        assert!(reg.remove(key(0x47, 54, A)).is_some());
+        assert!(reg.get(key(0x47, 54, A)).is_none());
+        assert!(reg.get(key(0x47, 54, B)).is_some());
     }
 
     #[test]
     fn get_missing_returns_none() {
         let reg = ServiceRegistry::default();
-        assert!(reg.get(test_id(0xFFFF, 0xFFFF)).is_none());
+        assert!(reg.get(key(0xFFFF, 0xFFFF, A)).is_none());
     }
 
     #[test]
     fn remove_missing_returns_none() {
         let mut reg = ServiceRegistry::default();
-        assert!(reg.remove(test_id(0xFFFF, 0xFFFF)).is_none());
+        assert!(reg.remove(key(0xFFFF, 0xFFFF, A)).is_none());
     }
 
     #[test]
@@ -126,13 +149,12 @@ mod tests {
         let mut reg = ServiceRegistry::default();
         for i in 0..SERVICE_REGISTRY_CAP {
             #[allow(clippy::cast_possible_truncation)]
-            let id = test_id(i as u16, 0);
-            assert!(reg.insert(id, test_info(0)).is_ok());
+            let k = key(i as u16, 0, A);
+            assert!(reg.insert(k, info(A, 0)).is_ok());
         }
-        let overflow_id = test_id(0xFFFF, 0xFFFF);
         assert_eq!(
-            reg.insert(overflow_id, test_info(0)),
-            Err(ServiceRegistryFull),
+            reg.insert(key(0xFFFF, 0xFFFF, A), info(A, 0)),
+            Err(ServiceRegistryFull)
         );
     }
 
@@ -141,13 +163,10 @@ mod tests {
         let mut reg = ServiceRegistry::default();
         for i in 0..SERVICE_REGISTRY_CAP {
             #[allow(clippy::cast_possible_truncation)]
-            let id = test_id(i as u16, 0);
-            assert!(reg.insert(id, test_info(0)).is_ok());
+            let k = key(i as u16, 0, A);
+            assert!(reg.insert(k, info(A, 0)).is_ok());
         }
-        // Re-inserting an existing key replaces and does not require new
-        // capacity.
-        let existing = test_id(0, 0);
-        assert!(reg.insert(existing, test_info(9999)).is_ok());
-        assert_eq!(reg.get(existing).unwrap().addr.port(), 9999);
+        assert!(reg.insert(key(0, 0, A), info(A, 9999)).is_ok());
+        assert_eq!(reg.get(key(0, 0, A)).unwrap().addr.port(), 9999);
     }
 }

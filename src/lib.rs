@@ -295,10 +295,11 @@ pub use transport::{StaticE2EHandle, StaticE2EStorage};
 /// Returns `default` when the variable is absent or empty.
 /// Panics at compile time if the string contains a non-digit character.
 ///
-/// Gated on `server`: every caller lives in the server module or in the
-/// `bare-metal-runtime` runtime (which itself implies `server`), so a
-/// `client`-only / `bare_metal`-only build would otherwise see it as dead code.
-#[cfg(feature = "server")]
+/// Gated on `server`/`client`: every caller lives in the server module, the
+/// client module, or in the `bare-metal-runtime` runtime (which itself
+/// implies `server`), so a build with neither feature enabled would
+/// otherwise see it as dead code.
+#[cfg(any(feature = "server", feature = "client"))]
 pub(crate) const fn from_env_or(var: Option<&'static str>, default: usize) -> usize {
     match var {
         None => default,

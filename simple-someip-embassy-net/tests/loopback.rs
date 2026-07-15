@@ -818,7 +818,7 @@ async fn client_send_request_server_runloop_stable() {
             );
 
             let _pending = client
-                .send_to_service(service_id, instance_id, request)
+                .send_to_service(service_id, instance_id, IP_A, request)
                 .await
                 .expect("send_to_service over embassy-net");
 
