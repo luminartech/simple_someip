@@ -19,7 +19,7 @@ pub const SERVICE_REGISTRY_CAP: usize =
 pub struct ServiceEndpointKey {
     pub service_id: u16,
     pub instance_id: u16,
-    pub source_ip: core::net::Ipv4Addr,
+    pub source_ip: core::net::IpAddr,
 }
 
 #[derive(Clone, Debug)]
@@ -75,7 +75,7 @@ mod tests {
         ServiceEndpointKey {
             service_id: service,
             instance_id: instance,
-            source_ip: ip,
+            source_ip: ip.into(),
         }
     }
     fn info(ip: Ipv4Addr, port: u16) -> ServiceEndpointInfo {

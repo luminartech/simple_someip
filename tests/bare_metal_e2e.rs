@@ -546,7 +546,7 @@ async fn client_send_request_server_runloop_stable() {
 
     // Send request via the client API
     let pending = client
-        .send_to_service(service_id, instance_id, Ipv4Addr::LOCALHOST, request)
+        .send_to_service(service_id, instance_id, Ipv4Addr::LOCALHOST.into(), request)
         .await
         .expect("send_to_service");
 
@@ -967,7 +967,7 @@ async fn binding_sockets_claims_one_buffer_each_until_pool_exhausted() {
                 payload,
             );
             client
-                .send_to_service(svc, 1, *target.ip(), request)
+                .send_to_service(svc, 1, (*target.ip()).into(), request)
                 .await
                 .map(|_| ())
         }
@@ -1079,7 +1079,7 @@ async fn e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_err
     );
 
     let result = client
-        .send_to_service(service_id, 1, *server_addr.ip(), request)
+        .send_to_service(service_id, 1, (*server_addr.ip()).into(), request)
         .await;
 
     // Must return typed Capacity error — not panic.

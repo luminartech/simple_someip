@@ -7,8 +7,9 @@
   instead of `(service_id, instance_id)`, so multiple devices advertising the same
   fixed instance id are tracked and addressed independently. `Client::subscribe`,
   `subscribe_no_wait`, `send_to_service`, `remove_endpoint`, and `request` gain a
-  `target_ip: Ipv4Addr` parameter identifying the device. `add_endpoint` is
-  unchanged.
+  `target_ip: IpAddr` parameter identifying the device (version-agnostic
+  `core::net::IpAddr`; today's transports are IPv4-only, so only V4 entries are
+  ever registered). `add_endpoint` is unchanged.
 
 ### Added
 - `SIMPLE_SOMEIP_SERVICE_REGISTRY_CAP` build-time env override for the client

@@ -67,7 +67,7 @@ use crate::transport::{
     OneshotRecv, Spawner, TransportFactory, TransportSocket, UnboundedPooled, UnboundedRecv,
 };
 use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
-use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use core::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use inner::Inner;
 #[cfg(feature = "client-tokio")]
 use std::sync::{Arc, Mutex, RwLock};
@@ -951,7 +951,7 @@ where
         &self,
         service_id: u16,
         instance_id: u16,
-        target_ip: Ipv4Addr,
+        target_ip: IpAddr,
         major_version: u8,
         ttl: u32,
         event_group_id: u16,
@@ -1006,7 +1006,7 @@ where
         &self,
         service_id: u16,
         instance_id: u16,
-        target_ip: Ipv4Addr,
+        target_ip: IpAddr,
         major_version: u8,
         ttl: u32,
         event_group_id: u16,
@@ -1152,7 +1152,7 @@ where
         &self,
         service_id: u16,
         instance_id: u16,
-        target_ip: Ipv4Addr,
+        target_ip: IpAddr,
     ) -> Result<(), Error> {
         let (response, message) =
             ControlMessage::remove_endpoint(service_id, instance_id, target_ip);
@@ -1191,7 +1191,7 @@ where
         &self,
         service_id: u16,
         instance_id: u16,
-        target_ip: Ipv4Addr,
+        target_ip: IpAddr,
         message: crate::protocol::Message<MessageDefinitions>,
     ) -> Result<PendingResponse<MessageDefinitions, C>, Error> {
         let (send_rx, response_rx, ctrl_msg) =
@@ -1229,7 +1229,7 @@ where
         &self,
         service_id: u16,
         instance_id: u16,
-        target_ip: Ipv4Addr,
+        target_ip: IpAddr,
         message: crate::protocol::Message<MessageDefinitions>,
     ) -> Result<MessageDefinitions, Error> {
         let (send_rx, response_rx, ctrl_msg) =
@@ -1540,7 +1540,7 @@ mod tests {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let _run_handle = tokio::spawn(run_fut);
         let result = client
-            .subscribe(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST, 1, 3, 0x01, 0)
+            .subscribe(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into(), 1, 3, 0x01, 0)
             .await;
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),
@@ -1557,7 +1557,7 @@ mod tests {
         // when the service is unknown (the inner loop sends ServiceNotFound
         // on the dropped response channel, which is harmless).
         client
-            .subscribe_no_wait(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST, 1, 3, 0x01, 0)
+            .subscribe_no_wait(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into(), 1, 3, 0x01, 0)
             .await;
         client.shut_down();
     }
@@ -1583,7 +1583,7 @@ mod tests {
         // buffer size (4) to also exercise backpressure.
         for _ in 0..200 {
             client
-                .subscribe_no_wait(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST, 1, 3, 0x01, 0)
+                .subscribe_no_wait(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into(), 1, 3, 0x01, 0)
                 .await;
         }
 
@@ -1591,7 +1591,7 @@ mod tests {
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            client.request(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST, msg),
+            client.request(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into(), msg),
         )
         .await
         .expect("inner loop unresponsive after 200 subscribe_no_wait calls");
@@ -1636,7 +1636,7 @@ mod tests {
         let _run_handle = tokio::spawn(run_fut);
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         let result = client
-            .send_to_service(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST, msg)
+            .send_to_service(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into(), msg)
             .await;
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),
@@ -1652,7 +1652,10 @@ mod tests {
         let ep_ip = Ipv4Addr::new(192, 168, 1, 1);
         let addr = SocketAddrV4::new(ep_ip, 30000);
         client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
-        client.remove_endpoint(0x1234, 0x0001, ep_ip).await.unwrap();
+        client
+            .remove_endpoint(0x1234, 0x0001, ep_ip.into())
+            .await
+            .unwrap();
         client.shut_down();
     }
 
@@ -1709,7 +1712,7 @@ mod tests {
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         // send_to_service succeeds (send completes), returning a PendingResponse
         let pending = client
-            .send_to_service(0x1234, 0x0001, Ipv4Addr::LOCALHOST, msg)
+            .send_to_service(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), msg)
             .await;
         assert!(pending.is_ok());
         client.shut_down();
@@ -1765,7 +1768,7 @@ mod tests {
         let _run_handle = tokio::spawn(run_fut);
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         let result = client
-            .request(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST, msg)
+            .request(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into(), msg)
             .await;
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),
