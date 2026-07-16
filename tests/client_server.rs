@@ -26,6 +26,7 @@
 //! parallel. The fix is tracked alongside the bare-metal refactor
 //! (which will need to abstract the port anyway).
 
+use simple_someip::ServiceEndpointKey;
 use simple_someip::e2e::{E2ECheckStatus, E2EKey, E2EProfile, Profile4Config};
 use simple_someip::protocol::{Header, Message, MessageId, sd};
 use simple_someip::server::ServerConfig;
@@ -181,7 +182,13 @@ async fn test_client_server_subscribe_and_receive_event() {
         .await
         .unwrap();
     client
-        .subscribe(service_id, 1, SERVER_IP.into(), 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::new(service_id, 1, SERVER_IP.into()),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -266,7 +273,13 @@ async fn test_client_bind_unbind_lifecycle_with_server() {
         .await
         .unwrap();
     client
-        .subscribe(service_id, 1, SERVER_IP.into(), 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::new(service_id, 1, SERVER_IP.into()),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -304,7 +317,13 @@ async fn test_add_endpoint_and_send_to_service() {
 
     // Subscribe to server's event group (auto-binds unicast internally)
     client
-        .subscribe(service_id, 1, SERVER_IP.into(), 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::new(service_id, 1, SERVER_IP.into()),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -334,12 +353,15 @@ async fn test_add_endpoint_and_send_to_service() {
 
     // Remove the endpoint and verify send_to_service returns ServiceNotFound
     client
-        .remove_endpoint(service_id, 1, SERVER_IP.into())
+        .remove_endpoint(ServiceEndpointKey::new(service_id, 1, SERVER_IP.into()))
         .await
         .unwrap();
     let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
     let result = client
-        .send_to_service(service_id, 1, SERVER_IP.into(), msg)
+        .send_to_service(
+            ServiceEndpointKey::new(service_id, 1, SERVER_IP.into()),
+            msg,
+        )
         .await;
     assert!(
         matches!(result, Err(simple_someip::client::Error::ServiceNotFound)),
@@ -371,7 +393,13 @@ async fn test_subscribe_auto_binds_discovery() {
         .unwrap();
     // Subscribe should auto-bind discovery internally
     client
-        .subscribe(service_id, 1, SERVER_IP.into(), 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::new(service_id, 1, SERVER_IP.into()),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -418,7 +446,13 @@ async fn test_client_request_resolves_via_unicast_reply() {
         .await
         .unwrap();
     client
-        .subscribe(service_id, 1, SERVER_IP.into(), 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::new(service_id, 1, SERVER_IP.into()),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -434,7 +468,10 @@ async fn test_client_request_resolves_via_unicast_reply() {
     // which has a matching request_id, resolving it.
     let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
     let pending = client
-        .send_to_service(service_id, 1, SERVER_IP.into(), msg)
+        .send_to_service(
+            ServiceEndpointKey::new(service_id, 1, SERVER_IP.into()),
+            msg,
+        )
         .await
         .expect("send_to_service failed");
 
@@ -495,7 +532,13 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
         .await
         .unwrap();
     client
-        .subscribe(service_id, 1, SERVER_IP.into(), 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::new(service_id, 1, SERVER_IP.into()),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -560,7 +603,13 @@ async fn test_multiple_subscribers_receive_events() {
         .await
         .unwrap();
     client1
-        .subscribe(service_id, 1, SERVER_IP.into(), 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::new(service_id, 1, SERVER_IP.into()),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -572,7 +621,13 @@ async fn test_multiple_subscribers_receive_events() {
         .await
         .unwrap();
     client2
-        .subscribe(service_id, 1, SERVER_IP.into(), 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::new(service_id, 1, SERVER_IP.into()),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -666,7 +721,13 @@ async fn test_cloned_client_works() {
         .await
         .unwrap();
     client2
-        .subscribe(service_id, 1, SERVER_IP.into(), 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::new(service_id, 1, SERVER_IP.into()),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -694,12 +755,24 @@ async fn test_subscribe_specific_port_reuse() {
     // Use specific port
     let specific_port = 44444;
     client
-        .subscribe(service_id, 1, SERVER_IP.into(), 1, 3, 0x01, specific_port)
+        .subscribe(
+            ServiceEndpointKey::new(service_id, 1, SERVER_IP.into()),
+            1,
+            3,
+            0x01,
+            specific_port,
+        )
         .await
         .unwrap();
     // Second subscribe reuses the port
     client
-        .subscribe(service_id, 1, SERVER_IP.into(), 1, 3, 0x02, specific_port)
+        .subscribe(
+            ServiceEndpointKey::new(service_id, 1, SERVER_IP.into()),
+            1,
+            3,
+            0x02,
+            specific_port,
+        )
         .await
         .unwrap();
 
@@ -744,11 +817,23 @@ async fn test_two_devices_same_service_instance_addressed_independently() {
     // Distinct event groups so `has_subscribers`/`publish_event` on each
     // server can be checked independently.
     client
-        .subscribe(service_id, 1, DEVICE_A.into(), 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::new(service_id, 1, DEVICE_A.into()),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
     client
-        .subscribe(service_id, 1, DEVICE_B.into(), 1, 3, 0x02, 0)
+        .subscribe(
+            ServiceEndpointKey::new(service_id, 1, DEVICE_B.into()),
+            1,
+            3,
+            0x02,
+            0,
+        )
         .await
         .unwrap();
 
@@ -799,13 +884,13 @@ async fn test_two_devices_same_service_instance_addressed_independently() {
     // Removing device A's endpoint must not evict device B's — the fix for
     // "StopOffer/remove from one device evicted all".
     client
-        .remove_endpoint(service_id, 1, DEVICE_A.into())
+        .remove_endpoint(ServiceEndpointKey::new(service_id, 1, DEVICE_A.into()))
         .await
         .unwrap();
 
     let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
     let result_a = client
-        .send_to_service(service_id, 1, DEVICE_A.into(), msg)
+        .send_to_service(ServiceEndpointKey::new(service_id, 1, DEVICE_A.into()), msg)
         .await;
     assert!(
         matches!(result_a, Err(simple_someip::client::Error::ServiceNotFound)),
@@ -814,7 +899,7 @@ async fn test_two_devices_same_service_instance_addressed_independently() {
 
     let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
     let result_b = client
-        .send_to_service(service_id, 1, DEVICE_B.into(), msg)
+        .send_to_service(ServiceEndpointKey::new(service_id, 1, DEVICE_B.into()), msg)
         .await;
     assert!(
         result_b.is_ok(),

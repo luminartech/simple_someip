@@ -5,6 +5,12 @@
 > `Ipv4Addr` as this plan's snippets show. Semantics unchanged (IP-only device
 > identity); only the Rust type widened. Transports remain IPv4-only, so only
 > V4 keys are auto-registered today.
+>
+> **Amendment 2 (2026-07-16, implemented):** the public API shipped taking
+> `ServiceEndpointKey` itself (re-exported at the crate root, `new`
+> constructor, `Copy`) instead of loose `service_id`/`instance_id`/`target_ip`
+> parameters, and `ControlMessage` carries the key. Supersedes this plan's
+> per-method signatures; the key contents match the design.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

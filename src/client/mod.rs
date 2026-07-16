@@ -51,6 +51,7 @@ pub use error::Error;
 /// reference this type directly — the `define_static_channels!` macro
 /// (under `feature = "bare_metal"`) names it for them.
 pub use inner::ControlMessage;
+pub use service_registry::ServiceEndpointKey;
 /// Per-socket message types exposed for the same reason as
 /// [`ControlMessage`] — see its docstring.
 pub use socket_manager::{ReceivedMessage, SendMessage};
@@ -67,7 +68,7 @@ use crate::transport::{
     OneshotRecv, Spawner, TransportFactory, TransportSocket, UnboundedPooled, UnboundedRecv,
 };
 use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
-use core::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use inner::Inner;
 #[cfg(feature = "client-tokio")]
 use std::sync::{Arc, Mutex, RwLock};
@@ -937,7 +938,9 @@ where
         response.recv().await.map_err(|_| Error::Shutdown)?
     }
 
-    /// Subscribes to an event group on a known service.
+    /// Subscribes to an event group on a known service instance,
+    /// addressed by its [`ServiceEndpointKey`] (service id + instance id
+    /// + device IP).
     ///
     /// # Errors
     ///
@@ -946,26 +949,16 @@ where
     /// exited before this call (dropped, cancelled, or otherwise gone)
     /// — the `Client` handle has outlived its driver and further
     /// control-channel sends cannot make progress.
-    #[allow(clippy::too_many_arguments)] // +1 for target_ip (source-keyed registry)
     pub async fn subscribe(
         &self,
-        service_id: u16,
-        instance_id: u16,
-        target_ip: IpAddr,
+        key: ServiceEndpointKey,
         major_version: u8,
         ttl: u32,
         event_group_id: u16,
         client_port: u16,
     ) -> Result<(), Error> {
-        let (response, message) = ControlMessage::subscribe(
-            service_id,
-            instance_id,
-            target_ip,
-            major_version,
-            ttl,
-            event_group_id,
-            client_port,
-        );
+        let (response, message) =
+            ControlMessage::subscribe(key, major_version, ttl, event_group_id, client_port);
         self.control_sender
             .send(message)
             .await
@@ -1001,26 +994,16 @@ where
     /// fire-and-forget contract: callers that need to know whether the
     /// subscription was actually dispatched should use
     /// [`subscribe`](Self::subscribe) instead.
-    #[allow(clippy::too_many_arguments)] // +1 for target_ip (source-keyed registry)
     pub async fn subscribe_no_wait(
         &self,
-        service_id: u16,
-        instance_id: u16,
-        target_ip: IpAddr,
+        key: ServiceEndpointKey,
         major_version: u8,
         ttl: u32,
         event_group_id: u16,
         client_port: u16,
     ) {
-        let (_response, message) = ControlMessage::subscribe(
-            service_id,
-            instance_id,
-            target_ip,
-            major_version,
-            ttl,
-            event_group_id,
-            client_port,
-        );
+        let (_response, message) =
+            ControlMessage::subscribe(key, major_version, ttl, event_group_id, client_port);
         let _ = self.control_sender.send(message).await;
     }
 
@@ -1148,14 +1131,8 @@ where
     /// exited before this call (dropped, cancelled, or otherwise gone)
     /// — the `Client` handle has outlived its driver and further
     /// control-channel sends cannot make progress.
-    pub async fn remove_endpoint(
-        &self,
-        service_id: u16,
-        instance_id: u16,
-        target_ip: IpAddr,
-    ) -> Result<(), Error> {
-        let (response, message) =
-            ControlMessage::remove_endpoint(service_id, instance_id, target_ip);
+    pub async fn remove_endpoint(&self, key: ServiceEndpointKey) -> Result<(), Error> {
+        let (response, message) = ControlMessage::remove_endpoint(key);
         self.control_sender
             .send(message)
             .await
@@ -1189,13 +1166,10 @@ where
     /// control-channel sends cannot make progress.
     pub async fn send_to_service(
         &self,
-        service_id: u16,
-        instance_id: u16,
-        target_ip: IpAddr,
+        key: ServiceEndpointKey,
         message: crate::protocol::Message<MessageDefinitions>,
     ) -> Result<PendingResponse<MessageDefinitions, C>, Error> {
-        let (send_rx, response_rx, ctrl_msg) =
-            ControlMessage::send_to_service(service_id, instance_id, target_ip, message);
+        let (send_rx, response_rx, ctrl_msg) = ControlMessage::send_to_service(key, message);
         self.control_sender
             .send(ctrl_msg)
             .await
@@ -1227,13 +1201,10 @@ where
     /// control-channel sends cannot make progress.
     pub async fn request(
         &self,
-        service_id: u16,
-        instance_id: u16,
-        target_ip: IpAddr,
+        key: ServiceEndpointKey,
         message: crate::protocol::Message<MessageDefinitions>,
     ) -> Result<MessageDefinitions, Error> {
-        let (send_rx, response_rx, ctrl_msg) =
-            ControlMessage::send_to_service(service_id, instance_id, target_ip, message);
+        let (send_rx, response_rx, ctrl_msg) = ControlMessage::send_to_service(key, message);
         self.control_sender
             .send(ctrl_msg)
             .await
@@ -1540,7 +1511,13 @@ mod tests {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let _run_handle = tokio::spawn(run_fut);
         let result = client
-            .subscribe(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into(), 1, 3, 0x01, 0)
+            .subscribe(
+                ServiceEndpointKey::new(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into()),
+                1,
+                3,
+                0x01,
+                0,
+            )
             .await;
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),
@@ -1557,7 +1534,13 @@ mod tests {
         // when the service is unknown (the inner loop sends ServiceNotFound
         // on the dropped response channel, which is harmless).
         client
-            .subscribe_no_wait(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into(), 1, 3, 0x01, 0)
+            .subscribe_no_wait(
+                ServiceEndpointKey::new(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into()),
+                1,
+                3,
+                0x01,
+                0,
+            )
             .await;
         client.shut_down();
     }
@@ -1583,7 +1566,13 @@ mod tests {
         // buffer size (4) to also exercise backpressure.
         for _ in 0..200 {
             client
-                .subscribe_no_wait(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into(), 1, 3, 0x01, 0)
+                .subscribe_no_wait(
+                    ServiceEndpointKey::new(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into()),
+                    1,
+                    3,
+                    0x01,
+                    0,
+                )
                 .await;
         }
 
@@ -1591,7 +1580,10 @@ mod tests {
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            client.request(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into(), msg),
+            client.request(
+                ServiceEndpointKey::new(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into()),
+                msg,
+            ),
         )
         .await
         .expect("inner loop unresponsive after 200 subscribe_no_wait calls");
@@ -1636,7 +1628,10 @@ mod tests {
         let _run_handle = tokio::spawn(run_fut);
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         let result = client
-            .send_to_service(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into(), msg)
+            .send_to_service(
+                ServiceEndpointKey::new(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into()),
+                msg,
+            )
             .await;
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),
@@ -1653,7 +1648,7 @@ mod tests {
         let addr = SocketAddrV4::new(ep_ip, 30000);
         client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
         client
-            .remove_endpoint(0x1234, 0x0001, ep_ip.into())
+            .remove_endpoint(ServiceEndpointKey::new(0x1234, 0x0001, ep_ip.into()))
             .await
             .unwrap();
         client.shut_down();
@@ -1712,7 +1707,10 @@ mod tests {
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         // send_to_service succeeds (send completes), returning a PendingResponse
         let pending = client
-            .send_to_service(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), msg)
+            .send_to_service(
+                ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
+                msg,
+            )
             .await;
         assert!(pending.is_ok());
         client.shut_down();
@@ -1768,7 +1766,10 @@ mod tests {
         let _run_handle = tokio::spawn(run_fut);
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         let result = client
-            .request(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into(), msg)
+            .request(
+                ServiceEndpointKey::new(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into()),
+                msg,
+            )
             .await;
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),

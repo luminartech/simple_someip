@@ -262,6 +262,7 @@ pub use traits::{OfferedEndpoint, PayloadWireFormat, WireFormat};
 #[cfg(feature = "client")]
 pub use client::{
     Client, ClientDeps, ClientUpdate, ClientUpdates, DiscoveryMessage, PendingResponse,
+    ServiceEndpointKey,
 };
 // `ClientChannelTypes`, `ControlMessage`, `SendMessage`, `ReceivedMessage`
 // are intentionally NOT re-exported at crate root — they are

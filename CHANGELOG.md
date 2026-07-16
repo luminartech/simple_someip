@@ -6,10 +6,15 @@
 - Client service registry is now keyed by `(service_id, instance_id, device IP)`
   instead of `(service_id, instance_id)`, so multiple devices advertising the same
   fixed instance id are tracked and addressed independently. `Client::subscribe`,
-  `subscribe_no_wait`, `send_to_service`, `remove_endpoint`, and `request` gain a
-  `target_ip: IpAddr` parameter identifying the device (version-agnostic
-  `core::net::IpAddr`; today's transports are IPv4-only, so only V4 entries are
-  ever registered). `add_endpoint` is unchanged.
+  `subscribe_no_wait`, `send_to_service`, `remove_endpoint`, and `request` now
+  take a `ServiceEndpointKey { service_id, instance_id, source_ip }` (new public
+  type, re-exported at the crate root) in place of the loose
+  `service_id` / `instance_id` parameters — build one per (service, device) pair
+  with `ServiceEndpointKey::new(service_id, instance_id, ip)` and reuse it (it is
+  `Copy`). The device IP is the version-agnostic `core::net::IpAddr`; today's
+  transports are IPv4-only, so only V4 entries are ever registered.
+  `add_endpoint` is unchanged (it still takes the full `SocketAddrV4` and derives
+  the key).
 
 ### Added
 - `SIMPLE_SOMEIP_SERVICE_REGISTRY_CAP` build-time env override for the client

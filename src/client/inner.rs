@@ -57,11 +57,9 @@ pub enum ControlMessage<P: PayloadWireFormat + 'static, C: ChannelFactory> {
         u16,
         C::OneshotSender<Result<(), Error>>,
     ),
-    RemoveEndpoint(u16, u16, IpAddr, C::OneshotSender<Result<(), Error>>),
+    RemoveEndpoint(ServiceEndpointKey, C::OneshotSender<Result<(), Error>>),
     SendToService {
-        service_id: u16,
-        instance_id: u16,
-        target_ip: IpAddr,
+        key: ServiceEndpointKey,
         message: Message<P>,
         /// Fires when the UDP send completes (or errors on lookup/bind).
         send_complete: C::OneshotSender<Result<(), Error>>,
@@ -69,9 +67,7 @@ pub enum ControlMessage<P: PayloadWireFormat + 'static, C: ChannelFactory> {
         response: C::OneshotSender<Result<P, Error>>,
     },
     Subscribe {
-        service_id: u16,
-        instance_id: u16,
-        target_ip: IpAddr,
+        key: ServiceEndpointKey,
         major_version: u8,
         ttl: u32,
         event_group_id: u16,
@@ -103,36 +99,19 @@ impl<P: PayloadWireFormat + 'static, C: ChannelFactory> core::fmt::Debug for Con
                 .field(addr)
                 .field(local_port)
                 .finish(),
-            Self::RemoveEndpoint(sid, iid, target_ip, _) => f
-                .debug_tuple("RemoveEndpoint")
-                .field(sid)
-                .field(iid)
-                .field(target_ip)
-                .finish(),
-            Self::SendToService {
-                service_id,
-                instance_id,
-                target_ip,
-                message,
-                ..
-            } => f
+            Self::RemoveEndpoint(key, _) => f.debug_tuple("RemoveEndpoint").field(key).finish(),
+            Self::SendToService { key, message, .. } => f
                 .debug_struct("SendToService")
-                .field("service_id", service_id)
-                .field("instance_id", instance_id)
-                .field("target_ip", target_ip)
+                .field("key", key)
                 .field("message", message)
                 .finish_non_exhaustive(),
             Self::Subscribe {
-                service_id,
-                instance_id,
-                target_ip,
+                key,
                 event_group_id,
                 ..
             } => f
                 .debug_struct("Subscribe")
-                .field("service_id", service_id)
-                .field("instance_id", instance_id)
-                .field("target_ip", target_ip)
+                .field("key", key)
                 .field("event_group_id", event_group_id)
                 .finish_non_exhaustive(),
             Self::QueryRebootFlag(_) => f.write_str("QueryRebootFlag"),
@@ -193,23 +172,16 @@ where
 
     #[must_use]
     pub fn remove_endpoint(
-        service_id: u16,
-        instance_id: u16,
-        target_ip: IpAddr,
+        key: ServiceEndpointKey,
     ) -> (C::OneshotReceiver<Result<(), Error>>, Self) {
         let (sender, receiver) = C::oneshot();
-        (
-            receiver,
-            Self::RemoveEndpoint(service_id, instance_id, target_ip, sender),
-        )
+        (receiver, Self::RemoveEndpoint(key, sender))
     }
 
     #[allow(clippy::type_complexity)]
     #[must_use]
     pub fn send_to_service(
-        service_id: u16,
-        instance_id: u16,
-        target_ip: IpAddr,
+        key: ServiceEndpointKey,
         message: Message<P>,
     ) -> (
         C::OneshotReceiver<Result<(), Error>>,
@@ -222,9 +194,7 @@ where
             send_complete_rx,
             response_rx,
             Self::SendToService {
-                service_id,
-                instance_id,
-                target_ip,
+                key,
                 message,
                 send_complete: send_complete_tx,
                 response: response_tx,
@@ -234,9 +204,7 @@ where
 
     #[must_use]
     pub fn subscribe(
-        service_id: u16,
-        instance_id: u16,
-        target_ip: IpAddr,
+        key: ServiceEndpointKey,
         major_version: u8,
         ttl: u32,
         event_group_id: u16,
@@ -246,9 +214,7 @@ where
         (
             receiver,
             Self::Subscribe {
-                service_id,
-                instance_id,
-                target_ip,
+                key,
                 major_version,
                 ttl,
                 event_group_id,
@@ -294,7 +260,7 @@ where
             | Self::UnbindDiscovery(response)
             | Self::SendSD(_, _, response)
             | Self::AddEndpoint(_, _, _, _, response)
-            | Self::RemoveEndpoint(_, _, _, response)
+            | Self::RemoveEndpoint(_, response)
             | Self::Subscribe { response, .. } => {
                 let _ = response.send(Err(Error::Capacity(structure_name)));
             }
@@ -961,33 +927,22 @@ where
                         debug!("AddEndpoint: caller dropped the response receiver");
                     }
                 }
-                ControlMessage::RemoveEndpoint(service_id, instance_id, target_ip, response) => {
-                    self.service_registry.remove(ServiceEndpointKey {
-                        service_id,
-                        instance_id,
-                        source_ip: target_ip,
-                    });
+                ControlMessage::RemoveEndpoint(key, response) => {
+                    self.service_registry.remove(key);
                     debug!(
                         "Removed endpoint for service 0x{:04X}.0x{:04X} (device {})",
-                        service_id, instance_id, target_ip,
+                        key.service_id, key.instance_id, key.source_ip,
                     );
                     if response.send(Ok(())).is_err() {
                         debug!("RemoveEndpoint: caller dropped the response receiver");
                     }
                 }
                 ControlMessage::SendToService {
-                    service_id,
-                    instance_id,
-                    target_ip,
+                    key,
                     mut message,
                     send_complete,
                     response,
                 } => {
-                    let key = ServiceEndpointKey {
-                        service_id,
-                        instance_id,
-                        source_ip: target_ip,
-                    };
                     let Some(endpoint) = self.service_registry.get(key) else {
                         let _ = send_complete.send(Err(Error::ServiceNotFound));
                         return;
@@ -1076,9 +1031,7 @@ where
                     }
                 }
                 ControlMessage::Subscribe {
-                    service_id,
-                    instance_id,
-                    target_ip,
+                    key,
                     major_version,
                     ttl,
                     event_group_id,
@@ -1086,11 +1039,6 @@ where
                     response,
                 } => {
                     // Look up endpoint from service registry
-                    let key = ServiceEndpointKey {
-                        service_id,
-                        instance_id,
-                        source_ip: target_ip,
-                    };
                     if self.service_registry.get(key).is_none() {
                         if response.send(Err(Error::ServiceNotFound)).is_err() {
                             debug!(
@@ -1132,9 +1080,7 @@ where
                                 // hit.
                                 if let Err(rejected) =
                                     self.request_queue.push_front(ControlMessage::Subscribe {
-                                        service_id,
-                                        instance_id,
-                                        target_ip,
+                                        key,
                                         major_version,
                                         ttl,
                                         event_group_id,
@@ -1158,8 +1104,8 @@ where
                         },
                         Some(discovery_socket) => {
                             let sd_header = PayloadDefinitions::new_subscription_sd_header(
-                                service_id,
-                                instance_id,
+                                key.service_id,
+                                key.instance_id,
                                 major_version,
                                 ttl,
                                 event_group_id,
@@ -1405,16 +1351,27 @@ mod tests {
         let (_rx, msg) = TestControl::add_endpoint(0x1234, 0x0001, addr, 0);
         assert!(matches!(msg, ControlMessage::AddEndpoint(..)));
 
-        let (_rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into());
+        let (_rx, msg) = TestControl::remove_endpoint(ServiceEndpointKey::new(
+            0x1234,
+            0x0001,
+            Ipv4Addr::LOCALHOST.into(),
+        ));
         assert!(matches!(msg, ControlMessage::RemoveEndpoint(..)));
 
         let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
-        let (_send_rx, _resp_rx, msg) =
-            TestControl::send_to_service(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), message);
+        let (_send_rx, _resp_rx, msg) = TestControl::send_to_service(
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
+            message,
+        );
         assert!(matches!(msg, ControlMessage::SendToService { .. }));
 
-        let (_rx, msg) =
-            TestControl::subscribe(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), 1, 3, 0x01, 0);
+        let (_rx, msg) = TestControl::subscribe(
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
+            1,
+            3,
+            0x01,
+            0,
+        );
         assert!(matches!(msg, ControlMessage::Subscribe { .. }));
     }
 
@@ -1462,12 +1419,21 @@ mod tests {
         msg.reject_with_capacity("request_queue");
         expect_capacity(rx.recv(), "AddEndpoint");
 
-        let (rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into());
+        let (rx, msg) = TestControl::remove_endpoint(ServiceEndpointKey::new(
+            0x1234,
+            0x0001,
+            Ipv4Addr::LOCALHOST.into(),
+        ));
         msg.reject_with_capacity("request_queue");
         expect_capacity(rx.recv(), "RemoveEndpoint");
 
-        let (rx, msg) =
-            TestControl::subscribe(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), 1, 3, 0x01, 0);
+        let (rx, msg) = TestControl::subscribe(
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
+            1,
+            3,
+            0x01,
+            0,
+        );
         msg.reject_with_capacity("request_queue");
         expect_capacity(rx.recv(), "Subscribe");
 
@@ -1475,8 +1441,10 @@ mod tests {
         // neither `send_rx.recv().await.unwrap()?` nor `PendingResponse::response()`
         // panics.
         let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
-        let (send_rx, resp_rx, msg) =
-            TestControl::send_to_service(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), message);
+        let (send_rx, resp_rx, msg) = TestControl::send_to_service(
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
+            message,
+        );
         msg.reject_with_capacity("request_queue");
         expect_capacity(send_rx.recv(), "SendToService.send_complete");
         // resp_rx has type Result<TestPayload, Error> — check it separately
@@ -1512,20 +1480,31 @@ mod tests {
         let s = format!("{msg:?}");
         assert!(s.contains("AddEndpoint"));
 
-        let (_rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into());
+        let (_rx, msg) = TestControl::remove_endpoint(ServiceEndpointKey::new(
+            0x1234,
+            0x0001,
+            Ipv4Addr::LOCALHOST.into(),
+        ));
         let s = format!("{msg:?}");
         assert!(s.contains("RemoveEndpoint"));
 
         let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
-        let (_send_rx, _resp_rx, msg) =
-            TestControl::send_to_service(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), message);
+        let (_send_rx, _resp_rx, msg) = TestControl::send_to_service(
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
+            message,
+        );
         let s = format!("{msg:?}");
         assert!(s.contains("SendToService"));
         assert!(s.contains("service_id"));
         assert!(s.contains("instance_id"));
 
-        let (_rx, msg) =
-            TestControl::subscribe(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), 1, 3, 0x01, 0);
+        let (_rx, msg) = TestControl::subscribe(
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
+            1,
+            3,
+            0x01,
+            0,
+        );
         let s = format!("{msg:?}");
         assert!(s.contains("Subscribe"));
         assert!(s.contains("service_id"));
@@ -2036,8 +2015,10 @@ mod tests {
     #[tokio::test]
     async fn test_send_to_service_constructor_returns_two_receivers() {
         let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
-        let (send_rx, resp_rx, msg) =
-            TestControl::send_to_service(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), message);
+        let (send_rx, resp_rx, msg) = TestControl::send_to_service(
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
+            message,
+        );
 
         // Extract the senders from the control message
         if let ControlMessage::SendToService {
@@ -2099,7 +2080,11 @@ mod tests {
         );
         let _run_handle = tokio::spawn(run_fut);
 
-        let (rx, msg) = TestControl::remove_endpoint(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into());
+        let (rx, msg) = TestControl::remove_endpoint(ServiceEndpointKey::new(
+            0x1234,
+            0x0001,
+            Ipv4Addr::LOCALHOST.into(),
+        ));
         drop(rx);
         control_sender.send(msg).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2130,8 +2115,10 @@ mod tests {
 
         // Send SendToService with the send_complete receiver dropped
         let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
-        let (send_rx, _resp_rx, msg) =
-            TestControl::send_to_service(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), message);
+        let (send_rx, _resp_rx, msg) = TestControl::send_to_service(
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
+            message,
+        );
         drop(send_rx);
         control_sender.send(msg).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2236,8 +2223,10 @@ mod tests {
         rx.recv().await.unwrap().unwrap();
 
         let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
-        let (send_rx, _resp_rx, msg) =
-            TestControl::send_to_service(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), message);
+        let (send_rx, _resp_rx, msg) = TestControl::send_to_service(
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
+            message,
+        );
         control_sender.send(msg).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), send_rx.recv())
             .await
@@ -2274,8 +2263,13 @@ mod tests {
         rx.recv().await.unwrap().unwrap();
 
         // Subscribe
-        let (rx, msg) =
-            TestControl::subscribe(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), 1, 3, 0x01, 0);
+        let (rx, msg) = TestControl::subscribe(
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
+            1,
+            3,
+            0x01,
+            0,
+        );
         control_sender.send(msg).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
@@ -2307,8 +2301,13 @@ mod tests {
         rx.recv().await.unwrap().unwrap();
 
         // Subscribe should auto-bind discovery
-        let (rx, msg) =
-            TestControl::subscribe(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), 1, 3, 0x01, 0);
+        let (rx, msg) = TestControl::subscribe(
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
+            1,
+            3,
+            0x01,
+            0,
+        );
         control_sender.send(msg).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
@@ -2332,8 +2331,13 @@ mod tests {
         );
         let _run_handle = tokio::spawn(run_fut);
 
-        let (rx, msg) =
-            TestControl::subscribe(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into(), 1, 3, 0x01, 0);
+        let (rx, msg) = TestControl::subscribe(
+            ServiceEndpointKey::new(0xFFFF, 0xFFFF, Ipv4Addr::LOCALHOST.into()),
+            1,
+            3,
+            0x01,
+            0,
+        );
         control_sender.send(msg).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
@@ -2365,15 +2369,19 @@ mod tests {
 
         // First send auto-binds unicast
         let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
-        let (send_rx, _resp_rx, msg) =
-            TestControl::send_to_service(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), message);
+        let (send_rx, _resp_rx, msg) = TestControl::send_to_service(
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
+            message,
+        );
         control_sender.send(msg).await.unwrap();
         send_rx.recv().await.unwrap().unwrap();
 
         // Second send reuses the existing socket (no auto-bind needed)
         let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
-        let (send_rx, _resp_rx, msg) =
-            TestControl::send_to_service(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), message);
+        let (send_rx, _resp_rx, msg) = TestControl::send_to_service(
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
+            message,
+        );
         control_sender.send(msg).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), send_rx.recv())
             .await
@@ -2401,8 +2409,13 @@ mod tests {
         );
         let _run_handle = tokio::spawn(run_fut);
 
-        let (rx, msg) =
-            TestControl::subscribe(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into(), 1, 3, 0x01, 0);
+        let (rx, msg) = TestControl::subscribe(
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
+            1,
+            3,
+            0x01,
+            0,
+        );
         drop(rx);
         control_sender.send(msg).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2506,9 +2519,7 @@ mod tests {
 
         // First subscribe with specific port — binds the port
         let (rx, msg) = TestControl::subscribe(
-            0x1234,
-            0x0001,
-            Ipv4Addr::LOCALHOST.into(),
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
             1,
             3,
             0x01,
@@ -2523,9 +2534,7 @@ mod tests {
 
         // Second subscribe with the same port — reuses the existing socket
         let (rx, msg) = TestControl::subscribe(
-            0x1234,
-            0x0001,
-            Ipv4Addr::LOCALHOST.into(),
+            ServiceEndpointKey::new(0x1234, 0x0001, Ipv4Addr::LOCALHOST.into()),
             1,
             3,
             0x02,

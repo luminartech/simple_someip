@@ -48,6 +48,15 @@ The bare-metal / `no_std` codec path does not use this registry; it is a
 > bake in IPv4 while the SD protocol layer already parses IPv6 endpoint
 > options. Today's transports remain IPv4-only, so only V4 keys are ever
 > auto-registered.
+>
+> **Amendment 2 (2026-07-16):** the public addressing API shipped taking
+> `ServiceEndpointKey` itself (re-exported at the crate root, with a `new`
+> constructor) instead of loose `service_id` / `instance_id` / `target_ip`
+> parameters — `subscribe(key, major_version, ttl, event_group_id,
+> client_port)`, `remove_endpoint(key)`, `send_to_service(key, message)`,
+> `request(key, message)`. The `ControlMessage` variants carry the key too.
+> This supersedes this doc's per-method parameter tables; the key's *contents*
+> are exactly as designed below.
 
 - **Key device identity by `Ipv4Addr`, not full `SocketAddrV4`.** One IP per
   physical device; the port for a given service is fixed and is retained in the

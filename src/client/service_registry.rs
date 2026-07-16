@@ -15,11 +15,29 @@ pub const SERVICE_REGISTRY_CAP: usize =
 /// device on the subnet — keying without the source IP would collapse all of
 /// them onto one entry (last-writer-wins). Mirrors how `SessionTracker` keys
 /// per device by address.
+///
+/// This is both the client service-registry key and the public addressing
+/// handle: [`Client::subscribe`](crate::Client::subscribe),
+/// [`send_to_service`](crate::Client::send_to_service),
+/// [`request`](crate::Client::request), and
+/// [`remove_endpoint`](crate::Client::remove_endpoint) all take one. Build it
+/// once per (service, device) pair and reuse it — it is `Copy`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ServiceEndpointKey {
     pub service_id: u16,
     pub instance_id: u16,
     pub source_ip: core::net::IpAddr,
+}
+
+impl ServiceEndpointKey {
+    #[must_use]
+    pub const fn new(service_id: u16, instance_id: u16, source_ip: core::net::IpAddr) -> Self {
+        Self {
+            service_id,
+            instance_id,
+            source_ip,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
