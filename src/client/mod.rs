@@ -17,14 +17,14 @@
 //!
 //! ## Sizing the pool
 //!
-//! Bare-metal callers should size their pool at **`(max concurrent sockets)
-//! + 1`** slots, not exactly the socket count. The unicast-eviction path
+//! Bare-metal callers should size their pool at **`(max concurrent
+//! sockets) + 1`** slots, not exactly the socket count. The unicast-eviction path
 //! frees a buffer lease asynchronously (when the spawned loop future drops),
 //! lagging the synchronous registry removal, so an evict-then-immediate-rebind
 //! can transiently need one extra slot; without the `+ 1` slack that surfaces
 //! as a spurious `Capacity("udp_buffer")`. The tokio provider already bakes
-//! this in (it sizes its pool at 10 = `UNICAST_SOCKETS_CAP (8) + 1 discovery
-//! + 1 release-lag`).
+//! this in (it sizes its pool at 10 = `UNICAST_SOCKETS_CAP (8) + 1
+//! discovery + 1 release-lag`).
 //!
 //! ## Minimum slot length
 //!

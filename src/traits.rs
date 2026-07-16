@@ -38,7 +38,11 @@ pub trait WireFormat: Send + Sized + Sync {
     /// Returns an error if `buf` is too small (requires at least
     /// [`required_size()`](Self::required_size) bytes).
     fn encode_to_slice(&self, buf: &mut [u8]) -> Result<usize, protocol::Error> {
-        self.encode(&mut &mut *buf)
+        // `embedded_io::Write` is implemented for `&mut [u8]` (the writer
+        // advances the slice), so the writer passed to `encode` is a
+        // reborrow of `buf` — named to avoid a `&mut &mut` expression.
+        let mut writer: &mut [u8] = buf;
+        self.encode(&mut writer)
     }
 
     /// Encode into a newly allocated `Vec<u8>`.
