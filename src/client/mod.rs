@@ -33,7 +33,7 @@
 //! enforces this floor with a compile-time `const` assertion. 16 is only the
 //! absolute header minimum: the practical floor is the largest expected
 //! message (header + payload), realistically one full UDP datagram
-//! ([`UDP_BUFFER_SIZE`](crate::UDP_BUFFER_SIZE)).
+//! ([`UDP_BUFFER_SIZE`]).
 //!
 //! See `docs/simple_someip/plans/2026-06-09-phase22-125-memory-reduction-design.md`.
 mod bind_dispatch;
