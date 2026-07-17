@@ -46,7 +46,7 @@ use crate::{
     buffer_pool::BufferLease,
     e2e::{E2ECheckStatus, E2EKey},
     protocol::{Message, MessageView, sd},
-    traits::{PayloadWireFormat, WireFormat},
+    traits::PayloadWireFormat,
     transport::{
         ChannelFactory, E2ERegistryHandle, LocalSpawner, MpscRecv, MpscSend, OneshotRecv,
         OneshotSend, ReceivedDatagram, SocketOptions, Spawner, TransportFactory, TransportSocket,
@@ -55,6 +55,7 @@ use crate::{
 
 use super::error::Error;
 use crate::log::{debug, error, info, trace, warn};
+use automotive_wire_codec::Encode;
 use core::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     task::{Context, Poll},
@@ -557,7 +558,9 @@ where
         // overload signal regardless of which path produced the oversize
         // message. Without this, an oversize encode would surface as a
         // protocol-level I/O error from inside the socket loop.
-        let required = message.required_size();
+        let required = message
+            .encoded_size()
+            .expect("Message encoded_size is closed-form and cannot fail");
         // Coarse fail-fast: `send()` has no leased buffer in scope, so
         // UDP_BUFFER_SIZE is the only bound available here.  The socket
         // loop's `buf.len()` check is the authoritative guard; E2E
@@ -727,7 +730,10 @@ where
                     // a caller-sized bare-metal pool may hand out a buffer
                     // smaller than `UDP_BUFFER_SIZE`, and the message must fit
                     // the buffer we actually encode into.
-                    let required = send_message.message.required_size();
+                    let required = send_message
+                        .message
+                        .encoded_size()
+                        .expect("Message encoded_size is closed-form and cannot fail");
                     if required > buf.len() {
                         warn!(
                             "outgoing message size {required} exceeds claimed buffer ({}); rejecting with Capacity(\"udp_buffer\")",

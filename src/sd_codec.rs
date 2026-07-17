@@ -11,7 +11,7 @@
 use core::net::{IpAddr, Ipv4Addr};
 use core::sync::atomic::{AtomicU16, Ordering};
 
-use crate::WireFormat;
+use crate::Encode;
 use crate::protocol::sd::{
     Entry, EventGroupEntry, Flags, Header as SdHeader, Options as SdOptions, OptionsCount,
     RebootFlag, SdHeaderView, ServiceEntry, TransportProtocol,

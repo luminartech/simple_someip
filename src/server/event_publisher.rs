@@ -6,10 +6,11 @@ use super::subscription_manager::{SUBSCRIBERS_PER_GROUP, SubscriptionHandle};
 use crate::CapacityKind;
 use crate::e2e::E2EKey;
 use crate::protocol::{Header, Message};
-use crate::traits::{PayloadWireFormat, WireFormat};
+use crate::traits::PayloadWireFormat;
 use crate::transport::{E2ERegistryHandle, SharedHandle, TransportSocket};
 #[cfg(test)]
 use alloc::sync::Arc;
+use automotive_wire_codec::Encode;
 use core::marker::PhantomData;
 use core::net::SocketAddrV4;
 use heapless::Vec as HeaplessVec;
@@ -194,7 +195,7 @@ where
         // `encode_to_slice` report a less-actionable protocol I/O error
         // when it runs out of buffer. Matches the raw-event path below
         // and the client socket_manager path.
-        let required_size = message.required_size();
+        let required_size = message.encoded_size()?;
         if required_size > msg_buf.len() {
             crate::log::error!(
                 "Message size ({} bytes) exceeds msg_buf.len() ({}); dropping publish",
@@ -207,7 +208,9 @@ where
         // Serialize the message into the caller-provided buffer.
         // (PR-3 #125 change: no longer uses an in-future `[u8; UDP_BUFFER_SIZE]`;
         // the caller decides the buffer size and lifetime.)
-        let mut message_length = message.encode_to_slice(msg_buf)?;
+        let mut message_length = message
+            .encode_to_slice(msg_buf)
+            .map_err(crate::protocol::Error::from)?;
 
         // Apply E2E protect if configured. `protected_buf` is disjoint from
         // `msg_buf`, so we can read the unprotected payload directly out of
@@ -439,7 +442,9 @@ where
 
         // Serialize header + payload into the caller-provided buffer.
         // (PR-3 #125 change: no longer uses an in-future `[u8; UDP_BUFFER_SIZE]`.)
-        let header_len = header.encode_to_slice(buf)?;
+        let header_len = header
+            .encode_to_slice(buf)
+            .map_err(crate::protocol::Error::from)?;
         let Some(total_len) = header_len.checked_add(payload.len()) else {
             crate::log::error!(
                 "raw event length computation overflowed usize (header_len={}, payload.len()={}); dropping publish",
@@ -742,7 +747,9 @@ where
             payload.len(),
         );
 
-        let header_len = header.encode_to_slice(buf)?;
+        let header_len = header
+            .encode_to_slice(buf)
+            .map_err(crate::protocol::Error::from)?;
         let Some(total_len) = header_len.checked_add(payload.len()) else {
             crate::log::error!(
                 "raw event length computation overflowed usize (header_len={}, payload.len()={}); dropping publish",
@@ -1182,7 +1189,7 @@ mod tests {
         );
         let message = Message::new(header, payload);
         assert!(
-            message.required_size() > UDP_BUFFER_SIZE,
+            message.encoded_size().unwrap() > UDP_BUFFER_SIZE,
             "fixture must exceed cap",
         );
 
@@ -1244,7 +1251,7 @@ mod tests {
         );
         let message = Message::new(header, payload);
         assert!(
-            message.required_size() <= UDP_BUFFER_SIZE,
+            message.encoded_size().unwrap() <= UDP_BUFFER_SIZE,
             "fixture's raw size must fit the cap so the pre-encode check passes and \
              we actually exercise the post-protect guard",
         );

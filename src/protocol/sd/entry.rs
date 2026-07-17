@@ -1,5 +1,6 @@
 use super::Error;
-use crate::{protocol::byte_order::WriteBytesExt, traits::WireFormat};
+use crate::protocol::byte_order::WriteBytesExt;
+use automotive_wire_codec::Encode;
 
 pub const ENTRY_SIZE: usize = 16;
 
@@ -133,15 +134,14 @@ impl EventGroupEntry {
     }
 }
 
-impl WireFormat for EventGroupEntry {
-    fn required_size(&self) -> usize {
-        16
+impl Encode for EventGroupEntry {
+    type Error = crate::protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        Ok(15)
     }
 
-    fn encode<T: embedded_io::Write>(
-        &self,
-        writer: &mut T,
-    ) -> Result<usize, crate::protocol::Error> {
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;
         writer.write_u8(u8::from(self.options_count))?;
@@ -151,7 +151,7 @@ impl WireFormat for EventGroupEntry {
         writer.write_u24_be(self.ttl)?;
         writer.write_u16_be(self.counter)?;
         writer.write_u16_be(self.event_group_id)?;
-        Ok(16)
+        Ok(15)
     }
 }
 
@@ -193,15 +193,14 @@ impl ServiceEntry {
     }
 }
 
-impl WireFormat for ServiceEntry {
-    fn required_size(&self) -> usize {
-        16
+impl Encode for ServiceEntry {
+    type Error = crate::protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        Ok(15)
     }
 
-    fn encode<W: embedded_io::Write>(
-        &self,
-        writer: &mut W,
-    ) -> Result<usize, crate::protocol::Error> {
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;
         writer.write_u8(u8::from(self.options_count))?;
@@ -210,7 +209,7 @@ impl WireFormat for ServiceEntry {
         writer.write_u8(self.major_version)?;
         writer.write_u24_be(self.ttl)?;
         writer.write_u32_be(self.minor_version)?;
-        Ok(16)
+        Ok(15)
     }
 }
 
@@ -269,43 +268,39 @@ impl Entry {
     }
 }
 
-impl WireFormat for Entry {
-    fn required_size(&self) -> usize {
-        1 + match self {
-            Entry::FindService(service_entry)
-            | Entry::OfferService(service_entry)
-            | Entry::StopOfferService(service_entry) => service_entry.required_size(),
-            Entry::SubscribeEventGroup(event_group_entry)
-            | Entry::SubscribeAckEventGroup(event_group_entry) => event_group_entry.required_size(),
-        }
+impl Encode for Entry {
+    type Error = crate::protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        // 1 type byte + 15 body bytes = 16 (ENTRY_SIZE) for every variant.
+        Ok(ENTRY_SIZE)
     }
 
-    fn encode<W: embedded_io::Write>(
-        &self,
-        writer: &mut W,
-    ) -> Result<usize, crate::protocol::Error> {
-        match self {
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
+        let body = match self {
             Entry::FindService(service_entry) => {
                 writer.write_u8(u8::from(EntryType::FindService))?;
-                service_entry.encode(writer)
+                service_entry.encode(writer)?
             }
             Entry::OfferService(service_entry) => {
                 writer.write_u8(u8::from(EntryType::OfferService))?;
-                service_entry.encode(writer)
+                service_entry.encode(writer)?
             }
             Entry::StopOfferService(service_entry) => {
                 writer.write_u8(u8::from(EntryType::StopOfferService))?;
-                service_entry.encode(writer)
+                service_entry.encode(writer)?
             }
             Entry::SubscribeEventGroup(event_group_entry) => {
                 writer.write_u8(u8::from(EntryType::Subscribe))?;
-                event_group_entry.encode(writer)
+                event_group_entry.encode(writer)?
             }
             Entry::SubscribeAckEventGroup(event_group_entry) => {
                 writer.write_u8(u8::from(EntryType::SubscribeAck))?;
-                event_group_entry.encode(writer)
+                event_group_entry.encode(writer)?
             }
-        }
+        };
+        // 1 type byte + `body` (15) = 16.
+        Ok(1 + body)
     }
 }
 
@@ -559,33 +554,48 @@ mod tests {
     // --- required_size ---
 
     #[test]
-    fn service_entry_required_size() {
-        assert_eq!(make_service_entry().required_size(), 16);
+    fn service_entry_encoded_size() {
+        // 15 body bytes (no leading type byte — that belongs to `Entry`).
+        assert_eq!(make_service_entry().encoded_size().unwrap(), 15);
     }
 
     #[test]
-    fn event_group_entry_required_size() {
-        assert_eq!(make_event_group_entry().required_size(), 16);
+    fn event_group_entry_encoded_size() {
+        assert_eq!(make_event_group_entry().encoded_size().unwrap(), 15);
     }
 
     #[test]
-    fn entry_required_size_all_variants() {
-        assert_eq!(Entry::FindService(make_service_entry()).required_size(), 17);
+    fn entry_encoded_size_all_variants() {
+        // 1 type byte + 15 body bytes = 16 (ENTRY_SIZE) for every variant.
         assert_eq!(
-            Entry::OfferService(make_service_entry()).required_size(),
-            17
+            Entry::FindService(make_service_entry())
+                .encoded_size()
+                .unwrap(),
+            16
         );
         assert_eq!(
-            Entry::StopOfferService(make_service_entry()).required_size(),
-            17
+            Entry::OfferService(make_service_entry())
+                .encoded_size()
+                .unwrap(),
+            16
         );
         assert_eq!(
-            Entry::SubscribeEventGroup(make_event_group_entry()).required_size(),
-            17
+            Entry::StopOfferService(make_service_entry())
+                .encoded_size()
+                .unwrap(),
+            16
         );
         assert_eq!(
-            Entry::SubscribeAckEventGroup(make_event_group_entry()).required_size(),
-            17
+            Entry::SubscribeEventGroup(make_event_group_entry())
+                .encoded_size()
+                .unwrap(),
+            16
+        );
+        assert_eq!(
+            Entry::SubscribeAckEventGroup(make_event_group_entry())
+                .encoded_size()
+                .unwrap(),
+            16
         );
     }
 
@@ -701,5 +711,52 @@ mod tests {
         assert_eq!(iter.next().unwrap().to_owned().unwrap(), e1);
         assert_eq!(iter.next().unwrap().to_owned().unwrap(), e2);
         assert!(iter.next().is_none());
+    }
+
+    // --- Encode size-exactness invariant ---
+
+    #[test]
+    fn entry_encoded_size_matches_bytes_written() {
+        use automotive_wire_codec::CountingSink;
+        for entry in [
+            Entry::FindService(make_service_entry()),
+            Entry::SubscribeEventGroup(make_event_group_entry()),
+        ] {
+            let mut sink = CountingSink::new();
+            let written = entry.encode(&mut sink).unwrap();
+            assert_eq!(written, entry.encoded_size().unwrap());
+            assert_eq!(written, sink.count());
+        }
+    }
+
+    #[test]
+    fn service_entry_encoded_size_matches_bytes_written() {
+        use automotive_wire_codec::CountingSink;
+        let se = make_service_entry();
+        let mut sink = CountingSink::new();
+        let written = se.encode(&mut sink).unwrap();
+        assert_eq!(written, se.encoded_size().unwrap());
+        assert_eq!(written, sink.count());
+
+        let eg = make_event_group_entry();
+        let mut sink = CountingSink::new();
+        let written = eg.encode(&mut sink).unwrap();
+        assert_eq!(written, eg.encoded_size().unwrap());
+        assert_eq!(written, sink.count());
+    }
+
+    #[test]
+    fn entry_encode_to_slice_too_small_yields_insufficient_buffer() {
+        use automotive_wire_codec::{EncodeToSliceError, InsufficientBuffer};
+        let entry = Entry::FindService(make_service_entry());
+        let mut buf = [0u8; 4]; // far smaller than 16
+        let err = entry.encode_to_slice(&mut buf).unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeToSliceError::InsufficientBuffer(InsufficientBuffer {
+                needed: 16,
+                available: 4,
+            })
+        ));
     }
 }

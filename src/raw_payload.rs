@@ -12,7 +12,8 @@ use std::vec::Vec;
 use embedded_io::Error as _;
 
 use crate::protocol::{self, MessageId, sd};
-use crate::traits::{PayloadWireFormat, WireFormat};
+use crate::traits::PayloadWireFormat;
+use automotive_wire_codec::Encode;
 
 /// Owned SD header backed by heap-allocated vectors.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,12 +26,14 @@ pub struct VecSdHeader {
     pub options: Vec<sd::Options>,
 }
 
-impl WireFormat for VecSdHeader {
-    fn required_size(&self) -> usize {
-        sd::Header::new(self.flags, &self.entries, &self.options).required_size()
+impl Encode for VecSdHeader {
+    type Error = protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        sd::Header::new(self.flags, &self.entries, &self.options).encoded_size()
     }
 
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, protocol::Error> {
         sd::Header::new(self.flags, &self.entries, &self.options).encode(writer)
     }
 }
@@ -124,7 +127,9 @@ impl PayloadWireFormat for RawPayload {
 
     fn required_size(&self) -> usize {
         match &self.kind {
-            RawPayloadKind::Sd(header) => header.required_size(),
+            RawPayloadKind::Sd(header) => header
+                .encoded_size()
+                .expect("VecSdHeader encoded_size is closed-form and cannot fail"),
             RawPayloadKind::Raw(bytes) => bytes.len(),
         }
     }
@@ -227,7 +232,7 @@ impl PayloadWireFormat for RawPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::WireFormat;
+    use automotive_wire_codec::Encode;
     use std::net::Ipv4Addr;
 
     fn make_sd_payload() -> RawPayload {
@@ -360,7 +365,7 @@ mod tests {
             &entries,
             &[],
         );
-        let mut buf = std::vec![0u8; header.required_size()];
+        let mut buf = std::vec![0u8; header.encoded_size().unwrap()];
         header.encode(&mut buf.as_mut_slice()).unwrap();
 
         let p = RawPayload::from_payload_bytes(MessageId::SD, &buf).unwrap();
@@ -528,7 +533,7 @@ mod tests {
             entries: std::vec![],
             options: std::vec![],
         };
-        let size = header.required_size();
+        let size = header.encoded_size().unwrap();
         assert!(size > 0);
         let mut buf = std::vec![0u8; size];
         let n = header.encode(&mut buf.as_mut_slice()).unwrap();

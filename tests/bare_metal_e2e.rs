@@ -26,9 +26,9 @@ use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};
 
+use simple_someip::Encode;
 use simple_someip::PayloadWireFormat;
 use simple_someip::ServiceEndpointKey;
-use simple_someip::WireFormat;
 use simple_someip::client::Error as ClientError;
 use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::define_static_channels;

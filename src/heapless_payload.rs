@@ -31,7 +31,8 @@ use embedded_io::Error as _;
 use heapless::Vec as HVec;
 
 use crate::protocol::{self, MessageId, sd};
-use crate::traits::{PayloadWireFormat, WireFormat};
+use crate::traits::PayloadWireFormat;
+use automotive_wire_codec::Encode;
 
 /// Max SD entries in a single payload. See module-level docs.
 pub const ENTRY_CAP: usize = 8;
@@ -54,12 +55,14 @@ pub struct HeaplessSdHeader {
     pub options: HVec<sd::Options, OPT_CAP>,
 }
 
-impl WireFormat for HeaplessSdHeader {
-    fn required_size(&self) -> usize {
-        sd::Header::new(self.flags, &self.entries, &self.options).required_size()
+impl Encode for HeaplessSdHeader {
+    type Error = protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        sd::Header::new(self.flags, &self.entries, &self.options).encoded_size()
     }
 
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, protocol::Error> {
         sd::Header::new(self.flags, &self.entries, &self.options).encode(writer)
     }
 }
@@ -167,7 +170,9 @@ impl PayloadWireFormat for HeaplessPayload {
 
     fn required_size(&self) -> usize {
         match &self.kind {
-            HeaplessPayloadKind::Sd(header) => header.required_size(),
+            HeaplessPayloadKind::Sd(header) => header
+                .encoded_size()
+                .expect("HeaplessSdHeader encoded_size is closed-form and cannot fail"),
             HeaplessPayloadKind::Raw(bytes) => bytes.len(),
         }
     }

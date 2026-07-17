@@ -1,5 +1,6 @@
 use crate::protocol::sd;
-use crate::traits::{PayloadWireFormat, WireFormat};
+use crate::traits::PayloadWireFormat;
+use automotive_wire_codec::Encode;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TestSdHeader {
@@ -8,14 +9,13 @@ pub(crate) struct TestSdHeader {
     pub options: heapless::Vec<sd::Options, 4>,
 }
 
-impl WireFormat for TestSdHeader {
-    fn required_size(&self) -> usize {
-        sd::Header::new(self.flags, &self.entries, &self.options).required_size()
+impl Encode for TestSdHeader {
+    type Error = crate::protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        sd::Header::new(self.flags, &self.entries, &self.options).encoded_size()
     }
-    fn encode<T: embedded_io::Write>(
-        &self,
-        writer: &mut T,
-    ) -> Result<usize, crate::protocol::Error> {
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
         sd::Header::new(self.flags, &self.entries, &self.options).encode(writer)
     }
 }
@@ -72,7 +72,9 @@ impl PayloadWireFormat for TestPayload {
         Some(self.header.flags)
     }
     fn required_size(&self) -> usize {
-        self.header.required_size()
+        self.header
+            .encoded_size()
+            .expect("TestSdHeader encoded_size is closed-form and cannot fail")
     }
     fn encode<T: embedded_io::Write>(
         &self,

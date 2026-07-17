@@ -24,7 +24,7 @@
 //! on-wire entry size). It is fixed in a later phase under the
 //! protection of these golden tests.
 
-use simple_someip::WireFormat;
+use simple_someip::Encode;
 use simple_someip::protocol::sd::{
     Entry, EventGroupEntry, Flags, Header as SdHeader, OptionType, Options, OptionsCount,
     RebootFlag, ServiceEntry, TransportProtocol,
@@ -106,7 +106,7 @@ mod message_golden {
     use simple_someip::RawPayload;
     use simple_someip::protocol::Message;
 
-    use super::{Header, MessageId, MessageType, MessageTypeField, ReturnCode, WireFormat};
+    use super::{Encode, Header, MessageId, MessageType, MessageTypeField, ReturnCode};
 
     #[test]
     fn message_raw_payload_golden_bytes() {
@@ -401,7 +401,7 @@ fn sd_header_subscribe_ack_eventgroup_with_configuration_golden_bytes() {
 fn encode_option(option: &Options) -> heapless::Vec<u8, 32> {
     let size = option.size();
     let mut buf = [0u8; 32];
-    let n = option.write(&mut &mut buf[..size]).unwrap();
+    let n = option.encode(&mut &mut buf[..size]).unwrap();
     assert_eq!(n, size);
     let mut out = heapless::Vec::new();
     out.extend_from_slice(&buf[..size]).unwrap();

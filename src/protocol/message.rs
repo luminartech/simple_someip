@@ -1,7 +1,8 @@
 use crate::{
     protocol::{Error, Header, MessageType, ReturnCode, header::HeaderView, sd::SdHeaderView},
-    traits::{PayloadWireFormat, WireFormat},
+    traits::PayloadWireFormat,
 };
+use automotive_wire_codec::Encode;
 
 /// A SOME/IP message consisting of a [`Header`] and a payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,7 +23,10 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
         request_id: u32,
         sd_header: &<PayloadDefinition as PayloadWireFormat>::SdHeader,
     ) -> Self {
-        let sd_header_size = sd_header.required_size();
+        // Every concrete `SdHeader` type overrides `encoded_size` with a
+        // closed-form `Ok(n)` that cannot fail; `unwrap_or(0)` avoids a
+        // `Debug` bound on the (generic) associated error type.
+        let sd_header_size = sd_header.encoded_size().unwrap_or(0);
         Self::new(
             Header::new_sd(request_id, sd_header_size),
             PayloadDefinition::new_sd_payload(sd_header),
@@ -155,12 +159,14 @@ impl<'a> MessageView<'a> {
     }
 }
 
-impl<PayloadDefinition: PayloadWireFormat> WireFormat for Message<PayloadDefinition> {
-    fn required_size(&self) -> usize {
-        self.header.required_size() + self.payload.required_size()
+impl<PayloadDefinition: PayloadWireFormat> Encode for Message<PayloadDefinition> {
+    type Error = Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        Ok(self.header.encoded_size()? + self.payload.required_size())
     }
 
-    fn encode<W: embedded_io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Error> {
         Ok(self.header.encode(writer)? + self.payload.encode(writer)?)
     }
 }
@@ -253,8 +259,8 @@ mod tests {
     #[test]
     fn required_size_is_header_plus_payload() {
         let msg = make_sd_message();
-        let expected = msg.header().required_size() + msg.payload().required_size();
-        assert_eq!(msg.required_size(), expected);
+        let expected = msg.header().encoded_size().unwrap() + msg.payload().required_size();
+        assert_eq!(msg.encoded_size().unwrap(), expected);
     }
 
     // --- WireFormat: encode / MessageView::parse round-trip ---
@@ -264,7 +270,7 @@ mod tests {
         let msg = make_sd_message();
         let mut buf = [0u8; 64];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
-        assert_eq!(n, msg.required_size());
+        assert_eq!(n, msg.encoded_size().unwrap());
         let view = MessageView::parse(&buf[..n]).unwrap();
         assert!(view.is_sd());
         assert_eq!(view.header().to_owned(), *msg.header());

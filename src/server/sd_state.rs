@@ -199,7 +199,7 @@ impl SdStateManager {
         socket: &T,
     ) -> Result<(), Error> {
         use crate::protocol::Header as SomeIpHeader;
-        use crate::traits::WireFormat;
+        use automotive_wire_codec::Encode;
 
         let entry = Entry::OfferService(ServiceEntry {
             index_first_options_run: 0,

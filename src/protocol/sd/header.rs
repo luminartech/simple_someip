@@ -1,6 +1,6 @@
 use crate::protocol::byte_order::WriteBytesExt;
 
-use crate::traits::WireFormat;
+use automotive_wire_codec::Encode;
 
 use super::{
     Entry, Flags, Options,
@@ -157,19 +157,18 @@ impl<'a> SdHeaderView<'a> {
     }
 }
 
-impl WireFormat for Header<'_> {
-    fn required_size(&self) -> usize {
+impl Encode for Header<'_> {
+    type Error = crate::protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
         let mut size = 12 + self.entries.len() * ENTRY_SIZE;
         for option in self.options {
             size += option.size();
         }
-        size
+        Ok(size)
     }
 
-    fn encode<T: embedded_io::Write>(
-        &self,
-        writer: &mut T,
-    ) -> Result<usize, crate::protocol::Error> {
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
         writer.write_u8(u8::from(self.flags))?;
         let reserved: [u8; 3] = [0; 3];
         writer.write_bytes(&reserved)?;
@@ -184,7 +183,7 @@ impl WireFormat for Header<'_> {
         }
         writer.write_u32_be(u32::try_from(options_size).expect("options size fits u32"))?;
         for option in self.options {
-            option.write(writer)?;
+            option.encode(writer)?;
         }
         Ok(12 + entries_size as usize + options_size)
     }
@@ -195,17 +194,15 @@ mod tests {
     use core::net::Ipv4Addr;
 
     use super::*;
-    use crate::{
-        protocol::sd::{
-            Error as SdError, EventGroupEntry, OptionType, OptionsCount, RebootFlag, ServiceEntry,
-            TransportProtocol,
-            options::{
-                IPV4_OPTION_IP_OFFSET, IPV4_OPTION_LENGTH_FIELD, IPV4_OPTION_PORT_OFFSET,
-                IPV4_OPTION_PROTOCOL_OFFSET, IPV4_OPTION_WIRE_SIZE,
-            },
+    use crate::protocol::sd::{
+        Error as SdError, EventGroupEntry, OptionType, OptionsCount, RebootFlag, ServiceEntry,
+        TransportProtocol,
+        options::{
+            IPV4_OPTION_IP_OFFSET, IPV4_OPTION_LENGTH_FIELD, IPV4_OPTION_PORT_OFFSET,
+            IPV4_OPTION_PROTOCOL_OFFSET, IPV4_OPTION_WIRE_SIZE,
         },
-        traits::WireFormat,
     };
+    use automotive_wire_codec::Encode;
 
     fn ipv4_endpoint_bytes(ip: [u8; 4], protocol: u8, port: u16) -> [u8; IPV4_OPTION_WIRE_SIZE] {
         let mut b = [0u8; IPV4_OPTION_WIRE_SIZE];
@@ -264,10 +261,10 @@ mod tests {
             &entries,
             &options,
         );
-        assert_eq!(h.required_size(), 40);
+        assert_eq!(h.encoded_size().unwrap(), 40);
         let mut buf = [0u8; 64];
         h.encode(&mut buf.as_mut_slice()).unwrap();
-        let view = SdHeaderView::parse(&buf[..h.required_size()]).unwrap();
+        let view = SdHeaderView::parse(&buf[..h.encoded_size().unwrap()]).unwrap();
         assert_eq!(view.entry_count(), 1);
         let entry_view = view.entries().next().unwrap();
         assert_eq!(entry_view.service_id(), 0x1234);
@@ -280,10 +277,10 @@ mod tests {
         ));
         let entries = [entry];
         let h = Header::new(Flags::new_sd(RebootFlag::RecentlyRebooted), &entries, &[]);
-        assert_eq!(h.required_size(), 28);
+        assert_eq!(h.encoded_size().unwrap(), 28);
         let mut buf = [0u8; 32];
         h.encode(&mut buf.as_mut_slice()).unwrap();
-        let view = SdHeaderView::parse(&buf[..h.required_size()]).unwrap();
+        let view = SdHeaderView::parse(&buf[..h.encoded_size().unwrap()]).unwrap();
         assert_eq!(view.entry_count(), 1);
     }
 
@@ -358,7 +355,7 @@ mod tests {
         let h = Header::new(Flags::new_sd(RebootFlag::RecentlyRebooted), &entries, &[]);
         let mut buf = [0u8; 64];
         h.encode(&mut buf.as_mut_slice()).unwrap();
-        let view = SdHeaderView::parse(&buf[..h.required_size()]).unwrap();
+        let view = SdHeaderView::parse(&buf[..h.encoded_size().unwrap()]).unwrap();
         assert_eq!(view.entry_count(), 2);
     }
 
@@ -367,7 +364,7 @@ mod tests {
         let h = Header::new(Flags::new_sd(RebootFlag::RecentlyRebooted), &[], &[]);
         let mut buf = [0u8; 16];
         h.encode(&mut buf.as_mut_slice()).unwrap();
-        let view = SdHeaderView::parse(&buf[..h.required_size()]).unwrap();
+        let view = SdHeaderView::parse(&buf[..h.encoded_size().unwrap()]).unwrap();
         assert_eq!(view.flags(), h.flags);
     }
 

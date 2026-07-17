@@ -1,7 +1,4 @@
-use crate::{
-    protocol::{Error, MessageId, MessageTypeField, ReturnCode, byte_order::WriteBytesExt},
-    traits::WireFormat,
-};
+use crate::protocol::{Error, MessageId, MessageTypeField, ReturnCode, byte_order::WriteBytesExt};
 
 /// SOME/IP header
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -336,12 +333,14 @@ impl<'a> HeaderView<'a> {
     }
 }
 
-impl WireFormat for Header {
-    fn required_size(&self) -> usize {
-        16
+impl automotive_wire_codec::Encode for Header {
+    type Error = Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        Ok(16)
     }
 
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Error> {
         writer.write_u32_be(self.message_id.message_id())?;
         writer.write_u32_be(self.length)?;
         writer.write_u32_be(self.request_id)?;
@@ -357,6 +356,8 @@ impl WireFormat for Header {
 mod tests {
     use super::*;
     use crate::protocol::{Error, MessageId, MessageTypeField, ReturnCode};
+    use crate::traits::EncodeExt;
+    use automotive_wire_codec::Encode;
 
     fn make_header() -> Header {
         Header {
@@ -441,7 +442,7 @@ mod tests {
 
     #[test]
     fn required_size_is_16() {
-        assert_eq!(make_header().required_size(), 16);
+        assert_eq!(make_header().encoded_size().unwrap(), 16);
     }
 
     // --- encode / parse round-trip ---
@@ -624,5 +625,32 @@ mod tests {
         assert_eq!(buf.len(), 16);
         let (view, _) = HeaderView::parse(&buf).unwrap();
         assert_eq!(view.to_owned(), h);
+    }
+
+    // --- Encode size-exactness invariant ---
+
+    #[test]
+    fn encoded_size_matches_bytes_written() {
+        use automotive_wire_codec::CountingSink;
+        let h = make_header();
+        let mut sink = CountingSink::new();
+        let written = h.encode(&mut sink).unwrap();
+        assert_eq!(written, h.encoded_size().unwrap());
+        assert_eq!(written, sink.count());
+    }
+
+    #[test]
+    fn encode_to_slice_too_small_yields_insufficient_buffer() {
+        use automotive_wire_codec::{EncodeToSliceError, InsufficientBuffer};
+        let h = make_header();
+        let mut buf = [0u8; 4];
+        let err = h.encode_to_slice(&mut buf).unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeToSliceError::InsufficientBuffer(InsufficientBuffer {
+                needed: 16,
+                available: 4,
+            })
+        ));
     }
 }

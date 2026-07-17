@@ -2,6 +2,7 @@ use core::net::{Ipv4Addr, Ipv6Addr};
 
 use super::Error;
 use crate::protocol::byte_order::WriteBytesExt;
+use automotive_wire_codec::Encode;
 
 /// Maximum length of an SD configuration option string in bytes.
 pub const MAX_CONFIGURATION_STRING_LENGTH: usize = 256;
@@ -226,6 +227,14 @@ impl Options {
             | Options::IpV6SD { .. } => IPV6_OPTION_WIRE_SIZE,
         }
     }
+}
+
+impl Encode for Options {
+    type Error = crate::protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        Ok(self.size())
+    }
 
     /// Serializes this option to a writer.
     ///
@@ -237,10 +246,7 @@ impl Options {
     ///
     /// Panics if the option size minus `OPTION_LENGTH_SIZE_DELTA` exceeds `u16::MAX`
     /// (unreachable in practice).
-    pub fn write<T: embedded_io::Write>(
-        &self,
-        writer: &mut T,
-    ) -> Result<usize, crate::protocol::Error> {
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
         writer.write_u16_be(
             u16::try_from(self.size() - OPTION_LENGTH_SIZE_DELTA).expect("option size fits u16"),
         )?;
@@ -660,7 +666,7 @@ mod tests {
     fn round_trip(option: &Options) {
         let size = option.size();
         let mut buf = [0u8; 4 + MAX_CONFIGURATION_STRING_LENGTH];
-        let written = option.write(&mut &mut buf[..size]).unwrap();
+        let written = option.encode(&mut &mut buf[..size]).unwrap();
         assert_eq!(written, size);
         let view = OptionView(&buf[..size]);
         let parsed = view.to_owned().unwrap();
@@ -983,8 +989,8 @@ mod tests {
             weight: 200,
         };
         let mut buf = [0u8; 24]; // 12 + 8 = 20
-        let n1 = opt1.write(&mut &mut buf[..12]).unwrap();
-        let n2 = opt2.write(&mut &mut buf[12..20]).unwrap();
+        let n1 = opt1.encode(&mut &mut buf[..12]).unwrap();
+        let n2 = opt2.encode(&mut &mut buf[12..20]).unwrap();
         let total = n1 + n2;
 
         let mut iter = OptionIter::new(&buf[..total]);
@@ -1011,8 +1017,8 @@ mod tests {
             port: 30491,
         };
         let mut buf = [0u8; 24];
-        let n1 = opt1.write(&mut &mut buf[..12]).unwrap();
-        let n2 = opt2.write(&mut &mut buf[12..24]).unwrap();
+        let n1 = opt1.encode(&mut &mut buf[..12]).unwrap();
+        let n2 = opt2.encode(&mut &mut buf[12..24]).unwrap();
         let total = n1 + n2;
 
         let iter = OptionIter::new(&buf[..total]);
@@ -1052,8 +1058,8 @@ mod tests {
             port: 30491,
         };
         let mut buf = [0u8; 24];
-        let n1 = opt1.write(&mut &mut buf[..12]).unwrap();
-        let n2 = opt2.write(&mut &mut buf[12..24]).unwrap();
+        let n1 = opt1.encode(&mut &mut buf[..12]).unwrap();
+        let n2 = opt2.encode(&mut &mut buf[12..24]).unwrap();
         let total = n1 + n2;
 
         let mut iter = OptionIter::new(&buf[..total]);
@@ -1066,5 +1072,58 @@ mod tests {
         let remaining = clone.next().unwrap().to_owned().unwrap();
         assert!(clone.next().is_none());
         assert_eq!(remaining, opt2);
+    }
+
+    // --- Encode size-exactness invariant ---
+
+    #[test]
+    fn encoded_size_matches_bytes_written_for_each_variant() {
+        use automotive_wire_codec::CountingSink;
+        let mut config_string = heapless::Vec::<u8, MAX_CONFIGURATION_STRING_LENGTH>::new();
+        config_string.extend_from_slice(b"k=v").unwrap();
+        let options = [
+            Options::Configuration {
+                configuration_string: config_string,
+            },
+            Options::LoadBalancing {
+                priority: 1,
+                weight: 2,
+            },
+            Options::IpV4Endpoint {
+                ip: Ipv4Addr::new(10, 0, 0, 1),
+                protocol: TransportProtocol::Udp,
+                port: 30490,
+            },
+            Options::IpV6Endpoint {
+                ip: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+                protocol: TransportProtocol::Tcp,
+                port: 8080,
+            },
+        ];
+        for option in &options {
+            let mut sink = CountingSink::new();
+            let written = option.encode(&mut sink).unwrap();
+            assert_eq!(written, option.encoded_size().unwrap());
+            assert_eq!(written, sink.count());
+        }
+    }
+
+    #[test]
+    fn encode_to_slice_too_small_yields_insufficient_buffer() {
+        use automotive_wire_codec::{EncodeToSliceError, InsufficientBuffer};
+        let option = Options::IpV4Endpoint {
+            ip: Ipv4Addr::new(10, 0, 0, 1),
+            protocol: TransportProtocol::Udp,
+            port: 30490,
+        };
+        let mut buf = [0u8; 4]; // needs 12
+        let err = option.encode_to_slice(&mut buf).unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeToSliceError::InsufficientBuffer(InsufficientBuffer {
+                needed: 12,
+                available: 4,
+            })
+        ));
     }
 }

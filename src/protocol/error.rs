@@ -32,3 +32,19 @@ pub enum Error {
     #[error(transparent)]
     Sd(#[from] super::sd::Error),
 }
+
+impl From<embedded_io::ErrorKind> for Error {
+    fn from(k: embedded_io::ErrorKind) -> Self {
+        Error::Io(k)
+    }
+}
+
+impl From<automotive_wire_codec::EncodeToSliceError<Error>> for Error {
+    fn from(e: automotive_wire_codec::EncodeToSliceError<Error>) -> Self {
+        use automotive_wire_codec::EncodeToSliceError::{Encode, InsufficientBuffer};
+        match e {
+            InsufficientBuffer(ib) => Error::InsufficientBuffer(ib),
+            Encode(inner) => inner,
+        }
+    }
+}

@@ -1441,7 +1441,7 @@ where
 mod tests {
     use super::*;
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
-    use crate::traits::WireFormat;
+    use automotive_wire_codec::Encode;
     use std::format;
 
     type TestClient =
@@ -1471,7 +1471,7 @@ mod tests {
 
         // DiscoveryUpdated
         let sd_header = empty_sd_header();
-        let someip_header = crate::protocol::Header::new_sd(1, sd_header.required_size());
+        let someip_header = crate::protocol::Header::new_sd(1, sd_header.encoded_size().unwrap());
         let discovery_msg = DiscoveryMessage {
             source: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 30490),
             someip_header,

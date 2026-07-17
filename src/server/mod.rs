@@ -1712,7 +1712,7 @@ mod tests {
         Header as SomeIpHeader, MessageType, MessageTypeField, MessageView, ReturnCode,
     };
     use crate::tokio_transport::{TokioTimer, TokioTransport};
-    use crate::traits::WireFormat;
+    use automotive_wire_codec::Encode;
     use std::format;
     use std::net::IpAddr;
     use std::vec;

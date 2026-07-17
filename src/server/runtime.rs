@@ -42,7 +42,7 @@ where
     T: TransportSocket,
 {
     use crate::protocol::Header as SomeIpHeader;
-    use crate::traits::WireFormat;
+    use automotive_wire_codec::Encode;
 
     let entry = Entry::OfferService(ServiceEntry {
         index_first_options_run: 0,
@@ -111,7 +111,7 @@ where
     T: TransportSocket,
 {
     use crate::protocol::Header as SomeIpHeader;
-    use crate::traits::WireFormat;
+    use automotive_wire_codec::Encode;
 
     let ack_entry = Entry::SubscribeAckEventGroup(sd::EventGroupEntry {
         index_first_options_run: 0,
@@ -177,7 +177,7 @@ where
     T: TransportSocket,
 {
     use crate::protocol::Header as SomeIpHeader;
-    use crate::traits::WireFormat;
+    use automotive_wire_codec::Encode;
 
     let nack_entry = Entry::SubscribeAckEventGroup(sd::EventGroupEntry {
         index_first_options_run: 0,
@@ -1024,7 +1024,7 @@ mod tests {
     /// Encode a minimal Subscribe SD payload and return `(wire_bytes, sd_len)` so
     /// callers can parse an `SdHeaderView` and extract an `EntryView`.
     fn subscribe_wire_bytes() -> ([u8; 512], usize) {
-        use crate::traits::WireFormat;
+        use automotive_wire_codec::Encode;
 
         let entry = sd::Entry::SubscribeEventGroup(sd::EventGroupEntry {
             index_first_options_run: 0,
