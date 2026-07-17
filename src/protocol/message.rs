@@ -2,7 +2,7 @@ use crate::{
     protocol::{Error, Header, MessageType, ReturnCode, header::HeaderView, sd::SdHeaderView},
     traits::PayloadWireFormat,
 };
-use automotive_wire_codec::Encode;
+use automotive_wire_codec::{Decode, Encode};
 
 /// A SOME/IP message consisting of a [`Header`] and a payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,8 +84,69 @@ impl<'a> MessageView<'a> {
     ///
     /// Returns an error if the header is invalid, the buffer is too short for the
     /// declared payload, or SD-specific validation fails.
+    ///
+    /// Any bytes past the declared payload are silently discarded. Use the
+    /// [`Decode`] impl's [`decode`](Decode::decode) to recover the trailing
+    /// bytes (the next message in a multi-message datagram), or
+    /// [`decode_exact`](Decode::decode_exact) to reject them.
+    ///
+    /// This is a thin wrapper over the [`Decode`] impl, which is the single
+    /// source of decode logic for this type.
     pub fn parse(buf: &'a [u8]) -> Result<Self, Error> {
-        let (header, remaining) = HeaderView::parse(buf)?;
+        Ok(Self::decode(buf)?.0)
+    }
+
+    /// Returns the header view.
+    #[must_use]
+    pub fn header(&self) -> HeaderView<'a> {
+        self.header
+    }
+
+    /// Returns the raw payload bytes.
+    #[must_use]
+    pub fn payload_bytes(&self) -> &'a [u8] {
+        self.payload
+    }
+
+    /// Returns `true` if this is a SOME/IP-SD message.
+    #[must_use]
+    pub fn is_sd(&self) -> bool {
+        self.header.is_sd()
+    }
+
+    /// Parse the payload as an SD header.
+    /// The caller should check `is_sd()` first; this method returns an error
+    /// if the message is not an SD message (the SD validation in `parse` must
+    /// have already passed).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this is not an SD message or the SD payload is malformed.
+    pub fn sd_header(&self) -> Result<SdHeaderView<'a>, Error> {
+        if !self.is_sd() {
+            return Err(crate::protocol::sd::Error::InvalidMessage("Not an SD message").into());
+        }
+        SdHeaderView::parse(self.payload)
+    }
+}
+
+impl<'a> Decode<'a> for MessageView<'a> {
+    type Error = Error;
+
+    /// Decode a single SOME/IP message from the front of `buf`.
+    ///
+    /// Validates the header, checks that the buffer contains enough data for the
+    /// declared payload, and for SD messages validates SD-specific constraints.
+    /// Returns `(message, remaining_bytes)`, where the remainder is any bytes
+    /// past this message's declared payload (the next message in a
+    /// multi-message datagram).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the header is invalid, the buffer is too short for the
+    /// declared payload, or SD-specific validation fails.
+    fn decode(buf: &'a [u8]) -> Result<(Self, &'a [u8]), Error> {
+        let (header, remaining) = HeaderView::decode(buf)?;
         let payload_size = header.payload_size();
 
         if remaining.len() < payload_size {
@@ -122,40 +183,8 @@ impl<'a> MessageView<'a> {
         }
 
         let payload = &remaining[..payload_size];
-        Ok(Self { header, payload })
-    }
-
-    /// Returns the header view.
-    #[must_use]
-    pub fn header(&self) -> HeaderView<'a> {
-        self.header
-    }
-
-    /// Returns the raw payload bytes.
-    #[must_use]
-    pub fn payload_bytes(&self) -> &'a [u8] {
-        self.payload
-    }
-
-    /// Returns `true` if this is a SOME/IP-SD message.
-    #[must_use]
-    pub fn is_sd(&self) -> bool {
-        self.header.is_sd()
-    }
-
-    /// Parse the payload as an SD header.
-    /// The caller should check `is_sd()` first; this method returns an error
-    /// if the message is not an SD message (the SD validation in `parse` must
-    /// have already passed).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if this is not an SD message or the SD payload is malformed.
-    pub fn sd_header(&self) -> Result<SdHeaderView<'a>, Error> {
-        if !self.is_sd() {
-            return Err(crate::protocol::sd::Error::InvalidMessage("Not an SD message").into());
-        }
-        SdHeaderView::parse(self.payload)
+        let rest = &remaining[payload_size..];
+        Ok((Self { header, payload }, rest))
     }
 }
 
@@ -295,6 +324,47 @@ mod tests {
         assert_eq!(sd_view.entry_count(), 1);
         let entry = sd_view.entries().next().unwrap();
         assert_eq!(entry.service_id(), 0xABCD);
+    }
+
+    // --- Decode: trailing bytes are the next message ---
+
+    #[test]
+    fn decode_returns_trailing_bytes_as_remainder() {
+        let msg = make_sd_message();
+        let mut buf = [0u8; 128];
+        let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
+        // Append 5 trailing bytes past the message.
+        for (i, b) in [0xDE, 0xAD, 0xBE, 0xEF, 0x42].into_iter().enumerate() {
+            buf[n + i] = b;
+        }
+        let (view, rest) = MessageView::decode(&buf[..n + 5]).unwrap();
+        assert_eq!(view.header().to_owned(), *msg.header());
+        assert_eq!(rest, &[0xDE, 0xAD, 0xBE, 0xEF, 0x42]);
+    }
+
+    #[test]
+    fn parse_silently_discards_trailing_bytes() {
+        let msg = make_sd_message();
+        let mut buf = [0u8; 128];
+        let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
+        buf[n] = 0xFF;
+        // parse (the thin wrapper) drops the remainder without error.
+        let view = MessageView::parse(&buf[..n + 1]).unwrap();
+        assert_eq!(view.header().to_owned(), *msg.header());
+    }
+
+    #[test]
+    fn decode_exact_rejects_trailing_bytes() {
+        let msg = make_sd_message();
+        let mut buf = [0u8; 128];
+        let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
+        buf[n] = 0xFF;
+        assert!(matches!(
+            MessageView::decode_exact(&buf[..n + 1]),
+            Err(Error::Trailing(_))
+        ));
+        // Exactly-sized succeeds.
+        assert!(MessageView::decode_exact(&buf[..n]).is_ok());
     }
 
     // --- parse with exactly-sized slice ---

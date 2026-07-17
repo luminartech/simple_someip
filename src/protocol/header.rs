@@ -1,4 +1,5 @@
 use crate::protocol::{Error, MessageId, MessageTypeField, ReturnCode, byte_order::WriteBytesExt};
+use automotive_wire_codec::Decode;
 
 /// SOME/IP header
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -217,28 +218,11 @@ impl<'a> HeaderView<'a> {
     /// # Panics
     ///
     /// Cannot panic — the `expect` is guarded by a length check above it.
+    ///
+    /// This is a thin wrapper over the [`Decode`] impl, which is the single
+    /// source of decode logic for this type.
     pub fn parse(buf: &'a [u8]) -> Result<(Self, &'a [u8]), Error> {
-        if buf.len() < 16 {
-            return Err(automotive_wire_codec::Incomplete {
-                needed: 16,
-                available: buf.len(),
-            }
-            .into());
-        }
-        let header_bytes: &[u8; 16] = buf[..16].try_into().expect("length checked above");
-        let view = Self(header_bytes);
-
-        // Validate protocol version
-        let pv = view.protocol_version();
-        if pv != 0x01 {
-            return Err(Error::InvalidProtocolVersion(pv));
-        }
-        // Validate message type
-        MessageTypeField::try_from(header_bytes[14])?;
-        // Validate return code
-        ReturnCode::try_from(header_bytes[15])?;
-
-        Ok((view, &buf[16..]))
+        Self::decode(buf)
     }
 
     /// Returns the message ID (service ID + method ID).
@@ -330,6 +314,46 @@ impl<'a> HeaderView<'a> {
             message_type: self.message_type(),
             return_code: self.return_code(),
         }
+    }
+}
+
+impl<'a> Decode<'a> for HeaderView<'a> {
+    type Error = Error;
+
+    /// Decode and validate a SOME/IP header from the front of `buf`.
+    ///
+    /// Returns `(view, remaining_bytes)` on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `buf` is shorter than 16 bytes, the protocol version is
+    /// not `0x01`, the message type byte is unrecognized, or the return code is invalid.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic — the `expect` is guarded by a length check above it.
+    fn decode(buf: &'a [u8]) -> Result<(Self, &'a [u8]), Error> {
+        if buf.len() < 16 {
+            return Err(automotive_wire_codec::Incomplete {
+                needed: 16,
+                available: buf.len(),
+            }
+            .into());
+        }
+        let header_bytes: &[u8; 16] = buf[..16].try_into().expect("length checked above");
+        let view = Self(header_bytes);
+
+        // Validate protocol version
+        let pv = view.protocol_version();
+        if pv != 0x01 {
+            return Err(Error::InvalidProtocolVersion(pv));
+        }
+        // Validate message type
+        MessageTypeField::try_from(header_bytes[14])?;
+        // Validate return code
+        ReturnCode::try_from(header_bytes[15])?;
+
+        Ok((view, &buf[16..]))
     }
 }
 
@@ -537,6 +561,33 @@ mod tests {
                 available: 4,
             }))
         ));
+    }
+
+    // --- Decode trait (Phase 3) ---
+
+    #[test]
+    fn decode_returns_header_and_remainder() {
+        use automotive_wire_codec::Decode;
+        let h = make_header();
+        let mut buf = [0u8; 20];
+        buf[..16].copy_from_slice(&encode_header(&h));
+        buf[16..].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let (view, rest) = HeaderView::decode(&buf).unwrap();
+        assert_eq!(view.to_owned(), h);
+        assert_eq!(rest, &[0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn decode_exact_rejects_trailing() {
+        use automotive_wire_codec::Decode;
+        let h = make_header();
+        let mut buf = [0u8; 17];
+        buf[..16].copy_from_slice(&encode_header(&h));
+        assert!(matches!(
+            HeaderView::decode_exact(&buf),
+            Err(Error::Trailing(_))
+        ));
+        assert!(HeaderView::decode_exact(&buf[..16]).is_ok());
     }
 
     // --- from_fields ---

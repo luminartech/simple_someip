@@ -257,7 +257,7 @@ mod traits;
 /// because the target module is feature-gated and would break
 /// default-feature rustdoc builds.
 pub mod transport;
-pub use automotive_wire_codec::{Encode, EncodeToSliceError};
+pub use automotive_wire_codec::{Decode, DecodeIter, DecodeIterator, Encode, EncodeToSliceError};
 #[cfg(feature = "bare_metal")]
 pub use heapless_payload::{HeaplessPayload, HeaplessSdHeader};
 pub use net_endpoint::{NetEndpoint, TransportProtocol};
