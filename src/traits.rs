@@ -44,9 +44,17 @@ impl<T: automotive_wire_codec::Encode> EncodeExt for T {}
 /// A trait for SOME/IP Payload types that can be serialized to a
 /// [`Writer`](embedded_io::Write) and constructed from raw payload bytes.
 ///
+/// The encode side is provided by the [`Encode`](automotive_wire_codec::Encode)
+/// supertrait (`encoded_size` + `encode`); implementors get `encode_to_slice`
+/// and — under `std` — the crate's [`EncodeExt::encode_to_vec`] for free.
+///
 /// Note that SOME/IP payloads are not self identifying, so the [Message ID](protocol::MessageId)
-/// must be provided by the caller.
-pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
+/// must be provided by the caller: `Encode` alone cannot reconstruct a payload
+/// from bytes, which is why [`from_payload_bytes`](Self::from_payload_bytes)
+/// remains an inherent requirement.
+pub trait PayloadWireFormat:
+    automotive_wire_codec::Encode<Error = protocol::Error> + core::fmt::Debug + Send + Sized + Sync
+{
     /// The SD header type used by this payload implementation.
     // `Send + Sync` were previously supplied for free by `WireFormat`'s
     // `Send + Sync` supertrait. The codec's `Encode` has no such supertrait,
@@ -73,14 +81,6 @@ pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
     fn new_sd_payload(header: &Self::SdHeader) -> Self;
     /// Return the SD flags if this payload is a service discovery message.
     fn sd_flags(&self) -> Option<Flags>;
-    /// Number of bytes required to write the payload
-    fn required_size(&self) -> usize;
-    /// Serialize the payload to a [Writer](embedded_io::Write)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the payload cannot be written to the writer.
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
 
     /// Construct an SD header for subscribing to an event group.
     #[allow(clippy::too_many_arguments)]

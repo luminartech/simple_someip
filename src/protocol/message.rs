@@ -195,7 +195,7 @@ impl<PayloadDefinition: PayloadWireFormat> Encode for Message<PayloadDefinition>
     type Error = Error;
 
     fn encoded_size(&self) -> Result<usize, Self::Error> {
-        Ok(self.header.encoded_size()? + self.payload.required_size())
+        Ok(self.header.encoded_size()? + self.payload.encoded_size()?)
     }
 
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Error> {
@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn required_size_is_header_plus_payload() {
         let msg = make_sd_message();
-        let expected = msg.header().encoded_size().unwrap() + msg.payload().required_size();
+        let expected = msg.header().encoded_size().unwrap() + msg.payload().encoded_size().unwrap();
         assert_eq!(msg.encoded_size().unwrap(), expected);
     }
 

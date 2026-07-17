@@ -29,6 +29,18 @@ pub(crate) struct TestPayload {
     pub header: TestSdHeader,
 }
 
+impl Encode for TestPayload {
+    type Error = crate::protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        self.header.encoded_size()
+    }
+
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
+        self.header.encode(writer)
+    }
+}
+
 impl PayloadWireFormat for TestPayload {
     type SdHeader = TestSdHeader;
     fn message_id(&self) -> crate::protocol::MessageId {
@@ -70,17 +82,6 @@ impl PayloadWireFormat for TestPayload {
     }
     fn sd_flags(&self) -> Option<sd::Flags> {
         Some(self.header.flags)
-    }
-    fn required_size(&self) -> usize {
-        self.header
-            .encoded_size()
-            .expect("TestSdHeader encoded_size is closed-form and cannot fail")
-    }
-    fn encode<T: embedded_io::Write>(
-        &self,
-        writer: &mut T,
-    ) -> Result<usize, crate::protocol::Error> {
-        self.header.encode(writer)
     }
     fn new_subscription_sd_header(
         service_id: u16,

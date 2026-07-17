@@ -103,6 +103,29 @@ impl HeaplessPayload {
     }
 }
 
+impl Encode for HeaplessPayload {
+    type Error = protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        match &self.kind {
+            HeaplessPayloadKind::Sd(header) => header.encoded_size(),
+            HeaplessPayloadKind::Raw(bytes) => Ok(bytes.len()),
+        }
+    }
+
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
+        match &self.kind {
+            HeaplessPayloadKind::Sd(header) => header.encode(writer),
+            HeaplessPayloadKind::Raw(bytes) => {
+                writer
+                    .write_all(bytes)
+                    .map_err(|e| protocol::Error::Io(e.kind()))?;
+                Ok(bytes.len())
+            }
+        }
+    }
+}
+
 impl PayloadWireFormat for HeaplessPayload {
     type SdHeader = HeaplessSdHeader;
 
@@ -165,27 +188,6 @@ impl PayloadWireFormat for HeaplessPayload {
         match &self.kind {
             HeaplessPayloadKind::Sd(header) => Some(header.flags),
             HeaplessPayloadKind::Raw(_) => None,
-        }
-    }
-
-    fn required_size(&self) -> usize {
-        match &self.kind {
-            HeaplessPayloadKind::Sd(header) => header
-                .encoded_size()
-                .expect("HeaplessSdHeader encoded_size is closed-form and cannot fail"),
-            HeaplessPayloadKind::Raw(bytes) => bytes.len(),
-        }
-    }
-
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
-        match &self.kind {
-            HeaplessPayloadKind::Sd(header) => header.encode(writer),
-            HeaplessPayloadKind::Raw(bytes) => {
-                writer
-                    .write_all(bytes)
-                    .map_err(|e| protocol::Error::Io(e.kind()))?;
-                Ok(bytes.len())
-            }
         }
     }
 
