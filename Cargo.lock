@@ -45,6 +45,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "automotive-wire-codec"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3619f2db27c70d93c5390ce2e90482c26c99675a85392271d2bfe07451234f6"
+dependencies = [
+ "embedded-io 0.7.1",
+]
+
+[[package]]
 name = "bare_metal_client"
 version = "0.0.0"
 dependencies = [
@@ -635,6 +644,7 @@ dependencies = [
 name = "simple-someip"
 version = "0.12.0"
 dependencies = [
+ "automotive-wire-codec",
  "crc",
  "critical-section",
  "embassy-executor",

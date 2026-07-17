@@ -48,6 +48,9 @@ embassy-sync = { version = "0.6", optional = true }
 embassy-executor = { version = "0.6", default-features = false, features = [
     "nightly",
 ], optional = true }
+# L0 shared wire-codec traits (Decode/DecodeIter/Encode) and big-endian leaf
+# helpers. `no_std`, no-alloc; shares `embedded-io = "0.7"` with this crate.
+automotive-wire-codec = "0.3"
 embedded-io = { version = "0.7" }
 # `futures` pulls in `futures-util` which provides the executor-agnostic
 # `select!` macro and `FutureExt::fuse` / `pin_mut!` helpers — used by
