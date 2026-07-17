@@ -147,6 +147,9 @@ impl<'a> Decode<'a> for MessageView<'a> {
     /// declared payload, or SD-specific validation fails.
     fn decode(buf: &'a [u8]) -> Result<(Self, &'a [u8]), Error> {
         let (header, remaining) = HeaderView::decode(buf)?;
+        if header.length() < 8 {
+            return Err(Error::InvalidLength(header.length()));
+        }
         let payload_size = header.payload_size();
 
         if remaining.len() < payload_size {
@@ -408,6 +411,25 @@ mod tests {
                 needed,
                 available,
             })) if needed == payload_size && available == payload_size - 1
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_length_below_8() {
+        let msg = make_sd_message();
+        let mut buf = [0u8; 64];
+        msg.encode(&mut buf.as_mut_slice()).unwrap();
+        // Overwrite the length field (bytes 4..8) with a value below the
+        // 8-byte minimum. This must be rejected, not underflow/panic.
+        let bad_len: u32 = 4;
+        buf[4..8].copy_from_slice(&bad_len.to_be_bytes());
+        assert!(matches!(
+            MessageView::decode(&buf[..]),
+            Err(Error::InvalidLength(4))
+        ));
+        assert!(matches!(
+            MessageView::decode_exact(&buf[..16]),
+            Err(Error::InvalidLength(4))
         ));
     }
 

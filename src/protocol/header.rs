@@ -193,7 +193,7 @@ impl Header {
     /// Returns the payload size in bytes (`length - 8`).
     #[must_use]
     pub const fn payload_size(&self) -> usize {
-        self.length as usize - 8
+        (self.length as usize).saturating_sub(8)
     }
 
     /// Sets the request ID field.
@@ -248,7 +248,7 @@ impl<'a> HeaderView<'a> {
     /// Returns the payload size in bytes (`length - 8`).
     #[must_use]
     pub fn payload_size(&self) -> usize {
-        self.length() as usize - 8
+        (self.length() as usize).saturating_sub(8)
     }
 
     /// Returns header bytes 8..16: the request ID, protocol and interface

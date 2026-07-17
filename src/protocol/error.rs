@@ -25,6 +25,9 @@ pub enum Error {
     /// The return code field contains an unrecognized value.
     #[error("Invalid value in ReturnCode field: {0:X}")]
     InvalidReturnCode(u8),
+    /// The SOME/IP length field was smaller than the 8-byte minimum (`request_id..return_code`).
+    #[error("Invalid SOME/IP length field: {0} (minimum 8)")]
+    InvalidLength(u32),
     /// The message ID is not supported by the payload implementation.
     #[error("Unsupported MessageID  {0:X?}")]
     UnsupportedMessageID(super::MessageId),
