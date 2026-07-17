@@ -228,6 +228,22 @@ where
                     protected_buf,
                 );
                 match result {
+                    // Post-hoc length backfill (intentional, not an `Encode` gap):
+                    // the SOME/IP length field at `msg_buf[4..8]` was already
+                    // written by `encode_to_slice` above, but E2E protection
+                    // changes the payload's size (header + CRC overhead), so
+                    // the final on-wire length isn't known until *after*
+                    // `protect` runs. A single-pass `Encode` impl cannot
+                    // express "go back and rewrite bytes already emitted
+                    // based on bytes written later" — that's exactly the
+                    // size-changing, post-hoc transform the codec's README
+                    // scopes out of `Encode`, recommending a two-phase
+                    // consumer-owned API instead. That two-phase API is
+                    // protect/check, which is why E2E stays off the
+                    // `Encode`/`Decode` traits rather than being forced onto
+                    // them. This rewrite does not change any on-wire bytes
+                    // that `Encode` would have produced without E2E; it only
+                    // patches the length field to reflect the protected size.
                     Some(Ok(protected_len)) => {
                         if 16 + protected_len > msg_buf.len() {
                             crate::log::error!(

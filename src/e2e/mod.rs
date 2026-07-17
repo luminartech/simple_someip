@@ -3,6 +3,35 @@
 //! This module implements E2E Profile 4 and Profile 5 protection as specified
 //! in the [Open SOME/IP Specification](https://github.com/some-ip-com/open-someip-spec).
 //!
+//! # Why E2E does not implement `Encode`/`Decode`
+//!
+//! Unlike the rest of the wire path (headers, SD entries/options, payloads),
+//! E2E deliberately stays on its own `protect`/`check` API instead of
+//! `automotive_wire_codec::{Encode, Decode}`. Two structural mismatches drive
+//! this, and both are intentional — not gaps to be closed later:
+//!
+//! - **In-place mutation, not a fresh encode.** `protect` writes a header in
+//!   front of an already-serialized payload and, at the call site (see
+//!   `server::event_publisher::EventPublisher::publish_event`), the
+//!   surrounding SOME/IP length field gets rewritten *after* protection
+//!   because the final length depends on protect's output size. `Encode` is
+//!   a single forward pass; it has no place to express "go back and patch
+//!   bytes already written based on bytes written later." The codec's own
+//!   README scopes this kind of size-changing, post-hoc transform out of
+//!   `Encode` and points to a two-phase, consumer-owned API for it — which
+//!   is exactly what `protect`/`check` are.
+//! - **Status results, not `Result<_, Error>`.** `check_profile4`/`check_profile5`
+//!   return an [`E2ECheckResult`] carrying an [`E2ECheckStatus`] (`Ok`,
+//!   `CrcError`, `Repeated`, `WrongSequence`, `OkSomeLost`, `BadArgument`,
+//!   `Unchecked`) rather than an error. Several of those statuses (e.g.
+//!   `OkSomeLost`) are still *successful* checks that also carry diagnostic
+//!   information — that doesn't fit `Decode`'s binary success/error split.
+//!
+//! [`crate::e2e::Error`] (used only by `protect`'s buffer-sizing failure) is
+//! bridged onto [`crate::protocol::Error`] via `impl From<e2e::Error> for
+//! protocol::Error` (see `protocol::error`) so callers that want one error
+//! type can still get it, without forcing E2E itself onto the codec traits.
+//!
 //! # Example
 //!
 //! ```

@@ -1,5 +1,21 @@
 //! CRC computation helpers for E2E profiles.
-
+//!
+//! # Little-endian `DataID`/CRC framing (Profile 5) — intentional, do not "fix"
+//!
+//! Profile 5's CRC input and on-wire CRC field use **little-endian** byte
+//! order for `DataID` and the CRC value itself (see `data_id.to_le_bytes()`
+//! and `crc.to_le_bytes()` below), whereas the rest of this crate — SOME/IP
+//! headers, Profile 4, and every `Encode`/`Decode` impl built on
+//! `automotive-wire-codec` — is big-endian. This is not an inconsistency to
+//! reconcile: it is spec-correct per E2E Profile 5, which defines its CRC
+//! and header fields as little-endian.
+//!
+//! `automotive-wire-codec` 0.3 only ships big-endian leaf helpers (`u16`/`u32`
+//! big-endian encode/decode), so E2E cannot express this LE framing through
+//! the codec's `Encode`/`Decode` traits even if it otherwise migrated onto
+//! them. This gap has been recorded as codec feedback (tracked as F2) rather
+//! than worked around here — do **not** introduce ad hoc LE codec helpers in
+//! this crate; the LE byte order below must stay exactly as written.
 use crc::{CRC_16_IBM_3740, CRC_32_AUTOSAR, Crc};
 
 /// CRC-32P4 algorithm used by E2E Profile 4.
@@ -57,7 +73,8 @@ pub fn compute_crc16_p5(data_id: u16, counter: u8, payload: &[u8]) -> u16 {
     // Payload
     digest.update(payload);
 
-    // DataID (little-endian)
+    // DataID (little-endian per E2E Profile 5 — see module-level doc comment;
+    // intentional, not a bug, and not to be "corrected" to big-endian).
     let data_id_bytes = data_id.to_le_bytes();
     digest.update(&data_id_bytes);
 
@@ -96,6 +113,8 @@ pub fn compute_crc16_p5_with_header(
     digest.update(&upper_header);
     digest.update(&[counter]);
     digest.update(payload);
+    // DataID (little-endian per E2E Profile 5 — see module-level doc comment;
+    // intentional, not a bug, and not to be "corrected" to big-endian).
     digest.update(&data_id.to_le_bytes());
 
     let crc = digest.finalize();

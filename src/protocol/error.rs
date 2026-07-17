@@ -51,3 +51,60 @@ impl From<automotive_wire_codec::EncodeToSliceError<Error>> for Error {
         }
     }
 }
+
+/// Bridges [`crate::e2e::Error`] onto `protocol::Error` so E2E failures can be
+/// reported through the same error type as the rest of the wire path.
+///
+/// E2E deliberately does **not** implement `Encode`/`Decode` (see the
+/// `src/e2e` module docs), so it keeps its own `Error` type. This impl only
+/// aligns the *shape* of that error with `protocol::Error` for callers that
+/// want a single error type to propagate; it does not change E2E's
+/// protect/check behavior or on-wire bytes.
+///
+/// # Mapping
+///
+/// `e2e::Error` currently has exactly one variant:
+///
+/// - [`crate::e2e::Error::BufferTooSmall`] `{ needed, actual }` → maps to
+///   [`Error::InsufficientBuffer`], **not** [`Error::Incomplete`]. Although
+///   `Incomplete { needed, available }` has the identical field shape, its
+///   semantics are decode-direction ("input ended before enough bytes could
+///   be *read*"). `BufferTooSmall` instead means an output slice was too
+///   small to hold the bytes E2E `protect` needed to *write* — the same
+///   direction as `automotive_wire_codec::InsufficientBuffer` ("An output
+///   slice was too small for the bytes an encode needed to write"). That is
+///   the semantically correct counterpart, so `needed`/`actual` map directly
+///   onto `InsufficientBuffer`'s `needed`/`available` fields.
+impl From<crate::e2e::Error> for Error {
+    fn from(err: crate::e2e::Error) -> Self {
+        match err {
+            crate::e2e::Error::BufferTooSmall { needed, actual } => {
+                Error::InsufficientBuffer(automotive_wire_codec::InsufficientBuffer {
+                    needed,
+                    available: actual,
+                })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod e2e_bridge_tests {
+    use super::Error;
+
+    #[test]
+    fn buffer_too_small_maps_to_insufficient_buffer() {
+        let e2e_err = crate::e2e::Error::BufferTooSmall {
+            needed: 16,
+            actual: 10,
+        };
+        let mapped: Error = e2e_err.into();
+        match mapped {
+            Error::InsufficientBuffer(ib) => {
+                assert_eq!(ib.needed, 16);
+                assert_eq!(ib.available, 10);
+            }
+            other => panic!("expected Error::InsufficientBuffer, got {other:?}"),
+        }
+    }
+}
