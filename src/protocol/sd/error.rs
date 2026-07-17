@@ -14,8 +14,13 @@ pub enum Error {
     #[error("Invalid value for Service Discovery Option Transport Protocol: {0:X}")]
     InvalidOptionTransportProtocol(u8),
     /// The declared options size does not match the actual data.
-    #[error("Incorrect options size, {0} bytes remaining")]
-    IncorrectOptionsSize(usize),
+    #[error("Incorrect options size: need {needed} bytes, have {available}")]
+    IncorrectOptionsSize {
+        /// The number of bytes required for the option header or body.
+        needed: usize,
+        /// The number of bytes actually remaining in the buffer.
+        available: usize,
+    },
     /// An option's length field does not match the expected size for its type.
     #[error(
         "Invalid SD option length for type 0x{option_type:02X}: expected {expected}, got {actual}"

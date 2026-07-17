@@ -222,7 +222,11 @@ impl<'a> HeaderView<'a> {
     /// Cannot panic — the `expect` is guarded by a length check above it.
     pub fn parse(buf: &'a [u8]) -> Result<(Self, &'a [u8]), Error> {
         if buf.len() < 16 {
-            return Err(Error::UnexpectedEof);
+            return Err(automotive_wire_codec::Incomplete {
+                needed: 16,
+                available: buf.len(),
+            }
+            .into());
         }
         let header_bytes: &[u8; 16] = buf[..16].try_into().expect("length checked above");
         let view = Self(header_bytes);
@@ -527,7 +531,10 @@ mod tests {
         let buf: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
         assert!(matches!(
             HeaderView::parse(&buf[..]),
-            Err(Error::UnexpectedEof)
+            Err(Error::Incomplete(automotive_wire_codec::Incomplete {
+                needed: 16,
+                available: 4,
+            }))
         ));
     }
 

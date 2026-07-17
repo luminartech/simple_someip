@@ -85,7 +85,11 @@ impl<'a> MessageView<'a> {
         let payload_size = header.payload_size();
 
         if remaining.len() < payload_size {
-            return Err(Error::UnexpectedEof);
+            return Err(automotive_wire_codec::Incomplete {
+                needed: payload_size,
+                available: remaining.len(),
+            }
+            .into());
         }
 
         // SD-specific validation
@@ -307,7 +311,27 @@ mod tests {
         let buf: [u8; 4] = [0; 4];
         assert!(matches!(
             MessageView::parse(&buf[..]),
-            Err(Error::UnexpectedEof)
+            Err(Error::Incomplete(automotive_wire_codec::Incomplete {
+                needed: 16,
+                available: 4,
+            }))
+        ));
+    }
+
+    #[test]
+    fn parse_payload_truncated_reports_needed_and_available() {
+        let msg = make_sd_message();
+        let mut buf = [0u8; 64];
+        let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
+        let payload_size = msg.header().payload_size();
+        // Keep the full 16-byte header but chop one byte off the payload.
+        let short = &buf[..n - 1];
+        assert!(matches!(
+            MessageView::parse(short),
+            Err(Error::Incomplete(automotive_wire_codec::Incomplete {
+                needed,
+                available,
+            })) if needed == payload_size && available == payload_size - 1
         ));
     }
 

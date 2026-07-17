@@ -7,9 +7,15 @@ pub enum Error {
     /// An I/O error occurred while reading or writing bytes.
     #[error("I/O error: {0:?}")]
     Io(embedded_io::ErrorKind),
-    /// The input buffer ended before the expected number of bytes could be read.
-    #[error("Unexpected end of input")]
-    UnexpectedEof,
+    /// Input ended before the expected number of bytes could be read.
+    #[error("incomplete: need {} bytes, have {}", .0.needed, .0.available)]
+    Incomplete(#[from] automotive_wire_codec::Incomplete),
+    /// Bytes remained after a value that should have consumed the whole buffer.
+    #[error("trailing bytes: {} left over", .0.0)]
+    Trailing(#[from] automotive_wire_codec::TrailingBytes),
+    /// An output slice was too small for the bytes an encode needed to write.
+    #[error("insufficient buffer: need {} bytes, have {}", .0.needed, .0.available)]
+    InsufficientBuffer(#[from] automotive_wire_codec::InsufficientBuffer),
     /// The protocol version field contains an unsupported value.
     #[error("Invalid protocol version: {0:X}")]
     InvalidProtocolVersion(u8),

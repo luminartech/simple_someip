@@ -144,7 +144,14 @@ pub trait ReadBytesExt {
 impl<T: embedded_io::Read> ReadBytesExt for T {
     fn read_bytes(&mut self, buf: &mut [u8]) -> Result<(), Error> {
         self.read_exact(buf).map_err(|e| match e {
-            embedded_io::ReadExactError::UnexpectedEof => Error::Io(embedded_io::ErrorKind::Other),
+            // `read_exact` doesn't tell us how many bytes it actually got before
+            // hitting EOF, so `available: 0` is the most honest value we can report
+            // (we know we needed `buf.len()`, not how far we got).
+            embedded_io::ReadExactError::UnexpectedEof => automotive_wire_codec::Incomplete {
+                needed: buf.len(),
+                available: 0,
+            }
+            .into(),
             embedded_io::ReadExactError::Other(e) => Error::Io(e.kind()),
         })
     }
@@ -323,6 +330,20 @@ mod tests {
         assert!(matches!(
             FailingReader.read_u8(),
             Err(Error::Io(embedded_io::ErrorKind::BrokenPipe))
+        ));
+    }
+
+    #[test]
+    fn read_truncated_stream_maps_to_incomplete() {
+        // A slice reader that runs out of bytes reports `UnexpectedEof`, which
+        // should be surfaced as `Error::Incomplete` (not a generic I/O error).
+        let buf: &[u8] = &[0x01];
+        assert!(matches!(
+            (&mut &*buf).read_u32_be(),
+            Err(Error::Incomplete(automotive_wire_codec::Incomplete {
+                needed: 4,
+                available: 0,
+            }))
         ));
     }
 

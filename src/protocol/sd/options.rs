@@ -541,12 +541,18 @@ impl<'a> Iterator for OptionIter<'a> {
 /// protocol byte.
 pub(crate) fn validate_option(buf: &[u8]) -> Result<usize, Error> {
     if buf.len() < OPTION_HEADER_SIZE {
-        return Err(Error::IncorrectOptionsSize(buf.len()));
+        return Err(Error::IncorrectOptionsSize {
+            needed: OPTION_HEADER_SIZE,
+            available: buf.len(),
+        });
     }
     let length = u16::from_be_bytes([buf[0], buf[1]]);
     let wire_size = usize::from(length) + OPTION_LENGTH_SIZE_DELTA;
     if wire_size > buf.len() {
-        return Err(Error::IncorrectOptionsSize(buf.len()));
+        return Err(Error::IncorrectOptionsSize {
+            needed: wire_size,
+            available: buf.len(),
+        });
     }
     let option_type_byte = buf[OPTION_TYPE_OFFSET];
     let option_type = OptionType::try_from(option_type_byte)?;

@@ -64,7 +64,11 @@ impl<'a> SdHeaderView<'a> {
     pub fn parse(buf: &'a [u8]) -> Result<Self, crate::protocol::Error> {
         // Minimum: 4 (flags+reserved) + 4 (entries_size) + 4 (options_size) = 12
         if buf.len() < 12 {
-            return Err(crate::protocol::Error::UnexpectedEof);
+            return Err(automotive_wire_codec::Incomplete {
+                needed: 12,
+                available: buf.len(),
+            }
+            .into());
         }
 
         let flags = Flags::from(buf[0]);
@@ -78,7 +82,11 @@ impl<'a> SdHeaderView<'a> {
 
         // Need entries data + 4 bytes for options_size field
         if buf.len() < 8 + entries_size + 4 {
-            return Err(crate::protocol::Error::UnexpectedEof);
+            return Err(automotive_wire_codec::Incomplete {
+                needed: 8 + entries_size + 4,
+                available: buf.len(),
+            }
+            .into());
         }
 
         let entries_buf = &buf[8..8 + entries_size];
@@ -100,7 +108,11 @@ impl<'a> SdHeaderView<'a> {
 
         let options_start = options_size_offset + 4;
         if buf.len() < options_start + options_size {
-            return Err(crate::protocol::Error::UnexpectedEof);
+            return Err(automotive_wire_codec::Incomplete {
+                needed: options_start + options_size,
+                available: buf.len(),
+            }
+            .into());
         }
 
         let options_buf = &buf[options_start..options_start + options_size];
@@ -312,7 +324,10 @@ mod tests {
         buf[..12].copy_from_slice(&prefix);
         assert!(matches!(
             SdHeaderView::parse(&buf),
-            Err(crate::protocol::Error::Sd(SdError::IncorrectOptionsSize(2)))
+            Err(crate::protocol::Error::Sd(SdError::IncorrectOptionsSize {
+                needed: 4,
+                available: 2,
+            }))
         ));
     }
 
@@ -325,7 +340,10 @@ mod tests {
         buf[12..24].copy_from_slice(&option);
         assert!(matches!(
             SdHeaderView::parse(&buf),
-            Err(crate::protocol::Error::Sd(SdError::IncorrectOptionsSize(5)))
+            Err(crate::protocol::Error::Sd(SdError::IncorrectOptionsSize {
+                needed: 12,
+                available: 5,
+            }))
         ));
     }
 
