@@ -4,8 +4,8 @@ use automotive_wire_codec::{Decode, DecodeIter, DecodeIterator, Encode};
 
 use super::{
     Entry, EntryView, Flags, OptionView, Options,
-    entry::{ENTRY_SIZE, EntryIter, EntryType},
-    options::{OptionIter, validate_option},
+    entry::{ENTRY_SIZE, EntryIter},
+    options::OptionIter,
 };
 
 /// An SD header that borrows its entries and options slices.
@@ -39,11 +39,28 @@ impl<'a> Header<'a> {
 /// Created by [`SdHeaderView::parse`], which fully validates the SD header,
 /// entries, and options upfront. This makes the entry and option iterators
 /// infallible.
+///
+/// # Validation-proof invariant (candidate "c")
+///
+/// The type system carries no proof tying the cached `entry_count` /
+/// `option_count` to `entries_buf` / `options_buf`. `parse` runs ONE eager
+/// validating walk (draining the lazy L1 [`DecodeIterator`]s) and caches the
+/// element counts; the infallible accessors ([`entries`](SdHeaderView::entries)
+/// / [`options`](SdHeaderView::options)) then re-slice those *already-validated*
+/// buffers with purpose-built iterators that advance by stride/length WITHOUT
+/// re-running the type/length/transport checks. They TRUST the construction-time
+/// walk. Nothing but this `parse`-only construction path may populate the
+/// buffers, so the trust holds — the same invariant `OptionIter` has always
+/// relied on.
 #[derive(Clone, Copy, Debug)]
 pub struct SdHeaderView<'a> {
     flags: Flags,
     entries_buf: &'a [u8],
     options_buf: &'a [u8],
+    /// Number of valid entries found during the construction-time walk.
+    entry_count: usize,
+    /// Number of valid options found during the construction-time walk.
+    option_count: usize,
 }
 
 impl<'a> SdHeaderView<'a> {
@@ -63,34 +80,41 @@ impl<'a> SdHeaderView<'a> {
     /// transport protocol byte.
     pub fn parse(buf: &'a [u8]) -> Result<Self, crate::protocol::Error> {
         // The O(1) slicing + length checks (flags/reserved, entries_size,
-        // options_size, and the section bounds) live in the single decode
-        // source, `SdBody::decode`. This eager path adds only the L2
-        // validation walks over the already-sliced sections. Those walks are
-        // slated to be re-founded on the lazy `DecodeIter`ators in Phase 4;
-        // until then they stay here so `SdHeaderView`'s entry/option iterators
-        // remain infallible.
+        // options_size, and the section bounds, incl. overflow hardening) live
+        // in the single decode source, `SdBody::decode`. This L2 path is
+        // re-founded (Phase 4) on top of that lazy L1 layer: it runs ONE eager
+        // validating walk by draining the L1 `DecodeIterator`s over the
+        // already-sliced entries and options sections, surfacing the first
+        // `Err` via `?`, and caches the element counts. The infallible
+        // accessors then re-slice these validated buffers without re-validating
+        // (candidate "c" — see the type-level docs for the trust invariant).
         let (body, _rest) = SdBody::decode(buf)?;
-        let entries_buf = body.entries_buf;
-        let options_buf = body.options_buf;
 
-        // Validate all entry type bytes.
-        let mut offset = 0;
-        while offset < entries_buf.len() {
-            EntryType::try_from(entries_buf[offset])?;
-            offset += ENTRY_SIZE;
+        // Eager validating walk over the entries section. `EntryView`'s L1
+        // decode only slices the fixed 16-byte stride (surfacing truncation);
+        // `entry_type()` validates the type byte. A partial trailing entry is
+        // surfaced here as an `Err`, not silently truncated at accessor time.
+        let mut entry_count = 0usize;
+        for entry in body.entries() {
+            entry?.entry_type()?;
+            entry_count += 1;
         }
 
-        // Validate all options.
-        let mut opt_offset = 0;
-        while opt_offset < options_buf.len() {
-            let wire_size = validate_option(&options_buf[opt_offset..])?;
-            opt_offset += wire_size;
+        // Eager validating walk over the options section. `OptionView`'s L1
+        // decode only slices by the length field (surfacing truncation);
+        // `validate()` checks type / per-type length / transport-protocol byte.
+        let mut option_count = 0usize;
+        for option in body.options() {
+            option?.validate()?;
+            option_count += 1;
         }
 
         Ok(Self {
             flags: body.flags,
-            entries_buf,
-            options_buf,
+            entries_buf: body.entries_buf,
+            options_buf: body.options_buf,
+            entry_count,
+            option_count,
         })
     }
 
@@ -100,22 +124,45 @@ impl<'a> SdHeaderView<'a> {
         self.flags
     }
 
-    /// Returns an iterator over the SD entries.
+    /// Returns an infallible iterator over the SD entries.
+    ///
+    /// Re-slices the already-validated `entries_buf` at the fixed 16-byte
+    /// stride; it never re-runs entry-type validation (done once in [`parse`]).
+    /// The returned [`EntryIter`] is [`ExactSizeIterator`] — its length comes
+    /// for free from the fixed stride.
     #[must_use]
     pub fn entries(&self) -> EntryIter<'a> {
         EntryIter::new(self.entries_buf)
     }
 
-    /// Returns an iterator over the SD options.
+    /// Returns an infallible iterator over the SD options.
+    ///
+    /// Re-slices the already-validated `options_buf` by each option's length
+    /// field; it never re-runs option validation (done once in [`parse`]).
+    /// Options have no fixed stride, so [`OptionIter`] is not itself
+    /// [`ExactSizeIterator`]; use [`option_count`](SdHeaderView::option_count)
+    /// for the cached element count.
     #[must_use]
     pub fn options(&self) -> OptionIter<'a> {
         OptionIter::new(self.options_buf)
     }
 
     /// Returns the number of entries in this SD header.
+    ///
+    /// This is the count cached by the construction-time validating walk.
     #[must_use]
     pub fn entry_count(&self) -> usize {
-        self.entries_buf.len() / ENTRY_SIZE
+        self.entry_count
+    }
+
+    /// Returns the number of options in this SD header.
+    ///
+    /// This is the count cached by the construction-time validating walk.
+    /// Because options have no fixed stride, this cached count is the analogue
+    /// of `EntryIter`'s free `ExactSizeIterator::len` for the options section.
+    #[must_use]
+    pub fn option_count(&self) -> usize {
+        self.option_count
     }
 }
 
@@ -200,18 +247,31 @@ impl<'a> Decode<'a> for SdBody<'a> {
             return Err(super::Error::IncorrectEntriesSize(entries_size).into());
         }
 
-        // Need entries data + 4 bytes for options_size field
-        if buf.len() < 8 + entries_size + 4 {
+        // All section-bound arithmetic is `checked_add`: on a 32-bit `usize`
+        // (`no_std` embedded targets) a hostile `entries_size` / `options_size`
+        // near `u32::MAX` would otherwise wrap `8 + entries_size + 4` or
+        // `options_start + options_size` and pass the length check with a bogus
+        // small bound. An overflow means the buffer cannot possibly hold the
+        // declared sections, so it is reported as `Incomplete`.
+        let overflow = || automotive_wire_codec::Incomplete {
+            needed: usize::MAX,
+            available: buf.len(),
+        };
+
+        // Need entries data + 4 bytes for options_size field.
+        let entries_end = 8usize.checked_add(entries_size).ok_or_else(overflow)?;
+        let options_size_offset = entries_end;
+        let entries_section_end = entries_end.checked_add(4).ok_or_else(overflow)?;
+        if buf.len() < entries_section_end {
             return Err(automotive_wire_codec::Incomplete {
-                needed: 8 + entries_size + 4,
+                needed: entries_section_end,
                 available: buf.len(),
             }
             .into());
         }
 
-        let entries_buf = &buf[8..8 + entries_size];
+        let entries_buf = &buf[8..options_size_offset];
 
-        let options_size_offset = 8 + entries_size;
         let options_size = u32::from_be_bytes([
             buf[options_size_offset],
             buf[options_size_offset + 1],
@@ -219,17 +279,20 @@ impl<'a> Decode<'a> for SdBody<'a> {
             buf[options_size_offset + 3],
         ]) as usize;
 
-        let options_start = options_size_offset + 4;
-        if buf.len() < options_start + options_size {
+        let options_start = entries_section_end;
+        let options_end = options_start
+            .checked_add(options_size)
+            .ok_or_else(overflow)?;
+        if buf.len() < options_end {
             return Err(automotive_wire_codec::Incomplete {
-                needed: options_start + options_size,
+                needed: options_end,
                 available: buf.len(),
             }
             .into());
         }
 
-        let options_buf = &buf[options_start..options_start + options_size];
-        let rest = &buf[options_start + options_size..];
+        let options_buf = &buf[options_start..options_end];
+        let rest = &buf[options_end..];
 
         Ok((
             Self {
@@ -401,15 +464,21 @@ mod tests {
 
     #[test]
     fn parse_options_size_below_minimum_returns_error() {
+        // The eager L2 walk now drains the L1 option `DecodeIterator`, so a
+        // truncated options section surfaces the L1 `Incomplete` (the needed /
+        // available byte counts are unchanged) rather than the old hand-rolled
+        // `IncorrectOptionsSize`.
         let prefix = raw_header(0, 2);
         let mut buf = [0u8; 14];
         buf[..12].copy_from_slice(&prefix);
         assert!(matches!(
             SdHeaderView::parse(&buf),
-            Err(crate::protocol::Error::Sd(SdError::IncorrectOptionsSize {
-                needed: 4,
-                available: 2,
-            }))
+            Err(crate::protocol::Error::Incomplete(
+                automotive_wire_codec::Incomplete {
+                    needed: 4,
+                    available: 2,
+                }
+            ))
         ));
     }
 
@@ -422,10 +491,12 @@ mod tests {
         buf[12..24].copy_from_slice(&option);
         assert!(matches!(
             SdHeaderView::parse(&buf),
-            Err(crate::protocol::Error::Sd(SdError::IncorrectOptionsSize {
-                needed: 12,
-                available: 5,
-            }))
+            Err(crate::protocol::Error::Incomplete(
+                automotive_wire_codec::Incomplete {
+                    needed: 12,
+                    available: 5,
+                }
+            ))
         ));
     }
 
@@ -442,6 +513,59 @@ mod tests {
         h.encode(&mut buf.as_mut_slice()).unwrap();
         let view = SdHeaderView::parse(&buf[..h.encoded_size().unwrap()]).unwrap();
         assert_eq!(view.entry_count(), 2);
+    }
+
+    #[test]
+    fn sd_header_view_accessors_yield_cached_counts() {
+        // After a successful parse, the infallible accessors yield exactly the
+        // cached counts and never panic.
+        let ip = Ipv4Addr::new(192, 168, 1, 10);
+        let entries = [
+            Entry::FindService(ServiceEntry::find(0x0001)),
+            Entry::FindService(ServiceEntry::find(0x0002)),
+        ];
+        let options = [
+            Options::IpV4Endpoint {
+                ip,
+                protocol: TransportProtocol::Udp,
+                port: 30509,
+            },
+            Options::IpV4Endpoint {
+                ip,
+                protocol: TransportProtocol::Tcp,
+                port: 30510,
+            },
+        ];
+        let h = Header::new(
+            Flags::new_sd(RebootFlag::RecentlyRebooted),
+            &entries,
+            &options,
+        );
+        let mut buf = [0u8; 128];
+        let n = h.encode(&mut buf.as_mut_slice()).unwrap();
+        let view = SdHeaderView::parse(&buf[..n]).unwrap();
+        assert_eq!(view.entry_count(), 2);
+        assert_eq!(view.option_count(), 2);
+        // Infallible accessors walk without panicking and match the counts.
+        assert_eq!(view.entries().count(), view.entry_count());
+        assert_eq!(view.options().count(), view.option_count());
+        // EntryIter is ExactSizeIterator: its len matches the cached count.
+        assert_eq!(view.entries().len(), view.entry_count());
+    }
+
+    #[test]
+    fn parse_rejects_trailing_partial_option() {
+        // options_size declares 12 bytes, but the single option's length field
+        // claims a wire size of 16 (length = 13). The eager walk must reject
+        // this at parse rather than silently truncating at accessor time.
+        let prefix = raw_header(0, 12);
+        let mut option = ipv4_endpoint_bytes([10, 0, 0, 1], 0x11, 30490);
+        // Overwrite the length field to claim more bytes than are present.
+        option[0..2].copy_from_slice(&13u16.to_be_bytes());
+        let mut buf = [0u8; 24];
+        buf[..12].copy_from_slice(&prefix);
+        buf[12..24].copy_from_slice(&option);
+        assert!(SdHeaderView::parse(&buf).is_err());
     }
 
     #[test]

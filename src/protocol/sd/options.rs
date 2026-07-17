@@ -365,6 +365,21 @@ impl<'a> OptionView<'a> {
         usize::from(length) + OPTION_LENGTH_SIZE_DELTA
     }
 
+    /// Fully validate this option's wire format (type, per-type length, and
+    /// transport-protocol byte for IP-bearing options).
+    ///
+    /// Used by the eager L2 validation walk in
+    /// [`SdHeaderView::parse`](super::SdHeaderView::parse) so that its
+    /// infallible option accessors can trust the buffer thereafter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the option type, length, or transport-protocol byte
+    /// is invalid.
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        validate_option(self.0).map(|_| ())
+    }
+
     /// Parse as IPv4 endpoint/multicast/SD option.
     /// Returns `(ip, protocol, port)`.
     ///
