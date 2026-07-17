@@ -279,6 +279,16 @@ jobs:
           cargo doc --no-deps --no-default-features --features $ALLOC_FEATURES
       - name: No-alloc witness (explicit gate)
         run: cargo test --features client,bare_metal --test no_alloc_witness
+      - name: embassy-net adapter (reference no_std backend)
+        # The `check` job's `--workspace` clippy checks this crate's *library*
+        # but never its test target (clippy runs without `--all-targets`, and
+        # the root-package `cargo test` steps above don't select `-p
+        # simple-someip-embassy-net`). Its `tests/loopback.rs` host harness
+        # therefore compiled nowhere in CI and silently bit-rotted against the
+        # client API. This step builds AND runs it (the loopback tests bridge
+        # two embassy-net stacks in-process — no TUN, no privilege) so the
+        # reference adapter stays wired to the current API.
+        run: cargo test -p simple-someip-embassy-net
       - name: SD wire-format conformance (TX direction)
         # `tx_announcement_loop_emits_wire_format_offer` is `#[ignore]`'d by
         # default because it needs an interface with the `MULTICAST` link
