@@ -17,14 +17,14 @@
 //!
 //! ## Sizing the pool
 //!
-//! Bare-metal callers should size their pool at **`(max concurrent sockets)
-//! + 1`** slots, not exactly the socket count. The unicast-eviction path
+//! Bare-metal callers should size their pool at **`(max concurrent
+//! sockets) + 1`** slots, not exactly the socket count. The unicast-eviction path
 //! frees a buffer lease asynchronously (when the spawned loop future drops),
 //! lagging the synchronous registry removal, so an evict-then-immediate-rebind
 //! can transiently need one extra slot; without the `+ 1` slack that surfaces
 //! as a spurious `Capacity("udp_buffer")`. The tokio provider already bakes
-//! this in (it sizes its pool at 10 = `UNICAST_SOCKETS_CAP (8) + 1 discovery
-//! + 1 release-lag`).
+//! this in (it sizes its pool at 10 = `UNICAST_SOCKETS_CAP (8) + 1
+//! discovery + 1 release-lag`).
 //!
 //! ## Minimum slot length
 //!
@@ -33,7 +33,7 @@
 //! enforces this floor with a compile-time `const` assertion. 16 is only the
 //! absolute header minimum: the practical floor is the largest expected
 //! message (header + payload), realistically one full UDP datagram
-//! ([`UDP_BUFFER_SIZE`](crate::UDP_BUFFER_SIZE)).
+//! ([`UDP_BUFFER_SIZE`]).
 //!
 //! See `docs/simple_someip/plans/2026-06-09-phase22-125-memory-reduction-design.md`.
 mod bind_dispatch;
@@ -51,6 +51,7 @@ pub use error::Error;
 /// reference this type directly — the `define_static_channels!` macro
 /// (under `feature = "bare_metal"`) names it for them.
 pub use inner::ControlMessage;
+pub use service_registry::ServiceEndpointKey;
 /// Per-socket message types exposed for the same reason as
 /// [`ControlMessage`] — see its docstring.
 pub use socket_manager::{ReceivedMessage, SendMessage};
@@ -937,32 +938,31 @@ where
         response.recv().await.map_err(|_| Error::Shutdown)?
     }
 
-    /// Subscribes to an event group on a known service.
+    /// Subscribes to an event group on a known service instance,
+    /// addressed by its [`ServiceEndpointKey`] (service id + provider
+    /// endpoint socket). The instance id for the `SubscribeEventgroup` SD
+    /// entry is read from the registry value stored by
+    /// [`add_endpoint`](Self::add_endpoint) or SD auto-registration.
     ///
     /// # Errors
     ///
     /// Returns an error if the service is not found or subscription fails.
+    /// Returns [`Error::UnsupportedEndpoint`] if the key's endpoint is
+    /// not an IPv4/UDP socket.
     /// Returns [`Error::Shutdown`] if the client's run-loop future has
     /// exited before this call (dropped, cancelled, or otherwise gone)
     /// — the `Client` handle has outlived its driver and further
     /// control-channel sends cannot make progress.
     pub async fn subscribe(
         &self,
-        service_id: u16,
-        instance_id: u16,
+        key: ServiceEndpointKey,
         major_version: u8,
         ttl: u32,
         event_group_id: u16,
         client_port: u16,
     ) -> Result<(), Error> {
-        let (response, message) = ControlMessage::subscribe(
-            service_id,
-            instance_id,
-            major_version,
-            ttl,
-            event_group_id,
-            client_port,
-        );
+        let (response, message) =
+            ControlMessage::subscribe(key, major_version, ttl, event_group_id, client_port);
         self.control_sender
             .send(message)
             .await
@@ -1000,21 +1000,14 @@ where
     /// [`subscribe`](Self::subscribe) instead.
     pub async fn subscribe_no_wait(
         &self,
-        service_id: u16,
-        instance_id: u16,
+        key: ServiceEndpointKey,
         major_version: u8,
         ttl: u32,
         event_group_id: u16,
         client_port: u16,
     ) {
-        let (_response, message) = ControlMessage::subscribe(
-            service_id,
-            instance_id,
-            major_version,
-            ttl,
-            event_group_id,
-            client_port,
-        );
+        let (_response, message) =
+            ControlMessage::subscribe(key, major_version, ttl, event_group_id, client_port);
         let _ = self.control_sender.send(message).await;
     }
 
@@ -1101,6 +1094,12 @@ where
 
     /// Registers a service endpoint in the client's endpoint registry.
     ///
+    /// `key` carries the wire identity (service id + provider socket +
+    /// transport protocol); `instance_id` is stored as data because
+    /// `SubscribeEventgroup` SD entries need it on the wire
+    /// (`[PRS_SOMEIP_00162]`: it is not part of a service instance's
+    /// wire identity).
+    ///
     /// `local_port` controls which source port is used when sending to this
     /// endpoint via [`send_to_service`](Self::send_to_service). Pass `0` to
     /// use an ephemeral (OS-assigned) port.
@@ -1119,13 +1118,11 @@ where
     /// control-channel sends cannot make progress.
     pub async fn add_endpoint(
         &self,
-        service_id: u16,
+        key: ServiceEndpointKey,
         instance_id: u16,
-        addr: SocketAddrV4,
         local_port: u16,
     ) -> Result<(), Error> {
-        let (response, message) =
-            ControlMessage::add_endpoint(service_id, instance_id, addr, local_port);
+        let (response, message) = ControlMessage::add_endpoint(key, instance_id, local_port);
         self.control_sender
             .send(message)
             .await
@@ -1142,8 +1139,8 @@ where
     /// exited before this call (dropped, cancelled, or otherwise gone)
     /// — the `Client` handle has outlived its driver and further
     /// control-channel sends cannot make progress.
-    pub async fn remove_endpoint(&self, service_id: u16, instance_id: u16) -> Result<(), Error> {
-        let (response, message) = ControlMessage::remove_endpoint(service_id, instance_id);
+    pub async fn remove_endpoint(&self, key: ServiceEndpointKey) -> Result<(), Error> {
+        let (response, message) = ControlMessage::remove_endpoint(key);
         self.control_sender
             .send(message)
             .await
@@ -1171,18 +1168,18 @@ where
     ///
     /// Returns an error if the service is not found, unicast binding fails,
     /// or the UDP send fails.
+    /// Returns [`Error::UnsupportedEndpoint`] if the key's endpoint is
+    /// not an IPv4/UDP socket.
     /// Returns [`Error::Shutdown`] if the client's run-loop future has
     /// exited before this call (dropped, cancelled, or otherwise gone)
     /// — the `Client` handle has outlived its driver and further
     /// control-channel sends cannot make progress.
     pub async fn send_to_service(
         &self,
-        service_id: u16,
-        instance_id: u16,
+        key: ServiceEndpointKey,
         message: crate::protocol::Message<MessageDefinitions>,
     ) -> Result<PendingResponse<MessageDefinitions, C>, Error> {
-        let (send_rx, response_rx, ctrl_msg) =
-            ControlMessage::send_to_service(service_id, instance_id, message);
+        let (send_rx, response_rx, ctrl_msg) = ControlMessage::send_to_service(key, message);
         self.control_sender
             .send(ctrl_msg)
             .await
@@ -1203,6 +1200,8 @@ where
     ///
     /// Returns an error if the service is not found, unicast binding fails,
     /// the UDP send fails, or the response payload fails to deserialize.
+    /// Returns [`Error::UnsupportedEndpoint`] if the key's endpoint is
+    /// not an IPv4/UDP socket.
     /// Returns [`Error::Capacity`] with tag `"pending_responses"` if the
     /// inner loop's response-tracking map was full when this request was
     /// sent — the UDP send still went out, but the reply cannot be
@@ -1214,12 +1213,10 @@ where
     /// control-channel sends cannot make progress.
     pub async fn request(
         &self,
-        service_id: u16,
-        instance_id: u16,
+        key: ServiceEndpointKey,
         message: crate::protocol::Message<MessageDefinitions>,
     ) -> Result<MessageDefinitions, Error> {
-        let (send_rx, response_rx, ctrl_msg) =
-            ControlMessage::send_to_service(service_id, instance_id, message);
+        let (send_rx, response_rx, ctrl_msg) = ControlMessage::send_to_service(key, message);
         self.control_sender
             .send(ctrl_msg)
             .await
@@ -1525,7 +1522,18 @@ mod tests {
     async fn test_subscribe_unknown_service_returns_error() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let _run_handle = tokio::spawn(run_fut);
-        let result = client.subscribe(0xFFFF, 0xFFFF, 1, 3, 0x01, 0).await;
+        let result = client
+            .subscribe(
+                ServiceEndpointKey::udp(
+                    0xFFFF,
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)),
+                ),
+                1,
+                3,
+                0x01,
+                0,
+            )
+            .await;
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),
             "expected ServiceNotFound, got {result:?}"
@@ -1541,7 +1549,16 @@ mod tests {
         // when the service is unknown (the inner loop sends ServiceNotFound
         // on the dropped response channel, which is harmless).
         client
-            .subscribe_no_wait(0xFFFF, 0xFFFF, 1, 3, 0x01, 0)
+            .subscribe_no_wait(
+                ServiceEndpointKey::udp(
+                    0xFFFF,
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)),
+                ),
+                1,
+                3,
+                0x01,
+                0,
+            )
             .await;
         client.shut_down();
     }
@@ -1567,7 +1584,16 @@ mod tests {
         // buffer size (4) to also exercise backpressure.
         for _ in 0..200 {
             client
-                .subscribe_no_wait(0xFFFF, 0xFFFF, 1, 3, 0x01, 0)
+                .subscribe_no_wait(
+                    ServiceEndpointKey::udp(
+                        0xFFFF,
+                        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)),
+                    ),
+                    1,
+                    3,
+                    0x01,
+                    0,
+                )
                 .await;
         }
 
@@ -1575,7 +1601,13 @@ mod tests {
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            client.request(0xFFFF, 0xFFFF, msg),
+            client.request(
+                ServiceEndpointKey::udp(
+                    0xFFFF,
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)),
+                ),
+                msg,
+            ),
         )
         .await
         .expect("inner loop unresponsive after 200 subscribe_no_wait calls");
@@ -1610,7 +1642,14 @@ mod tests {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let _run_handle = tokio::spawn(run_fut);
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 30000);
-        client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
+        client
+            .add_endpoint(
+                ServiceEndpointKey::udp(0x1234, SocketAddr::V4(addr)),
+                0x0001,
+                0,
+            )
+            .await
+            .unwrap();
         client.shut_down();
     }
 
@@ -1619,7 +1658,15 @@ mod tests {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let _run_handle = tokio::spawn(run_fut);
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
-        let result = client.send_to_service(0xFFFF, 0xFFFF, msg).await;
+        let result = client
+            .send_to_service(
+                ServiceEndpointKey::udp(
+                    0xFFFF,
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)),
+                ),
+                msg,
+            )
+            .await;
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),
             "expected ServiceNotFound, got {result:?}"
@@ -1631,9 +1678,20 @@ mod tests {
     async fn test_remove_endpoint_succeeds() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let _run_handle = tokio::spawn(run_fut);
-        let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 30000);
-        client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
-        client.remove_endpoint(0x1234, 0x0001).await.unwrap();
+        let ep_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let addr = SocketAddrV4::new(ep_ip, 30000);
+        client
+            .add_endpoint(
+                ServiceEndpointKey::udp(0x1234, SocketAddr::V4(addr)),
+                0x0001,
+                0,
+            )
+            .await
+            .unwrap();
+        client
+            .remove_endpoint(ServiceEndpointKey::udp(0x1234, SocketAddr::V4(addr)))
+            .await
+            .unwrap();
         client.shut_down();
     }
 
@@ -1686,10 +1744,19 @@ mod tests {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let _run_handle = tokio::spawn(run_fut);
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30000);
-        client.add_endpoint(0x1234, 0x0001, addr, 0).await.unwrap();
+        client
+            .add_endpoint(
+                ServiceEndpointKey::udp(0x1234, SocketAddr::V4(addr)),
+                0x0001,
+                0,
+            )
+            .await
+            .unwrap();
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
         // send_to_service succeeds (send completes), returning a PendingResponse
-        let pending = client.send_to_service(0x1234, 0x0001, msg).await;
+        let pending = client
+            .send_to_service(ServiceEndpointKey::udp(0x1234, SocketAddr::V4(addr)), msg)
+            .await;
         assert!(pending.is_ok());
         client.shut_down();
     }
@@ -1743,7 +1810,15 @@ mod tests {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let _run_handle = tokio::spawn(run_fut);
         let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
-        let result = client.request(0xFFFF, 0xFFFF, msg).await;
+        let result = client
+            .request(
+                ServiceEndpointKey::udp(
+                    0xFFFF,
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)),
+                ),
+                msg,
+            )
+            .await;
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),
             "expected ServiceNotFound, got {result:?}"

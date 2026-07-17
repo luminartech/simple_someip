@@ -26,6 +26,7 @@
 //! parallel. The fix is tracked alongside the bare-metal refactor
 //! (which will need to abstract the port anyway).
 
+use simple_someip::ServiceEndpointKey;
 use simple_someip::e2e::{E2ECheckStatus, E2EKey, E2EProfile, Profile4Config};
 use simple_someip::protocol::{Header, Message, MessageId, sd};
 use simple_someip::server::ServerConfig;
@@ -33,7 +34,7 @@ use simple_someip::{
     Client, ClientUpdate, ClientUpdates, PayloadWireFormat, RawPayload, Server, TokioChannels,
     VecSdHeader,
 };
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU16, Ordering};
 
 /// Allocate a unique service ID per test invocation. Multiple
@@ -96,8 +97,20 @@ type TestEventPublisher = simple_someip::server::EventPublisher<
 const SERVER_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 
 async fn create_server(service_id: u16, instance_id: u16) -> (TestServer, u16) {
+    create_server_on(SERVER_IP, service_id, instance_id).await
+}
+
+/// Like [`create_server`] but lets the caller pick the interface. Used by
+/// tests that need multiple *distinct* devices (loopback IPs) offering the
+/// same `(service_id, instance_id)` — the source-keyed-registry regression
+/// coverage.
+async fn create_server_on(
+    interface: Ipv4Addr,
+    service_id: u16,
+    instance_id: u16,
+) -> (TestServer, u16) {
     let config = ServerConfig::new(service_id, instance_id)
-        .with_interface(SERVER_IP)
+        .with_interface(interface)
         .with_local_port(0);
     let (server, _handles, _run): (TestServer, _, _) =
         TestServer::new(config).await.expect("Server::new failed");
@@ -165,11 +178,21 @@ async fn test_client_server_subscribe_and_receive_event() {
     let _run_handle = tokio::spawn(run_fut);
     let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
-        .add_endpoint(service_id, 1, server_addr, 0)
+        .add_endpoint(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            0,
+        )
         .await
         .unwrap();
     client
-        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -250,11 +273,21 @@ async fn test_client_bind_unbind_lifecycle_with_server() {
     client.bind_discovery().await.unwrap();
     let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
-        .add_endpoint(service_id, 1, server_addr, 0)
+        .add_endpoint(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            0,
+        )
         .await
         .unwrap();
     client
-        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -286,13 +319,23 @@ async fn test_add_endpoint_and_send_to_service() {
     // Register the server's endpoint manually (simulating non-broadcasting service)
     let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
-        .add_endpoint(service_id, 1, server_addr, 0)
+        .add_endpoint(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            0,
+        )
         .await
         .unwrap();
 
     // Subscribe to server's event group (auto-binds unicast internally)
     client
-        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -321,9 +364,20 @@ async fn test_add_endpoint_and_send_to_service() {
     );
 
     // Remove the endpoint and verify send_to_service returns ServiceNotFound
-    client.remove_endpoint(service_id, 1).await.unwrap();
+    client
+        .remove_endpoint(ServiceEndpointKey::udp(
+            service_id,
+            SocketAddr::V4(server_addr),
+        ))
+        .await
+        .unwrap();
     let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
-    let result = client.send_to_service(service_id, 1, msg).await;
+    let result = client
+        .send_to_service(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            msg,
+        )
+        .await;
     assert!(
         matches!(result, Err(simple_someip::client::Error::ServiceNotFound)),
         "expected ServiceNotFound after remove, got {result:?}"
@@ -349,12 +403,22 @@ async fn test_subscribe_auto_binds_discovery() {
     let _run_handle = tokio::spawn(run_fut);
     let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
-        .add_endpoint(service_id, 1, server_addr, 0)
+        .add_endpoint(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            0,
+        )
         .await
         .unwrap();
     // Subscribe should auto-bind discovery internally
     client
-        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -397,11 +461,21 @@ async fn test_client_request_resolves_via_unicast_reply() {
     let _run_handle = tokio::spawn(run_fut);
     let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
-        .add_endpoint(service_id, 1, server_addr, 0)
+        .add_endpoint(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            0,
+        )
         .await
         .unwrap();
     client
-        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -417,7 +491,10 @@ async fn test_client_request_resolves_via_unicast_reply() {
     // which has a matching request_id, resolving it.
     let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
     let pending = client
-        .send_to_service(service_id, 1, msg)
+        .send_to_service(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            msg,
+        )
         .await
         .expect("send_to_service failed");
 
@@ -474,11 +551,21 @@ async fn test_e2e_protect_on_publish_and_check_on_receive() {
 
     let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
-        .add_endpoint(service_id, 1, server_addr, 0)
+        .add_endpoint(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            0,
+        )
         .await
         .unwrap();
     client
-        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -539,11 +626,21 @@ async fn test_multiple_subscribers_receive_events() {
     let (client1, mut updates1, run_fut1) = TestClient::new(Ipv4Addr::LOCALHOST);
     tokio::spawn(run_fut1);
     client1
-        .add_endpoint(service_id, 1, server_addr, 0)
+        .add_endpoint(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            0,
+        )
         .await
         .unwrap();
     client1
-        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -551,11 +648,21 @@ async fn test_multiple_subscribers_receive_events() {
     let (client2, mut updates2, run_fut2) = TestClient::new(Ipv4Addr::LOCALHOST);
     tokio::spawn(run_fut2);
     client2
-        .add_endpoint(service_id, 1, server_addr, 0)
+        .add_endpoint(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            0,
+        )
         .await
         .unwrap();
     client2
-        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -645,11 +752,21 @@ async fn test_cloned_client_works() {
     // Both clones can send commands
     let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
-        .add_endpoint(service_id, 1, server_addr, 0)
+        .add_endpoint(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            0,
+        )
         .await
         .unwrap();
     client2
-        .subscribe(service_id, 1, 1, 3, 0x01, 0)
+        .subscribe(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            3,
+            0x01,
+            0,
+        )
         .await
         .unwrap();
 
@@ -670,22 +787,189 @@ async fn test_subscribe_specific_port_reuse() {
     let _run_handle = tokio::spawn(run_fut);
     let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
     client
-        .add_endpoint(service_id, 1, server_addr, 0)
+        .add_endpoint(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            0,
+        )
         .await
         .unwrap();
 
     // Use specific port
     let specific_port = 44444;
     client
-        .subscribe(service_id, 1, 1, 3, 0x01, specific_port)
+        .subscribe(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            3,
+            0x01,
+            specific_port,
+        )
         .await
         .unwrap();
     // Second subscribe reuses the port
     client
-        .subscribe(service_id, 1, 1, 3, 0x02, specific_port)
+        .subscribe(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            3,
+            0x02,
+            specific_port,
+        )
         .await
         .unwrap();
 
     client.shut_down();
     server_handle.abort();
+}
+
+/// Regression for the source-keyed registry (the fix this test suite gates):
+/// once firmware assigns a fixed (ECU-Extract) instance id, every device on
+/// the subnet advertises the identical `(service_id, instance_id)`. Two real
+/// servers on distinct loopback IPs both offer that same pair; the client
+/// must resolve each by `target_ip` independently, receive events tagged
+/// with the correct source, and removing one device's endpoint must not
+/// evict the other's.
+#[tokio::test]
+async fn test_two_devices_same_service_instance_addressed_independently() {
+    let service_id = next_service_id();
+    const DEVICE_A: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 10);
+    const DEVICE_B: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 11);
+
+    let (server_a, port_a) = create_server_on(DEVICE_A, service_id, 1).await;
+    let publisher_a = server_a.publisher();
+    let server_a_handle = tokio::spawn(async move { server_a.run().await });
+
+    let (server_b, port_b) = create_server_on(DEVICE_B, service_id, 1).await;
+    let publisher_b = server_b.publisher();
+    let server_b_handle = tokio::spawn(async move { server_b.run().await });
+
+    let addr_a = SocketAddrV4::new(DEVICE_A, port_a);
+    let addr_b = SocketAddrV4::new(DEVICE_B, port_b);
+
+    let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+    let _run_handle = tokio::spawn(run_fut);
+
+    // Both devices advertise the identical (service_id, instance_id=1) — the
+    // exact scenario a fixed ECU-Extract instance id produces. Before this
+    // task, the second `add_endpoint` would have overwritten the first in
+    // the registry.
+    client
+        .add_endpoint(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(addr_a)),
+            1,
+            0,
+        )
+        .await
+        .unwrap();
+    client
+        .add_endpoint(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(addr_b)),
+            1,
+            0,
+        )
+        .await
+        .unwrap();
+
+    // Distinct event groups so `has_subscribers`/`publish_event` on each
+    // server can be checked independently.
+    client
+        .subscribe(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(addr_a)),
+            1,
+            3,
+            0x01,
+            0,
+        )
+        .await
+        .unwrap();
+    client
+        .subscribe(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(addr_b)),
+            1,
+            3,
+            0x02,
+            0,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        wait_for_subscribers(&publisher_a, service_id, 1, 0x01).await,
+        "server A should have registered the subscriber"
+    );
+    assert!(
+        wait_for_subscribers(&publisher_b, service_id, 1, 0x02).await,
+        "server B should have registered the subscriber"
+    );
+
+    // Publish from A: the client must receive an event sourced from A, not B.
+    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
+    let sent_a = publisher_a
+        .publish_event(service_id, 1, 0x01, &event_msg)
+        .await
+        .expect("publish_event from device A failed");
+    assert_eq!(sent_a, 1);
+    match recv_unicast(&mut updates).await {
+        ClientUpdate::Unicast { source, .. } => {
+            assert_eq!(
+                source.ip(),
+                std::net::IpAddr::V4(DEVICE_A),
+                "event should have arrived from device A"
+            );
+        }
+        other => panic!("expected Unicast from device A, got {other:?}"),
+    }
+
+    // Publish from B: independently resolvable, not shadowed by A's entry.
+    let sent_b = publisher_b
+        .publish_event(service_id, 1, 0x02, &event_msg)
+        .await
+        .expect("publish_event from device B failed");
+    assert_eq!(sent_b, 1);
+    match recv_unicast(&mut updates).await {
+        ClientUpdate::Unicast { source, .. } => {
+            assert_eq!(
+                source.ip(),
+                std::net::IpAddr::V4(DEVICE_B),
+                "event should have arrived from device B"
+            );
+        }
+        other => panic!("expected Unicast from device B, got {other:?}"),
+    }
+
+    // Removing device A's endpoint must not evict device B's — the fix for
+    // "StopOffer/remove from one device evicted all".
+    client
+        .remove_endpoint(ServiceEndpointKey::udp(service_id, SocketAddr::V4(addr_a)))
+        .await
+        .unwrap();
+
+    let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
+    let result_a = client
+        .send_to_service(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(addr_a)),
+            msg,
+        )
+        .await;
+    assert!(
+        matches!(result_a, Err(simple_someip::client::Error::ServiceNotFound)),
+        "expected ServiceNotFound for removed device A, got {result_a:?}"
+    );
+
+    let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
+    let result_b = client
+        .send_to_service(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(addr_b)),
+            msg,
+        )
+        .await;
+    assert!(
+        result_b.is_ok(),
+        "device B must remain reachable after removing device A's endpoint: {result_b:?}"
+    );
+
+    client.shut_down();
+    server_a_handle.abort();
+    server_b_handle.abort();
 }

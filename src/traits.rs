@@ -11,8 +11,9 @@ pub struct OfferedEndpoint {
     pub major_version: u8,
     /// The minor version of the offered service interface.
     pub minor_version: u32,
-    /// The IPv4 socket address extracted from the SD options, if present.
-    pub addr: Option<core::net::SocketAddrV4>,
+    /// The full endpoint (IPv4 socket + transport protocol) extracted
+    /// from the SD options, if present.
+    pub endpoint: Option<crate::NetEndpoint>,
     /// `true` for `OfferService`, `false` for `StopOfferService`.
     pub is_offer: bool,
 }
@@ -38,7 +39,11 @@ pub trait WireFormat: Send + Sized + Sync {
     /// Returns an error if `buf` is too small (requires at least
     /// [`required_size()`](Self::required_size) bytes).
     fn encode_to_slice(&self, buf: &mut [u8]) -> Result<usize, protocol::Error> {
-        self.encode(&mut &mut *buf)
+        // `embedded_io::Write` is implemented for `&mut [u8]` (the writer
+        // advances the slice), so the writer passed to `encode` is a
+        // reborrow of `buf` — named to avoid a `&mut &mut` expression.
+        let mut writer: &mut [u8] = buf;
+        self.encode(&mut writer)
     }
 
     /// Encode into a newly allocated `Vec<u8>`.

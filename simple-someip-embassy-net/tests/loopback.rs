@@ -33,7 +33,7 @@
 //! `EmbassyNetSocket` and forces the `_local` Client paths plus
 //! `Server::run_with_buffers` (no `Send` bound).
 
-use core::net::{Ipv4Addr, SocketAddrV4};
+use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use core::task::{Context, Waker};
 use core::time::Duration;
 use std::collections::VecDeque;
@@ -411,7 +411,7 @@ use simple_someip::protocol::{
 };
 use simple_someip::server::{ServerConfig, SubscribeError, Subscriber, SubscriptionHandle};
 use simple_someip::transport::{LocalSpawner, Timer};
-use simple_someip::{Client, ClientDeps, RawPayload, Server, ServerDeps};
+use simple_someip::{Client, ClientDeps, RawPayload, Server, ServerDeps, ServiceEndpointKey};
 
 // ── Static-pool channels ────────────────────────────────────────────
 //
@@ -787,12 +787,13 @@ async fn client_send_request_server_runloop_stable() {
             >::new_with_deps_local(client_deps, false);
             tokio::task::spawn_local(run_fut);
 
-            // Register the server's unicast endpoint. The 0 in the
-            // 4th slot is the eventgroup id (unused for a plain
-            // request-response add_endpoint).
+            // Register the server's unicast endpoint. The registry is
+            // keyed by (service_id, socket); `local_port = 0` requests an
+            // ephemeral source port for sends to this endpoint.
             let server_addr = SocketAddrV4::new(IP_A, server_port);
+            let server_key = ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr));
             client
-                .add_endpoint(service_id, instance_id, server_addr, 0)
+                .add_endpoint(server_key, instance_id, 0)
                 .await
                 .expect("add_endpoint");
 
@@ -818,7 +819,7 @@ async fn client_send_request_server_runloop_stable() {
             );
 
             let _pending = client
-                .send_to_service(service_id, instance_id, request)
+                .send_to_service(server_key, request)
                 .await
                 .expect("send_to_service over embassy-net");
 

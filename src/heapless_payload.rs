@@ -233,13 +233,16 @@ impl PayloadWireFormat for HeaplessPayload {
         for entry in &header.entries {
             if let sd::Entry::OfferService(svc) | sd::Entry::StopOfferService(svc) = entry {
                 let is_offer = matches!(entry, sd::Entry::OfferService(_));
-                let addr = sd::extract_ipv4_endpoint(&header.options);
+                let endpoint =
+                    sd::extract_ipv4_endpoint(&header.options).map(|(addr, protocol)| {
+                        crate::NetEndpoint::new(core::net::SocketAddr::V4(addr), protocol)
+                    });
                 f(crate::OfferedEndpoint {
                     service_id: svc.service_id,
                     instance_id: svc.instance_id,
                     major_version: svc.major_version,
                     minor_version: svc.minor_version,
-                    addr,
+                    endpoint,
                     is_offer,
                 });
             }

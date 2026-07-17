@@ -194,6 +194,7 @@ pub mod e2e;
 #[cfg(feature = "bare_metal")]
 pub mod heapless_payload;
 mod log;
+mod net_endpoint;
 /// SOME/IP protocol primitives: headers, messages, return codes, and service discovery.
 pub mod protocol;
 /// A general-purpose, heap-allocated [`PayloadWireFormat`] implementation.
@@ -255,6 +256,7 @@ mod traits;
 pub mod transport;
 #[cfg(feature = "bare_metal")]
 pub use heapless_payload::{HeaplessPayload, HeaplessSdHeader};
+pub use net_endpoint::{NetEndpoint, TransportProtocol};
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
 pub use traits::{OfferedEndpoint, PayloadWireFormat, WireFormat};
@@ -262,6 +264,7 @@ pub use traits::{OfferedEndpoint, PayloadWireFormat, WireFormat};
 #[cfg(feature = "client")]
 pub use client::{
     Client, ClientDeps, ClientUpdate, ClientUpdates, DiscoveryMessage, PendingResponse,
+    ServiceEndpointKey,
 };
 // `ClientChannelTypes`, `ControlMessage`, `SendMessage`, `ReceivedMessage`
 // are intentionally NOT re-exported at crate root — they are
@@ -295,10 +298,11 @@ pub use transport::{StaticE2EHandle, StaticE2EStorage};
 /// Returns `default` when the variable is absent or empty.
 /// Panics at compile time if the string contains a non-digit character.
 ///
-/// Gated on `server`: every caller lives in the server module or in the
-/// `bare-metal-runtime` runtime (which itself implies `server`), so a
-/// `client`-only / `bare_metal`-only build would otherwise see it as dead code.
-#[cfg(feature = "server")]
+/// Gated on `server`/`client`: every caller lives in the server module, the
+/// client module, or in the `bare-metal-runtime` runtime (which itself
+/// implies `server`), so a build with neither feature enabled would
+/// otherwise see it as dead code.
+#[cfg(any(feature = "server", feature = "client"))]
 pub(crate) const fn from_env_or(var: Option<&'static str>, default: usize) -> usize {
     match var {
         None => default,

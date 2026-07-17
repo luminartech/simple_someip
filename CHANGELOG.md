@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.9.0]
+
+### Breaking
+- Client service registry is now keyed by the AUTOSAR wire identity of a
+  service instance — `ServiceEndpointKey { service_id, endpoint: NetEndpoint }`,
+  where `NetEndpoint` is the provider's full socket (`core::net::SocketAddr` +
+  `TransportProtocol`). Per PRS_SOMEIP §4.2.1.3 a service instance is
+  identified by "the Service ID combined with the socket (i.e. IP-address,
+  transport protocol, and port number)"; the instance id is not part of the
+  wire identity ([PRS_SOMEIP_00162]) and moved into `ServiceEndpointInfo` as
+  data (SubscribeEventgroup SD entries still carry it on the wire — `subscribe`
+  reads it from the registry value). Co-hosted instances of the same service
+  are keyed apart by their mandatory-distinct ports ([PRS_SOMEIP_00163]).
+  `Client::subscribe`, `subscribe_no_wait`, `send_to_service`, `request`, and
+  `remove_endpoint` take the new key — build one per (service, endpoint) pair
+  with `ServiceEndpointKey::udp(service_id, addr)` and reuse it (it is `Copy`).
+  `Client::add_endpoint` now takes `(key, instance_id, local_port)`.
+  Sends/subscribes to endpoints the transports cannot reach (non-IPv4 or
+  non-UDP) fail with the new `Error::UnsupportedEndpoint`.
+- `TransportProtocol` moved from `protocol::sd` to the crate root (still
+  re-exported at `protocol::sd::TransportProtocol`) and is `#[non_exhaustive]`.
+  It represents only the two transport protocols the SOME/IP specification
+  defines for SD endpoint options: `Udp` (IANA 0x11) and `Tcp` (IANA 0x06).
+- `OfferedEndpoint::addr: Option<SocketAddrV4>` is now
+  `endpoint: Option<NetEndpoint>` (socket + transport protocol), and
+  `sd::extract_ipv4_endpoint` returns the transport protocol alongside the
+  socket address.
+
+### Added
+- `NetEndpoint` — shared transport-endpoint identity (socket address +
+  transport protocol), exported at the crate root; the intended common
+  foundation shared across sibling protocol crates.
+- `SIMPLE_SOMEIP_SERVICE_REGISTRY_CAP` build-time env override for the client
+  registry capacity (default 64).
+
 ## [0.8.0]
 
 ### Breaking — bare-metal server buffer extraction (PR #125 / PR 3)

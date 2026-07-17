@@ -40,6 +40,9 @@ impl fmt::Display for Endpoint {
         let proto = match self.protocol {
             TransportProtocol::Udp => "UDP",
             TransportProtocol::Tcp => "TCP",
+            // `TransportProtocol` is #[non_exhaustive]; SD parsing only
+            // ever yields the wire-encodable variants above.
+            _ => "?",
         };
         write!(f, "{}:{} ({proto})", self.ip, self.port)
     }

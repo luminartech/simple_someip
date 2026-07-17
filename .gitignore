@@ -5,3 +5,10 @@ CLAUDE.md
 lcov.info
 /target
 tools/size_probe/target
+
+# Superpowers plan/spec scratch docs — working artifacts, not useful once
+# the code they describe is committed. (Plans already tracked from main
+# remain tracked; gitignore only hides untracked files.)
+docs/simple_someip/plans/
+# Local semantic-search index
+.omniscient/

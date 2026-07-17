@@ -737,7 +737,10 @@ where
                             .send(Err(Error::Capacity("udp_buffer")));
                         continue;
                     }
-                    let mut message_length = match send_message.message.encode(&mut &mut buf[..]) {
+                    // `embedded_io::Write` writer = a reborrow of `buf` that
+                    // advances as bytes are written; named to avoid `&mut &mut`.
+                    let mut writer = &mut buf[..];
+                    let mut message_length = match send_message.message.encode(&mut writer) {
                         Ok(length) => length,
                         Err(e) => {
                             error!("Failed to encode message: {:?}", e);

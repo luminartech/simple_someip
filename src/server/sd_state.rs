@@ -118,6 +118,11 @@ impl SdStateManager {
     /// clippy's `missing_panics_doc` and as a tripwire if the closure
     /// is ever changed to be conditional.
     pub fn next_session_id_with_reboot_flag(&self) -> (u32, RebootFlag) {
+        // Nightly deprecates `fetch_update` in favor of the renamed
+        // `try_update`, but `try_update` does not exist on stable yet and
+        // this file builds in the stable CI lanes. Switch to `try_update`
+        // (and drop this allow) once the rename reaches stable.
+        #[allow(deprecated)]
         let prev_state = self
             .session_state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
