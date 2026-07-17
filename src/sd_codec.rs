@@ -11,6 +11,8 @@
 use core::net::{IpAddr, Ipv4Addr};
 use core::sync::atomic::{AtomicU16, Ordering};
 
+use automotive_wire_codec::{EncodeToSliceError, InsufficientBuffer};
+
 use crate::Encode;
 use crate::protocol::sd::{
     Entry, EventGroupEntry, Flags, Header as SdHeader, Options as SdOptions, OptionsCount,
@@ -69,10 +71,38 @@ pub struct SubscribeAckRequest {
 /// Packet-construction errors.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum BuildError {
-    /// `buf` is shorter than the encoded datagram.
-    BufferTooSmall,
+    /// `buf` is shorter than the encoded datagram. Carries the codec's
+    /// [`InsufficientBuffer`] so callers see the needed / available byte
+    /// counts, matching the rest of the crate's buffer-too-small reporting.
+    BufferTooSmall(InsufficientBuffer),
     /// SD or SOME/IP encoding failed mid-write.
     EncodeFailed,
+}
+
+impl core::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            BuildError::BufferTooSmall(ib) => write!(f, "buffer too small: {ib}"),
+            BuildError::EncodeFailed => f.write_str("encoding failed mid-write"),
+        }
+    }
+}
+
+impl core::error::Error for BuildError {}
+
+impl From<InsufficientBuffer> for BuildError {
+    fn from(ib: InsufficientBuffer) -> Self {
+        BuildError::BufferTooSmall(ib)
+    }
+}
+
+impl From<EncodeToSliceError<crate::protocol::Error>> for BuildError {
+    fn from(e: EncodeToSliceError<crate::protocol::Error>) -> Self {
+        match e {
+            EncodeToSliceError::InsufficientBuffer(ib) => BuildError::BufferTooSmall(ib),
+            EncodeToSliceError::Encode(_) => BuildError::EncodeFailed,
+        }
+    }
 }
 
 /// Encode a `SubscribeEventgroup` datagram into `buf`. Returns its
@@ -191,16 +221,28 @@ fn build_multi_service_entry_datagram<const N: usize>(
         } else {
             Entry::OfferService(svc)
         };
-        entries
-            .push(entry)
-            .map_err(|_| BuildError::BufferTooSmall)?;
+        // `take(N)` bounds the loop to the vecs' capacity, so these pushes
+        // cannot actually fail; the mapping keeps the fallible signature honest
+        // and reports capacity as needed/available if that invariant is ever
+        // broken.
+        entries.push(entry).map_err(|_| {
+            BuildError::BufferTooSmall(InsufficientBuffer {
+                needed: requests.len(),
+                available: N,
+            })
+        })?;
         options
             .push(SdOptions::IpV4Endpoint {
                 ip: req.local_ip,
                 port: req.unicast_port,
                 protocol: TransportProtocol::Udp,
             })
-            .map_err(|_| BuildError::BufferTooSmall)?;
+            .map_err(|_| {
+                BuildError::BufferTooSmall(InsufficientBuffer {
+                    needed: requests.len(),
+                    available: N,
+                })
+            })?;
     }
     encode_sd_datagram(buf, &entries, &options, session, RebootFlag::Continuous)
 }
@@ -268,21 +310,26 @@ fn encode_sd_datagram(
     session: u16,
     reboot: RebootFlag,
 ) -> Result<usize, BuildError> {
-    if buf.len() < SOMEIP_HEADER_LEN {
-        return Err(BuildError::BufferTooSmall);
-    }
-
+    // Header-first, body-second: `sd::Header::encoded_size()` is exact and
+    // computable without writing, so the SOME/IP length field is known before
+    // either section is written. One linear forward pass — no backfill.
     let sd_payload = SdHeader::new(Flags::new_sd(reboot), entries, options);
     let sd_payload_len = sd_payload
-        .encode_to_slice(&mut buf[SOMEIP_HEADER_LEN..])
+        .encoded_size()
         .map_err(|_| BuildError::EncodeFailed)?;
+    let total = SOMEIP_HEADER_LEN + sd_payload_len;
+    if buf.len() < total {
+        return Err(BuildError::BufferTooSmall(InsufficientBuffer {
+            needed: total,
+            available: buf.len(),
+        }));
+    }
 
     let header = Header::new_sd(u32::from(session), sd_payload_len);
-    header
-        .encode_to_slice(&mut buf[..SOMEIP_HEADER_LEN])
-        .map_err(|_| BuildError::EncodeFailed)?;
+    header.encode_to_slice(&mut buf[..SOMEIP_HEADER_LEN])?;
+    let written = sd_payload.encode_to_slice(&mut buf[SOMEIP_HEADER_LEN..total])?;
 
-    Ok(SOMEIP_HEADER_LEN + sd_payload_len)
+    Ok(SOMEIP_HEADER_LEN + written)
 }
 
 /// Build a SOME/IP notification (event) datagram into `buf`: the
@@ -301,7 +348,10 @@ pub fn build_notification_datagram(
 ) -> Result<usize, BuildError> {
     let total = SOMEIP_HEADER_LEN + payload.len();
     if buf.len() < total {
-        return Err(BuildError::BufferTooSmall);
+        return Err(BuildError::BufferTooSmall(InsufficientBuffer {
+            needed: total,
+            available: buf.len(),
+        }));
     }
     #[allow(clippy::cast_possible_truncation)]
     let length_field: u32 = 8 + payload.len() as u32;
@@ -336,7 +386,10 @@ pub fn encode_response_header(
     payload_len: usize,
 ) -> Result<(), BuildError> {
     if buf.len() < SOMEIP_HEADER_LEN {
-        return Err(BuildError::BufferTooSmall);
+        return Err(BuildError::BufferTooSmall(InsufficientBuffer {
+            needed: SOMEIP_HEADER_LEN,
+            available: buf.len(),
+        }));
     }
     let header = Header::new(
         MessageId::new_from_service_and_method(service_id, method_id),
@@ -376,13 +429,19 @@ pub struct ParsedDatagram<'a> {
     pub payload: &'a [u8],
 }
 
-/// Parse `data` as a SOME/IP datagram. Returns `None` if shorter than
-/// [`SOMEIP_HEADER_LEN`] or [`HeaderView::parse`] rejects the header.
-#[must_use]
-pub fn parse_someip_datagram(data: &[u8]) -> Option<ParsedDatagram<'_>> {
-    let (view, payload) = HeaderView::parse(data).ok()?;
+/// Parse `data` as a SOME/IP datagram.
+///
+/// # Errors
+/// Propagates the [`HeaderView::parse`] error: [`protocol::Error::Incomplete`]
+/// if `data` is shorter than a header can consume, or a validation error if the
+/// header fields are malformed. This is the same error type used throughout the
+/// crate, so callers can distinguish "not enough bytes yet" from "malformed".
+///
+/// [`protocol::Error::Incomplete`]: crate::protocol::Error::Incomplete
+pub fn parse_someip_datagram(data: &[u8]) -> Result<ParsedDatagram<'_>, crate::protocol::Error> {
+    let (view, payload) = HeaderView::parse(data)?;
     let message_id = view.message_id();
-    Some(ParsedDatagram {
+    Ok(ParsedDatagram {
         service_id: message_id.service_id(),
         method_id: message_id.method_id(),
         upper_header: view.upper_header_bytes(),
@@ -391,15 +450,27 @@ pub fn parse_someip_datagram(data: &[u8]) -> Option<ParsedDatagram<'_>> {
 }
 
 /// Parse `data` as a SOME/IP-SD datagram, returning the inner
-/// [`SdHeaderView`] for entry/option iteration. `None` if the wrapper
-/// fails to parse, the message-ID is not SD, or the SD payload is bad.
-#[must_use]
-pub fn parse_someip_sd_datagram(data: &[u8]) -> Option<SdHeaderView<'_>> {
-    let (view, sd_payload) = HeaderView::parse(data).ok()?;
+/// [`SdHeaderView`] for entry/option iteration.
+///
+/// # Errors
+/// The three failure modes are distinguishable by variant:
+/// - [`protocol::Error::Incomplete`] — the SOME/IP wrapper needs more bytes.
+/// - [`protocol::Error::UnsupportedMessageID`] — a well-formed SOME/IP message
+///   whose message-ID is not [`MessageId::SD`] (i.e. not an SD message).
+/// - [`protocol::Error::Sd`] (and other validation variants) — the wrapper or
+///   the inner SD payload is malformed.
+///
+/// [`protocol::Error::Incomplete`]: crate::protocol::Error::Incomplete
+/// [`protocol::Error::UnsupportedMessageID`]: crate::protocol::Error::UnsupportedMessageID
+/// [`protocol::Error::Sd`]: crate::protocol::Error::Sd
+pub fn parse_someip_sd_datagram(data: &[u8]) -> Result<SdHeaderView<'_>, crate::protocol::Error> {
+    let (view, sd_payload) = HeaderView::parse(data)?;
     if !view.is_sd() {
-        return None;
+        return Err(crate::protocol::Error::UnsupportedMessageID(
+            view.message_id(),
+        ));
     }
-    SdHeaderView::parse(sd_payload).ok()
+    SdHeaderView::parse(sd_payload)
 }
 
 /// Run an E2E check for `parsed` against `e2e`, keyed by `source`. Returns
@@ -487,6 +558,78 @@ mod tests {
         assert_eq!(parsed.service_id, 0x0003);
         assert_eq!(parsed.method_id, 0x8001);
         assert_eq!(parsed.payload, &payload);
+    }
+
+    #[test]
+    fn build_too_small_buffer_reports_needed_and_available() {
+        let request = SubscribeEventgroupRequest {
+            service_id: 0x0042,
+            instance_id: 1,
+            major_version: 1,
+            event_group_id: 1,
+            ttl: 3,
+            local_ip: Ipv4Addr::new(192, 0, 2, 2),
+            local_rx_port: 30600,
+        };
+        // Enough for the SOME/IP header but not the SD body.
+        let mut buf = [0u8; SOMEIP_HEADER_LEN];
+        let err =
+            build_subscribe_eventgroup_datagram(&mut buf, &request, 3, RebootFlag::Continuous)
+                .unwrap_err();
+        match err {
+            BuildError::BufferTooSmall(ib) => {
+                assert_eq!(ib.available, SOMEIP_HEADER_LEN);
+                assert!(ib.needed > ib.available);
+            }
+            BuildError::EncodeFailed => panic!("expected BufferTooSmall, got EncodeFailed"),
+        }
+    }
+
+    #[test]
+    fn parse_someip_datagram_incomplete_is_error() {
+        // Fewer than SOMEIP_HEADER_LEN bytes -> Incomplete, not a silent None.
+        let err = parse_someip_datagram(&[0u8; 4]).unwrap_err();
+        assert!(matches!(err, crate::protocol::Error::Incomplete(_)));
+    }
+
+    #[test]
+    fn parse_sd_datagram_incomplete_vs_not_sd_vs_malformed() {
+        // 1. Incomplete: too few bytes for even the SOME/IP header.
+        let err = parse_someip_sd_datagram(&[0u8; 4]).unwrap_err();
+        assert!(matches!(err, crate::protocol::Error::Incomplete(_)));
+
+        // 2. Not SD: a well-formed non-SD notification datagram.
+        let mut buf = [0u8; 64];
+        let len = build_notification_datagram(&mut buf, 0x0003, 0x8001, 9, &[1, 2, 3]).unwrap();
+        let err = parse_someip_sd_datagram(&buf[..len]).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::protocol::Error::UnsupportedMessageID(_)
+        ));
+
+        // 3. Truncated SD datagram: the SD message-ID is present but the
+        //    payload is chopped short. This is an error, and crucially it is
+        //    NOT reported as the not-SD (`UnsupportedMessageID`) case — the
+        //    three failure modes stay distinguishable.
+        let request = SubscribeEventgroupRequest {
+            service_id: 0x0042,
+            instance_id: 1,
+            major_version: 1,
+            event_group_id: 1,
+            ttl: 3,
+            local_ip: Ipv4Addr::new(192, 0, 2, 2),
+            local_rx_port: 30600,
+        };
+        let mut sd_buf = [0u8; 128];
+        let sd_len =
+            build_subscribe_eventgroup_datagram(&mut sd_buf, &request, 3, RebootFlag::Continuous)
+                .unwrap();
+        let truncated = &sd_buf[..sd_len - 4];
+        let err = parse_someip_sd_datagram(truncated).unwrap_err();
+        assert!(
+            !matches!(err, crate::protocol::Error::UnsupportedMessageID(_)),
+            "truncated SD datagram must not surface as not-SD"
+        );
     }
 
     #[test]

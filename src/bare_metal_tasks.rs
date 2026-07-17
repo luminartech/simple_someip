@@ -128,7 +128,7 @@ pub async fn event_rx_dispatch_future<'a, S, R>(
             Ok(d) => (d.bytes_received, d.source),
             Err(_) => continue,
         };
-        let Some(parsed) = parse_someip_datagram(&buf[..n]) else {
+        let Ok(parsed) = parse_someip_datagram(&buf[..n]) else {
             continue;
         };
         let (status, body) = if e2e_enabled {
