@@ -19,7 +19,7 @@
 #![cfg(all(feature = "client", feature = "server", feature = "bare_metal"))]
 
 use core::future::Future;
-use core::net::{Ipv4Addr, SocketAddrV4};
+use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
@@ -524,7 +524,11 @@ async fn client_send_request_server_runloop_stable() {
     // Register the server endpoint with the client
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
     client
-        .add_endpoint(service_id, instance_id, server_addr, 0)
+        .add_endpoint(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            instance_id,
+            0,
+        )
         .await
         .expect("add_endpoint");
 
@@ -548,7 +552,7 @@ async fn client_send_request_server_runloop_stable() {
     // Send request via the client API
     let pending = client
         .send_to_service(
-            ServiceEndpointKey::new(service_id, instance_id, Ipv4Addr::LOCALHOST.into()),
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
             request,
         )
         .await
@@ -608,7 +612,11 @@ async fn client_send_request_server_runloop_stable() {
 /// the TC4 build. Same semantics/update procedure as the constants in
 /// src/client/mod.rs; authoritative numbers come from
 /// `tools/capture_type_sizes.sh` (thumbv7em).
-const BM_CLIENT_RUN_FUTURE_BUDGET: usize = 34048; // = ceil64(27224 × 1.25)
+// Re-baselined 2026-07-17 for the socket-keyed registry
+// (ServiceEndpointKey now embeds a full NetEndpoint — SocketAddr +
+// TransportProtocol — so the 64 inline registry entries and every
+// queued ControlMessage carry the larger key).
+const BM_CLIENT_RUN_FUTURE_BUDGET: usize = 44224; // = ceil64(35376 × 1.25)
 const BM_CLIENT_SOCKET_LOOP_BUDGET: usize = 1024; // = ceil64(776 × 1.25); receive buffer moved to BufferProvider pool (Tasks 3+4)
 const BM_SERVER_RUN_FUTURE_BUDGET: usize = 4416; // = ceil64(3528 × 1.25); send buffers moved to caller scratch (PR3 T2+T3)
 
@@ -953,7 +961,11 @@ async fn binding_sockets_claims_one_buffer_each_until_pool_exhausted() {
         let client = client.clone();
         async move {
             client
-                .add_endpoint(svc, 1, target, port)
+                .add_endpoint(
+                    ServiceEndpointKey::udp(svc, SocketAddr::V4(target)),
+                    1,
+                    port,
+                )
                 .await
                 .expect("add_endpoint");
             let msg_id = MessageId::new_from_service_and_method(svc, 0x0001);
@@ -972,7 +984,7 @@ async fn binding_sockets_claims_one_buffer_each_until_pool_exhausted() {
             );
             client
                 .send_to_service(
-                    ServiceEndpointKey::new(svc, 1, (*target.ip()).into()),
+                    ServiceEndpointKey::udp(svc, SocketAddr::V4(target)),
                     request,
                 )
                 .await
@@ -1063,7 +1075,11 @@ async fn e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_err
 
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30800);
     client
-        .add_endpoint(service_id, 1, server_addr, 42000)
+        .add_endpoint(
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
+            1,
+            42000,
+        )
         .await
         .expect("add_endpoint");
 
@@ -1087,7 +1103,7 @@ async fn e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_err
 
     let result = client
         .send_to_service(
-            ServiceEndpointKey::new(service_id, 1, (*server_addr.ip()).into()),
+            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
             request,
         )
         .await;
