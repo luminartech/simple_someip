@@ -1,6 +1,6 @@
 use super::Error;
 use crate::protocol::byte_order::WriteBytesExt;
-use automotive_wire_codec::Encode;
+use automotive_wire_codec::{Decode, DecodeIter, Encode, take};
 
 pub const ENTRY_SIZE: usize = 16;
 
@@ -438,6 +438,56 @@ impl EntryView<'_> {
     }
 }
 
+impl<'a> Decode<'a> for EntryView<'a> {
+    type Error = crate::protocol::Error;
+
+    /// Decode a single 16-byte SD entry from the front of `buf`.
+    ///
+    /// This is a pure fixed-stride slice: it does NOT validate the entry-type
+    /// byte. Validation is deferred to [`EntryView::entry_type`] /
+    /// [`EntryView::to_owned`] (the L2 validation pass), keeping this a lazy
+    /// zero-copy view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Incomplete`](automotive_wire_codec::Incomplete) if fewer than
+    /// [`ENTRY_SIZE`] bytes remain.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic — `take` guarantees exactly `ENTRY_SIZE` bytes.
+    fn decode(buf: &'a [u8]) -> Result<(Self, &'a [u8]), Self::Error> {
+        let (head, rest) = take(buf, ENTRY_SIZE)?;
+        let entry_bytes: &'a [u8; ENTRY_SIZE] =
+            head.try_into().expect("take guarantees ENTRY_SIZE bytes");
+        Ok((EntryView(entry_bytes), rest))
+    }
+}
+
+impl<'a> DecodeIter<'a> for EntryView<'a> {
+    type Error = crate::protocol::Error;
+
+    /// SD entries have a fixed 16-byte (`ENTRY_SIZE`) stride, enabling
+    /// [`DecodeIterator::remaining_len`](automotive_wire_codec::DecodeIterator::remaining_len).
+    const WIRE_SIZE: Option<usize> = Some(ENTRY_SIZE);
+
+    /// Decode the next entry, or `Ok(None)` at a clean end of buffer.
+    ///
+    /// A partial (non-multiple-of-16) trailing element is surfaced as an
+    /// `Err` rather than silently dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Incomplete`](automotive_wire_codec::Incomplete) if a partial
+    /// entry remains after a good start.
+    fn decode_next(buf: &'a [u8]) -> Result<Option<(Self, &'a [u8])>, Self::Error> {
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        Self::decode(buf).map(Some)
+    }
+}
+
 /// Iterator over 16-byte SD entries in a validated buffer.
 /// Entries are guaranteed valid (validated upfront in `SdHeaderView::parse`).
 pub struct EntryIter<'a> {
@@ -711,6 +761,117 @@ mod tests {
         assert_eq!(iter.next().unwrap().to_owned().unwrap(), e1);
         assert_eq!(iter.next().unwrap().to_owned().unwrap(), e2);
         assert!(iter.next().is_none());
+    }
+
+    // --- Decode / DecodeIter (Phase 3 lazy L1) ---
+
+    fn two_entry_buf(e1: &Entry, e2: &Entry) -> [u8; 32] {
+        let b1 = encode_entry(e1);
+        let b2 = encode_entry(e2);
+        let mut combined = [0u8; 32];
+        combined[..16].copy_from_slice(&b1[..16]);
+        combined[16..32].copy_from_slice(&b2[..16]);
+        combined
+    }
+
+    #[test]
+    fn decode_yields_entry_and_remainder() {
+        let e1 = Entry::FindService(make_service_entry());
+        let e2 = Entry::SubscribeEventGroup(make_event_group_entry());
+        let buf = two_entry_buf(&e1, &e2);
+        let (view, rest) = EntryView::decode(&buf).unwrap();
+        assert_eq!(view.to_owned().unwrap(), e1);
+        assert_eq!(rest.len(), 16);
+        let (view2, rest2) = EntryView::decode(rest).unwrap();
+        assert_eq!(view2.to_owned().unwrap(), e2);
+        assert!(rest2.is_empty());
+    }
+
+    #[test]
+    fn decode_truncated_is_incomplete() {
+        let e1 = Entry::FindService(make_service_entry());
+        let buf = encode_entry(&e1);
+        assert!(matches!(
+            EntryView::decode(&buf[..15]),
+            Err(crate::protocol::Error::Incomplete(
+                automotive_wire_codec::Incomplete {
+                    needed: 16,
+                    available: 15,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn decode_exact_rejects_trailing() {
+        let e1 = Entry::FindService(make_service_entry());
+        let e2 = Entry::OfferService(make_service_entry());
+        let buf = two_entry_buf(&e1, &e2);
+        assert!(matches!(
+            EntryView::decode_exact(&buf),
+            Err(crate::protocol::Error::Trailing(_))
+        ));
+        // Single entry consumes the whole buffer.
+        assert!(EntryView::decode_exact(&buf[..16]).is_ok());
+    }
+
+    #[test]
+    fn decode_iter_yields_all_then_none() {
+        let e1 = Entry::FindService(make_service_entry());
+        let e2 = Entry::SubscribeEventGroup(make_event_group_entry());
+        let buf = two_entry_buf(&e1, &e2);
+        let mut iter = EntryView::iter(&buf);
+        assert_eq!(iter.next().unwrap().unwrap().to_owned().unwrap(), e1);
+        assert_eq!(iter.next().unwrap().unwrap().to_owned().unwrap(), e2);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn decode_iter_surfaces_truncated_tail_as_err() {
+        let e1 = Entry::FindService(make_service_entry());
+        let buf = two_entry_buf(&e1, &Entry::OfferService(make_service_entry()));
+        // One full entry plus a partial (8-byte) tail.
+        let mut iter = EntryView::iter(&buf[..24]);
+        assert!(matches!(iter.next(), Some(Ok(_))));
+        assert!(matches!(
+            iter.next(),
+            Some(Err(crate::protocol::Error::Incomplete(_)))
+        ));
+        // Adapter fuses after the first error.
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn decode_iter_empty_is_immediately_none() {
+        let mut iter = EntryView::iter(&[]);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn decode_iter_remaining_len_counts_entries() {
+        let e1 = Entry::FindService(make_service_entry());
+        let e2 = Entry::SubscribeEventGroup(make_event_group_entry());
+        let buf = two_entry_buf(&e1, &e2);
+        let mut iter = EntryView::iter(&buf);
+        assert_eq!(iter.remaining_len(), Some(2));
+        iter.next();
+        assert_eq!(iter.remaining_len(), Some(1));
+        iter.next();
+        iter.next(); // Ok(None) -> done
+        assert_eq!(iter.remaining_len(), Some(0));
+    }
+
+    #[test]
+    fn decode_iter_does_not_validate_entry_type() {
+        // An invalid entry-type byte (0x03) must still decode as a view — the
+        // lazy path defers type validation to `to_owned` / `entry_type`.
+        let buf = [0x03u8; ENTRY_SIZE];
+        let mut iter = EntryView::iter(&buf);
+        let view = iter.next().unwrap().unwrap();
+        assert!(matches!(
+            view.to_owned(),
+            Err(Error::InvalidEntryType(0x03))
+        ));
     }
 
     // --- Encode size-exactness invariant ---
