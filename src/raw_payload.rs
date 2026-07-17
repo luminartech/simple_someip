@@ -186,13 +186,16 @@ impl PayloadWireFormat for RawPayload {
         for entry in &header.entries {
             if let sd::Entry::OfferService(svc) | sd::Entry::StopOfferService(svc) = entry {
                 let is_offer = matches!(entry, sd::Entry::OfferService(_));
-                let addr = sd::extract_ipv4_endpoint(&header.options);
+                let endpoint =
+                    sd::extract_ipv4_endpoint(&header.options).map(|(addr, protocol)| {
+                        crate::NetEndpoint::new(core::net::SocketAddr::V4(addr), protocol)
+                    });
                 f(crate::OfferedEndpoint {
                     service_id: svc.service_id,
                     instance_id: svc.instance_id,
                     major_version: svc.major_version,
                     minor_version: svc.minor_version,
-                    addr,
+                    endpoint,
                     is_offer,
                 });
             }
@@ -445,7 +448,12 @@ mod tests {
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].service_id, 0x5B);
         assert!(endpoints[0].is_offer);
-        assert!(endpoints[0].addr.is_some());
+        let ep = endpoints[0].endpoint.expect("endpoint option present");
+        assert_eq!(ep.protocol, crate::TransportProtocol::Udp);
+        assert_eq!(
+            ep.addr,
+            core::net::SocketAddr::V4(core::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30000))
+        );
     }
 
     #[test]
@@ -462,7 +470,7 @@ mod tests {
         let endpoints = p.offered_endpoints();
         assert_eq!(endpoints.len(), 1);
         assert!(!endpoints[0].is_offer);
-        assert!(endpoints[0].addr.is_none());
+        assert!(endpoints[0].endpoint.is_none());
     }
 
     #[test]

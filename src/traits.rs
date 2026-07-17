@@ -11,8 +11,9 @@ pub struct OfferedEndpoint {
     pub major_version: u8,
     /// The minor version of the offered service interface.
     pub minor_version: u32,
-    /// The IPv4 socket address extracted from the SD options, if present.
-    pub addr: Option<core::net::SocketAddrV4>,
+    /// The full endpoint (IPv4 socket + transport protocol) extracted
+    /// from the SD options, if present.
+    pub endpoint: Option<crate::NetEndpoint>,
     /// `true` for `OfferService`, `false` for `StopOfferService`.
     pub is_offer: bool,
 }
