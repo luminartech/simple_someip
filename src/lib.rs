@@ -194,6 +194,7 @@ pub mod e2e;
 #[cfg(feature = "bare_metal")]
 pub mod heapless_payload;
 mod log;
+mod net_endpoint;
 /// SOME/IP protocol primitives: headers, messages, return codes, and service discovery.
 pub mod protocol;
 /// A general-purpose, heap-allocated [`PayloadWireFormat`] implementation.
@@ -255,6 +256,7 @@ mod traits;
 pub mod transport;
 #[cfg(feature = "bare_metal")]
 pub use heapless_payload::{HeaplessPayload, HeaplessSdHeader};
+pub use net_endpoint::{NetEndpoint, TransportProtocol};
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
 pub use traits::{OfferedEndpoint, PayloadWireFormat, WireFormat};

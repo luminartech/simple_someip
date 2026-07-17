@@ -60,14 +60,7 @@ pub(crate) const LOAD_BALANCING_OPTION_LENGTH_FIELD: u16 = 5;
 /// (the `+1` accounts for the trailing null terminator byte).
 const CONFIGURATION_OPTION_LENGTH_STRING_DELTA: u16 = 1;
 
-/// Transport protocol used in SD endpoint options.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum TransportProtocol {
-    /// UDP (0x11).
-    Udp,
-    /// TCP (0x06).
-    Tcp,
-}
+pub use crate::net_endpoint::TransportProtocol;
 
 impl TryFrom<u8> for TransportProtocol {
     type Error = Error;
@@ -80,11 +73,13 @@ impl TryFrom<u8> for TransportProtocol {
     }
 }
 
-impl From<TransportProtocol> for u8 {
-    fn from(transport_protocol: TransportProtocol) -> u8 {
-        match transport_protocol {
-            TransportProtocol::Udp => 0x11,
-            TransportProtocol::Tcp => 0x06,
+impl TryFrom<TransportProtocol> for u8 {
+    type Error = Error;
+    fn try_from(value: TransportProtocol) -> Result<u8, Error> {
+        match value {
+            TransportProtocol::Udp => Ok(0x11),
+            TransportProtocol::Tcp => Ok(0x06),
+            other => Err(Error::UnencodableTransportProtocol(other)),
         }
     }
 }
@@ -299,7 +294,7 @@ fn write_ipv4_option<T: embedded_io::Write>(
     writer.write_u8(0)?;
     writer.write_u32_be(ip.to_bits())?;
     writer.write_u8(0)?;
-    writer.write_u8(u8::from(protocol))?;
+    writer.write_u8(u8::try_from(protocol)?)?;
     writer.write_u16_be(port)?;
     Ok(IPV4_OPTION_WIRE_SIZE)
 }
@@ -315,7 +310,7 @@ fn write_ipv6_option<T: embedded_io::Write>(
     writer.write_u8(0)?;
     writer.write_bytes(&ip.octets())?;
     writer.write_u8(0)?;
-    writer.write_u8(u8::from(protocol))?;
+    writer.write_u8(u8::try_from(protocol)?)?;
     writer.write_u16_be(port)?;
     Ok(IPV6_OPTION_WIRE_SIZE)
 }
@@ -607,7 +602,7 @@ mod tests {
             TransportProtocol::try_from(0x06).unwrap(),
             TransportProtocol::Tcp
         );
-        assert_eq!(u8::from(TransportProtocol::Tcp), 0x06);
+        assert_eq!(u8::try_from(TransportProtocol::Tcp).unwrap(), 0x06);
     }
 
     #[test]
@@ -615,6 +610,14 @@ mod tests {
         assert!(matches!(
             TransportProtocol::try_from(0xFF),
             Err(Error::InvalidOptionTransportProtocol(0xFF))
+        ));
+    }
+
+    #[test]
+    fn transport_protocol_tls_has_no_wire_encoding() {
+        assert!(matches!(
+            u8::try_from(TransportProtocol::Tls),
+            Err(Error::UnencodableTransportProtocol(TransportProtocol::Tls))
         ));
     }
 
