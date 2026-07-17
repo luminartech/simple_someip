@@ -13,10 +13,9 @@ use core::net::SocketAddr;
 /// Transport protocol of a network endpoint.
 ///
 /// `Udp`/`Tcp` correspond to the IANA protocol numbers SOME/IP-SD
-/// endpoint options carry on the wire (0x11 / 0x06). `Tls` (secure `DoIP`,
-/// ISO 13400-2 Ed. 3) has no IANA protocol number and therefore no
-/// SOME/IP-SD wire encoding; encoding it into an SD option fails with
-/// [`crate::protocol::sd::Error::UnencodableTransportProtocol`].
+/// endpoint options carry on the wire (0x11 / 0x06) — the only two
+/// transport protocols the SOME/IP specification defines for endpoint
+/// options.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum TransportProtocol {
@@ -24,9 +23,6 @@ pub enum TransportProtocol {
     Udp,
     /// TCP (IANA 0x06).
     Tcp,
-    /// TLS over TCP. No IANA protocol number; not representable in
-    /// SOME/IP-SD endpoint options.
-    Tls,
 }
 
 /// A full transport endpoint: socket address plus transport protocol.
@@ -53,11 +49,6 @@ impl NetEndpoint {
     pub const fn tcp(addr: SocketAddr) -> Self {
         Self::new(addr, TransportProtocol::Tcp)
     }
-
-    #[must_use]
-    pub const fn tls(addr: SocketAddr) -> Self {
-        Self::new(addr, TransportProtocol::Tls)
-    }
 }
 
 #[cfg(test)]
@@ -70,7 +61,6 @@ mod tests {
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30490));
         assert_eq!(NetEndpoint::udp(addr).protocol, TransportProtocol::Udp);
         assert_eq!(NetEndpoint::tcp(addr).protocol, TransportProtocol::Tcp);
-        assert_eq!(NetEndpoint::tls(addr).protocol, TransportProtocol::Tls);
         assert_eq!(NetEndpoint::udp(addr).addr, addr);
     }
 

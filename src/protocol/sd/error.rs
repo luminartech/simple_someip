@@ -12,11 +12,6 @@ pub enum Error {
     /// The transport protocol byte is not a recognized value.
     #[error("Invalid value for Service Discovery Option Transport Protocol: {0:X}")]
     InvalidOptionTransportProtocol(u8),
-    /// The transport protocol has no IANA protocol number and therefore
-    /// no SOME/IP-SD endpoint-option wire encoding (e.g.
-    /// [`TransportProtocol::Tls`](crate::TransportProtocol::Tls)).
-    #[error("Transport protocol {0:?} has no SOME/IP-SD wire encoding")]
-    UnencodableTransportProtocol(crate::TransportProtocol),
     /// The declared options size does not match the actual data.
     #[error("Incorrect options size, {0} bytes remaining")]
     IncorrectOptionsSize(usize),

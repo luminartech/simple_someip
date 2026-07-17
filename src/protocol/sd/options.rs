@@ -79,7 +79,6 @@ impl TryFrom<TransportProtocol> for u8 {
         match value {
             TransportProtocol::Udp => Ok(0x11),
             TransportProtocol::Tcp => Ok(0x06),
-            other => Err(Error::UnencodableTransportProtocol(other)),
         }
     }
 }
@@ -615,14 +614,6 @@ mod tests {
         assert!(matches!(
             TransportProtocol::try_from(0xFF),
             Err(Error::InvalidOptionTransportProtocol(0xFF))
-        ));
-    }
-
-    #[test]
-    fn transport_protocol_tls_has_no_wire_encoding() {
-        assert!(matches!(
-            u8::try_from(TransportProtocol::Tls),
-            Err(Error::UnencodableTransportProtocol(TransportProtocol::Tls))
         ));
     }
 

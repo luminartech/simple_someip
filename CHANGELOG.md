@@ -20,11 +20,9 @@
   Sends/subscribes to endpoints the transports cannot reach (non-IPv4 or
   non-UDP) fail with the new `Error::UnsupportedEndpoint`.
 - `TransportProtocol` moved from `protocol::sd` to the crate root (still
-  re-exported at `protocol::sd::TransportProtocol`), is `#[non_exhaustive]`,
-  and gained a `Tls` variant (secure DoIP, ISO 13400-2 Ed. 3). Encoding a
-  protocol into an SD endpoint option is now fallible
-  (`u8::try_from(TransportProtocol)`): `Tls` has no IANA protocol number and
-  yields `sd::Error::UnencodableTransportProtocol`.
+  re-exported at `protocol::sd::TransportProtocol`) and is `#[non_exhaustive]`.
+  It represents only the two transport protocols the SOME/IP specification
+  defines for SD endpoint options: `Udp` (IANA 0x11) and `Tcp` (IANA 0x06).
 - `OfferedEndpoint::addr: Option<SocketAddrV4>` is now
   `endpoint: Option<NetEndpoint>` (socket + transport protocol), and
   `sd::extract_ipv4_endpoint` returns the transport protocol alongside the
@@ -33,7 +31,7 @@
 ### Added
 - `NetEndpoint` — shared transport-endpoint identity (socket address +
   transport protocol), exported at the crate root; the intended common
-  foundation across `simple_someip` / `simple_doip` / `uds_on_ip`.
+  foundation shared across sibling protocol crates.
 - `SIMPLE_SOMEIP_SERVICE_REGISTRY_CAP` build-time env override for the client
   registry capacity (default 64).
 
