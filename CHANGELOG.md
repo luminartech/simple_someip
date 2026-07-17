@@ -59,6 +59,12 @@ after).
   self-identifying, so decoding still requires the caller to supply the
   `MessageId`).
 
+- **`ReadBytesExt` removed.** Decode is now fully slice-based
+  (`Decode`/`DecodeIter` via `take`/`ensure_len`), leaving the
+  `embedded_io::Read`-backed `ReadBytesExt` trait with no remaining callers.
+  It has been deleted along with its blanket impl and unit tests.
+  `WriteBytesExt` is unaffected and remains available.
+
 - **New dependency:** `automotive-wire-codec = "0.3"`.
 
 - **Robustness fix:** SOME/IP datagrams with `length < 8` are now rejected

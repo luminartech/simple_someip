@@ -14,15 +14,15 @@
 //! phase of the automotive-wire-codec migration — that is their entire
 //! purpose.
 //!
-//! Known pre-existing bug (see `src/protocol/sd/entry.rs`): `Entry::
-//! required_size()` returns 17 and `ServiceEntry`/`EventGroupEntry::
-//! encode` return `Ok(16)` while only writing 15 bytes — i.e. the
-//! *returned counts* overstate the true 16-byte wire size by one. This
-//! affects only the `usize` returned from `encode`/`required_size`, not
-//! the bytes actually placed on the wire, so it does not affect any
-//! golden literal below (all literals reflect the true 16-byte
-//! on-wire entry size). It is fixed in a later phase under the
-//! protection of these golden tests.
+//! This suite protected the Phase 2 fix of a historical entry-size bug
+//! (see `src/protocol/sd/entry.rs`): the former `Entry::required_size()`
+//! returned 17 and `ServiceEntry`/`EventGroupEntry::encode` returned
+//! `Ok(16)` while only writing 15 bytes — i.e. the *returned counts*
+//! overstated the true 16-byte wire size by one. That mismatch never
+//! affected the bytes actually placed on the wire, so no golden literal
+//! below ever needed to change (all literals reflect the true 16-byte
+//! on-wire entry size); the bug was in the returned `usize`, which was
+//! corrected in Phase 2 with these golden tests as the regression guard.
 
 use simple_someip::Encode;
 use simple_someip::protocol::sd::{
