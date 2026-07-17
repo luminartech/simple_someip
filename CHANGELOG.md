@@ -1,5 +1,70 @@
 # Changelog
 
+## [0.13.0]
+
+Contains a breaking change to the serialization trait surface, so this release
+takes the major position under this crate's 0.x convention. As in 0.10.0
+through 0.12.0, the `version` in `Cargo.toml` is bumped here rather than left
+to release-plz so that `cargo-semver-checks` compares against the version this
+change actually lands as.
+
+### Breaking — migrate wire encode/decode onto `automotive-wire-codec` 0.3
+
+The hand-rolled `WireFormat` trait and its supporting `Option`-returning
+parsers are gone, replaced by the `automotive-wire-codec` crate's `Encode` /
+`Decode` / `DecodeIter` traits. This is a from-scratch rewrite of the
+serialization layer's *trait surface*; on-wire bytes are unchanged (every
+golden-bytes test, including under `--features server`, is green before and
+after).
+
+- **`WireFormat` removed — replaced by `automotive_wire_codec::Encode`.**
+  `required_size(&self) -> usize` is now `encoded_size(&self) ->
+  Result<usize, Self::Error>` (fallible: some encodings, e.g. SD configuration
+  strings, can exceed representable bounds). `encode` keeps its
+  `embedded_io::Write`-based signature. The crate re-exports `Encode` (plus
+  `Decode`, `DecodeIter`, `DecodeIterator`, `EncodeToSliceError`) from the
+  crate root. `encode_to_slice` is now a codec-provided default method
+  returning `EncodeToSliceError` instead of `protocol::Error` directly; the
+  crate-local `EncodeExt::encode_to_vec` (std-only) extension trait replaces
+  the old inherent heap-allocating helper.
+
+- **Decode via `Decode` / `DecodeIter`.** `HeaderView`, `MessageView`,
+  `EntryView`, and `OptionView` now implement the codec's `Decode` trait, and
+  service discovery entries/options are exposed as lazy `DecodeIterator`s
+  (backed by a new lazy `SdBody`) instead of eagerly-materialized
+  collections. `MessageView::decode` returns `(value, rest)`, recovering any
+  trailing bytes (e.g. the next message in a multi-message datagram); the new
+  `decode_exact` is the strict form that errors on trailing bytes instead of
+  discarding them. `HeaderView::parse` / `SdHeaderView::parse` remain as thin
+  wrappers over the `Decode` impls for source compatibility.
+
+- **`protocol::Error` reworked.** `UnexpectedEof` is gone. New variants:
+  `Incomplete { needed, available }` (buffer too short to decode), `Trailing`
+  (unconsumed bytes after a strict decode), `InsufficientBuffer { needed,
+  available }` (output buffer too small to encode into), and
+  `InvalidLength(u32)` (SOME/IP `length` field below the 8-byte minimum).
+  `sd::Error::IncorrectOptionsSize` is now a struct variant `{ needed,
+  available }` instead of a tuple/unit variant.
+
+- **`sd_codec` parsers now return `Result`, not `Option`.**
+  `parse_someip_datagram` and `parse_someip_sd_datagram` surface
+  `protocol::Error` (distinguishing "too few bytes" / "not an SD message" /
+  "malformed SD payload" instead of collapsing all three into `None`).
+  `BuildError::BufferTooSmall` now carries the codec's `InsufficientBuffer`
+  (`needed` / `available`) instead of being a unit variant.
+
+- **`PayloadWireFormat` gains an `Encode` supertrait.** The inherent
+  `required_size` / `encode` methods are gone — implementors get them from
+  `Encode` instead. `from_payload_bytes` is unchanged (payloads aren't
+  self-identifying, so decoding still requires the caller to supply the
+  `MessageId`).
+
+- **New dependency:** `automotive-wire-codec = "0.3"`.
+
+- **Robustness fix:** SOME/IP datagrams with `length < 8` are now rejected
+  with `Error::InvalidLength` instead of risking an arithmetic-underflow
+  panic when computing `payload_size` (`length - 8`).
+
 ## [0.12.0]
 
 Contains a breaking change to the public error enums, so this release takes the

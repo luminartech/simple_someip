@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(view.is_sd(), h.is_sd());
     }
 
-    // --- WireFormat default methods ---
+    // --- Encode/EncodeExt default methods (encode_to_slice / encode_to_vec) ---
 
     #[test]
     fn encode_to_slice_works() {

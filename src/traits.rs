@@ -56,9 +56,10 @@ pub trait PayloadWireFormat:
     automotive_wire_codec::Encode<Error = protocol::Error> + core::fmt::Debug + Send + Sized + Sync
 {
     /// The SD header type used by this payload implementation.
-    // `Send + Sync` were previously supplied for free by `WireFormat`'s
-    // `Send + Sync` supertrait. The codec's `Encode` has no such supertrait,
-    // but the client's channel-carried types (`DiscoveryMessage`,
+    // `Send + Sync` used to come for free from this trait's predecessor's own
+    // `Send + Sync` supertrait (removed in the codec migration). The codec's
+    // `Encode` has no such supertrait, but the client's channel-carried types
+    // (`DiscoveryMessage`,
     // `ClientUpdate`, `ControlMessage`) embed `SdHeader` and flow through
     // `Send`-bounded channels, so the bound is pervasive rather than
     // localized. Restate it here on the associated type (all concrete

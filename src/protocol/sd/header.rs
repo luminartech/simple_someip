@@ -565,7 +565,15 @@ mod tests {
         let mut buf = [0u8; 24];
         buf[..12].copy_from_slice(&prefix);
         buf[12..24].copy_from_slice(&option);
-        assert!(SdHeaderView::parse(&buf).is_err());
+        assert!(matches!(
+            SdHeaderView::parse(&buf),
+            Err(crate::protocol::Error::Incomplete(
+                automotive_wire_codec::Incomplete {
+                    needed: 16,
+                    available: 12,
+                }
+            ))
+        ));
     }
 
     #[test]

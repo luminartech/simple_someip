@@ -633,6 +633,46 @@ mod tests {
     }
 
     #[test]
+    fn parse_sd_datagram_structurally_invalid_entry_is_sd_error() {
+        // Length-consistent SD datagram (unlike the truncation case above,
+        // which short-circuits as `Incomplete` before `SdHeaderView::parse`
+        // ever reaches the entry walk): corrupt the first entry's type byte
+        // to an unrecognized value while leaving every length field intact,
+        // so parsing gets past the `Incomplete` checks and hits
+        // `EntryView::entry_type()`'s validation, surfacing
+        // `protocol::Error::Sd(sd::Error::InvalidEntryType(_))`.
+        let request = SubscribeEventgroupRequest {
+            service_id: 0x0042,
+            instance_id: 1,
+            major_version: 1,
+            event_group_id: 1,
+            ttl: 3,
+            local_ip: Ipv4Addr::new(192, 0, 2, 2),
+            local_rx_port: 30600,
+        };
+        let mut sd_buf = [0u8; 128];
+        let sd_len =
+            build_subscribe_eventgroup_datagram(&mut sd_buf, &request, 3, RebootFlag::Continuous)
+                .unwrap();
+
+        // Byte layout: 16-byte SOME/IP header, then flags/reserved(4) +
+        // entries_size(4), then the entries array (options_size + options
+        // follow after the entries). The first entry's type byte is
+        // therefore at offset 24.
+        const ENTRY_TYPE_OFFSET: usize = 16 + 8;
+        sd_buf[ENTRY_TYPE_OFFSET] = 0xFF;
+
+        let err = parse_someip_sd_datagram(&sd_buf[..sd_len]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::protocol::Error::Sd(crate::protocol::sd::Error::InvalidEntryType(0xFF))
+            ),
+            "expected Sd(InvalidEntryType(0xFF)), got {err:?}"
+        );
+    }
+
+    #[test]
     fn subscribe_builder_honors_reboot_flag() {
         let request = SubscribeEventgroupRequest {
             service_id: 0x0042,

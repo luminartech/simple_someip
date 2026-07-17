@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(msg.sd_header().unwrap(), &sd_hdr);
     }
 
-    // --- WireFormat: required_size ---
+    // --- Encode: encoded_size ---
 
     #[test]
     fn required_size_is_header_plus_payload() {
@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(msg.encoded_size().unwrap(), expected);
     }
 
-    // --- WireFormat: encode / MessageView::parse round-trip ---
+    // --- Encode: encode / MessageView::parse round-trip ---
 
     #[test]
     fn encode_parse_round_trip() {
