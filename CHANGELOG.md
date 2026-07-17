@@ -3,20 +3,37 @@
 ## [0.9.0]
 
 ### Breaking
-- Client service registry is now keyed by `(service_id, instance_id, device IP)`
-  instead of `(service_id, instance_id)`, so multiple devices advertising the same
-  fixed instance id are tracked and addressed independently. `Client::subscribe`,
-  `subscribe_no_wait`, `send_to_service`, `remove_endpoint`, and `request` now
-  take a `ServiceEndpointKey { service_id, instance_id, source_ip }` (new public
-  type, re-exported at the crate root) in place of the loose
-  `service_id` / `instance_id` parameters — build one per (service, device) pair
-  with `ServiceEndpointKey::new(service_id, instance_id, ip)` and reuse it (it is
-  `Copy`). The device IP is the version-agnostic `core::net::IpAddr`; today's
-  transports are IPv4-only, so only V4 entries are ever registered.
-  `add_endpoint` is unchanged (it still takes the full `SocketAddrV4` and derives
-  the key).
+- Client service registry is now keyed by the AUTOSAR wire identity of a
+  service instance — `ServiceEndpointKey { service_id, endpoint: NetEndpoint }`,
+  where `NetEndpoint` is the provider's full socket (`core::net::SocketAddr` +
+  `TransportProtocol`). Per PRS_SOMEIP §4.2.1.3 a service instance is
+  identified by "the Service ID combined with the socket (i.e. IP-address,
+  transport protocol, and port number)"; the instance id is not part of the
+  wire identity ([PRS_SOMEIP_00162]) and moved into `ServiceEndpointInfo` as
+  data (SubscribeEventgroup SD entries still carry it on the wire — `subscribe`
+  reads it from the registry value). Co-hosted instances of the same service
+  are keyed apart by their mandatory-distinct ports ([PRS_SOMEIP_00163]).
+  `Client::subscribe`, `subscribe_no_wait`, `send_to_service`, `request`, and
+  `remove_endpoint` take the new key — build one per (service, endpoint) pair
+  with `ServiceEndpointKey::udp(service_id, addr)` and reuse it (it is `Copy`).
+  `Client::add_endpoint` now takes `(key, instance_id, local_port)`.
+  Sends/subscribes to endpoints the transports cannot reach (non-IPv4 or
+  non-UDP) fail with the new `Error::UnsupportedEndpoint`.
+- `TransportProtocol` moved from `protocol::sd` to the crate root (still
+  re-exported at `protocol::sd::TransportProtocol`), is `#[non_exhaustive]`,
+  and gained a `Tls` variant (secure DoIP, ISO 13400-2 Ed. 3). Encoding a
+  protocol into an SD endpoint option is now fallible
+  (`u8::try_from(TransportProtocol)`): `Tls` has no IANA protocol number and
+  yields `sd::Error::UnencodableTransportProtocol`.
+- `OfferedEndpoint::addr: Option<SocketAddrV4>` is now
+  `endpoint: Option<NetEndpoint>` (socket + transport protocol), and
+  `sd::extract_ipv4_endpoint` returns the transport protocol alongside the
+  socket address.
 
 ### Added
+- `NetEndpoint` — shared transport-endpoint identity (socket address +
+  transport protocol), exported at the crate root; the intended common
+  foundation across `simple_someip` / `simple_doip` / `uds_on_ip`.
 - `SIMPLE_SOMEIP_SERVICE_REGISTRY_CAP` build-time env override for the client
   registry capacity (default 64).
 

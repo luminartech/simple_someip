@@ -16,7 +16,7 @@ pub const SERVICE_REGISTRY_CAP: usize =
 /// of the Service ID combined with the socket (i.e. IP-address,
 /// transport protocol, and port number)". The instance id is NOT part
 /// of the key — it never appears in the SOME/IP header
-/// (`[PRS_SOMEIP_00162]`) and lives in [`ServiceEndpointInfo`] instead.
+/// (`[PRS_SOMEIP_00162]`) and lives in `ServiceEndpointInfo` instead.
 /// Co-hosted instances of the same service on one device are required
 /// to use distinct ports (`[PRS_SOMEIP_00163]`), so the socket key
 /// keeps them distinct.
