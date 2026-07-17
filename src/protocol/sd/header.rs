@@ -1,9 +1,9 @@
 use crate::protocol::byte_order::WriteBytesExt;
 
-use automotive_wire_codec::Encode;
+use automotive_wire_codec::{Decode, DecodeIter, DecodeIterator, Encode};
 
 use super::{
-    Entry, Flags, Options,
+    Entry, EntryView, Flags, OptionView, Options,
     entry::{ENTRY_SIZE, EntryIter, EntryType},
     options::{OptionIter, validate_option},
 };
@@ -62,6 +62,126 @@ impl<'a> SdHeaderView<'a> {
     /// any entry type byte is invalid, or any option has an invalid type, length, or
     /// transport protocol byte.
     pub fn parse(buf: &'a [u8]) -> Result<Self, crate::protocol::Error> {
+        // The O(1) slicing + length checks (flags/reserved, entries_size,
+        // options_size, and the section bounds) live in the single decode
+        // source, `SdBody::decode`. This eager path adds only the L2
+        // validation walks over the already-sliced sections. Those walks are
+        // slated to be re-founded on the lazy `DecodeIter`ators in Phase 4;
+        // until then they stay here so `SdHeaderView`'s entry/option iterators
+        // remain infallible.
+        let (body, _rest) = SdBody::decode(buf)?;
+        let entries_buf = body.entries_buf;
+        let options_buf = body.options_buf;
+
+        // Validate all entry type bytes.
+        let mut offset = 0;
+        while offset < entries_buf.len() {
+            EntryType::try_from(entries_buf[offset])?;
+            offset += ENTRY_SIZE;
+        }
+
+        // Validate all options.
+        let mut opt_offset = 0;
+        while opt_offset < options_buf.len() {
+            let wire_size = validate_option(&options_buf[opt_offset..])?;
+            opt_offset += wire_size;
+        }
+
+        Ok(Self {
+            flags: body.flags,
+            entries_buf,
+            options_buf,
+        })
+    }
+
+    /// Returns the SD flags.
+    #[must_use]
+    pub fn flags(&self) -> Flags {
+        self.flags
+    }
+
+    /// Returns an iterator over the SD entries.
+    #[must_use]
+    pub fn entries(&self) -> EntryIter<'a> {
+        EntryIter::new(self.entries_buf)
+    }
+
+    /// Returns an iterator over the SD options.
+    #[must_use]
+    pub fn options(&self) -> OptionIter<'a> {
+        OptionIter::new(self.options_buf)
+    }
+
+    /// Returns the number of entries in this SD header.
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
+        self.entries_buf.len() / ENTRY_SIZE
+    }
+}
+
+/// Lazy zero-copy view over an SD payload body.
+///
+/// [`SdBody::decode`] performs only the O(1) flag decode and section slicing
+/// (with the accompanying length / `entries_size`-multiple checks); it does NOT
+/// walk the entries validating their type bytes, nor the options validating
+/// their type / length / transport-protocol bytes. That per-element validation
+/// is the job of the lazy [`DecodeIter`] adapters returned by [`SdBody::entries`]
+/// / [`SdBody::options`], or of the L2 validation pass ([`SdHeaderView::parse`]).
+///
+/// Contrast with [`SdHeaderView`], which validates everything upfront so its
+/// iterators are infallible.
+#[derive(Clone, Copy, Debug)]
+pub struct SdBody<'a> {
+    flags: Flags,
+    entries_buf: &'a [u8],
+    options_buf: &'a [u8],
+}
+
+impl<'a> SdBody<'a> {
+    /// Returns the SD flags.
+    #[must_use]
+    pub fn flags(&self) -> Flags {
+        self.flags
+    }
+
+    /// Returns a lazy iterator over the SD entries.
+    ///
+    /// Each item is a `Result<EntryView, Error>`; a malformed/truncated entry
+    /// surfaces as an `Err`. The entry-type byte is not validated here — call
+    /// [`EntryView::entry_type`] / [`EntryView::to_owned`] to validate it.
+    #[must_use]
+    pub fn entries(&self) -> DecodeIterator<'a, EntryView<'a>> {
+        EntryView::iter(self.entries_buf)
+    }
+
+    /// Returns a lazy iterator over the SD options.
+    ///
+    /// Each item is a `Result<OptionView, Error>`; a malformed/truncated option
+    /// surfaces as an `Err`. Option type / length / transport-protocol bytes
+    /// are not validated here — validate them via the `OptionView` accessors.
+    #[must_use]
+    pub fn options(&self) -> DecodeIterator<'a, OptionView<'a>> {
+        OptionView::iter(self.options_buf)
+    }
+}
+
+impl<'a> Decode<'a> for SdBody<'a> {
+    type Error = crate::protocol::Error;
+
+    /// Decode and slice an SD payload body from the front of `buf`.
+    ///
+    /// Performs only the flag decode and the section slicing / length checks
+    /// (buffer minimum, `entries_size` multiple-of-16, and section bounds). It
+    /// deliberately does NOT validate entry-type bytes or option contents —
+    /// see the type-level docs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Incomplete`](automotive_wire_codec::Incomplete) if the buffer
+    /// is too short for the declared sections, or
+    /// [`IncorrectEntriesSize`](super::Error::IncorrectEntriesSize) if
+    /// `entries_size` is not a multiple of `ENTRY_SIZE` (16).
+    fn decode(buf: &'a [u8]) -> Result<(Self, &'a [u8]), Self::Error> {
         // Minimum: 4 (flags+reserved) + 4 (entries_size) + 4 (options_size) = 12
         if buf.len() < 12 {
             return Err(automotive_wire_codec::Incomplete {
@@ -91,13 +211,6 @@ impl<'a> SdHeaderView<'a> {
 
         let entries_buf = &buf[8..8 + entries_size];
 
-        // Validate all entry type bytes
-        let mut offset = 0;
-        while offset < entries_size {
-            EntryType::try_from(entries_buf[offset])?;
-            offset += ENTRY_SIZE;
-        }
-
         let options_size_offset = 8 + entries_size;
         let options_size = u32::from_be_bytes([
             buf[options_size_offset],
@@ -116,44 +229,16 @@ impl<'a> SdHeaderView<'a> {
         }
 
         let options_buf = &buf[options_start..options_start + options_size];
+        let rest = &buf[options_start + options_size..];
 
-        // Validate all options
-        let mut opt_offset = 0;
-        while opt_offset < options_size {
-            let remaining = &options_buf[opt_offset..];
-            let wire_size = validate_option(remaining)?;
-            opt_offset += wire_size;
-        }
-
-        Ok(Self {
-            flags,
-            entries_buf,
-            options_buf,
-        })
-    }
-
-    /// Returns the SD flags.
-    #[must_use]
-    pub fn flags(&self) -> Flags {
-        self.flags
-    }
-
-    /// Returns an iterator over the SD entries.
-    #[must_use]
-    pub fn entries(&self) -> EntryIter<'a> {
-        EntryIter::new(self.entries_buf)
-    }
-
-    /// Returns an iterator over the SD options.
-    #[must_use]
-    pub fn options(&self) -> OptionIter<'a> {
-        OptionIter::new(self.options_buf)
-    }
-
-    /// Returns the number of entries in this SD header.
-    #[must_use]
-    pub fn entry_count(&self) -> usize {
-        self.entries_buf.len() / ENTRY_SIZE
+        Ok((
+            Self {
+                flags,
+                entries_buf,
+                options_buf,
+            },
+            rest,
+        ))
     }
 }
 
@@ -397,5 +482,138 @@ mod tests {
                 SdError::InvalidOptionTransportProtocol(0xAB)
             ))
         ));
+    }
+
+    // --- SdBody (Phase 3 lazy L1 decode) ---
+
+    #[test]
+    fn sd_body_decode_slices_sections() {
+        let ip = Ipv4Addr::new(192, 168, 1, 10);
+        let entry = Entry::OfferService(ServiceEntry {
+            service_id: 0x1234,
+            instance_id: 0x0001,
+            major_version: 1,
+            ttl: 0xFF_FFFF,
+            index_first_options_run: 0,
+            index_second_options_run: 0,
+            options_count: OptionsCount::new(1, 0),
+            minor_version: 0,
+        });
+        let endpoint = Options::IpV4Endpoint {
+            ip,
+            protocol: TransportProtocol::Udp,
+            port: 30509,
+        };
+        let entries = [entry];
+        let options = [endpoint];
+        let h = Header::new(
+            Flags::new_sd(RebootFlag::RecentlyRebooted),
+            &entries,
+            &options,
+        );
+        let mut buf = [0u8; 64];
+        let n = h.encode(&mut buf.as_mut_slice()).unwrap();
+        let (body, rest) = SdBody::decode(&buf[..n]).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(body.flags(), h.flags);
+        // Lazy iterators recover the entry and option.
+        let entry_view = body.entries().next().unwrap().unwrap();
+        assert_eq!(entry_view.service_id(), 0x1234);
+        let opt_view = body.options().next().unwrap().unwrap();
+        assert_eq!(opt_view.as_ipv4().unwrap().0, ip);
+    }
+
+    #[test]
+    fn sd_body_decode_returns_trailing_remainder() {
+        let h = Header::new(Flags::new_sd(RebootFlag::RecentlyRebooted), &[], &[]);
+        let mut buf = [0u8; 32];
+        let n = h.encode(&mut buf.as_mut_slice()).unwrap();
+        // Append 3 extra trailing bytes past the SD body.
+        buf[n] = 0xDE;
+        buf[n + 1] = 0xAD;
+        buf[n + 2] = 0xBE;
+        let (_body, rest) = SdBody::decode(&buf[..n + 3]).unwrap();
+        assert_eq!(rest, &[0xDE, 0xAD, 0xBE]);
+    }
+
+    #[test]
+    fn sd_body_decode_defers_entry_type_validation() {
+        // A body whose single entry has an invalid entry-type byte (0x03)
+        // must still decode successfully — SdBody does NOT walk entry types.
+        // entries_size = 16 (valid multiple), options_size = 0.
+        let mut buf = [0u8; 28];
+        buf[4..8].copy_from_slice(&16u32.to_be_bytes());
+        buf[8] = 0x03; // invalid entry type byte
+        // bytes 24..28 = options_size = 0
+        let (body, rest) = SdBody::decode(&buf).unwrap();
+        assert!(rest.is_empty());
+        // The lazy iterator produces the view; validation only fails on to_owned.
+        let entry_view = body.entries().next().unwrap().unwrap();
+        assert!(matches!(
+            entry_view.to_owned(),
+            Err(SdError::InvalidEntryType(0x03))
+        ));
+        // But SdHeaderView::parse (the eager L2 walk) DOES reject it.
+        assert!(matches!(
+            SdHeaderView::parse(&buf),
+            Err(crate::protocol::Error::Sd(SdError::InvalidEntryType(0x03)))
+        ));
+    }
+
+    #[test]
+    fn sd_body_decode_defers_option_validation() {
+        // options_size = 12 with an IPv4 option carrying an invalid transport
+        // protocol byte. SdBody slices it without complaint.
+        const PREFIX: usize = 12;
+        let options_size = u32::try_from(IPV4_OPTION_WIRE_SIZE).unwrap();
+        let prefix = raw_header(0, options_size);
+        let option = ipv4_endpoint_bytes([10, 0, 0, 1], 0xAB, 30490);
+        let mut buf = [0u8; PREFIX + IPV4_OPTION_WIRE_SIZE];
+        buf[..PREFIX].copy_from_slice(&prefix);
+        buf[PREFIX..].copy_from_slice(&option);
+        let (body, rest) = SdBody::decode(&buf).unwrap();
+        assert!(rest.is_empty());
+        let opt_view = body.options().next().unwrap().unwrap();
+        assert!(matches!(
+            opt_view.as_ipv4(),
+            Err(SdError::InvalidOptionTransportProtocol(0xAB))
+        ));
+    }
+
+    #[test]
+    fn sd_body_decode_too_short_is_incomplete() {
+        let buf = [0u8; 8];
+        assert!(matches!(
+            SdBody::decode(&buf),
+            Err(crate::protocol::Error::Incomplete(
+                automotive_wire_codec::Incomplete {
+                    needed: 12,
+                    available: 8,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn sd_body_decode_rejects_non_multiple_entries_size() {
+        let mut buf = [0u8; 12];
+        buf[4..8].copy_from_slice(&5u32.to_be_bytes());
+        assert!(matches!(
+            SdBody::decode(&buf),
+            Err(crate::protocol::Error::Sd(SdError::IncorrectEntriesSize(5)))
+        ));
+    }
+
+    #[test]
+    fn sd_body_entries_remaining_len_reports_count() {
+        let entries = [
+            Entry::FindService(ServiceEntry::find(0x0001)),
+            Entry::FindService(ServiceEntry::find(0x0002)),
+        ];
+        let h = Header::new(Flags::new_sd(RebootFlag::RecentlyRebooted), &entries, &[]);
+        let mut buf = [0u8; 64];
+        let n = h.encode(&mut buf.as_mut_slice()).unwrap();
+        let (body, _rest) = SdBody::decode(&buf[..n]).unwrap();
+        assert_eq!(body.entries().remaining_len(), Some(2));
     }
 }

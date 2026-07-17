@@ -23,7 +23,7 @@ pub use entry::{
 };
 pub use error::Error;
 pub use flags::{Flags, RebootFlag};
-pub use header::{Header, SdHeaderView};
+pub use header::{Header, SdBody, SdHeaderView};
 pub use options::{
     MAX_CONFIGURATION_STRING_LENGTH, OptionIter, OptionType, OptionView, Options,
     TransportProtocol, extract_ipv4_endpoint,
