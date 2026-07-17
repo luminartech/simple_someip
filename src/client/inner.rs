@@ -2607,9 +2607,9 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn handle_discovery_datagram_keys_offers_by_device_ip() {
+        use crate::Encode;
         use crate::RawPayload;
         use crate::protocol::sd::{self, Entry, Options, OptionsCount, ServiceEntry};
-        use crate::traits::WireFormat;
         use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
         type RawInner = Inner<
@@ -2675,7 +2675,10 @@ mod tests {
             [(1u32, DEVICE_A, addr_a), (2u32, DEVICE_B, addr_b)]
         {
             let sd_header = offer_header(service_addr, true);
-            let someip_header = protocol::Header::new_sd(request_id, sd_header.required_size());
+            let someip_header = protocol::Header::new_sd(
+                request_id,
+                sd_header.encoded_size().expect("encoded_size"),
+            );
             RawInner::handle_discovery_datagram(
                 SocketAddr::new(source_ip.into(), sd::MULTICAST_PORT),
                 TransportKind::Multicast,
@@ -2706,7 +2709,8 @@ mod tests {
         // ad515c3, the registry was keyed by (service_id, instance_id)
         // alone, so removing A's entry would have removed B's too.
         let stop_header = offer_header(addr_a, false);
-        let someip_header = protocol::Header::new_sd(3, stop_header.required_size());
+        let someip_header =
+            protocol::Header::new_sd(3, stop_header.encoded_size().expect("encoded_size"));
         RawInner::handle_discovery_datagram(
             SocketAddr::new(DEVICE_A.into(), sd::MULTICAST_PORT),
             TransportKind::Multicast,
