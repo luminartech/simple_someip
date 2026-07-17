@@ -28,6 +28,12 @@ pub enum Error {
     /// The requested service was not found in the endpoint registry.
     #[error("Service not found in endpoint registry")]
     ServiceNotFound,
+    /// The key's endpoint uses an address family or transport protocol
+    /// the client's transports cannot send to (currently IPv4 + UDP
+    /// only). The registry stores such keys without error; sending or
+    /// subscribing to them fails with this variant.
+    #[error("Endpoint not supported by this client's transports (IPv4/UDP only): {0:?}")]
+    UnsupportedEndpoint(crate::NetEndpoint),
     /// An E2E protection or checking error occurred.
     #[error(transparent)]
     E2e(#[from] crate::e2e::Error),
