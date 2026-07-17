@@ -3008,13 +3008,13 @@ mod tests {
     ) -> usize {
         let opt = sd::Options::IpV4Endpoint { ip, protocol, port };
         let mut slot = buf;
-        opt.write(&mut slot).unwrap()
+        opt.encode(&mut slot).unwrap()
     }
 
     fn write_load_balancing_option(buf: &mut [u8], priority: u16, weight: u16) -> usize {
         let opt = sd::Options::LoadBalancing { priority, weight };
         let mut slot = buf;
-        opt.write(&mut slot).unwrap()
+        opt.encode(&mut slot).unwrap()
     }
 
     /// Build a byte buffer holding `count` `IpV4Endpoint` options with
