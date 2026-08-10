@@ -1,6 +1,7 @@
 //! Event publishing functionality
 
 use super::Error;
+use super::service_info::Subscriber;
 use super::subscription_manager::{SUBSCRIBERS_PER_GROUP, SubscriptionHandle};
 use crate::e2e::E2EKey;
 use crate::protocol::{Header, Message};
@@ -62,6 +63,39 @@ where
     _phantom: PhantomData<fn() -> T>,
 }
 
+// `for<'a> S::ForEachFuture<'a>: Send` is attached per-method below rather
+// than to this `impl` block or to `S`'s bound on the struct.
+//
+// What the bound is NOT: it is not what makes these futures `Send`. That
+// comes from `for_each_subscriber` returning the nameable
+// `SubscriptionHandle::ForEachFuture` GAT instead of an RPITIT — with a
+// concrete handle the projection normalizes to a `Send` future and auto-trait
+// leakage does the rest. Removing every one of these `where` clauses still
+// compiles `assert_publisher_futures_are_send`.
+//
+// What it IS: the same explicit-contract move `Server::run` already makes
+// with `for<'a> Sub::SubscribeFuture<'a>: Send`. It states the requirement at
+// the library boundary, so a consumer that pairs a `!Send`-future handle with
+// `tokio::spawn` gets an error naming the handle and the method instead of an
+// unreadable one from inside `tokio::spawn`'s bound check.
+//
+// Scoping, therefore, is by *entry point*: the `*_with_buffers` methods are
+// the no-alloc bare-metal surface and carry NO bound, so a handle with a
+// `!Send` `ForEachFuture` keeps full access to them (what `bare_metal_tasks`
+// and the `thumbv7em` builds rely on). The allocator-backed conveniences and
+// the query helpers — the ones a multi-threaded consumer actually spawns —
+// carry it.
+//
+// Known asymmetry: `publish_event` / `publish_raw_event` /
+// `publish_raw_event_to` each have a `*_with_buffers` escape hatch for a
+// `!Send`-future handle, but `has_subscribers` / `subscriber_count` /
+// `subscriber_addresses` do not — the bound is the only way to reach them. If
+// a single-threaded consumer ever needs those three, dropping their bound is
+// a non-breaking relaxation and costs the fix nothing (see above).
+//
+// Method-level `where` clauses rather than a second `impl` block: the
+// scoping is identical (an inherent method is only callable when its own
+// bounds hold) and it keeps each method's requirement next to the method.
 impl<R, S, H, T> EventPublisher<R, S, H, T>
 where
     R: E2ERegistryHandle,
@@ -134,14 +168,15 @@ where
         // The buffer cap matches the manager's per-group cap so push()
         // is provably infallible — see the `const _` guard below.
         let mut subscribers: HeaplessVec<SocketAddrV4, SUBSCRIBERS_PER_GROUP> = HeaplessVec::new();
+        let mut visit = |sub: &Subscriber| {
+            // push() can never fail here: SUBSCRIBERS_PER_GROUP is
+            // both the manager's per-group cap and this buffer's
+            // cap, so the manager will never feed us more than fits.
+            let _ = subscribers.push(sub.address);
+        };
         let _total = self
             .subscriptions
-            .for_each_subscriber(service_id, instance_id, event_group_id, |sub| {
-                // push() can never fail here: SUBSCRIBERS_PER_GROUP is
-                // both the manager's per-group cap and this buffer's
-                // cap, so the manager will never feed us more than fits.
-                let _ = subscribers.push(sub.address);
-            })
+            .for_each_subscriber(service_id, instance_id, event_group_id, &mut visit)
             .await;
 
         if subscribers.is_empty() {
@@ -304,7 +339,10 @@ where
         instance_id: u16,
         event_group_id: u16,
         message: &Message<P>,
-    ) -> Result<usize, Error> {
+    ) -> Result<usize, Error>
+    where
+        for<'a> S::ForEachFuture<'a>: Send,
+    {
         let mut msg_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
         let mut protected_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
         self.publish_event_with_buffers(
@@ -349,11 +387,12 @@ where
         // Snapshot subscriber addresses into a stack buffer (see
         // publish_event_with_buffers for rationale).
         let mut subscribers: HeaplessVec<SocketAddrV4, SUBSCRIBERS_PER_GROUP> = HeaplessVec::new();
+        let mut visit = |sub: &Subscriber| {
+            let _ = subscribers.push(sub.address);
+        };
         let _total = self
             .subscriptions
-            .for_each_subscriber(service_id, instance_id, event_group_id, |sub| {
-                let _ = subscribers.push(sub.address);
-            })
+            .for_each_subscriber(service_id, instance_id, event_group_id, &mut visit)
             .await;
 
         if subscribers.is_empty() {
@@ -479,7 +518,10 @@ where
         protocol_version: u8,
         interface_version: u8,
         payload: &[u8],
-    ) -> Result<usize, Error> {
+    ) -> Result<usize, Error>
+    where
+        for<'a> S::ForEachFuture<'a>: Send,
+    {
         let mut buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
         self.publish_raw_event_with_buffers(
             service_id,
@@ -509,9 +551,11 @@ where
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-    ) -> bool {
-        self.subscriptions
-            .for_each_subscriber(service_id, instance_id, event_group_id, |_| {})
+    ) -> bool
+    where
+        for<'a> S::ForEachFuture<'a>: Send,
+    {
+        self.subscriber_count(service_id, instance_id, event_group_id)
             .await
             > 0
     }
@@ -597,9 +641,13 @@ where
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-    ) -> usize {
+    ) -> usize
+    where
+        for<'a> S::ForEachFuture<'a>: Send,
+    {
+        let mut visit = |_: &Subscriber| {};
         self.subscriptions
-            .for_each_subscriber(service_id, instance_id, event_group_id, |_| {})
+            .for_each_subscriber(service_id, instance_id, event_group_id, &mut visit)
             .await
     }
 
@@ -650,13 +698,18 @@ where
         // Only deliver to a currently-subscribed endpoint, so a caller cannot
         // address a receiver that has not subscribed.
         let mut is_subscribed = false;
-        self.subscriptions
-            .for_each_subscriber(service_id, instance_id, event_group_id, |sub| {
+        // Inner scope so the visitor's mutable borrow of `is_subscribed`
+        // ends before it is read back below.
+        {
+            let mut visit = |sub: &Subscriber| {
                 if sub.address == target {
                     is_subscribed = true;
                 }
-            })
-            .await;
+            };
+            self.subscriptions
+                .for_each_subscriber(service_id, instance_id, event_group_id, &mut visit)
+                .await;
+        }
         if !is_subscribed {
             return Ok(0);
         }
@@ -748,7 +801,10 @@ where
         protocol_version: u8,
         interface_version: u8,
         payload: &[u8],
-    ) -> Result<usize, Error> {
+    ) -> Result<usize, Error>
+    where
+        for<'a> S::ForEachFuture<'a>: Send,
+    {
         let mut buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
         self.publish_raw_event_to_with_buffers(
             target,
@@ -778,14 +834,18 @@ where
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-    ) -> HeaplessVec<SocketAddrV4, SUBSCRIBERS_PER_GROUP> {
+    ) -> HeaplessVec<SocketAddrV4, SUBSCRIBERS_PER_GROUP>
+    where
+        for<'a> S::ForEachFuture<'a>: Send,
+    {
         let mut addrs: HeaplessVec<SocketAddrV4, SUBSCRIBERS_PER_GROUP> = HeaplessVec::new();
+        let mut visit = |sub: &Subscriber| {
+            // push() can never fail: this buffer's cap equals the manager's
+            // per-group cap, so it will never feed us more than fits.
+            let _ = addrs.push(sub.address);
+        };
         self.subscriptions
-            .for_each_subscriber(service_id, instance_id, event_group_id, |sub| {
-                // push() can never fail: this buffer's cap equals the manager's
-                // per-group cap, so it will never feed us more than fits.
-                let _ = addrs.push(sub.address);
-            })
+            .for_each_subscriber(service_id, instance_id, event_group_id, &mut visit)
             .await;
         addrs
     }
@@ -1527,5 +1587,111 @@ mod tests {
         assert_eq!(addrs.len(), 2);
         assert!(addrs.contains(&a));
         assert!(addrs.contains(&b));
+    }
+
+    // ── `Send` witnesses ─────────────────────────────────────────────────
+    //
+    // Regression guard for the bug fixed in 0.10.0: `SubscriptionHandle::
+    // for_each_subscriber` used to be return-position `impl Trait` in trait.
+    // Because an RPITIT return has no nameable associated type, the
+    // `EventPublisher` methods below — which are generic over
+    // `S: SubscriptionHandle` and so see only the trait's declared bounds —
+    // could not be proven `Send`, and downstream consumers could not
+    // `tokio::spawn` any task that published an event. Converting the return
+    // to the `ForEachFuture<'a>` GAT made the `Send`-ness nameable and
+    // bindable.
+    //
+    // Nothing asserted this before, which is exactly why the hole survived a
+    // release. Keep these witnesses.
+
+    /// Compile-time witness: every publisher entry point a multi-threaded
+    /// consumer spawns must return a `Send` future when the handle's
+    /// `ForEachFuture` is `Send` (the tokio
+    /// `Arc<RwLock<SubscriptionManager>>` handle boxes one).
+    ///
+    /// Never called — the value is in type-checking it. If a future here
+    /// stops being `Send`, this fails to compile.
+    #[allow(dead_code)]
+    fn assert_publisher_futures_are_send(
+        publisher: &TestEventPublisher,
+        message: &Message<TestPayload>,
+    ) {
+        fn assert_send<T: Send>(_: T) {}
+
+        // GAT-backed before 0.10.0 — these already held.
+        assert_send(publisher.register_subscriber(0x5B, 1, 0x01, ADDR_A));
+        assert_send(publisher.remove_subscriber(0x5B, 1, 0x01, ADDR_A));
+
+        // RPITIT-backed before 0.10.0 — these are the ones that regressed.
+        assert_send(publisher.publish_event(0x5B, 1, 0x01, message));
+        assert_send(publisher.publish_raw_event(0x5B, 1, 0x01, 0x8001, 0x0001, 0x01, 0x01, &[0u8]));
+        assert_send(publisher.publish_raw_event_to(
+            ADDR_A,
+            0x5B,
+            1,
+            0x01,
+            0x8001,
+            0x0001,
+            0x01,
+            0x01,
+            &[0u8],
+        ));
+        assert_send(publisher.has_subscribers(0x5B, 1, 0x01));
+        assert_send(publisher.subscriber_count(0x5B, 1, 0x01));
+        assert_send(publisher.subscriber_addresses(0x5B, 1, 0x01));
+    }
+
+    /// Compile-time witness that the publisher itself crosses a thread
+    /// boundary, so `Arc<EventPublisher<..>>` can be shared with spawned
+    /// tasks.
+    #[allow(dead_code)]
+    fn assert_publisher_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TestEventPublisher>();
+        assert_send_sync::<Arc<TestEventPublisher>>();
+    }
+
+    /// Runtime witness for the real consumer shape: hand an
+    /// `Arc<EventPublisher>` to `tokio::spawn` (which requires
+    /// `Future: Send + 'static`) and publish from the spawned task.
+    ///
+    /// The compile-time witnesses above cover the futures individually;
+    /// this proves the whole `tokio::spawn` path a downstream consumer
+    /// actually writes, on a multi-threaded runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publisher_work_is_spawnable_on_a_multi_thread_runtime() {
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let (publisher, _socket) = make_publisher(Arc::clone(&subscriptions)).await;
+        let publisher = Arc::new(publisher);
+
+        // A subscriber so `publish_event` takes the fan-out branch rather
+        // than the early `Ok(0)` return.
+        let receiver = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind receiver socket");
+        let receiver_addr = match receiver.local_addr().expect("receiver local_addr") {
+            std::net::SocketAddr::V4(a) => a,
+            other => panic!("expected an IPv4 receiver address, got {other}"),
+        };
+        publisher
+            .register_subscriber(0x5B, 1, 0x01, receiver_addr)
+            .await
+            .expect("register subscriber");
+
+        let spawned = Arc::clone(&publisher);
+        let sent = tokio::spawn(async move {
+            assert!(spawned.has_subscribers(0x5B, 1, 0x01).await);
+            assert_eq!(spawned.subscriber_count(0x5B, 1, 0x01).await, 1);
+            assert_eq!(spawned.subscriber_addresses(0x5B, 1, 0x01).await.len(), 1);
+            let msg = make_test_message();
+            spawned
+                .publish_event(0x5B, 1, 0x01, &msg)
+                .await
+                .expect("publish from a spawned task")
+        })
+        .await
+        .expect("spawned publish task must not panic");
+
+        assert_eq!(sent, 1);
     }
 }

@@ -29,8 +29,9 @@ use crate::sd_codec::{
     build_notification_datagram, build_subscribe_eventgroup_datagram, check_parsed_e2e,
     e2e_status_code, next_sd_session, parse_someip_datagram,
 };
-use crate::server::{Subscriber, SubscriptionHandle};
+use crate::server::{ServerConfig, Subscriber, SubscriptionHandle};
 use crate::transport::{E2ERegistryHandle, Timer, TransportSocket};
+use heapless::Vec as HeaplessVec;
 
 /// Handler for one decoded inbound request. A getter fills `response_out`
 /// and returns the response length; a setter / fire-and-forget returns `<0`.
@@ -305,6 +306,13 @@ const NOOP_RAW_WAKER: RawWaker = {
 /// buffer (no per-call stack buffer). Returns the number of subscribers
 /// sent to (`>= 0`), or a negative error: `-2` if `scratch` is too small
 /// for the header + payload.
+///
+/// `send` is invoked *after* the subscription handle's critical section is
+/// released, not from inside the visitor: this function snapshots the
+/// subscriber endpoints into a stack buffer first (no allocation — the
+/// buffer is sized to the manager's own per-group cap). `send` therefore
+/// need not be reentrancy-safe with respect to the subscription table, and
+/// it does not have to be `Send`.
 // A SOME/IP notification's full addressing (service/instance/eg/method/
 // session) plus payload, scratch, and send sink; a params struct would
 // only relocate the list.
@@ -330,19 +338,46 @@ where
     };
     let datagram = &scratch[..total];
 
-    let send_one = |sub: &Subscriber| send(datagram, sub.address);
-    // `for_each_subscriber` is synchronous-backed on the bare-metal
-    // handle and resolves to the subscriber count on the first poll;
-    // drive it once under a no-op waker.
-    let fut = subscriptions.for_each_subscriber(service_id, instance_id, event_group_id, send_one);
-    let mut fut = pin!(fut);
-    // SAFETY: NOOP_RAW_WAKER's vtable functions are all no-ops / return
-    // the same waker, satisfying the RawWaker contract.
-    let waker = unsafe { Waker::from_raw(NOOP_RAW_WAKER) };
-    let mut cx = Context::from_waker(&waker);
+    // Two-phase: snapshot the subscriber endpoints under the handle's
+    // critical section, then transmit after it is released. The visitor
+    // therefore captures only a `HeaplessVec` of addresses — it does not
+    // capture `send` — which keeps `FSend` free of the `Send` bound that
+    // `SubscriptionHandle::for_each_subscriber`'s `&mut dyn FnMut(..) + Send`
+    // visitor would otherwise impose on every firmware transmit callback.
+    // The buffer's cap is the manager's own per-group cap, so the snapshot
+    // can never truncate. Keeping the caller's `send` out of the critical
+    // section is also the pattern the trait documents.
+    let mut targets: HeaplessVec<SocketAddrV4, { ServerConfig::SUBSCRIBERS_PER_GROUP_CAP }> =
+        HeaplessVec::new();
+    // Inner scope so the visitor's mutable borrow of `targets` (and the
+    // future's borrow of the visitor) both end before the transmit loop
+    // reads `targets` back.
+    let visited = {
+        let mut visit = |sub: &Subscriber| {
+            let _ = targets.push(sub.address);
+        };
+        // `for_each_subscriber` is synchronous-backed on the bare-metal
+        // handle and resolves to the subscriber count on the first poll;
+        // drive it once under a no-op waker.
+        let fut =
+            subscriptions.for_each_subscriber(service_id, instance_id, event_group_id, &mut visit);
+        let mut fut = pin!(fut);
+        // SAFETY: NOOP_RAW_WAKER's vtable functions are all no-ops / return
+        // the same waker, satisfying the RawWaker contract.
+        let waker = unsafe { Waker::from_raw(NOOP_RAW_WAKER) };
+        let mut cx = Context::from_waker(&waker);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(n) => n,
+            Poll::Pending => 0,
+        }
+    };
+
+    for target in &targets {
+        send(datagram, *target);
+    }
+
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    match fut.as_mut().poll(&mut cx) {
-        Poll::Ready(n) => n as i32,
-        Poll::Pending => 0,
+    {
+        visited as i32
     }
 }

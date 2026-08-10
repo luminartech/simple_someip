@@ -302,19 +302,24 @@ impl Default for SubscriptionManager {
 /// single-threaded executors (embassy-style) to satisfy the trait
 /// without an `Arc<RwLock>`-style shared state. Implementations on
 /// multi-threaded executors are free to make their `SubscribeFuture`
-/// / `UnsubscribeFuture` `Send`, which lets `Server::run` (the
-/// `Send`-bounded entry point used by `tokio::spawn`) accept them via
-/// the `for<'a> Sub::SubscribeFuture<'a>: Send` bound.
+/// / `UnsubscribeFuture` / `ForEachFuture` `Send`, which lets
+/// `Server::run` and the `Send`-bounded [`EventPublisher`] methods
+/// (the entry points used by `tokio::spawn`) accept them via
+/// `for<'a> Sub::SubscribeFuture<'a>: Send`-style bounds.
 ///
-/// `subscribe` and `unsubscribe` use named [GATs] (rather than
-/// return-position `impl Trait`) so `Server::run`'s where clause can
-/// spell their `Send`-ness explicitly. `for_each_subscriber` stays
-/// as RPIT — it is called by
-/// [`EventPublisher::publish_event`](crate::server::EventPublisher),
-/// not by the SD run-future, so no `Send` bound on it is currently
-/// load-bearing.
+/// Every method returns a named [GAT] rather than return-position
+/// `impl Trait`. That is deliberate and load-bearing: a caller that is
+/// generic over the handle (`Server::run`, every [`EventPublisher`]
+/// method) can only require `Send` of a future it can *name*. An
+/// RPIT(IT) return has no nameable associated type to hang
+/// `for<'a> Sub::Fut<'a>: Send` on, and no implementor can close that
+/// hole from the outside — so `for_each_subscriber` was converted from
+/// RPIT to a GAT to unblock `tokio::spawn`ing publisher work. See the
+/// CHANGELOG's `for_each_subscriber` entry for the migration shape.
 ///
-/// [GATs]: https://blog.rust-lang.org/2022/10/28/gats-stabilization.html
+/// [GAT]: https://blog.rust-lang.org/2022/10/28/gats-stabilization.html
+///
+/// [`EventPublisher`]: crate::server::EventPublisher
 ///
 /// Both `Server` and `EventPublisher` clone the same handle at construction
 /// time; the underlying subscription state is shared between them.
@@ -333,6 +338,19 @@ pub trait SubscriptionHandle: Clone + 'static {
     /// Future returned by [`Self::unsubscribe`]. Same `Send`-or-not
     /// freedom as [`Self::SubscribeFuture`].
     type UnsubscribeFuture<'a>: Future<Output = ()> + 'a
+    where
+        Self: 'a;
+
+    /// Future returned by [`Self::for_each_subscriber`]. Same
+    /// `Send`-or-not freedom as [`Self::SubscribeFuture`].
+    ///
+    /// This is a named GAT rather than an `impl Future` return so that
+    /// [`EventPublisher`](crate::server::EventPublisher)'s methods —
+    /// which are generic over the handle and therefore see only this
+    /// trait's declared bounds — can require
+    /// `for<'a> Self::ForEachFuture<'a>: Send` and hand the resulting
+    /// future to `tokio::spawn`.
+    type ForEachFuture<'a>: Future<Output = usize> + 'a
     where
         Self: 'a;
 
@@ -378,15 +396,43 @@ pub trait SubscriptionHandle: Clone + 'static {
     /// previous `get_subscribers -> Vec<Subscriber>` API; the visitor
     /// pattern lets `EventPublisher::publish_event` avoid a per-event
     /// heap allocation.
-    fn for_each_subscriber<'a, F>(
+    ///
+    /// Same construction-time-mutation caveat as [`Self::subscribe`]:
+    /// implementations whose critical section is fully synchronous (e.g.
+    /// `StaticSubscriptionHandle`) may run the whole visit when the
+    /// future is *constructed*, deferring only the count to the poll.
+    /// Callers must not assume that constructing the returned future
+    /// leaves `f` uncalled.
+    ///
+    /// # Why `&mut dyn FnMut`, and why `+ Send`
+    ///
+    /// The visitor is erased to a trait object rather than taken as a
+    /// generic `F`. A generic `F` would force the future's GAT to be
+    /// `ForEachFuture<'a, F>`, and `for<'a> S::ForEachFuture<'a, F>: Send`
+    /// is inexpressible for a caller that constructs the closure itself:
+    /// Rust has no `for<T>`, and closure types are unnameable. Erasing to
+    /// `&mut dyn` leaves the future's type parameterized by lifetime
+    /// alone, which a higher-ranked bound *can* quantify over.
+    /// `&mut dyn FnMut` is a fat pointer, so the erasure costs no
+    /// allocation and the crate's no-alloc guarantee is unaffected.
+    ///
+    /// The `+ Send` is required for the same reason: `&'a mut T` is `Send`
+    /// only when `T` is, so a visitor that is not `Send` would make every
+    /// implementor's future `!Send` no matter how the future itself is
+    /// built. Implementors are still free to leave `ForEachFuture` `!Send`
+    /// (the single-threaded `embassy-net` example's is); the bound only
+    /// means a *visitor* cannot capture non-`Send` state. Visitors that need
+    /// to accumulate into non-`Send` state should collect addresses here and
+    /// do the non-`Send` work after the future resolves — which is what
+    /// `bare_metal_tasks::publish_notification` does with its transmit
+    /// callback.
+    fn for_each_subscriber<'a>(
         &'a self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-        f: F,
-    ) -> impl Future<Output = usize> + 'a
-    where
-        F: FnMut(&Subscriber) + 'a;
+        f: &'a mut (dyn FnMut(&Subscriber) + Send),
+    ) -> Self::ForEachFuture<'a>;
 }
 
 #[cfg(feature = "server-tokio")]
@@ -400,6 +446,16 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
     >;
     type UnsubscribeFuture<'a> =
         core::pin::Pin<alloc::boxed::Box<dyn Future<Output = ()> + Send + 'a>>;
+    /// Also boxed `Send`, so the `EventPublisher` methods that
+    /// `tokio::spawn`-ing consumers use (`publish_event`,
+    /// `has_subscribers`, ...) can satisfy their
+    /// `for<'a> S::ForEachFuture<'a>: Send` bound. The visit must be
+    /// deferred to the poll here — unlike the bare-metal handle, the
+    /// `RwLock` read is itself `.await`ed — so the future genuinely holds
+    /// the visitor across a suspension point, which is why the visitor
+    /// carries `+ Send`.
+    type ForEachFuture<'a> =
+        core::pin::Pin<alloc::boxed::Box<dyn Future<Output = usize> + Send + 'a>>;
 
     fn subscribe(
         &self,
@@ -434,18 +490,15 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
         })
     }
 
-    fn for_each_subscriber<'a, F>(
+    fn for_each_subscriber<'a>(
         &'a self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-        mut f: F,
-    ) -> impl Future<Output = usize> + 'a
-    where
-        F: FnMut(&Subscriber) + 'a,
-    {
+        f: &'a mut (dyn FnMut(&Subscriber) + Send),
+    ) -> Self::ForEachFuture<'a> {
         let this = self.clone();
-        async move {
+        alloc::boxed::Box::pin(async move {
             let guard = this.read().await;
             let key = (service_id, instance_id, event_group_id);
             match guard.subscriptions.get(&key) {
@@ -457,7 +510,7 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
                 }
                 None => 0,
             }
-        }
+        })
     }
 }
 
@@ -491,7 +544,6 @@ impl SubscriptionHandle for Arc<RwLock<SubscriptionManager>> {
 pub mod bare_metal_subscription_impl {
     use super::{SubscribeError, Subscriber, SubscriptionHandle, SubscriptionManager};
     use core::cell::RefCell;
-    use core::future::Future;
     use core::net::SocketAddrV4;
     use embassy_sync::blocking_mutex::Mutex;
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -534,6 +586,12 @@ pub mod bare_metal_subscription_impl {
         // there.
         type SubscribeFuture<'a> = core::future::Ready<Result<(), SubscribeError>>;
         type UnsubscribeFuture<'a> = core::future::Ready<()>;
+        // Same story for the visit: the whole walk happens inside the
+        // synchronous lock closure at construction time, so the future
+        // never holds the visitor and `Ready<usize>` suffices — no heap,
+        // and `Send` falls out for free (`usize: Send`) without the
+        // handle having to be a multi-threaded one.
+        type ForEachFuture<'a> = core::future::Ready<usize>;
 
         fn subscribe(
             &self,
@@ -572,32 +630,27 @@ pub mod bare_metal_subscription_impl {
             core::future::ready(())
         }
 
-        fn for_each_subscriber<'a, F>(
+        fn for_each_subscriber<'a>(
             &'a self,
             service_id: u16,
             instance_id: u16,
             event_group_id: u16,
-            mut f: F,
-        ) -> impl Future<Output = usize> + 'a
-        where
-            F: FnMut(&Subscriber) + 'a,
-        {
+            f: &'a mut (dyn FnMut(&Subscriber) + Send),
+        ) -> Self::ForEachFuture<'a> {
             let storage = self.0;
-            async move {
-                storage.lock(|cell| {
-                    let guard = cell.borrow();
-                    let key = (service_id, instance_id, event_group_id);
-                    match guard.subscriptions.get(&key) {
-                        Some(list) => {
-                            for sub in list {
-                                f(sub);
-                            }
-                            list.len()
+            core::future::ready(storage.lock(|cell| {
+                let guard = cell.borrow();
+                let key = (service_id, instance_id, event_group_id);
+                match guard.subscriptions.get(&key) {
+                    Some(list) => {
+                        for sub in list {
+                            f(sub);
                         }
-                        None => 0,
+                        list.len()
                     }
-                })
-            }
+                    None => 0,
+                }
+            }))
         }
     }
 }
@@ -800,9 +853,10 @@ mod tests {
             handle.subscribe(0x5B, 1, 0x01, a2).await.unwrap();
 
             let mut visited = Vec::new();
-            let count = handle
-                .for_each_subscriber(0x5B, 1, 0x01, |s| visited.push(s.address))
-                .await;
+            let count = {
+                let mut visit = |s: &Subscriber| visited.push(s.address);
+                handle.for_each_subscriber(0x5B, 1, 0x01, &mut visit).await
+            };
 
             assert_eq!(count, 2);
             assert!(visited.contains(&a1));
@@ -813,7 +867,8 @@ mod tests {
         async fn for_each_subscriber_empty_group_returns_zero() {
             let handle: Arc<RwLock<SubscriptionManager>> =
                 Arc::new(RwLock::new(SubscriptionManager::new()));
-            let count = handle.for_each_subscriber(0x5B, 1, 0x01, |_| {}).await;
+            let mut visit = |_: &Subscriber| {};
+            let count = handle.for_each_subscriber(0x5B, 1, 0x01, &mut visit).await;
             assert_eq!(count, 0);
         }
 
@@ -829,9 +884,10 @@ mod tests {
             handle.unsubscribe(0x5B, 1, 0x01, a1).await;
 
             let mut visited = Vec::new();
-            let count = handle
-                .for_each_subscriber(0x5B, 1, 0x01, |s| visited.push(s.address))
-                .await;
+            let count = {
+                let mut visit = |s: &Subscriber| visited.push(s.address);
+                handle.for_each_subscriber(0x5B, 1, 0x01, &mut visit).await
+            };
             assert_eq!(count, 1);
             assert_eq!(visited, [a2]);
         }
@@ -889,18 +945,20 @@ mod tests {
             block_on_sync(handle.subscribe(0x5B, 1, 0x01, a2)).unwrap();
 
             let mut visited: std::vec::Vec<SocketAddrV4> = std::vec::Vec::new();
-            let count = block_on_sync(
-                handle.for_each_subscriber(0x5B, 1, 0x01, |s| visited.push(s.address)),
-            );
+            let count = {
+                let mut visit = |s: &Subscriber| visited.push(s.address);
+                block_on_sync(handle.for_each_subscriber(0x5B, 1, 0x01, &mut visit))
+            };
             assert_eq!(count, 2);
             assert!(visited.contains(&a1));
             assert!(visited.contains(&a2));
 
             block_on_sync(handle.unsubscribe(0x5B, 1, 0x01, a1));
             visited.clear();
-            let count = block_on_sync(
-                handle.for_each_subscriber(0x5B, 1, 0x01, |s| visited.push(s.address)),
-            );
+            let count = {
+                let mut visit = |s: &Subscriber| visited.push(s.address);
+                block_on_sync(handle.for_each_subscriber(0x5B, 1, 0x01, &mut visit))
+            };
             assert_eq!(count, 1);
             assert_eq!(visited, [a2]);
         }
