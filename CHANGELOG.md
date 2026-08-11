@@ -1,10 +1,11 @@
 # Changelog
 
-## [Unreleased]
+## [0.10.0]
 
-Contains a breaking change to a public trait, so the next release is 0.10.0
-under this crate's 0.x convention. (The `version` in `Cargo.toml` is bumped by
-release-plz, not by hand.)
+Contains a breaking change to a public trait, so this release takes the major
+position under this crate's 0.x convention. The `version` in `Cargo.toml` is
+bumped here rather than left to release-plz so that `cargo-semver-checks`
+compares against the version this change actually lands as.
 
 ### Breaking — `SubscriptionHandle::for_each_subscriber` returns a [generic associated type] and takes an erased visitor
 
