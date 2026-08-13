@@ -273,6 +273,7 @@ impl SubscriptionHandle for InMemorySubscriptions {
     type SubscribeFuture<'a> =
         core::pin::Pin<Box<dyn Future<Output = Result<(), SubscribeError>> + 'a>>;
     type UnsubscribeFuture<'a> = core::pin::Pin<Box<dyn Future<Output = ()> + 'a>>;
+    type ForEachFuture<'a> = core::pin::Pin<Box<dyn Future<Output = usize> + 'a>>;
 
     fn subscribe(
         &self,
@@ -306,18 +307,15 @@ impl SubscriptionHandle for InMemorySubscriptions {
         })
     }
 
-    fn for_each_subscriber<'a, F>(
+    fn for_each_subscriber<'a>(
         &'a self,
         service_id: u16,
         instance_id: u16,
         event_group_id: u16,
-        mut f: F,
-    ) -> impl Future<Output = usize> + 'a
-    where
-        F: FnMut(&Subscriber) + 'a,
-    {
+        f: &'a mut (dyn FnMut(&Subscriber) + Send),
+    ) -> Self::ForEachFuture<'a> {
         let this = self.0.clone();
-        async move {
+        Box::pin(async move {
             let g = this.lock().unwrap();
             let mut n = 0;
             for (s, i, e, addr) in g.iter() {
@@ -327,7 +325,7 @@ impl SubscriptionHandle for InMemorySubscriptions {
                 }
             }
             n
-        }
+        })
     }
 }
 

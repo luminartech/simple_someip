@@ -44,7 +44,7 @@
 
 #![cfg(all(feature = "server", feature = "bare_metal"))]
 
-use core::cell::{Cell, RefCell};
+use core::cell::RefCell;
 use core::future::Future;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::pin::Pin;
@@ -57,7 +57,8 @@ use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 use simple_someip::server::{
-    StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionHandle, SubscriptionManager,
+    StaticSubscriptionHandle, StaticSubscriptionStorage, Subscriber, SubscriptionHandle,
+    SubscriptionManager,
 };
 
 // ── Panic allocator ───────────────────────────────────────────────────────
@@ -151,13 +152,18 @@ fn witness_static_subscription_handle() {
     });
 
     assert_no_alloc("StaticSubscriptionHandle::for_each_subscriber", || {
-        let count = Cell::new(0usize);
-        let mut fut = core::pin::pin!(
-            handle.for_each_subscriber(0x5B, 1, 0x01, |_s| count.set(count.get() + 1))
-        );
-        let visited = poll_once_to_ready(fut.as_mut());
+        // `&mut usize` rather than `&Cell<usize>`: the visitor is now a
+        // `&mut dyn FnMut(&Subscriber) + Send` trait object, and
+        // `&Cell<_>` is `!Send` (`Cell` is `!Sync`). A `&mut` capture is
+        // `Send` and needs no interior mutability here anyway.
+        let mut count = 0usize;
+        let visited = {
+            let mut visit = |_s: &Subscriber| count += 1;
+            let mut fut = core::pin::pin!(handle.for_each_subscriber(0x5B, 1, 0x01, &mut visit));
+            poll_once_to_ready(fut.as_mut())
+        };
         assert_eq!(visited, 2);
-        assert_eq!(count.get(), 2);
+        assert_eq!(count, 2);
     });
 
     assert_no_alloc("StaticSubscriptionHandle::unsubscribe", || {
@@ -168,13 +174,15 @@ fn witness_static_subscription_handle() {
     assert_no_alloc(
         "StaticSubscriptionHandle::for_each_subscriber (post-unsub)",
         || {
-            let count = Cell::new(0usize);
-            let mut fut = core::pin::pin!(
-                handle.for_each_subscriber(0x5B, 1, 0x01, |_s| count.set(count.get() + 1))
-            );
-            let visited = poll_once_to_ready(fut.as_mut());
+            let mut count = 0usize;
+            let visited = {
+                let mut visit = |_s: &Subscriber| count += 1;
+                let mut fut =
+                    core::pin::pin!(handle.for_each_subscriber(0x5B, 1, 0x01, &mut visit));
+                poll_once_to_ready(fut.as_mut())
+            };
             assert_eq!(visited, 1);
-            assert_eq!(count.get(), 1);
+            assert_eq!(count, 1);
         },
     );
 }

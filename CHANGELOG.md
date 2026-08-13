@@ -1,5 +1,145 @@
 # Changelog
 
+## [0.10.0]
+
+Contains a breaking change to a public trait, so this release takes the major
+position under this crate's 0.x convention. The `version` in `Cargo.toml` is
+bumped here rather than left to release-plz so that `cargo-semver-checks`
+compares against the version this change actually lands as.
+
+### Breaking — `SubscriptionHandle::for_each_subscriber` returns a [generic associated type] and takes an erased visitor
+
+0.8.0 promoted `subscribe` / `unsubscribe` to GATs and left a note saying
+`for_each_subscriber` "stayed RPIT — no `Server::run`-side bound needs it".
+That was true of `Server::run` and wrong about everyone else:
+`EventPublisher`'s futures were consequently not provably `Send`, so a
+downstream consumer could not `tokio::spawn` *any* task that published an
+event or queried subscribers.
+
+```rust
+// Before — the future has no nameable type, so nothing can bound it `Send`.
+fn for_each_subscriber<'a, F>(
+    &'a self, service_id: u16, instance_id: u16, event_group_id: u16, f: F,
+) -> impl Future<Output = usize> + 'a
+where F: FnMut(&Subscriber) + 'a;
+
+// After
+type ForEachFuture<'a>: Future<Output = usize> + 'a where Self: 'a;
+
+fn for_each_subscriber<'a>(
+    &'a self, service_id: u16, instance_id: u16, event_group_id: u16,
+    f: &'a mut (dyn FnMut(&Subscriber) + Send),
+) -> Self::ForEachFuture<'a>;
+```
+
+**Why no implementor could fix this from outside.** `EventPublisher`'s methods
+are generic over `S: SubscriptionHandle`, so inside their bodies only the
+trait's *declared* bounds are visible. A return-position `impl Trait` in trait
+has no nameable associated type on which to place a `Send` bound, and an impl
+that happens to return a `Send` future is only observable with a statically
+known receiver. The hole was verified empirically before the fix: with one
+handle boxing *every* future as `Send`, the GAT-backed
+`register_subscriber` / `remove_subscriber` were `Send` while the
+RPITIT-backed `has_subscribers` / `publish_event` were not — same handle, same
+boxing, GAT-vs-RPITIT the only variable.
+
+**Why the visitor is now `&mut dyn` rather than a generic `F`.** A GAT could
+have been `ForEachFuture<'a, F>`, but then `for<'a> S::ForEachFuture<'a, F>: Send`
+is inexpressible for a caller that builds the closure itself: Rust has no
+`for<T>`, and closure types are unnameable. Erasing to `&mut dyn` leaves the
+future parameterized by lifetime alone, which a higher-ranked bound *can*
+quantify over. `&mut dyn FnMut` is a fat pointer, so **the erasure allocates
+nothing** — the `no_alloc_witness` gate is unchanged.
+
+**Why the visitor carries `+ Send`.** `&'a mut T` is `Send` only when `T` is,
+so a `!Send` visitor would make every implementor's future `!Send` no matter
+how the future itself is built. Implementors are still free to leave
+`ForEachFuture` `!Send` — the bare-metal ones do — the bound only constrains
+*visitors*. A visitor that must touch non-`Send` state should collect
+subscriber addresses and do that work after the future resolves (this is the
+two-phase pattern the trait already documented, and what
+`bare_metal_tasks::publish_notification` now does internally; its public
+signature is unchanged, and the caller's transmit callback now runs *after*
+the subscription critical section is released rather than inside it).
+
+**Where the `Send` bound landed.** `for<'a> S::ForEachFuture<'a>: Send` is
+attached per-method, only to the entry points a multi-threaded consumer
+spawns: `publish_event`, `publish_raw_event`, `publish_raw_event_to`,
+`has_subscribers`, `subscriber_count`, `subscriber_addresses`. The no-alloc
+`*_with_buffers` methods carry **no** `Send` bound, so a handle with a `!Send`
+`ForEachFuture` keeps full access to the bare-metal surface — the trait's
+promise to implementors is intact.
+
+Note that the bound is a stated contract, not the mechanism: the GAT
+conversion alone is what makes these futures `Send`. The bound exists so a
+consumer that pairs a `!Send`-future handle with `tokio::spawn` gets an error
+naming the handle and the method, rather than an unreadable one from inside
+`tokio::spawn`'s bound check — the same reason `Server::run` carries
+`for<'a> Sub::SubscribeFuture<'a>: Send`.
+
+#### Migration
+
+For implementors — add the associated type and box (or `core::future::ready`)
+the future, exactly as 0.8.0 required for `SubscribeFuture`:
+
+```rust
+// Before
+impl SubscriptionHandle for MyHandle {
+    fn for_each_subscriber<'a, F>(
+        &'a self, service_id: u16, instance_id: u16, event_group_id: u16, mut f: F,
+    ) -> impl Future<Output = usize> + 'a
+    where
+        F: FnMut(&Subscriber) + 'a,
+    {
+        async move { /* … f(sub) … */ }
+    }
+}
+
+// After
+impl SubscriptionHandle for MyHandle {
+    // Drop `+ Send` on a `!Send` handle; use
+    // `type ForEachFuture<'a> = core::future::Ready<usize>` if your critical
+    // section is synchronous (no `.await` inside it) — then the future never
+    // holds the visitor at all, and no allocation is needed.
+    type ForEachFuture<'a> = Pin<Box<dyn Future<Output = usize> + Send + 'a>>;
+
+    fn for_each_subscriber<'a>(
+        &'a self, service_id: u16, instance_id: u16, event_group_id: u16,
+        f: &'a mut (dyn FnMut(&Subscriber) + Send),
+    ) -> Self::ForEachFuture<'a> {
+        Box::pin(async move { /* … f(sub) … */ })
+    }
+}
+```
+
+For callers — pass `&mut closure` instead of `closure`, and let the visitor's
+borrow end before you read the accumulator back:
+
+```rust
+// Before
+let count = handle.for_each_subscriber(sid, iid, egid, |s| addrs.push(s.address)).await;
+
+// After
+let count = {
+    let mut visit = |s: &Subscriber| addrs.push(s.address);
+    handle.for_each_subscriber(sid, iid, egid, &mut visit).await
+};
+```
+
+All five in-tree implementations were converted
+(`Arc<RwLock<SubscriptionManager>>`, `StaticSubscriptionHandle`, the example
+`InMemorySubscriptions`, and three test `MockSubscriptions` variants);
+downstream implementors will hit a compile error naming the missing
+associated type verbatim.
+
+### Added
+- Compile-time and runtime `Send` witnesses for `EventPublisher`
+  (`assert_publisher_futures_are_send`,
+  `publisher_work_is_spawnable_on_a_multi_thread_runtime`). Nothing asserted
+  this before, which is why the hole above survived a release.
+
+[generic associated type]: https://blog.rust-lang.org/2022/10/28/gats-stabilization.html
+
 ## [0.9.0]
 
 ### Breaking
