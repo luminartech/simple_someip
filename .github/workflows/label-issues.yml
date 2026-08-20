@@ -1,0 +1,27 @@
+# Applies the labels that wire this repo into the Customer Engineering
+# project board (luminartech org project #29):
+#   simple_someip   -> places the issue in the board's unified SOME/IP view
+#   Customer Facing -> makes the issue eligible for the board's auto-add workflow
+# This repo is public, so every issue in it is customer-facing by definition.
+name: Label new issues
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply board labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
+        run: |
+          gh issue edit "$NUMBER" --repo "$REPO" \
+            --add-label simple_someip \
+            --add-label "Customer Facing"
