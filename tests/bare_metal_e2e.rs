@@ -909,7 +909,7 @@ async fn inbound_datagram_larger_than_claimed_buffer_is_dropped_not_fatal() {
 
 /// Task 4: binding N unicast sockets claims N buffers from the shared pool;
 /// a pool with exactly 2 slots rejects the 3rd distinct bind with
-/// `Error::Capacity("udp_buffer")`. Driven through the public `Client`
+/// `Error::Capacity(CapacityKind::UdpBuffer)`. Driven through the public `Client`
 /// `send_to_service` path, which binds one unicast socket per distinct
 /// endpoint `local_port` and surfaces the bind error to the caller.
 ///
@@ -1000,7 +1000,7 @@ async fn binding_sockets_claims_one_buffer_each_until_pool_exhausted() {
     // 3rd distinct port: pool exhausted -> typed capacity error surfaces.
     let third = bind_via_send(0x4003, 40002).await;
     assert!(
-        matches!(third, Err(ClientError::Capacity("udp_buffer"))),
+        matches!(third, Err(ClientError::Capacity(CapacityKind::UdpBuffer))),
         "3rd bind must fail with Capacity(\"udp_buffer\"), got {third:?}"
     );
 
@@ -1010,7 +1010,7 @@ async fn binding_sockets_claims_one_buffer_each_until_pool_exhausted() {
 
 /// Task 5 (regression): E2E-protected send whose expanded payload exceeds the
 /// leased buffer (but not `UDP_BUFFER_SIZE`) must return
-/// `Err(Error::Capacity("udp_buffer"))`, not panic.
+/// `Err(Error::Capacity(CapacityKind::UdpBuffer))`, not panic.
 ///
 /// # Why the window is deterministic
 ///
@@ -1108,7 +1108,7 @@ async fn e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_err
 
     // Must return typed Capacity error — not panic.
     assert!(
-        matches!(result, Err(ClientError::Capacity("udp_buffer"))),
+        matches!(result, Err(ClientError::Capacity(CapacityKind::UdpBuffer))),
         "expected Err(Capacity(\"udp_buffer\")), got {result:?}"
     );
 
@@ -1134,7 +1134,7 @@ async fn e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_err
 // Task 3 will thread the real caller-owned scratch buffer through `recv_loop`
 // → `handle_sd_message` → the helpers, at which point an end-to-end
 // integration test here can drive a Subscribe through the server harness with
-// a tiny SD send-scratch and assert `Error::Capacity("udp_buffer")`.
+// a tiny SD send-scratch and assert `Error::Capacity(CapacityKind::UdpBuffer)`.
 
 /// An empty `VecSdHeader` for building a minimal valid SD message.
 fn empty_vec_sd_header() -> simple_someip::VecSdHeader {
@@ -1150,7 +1150,7 @@ fn empty_vec_sd_header() -> simple_someip::VecSdHeader {
 
 /// Task 4 regression (server-side PR-2 lesson): E2E-protected publish whose
 /// expanded payload exceeds the caller-provided `msg_buf` / `protected_buf`
-/// must return `Err(ServerError::Capacity("udp_buffer"))`, NOT panic from
+/// must return `Err(ServerError::Capacity(CapacityKind::UdpBuffer))`, NOT panic from
 /// an out-of-bounds copy.
 ///
 /// # Why the window is deterministic
@@ -1244,14 +1244,14 @@ async fn e2e_publish_with_undersized_scratch_returns_capacity_not_panic() {
 
     // Must return typed Capacity error — NOT panic from out-of-bounds copy.
     assert!(
-        matches!(result, Err(ServerError::Capacity("udp_buffer"))),
+        matches!(result, Err(ServerError::Capacity(CapacityKind::UdpBuffer))),
         "expected Err(Capacity(\"udp_buffer\")), got {result:?}"
     );
 }
 
 /// Task 4 regression (raw event path): `publish_raw_event_with_buffers` with a
 /// buffer too small to hold `16 + payload` must return
-/// `Err(ServerError::Capacity("udp_buffer"))`, NOT panic.
+/// `Err(ServerError::Capacity(CapacityKind::UdpBuffer))`, NOT panic.
 ///
 /// # Why the window is deterministic
 ///
@@ -1311,7 +1311,7 @@ async fn publish_raw_event_with_undersized_buf_returns_capacity_not_panic() {
         .await;
 
     assert!(
-        matches!(result, Err(ServerError::Capacity("udp_buffer"))),
+        matches!(result, Err(ServerError::Capacity(CapacityKind::UdpBuffer))),
         "expected Err(Capacity(\"udp_buffer\")), got {result:?}"
     );
 
@@ -1335,7 +1335,7 @@ async fn publish_raw_event_with_undersized_buf_returns_capacity_not_panic() {
         )
         .await;
     assert!(
-        matches!(result, Err(ServerError::Capacity("udp_buffer"))),
+        matches!(result, Err(ServerError::Capacity(CapacityKind::UdpBuffer))),
         "sub-16 buffer + empty payload must Capacity, got {result:?}"
     );
 }

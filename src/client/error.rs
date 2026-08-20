@@ -39,37 +39,14 @@ pub enum Error {
     /// An E2E protection or checking error occurred.
     #[error(transparent)]
     E2e(#[from] crate::e2e::Error),
-    /// A fixed-capacity internal structure is full. The argument is a
-    /// lowercase `snake_case` tag naming the resource; grep the crate for
-    /// the tag to find the compile-time constant that governs it.
+    /// A fixed-capacity internal structure is full.
     ///
-    /// Current tags:
-    /// - `"unicast_sockets"` — bound by `UNICAST_SOCKETS_CAP`. The
-    ///   client cannot bind a new ephemeral / requested-port unicast
-    ///   socket because the per-client cap is exhausted.
-    /// - `"udp_buffer"` — bound by [`crate::UDP_BUFFER_SIZE`]. A
-    ///   `Client::send` was rejected because the encoded message
-    ///   exceeds the application-level UDP cap. **Note:** with E2E
-    ///   protect configured for the destination key, the post-protect
-    ///   payload may add up to the protect profile's overhead bytes
-    ///   (Profile 1: 4, Profile 4: 16). The pre-encode check uses the
-    ///   raw size; the post-protect re-check inside the spawned send
-    ///   loop produces this error if the protected datagram would
-    ///   overflow the cap.
-    /// - `"pending_responses"` — bound by `PENDING_RESPONSES_CAP`. A
-    ///   request was enqueued but the in-flight response table is
-    ///   full; the request was dropped.
-    /// - `"request_queue"` — bound by `REQUEST_QUEUE_CAP`. The
-    ///   client's internal control-message queue overflowed during a
-    ///   multi-pass `push_front` re-enqueue (e.g. an auto-bind path).
-    ///   Public callers normally hit the bounded(4) control channel
-    ///   first and either backpressure or fail with `Shutdown`; this
-    ///   tag fires only in the narrow re-enqueue overflow window.
-    /// - `"service_registry"` — bound by `SERVICE_REGISTRY_CAP`. A
-    ///   new `(service_id, instance_id)` endpoint cannot be registered
-    ///   because the registry is full.
+    /// [`CapacityKind`](crate::CapacityKind) names which one, and its variant docs name the
+    /// governing compile-time constant. Before 0.11.0 this carried a
+    /// `&'static str` tag and the docs told you to grep the crate for it;
+    /// the `Display` output is unchanged.
     #[error("internal capacity exceeded: {0}")]
-    Capacity(&'static str),
+    Capacity(crate::CapacityKind),
     /// An error surfaced by the pluggable transport backend (see
     /// [`crate::transport::TransportError`]).
     #[error(transparent)]
@@ -89,6 +66,7 @@ pub enum Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CapacityKind;
     use crate::transport::TransportError;
     use std::format;
 
@@ -125,7 +103,7 @@ mod tests {
 
     #[test]
     fn capacity_variant_includes_tag_in_display() {
-        let err = Error::Capacity("request_queue");
+        let err = Error::Capacity(CapacityKind::RequestQueue);
         let displayed = format!("{err}");
         assert!(
             displayed.contains("request_queue"),

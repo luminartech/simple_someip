@@ -19,6 +19,7 @@
 //! public surface by implementing [`crate::Spawner`] or
 //! [`crate::LocalSpawner`], not by writing their own `BindDispatch`.
 
+use crate::CapacityKind;
 use core::future::Future;
 use core::net::Ipv4Addr;
 
@@ -123,7 +124,7 @@ where
             let buf = self
                 .buffer_provider
                 .claim()
-                .ok_or(Error::Capacity("udp_buffer"))?;
+                .ok_or(Error::Capacity(CapacityKind::UdpBuffer))?;
             SocketManager::<MD, C>::bind_discovery_seeded_with_transport(
                 &self.factory,
                 &self.spawner,
@@ -148,7 +149,7 @@ where
             let buf = self
                 .buffer_provider
                 .claim()
-                .ok_or(Error::Capacity("udp_buffer"))?;
+                .ok_or(Error::Capacity(CapacityKind::UdpBuffer))?;
             SocketManager::<MD, C>::bind_with_transport(
                 &self.factory,
                 &self.spawner,
@@ -170,7 +171,7 @@ where
             let buf = self
                 .buffer_provider
                 .claim()
-                .ok_or(Error::Capacity("udp_buffer"))?;
+                .ok_or(Error::Capacity(CapacityKind::UdpBuffer))?;
             SocketManager::<MD, C>::bind_discovery_unicast_with_transport(
                 &self.factory,
                 &self.spawner,
@@ -226,7 +227,7 @@ where
             let buf = self
                 .buffer_provider
                 .claim()
-                .ok_or(Error::Capacity("udp_buffer"))?;
+                .ok_or(Error::Capacity(CapacityKind::UdpBuffer))?;
             SocketManager::<MD, C>::bind_discovery_seeded_with_transport_local(
                 &self.factory,
                 &self.spawner,
@@ -251,7 +252,7 @@ where
             let buf = self
                 .buffer_provider
                 .claim()
-                .ok_or(Error::Capacity("udp_buffer"))?;
+                .ok_or(Error::Capacity(CapacityKind::UdpBuffer))?;
             SocketManager::<MD, C>::bind_with_transport_local(
                 &self.factory,
                 &self.spawner,
@@ -273,7 +274,7 @@ where
             let buf = self
                 .buffer_provider
                 .claim()
-                .ok_or(Error::Capacity("udp_buffer"))?;
+                .ok_or(Error::Capacity(CapacityKind::UdpBuffer))?;
             SocketManager::<MD, C>::bind_discovery_unicast_with_transport_local(
                 &self.factory,
                 &self.spawner,

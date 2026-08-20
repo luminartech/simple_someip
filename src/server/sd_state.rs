@@ -10,6 +10,7 @@
 //! parameter on [`SdStateManager::send_offer_service`] becomes the single
 //! migration point for the announcement path.
 
+use crate::CapacityKind;
 use core::net::SocketAddrV4;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -230,11 +231,11 @@ impl SdStateManager {
         // alloc-free without parking a `[u8; UDP_BUFFER_SIZE]` in the
         // announce future. 16-byte SOME/IP header + the SD payload.
         if buf.len() < 16 {
-            return Err(Error::Capacity("udp_buffer"));
+            return Err(Error::Capacity(CapacityKind::UdpBuffer));
         }
         let sd_data_len = sd_payload
             .encode_to_slice(&mut buf[16..])
-            .map_err(|_| Error::Capacity("udp_buffer"))?;
+            .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
         let total_len = 16 + sd_data_len;
         // The `< 16` guard plus `encode_to_slice`'s own over-capacity
         // error already cover the fit; this stays as a debug-only
@@ -243,7 +244,7 @@ impl SdStateManager {
         let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
         someip_header
             .encode_to_slice(&mut buf[..16])
-            .map_err(|_| Error::Capacity("udp_buffer"))?;
+            .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
 
         let multicast_addr = SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT);
 

@@ -12,6 +12,7 @@
 //! [`Server::run`](super::Server::run) /
 //! [`Server::run_with_buffers`](super::Server::run_with_buffers).
 
+use crate::CapacityKind;
 use core::net::SocketAddrV4;
 
 use futures_util::{FutureExt, future::Either, pin_mut, select_biased};
@@ -67,11 +68,11 @@ where
 
     // Guard: SOME/IP header needs 16 bytes; SD payload needs the rest.
     if buf.len() < 16 {
-        return Err(Error::Capacity("udp_buffer"));
+        return Err(Error::Capacity(CapacityKind::UdpBuffer));
     }
     let sd_data_len = sd_payload
         .encode_to_slice(&mut buf[16..])
-        .map_err(|_| Error::Capacity("udp_buffer"))?;
+        .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
     let total_len = 16 + sd_data_len;
     // The `< 16` guard plus `encode_to_slice`'s own over-capacity error
     // already cover the fit; this stays as a debug-only sanity check
@@ -80,7 +81,7 @@ where
     let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
     someip_header
         .encode_to_slice(&mut buf[..16])
-        .map_err(|_| Error::Capacity("udp_buffer"))?;
+        .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
 
     let target_v4 = socket_addr_v4(target)?;
     sd_socket.send_to(&buf[..total_len], target_v4).await?;
@@ -130,11 +131,11 @@ where
 
     // Guard: SOME/IP header needs 16 bytes; SD payload needs the rest.
     if buf.len() < 16 {
-        return Err(Error::Capacity("udp_buffer"));
+        return Err(Error::Capacity(CapacityKind::UdpBuffer));
     }
     let sd_data_len = sd_payload
         .encode_to_slice(&mut buf[16..])
-        .map_err(|_| Error::Capacity("udp_buffer"))?;
+        .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
     let total_len = 16 + sd_data_len;
     // The `< 16` guard plus `encode_to_slice`'s own over-capacity error
     // already cover the fit; this stays as a debug-only sanity check
@@ -143,7 +144,7 @@ where
     let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
     someip_header
         .encode_to_slice(&mut buf[..16])
-        .map_err(|_| Error::Capacity("udp_buffer"))?;
+        .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
 
     let subscriber_v4 = socket_addr_v4(subscriber)?;
     sd_socket.send_to(&buf[..total_len], subscriber_v4).await?;
@@ -196,11 +197,11 @@ where
 
     // Guard: SOME/IP header needs 16 bytes; SD payload needs the rest.
     if buf.len() < 16 {
-        return Err(Error::Capacity("udp_buffer"));
+        return Err(Error::Capacity(CapacityKind::UdpBuffer));
     }
     let sd_data_len = sd_payload
         .encode_to_slice(&mut buf[16..])
-        .map_err(|_| Error::Capacity("udp_buffer"))?;
+        .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
     let total_len = 16 + sd_data_len;
     // The `< 16` guard plus `encode_to_slice`'s own over-capacity error
     // already cover the fit; this stays as a debug-only sanity check
@@ -209,7 +210,7 @@ where
     let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
     someip_header
         .encode_to_slice(&mut buf[..16])
-        .map_err(|_| Error::Capacity("udp_buffer"))?;
+        .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
 
     let subscriber_v4 = socket_addr_v4(subscriber)?;
     sd_socket.send_to(&buf[..total_len], subscriber_v4).await?;
@@ -965,7 +966,7 @@ mod tests {
     // ── Task 1 RED/GREEN: undersized buf rejects with Capacity, not panic ─
 
     /// `send_unicast_offer` with a 24-byte buf (fits 16-byte header but
-    /// not the SD payload) must return `Err(Capacity("udp_buffer"))`.
+    /// not the SD payload) must return `Err(Capacity(CapacityKind::UdpBuffer))`.
     #[tokio::test]
     async fn send_unicast_offer_undersized_buf_returns_capacity() {
         let config = make_config();
@@ -976,13 +977,13 @@ mod tests {
         let result = send_unicast_offer(&mut [0u8; 24], &config, &socket, &sd_state, target).await;
 
         assert!(
-            matches!(result, Err(Error::Capacity("udp_buffer"))),
+            matches!(result, Err(Error::Capacity(CapacityKind::UdpBuffer))),
             "expected Capacity(\"udp_buffer\"), got {result:?}"
         );
     }
 
     /// `send_unicast_offer` with a buf shorter than the 16-byte SOME/IP
-    /// header must return `Err(Capacity("udp_buffer"))`.
+    /// header must return `Err(Capacity(CapacityKind::UdpBuffer))`.
     #[tokio::test]
     async fn send_unicast_offer_buf_shorter_than_header_returns_capacity() {
         let config = make_config();
@@ -993,7 +994,7 @@ mod tests {
         let result = send_unicast_offer(&mut [0u8; 8], &config, &socket, &sd_state, target).await;
 
         assert!(
-            matches!(result, Err(Error::Capacity("udp_buffer"))),
+            matches!(result, Err(Error::Capacity(CapacityKind::UdpBuffer))),
             "expected Capacity(\"udp_buffer\"), got {result:?}"
         );
     }
@@ -1055,7 +1056,7 @@ mod tests {
     }
 
     /// `send_subscribe_ack_from_view` with a 24-byte buf must return
-    /// `Err(Capacity("udp_buffer"))` without panicking.
+    /// `Err(Capacity(CapacityKind::UdpBuffer))` without panicking.
     #[tokio::test]
     async fn send_subscribe_ack_undersized_buf_returns_capacity_not_panic() {
         let config = make_config();
@@ -1078,7 +1079,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Err(Error::Capacity("udp_buffer"))),
+            matches!(result, Err(Error::Capacity(CapacityKind::UdpBuffer))),
             "expected Capacity(\"udp_buffer\"), got {result:?}"
         );
     }
@@ -1109,7 +1110,7 @@ mod tests {
     }
 
     /// `send_subscribe_nack_from_view` with a 24-byte buf must return
-    /// `Err(Capacity("udp_buffer"))` without panicking.
+    /// `Err(Capacity(CapacityKind::UdpBuffer))` without panicking.
     #[tokio::test]
     async fn send_subscribe_nack_undersized_buf_returns_capacity_not_panic() {
         let config = make_config();
@@ -1133,7 +1134,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Err(Error::Capacity("udp_buffer"))),
+            matches!(result, Err(Error::Capacity(CapacityKind::UdpBuffer))),
             "expected Capacity(\"udp_buffer\"), got {result:?}"
         );
     }

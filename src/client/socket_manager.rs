@@ -40,6 +40,7 @@
 //! `transport` trait layer directly — the `bare_metal_client` /
 //! `bare_metal_server` example workspace members demonstrate that surface.
 
+use crate::CapacityKind;
 use crate::{
     UDP_BUFFER_SIZE,
     buffer_pool::BufferLease,
@@ -187,7 +188,7 @@ where
         use crate::transport::BufferProvider;
         let buf = TokioBufferProvider::new()
             .claim()
-            .ok_or(Error::Capacity("udp_buffer"))?;
+            .ok_or(Error::Capacity(CapacityKind::UdpBuffer))?;
         Self::bind_discovery_seeded_with_transport(
             &TokioTransport,
             &TokioSpawner,
@@ -442,7 +443,7 @@ where
         use crate::transport::BufferProvider;
         let buf = TokioBufferProvider::new()
             .claim()
-            .ok_or(Error::Capacity("udp_buffer"))?;
+            .ok_or(Error::Capacity(CapacityKind::UdpBuffer))?;
         Self::bind_with_transport(&TokioTransport, &TokioSpawner, port, e2e_registry, buf).await
     }
 
@@ -550,7 +551,7 @@ where
         target_addr: SocketAddrV4,
         message: Message<MessageDefinitions>,
     ) -> Result<(), Error> {
-        // Pre-encode size check: fail fast with `Error::Capacity("udp_buffer")`
+        // Pre-encode size check: fail fast with `Error::Capacity(CapacityKind::UdpBuffer)`
         // for messages that exceed `UDP_BUFFER_SIZE`. Mirrors the analogous
         // check in `server::EventPublisher` so callers see a uniform
         // overload signal regardless of which path produced the oversize
@@ -566,7 +567,7 @@ where
             warn!(
                 "outgoing message size {required} exceeds UDP_BUFFER_SIZE ({UDP_BUFFER_SIZE}); rejecting with Capacity(\"udp_buffer\")"
             );
-            return Err(Error::Capacity("udp_buffer"));
+            return Err(Error::Capacity(CapacityKind::UdpBuffer));
         }
         let (result_channel, message) =
             SendMessage::<MessageDefinitions, C>::new(target_addr, message);
@@ -734,7 +735,7 @@ where
                         );
                         let _ = send_message
                             .response
-                            .send(Err(Error::Capacity("udp_buffer")));
+                            .send(Err(Error::Capacity(CapacityKind::UdpBuffer)));
                         continue;
                     }
                     // `embedded_io::Write` writer = a reborrow of `buf` that
@@ -781,7 +782,7 @@ where
                                         );
                                         let _ = send_message
                                             .response
-                                            .send(Err(Error::Capacity("udp_buffer")));
+                                            .send(Err(Error::Capacity(CapacityKind::UdpBuffer)));
                                         continue;
                                     }
                                     #[allow(clippy::cast_possible_truncation)]

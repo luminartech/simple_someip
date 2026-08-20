@@ -302,7 +302,7 @@ async fn main() {
             // Caller-declared static buffer pool (#125): UNICAST_SOCKETS_CAP
             // (8) + 1 discovery + 1 release-lag slack = 10 slots. An evicted
             // socket's lease frees asynchronously, so size one above the max
-            // live socket count to avoid a transient Capacity("udp_buffer")
+            // live socket count to avoid a transient Capacity(CapacityKind::UdpBuffer)
             // on evict-then-rebind. On real firmware this is a `static`; here
             // it is a function-local `static` for the example.
             buffer_provider: {
