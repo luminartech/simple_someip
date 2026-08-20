@@ -1,0 +1,25 @@
+# Applies the label that wires this repo into the Customer Engineering project
+# board (luminartech org project #29). The board's unified SOME/IP view spans
+# this repo plus the iris_someip_* labels in luminartech/dft, and Projects view
+# filters cannot OR across qualifiers -- so a shared label is what keeps both
+# repos in one view. Without this label a new issue is auto-added to the project
+# but matches no view, leaving it invisible in every tab.
+name: Label new issues
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply board label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
+        run: gh issue edit "$NUMBER" --repo "$REPO" --add-label simple_someip
