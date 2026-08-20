@@ -1,8 +1,9 @@
-# Applies the labels that wire this repo into the Customer Engineering
-# project board (luminartech org project #29):
-#   simple_someip   -> places the issue in the board's unified SOME/IP view
-#   Customer Facing -> makes the issue eligible for the board's auto-add workflow
-# This repo is public, so every issue in it is customer-facing by definition.
+# Applies the label that wires this repo into the Customer Engineering project
+# board (luminartech org project #29). The board's unified SOME/IP view spans
+# this repo plus the iris_someip_* labels in luminartech/dft, and Projects view
+# filters cannot OR across qualifiers -- so a shared label is what keeps both
+# repos in one view. Without this label a new issue is auto-added to the project
+# but matches no view, leaving it invisible in every tab.
 name: Label new issues
 
 on:
@@ -16,12 +17,9 @@ jobs:
   label:
     runs-on: ubuntu-latest
     steps:
-      - name: Apply board labels
+      - name: Apply board label
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           NUMBER: ${{ github.event.issue.number }}
-        run: |
-          gh issue edit "$NUMBER" --repo "$REPO" \
-            --add-label simple_someip \
-            --add-label "Customer Facing"
+        run: gh issue edit "$NUMBER" --repo "$REPO" --add-label simple_someip
