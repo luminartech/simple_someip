@@ -6,6 +6,7 @@ use thiserror::Error;
 /// enum rely on exhaustiveness. Variant additions are breaking changes
 /// and require a `SemVer` bump.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// A SOME/IP protocol-level error.
     #[error(transparent)]

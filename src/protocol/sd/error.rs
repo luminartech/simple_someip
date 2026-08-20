@@ -2,6 +2,7 @@ use thiserror::Error;
 
 /// Errors that can occur when parsing or validating SOME/IP-SD messages.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// The entry type byte is not a recognized SD entry type.
     #[error("Invalid value for Service Discovery entry type: {0:X}")]

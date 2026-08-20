@@ -2,6 +2,7 @@ use thiserror::Error;
 
 /// Errors that can occur when encoding, decoding, or validating SOME/IP messages.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// An I/O error occurred while reading or writing bytes.
     #[error("I/O error: {0:?}")]

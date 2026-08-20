@@ -1,5 +1,64 @@
 # Changelog
 
+## [0.11.0]
+
+Contains a breaking change to the public error enums, so this release takes the
+major position under this crate's 0.x convention. As in 0.10.0, the `version` in
+`Cargo.toml` is bumped here rather than left to release-plz so that
+`cargo-semver-checks` compares against the version this change actually lands as.
+
+### Breaking — the public error enums are now `#[non_exhaustive]`
+
+`client::Error`, `server::Error`, `e2e::Error`, `protocol::Error`, and
+`protocol::sd::Error` all gain `#[non_exhaustive]`. (`transport::TransportError`
+already had it.)
+
+`client::Error` previously carried a stability note stating the opposite, and
+spelling out the cost it was accepting: *"any new variant added here is a
+breaking change and must be flagged in the changelog and reflected in the next
+`SemVer` bump."* That cost is what this change removes. The crate is pre-1.0 with
+an active release cadence, and in practice every added variant broke every
+downstream `match` — including consumers who only ever wanted a catch-all arm.
+
+```rust
+// Before — compiles.
+match err {
+    Error::Shutdown => ...,
+    Error::ServiceNotFound => ...,
+    // ... all ten variants
+}
+
+// After — needs a wildcard.
+match err {
+    Error::Shutdown => ...,
+    Error::ServiceNotFound => ...,
+    _ => ...,
+}
+```
+
+Adding a variant is no longer a breaking change. Renaming or restructuring an
+existing one still is.
+
+### Added — `E2E_REGISTRY_CAP` and `E2E_RX_STATE_CAP` are build-time configurable
+
+Both now read `SIMPLE_SOMEIP_E2E_REGISTRY_CAP` / `SIMPLE_SOMEIP_E2E_RX_STATE_CAP`
+through the same `from_env_or` mechanism `SERVICE_REGISTRY_CAP`, the server caps,
+and the bare-metal runtime already used. Defaults are unchanged (32 and 64), so
+this is additive.
+
+`E2E_RX_STATE_CAP` is the one that most wanted this: receive state is keyed
+`(source, key)`, so it bounds *sources × keys* rather than keys alone. A node
+demuxing many senders is exactly the deployment that needs to raise it, and
+previously could not without vendoring the crate.
+
+The power-of-two `const _` assertions are now load-bearing rather than
+defensive — a non-power-of-two supplied through the env var fails the build
+instead of silently mis-sizing the `FnvIndexMap`.
+
+`from_env_or` itself is no longer gated on `server`/`client`. The `e2e` module is
+compiled unconditionally, so there is no feature combination in which it is dead
+code; leaving the gate in place would have broken `--no-default-features`.
+
 ## [0.10.0]
 
 Contains a breaking change to a public trait, so this release takes the major
