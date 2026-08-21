@@ -293,16 +293,16 @@ pub use transport::{StaticE2EHandle, StaticE2EStorage};
 
 /// Parse a decimal `usize` from a compile-time optional env var string.
 ///
-/// Used to size internal constants from `SIMPLE_SOMEIP_MAX_*` env vars
+/// Used to size internal constants from `SIMPLE_SOMEIP_*` env vars
+/// (`SIMPLE_SOMEIP_MAX_OFFERS`, `SIMPLE_SOMEIP_*_CAP`, …)
 /// injected by the host build system (e.g. `CMake` via `.cargo/config.toml`).
 /// Returns `default` when the variable is absent or empty.
 /// Panics at compile time if the string contains a non-digit character.
 ///
-/// Gated on `server`/`client`: every caller lives in the server module, the
-/// client module, or in the `bare-metal-runtime` runtime (which itself
-/// implies `server`), so a build with neither feature enabled would
-/// otherwise see it as dead code.
-#[cfg(any(feature = "server", feature = "client"))]
+/// Ungated: `e2e` is compiled unconditionally and sizes its registry caps
+/// through this, so there is no feature combination in which this is dead
+/// code. (It was previously gated on `server`/`client`, back when every
+/// caller lived in one of those modules.)
 pub(crate) const fn from_env_or(var: Option<&'static str>, default: usize) -> usize {
     match var {
         None => default,
@@ -317,7 +317,7 @@ pub(crate) const fn from_env_or(var: Option<&'static str>, default: usize) -> us
                 let byte = b[i];
                 assert!(
                     byte.is_ascii_digit(),
-                    "SIMPLE_SOMEIP_MAX_* env var contains a non-digit character"
+                    "SIMPLE_SOMEIP_* env var contains a non-digit character"
                 );
                 // `byte - b'0'` is in 0..=9; u8 -> usize is lossless. `as` is
                 // required here because `usize::from` is not a `const fn`.

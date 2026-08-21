@@ -2,6 +2,7 @@ use thiserror::Error;
 
 /// Errors that can occur during E2E protection or checking.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// The output buffer is too small to hold the protected payload.
     #[error("output buffer too small: need {needed} bytes, got {actual}")]

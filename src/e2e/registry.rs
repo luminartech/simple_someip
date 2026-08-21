@@ -17,9 +17,17 @@ use super::{E2ECheckStatus, E2EKey, E2EProfile, E2EState, Error, e2e_check, e2e_
 /// can hold. Sized for typical workloads where a single service
 /// instance has at most a few dozen E2E-protected message types.
 ///
+/// Override at build time with `SIMPLE_SOMEIP_E2E_REGISTRY_CAP`, the same
+/// mechanism `SERVICE_REGISTRY_CAP` and the server caps use. (Not an
+/// intra-doc link: those constants live behind the `client` / `server`
+/// features, and this module is compiled unconditionally.)
+///
 /// Must be a power of two for [`FnvIndexMap`]; the `const _` assertion
-/// below catches any future change that would violate the requirement.
-pub const E2E_REGISTRY_CAP: usize = 32;
+/// below catches any future change that would violate the requirement —
+/// including a non-power-of-two supplied through the env var, which fails
+/// the build rather than silently mis-sizing the map.
+pub const E2E_REGISTRY_CAP: usize =
+    crate::from_env_or(option_env!("SIMPLE_SOMEIP_E2E_REGISTRY_CAP"), 32);
 
 const _: () = assert!(
     E2E_REGISTRY_CAP.is_power_of_two(),
@@ -39,8 +47,16 @@ const _: () = assert!(
 /// [`E2ERegistry::unregister`]. A one-shot `warn!` fires the first time
 /// this happens.
 ///
-/// Must be a power of two for [`FnvIndexMap`].
-pub const E2E_RX_STATE_CAP: usize = 64;
+/// Override at build time with `SIMPLE_SOMEIP_E2E_RX_STATE_CAP`. Because
+/// this bounds *sources × keys*, a deployment demuxing many senders is
+/// exactly the case that needs to raise it, and previously could not
+/// without vendoring the crate.
+///
+/// Must be a power of two for [`FnvIndexMap`]; the `const _` assertion
+/// below rejects a non-power-of-two supplied through the env var at compile
+/// time.
+pub const E2E_RX_STATE_CAP: usize =
+    crate::from_env_or(option_env!("SIMPLE_SOMEIP_E2E_RX_STATE_CAP"), 64);
 
 const _: () = assert!(
     E2E_RX_STATE_CAP.is_power_of_two(),

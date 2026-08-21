@@ -4,14 +4,16 @@ use thiserror::Error;
 ///
 /// # Stability
 ///
-/// This enum is **not** marked `#[non_exhaustive]`, so downstream crates
-/// may currently match it exhaustively. That convenience comes with a
-/// real cost: **any new variant added here is a breaking change** and
-/// must be flagged in the changelog and reflected in the next `SemVer`
-/// bump (pre-1.0, a minor bump is sufficient, but it still requires a
-/// release-notes entry). The same is true of renaming or restructuring
-/// existing variants.
+/// This enum is `#[non_exhaustive]`, so downstream crates must include a
+/// wildcard arm when matching on it and a new variant is *not* a breaking
+/// change. Renaming or restructuring an existing variant still is, and still
+/// needs a changelog entry and a `SemVer` bump.
+///
+/// The attribute was added deliberately: this crate is pre-1.0 with an active
+/// release cadence, and without it every added variant broke every downstream
+/// `match` — including consumers who only ever wanted a catch-all.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// A SOME/IP protocol-level error.
     #[error(transparent)]
