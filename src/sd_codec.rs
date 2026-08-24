@@ -659,8 +659,8 @@ mod tests {
         // entries_size(4), then the entries array (options_size + options
         // follow after the entries). The first entry's type byte is
         // therefore at offset 24.
-        const ENTRY_TYPE_OFFSET: usize = 16 + 8;
-        sd_buf[ENTRY_TYPE_OFFSET] = 0xFF;
+        let entry_type_offset: usize = 16 + 8;
+        sd_buf[entry_type_offset] = 0xFF;
 
         let err = parse_someip_sd_datagram(&sd_buf[..sd_len]).unwrap_err();
         assert!(

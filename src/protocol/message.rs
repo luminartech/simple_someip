@@ -352,7 +352,7 @@ mod tests {
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
         buf[n] = 0xFF;
         // parse (the thin wrapper) drops the remainder without error.
-        let view = MessageView::parse(&buf[..n + 1]).unwrap();
+        let view = MessageView::parse(&buf[..=n]).unwrap();
         assert_eq!(view.header().to_owned(), *msg.header());
     }
 
@@ -363,7 +363,7 @@ mod tests {
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
         buf[n] = 0xFF;
         assert!(matches!(
-            MessageView::decode_exact(&buf[..n + 1]),
+            MessageView::decode_exact(&buf[..=n]),
             Err(Error::Trailing(_))
         ));
         // Exactly-sized succeeds.

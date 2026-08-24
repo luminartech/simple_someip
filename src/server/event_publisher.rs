@@ -8,8 +8,6 @@ use crate::e2e::E2EKey;
 use crate::protocol::{Header, Message};
 use crate::traits::PayloadWireFormat;
 use crate::transport::{E2ERegistryHandle, SharedHandle, TransportSocket};
-#[cfg(test)]
-use alloc::sync::Arc;
 use automotive_wire_codec::Encode;
 use core::marker::PhantomData;
 use core::net::SocketAddrV4;

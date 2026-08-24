@@ -30,8 +30,6 @@ use crate::Timer;
 use crate::e2e::{E2EKey, E2EProfile};
 #[cfg(feature = "_alloc")]
 use crate::protocol::sd;
-#[cfg(test)]
-use crate::protocol::sd::{Entry, Flags, ServiceEntry};
 #[cfg(feature = "_alloc")]
 use crate::transport::SocketOptions;
 #[cfg(feature = "_alloc")]
@@ -42,8 +40,6 @@ use alloc::sync::Arc;
 use core::net::Ipv4Addr;
 #[cfg(feature = "_alloc")]
 use core::net::SocketAddrV4;
-#[cfg(test)]
-use std::vec::Vec;
 
 #[cfg(feature = "server-tokio")]
 use crate::e2e::E2ERegistry;
