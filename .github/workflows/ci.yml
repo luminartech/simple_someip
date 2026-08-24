@@ -67,8 +67,20 @@ jobs:
     # feature combos it ships, plus a real no_std target build via build-std.
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
+      # Pinned rather than floating on `@nightly`. `clippy::pedantic` enables
+      # `large_futures`, which ICEs under the next trait solver on any nightly
+      # from 2026-08-22 onward — `unexpected rigid alias in layout_of after
+      # normalization`, on the opaque returned by `bare_metal_tasks::run_someip`.
+      # It is the lint, not the code: plain `cargo check` on the same nightly is
+      # clean, and it reproduces on unchanged `main`.
+      #
+      # Fixed upstream by rust-lang/rust-clippy#17601 (merged 2026-08-23), which
+      # has to ride a clippy subtree sync into rustc before it reaches a nightly.
+      # UNPIN once a nightly carries that fix — restore `@nightly` and delete
+      # this comment; the pinned date is the last known-good toolchain.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-08-21
           components: clippy, rust-src
           targets: thumbv7em-none-eabihf
       - uses: Swatinem/rust-cache@v2
