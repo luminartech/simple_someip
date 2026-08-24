@@ -21,7 +21,7 @@
 //!   `Encode` and points to a two-phase, consumer-owned API for it — which
 //!   is exactly what `protect`/`check` are.
 //! - **Status results, not `Result<_, Error>`.** `check_profile4`/`check_profile5`
-//!   return an [`E2ECheckResult`] carrying an [`E2ECheckStatus`] (`Ok`,
+//!   return an [`E2ECheckResult`](crate::e2e::E2ECheckResult) carrying an [`E2ECheckStatus`] (`Ok`,
 //!   `CrcError`, `Repeated`, `WrongSequence`, `OkSomeLost`, `BadArgument`,
 //!   `Unchecked`) rather than an error. Several of those statuses (e.g.
 //!   `OkSomeLost`) are still *successful* checks that also carry diagnostic

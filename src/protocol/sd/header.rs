@@ -127,7 +127,8 @@ impl<'a> SdHeaderView<'a> {
     /// Returns an infallible iterator over the SD entries.
     ///
     /// Re-slices the already-validated `entries_buf` at the fixed 16-byte
-    /// stride; it never re-runs entry-type validation (done once in [`parse`]).
+    /// stride; it never re-runs entry-type validation (done once in
+    /// [`parse`](SdHeaderView::parse)).
     /// The returned [`EntryIter`] is [`ExactSizeIterator`] — its length comes
     /// for free from the fixed stride.
     #[must_use]
@@ -138,7 +139,8 @@ impl<'a> SdHeaderView<'a> {
     /// Returns an infallible iterator over the SD options.
     ///
     /// Re-slices the already-validated `options_buf` by each option's length
-    /// field; it never re-runs option validation (done once in [`parse`]).
+    /// field; it never re-runs option validation (done once in
+    /// [`parse`](SdHeaderView::parse)).
     /// Options have no fixed stride, so [`OptionIter`] is not itself
     /// [`ExactSizeIterator`]; use [`option_count`](SdHeaderView::option_count)
     /// for the cached element count.

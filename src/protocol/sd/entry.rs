@@ -451,7 +451,7 @@ impl<'a> Decode<'a> for EntryView<'a> {
     /// # Errors
     ///
     /// Returns [`Incomplete`](automotive_wire_codec::Incomplete) if fewer than
-    /// [`ENTRY_SIZE`] bytes remain.
+    /// `ENTRY_SIZE` (16) bytes remain.
     ///
     /// # Panics
     ///

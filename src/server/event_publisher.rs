@@ -889,7 +889,7 @@ mod tests {
     use crate::server::SubscriptionManager;
     use crate::tokio_transport::TokioSocket;
     use std::net::{Ipv4Addr, SocketAddrV4};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::vec;
     use std::vec::Vec;
     use tokio::net::UdpSocket;

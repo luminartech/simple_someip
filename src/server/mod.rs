@@ -1704,6 +1704,7 @@ where
 #[cfg(all(test, feature = "server-tokio"))]
 mod tests {
     use super::*;
+    use crate::protocol::sd::{Entry, Flags, ServiceEntry};
     use crate::protocol::{
         Header as SomeIpHeader, MessageType, MessageTypeField, MessageView, ReturnCode,
     };
@@ -1712,6 +1713,7 @@ mod tests {
     use std::format;
     use std::net::IpAddr;
     use std::vec;
+    use std::vec::Vec;
     use tokio::net::UdpSocket;
 
     /// Type alias bringing the tokio-flavor concrete type parameters back

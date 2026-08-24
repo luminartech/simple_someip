@@ -46,7 +46,7 @@ impl<T: automotive_wire_codec::Encode> EncodeExt for T {}
 ///
 /// The encode side is provided by the [`Encode`](automotive_wire_codec::Encode)
 /// supertrait (`encoded_size` + `encode`); implementors get `encode_to_slice`
-/// and — under `std` — the crate's [`EncodeExt::encode_to_vec`] for free.
+/// and — under `std` — the crate's [`EncodeExt`]`::encode_to_vec` for free.
 ///
 /// Note that SOME/IP payloads are not self identifying, so the [Message ID](protocol::MessageId)
 /// must be provided by the caller: `Encode` alone cannot reconstruct a payload
