@@ -68,7 +68,7 @@ pub enum CapacityKind {
 impl CapacityKind {
     /// The `snake_case` tag for this kind.
     ///
-    /// These are the exact strings the pre-0.11.0 `Capacity(&'static str)`
+    /// These are the exact strings the pre-0.12.0 `Capacity(&'static str)`
     /// variant carried, so log output and anything scraping it are
     /// unchanged by the move to a typed kind.
     #[must_use]

@@ -42,7 +42,7 @@ pub enum Error {
     /// A fixed-capacity internal structure is full.
     ///
     /// [`CapacityKind`](crate::CapacityKind) names which one, and its variant docs name the
-    /// governing compile-time constant. Before 0.11.0 this carried a
+    /// governing compile-time constant. Before 0.12.0 this carried a
     /// `&'static str` tag and the docs told you to grep the crate for it;
     /// the `Display` output is unchanged.
     #[error("internal capacity exceeded: {0}")]

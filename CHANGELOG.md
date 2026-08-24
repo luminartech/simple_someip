@@ -1,8 +1,43 @@
 # Changelog
 
+## [0.12.0]
+
+Contains a breaking change to the public error enums, so this release takes the
+major position under this crate's 0.x convention. As in 0.11.0, the `version` in
+`Cargo.toml` is bumped here rather than left to release-plz so that
+`cargo-semver-checks` compares against the version this change actually lands as.
+
+### Breaking — `Capacity` carries a typed `CapacityKind` instead of a `&'static str`
+
+`client::Error::Capacity` and `server::Error::Capacity` now hold a
+`CapacityKind` rather than a `snake_case` string tag. The old docs told the
+reader to "grep the crate for the tag to find the compile-time constant that
+governs it" — that information now lives on the variant.
+
+```rust
+// Before — the resource is a string, and telling one from another means
+// comparing text.
+Err(Error::Capacity(tag)) if tag == "service_registry" => ...,
+
+// After.
+Err(Error::Capacity(CapacityKind::ServiceRegistry)) => ...,
+```
+
+`Display` is unchanged: `CapacityKind` renders as the same tag it replaced,
+so `"internal capacity exceeded: udp_buffer"` still formats byte-for-byte as
+before, and a test pins each string against its pre-0.12.0 literal.
+
+The kind is shared between the client and server error types rather than
+split in two, so a consumer handles capacity exhaustion the same way
+whichever layer reports it. Not every kind is reachable from both — the
+server currently produces only `UdpBuffer`.
+
+`CapacityKind` is itself `#[non_exhaustive]`, so bounding a new internal
+structure later is additive.
+
 ## [0.11.0]
 
-Contains breaking changes to the public error enums, so this release takes the
+Contains a breaking change to the public error enums, so this release takes the
 major position under this crate's 0.x convention. As in 0.10.0, the `version` in
 `Cargo.toml` is bumped here rather than left to release-plz so that
 `cargo-semver-checks` compares against the version this change actually lands as.
@@ -38,34 +73,6 @@ match err {
 
 Adding a variant is no longer a breaking change. Renaming or restructuring an
 existing one still is.
-
-### Breaking — `Capacity` carries a typed `CapacityKind` instead of a `&'static str`
-
-`client::Error::Capacity` and `server::Error::Capacity` now hold a
-`CapacityKind` rather than a `snake_case` string tag. The old docs told the
-reader to "grep the crate for the tag to find the compile-time constant that
-governs it" — that information now lives on the variant.
-
-```rust
-// Before — the resource is a string, and telling one from another means
-// comparing text.
-Err(Error::Capacity(tag)) if tag == "service_registry" => ...,
-
-// After.
-Err(Error::Capacity(CapacityKind::ServiceRegistry)) => ...,
-```
-
-`Display` is unchanged: `CapacityKind` renders as the same tag it replaced,
-so `"internal capacity exceeded: udp_buffer"` still formats byte-for-byte as
-before, and a test pins each string against its pre-0.11.0 literal.
-
-The kind is shared between the client and server error types rather than
-split in two, so a consumer handles capacity exhaustion the same way
-whichever layer reports it. Not every kind is reachable from both — the
-server currently produces only `UdpBuffer`.
-
-`CapacityKind` is itself `#[non_exhaustive]`, so bounding a new internal
-structure later is additive.
 
 ### Added — `E2E_REGISTRY_CAP` and `E2E_RX_STATE_CAP` are build-time configurable
 
