@@ -1,3 +1,4 @@
+use crate::CapacityKind;
 use crate::log::{debug, error, info, trace, warn};
 use core::future;
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -250,7 +251,7 @@ where
     /// — that would panic callers under load. Delivering an explicit
     /// `Err(Error::Capacity(..))` turns a would-be panic into a normal
     /// `Result` with a stable, descriptive error.
-    fn reject_with_capacity(self, structure_name: &'static str) {
+    fn reject_with_capacity(self, structure_name: crate::CapacityKind) {
         match self {
             Self::SetInterface(_, response)
             | Self::BindDiscovery(response)
@@ -491,7 +492,7 @@ where
                 "unicast_sockets at capacity ({}); refusing new bind of port {}",
                 UNICAST_SOCKETS_CAP, port
             );
-            return Err(Error::Capacity("unicast_sockets"));
+            return Err(Error::Capacity(CapacityKind::UnicastSockets));
         }
         let unicast_socket = self
             .dispatch
@@ -509,7 +510,7 @@ where
             error!(
                 "unicast_sockets insert failed after capacity check passed — invariant violation"
             );
-            return Err(Error::Capacity("unicast_sockets"));
+            return Err(Error::Capacity(CapacityKind::UnicastSockets));
         }
         debug!("Bound unicast socket on port {}", bound_port);
         Ok(bound_port)
@@ -519,13 +520,13 @@ where
     /// future unicast reply can be routed back. If the
     /// `pending_responses` map is already at `PENDING_RESPONSES_CAP`, the
     /// `response` sender is recovered from the failed `insert` and used
-    /// to deliver `Err(Error::Capacity("pending_responses"))` — the
+    /// to deliver `Err(Error::Capacity(CapacityKind::PendingResponses))` — the
     /// caller's `PendingResponse::response().await` resolves cleanly
     /// instead of panicking on the `RecvError` that dropping the Sender
     /// would have produced. If `request_id` is reused while an older
     /// pending entry still exists (e.g. after a `session_counter`
     /// wrap-around), the displaced sender is likewise completed with
-    /// `Err(Error::Capacity("pending_responses"))` rather than being
+    /// `Err(Error::Capacity(CapacityKind::PendingResponses))` rather than being
     /// silently dropped — the caller awaiting the previous request
     /// sees a clean error instead of a `RecvError` panic. Any reply
     /// that later arrives for a dropped `request_id` is surfaced on
@@ -550,7 +551,8 @@ where
                      0x{:08X}; replacing existing pending response",
                     request_id
                 );
-                let _ = displaced_response.send(Err(Error::Capacity("pending_responses")));
+                let _ =
+                    displaced_response.send(Err(Error::Capacity(CapacityKind::PendingResponses)));
             }
             Err((_req_id, response)) => {
                 warn!(
@@ -558,7 +560,7 @@ where
                      dropped for request_id 0x{:08X}",
                     PENDING_RESPONSES_CAP, request_id
                 );
-                let _ = response.send(Err(Error::Capacity("pending_responses")));
+                let _ = response.send(Err(Error::Capacity(CapacityKind::PendingResponses)));
             }
         }
     }
@@ -791,7 +793,7 @@ where
                             .push_front(ControlMessage::SetInterface(interface, response))
                         {
                             error!("request_queue push_front failed after pop — invariant broken");
-                            rejected.reject_with_capacity("request_queue");
+                            rejected.reject_with_capacity(CapacityKind::RequestQueue);
                         }
                         return;
                     }
@@ -803,7 +805,7 @@ where
                             .push_front(ControlMessage::SetInterface(interface, response))
                         {
                             error!("request_queue push_front failed after pop — invariant broken");
-                            rejected.reject_with_capacity("request_queue");
+                            rejected.reject_with_capacity(CapacityKind::RequestQueue);
                         }
                         return;
                     }
@@ -844,7 +846,7 @@ where
                                         error!(
                                             "request_queue push_front failed after pop — invariant broken"
                                         );
-                                        rejected.reject_with_capacity("request_queue");
+                                        rejected.reject_with_capacity(CapacityKind::RequestQueue);
                                     }
                                 }
                                 Err(e) => {
@@ -901,7 +903,7 @@ where
                             key.service_id,
                             key.endpoint,
                         );
-                        Err(Error::Capacity("service_registry"))
+                        Err(Error::Capacity(CapacityKind::ServiceRegistry))
                     };
                     if response.send(outcome).is_err() {
                         debug!("AddEndpoint: caller dropped the response receiver");
@@ -1089,7 +1091,7 @@ where
                                     error!(
                                         "request_queue push_front failed after pop — invariant broken"
                                     );
-                                    rejected.reject_with_capacity("request_queue");
+                                    rejected.reject_with_capacity(CapacityKind::RequestQueue);
                                 }
                             }
                             Err(e) => {
@@ -1218,7 +1220,7 @@ where
                                 "request_queue at capacity ({}); rejecting control message with Capacity error",
                                 REQUEST_QUEUE_CAP
                             );
-                            rejected.reject_with_capacity("request_queue");
+                            rejected.reject_with_capacity(CapacityKind::RequestQueue);
                         }
                     } else {
                         // The sender has been dropped, so we should exit
@@ -1390,27 +1392,29 @@ mod tests {
             F: core::future::Future<Output = Result<Result<(), Error>, OneshotCancelled>>,
         {
             match rx.now_or_never() {
-                Some(Ok(Err(Error::Capacity(s)))) => assert_eq!(s, "request_queue", "{label}"),
+                Some(Ok(Err(Error::Capacity(s)))) => {
+                    assert_eq!(s, CapacityKind::RequestQueue, "{label}")
+                }
                 other => panic!("{label}: expected Some(Ok(Err(Capacity))), got {other:?}"),
             }
         }
 
         // Variants carrying a single Result<(), Error> response sender.
         let (rx, msg) = TestControl::set_interface(Ipv4Addr::LOCALHOST);
-        msg.reject_with_capacity("request_queue");
+        msg.reject_with_capacity(CapacityKind::RequestQueue);
         expect_capacity(rx.recv(), "SetInterface");
 
         let (rx, msg) = TestControl::bind_discovery();
-        msg.reject_with_capacity("request_queue");
+        msg.reject_with_capacity(CapacityKind::RequestQueue);
         expect_capacity(rx.recv(), "BindDiscovery");
 
         let (rx, msg) = TestControl::unbind_discovery();
-        msg.reject_with_capacity("request_queue");
+        msg.reject_with_capacity(CapacityKind::RequestQueue);
         expect_capacity(rx.recv(), "UnbindDiscovery");
 
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
         let (rx, msg) = TestControl::send_sd(target, empty_sd_header());
-        msg.reject_with_capacity("request_queue");
+        msg.reject_with_capacity(CapacityKind::RequestQueue);
         expect_capacity(rx.recv(), "SendSD");
 
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
@@ -1419,15 +1423,15 @@ mod tests {
             0x0001,
             0,
         );
-        msg.reject_with_capacity("request_queue");
+        msg.reject_with_capacity(CapacityKind::RequestQueue);
         expect_capacity(rx.recv(), "AddEndpoint");
 
         let (rx, msg) = TestControl::remove_endpoint(lh_key(0x1234, 5000));
-        msg.reject_with_capacity("request_queue");
+        msg.reject_with_capacity(CapacityKind::RequestQueue);
         expect_capacity(rx.recv(), "RemoveEndpoint");
 
         let (rx, msg) = TestControl::subscribe(lh_key(0x1234, 5000), 1, 3, 0x01, 0);
-        msg.reject_with_capacity("request_queue");
+        msg.reject_with_capacity(CapacityKind::RequestQueue);
         expect_capacity(rx.recv(), "Subscribe");
 
         // SendToService carries two senders — both must be notified so that
@@ -1435,12 +1439,12 @@ mod tests {
         // panics.
         let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
         let (send_rx, resp_rx, msg) = TestControl::send_to_service(lh_key(0x1234, 5000), message);
-        msg.reject_with_capacity("request_queue");
+        msg.reject_with_capacity(CapacityKind::RequestQueue);
         expect_capacity(send_rx.recv(), "SendToService.send_complete");
         // resp_rx has type Result<TestPayload, Error> — check it separately
         match resp_rx.recv().now_or_never() {
             Some(Ok(Err(Error::Capacity(s)))) => {
-                assert_eq!(s, "request_queue", "SendToService.response");
+                assert_eq!(s, CapacityKind::RequestQueue, "SendToService.response");
             }
             other => {
                 panic!("SendToService.response: expected Some(Ok(Err(Capacity))), got {other:?}")
@@ -1550,7 +1554,7 @@ mod tests {
             .await
             .expect_err("bind past cap should fail");
         match err {
-            Error::Capacity(name) => assert_eq!(name, "unicast_sockets"),
+            Error::Capacity(name) => assert_eq!(name, CapacityKind::UnicastSockets),
             other => panic!("expected Error::Capacity, got {other:?}"),
         }
         assert_eq!(
@@ -1587,7 +1591,7 @@ mod tests {
     /// Regression guard against cb1d0d1: without explicit rejection,
     /// the dropped Sender would cause `PendingResponse::response()` to
     /// panic on `RecvError` rather than returning a clean
-    /// `Err(Error::Capacity("pending_responses"))`. Exercises the
+    /// `Err(Error::Capacity(CapacityKind::PendingResponses))`. Exercises the
     /// overflow branch in `track_or_reject_pending_response`, which is
     /// the same branch the `SendToService` run-loop arm now delegates
     /// to.
@@ -1643,7 +1647,7 @@ mod tests {
             .await
             .expect("receiver should get the explicit Err, not RecvError from dropped Sender");
         match result {
-            Err(Error::Capacity(tag)) => assert_eq!(tag, "pending_responses"),
+            Err(Error::Capacity(tag)) => assert_eq!(tag, CapacityKind::PendingResponses),
             other => panic!("expected Err(Error::Capacity(\"pending_responses\")), got {other:?}"),
         }
     }
@@ -1655,7 +1659,7 @@ mod tests {
     /// hits `RecvError` (which `PendingResponse::response()` treats as a
     /// fatal panic). This test guards against that: the displaced
     /// sender must be completed with
-    /// `Err(Error::Capacity("pending_responses"))` so the original
+    /// `Err(Error::Capacity(CapacityKind::PendingResponses))` so the original
     /// caller gets a clean `Result` instead of a panicking `RecvError`.
     #[tokio::test]
     async fn track_or_reject_pending_response_completes_displaced_sender() {
@@ -1684,7 +1688,7 @@ mod tests {
              not dropped (which would produce RecvError)",
         );
         match displaced_result {
-            Err(Error::Capacity(tag)) => assert_eq!(tag, "pending_responses"),
+            Err(Error::Capacity(tag)) => assert_eq!(tag, CapacityKind::PendingResponses),
             other => {
                 panic!("expected Err(Error::Capacity(\\\"pending_responses\\\")), got {other:?}")
             }

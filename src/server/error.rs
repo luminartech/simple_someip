@@ -28,12 +28,15 @@ pub enum Error {
     #[error(transparent)]
     E2e(#[from] crate::e2e::Error),
     /// A fixed-capacity internal structure is full (e.g. a stack send
-    /// buffer smaller than the outgoing message). The argument is a
-    /// lowercase `snake_case` tag naming the resource; grep the crate for
-    /// the tag to find the compile-time constant that governs it. Current
-    /// tags: `"udp_buffer"` (→ `crate::UDP_BUFFER_SIZE`).
+    /// buffer smaller than the outgoing message).
+    ///
+    /// [`CapacityKind`](crate::CapacityKind) names which one. The server
+    /// currently only produces
+    /// [`UdpBuffer`](crate::CapacityKind::UdpBuffer); the kind is shared
+    /// with the client so consumers handle capacity exhaustion the same
+    /// way whichever layer reports it.
     #[error("internal capacity exceeded: {0}")]
-    Capacity(&'static str),
+    Capacity(crate::CapacityKind),
     /// A `Server` API was called in a way that violates its
     /// preconditions. The argument is a `&'static str` tag naming the
     /// misuse; current tags:

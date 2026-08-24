@@ -159,8 +159,8 @@ extern crate alloc;
 ///
 /// When one of these paths is actually reached and serialization is
 /// attempted, messages larger than this cap fail with
-/// `client::Error::Capacity("udp_buffer")` or
-/// `server::Error::Capacity("udp_buffer")`, depending on the path.
+/// `client::Error::Capacity(crate::CapacityKind::UdpBuffer)` or
+/// `server::Error::Capacity(crate::CapacityKind::UdpBuffer)`, depending on the path.
 /// Paths that return early before
 /// attempting serialization (e.g. `publish_event` when there are no
 /// subscribers) are not affected. The remaining outbound SD paths
@@ -182,6 +182,9 @@ pub const UDP_BUFFER_SIZE: usize = 1500;
 /// both the bare-metal and std/tokio paths can reach [`buffer_pool::BufferPool`]
 /// and [`buffer_pool::BufferLease`].
 pub mod buffer_pool;
+/// Names the fixed-capacity internal structures reported by the
+/// `Capacity` variant of the client and server error enums.
+pub mod capacity;
 
 /// SOME/IP client for discovering services and exchanging messages.
 #[cfg(feature = "client")]
@@ -274,6 +277,7 @@ pub use client::{
 // types. Elevating them to crate root would lock their shape into
 // the public-API contract and tempt generic users into hitting the
 // `ClientChannelTypes` elaboration limit at the wrong call site.
+pub use capacity::CapacityKind;
 pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
 pub use server::{

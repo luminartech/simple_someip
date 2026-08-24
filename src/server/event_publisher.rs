@@ -3,6 +3,7 @@
 use super::Error;
 use super::service_info::Subscriber;
 use super::subscription_manager::{SUBSCRIBERS_PER_GROUP, SubscriptionHandle};
+use crate::CapacityKind;
 use crate::e2e::E2EKey;
 use crate::protocol::{Header, Message};
 use crate::traits::{PayloadWireFormat, WireFormat};
@@ -200,7 +201,7 @@ where
                 required_size,
                 msg_buf.len()
             );
-            return Err(Error::Capacity("udp_buffer"));
+            return Err(Error::Capacity(CapacityKind::UdpBuffer));
         }
 
         // Serialize the message into the caller-provided buffer.
@@ -232,7 +233,7 @@ where
                                 16 + protected_len,
                                 msg_buf.len()
                             );
-                            return Err(Error::Capacity("udp_buffer"));
+                            return Err(Error::Capacity(CapacityKind::UdpBuffer));
                         }
                         #[allow(clippy::cast_possible_truncation)]
                         let new_length: u32 = 8 + protected_len as u32;
@@ -244,7 +245,7 @@ where
                     Some(Err(e @ crate::e2e::Error::BufferTooSmall { .. })) => {
                         // `protect` returned `BufferTooSmall`, meaning the
                         // caller-supplied `protected_buf` was too short.
-                        // Map to `Capacity("udp_buffer")` for symmetry with
+                        // Map to `Capacity(CapacityKind::UdpBuffer)` for symmetry with
                         // the pre-encode and post-protect `msg_buf` guards
                         // above — the PR-3 contract is "undersized scratch →
                         // `Error::Capacity`". If `crate::e2e::Error` gains
@@ -255,7 +256,7 @@ where
                             "E2E protect error (buffer too small): {:?}; dropping publish",
                             e
                         );
-                        return Err(Error::Capacity("udp_buffer"));
+                        return Err(Error::Capacity(CapacityKind::UdpBuffer));
                     }
                     None => unreachable!("contains_key was true"),
                 }
@@ -415,7 +416,7 @@ where
                 "raw event buffer ({} bytes) too small for the 16-byte SOME/IP header; dropping publish",
                 buf.len()
             );
-            return Err(Error::Capacity("udp_buffer"));
+            return Err(Error::Capacity(CapacityKind::UdpBuffer));
         }
         if payload.len() > buf.len().saturating_sub(16) {
             crate::log::error!(
@@ -423,7 +424,7 @@ where
                 payload.len(),
                 buf.len()
             );
-            return Err(Error::Capacity("udp_buffer"));
+            return Err(Error::Capacity(CapacityKind::UdpBuffer));
         }
 
         // Build SOME/IP header
@@ -445,7 +446,7 @@ where
                 header_len,
                 payload.len()
             );
-            return Err(Error::Capacity("udp_buffer"));
+            return Err(Error::Capacity(CapacityKind::UdpBuffer));
         };
         // Defence-in-depth: the pre-build guard above already rejects
         // oversize payloads, but a future caller adding optional
@@ -457,7 +458,7 @@ where
                 total_len,
                 buf.len()
             );
-            return Err(Error::Capacity("udp_buffer"));
+            return Err(Error::Capacity(CapacityKind::UdpBuffer));
         }
         buf[header_len..total_len].copy_from_slice(payload);
         let datagram = &buf[..total_len];
@@ -721,7 +722,7 @@ where
                 "raw event buffer ({} bytes) too small for the 16-byte SOME/IP header; dropping publish",
                 buf.len()
             );
-            return Err(Error::Capacity("udp_buffer"));
+            return Err(Error::Capacity(CapacityKind::UdpBuffer));
         }
         if payload.len() > buf.len().saturating_sub(16) {
             crate::log::error!(
@@ -729,7 +730,7 @@ where
                 payload.len(),
                 buf.len()
             );
-            return Err(Error::Capacity("udp_buffer"));
+            return Err(Error::Capacity(CapacityKind::UdpBuffer));
         }
 
         let header = Header::new_event(
@@ -748,7 +749,7 @@ where
                 header_len,
                 payload.len()
             );
-            return Err(Error::Capacity("udp_buffer"));
+            return Err(Error::Capacity(CapacityKind::UdpBuffer));
         };
         if total_len > buf.len() {
             crate::log::error!(
@@ -756,7 +757,7 @@ where
                 total_len,
                 buf.len()
             );
-            return Err(Error::Capacity("udp_buffer"));
+            return Err(Error::Capacity(CapacityKind::UdpBuffer));
         }
         buf[header_len..total_len].copy_from_slice(payload);
         let datagram = &buf[..total_len];
@@ -996,7 +997,7 @@ mod tests {
             .await
             .expect_err("oversize payload must error, not report Ok(0)");
         match err {
-            Error::Capacity(tag) => assert_eq!(tag, "udp_buffer"),
+            Error::Capacity(tag) => assert_eq!(tag, CapacityKind::UdpBuffer),
             other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
         }
     }
@@ -1142,7 +1143,7 @@ mod tests {
     /// Regression guard against 343da67: without the pre-check, an oversize
     /// message would fail with a less-actionable protocol I/O error from
     /// `encode_to_slice`'s slice writer running out of buffer, rather than
-    /// the explicit `Error::Capacity("udp_buffer")` the new branch returns.
+    /// the explicit `Error::Capacity(CapacityKind::UdpBuffer)` the new branch returns.
     ///
     /// Note: a subscriber must be registered first — the pre-check sits
     /// after the `subscribers.is_empty()` early return, so without one the
@@ -1190,14 +1191,14 @@ mod tests {
             .await
             .expect_err("oversize message must error, not report Ok(_)");
         match err {
-            Error::Capacity(tag) => assert_eq!(tag, "udp_buffer"),
+            Error::Capacity(tag) => assert_eq!(tag, CapacityKind::UdpBuffer),
             other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
         }
     }
 
     /// Messages whose raw encoded size fits `UDP_BUFFER_SIZE` but whose
     /// E2E-protected size does not must be rejected with
-    /// `Error::Capacity("udp_buffer")` — guarding the post-protect branch
+    /// `Error::Capacity(CapacityKind::UdpBuffer)` — guarding the post-protect branch
     /// added alongside the raw-size pre-check.
     #[tokio::test]
     async fn test_publish_event_e2e_protected_exceeds_udp_buffer_returns_capacity_error() {
@@ -1253,7 +1254,7 @@ mod tests {
             .await
             .expect_err("E2E-protected oversize message must error, not report Ok(n)");
         match err {
-            Error::Capacity(tag) => assert_eq!(tag, "udp_buffer"),
+            Error::Capacity(tag) => assert_eq!(tag, CapacityKind::UdpBuffer),
             other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
         }
     }

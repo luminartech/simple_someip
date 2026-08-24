@@ -22,7 +22,7 @@
 //! frees a buffer lease asynchronously (when the spawned loop future drops),
 //! lagging the synchronous registry removal, so an evict-then-immediate-rebind
 //! can transiently need one extra slot; without the `+ 1` slack that surfaces
-//! as a spurious `Capacity("udp_buffer")`. The tokio provider already bakes
+//! as a spurious `Capacity(CapacityKind::UdpBuffer)`. The tokio provider already bakes
 //! this in (it sizes its pool at 10 = `UNICAST_SOCKETS_CAP (8) + 1
 //! discovery + 1 release-lag`).
 //!
@@ -1158,7 +1158,7 @@ where
     /// saturated at the moment the reply-tracking slot would be installed,
     /// this method still returns `Ok(PendingResponse)` — the UDP send has
     /// already happened — but the returned `PendingResponse` will resolve to
-    /// `Err(Error::Capacity("pending_responses"))`. Any reply that later
+    /// `Err(Error::Capacity(CapacityKind::PendingResponses))`. Any reply that later
     /// arrives for that `request_id` is delivered as
     /// [`ClientUpdate::Unicast`] on the update stream instead of through the
     /// `PendingResponse`. Treat this error as "reply lost to saturation",
