@@ -46,7 +46,9 @@ use simple_someip::transport::{
     E2ERegistryHandle, ReceivedDatagram, SocketOptions, Spawner, StaticBufferProvider, Timer,
     TransportError, TransportFactory, TransportSocket,
 };
-use simple_someip::{Client, ClientDeps, E2EKey, RawPayload, Server, ServerDeps, UDP_BUFFER_SIZE};
+use simple_someip::{
+    CapacityKind, Client, ClientDeps, E2EKey, RawPayload, Server, ServerDeps, UDP_BUFFER_SIZE,
+};
 
 // ── Static-pool channel factory ───────────────────────────────────────
 //
