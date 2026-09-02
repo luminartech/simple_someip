@@ -3,7 +3,7 @@
 //! The Profile 4 and Profile 5 algorithms live in [`simple_e2e`]; this module
 //! adds the SOME/IP glue: [`E2EKey`] (service + method/event), [`E2EProfile`]
 //! (which profile a key uses, and whether the SOME/IP upper header is folded
-//! into the Profile 5 CRC), the per-source [`E2ERegistry`], and the mapping
+//! into the Profile 5 CRC), the per-source [`E2ERegistry`](crate::e2e::E2ERegistry), and the mapping
 //! from [`E2ECheckStatus`] to the wire return code.
 //!
 //! # Example
