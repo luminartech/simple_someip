@@ -428,25 +428,48 @@ pub fn check_parsed_e2e<'a, R: E2ERegistryHandle>(
 }
 
 /// Map an [`E2ECheckStatus`] to the 1-byte code the firmware dispatch
-/// expects (`0` = unchecked / none). Shared so the library and firmware
-/// agree on the wire mapping.
+/// expects (`0` = unchecked / none). Delegates to
+/// [`E2ECheckStatus::to_return_code`]; kept as a named function because the
+/// firmware dispatch table cites it.
 #[must_use]
 pub fn e2e_status_code(status: E2ECheckStatus) -> u8 {
-    match status {
-        E2ECheckStatus::Ok => 1,
-        E2ECheckStatus::CrcError => 2,
-        E2ECheckStatus::Repeated => 3,
-        E2ECheckStatus::OkSomeLost => 4,
-        E2ECheckStatus::WrongSequence => 5,
-        E2ECheckStatus::BadArgument => 6,
-        E2ECheckStatus::Unchecked => 0,
-    }
+    status.to_return_code()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::sd::EntryType;
+
+    #[test]
+    fn e2e_status_code_matches_return_code_for_every_status() {
+        use crate::e2e::{E2ECheckStatus, E2EValidateError};
+        use simple_e2e::{profile4, profile5};
+        let statuses = [
+            E2ECheckStatus::Unchecked,
+            E2ECheckStatus::Ok,
+            E2ECheckStatus::OkSomeLost,
+            E2ECheckStatus::Repeated,
+            E2ECheckStatus::WrongSequence,
+            E2ECheckStatus::Invalid(E2EValidateError::Profile5(
+                profile5::ValidateError::CrcMismatch {
+                    got: 1,
+                    expected: 2,
+                },
+            )),
+            E2ECheckStatus::Invalid(E2EValidateError::Profile4(
+                profile4::ValidateError::DataIdMismatch {
+                    got: 1,
+                    expected: 2,
+                },
+            )),
+        ];
+        for s in statuses {
+            assert_eq!(e2e_status_code(s), s.to_return_code(), "{s:?}");
+        }
+        assert_eq!(e2e_status_code(statuses[5]), 2);
+        assert_eq!(e2e_status_code(statuses[6]), 6);
+    }
 
     fn req(service_id: u16, port: u16) -> OfferServiceRequest {
         OfferServiceRequest {
