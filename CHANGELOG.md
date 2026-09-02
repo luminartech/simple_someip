@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.13.0]
+
+Contains a breaking change to a public enum, so this release takes the major
+position under this crate's 0.x convention. As in 0.12.0, the `version` in
+`Cargo.toml` is bumped here rather than left to release-plz so that
+`cargo-semver-checks` compares against the version this change actually lands as.
+
+### Breaking — `E2ECheckStatus` reports the real validation error
+
+The E2E Profile 4 and Profile 5 algorithms now come from the `simple-e2e`
+crate; this crate keeps only the SOME/IP-specific glue (the registry, `E2EKey`,
+`E2EProfile`, and the return-code mapping). The visible consequence is that a
+rejected message tells you *why*:
+
+```rust
+// Before — two tags, no detail. A downstream logger wanting the CRC values
+// had to fabricate them.
+E2ECheckStatus::CrcError
+E2ECheckStatus::BadArgument
+
+// After — the profile's own error, with the received and computed values.
+E2ECheckStatus::Invalid(E2EValidateError::Profile5(
+    profile5::ValidateError::CrcMismatch { got: 0x1A2B, expected: 0x1A2C },
+))
+E2ECheckStatus::Invalid(E2EValidateError::Profile4(
+    profile4::ValidateError::DataIdMismatch { got: .., expected: .. },
+))
+```
+
+`E2ECheckStatus::to_return_code` (and `sd_codec::e2e_status_code`) are
+unchanged on the wire: a CRC mismatch is still `2`, every other validation
+failure is still `6`. `E2EValidateError::is_crc_mismatch` is the predicate
+behind that split. `E2EValidateError` is `#[non_exhaustive]`, `Copy`, and
+implements `Display` through the inner error.
+
+Migration for a `match` on `E2ECheckStatus`:
+
+| 0.12 | 0.13 |
+|---|---|
+| `CrcError` | `Invalid(e) if e.is_crc_mismatch()` |
+| `BadArgument` | `Invalid(_)` (after the CRC arm) |
+| `CrcError \| BadArgument` | `Invalid(_)` |
+
+Everything else in `e2e` keeps its name. `Profile4Config`, `Profile5Config`,
+`Profile4State`, `Profile5State` are now type aliases of
+`simple_e2e::profile{4,5}::{Config, State}`; `PROFILE4_HEADER_SIZE` /
+`PROFILE5_HEADER_SIZE` alias the profile modules' `HEADER_SIZE`; and the six
+`check_*` / `protect_*` functions are thin adapters that still return
+`E2ECheckResult` / `e2e::Error`. `E2ECheckResult::counter` stays `Option<u32>`.
+The direct `crc` dependency is gone (it arrives through `simple-e2e`).
+
+### Removed
+
+- `E2ECheckStatus::CrcError`, `E2ECheckStatus::BadArgument` (see above).
+- The crate-private CRC and profile modules and their unit tests, which
+  duplicated `simple-e2e`'s.
+
 ## [0.12.0]
 
 Contains a breaking change to the public error enums, so this release takes the

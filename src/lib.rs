@@ -17,7 +17,7 @@
 //! | Module | `no_std` | Description |
 //! |--------|----------|-------------|
 //! | [`protocol`] | Yes | Wire format: headers, messages, message types, return codes, and service discovery (SD) entries/options |
-//! | [`e2e`] | Yes | End-to-End protection — Profile 4 (CRC-32) and Profile 5 (CRC-16) |
+//! | [`e2e`] | Yes | End-to-End protection — Profile 4 (CRC-32) and Profile 5 (CRC-16), via `simple-e2e` |
 //! | [`WireFormat`] / [`PayloadWireFormat`] | Yes | Traits for serializing messages and defining custom payload types |
 //! | `client` | No | Async client trait surface — service discovery, subscriptions, request/response (feature `client`; add `client-tokio` for `Client::new`) |
 //! | `server` | No | Async server trait surface — service offering, event publishing, subscription management (feature `server`; add `server-tokio` for `Server::new`) |
@@ -278,7 +278,7 @@ pub use client::{
 // the public-API contract and tempt generic users into hitting the
 // `ClientChannelTypes` elaboration limit at the wrong call site.
 pub use capacity::CapacityKind;
-pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
+pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2EValidateError};
 #[cfg(feature = "server")]
 pub use server::{
     NonSdRequestCallback, Server, ServerDeps, ServerHandles, ServerStorage, SubscriptionHandle,
