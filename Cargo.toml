@@ -64,6 +64,9 @@ futures-util = { version = "0.3", default-features = false, features = [
     "async-await-macro",
 ], optional = true }
 heapless = "0.9"
+# The E2E Profile 4 / Profile 5 algorithms. This crate keeps only the
+# SOME/IP-specific glue (registry, key, profile selection, return codes).
+simple-e2e = { version = "0.1", default-features = false }
 socket2 = { version = "0.5", optional = true, features = ["all"] }
 thiserror = { version = "2", default-features = false }
 tokio = { version = "1", default-features = false, features = [
@@ -94,7 +97,7 @@ default = ["std"]
 # tracing behind a feature so those builds can opt out; std users
 # pick it up automatically through the `std` feature below.
 tracing = ["dep:tracing"]
-std = ["embedded-io/std", "thiserror/std", "tracing", "tracing/std", "_alloc"]
+std = ["embedded-io/std", "thiserror/std", "tracing", "tracing/std", "_alloc", "simple-e2e/std"]
 # Feature split: `client` exposes the protocol/trait-surface client
 # (no tokio, no socket2); `client-tokio` layers the tokio + socket2
 # convenience defaults on top. Consumers of the bare-metal trait surface
@@ -203,3 +206,6 @@ required-features = ["client", "server", "bare_metal"]
 
 [[test]]
 name = "buffer_pool"
+
+[patch.crates-io]
+simple-e2e = { path = "../simple_e2e" }
