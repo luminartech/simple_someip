@@ -278,7 +278,7 @@ pub use client::{
 // the public-API contract and tempt generic users into hitting the
 // `ClientChannelTypes` elaboration limit at the wrong call site.
 pub use capacity::CapacityKind;
-pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
+pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2EValidateError};
 #[cfg(feature = "server")]
 pub use server::{
     NonSdRequestCallback, Server, ServerDeps, ServerHandles, ServerStorage, SubscriptionHandle,

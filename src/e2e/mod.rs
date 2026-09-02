@@ -24,55 +24,208 @@
 //! assert!(matches!(result.status, E2ECheckStatus::Ok));
 //! ```
 
-mod config;
-mod crc;
-mod e2e_checker;
-mod e2e_protector;
 mod error;
 mod registry;
-mod state;
 
-pub use config::{Profile4Config, Profile5Config};
-pub use e2e_checker::{check_profile4, check_profile5, check_profile5_with_header};
-pub use e2e_protector::{
-    PROFILE4_HEADER_SIZE, PROFILE5_HEADER_SIZE, protect_profile4, protect_profile5,
-    protect_profile5_with_header,
-};
 pub use error::Error;
 pub use registry::{E2E_REGISTRY_CAP, E2E_RX_STATE_CAP, E2ERegistry, E2ERegistryFull};
-pub use state::{Profile4State, Profile5State};
+
+/// Profile 4 configuration (`data_id`, `max_delta_counter`).
+pub type Profile4Config = simple_e2e::profile4::Config;
+/// Profile 4 per-direction counter state.
+pub type Profile4State = simple_e2e::profile4::State;
+/// Profile 5 configuration (`data_id`, `data_length`, `max_delta_counter`).
+pub type Profile5Config = simple_e2e::profile5::Config;
+/// Profile 5 per-direction counter state.
+pub type Profile5State = simple_e2e::profile5::State;
+/// Profile 4 header length in bytes (length, counter, data ID, CRC-32).
+pub const PROFILE4_HEADER_SIZE: usize = simple_e2e::profile4::HEADER_SIZE;
+/// Profile 5 header length in bytes (CRC-16, counter).
+pub const PROFILE5_HEADER_SIZE: usize = simple_e2e::profile5::HEADER_SIZE;
+
+/// Check a Profile 4 protected message, tracking the counter in `state`.
+pub fn check_profile4<'a>(
+    config: &Profile4Config,
+    state: &mut Profile4State,
+    protected: &'a [u8],
+) -> E2ECheckResult<'a> {
+    let result = simple_e2e::profile4::check(config, state, protected);
+    E2ECheckResult {
+        status: result.status.into(),
+        counter: result.counter.map(u32::from),
+        payload: result.payload,
+    }
+}
+
+/// Check a Profile 5 protected message, tracking the counter in `state`.
+pub fn check_profile5<'a>(
+    config: &Profile5Config,
+    state: &mut Profile5State,
+    protected: &'a [u8],
+) -> E2ECheckResult<'a> {
+    let result = simple_e2e::profile5::check(config, state, protected);
+    E2ECheckResult {
+        status: result.status.into(),
+        counter: result.counter.map(u32::from),
+        payload: result.payload,
+    }
+}
+
+/// Check a Profile 5 protected message whose CRC also covers the 8-byte
+/// SOME/IP upper header.
+pub fn check_profile5_with_header<'a>(
+    config: &Profile5Config,
+    state: &mut Profile5State,
+    protected: &'a [u8],
+    upper_header: [u8; 8],
+) -> E2ECheckResult<'a> {
+    let result = simple_e2e::profile5::check_with_header(config, state, protected, upper_header);
+    E2ECheckResult {
+        status: result.status.into(),
+        counter: result.counter.map(u32::from),
+        payload: result.payload,
+    }
+}
+
+/// Protect `payload` with a Profile 4 header into `output`; returns the
+/// number of bytes written.
+///
+/// # Errors
+/// [`Error::BufferTooSmall`] if `output` cannot hold header + payload.
+pub fn protect_profile4(
+    config: &Profile4Config,
+    state: &mut Profile4State,
+    payload: &[u8],
+    output: &mut [u8],
+) -> Result<usize, Error> {
+    simple_e2e::profile4::protect(config, state, payload, output).map_err(Error::from)
+}
+
+/// Protect `payload` with a Profile 5 header into `output`; returns the
+/// number of bytes written.
+///
+/// # Errors
+/// [`Error::BufferTooSmall`] if `output` cannot hold header + payload.
+pub fn protect_profile5(
+    config: &Profile5Config,
+    state: &mut Profile5State,
+    payload: &[u8],
+    output: &mut [u8],
+) -> Result<usize, Error> {
+    simple_e2e::profile5::protect(config, state, payload, output).map_err(Error::from)
+}
+
+/// Protect `payload` with a Profile 5 header whose CRC also covers the
+/// 8-byte SOME/IP upper header.
+///
+/// # Errors
+/// [`Error::BufferTooSmall`] if `output` cannot hold header + payload.
+pub fn protect_profile5_with_header(
+    config: &Profile5Config,
+    state: &mut Profile5State,
+    payload: &[u8],
+    upper_header: [u8; 8],
+    output: &mut [u8],
+) -> Result<usize, Error> {
+    simple_e2e::profile5::protect_with_header(config, state, payload, upper_header, output)
+        .map_err(Error::from)
+}
 
 /// Status result from E2E check operations.
+///
+/// `Unchecked` is a registry-level outcome (no profile is registered for the
+/// message's [`E2EKey`]); the remaining variants come from the profile
+/// algorithm in `simple_e2e`. A wire-level rejection carries the concrete
+/// [`E2EValidateError`], so a CRC mismatch reports the received and computed
+/// values instead of a bare tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum E2ECheckStatus {
-    /// Initial state, no check performed yet.
+    /// No E2E profile is registered for this message; nothing was checked.
     Unchecked,
-    /// Check passed successfully.
+    /// Valid CRC and the counter advanced by exactly one (or first message).
     Ok,
-    /// CRC verification failed.
-    CrcError,
-    /// Counter value is repeated (same as last received).
-    Repeated,
-    /// Check passed but some messages were lost (counter gap within tolerance).
+    /// Valid CRC; some messages were lost, within `max_delta_counter`.
     OkSomeLost,
-    /// Counter sequence error (gap exceeds `max_delta_counter`).
+    /// Valid CRC; the counter did not advance (duplicate).
+    Repeated,
+    /// Valid CRC; the counter jumped past `max_delta_counter`.
     WrongSequence,
-    /// Invalid input arguments (e.g., message too short).
-    BadArgument,
+    /// The message failed wire-level validation (length, data ID, or CRC).
+    Invalid(E2EValidateError),
+}
+
+/// Wire-level validation failure, tagged with the profile that produced it.
+///
+/// Profile 4 uses a CRC-32 and Profile 5 a CRC-16, so the two error types
+/// differ in width; this enum keeps each profile's real values rather than
+/// widening them into a lossy common shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum E2EValidateError {
+    /// Profile 4 (CRC-32) validation failure.
+    #[error("profile 4: {0}")]
+    Profile4(simple_e2e::profile4::ValidateError),
+    /// Profile 5 (CRC-16) validation failure.
+    #[error("profile 5: {0}")]
+    Profile5(simple_e2e::profile5::ValidateError),
+}
+
+impl E2EValidateError {
+    /// `true` when the failure is a CRC mismatch (as opposed to a length or
+    /// data-ID problem). Selects the wire return code in
+    /// [`E2ECheckStatus::to_return_code`].
+    #[must_use]
+    pub const fn is_crc_mismatch(self) -> bool {
+        matches!(
+            self,
+            Self::Profile4(simple_e2e::profile4::ValidateError::CrcMismatch { .. })
+                | Self::Profile5(simple_e2e::profile5::ValidateError::CrcMismatch { .. })
+        )
+    }
 }
 
 impl E2ECheckStatus {
-    /// Convert to a numeric return code compatible with E2E.
+    /// Convert to a numeric return code.
+    ///
+    /// The codes are the pre-0.13 values: a CRC mismatch is `2` (formerly
+    /// `CrcError`) and every other validation failure is `6` (formerly
+    /// `BadArgument`), so the wire mapping is unchanged.
     #[must_use]
     pub fn to_return_code(self) -> u8 {
         match self {
             E2ECheckStatus::Unchecked => 0,
             E2ECheckStatus::Ok => 1,
-            E2ECheckStatus::CrcError => 2,
+            E2ECheckStatus::Invalid(err) if err.is_crc_mismatch() => 2,
             E2ECheckStatus::Repeated => 3,
             E2ECheckStatus::OkSomeLost => 4,
             E2ECheckStatus::WrongSequence => 5,
-            E2ECheckStatus::BadArgument => 6,
+            E2ECheckStatus::Invalid(_) => 6,
+        }
+    }
+}
+
+impl From<simple_e2e::profile4::CheckStatus> for E2ECheckStatus {
+    fn from(status: simple_e2e::profile4::CheckStatus) -> Self {
+        use simple_e2e::profile4::CheckStatus as S;
+        match status {
+            S::Ok => Self::Ok,
+            S::OkSomeLost => Self::OkSomeLost,
+            S::Repeated => Self::Repeated,
+            S::WrongSequence => Self::WrongSequence,
+            S::Invalid(err) => Self::Invalid(E2EValidateError::Profile4(err)),
+        }
+    }
+}
+
+impl From<simple_e2e::profile5::CheckStatus> for E2ECheckStatus {
+    fn from(status: simple_e2e::profile5::CheckStatus) -> Self {
+        use simple_e2e::profile5::CheckStatus as S;
+        match status {
+            S::Ok => Self::Ok,
+            S::OkSomeLost => Self::OkSomeLost,
+            S::Repeated => Self::Repeated,
+            S::WrongSequence => Self::WrongSequence,
+            S::Invalid(err) => Self::Invalid(E2EValidateError::Profile5(err)),
         }
     }
 }
@@ -91,23 +244,7 @@ pub struct E2ECheckResult<'a> {
     pub payload: Option<&'a [u8]>,
 }
 
-impl<'a> E2ECheckResult<'a> {
-    pub(crate) fn error(status: E2ECheckStatus) -> Self {
-        Self {
-            status,
-            counter: None,
-            payload: None,
-        }
-    }
-
-    pub(crate) fn success(status: E2ECheckStatus, counter: u32, payload: &'a [u8]) -> Self {
-        Self {
-            status,
-            counter: Some(counter),
-            payload: Some(payload),
-        }
-    }
-
+impl E2ECheckResult<'_> {
     /// Copy the extracted payload into an owned `Vec<u8>`.
     ///
     /// Returns `None` if the check did not produce a payload (e.g. on error).
@@ -196,7 +333,7 @@ pub(crate) fn e2e_check<'a>(
         (E2EProfile::Profile5WithHeader(config), E2EState::Profile5(st)) => {
             check_profile5_with_header(config, st, payload, upper_header)
         }
-        _ => return (E2ECheckStatus::BadArgument, payload),
+        _ => unreachable!("E2EState is always created from E2EProfile"),
     };
     let stripped = result.payload.unwrap_or(payload);
     (result.status, stripped)
@@ -232,15 +369,75 @@ pub(crate) fn e2e_protect(
 mod tests {
     use super::*;
 
+    use simple_e2e::{profile4, profile5};
+
     #[test]
     fn test_status_return_codes() {
         assert_eq!(E2ECheckStatus::Unchecked.to_return_code(), 0);
         assert_eq!(E2ECheckStatus::Ok.to_return_code(), 1);
-        assert_eq!(E2ECheckStatus::CrcError.to_return_code(), 2);
+        let p5_crc = E2ECheckStatus::Invalid(E2EValidateError::Profile5(
+            profile5::ValidateError::CrcMismatch {
+                got: 1,
+                expected: 2,
+            },
+        ));
+        assert_eq!(p5_crc.to_return_code(), 2);
+        let p4_crc = E2ECheckStatus::Invalid(E2EValidateError::Profile4(
+            profile4::ValidateError::CrcMismatch {
+                got: 1,
+                expected: 2,
+            },
+        ));
+        assert_eq!(p4_crc.to_return_code(), 2);
         assert_eq!(E2ECheckStatus::Repeated.to_return_code(), 3);
         assert_eq!(E2ECheckStatus::OkSomeLost.to_return_code(), 4);
         assert_eq!(E2ECheckStatus::WrongSequence.to_return_code(), 5);
-        assert_eq!(E2ECheckStatus::BadArgument.to_return_code(), 6);
+        // Every non-CRC validation failure is the wire's "bad argument".
+        for err in [
+            E2EValidateError::Profile5(profile5::ValidateError::TooShort { actual: 1 }),
+            E2EValidateError::Profile5(profile5::ValidateError::LengthMismatch {
+                expected: 4,
+                actual: 3,
+            }),
+            E2EValidateError::Profile4(profile4::ValidateError::TooShort { actual: 1 }),
+            E2EValidateError::Profile4(profile4::ValidateError::LengthMismatch {
+                header_length: 4,
+                actual: 3,
+            }),
+            E2EValidateError::Profile4(profile4::ValidateError::DataIdMismatch {
+                got: 1,
+                expected: 2,
+            }),
+        ] {
+            assert_eq!(E2ECheckStatus::Invalid(err).to_return_code(), 6, "{err:?}");
+        }
+    }
+
+    #[test]
+    fn test_check_status_from_profile_status() {
+        assert_eq!(
+            E2ECheckStatus::from(profile4::CheckStatus::OkSomeLost),
+            E2ECheckStatus::OkSomeLost
+        );
+        assert_eq!(
+            E2ECheckStatus::from(profile5::CheckStatus::WrongSequence),
+            E2ECheckStatus::WrongSequence
+        );
+        let e = profile5::ValidateError::CrcMismatch {
+            got: 0xBEEF,
+            expected: 0xCAFE,
+        };
+        assert_eq!(
+            E2ECheckStatus::from(profile5::CheckStatus::Invalid(e)),
+            E2ECheckStatus::Invalid(E2EValidateError::Profile5(e))
+        );
+    }
+
+    #[test]
+    fn test_check_status_is_copy() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<E2ECheckStatus>();
+        assert_copy::<E2EValidateError>();
     }
 
     #[test]
@@ -374,7 +571,18 @@ mod tests {
         buf[8] ^= 0xFF;
 
         let result = check_profile4(&config, &mut check_state, &buf[..len]);
-        assert_eq!(result.status, E2ECheckStatus::CrcError);
+        let E2ECheckStatus::Invalid(E2EValidateError::Profile4(
+            profile4::ValidateError::CrcMismatch { got, expected },
+        )) = result.status
+        else {
+            panic!("expected a Profile 4 CRC mismatch, got {:?}", result.status);
+        };
+        // Profile 4 stores the CRC big-endian at bytes 8..12; we flipped byte 8.
+        assert_eq!(got, u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]));
+        assert_eq!(
+            expected,
+            u32::from_be_bytes([buf[8] ^ 0xFF, buf[9], buf[10], buf[11]])
+        );
     }
 
     #[test]
@@ -392,7 +600,15 @@ mod tests {
         buf[1] ^= 0xFF;
 
         let result = check_profile5(&config, &mut check_state, &buf[..len]);
-        assert_eq!(result.status, E2ECheckStatus::CrcError);
+        let E2ECheckStatus::Invalid(E2EValidateError::Profile5(
+            profile5::ValidateError::CrcMismatch { got, expected },
+        )) = result.status
+        else {
+            panic!("expected a Profile 5 CRC mismatch, got {:?}", result.status);
+        };
+        // Profile 5 stores the CRC little-endian at bytes 0..2; we flipped byte 1.
+        assert_eq!(got, u16::from_le_bytes([buf[0], buf[1]]));
+        assert_eq!(expected, u16::from_le_bytes([buf[0], buf[1] ^ 0xFF]));
     }
 
     #[test]
@@ -403,7 +619,12 @@ mod tests {
         // Message too short (less than 12-byte header)
         let short_message = [0u8; 8];
         let result = check_profile4(&config, &mut check_state, &short_message);
-        assert_eq!(result.status, E2ECheckStatus::BadArgument);
+        assert_eq!(
+            result.status,
+            E2ECheckStatus::Invalid(E2EValidateError::Profile4(
+                profile4::ValidateError::TooShort { actual: 8 }
+            ))
+        );
     }
 
     #[test]
@@ -414,18 +635,32 @@ mod tests {
         // Message too short (less than 3-byte header)
         let short_message = [0u8; 2];
         let result = check_profile5(&config, &mut check_state, &short_message);
-        assert_eq!(result.status, E2ECheckStatus::BadArgument);
+        assert_eq!(
+            result.status,
+            E2ECheckStatus::Invalid(E2EValidateError::Profile5(
+                profile5::ValidateError::TooShort { actual: 2 }
+            ))
+        );
     }
 
     #[cfg(feature = "std")]
     #[test]
     fn test_check_result_to_owned_payload() {
         let data = b"hello";
-        let result = E2ECheckResult::success(E2ECheckStatus::Ok, 0, data);
-        let owned = result.to_owned_payload();
-        assert_eq!(owned, Some(b"hello".to_vec()));
+        let result = E2ECheckResult {
+            status: E2ECheckStatus::Ok,
+            counter: Some(0),
+            payload: Some(data),
+        };
+        assert_eq!(result.to_owned_payload(), Some(b"hello".to_vec()));
 
-        let err_result = E2ECheckResult::error(E2ECheckStatus::CrcError);
+        let err_result = E2ECheckResult {
+            status: E2ECheckStatus::Invalid(E2EValidateError::Profile5(
+                profile5::ValidateError::TooShort { actual: 1 },
+            )),
+            counter: None,
+            payload: None,
+        };
         assert_eq!(err_result.to_owned_payload(), None);
     }
 

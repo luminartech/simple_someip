@@ -13,3 +13,23 @@ pub enum Error {
         actual: usize,
     },
 }
+
+impl From<simple_e2e::profile4::ProtectError> for Error {
+    fn from(err: simple_e2e::profile4::ProtectError) -> Self {
+        match err {
+            simple_e2e::profile4::ProtectError::BufferTooSmall { needed, actual } => {
+                Self::BufferTooSmall { needed, actual }
+            }
+        }
+    }
+}
+
+impl From<simple_e2e::profile5::ProtectError> for Error {
+    fn from(err: simple_e2e::profile5::ProtectError) -> Self {
+        match err {
+            simple_e2e::profile5::ProtectError::BufferTooSmall { needed, actual } => {
+                Self::BufferTooSmall { needed, actual }
+            }
+        }
+    }
+}
