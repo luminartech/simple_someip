@@ -71,6 +71,55 @@ after).
   with `Error::InvalidLength` instead of risking an arithmetic-underflow
   panic when computing `payload_size` (`length - 8`).
 
+- **`Options::write` removed.** It was a `pub` inherent method on
+  `sd::Options`; the equivalent is now the `Encode::encode` trait method, so
+  callers need `use automotive_wire_codec::Encode` (or the crate-root
+  re-export) in scope. Nothing else changes — the bytes written are identical.
+
+- **`ServiceEntry::required_size()` / `EventGroupEntry::required_size()`
+  returned 16 but wrote 15 bytes.** Their replacement `encoded_size()`
+  returns `Ok(15)`, which is what `encode` actually writes. The 16 belongs to
+  the enclosing `Entry` (1 type byte + 15 body bytes = `ENTRY_SIZE`), and
+  these two body types had inherited it. Anyone who sized a buffer from
+  `required_size()` on these types gets a different number now; it is the
+  correct one, and this is a latent-bug fix rather than a rename.
+
+- **`Message::new_sd` returns `Result<Self, Error>`.** It previously
+  swallowed a failed `SdHeader::encoded_size()` with `unwrap_or(0)`, building
+  a header that declared the bare 8-byte SD length while `encode` went on to
+  write the full payload. Receivers truncate at the declared length, so the
+  failure mode was silent wire corruption rather than an error. No in-tree SD
+  header can fail — `sd::Header::encoded_size` is unconditionally `Ok` — so
+  in-tree callers only gain a `?` or an `expect`.
+
+- **`PayloadWireFormat::SdHeader` is bounded `Encode<Error =
+  protocol::Error>`.** This matches the bound the trait already places on
+  `Self` and is what makes the error above nameable and therefore
+  propagatable. Every concrete `SdHeader` already used `protocol::Error`, so
+  in-tree this is a no-op; a downstream implementor with a different error
+  type must change it.
+
+- **`BuildError::ListFull { needed, capacity }` added.** A fixed-capacity
+  entry/option list overflow used to be reported as
+  `BufferTooSmall(InsufficientBuffer { .. })`, whose fields are documented in
+  *bytes* — it was putting element counts in them. The path is unreachable
+  (`take(N)` bounds the loop), but the error would have been actively
+  misleading if it ever fired. Exhaustive matches on `BuildError` need a new
+  arm.
+
+- **Under-length SD options are rejected instead of panicking.**
+  `OptionView::decode` required a 4-byte option header but then took
+  `length + 3` bytes, so a declared `length` below 1 produced a view shorter
+  than the header it had just insisted on, and the accessors indexed it
+  unconditionally: option bytes `00 02 04 00 00` panicked in `as_ipv4` via
+  `to_owned`, and a zero-length Configuration option panicked in
+  `configuration_bytes`. `decode` now rejects a wire size below the option
+  header, and `as_ipv4` / `as_ipv6` / `as_load_balancing` check their own span
+  before indexing, returning `IncorrectOptionsSize`. The crate's own paths
+  went through `SdHeaderView::parse`, whose eager `validate()` walk already
+  rejected these, so this was not reachable via `parse_someip_sd_datagram` —
+  but the lazy `SdBody` / `Decode` surface the docs point at is public.
+
 ## [0.12.0]
 
 Contains a breaking change to the public error enums, so this release takes the
