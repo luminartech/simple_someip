@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "simple-someip-embassy-net"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "critical-section",
  "embassy-executor",
