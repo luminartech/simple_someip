@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/luminartech/simple_someip/compare/v0.1.0...v0.2.0) - 2026-09-10
+
+### Added
+
+- [**breaking**] mark the public error enums non-exhaustive, make the E2E caps configurable
+- *(client)* [**breaking**] key service registry by device IP
+
+### Fixed
+
+- *(server)* [**breaking**] return a GAT from for_each_subscriber so EventPublisher futures are Send
+
+### Other
+
+- Phase 7 cleanup — sweep WireFormat prose, tighten tests, add 0.9.0 CHANGELOG
+- *(release)* land the typed CapacityKind as 0.12.0
+- *(release)* bump to 0.10.0 for the for_each_subscriber break
+- *(embassy-net)* migrate loopback to ServiceEndpointKey and gate it in CI
+- *(release)* 0.9.0 — source-keyed client registry
+
 ## [0.1.0](https://github.com/luminartech/simple_someip/releases/tag/v0.1.0) - 2026-06-29
 
 ### Added
