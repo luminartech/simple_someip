@@ -1,8 +1,11 @@
 # Lanes the org-wide reusable workflow cannot express.
 #
-# `main.yml` is the thin caller for `luminartech/rust_workflow` and owns lint,
-# docs, security, the publish dry run, semver-checks and release-plz. This
-# file is what is left over, and every job here stayed for a concrete reason:
+# `main.yml` is the thin caller for `luminartech/rust_workflow`. It contributes
+# release-plz, docs, the security audit, a publish dry run, a release build and
+# a no_std smoke build -- all of which this repo previously lacked.
+#
+# It takes over none of the jobs below. Every one of them stayed, each for a
+# concrete reason:
 #
 # - `Build, Test & Coverage` -- the shared workflow applies ONE `feature-flags`
 #   value to build, test, clippy and docs. Lint wants `bare_metal` in; tests
@@ -20,6 +23,14 @@
 # - `Bare-metal runtime (nightly)` -- the `bare-metal-runtime` feature needs
 #   nightly and is mutually exclusive with the alloc features. The shared
 #   workflow's nightly toolchain is used only for fuzz and miri.
+# - `Format & Lint` -- the shared lint job hardcodes `cargo clippy
+#   --all-targets`, which this pipeline never did. That surfaces ~89
+#   pre-existing pedantic/style findings in test and example code, and
+#   `clippy-args` only appends after `--`, so the scope cannot be narrowed
+#   from the caller.
+# - `SemVer Check` -- `cargo-semver-checks` builds rustdoc with ALL features
+#   and takes no feature input, so it trips this crate's own `compile_error!`
+#   guard for `bare-metal-runtime`. The job here passes a feature set.
 # - `Linear PR History` -- not provided.
 name: Bare-metal & Platform CI
 
@@ -49,6 +60,57 @@ env:
   HOST_FEATURES: std,tracing,client,client-tokio,server,server-tokio
 
 jobs:
+  check:
+    name: Format & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # `--workspace --all-features` activates every feature on every
+      # workspace member through cargo's feature unification, which
+      # gives strong "max coverage" but means that, e.g., a clippy
+      # regression triggered only by smoltcp's `proto-ipv6` (pulled in
+      # transitively via the embassy-net adapter under all-features)
+      # blocks merges on the parent simple-someip crate. The explicit
+      # per-feature passes below run clippy on `simple-someip` alone
+      # under the feature combos we actually ship, so a feature-set
+      # regression surfaces against its responsible feature flag
+      # rather than as workspace-wide noise.
+      #
+      # `$ALLOC_FEATURES` is every feature except `bare-metal-runtime` (which
+      # is no-alloc + nightly and runs in the `bare-metal-runtime` job); it
+      # replaces the former `--all-features` pass, which can no longer build
+      # once a no-alloc-only feature exists.
+      - run: cargo clippy --workspace --no-default-features --features $ALLOC_FEATURES -- -D warnings -D clippy::pedantic
+      - run: cargo clippy --no-default-features -- -D warnings -D clippy::pedantic
+      - run: cargo clippy -p simple-someip --no-default-features --features client,bare_metal -- -D warnings -D clippy::pedantic
+      - run: cargo clippy -p simple-someip --no-default-features --features server,bare_metal -- -D warnings -D clippy::pedantic
+      - run: cargo clippy -p simple-someip --no-default-features --features client,server,bare_metal -- -D warnings -D clippy::pedantic
+
+  semver:
+    name: SemVer Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Scope to the alloc/host feature set: the default `all-features`
+      # group pulls `bare-metal-runtime`, which is no-alloc + nightly and
+      # fails to build (and document) alongside the alloc features, so
+      # rustdoc — and thus the whole check — aborts. The host API is what
+      # we semver-gate; the bare-metal lane is nightly-only.
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: only-explicit-features
+          features: std,tracing,client,client-tokio,server,server-tokio,bare_metal,embassy_channels
+
   bare-metal-runtime:
     name: Bare-metal runtime (nightly)
     runs-on: ubuntu-latest
@@ -122,6 +184,7 @@ jobs:
     # cheap stable-toolchain tripwire that names the offending symbol
     # when something regresses.
     name: no_std target build (thumbv7em-none-eabihf)
+    needs: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -215,6 +278,7 @@ jobs:
     # gate (phase 22 / measurement PR 0 — see
     # docs/simple_someip/plans/2026-06-09-phase22-125-memory-reduction-design.md).
     name: build-std core gate (no alloc in sysroot)
+    needs: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -232,6 +296,7 @@ jobs:
 
   test:
     name: Build, Test & Coverage
+    needs: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

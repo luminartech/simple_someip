@@ -1,10 +1,14 @@
 # Thin caller for the org-wide reusable Rust CI workflow, matching the sibling
 # protocol repos (`simple_doip`, `uds_protocol`, `automotive_wire_codec`).
 #
-# Unlike those three, this repository keeps a second workflow. `ci.yml` still
-# owns the bare-metal and Windows lanes that `rust_workflow` cannot express --
-# see the header there for why each one stayed. This file owns everything the
-# shared workflow does cover.
+# Unlike those three, this repository keeps its own `ci.yml` as well, and this
+# file takes over none of its jobs -- the shared workflow cannot express any of
+# them, for reasons recorded one by one in that file's header and in the `run-*`
+# comments below.
+#
+# What this file adds, all of which the repo previously lacked: release-plz,
+# a docs build, a security audit, a publish dry run, a release build, and a
+# no_std smoke build.
 #
 # Releasing is not a separate workflow: `use-release-plz` below turns on the
 # two release-plz jobs in the reusable workflow, which maintain a release PR
@@ -108,6 +112,19 @@ jobs:
       # MSRV to verify against. Picking one is a policy decision, not a CI
       # one; add `rust-version` to Cargo.toml and flip this to `true`.
       run-msrv: false
+      # `run-lint` -- the shared job hardcodes `cargo clippy --all-targets`,
+      # which the old pipeline did not. That surfaces ~89 pre-existing
+      # pedantic and style findings in test and example code, and
+      # `clippy-args` only appends after `--`, so the scope cannot be narrowed
+      # from here. `ci.yml` keeps `Format & Lint` at its original scope.
+      # Unblocking this means either fixing those findings or the shared
+      # workflow gaining a lint-scope input.
+      run-lint: false
+      # `run-semver-checks` -- `cargo-semver-checks` builds rustdoc with ALL
+      # features and does not take `feature-flags`, so it trips this crate's
+      # own `compile_error!` guard for `bare-metal-runtime`. Not fixable from
+      # the caller; `ci.yml` keeps `SemVer Check`, which passes a feature set.
+      run-semver-checks: false
       # `run-miri-tests` -- this crate has never run miri. Turning it on in
       # the same change that moves the whole pipeline would conflate a
       # migration with a new gate, and miri on a crate with this much unsafe-free
@@ -115,12 +132,6 @@ jobs:
       # in its own PR, where a failure is unambiguous.
       run-miri-tests: false
 
-      # ON: 0.12.0 and 0.13.0 are both on crates.io, so cargo-semver-checks has
-      # a published baseline to diff the public API against. Note what it does
-      # not catch -- it reads the API surface, so a function that keeps its
-      # signature and changes its bytes passes clean. Behavioural breaks still
-      # need `!` on the PR title by hand.
-      run-semver-checks: true
       # Needs no credentials and is the check that the crate still packages.
       run-publish-dry-run: true
 
