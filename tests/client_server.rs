@@ -205,7 +205,8 @@ async fn test_client_server_subscribe_and_receive_event() {
     let _ = tokio::time::timeout(std::time::Duration::from_millis(250), updates.recv()).await;
 
     // Publish an event from the server to the client's unicast port
-    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
+    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header())
+        .expect("in-tree SdHeader sizing is infallible");
     let sent = publisher
         .publish_event(service_id, 1, 0x01, &event_msg)
         .await
@@ -349,7 +350,8 @@ async fn test_add_endpoint_and_send_to_service() {
     let _ = tokio::time::timeout(std::time::Duration::from_millis(250), updates.recv()).await;
 
     // Publish an event from the server
-    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
+    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header())
+        .expect("in-tree SdHeader sizing is infallible");
     let sent = publisher
         .publish_event(service_id, 1, 0x01, &event_msg)
         .await
@@ -371,7 +373,8 @@ async fn test_add_endpoint_and_send_to_service() {
         ))
         .await
         .unwrap();
-    let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
+    let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header())
+        .expect("in-tree SdHeader sizing is infallible");
     let result = client
         .send_to_service(
             ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
@@ -431,7 +434,8 @@ async fn test_subscribe_auto_binds_discovery() {
     let _ = tokio::time::timeout(std::time::Duration::from_millis(250), updates.recv()).await;
 
     // Publish an event and verify the client can receive it
-    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
+    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header())
+        .expect("in-tree SdHeader sizing is infallible");
     let sent = publisher
         .publish_event(service_id, 1, 0x01, &event_msg)
         .await
@@ -489,7 +493,8 @@ async fn test_client_request_resolves_via_unicast_reply() {
 
     // send_to_service creates a PendingResponse; the server will send the event
     // which has a matching request_id, resolving it.
-    let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
+    let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header())
+        .expect("in-tree SdHeader sizing is infallible");
     let pending = client
         .send_to_service(
             ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
@@ -499,7 +504,8 @@ async fn test_client_request_resolves_via_unicast_reply() {
         .expect("send_to_service failed");
 
     // Publish an event that the client unicast socket will receive
-    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
+    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header())
+        .expect("in-tree SdHeader sizing is infallible");
     publisher
         .publish_event(service_id, 1, 0x01, &event_msg)
         .await
@@ -690,7 +696,8 @@ async fn test_multiple_subscribers_receive_events() {
     let _ = tokio::time::timeout(std::time::Duration::from_millis(250), updates2.recv()).await;
 
     // Publish event
-    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
+    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header())
+        .expect("in-tree SdHeader sizing is infallible");
     let sent = publisher
         .publish_event(service_id, 1, 0x01, &event_msg)
         .await
@@ -904,7 +911,8 @@ async fn test_two_devices_same_service_instance_addressed_independently() {
     );
 
     // Publish from A: the client must receive an event sourced from A, not B.
-    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
+    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header())
+        .expect("in-tree SdHeader sizing is infallible");
     let sent_a = publisher_a
         .publish_event(service_id, 1, 0x01, &event_msg)
         .await
@@ -945,7 +953,8 @@ async fn test_two_devices_same_service_instance_addressed_independently() {
         .await
         .unwrap();
 
-    let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
+    let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header())
+        .expect("in-tree SdHeader sizing is infallible");
     let result_a = client
         .send_to_service(
             ServiceEndpointKey::udp(service_id, SocketAddr::V4(addr_a)),
@@ -957,7 +966,8 @@ async fn test_two_devices_same_service_instance_addressed_independently() {
         "expected ServiceNotFound for removed device A, got {result_a:?}"
     );
 
-    let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header());
+    let msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header())
+        .expect("in-tree SdHeader sizing is infallible");
     let result_b = client
         .send_to_service(
             ServiceEndpointKey::udp(service_id, SocketAddr::V4(addr_b)),

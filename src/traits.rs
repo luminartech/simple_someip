@@ -67,7 +67,18 @@ pub trait PayloadWireFormat:
     // and the test header — are plain owned/borrowed structs that are auto
     // `Send + Sync`), instead of threading a `where` clause through every
     // client type definition and impl.
-    type SdHeader: automotive_wire_codec::Encode + Clone + core::fmt::Debug + Eq + Send + Sync;
+    // `Error = protocol::Error` matches the bound this trait already puts on
+    // `Self`. Without it the associated error type is opaque, which is what
+    // pushed `Message::new_sd` into swallowing a failed `encoded_size` with
+    // `unwrap_or(0)` -- it could not name the error to propagate it. Every
+    // concrete `SdHeader` already uses `protocol::Error`, so this costs
+    // nothing in tree and closes the hole for downstream impls.
+    type SdHeader: automotive_wire_codec::Encode<Error = protocol::Error>
+        + Clone
+        + core::fmt::Debug
+        + Eq
+        + Send
+        + Sync;
 
     /// Get the Message ID for the payload
     fn message_id(&self) -> MessageId;

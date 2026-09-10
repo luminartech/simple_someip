@@ -936,7 +936,7 @@ mod tests {
     }
 
     fn make_test_message() -> Message<TestPayload> {
-        Message::new_sd(0x0001, &empty_sd_header())
+        Message::new_sd(0x0001, &empty_sd_header()).expect("in-tree SdHeader sizing is infallible")
     }
 
     #[tokio::test]

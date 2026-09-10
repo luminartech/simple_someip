@@ -1488,7 +1488,8 @@ mod tests {
         assert!(debug_str.contains("SenderRebooted"));
 
         // Unicast
-        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
+        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let update: ClientUpdate<TestPayload> = ClientUpdate::Unicast {
             message: msg,
             e2e_status: None,
@@ -1506,7 +1507,8 @@ mod tests {
     #[test]
     fn unicast_update_carries_source() {
         let src = SocketAddr::new(Ipv4Addr::new(192, 168, 11, 101).into(), 30640);
-        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
+        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let update: ClientUpdate<TestPayload> = ClientUpdate::Unicast {
             message: msg,
             e2e_status: None,
@@ -1598,7 +1600,8 @@ mod tests {
         }
 
         // Inner loop must still be responsive after the stress.
-        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
+        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             client.request(
@@ -1657,7 +1660,8 @@ mod tests {
     async fn test_send_to_service_unknown_returns_error() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let _run_handle = tokio::spawn(run_fut);
-        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
+        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let result = client
             .send_to_service(
                 ServiceEndpointKey::udp(
@@ -1752,7 +1756,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
+        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         // send_to_service succeeds (send completes), returning a PendingResponse
         let pending = client
             .send_to_service(ServiceEndpointKey::udp(0x1234, SocketAddr::V4(addr)), msg)
@@ -1809,7 +1814,8 @@ mod tests {
     async fn test_request_unknown_service_returns_error() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let _run_handle = tokio::spawn(run_fut);
-        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header());
+        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let result = client
             .request(
                 ServiceEndpointKey::udp(

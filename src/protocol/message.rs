@@ -18,19 +18,27 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
     }
 
     /// Creates a new SOME/IP-SD message from a request ID and SD header.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from [`Encode::encoded_size`] on the SD header. No
+    /// in-tree `SdHeader` can fail this -- `sd::Header::encoded_size` is
+    /// unconditionally `Ok` -- but [`PayloadWireFormat`] is public, and a
+    /// downstream implementation may.
     pub fn new_sd(
         request_id: u32,
         sd_header: &<PayloadDefinition as PayloadWireFormat>::SdHeader,
-    ) -> Self {
-        // Every concrete `SdHeader` type overrides `encoded_size` with a
-        // closed-form `Ok(n)` that cannot fail; `unwrap_or(0)` avoids a
-        // `Debug` bound on the (generic) associated error type.
-        let sd_header_size = sd_header.encoded_size().unwrap_or(0);
-        Self::new(
+    ) -> Result<Self, Error> {
+        // Propagated rather than defaulted. `unwrap_or(0)` produced
+        // `Header::new_sd(request_id, 0)` -- a header declaring the bare
+        // 8-byte SD length -- and `encode` then wrote the full payload after
+        // it. Receivers truncate at the declared length, so a failure here
+        // used to become silent wire corruption instead of an error.
+        let sd_header_size = sd_header.encoded_size()?;
+        Ok(Self::new(
             Header::new_sd(request_id, sd_header_size),
             PayloadDefinition::new_sd_payload(sd_header),
-        )
+        ))
     }
 
     /// Returns a reference to the message header.
@@ -216,7 +224,25 @@ mod tests {
     }
 
     fn make_sd_message() -> Msg {
-        Msg::new_sd(0x0000_0001, &minimal_sd_header())
+        Msg::new_sd(0x0000_0001, &minimal_sd_header()).expect("in-tree SdHeader cannot fail")
+    }
+
+    /// A failing `SdHeader::encoded_size` must surface as an error, not as a
+    /// header declaring the bare 8-byte SD length.
+    ///
+    /// `unwrap_or(0)` built `Header::new_sd(request_id, 0)` on `Err`, and
+    /// `Message::encode` then wrote the full payload after it. Receivers
+    /// truncate at the declared length, so the failure mode was silent wire
+    /// corruption rather than an error. (PR #153 review.)
+    #[test]
+    fn new_sd_surfaces_a_failing_sd_header_size() {
+        use crate::protocol::sd::test_support::{FailingPayload, FailingSdHeader};
+
+        assert!(
+            FailingSdHeader.encoded_size().is_err(),
+            "fixture must actually fail, or this test proves nothing",
+        );
+        assert!(Message::<FailingPayload>::new_sd(0x1, &FailingSdHeader).is_err());
     }
 
     // --- new ---
@@ -319,7 +345,7 @@ mod tests {
             entries,
             options: heapless::Vec::new(),
         };
-        let msg = Msg::new_sd(0x42, &sd_hdr);
+        let msg = Msg::new_sd(0x42, &sd_hdr).expect("in-tree SdHeader cannot fail");
         let mut buf = [0u8; 64];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
         let view = MessageView::parse(&buf[..n]).unwrap();
