@@ -1,0 +1,127 @@
+# Thin caller for the org-wide reusable Rust CI workflow, matching the sibling
+# protocol repos (`simple_doip`, `uds_protocol`, `automotive_wire_codec`).
+#
+# Unlike those three, this repository keeps a second workflow. `ci.yml` still
+# owns the bare-metal and Windows lanes that `rust_workflow` cannot express --
+# see the header there for why each one stayed. This file owns everything the
+# shared workflow does cover.
+#
+# Releasing is not a separate workflow: `use-release-plz` below turns on the
+# two release-plz jobs in the reusable workflow, which maintain a release PR
+# on every `main` push and publish when it merges. `release-plz.yml` is gone.
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      enable-comprehensive-tests:
+        description: 'Run comprehensive test suites'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: luminartech/rust_workflow/.github/workflows/rust-ci.yml@v1
+    # The test jobs downscope themselves to `contents: read`; this grant
+    # exists for the release-plz jobs, which push the release-PR branch and
+    # the release tag.
+    permissions:
+      contents: write
+      pull-requests: write
+    secrets:
+      cargo-registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      release-plz-app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
+      release-plz-app-private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
+    with:
+      # release-plz owns versioning, the changelog, tags, GitHub releases and
+      # the publish, as it did before -- but through the shared workflow's
+      # jobs rather than this repo's own `release-plz.yml`.
+      use-release-plz: true
+      # Restrict publishing to the canonical repo so a fork never publishes
+      # under this crate's name.
+      publish-repository: luminartech/simple_someip
+      # The workspace has seven members (the crate, five examples, and
+      # `simple-someip-embassy-net`); semver-checks and publish target the
+      # library only.
+      package: simple-someip
+
+      # OFF: `run-unit-tests` cannot move here. The shared workflow applies
+      # one `feature-flags` value to build, test, clippy and docs alike, and
+      # this crate needs two different sets. Lint wants `bare_metal` in (to
+      # cover the bare-metal-gated code); tests want it OUT, because the
+      # server's runtime caps (`SUBSCRIBERS_PER_GROUP` and friends) default
+      # tight under `bare_metal` and generous otherwise -- running the host
+      # suite at the tight defaults fails a dozen server tests. `ci.yml` keeps
+      # the test + coverage job at `$HOST_FEATURES` for that reason. Revisit if
+      # the shared workflow ever grows a separate test-feature input.
+      run-unit-tests: false
+
+      # `--all-features` -- the workflow default -- cannot build this crate.
+      # `bare-metal-runtime` is no-alloc and the manifest rejects combining it
+      # with `std`/`_alloc`/`embassy_channels`/`*-tokio`, so cargo fails before
+      # compiling. This is `$ALLOC_FEATURES` from the old `ci.yml`, and with
+      # `run-unit-tests: false` above it now feeds lint, docs and the publish
+      # dry run only -- the lanes that want the widest buildable surface. The
+      # bare-metal-only combinations are covered by dedicated lanes in
+      # `ci.yml`.
+      feature-flags: >-
+        --no-default-features --features
+        std,tracing,client,client-tokio,server,server-tokio,bare_metal,embassy_channels
+
+      # This crate's alloc gate is `_alloc`, not the workflow's default
+      # `alloc`. Naming it wrong would silently skip the alloc build variants.
+      alloc-feature: _alloc
+
+      # `thumbv7em-none-eabihf` rather than the workflow's `thumbv6m` default:
+      # it is the target this crate's bare-metal support targets.
+      #
+      # This does NOT replace `ci.yml`'s `no_std target build`. That job builds
+      # four separate feature combinations and audits each rlib for allocator
+      # symbols; this one builds the target with and without the alloc feature.
+      # The shared job is the cheap smoke test, the local one is the gate.
+      no-std-target: thumbv7em-none-eabihf
+
+      # OFF, each for a concrete reason rather than by preference:
+      #
+      # `run-property-tests` -- there are no `prop_`-named tests in this crate.
+      # The property job's nextest filter would select nothing, and
+      # `cargo nextest` exits 4 on an empty selection, so the job would fail
+      # rather than skip.
+      run-property-tests: false
+      # `run-fuzz-tests` -- there is no `fuzz/` cargo-fuzz package here.
+      run-fuzz-tests: false
+      # `run-pre-commit` -- there is no `.pre-commit-config.yaml`.
+      run-pre-commit: false
+      # `run-msrv` -- the manifest declares no `rust-version`, so there is no
+      # MSRV to verify against. Picking one is a policy decision, not a CI
+      # one; add `rust-version` to Cargo.toml and flip this to `true`.
+      run-msrv: false
+      # `run-miri-tests` -- this crate has never run miri. Turning it on in
+      # the same change that moves the whole pipeline would conflate a
+      # migration with a new gate, and miri on a crate with this much unsafe-free
+      # slice work is likely to need `miri-args` tuning first. Worth enabling
+      # in its own PR, where a failure is unambiguous.
+      run-miri-tests: false
+
+      # ON: 0.12.0 and 0.13.0 are both on crates.io, so cargo-semver-checks has
+      # a published baseline to diff the public API against. Note what it does
+      # not catch -- it reads the API surface, so a function that keeps its
+      # signature and changes its bytes passes clean. Behavioural breaks still
+      # need `!` on the PR title by hand.
+      run-semver-checks: true
+      # Needs no credentials and is the check that the crate still packages.
+      run-publish-dry-run: true
+
+      comprehensive-tests: ${{ inputs.enable-comprehensive-tests || false }}
