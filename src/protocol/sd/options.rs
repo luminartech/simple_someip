@@ -380,6 +380,19 @@ impl<'a> OptionView<'a> {
         validate_option(self.0).map(|_| ())
     }
 
+    /// A view is only guaranteed to hold the 4-byte option header -- `decode`
+    /// is deliberately lazy about the type and per-type length -- so each
+    /// accessor that reads a body checks its own span before indexing.
+    fn ensure_body_len(&self, needed: usize) -> Result<(), Error> {
+        if self.0.len() < needed {
+            return Err(Error::IncorrectOptionsSize {
+                needed,
+                available: self.0.len(),
+            });
+        }
+        Ok(())
+    }
+
     /// Parse as IPv4 endpoint/multicast/SD option.
     /// Returns `(ip, protocol, port)`.
     ///
@@ -391,6 +404,7 @@ impl<'a> OptionView<'a> {
     /// it is retained only to keep the API usable if an `OptionView` is ever constructed
     /// outside the validated parse path.
     pub fn as_ipv4(&self) -> Result<(Ipv4Addr, TransportProtocol, u16), Error> {
+        self.ensure_body_len(IPV4_OPTION_WIRE_SIZE)?;
         let ip = Ipv4Addr::from_bits(u32::from_be_bytes([
             self.0[IPV4_OPTION_IP_OFFSET],
             self.0[IPV4_OPTION_IP_OFFSET + 1],
@@ -416,6 +430,7 @@ impl<'a> OptionView<'a> {
     /// it is retained only to keep the API usable if an `OptionView` is ever constructed
     /// outside the validated parse path.
     pub fn as_ipv6(&self) -> Result<(Ipv6Addr, TransportProtocol, u16), Error> {
+        self.ensure_body_len(IPV6_OPTION_WIRE_SIZE)?;
         let mut octets = [0u8; 16];
         octets.copy_from_slice(&self.0[IPV6_OPTION_IP_OFFSET..IPV6_OPTION_IP_END]);
         let ip = Ipv6Addr::from(octets);
@@ -441,6 +456,7 @@ impl<'a> OptionView<'a> {
     ///
     /// Currently always succeeds; the `Result` return type is reserved for future validation.
     pub fn as_load_balancing(&self) -> Result<(u16, u16), Error> {
+        self.ensure_body_len(LOAD_BALANCING_OPTION_WIRE_SIZE)?;
         let priority = u16::from_be_bytes([
             self.0[OPTION_PAYLOAD_OFFSET],
             self.0[OPTION_PAYLOAD_OFFSET + 1],
@@ -527,11 +543,25 @@ impl<'a> Decode<'a> for OptionView<'a> {
     ///
     /// Returns [`Incomplete`](automotive_wire_codec::Incomplete) if fewer than
     /// the fixed option header remains, or if the declared wire size exceeds
-    /// the remaining bytes.
+    /// the remaining bytes, and
+    /// [`IncorrectOptionsSize`](Error::IncorrectOptionsSize) if the declared
+    /// wire size is smaller than the option header itself.
     fn decode(buf: &'a [u8]) -> Result<(Self, &'a [u8]), Self::Error> {
         ensure_len(buf, OPTION_HEADER_SIZE)?;
         let length = u16::from_be_bytes([buf[0], buf[1]]);
         let wire_size = usize::from(length) + OPTION_LENGTH_SIZE_DELTA;
+        // `wire_size` is `length + 3`, so a declared `length` below 1 produces
+        // a view shorter than the 4-byte header this function just required --
+        // a view that contradicts its own header. `configuration_bytes` reads
+        // from `OPTION_PAYLOAD_OFFSET` unconditionally and would index past the
+        // end of such a view. Reject it here so no accessor can see one.
+        if wire_size < OPTION_HEADER_SIZE {
+            return Err(Error::IncorrectOptionsSize {
+                needed: OPTION_HEADER_SIZE,
+                available: wire_size,
+            }
+            .into());
+        }
         let (head, rest) = take(buf, wire_size)?;
         Ok((OptionView(head), rest))
     }
@@ -671,6 +701,82 @@ mod tests {
     use core::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+
+    // --- Under-length option views (PR #153 review, blocking finding) ---
+    //
+    // `decode` required OPTION_HEADER_SIZE (4) but then took
+    // `length + OPTION_LENGTH_SIZE_DELTA` (3), so a small declared `length`
+    // produced a view shorter than the header `decode` had just insisted on,
+    // and the accessors indexed it unconditionally.
+
+    /// `length = 0` yields a 3-byte view — shorter than the 4-byte header
+    /// `decode` just required. `configuration_bytes` then indexed past its end.
+    #[test]
+    fn decode_rejects_a_wire_size_below_the_option_header() {
+        let buf = [0x00, 0x00, 0x01, 0x00];
+        assert!(
+            matches!(
+                OptionView::decode(&buf),
+                Err(crate::protocol::Error::Sd(
+                    Error::IncorrectOptionsSize { .. }
+                ))
+            ),
+            "a 3-byte view cannot satisfy the 4-byte option header",
+        );
+    }
+
+    /// The review's repro: `length = 2` gives a 5-byte view typed as IPv4
+    /// Endpoint (0x04), which needs 12.
+    #[test]
+    fn as_ipv4_rejects_a_view_too_short_for_an_ipv4_option() {
+        let buf = [0x00, 0x02, 0x04, 0x00, 0x00];
+        let (view, _) = OptionView::decode(&buf).expect("header-sized view decodes");
+        assert!(matches!(
+            view.as_ipv4(),
+            Err(Error::IncorrectOptionsSize { .. })
+        ));
+    }
+
+    /// Same shape reached through the documented lazy path the review cites.
+    #[test]
+    fn to_owned_rejects_a_short_ipv4_option_instead_of_panicking() {
+        let buf = [0x00, 0x02, 0x04, 0x00, 0x00];
+        let (view, _) = OptionView::decode(&buf).expect("header-sized view decodes");
+        assert!(view.to_owned().is_err());
+    }
+
+    #[test]
+    fn as_ipv6_rejects_a_view_too_short_for_an_ipv6_option() {
+        let buf = [0x00, 0x02, 0x06, 0x00, 0x00];
+        let (view, _) = OptionView::decode(&buf).expect("header-sized view decodes");
+        assert!(matches!(
+            view.as_ipv6(),
+            Err(Error::IncorrectOptionsSize { .. })
+        ));
+    }
+
+    #[test]
+    fn as_load_balancing_rejects_a_view_too_short_for_the_option() {
+        let buf = [0x00, 0x02, 0x02, 0x00, 0x00];
+        let (view, _) = OptionView::decode(&buf).expect("header-sized view decodes");
+        assert!(matches!(
+            view.as_load_balancing(),
+            Err(Error::IncorrectOptionsSize { .. })
+        ));
+    }
+
+    /// A well-formed option must keep decoding — the guards must not reject
+    /// valid input.
+    #[test]
+    fn a_well_formed_ipv4_option_still_decodes() {
+        let mut buf = [0u8; IPV4_OPTION_WIRE_SIZE];
+        buf[0..2].copy_from_slice(&IPV4_OPTION_LENGTH_FIELD.to_be_bytes());
+        buf[OPTION_TYPE_OFFSET] = 0x04;
+        buf[IPV4_OPTION_PROTOCOL_OFFSET] = 0x11;
+        let (view, rest) = OptionView::decode(&buf).expect("valid option decodes");
+        assert!(rest.is_empty());
+        assert!(view.as_ipv4().is_ok());
+    }
 
     // --- TransportProtocol ---
 
