@@ -75,6 +75,18 @@ pub enum BuildError {
     /// [`InsufficientBuffer`] so callers see the needed / available byte
     /// counts, matching the rest of the crate's buffer-too-small reporting.
     BufferTooSmall(InsufficientBuffer),
+    /// A fixed-capacity entry or option list could not take another element.
+    ///
+    /// Distinct from [`BufferTooSmall`](Self::BufferTooSmall), whose
+    /// [`InsufficientBuffer`] fields are documented in *bytes*. Element counts
+    /// were previously reported through that variant, which read as a byte
+    /// count and would have been actively misleading if it ever fired.
+    ListFull {
+        /// Elements the caller tried to place.
+        needed: usize,
+        /// Elements the fixed-capacity list can hold.
+        capacity: usize,
+    },
     /// SD or SOME/IP encoding failed mid-write.
     EncodeFailed,
 }
@@ -83,6 +95,10 @@ impl core::fmt::Display for BuildError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             BuildError::BufferTooSmall(ib) => write!(f, "buffer too small: {ib}"),
+            BuildError::ListFull { needed, capacity } => write!(
+                f,
+                "fixed-capacity list full: needed {needed} elements, capacity {capacity}"
+            ),
             BuildError::EncodeFailed => f.write_str("encoding failed mid-write"),
         }
     }
@@ -225,11 +241,9 @@ fn build_multi_service_entry_datagram<const N: usize>(
         // cannot actually fail; the mapping keeps the fallible signature honest
         // and reports capacity as needed/available if that invariant is ever
         // broken.
-        entries.push(entry).map_err(|_| {
-            BuildError::BufferTooSmall(InsufficientBuffer {
-                needed: requests.len(),
-                available: N,
-            })
+        entries.push(entry).map_err(|_| BuildError::ListFull {
+            needed: requests.len(),
+            capacity: N,
         })?;
         options
             .push(SdOptions::IpV4Endpoint {
@@ -237,11 +251,9 @@ fn build_multi_service_entry_datagram<const N: usize>(
                 port: req.unicast_port,
                 protocol: TransportProtocol::Udp,
             })
-            .map_err(|_| {
-                BuildError::BufferTooSmall(InsufficientBuffer {
-                    needed: requests.len(),
-                    available: N,
-                })
+            .map_err(|_| BuildError::ListFull {
+                needed: requests.len(),
+                capacity: N,
             })?;
     }
     encode_sd_datagram(buf, &entries, &options, session, RebootFlag::Continuous)
@@ -581,7 +593,7 @@ mod tests {
                 assert_eq!(ib.available, SOMEIP_HEADER_LEN);
                 assert!(ib.needed > ib.available);
             }
-            BuildError::EncodeFailed => panic!("expected BufferTooSmall, got EncodeFailed"),
+            other => panic!("expected BufferTooSmall, got {other:?}"),
         }
     }
 
