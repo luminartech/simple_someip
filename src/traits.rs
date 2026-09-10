@@ -18,54 +18,67 @@ pub struct OfferedEndpoint {
     pub is_offer: bool,
 }
 
-/// A trait for types that can be serialized to a [`Writer`](embedded_io::Write).
+/// Crate-local conveniences over any codec [`Encode`](automotive_wire_codec::Encode) type.
 ///
-/// `WireFormat` acts as the base trait for all types that can be serialized
-/// as part of the Simple SOME/IP ecosystem. Decoding is handled by zero-copy
-/// view types (`HeaderView`, `MessageView`, etc.) instead of this trait.
-pub trait WireFormat: Send + Sized + Sync {
-    /// Returns the number of bytes required to serialize this value.
-    fn required_size(&self) -> usize;
-
-    /// Serialize a value to a byte stream.
-    /// Returns the number of bytes written.
-    /// # Errors
-    /// - If the data cannot be written to the stream
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
-
-    /// Encode into a byte slice, returning the number of bytes written.
-    ///
-    /// # Errors
-    /// Returns an error if `buf` is too small (requires at least
-    /// [`required_size()`](Self::required_size) bytes).
-    fn encode_to_slice(&self, buf: &mut [u8]) -> Result<usize, protocol::Error> {
-        // `embedded_io::Write` is implemented for `&mut [u8]` (the writer
-        // advances the slice), so the writer passed to `encode` is a
-        // reborrow of `buf` — named to avoid a `&mut &mut` expression.
-        let mut writer: &mut [u8] = buf;
-        self.encode(&mut writer)
-    }
-
+/// The codec's `Encode` trait provides `encode`, `encoded_size`, and
+/// `encode_to_slice`; this extension adds the heap-allocating
+/// `encode_to_vec` helper for `std` builds. It is blanket-implemented for
+/// every `Encode` type, so bringing it into scope makes `encode_to_vec`
+/// available anywhere.
+pub trait EncodeExt: automotive_wire_codec::Encode {
     /// Encode into a newly allocated `Vec<u8>`.
     ///
     /// # Errors
     /// Returns an error if encoding fails.
     #[cfg(feature = "std")]
-    fn encode_to_vec(&self) -> Result<std::vec::Vec<u8>, protocol::Error> {
-        let mut buf = std::vec![0u8; self.required_size()];
-        self.encode_to_slice(&mut buf)?;
+    fn encode_to_vec(&self) -> Result<std::vec::Vec<u8>, Self::Error> {
+        let mut buf = std::vec![0u8; self.encoded_size()?];
+        let mut cursor: &mut [u8] = &mut buf;
+        self.encode(&mut cursor)?;
         Ok(buf)
     }
 }
 
+impl<T: automotive_wire_codec::Encode> EncodeExt for T {}
+
 /// A trait for SOME/IP Payload types that can be serialized to a
 /// [`Writer`](embedded_io::Write) and constructed from raw payload bytes.
 ///
+/// The encode side is provided by the [`Encode`](automotive_wire_codec::Encode)
+/// supertrait (`encoded_size` + `encode`); implementors get `encode_to_slice`
+/// and — under `std` — the crate's [`EncodeExt`]`::encode_to_vec` for free.
+///
 /// Note that SOME/IP payloads are not self identifying, so the [Message ID](protocol::MessageId)
-/// must be provided by the caller.
-pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
+/// must be provided by the caller: `Encode` alone cannot reconstruct a payload
+/// from bytes, which is why [`from_payload_bytes`](Self::from_payload_bytes)
+/// remains an inherent requirement.
+pub trait PayloadWireFormat:
+    automotive_wire_codec::Encode<Error = protocol::Error> + core::fmt::Debug + Send + Sized + Sync
+{
     /// The SD header type used by this payload implementation.
-    type SdHeader: WireFormat + Clone + core::fmt::Debug + Eq;
+    // `Send + Sync` used to come for free from this trait's predecessor's own
+    // `Send + Sync` supertrait (removed in the codec migration). The codec's
+    // `Encode` has no such supertrait, but the client's channel-carried types
+    // (`DiscoveryMessage`,
+    // `ClientUpdate`, `ControlMessage`) embed `SdHeader` and flow through
+    // `Send`-bounded channels, so the bound is pervasive rather than
+    // localized. Restate it here on the associated type (all concrete
+    // `SdHeader` types — `VecSdHeader`, `HeaplessSdHeader`, `sd::Header<'a>`,
+    // and the test header — are plain owned/borrowed structs that are auto
+    // `Send + Sync`), instead of threading a `where` clause through every
+    // client type definition and impl.
+    // `Error = protocol::Error` matches the bound this trait already puts on
+    // `Self`. Without it the associated error type is opaque, which is what
+    // pushed `Message::new_sd` into swallowing a failed `encoded_size` with
+    // `unwrap_or(0)` -- it could not name the error to propagate it. Every
+    // concrete `SdHeader` already uses `protocol::Error`, so this costs
+    // nothing in tree and closes the hole for downstream impls.
+    type SdHeader: automotive_wire_codec::Encode<Error = protocol::Error>
+        + Clone
+        + core::fmt::Debug
+        + Eq
+        + Send
+        + Sync;
 
     /// Get the Message ID for the payload
     fn message_id(&self) -> MessageId;
@@ -80,14 +93,6 @@ pub trait PayloadWireFormat: core::fmt::Debug + Send + Sized + Sync {
     fn new_sd_payload(header: &Self::SdHeader) -> Self;
     /// Return the SD flags if this payload is a service discovery message.
     fn sd_flags(&self) -> Option<Flags>;
-    /// Number of bytes required to write the payload
-    fn required_size(&self) -> usize;
-    /// Serialize the payload to a [Writer](embedded_io::Write)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the payload cannot be written to the writer.
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error>;
 
     /// Construct an SD header for subscribing to an event group.
     #[allow(clippy::too_many_arguments)]

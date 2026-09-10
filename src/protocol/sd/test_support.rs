@@ -1,5 +1,6 @@
 use crate::protocol::sd;
-use crate::traits::{PayloadWireFormat, WireFormat};
+use crate::traits::PayloadWireFormat;
+use automotive_wire_codec::Encode;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TestSdHeader {
@@ -8,14 +9,13 @@ pub(crate) struct TestSdHeader {
     pub options: heapless::Vec<sd::Options, 4>,
 }
 
-impl WireFormat for TestSdHeader {
-    fn required_size(&self) -> usize {
-        sd::Header::new(self.flags, &self.entries, &self.options).required_size()
+impl Encode for TestSdHeader {
+    type Error = crate::protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        sd::Header::new(self.flags, &self.entries, &self.options).encoded_size()
     }
-    fn encode<T: embedded_io::Write>(
-        &self,
-        writer: &mut T,
-    ) -> Result<usize, crate::protocol::Error> {
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
         sd::Header::new(self.flags, &self.entries, &self.options).encode(writer)
     }
 }
@@ -27,6 +27,18 @@ impl WireFormat for TestSdHeader {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TestPayload {
     pub header: TestSdHeader,
+}
+
+impl Encode for TestPayload {
+    type Error = crate::protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        self.header.encoded_size()
+    }
+
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
+        self.header.encode(writer)
+    }
 }
 
 impl PayloadWireFormat for TestPayload {
@@ -70,15 +82,6 @@ impl PayloadWireFormat for TestPayload {
     }
     fn sd_flags(&self) -> Option<sd::Flags> {
         Some(self.header.flags)
-    }
-    fn required_size(&self) -> usize {
-        self.header.required_size()
-    }
-    fn encode<T: embedded_io::Write>(
-        &self,
-        writer: &mut T,
-    ) -> Result<usize, crate::protocol::Error> {
-        self.header.encode(writer)
     }
     fn new_subscription_sd_header(
         service_id: u16,
@@ -217,5 +220,89 @@ mod tests {
             header: empty_sd_header(),
         };
         assert!(p.offered_endpoints().is_empty());
+    }
+}
+
+/// An `SdHeader` whose `encoded_size` fails, modelling a downstream
+/// [`PayloadWireFormat`] impl.
+///
+/// No in-tree `SdHeader` can fail — `sd::Header::encoded_size` is
+/// unconditionally `Ok(size)` — so the only way to exercise the error path
+/// that the trait bound permits is to write an impl that takes it. That is
+/// precisely the case the PR #153 review flagged: the bound does not require
+/// infallibility, and `PayloadWireFormat` is public.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailingSdHeader;
+
+impl Encode for FailingSdHeader {
+    type Error = crate::protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        Err(crate::protocol::Error::Sd(
+            sd::Error::ConfigurationStringTooLong(usize::MAX),
+        ))
+    }
+
+    fn encode(&self, _writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
+        Err(crate::protocol::Error::Sd(
+            sd::Error::ConfigurationStringTooLong(usize::MAX),
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailingPayload {
+    pub header: FailingSdHeader,
+}
+
+impl Encode for FailingPayload {
+    type Error = crate::protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        self.header.encoded_size()
+    }
+
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
+        self.header.encode(writer)
+    }
+}
+
+impl PayloadWireFormat for FailingPayload {
+    type SdHeader = FailingSdHeader;
+    fn message_id(&self) -> crate::protocol::MessageId {
+        crate::protocol::MessageId::SD
+    }
+    fn as_sd_header(&self) -> Option<&FailingSdHeader> {
+        Some(&self.header)
+    }
+    fn from_payload_bytes(
+        _message_id: crate::protocol::MessageId,
+        _payload: &[u8],
+    ) -> Result<Self, crate::protocol::Error> {
+        Ok(Self {
+            header: FailingSdHeader,
+        })
+    }
+    fn new_sd_payload(header: &FailingSdHeader) -> Self {
+        Self {
+            header: header.clone(),
+        }
+    }
+    fn sd_flags(&self) -> Option<sd::Flags> {
+        None
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn new_subscription_sd_header(
+        _service_id: u16,
+        _instance_id: u16,
+        _major_version: u8,
+        _ttl: u32,
+        _event_group_id: u16,
+        _client_ip: core::net::Ipv4Addr,
+        _protocol: sd::TransportProtocol,
+        _client_port: u16,
+        _reboot_flag: sd::RebootFlag,
+    ) -> FailingSdHeader {
+        FailingSdHeader
     }
 }

@@ -1,7 +1,8 @@
 use crate::{
     protocol::{Error, Header, MessageType, ReturnCode, header::HeaderView, sd::SdHeaderView},
-    traits::{PayloadWireFormat, WireFormat},
+    traits::PayloadWireFormat,
 };
+use automotive_wire_codec::{Decode, Encode};
 
 /// A SOME/IP message consisting of a [`Header`] and a payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17,16 +18,27 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
     }
 
     /// Creates a new SOME/IP-SD message from a request ID and SD header.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from [`Encode::encoded_size`] on the SD header. No
+    /// in-tree `SdHeader` can fail this -- `sd::Header::encoded_size` is
+    /// unconditionally `Ok` -- but [`PayloadWireFormat`] is public, and a
+    /// downstream implementation may.
     pub fn new_sd(
         request_id: u32,
         sd_header: &<PayloadDefinition as PayloadWireFormat>::SdHeader,
-    ) -> Self {
-        let sd_header_size = sd_header.required_size();
-        Self::new(
+    ) -> Result<Self, Error> {
+        // Propagated rather than defaulted. `unwrap_or(0)` produced
+        // `Header::new_sd(request_id, 0)` -- a header declaring the bare
+        // 8-byte SD length -- and `encode` then wrote the full payload after
+        // it. Receivers truncate at the declared length, so a failure here
+        // used to become silent wire corruption instead of an error.
+        let sd_header_size = sd_header.encoded_size()?;
+        Ok(Self::new(
             Header::new_sd(request_id, sd_header_size),
             PayloadDefinition::new_sd_payload(sd_header),
-        )
+        ))
     }
 
     /// Returns a reference to the message header.
@@ -80,41 +92,16 @@ impl<'a> MessageView<'a> {
     ///
     /// Returns an error if the header is invalid, the buffer is too short for the
     /// declared payload, or SD-specific validation fails.
+    ///
+    /// Any bytes past the declared payload are silently discarded. Use the
+    /// [`Decode`] impl's [`decode`](Decode::decode) to recover the trailing
+    /// bytes (the next message in a multi-message datagram), or
+    /// [`decode_exact`](Decode::decode_exact) to reject them.
+    ///
+    /// This is a thin wrapper over the [`Decode`] impl, which is the single
+    /// source of decode logic for this type.
     pub fn parse(buf: &'a [u8]) -> Result<Self, Error> {
-        let (header, remaining) = HeaderView::parse(buf)?;
-        let payload_size = header.payload_size();
-
-        if remaining.len() < payload_size {
-            return Err(Error::UnexpectedEof);
-        }
-
-        // SD-specific validation
-        if header.is_sd() {
-            if payload_size < 12 {
-                return Err(
-                    crate::protocol::sd::Error::InvalidMessage("SD message too short").into(),
-                );
-            }
-            if header.interface_version() != 0x01 {
-                return Err(crate::protocol::sd::Error::InvalidMessage(
-                    "SD interface version mismatch",
-                )
-                .into());
-            }
-            if header.message_type().message_type() != MessageType::Notification {
-                return Err(
-                    crate::protocol::sd::Error::InvalidMessage("SD message type mismatch").into(),
-                );
-            }
-            if header.return_code() != ReturnCode::Ok {
-                return Err(
-                    crate::protocol::sd::Error::InvalidMessage("SD return code mismatch").into(),
-                );
-            }
-        }
-
-        let payload = &remaining[..payload_size];
-        Ok(Self { header, payload })
+        Ok(Self::decode(buf)?.0)
     }
 
     /// Returns the header view.
@@ -151,12 +138,75 @@ impl<'a> MessageView<'a> {
     }
 }
 
-impl<PayloadDefinition: PayloadWireFormat> WireFormat for Message<PayloadDefinition> {
-    fn required_size(&self) -> usize {
-        self.header.required_size() + self.payload.required_size()
+impl<'a> Decode<'a> for MessageView<'a> {
+    type Error = Error;
+
+    /// Decode a single SOME/IP message from the front of `buf`.
+    ///
+    /// Validates the header, checks that the buffer contains enough data for the
+    /// declared payload, and for SD messages validates SD-specific constraints.
+    /// Returns `(message, remaining_bytes)`, where the remainder is any bytes
+    /// past this message's declared payload (the next message in a
+    /// multi-message datagram).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the header is invalid, the buffer is too short for the
+    /// declared payload, or SD-specific validation fails.
+    fn decode(buf: &'a [u8]) -> Result<(Self, &'a [u8]), Error> {
+        let (header, remaining) = HeaderView::decode(buf)?;
+        if header.length() < 8 {
+            return Err(Error::InvalidLength(header.length()));
+        }
+        let payload_size = header.payload_size();
+
+        if remaining.len() < payload_size {
+            return Err(automotive_wire_codec::Incomplete {
+                needed: payload_size,
+                available: remaining.len(),
+            }
+            .into());
+        }
+
+        // SD-specific validation
+        if header.is_sd() {
+            if payload_size < 12 {
+                return Err(
+                    crate::protocol::sd::Error::InvalidMessage("SD message too short").into(),
+                );
+            }
+            if header.interface_version() != 0x01 {
+                return Err(crate::protocol::sd::Error::InvalidMessage(
+                    "SD interface version mismatch",
+                )
+                .into());
+            }
+            if header.message_type().message_type() != MessageType::Notification {
+                return Err(
+                    crate::protocol::sd::Error::InvalidMessage("SD message type mismatch").into(),
+                );
+            }
+            if header.return_code() != ReturnCode::Ok {
+                return Err(
+                    crate::protocol::sd::Error::InvalidMessage("SD return code mismatch").into(),
+                );
+            }
+        }
+
+        let payload = &remaining[..payload_size];
+        let rest = &remaining[payload_size..];
+        Ok((Self { header, payload }, rest))
+    }
+}
+
+impl<PayloadDefinition: PayloadWireFormat> Encode for Message<PayloadDefinition> {
+    type Error = Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        Ok(self.header.encoded_size()? + self.payload.encoded_size()?)
     }
 
-    fn encode<W: embedded_io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Error> {
         Ok(self.header.encode(writer)? + self.payload.encode(writer)?)
     }
 }
@@ -174,7 +224,25 @@ mod tests {
     }
 
     fn make_sd_message() -> Msg {
-        Msg::new_sd(0x0000_0001, &minimal_sd_header())
+        Msg::new_sd(0x0000_0001, &minimal_sd_header()).expect("in-tree SdHeader cannot fail")
+    }
+
+    /// A failing `SdHeader::encoded_size` must surface as an error, not as a
+    /// header declaring the bare 8-byte SD length.
+    ///
+    /// `unwrap_or(0)` built `Header::new_sd(request_id, 0)` on `Err`, and
+    /// `Message::encode` then wrote the full payload after it. Receivers
+    /// truncate at the declared length, so the failure mode was silent wire
+    /// corruption rather than an error. (PR #153 review.)
+    #[test]
+    fn new_sd_surfaces_a_failing_sd_header_size() {
+        use crate::protocol::sd::test_support::{FailingPayload, FailingSdHeader};
+
+        assert!(
+            FailingSdHeader.encoded_size().is_err(),
+            "fixture must actually fail, or this test proves nothing",
+        );
+        assert!(Message::<FailingPayload>::new_sd(0x1, &FailingSdHeader).is_err());
     }
 
     // --- new ---
@@ -244,23 +312,23 @@ mod tests {
         assert_eq!(msg.sd_header().unwrap(), &sd_hdr);
     }
 
-    // --- WireFormat: required_size ---
+    // --- Encode: encoded_size ---
 
     #[test]
     fn required_size_is_header_plus_payload() {
         let msg = make_sd_message();
-        let expected = msg.header().required_size() + msg.payload().required_size();
-        assert_eq!(msg.required_size(), expected);
+        let expected = msg.header().encoded_size().unwrap() + msg.payload().encoded_size().unwrap();
+        assert_eq!(msg.encoded_size().unwrap(), expected);
     }
 
-    // --- WireFormat: encode / MessageView::parse round-trip ---
+    // --- Encode: encode / MessageView::parse round-trip ---
 
     #[test]
     fn encode_parse_round_trip() {
         let msg = make_sd_message();
         let mut buf = [0u8; 64];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
-        assert_eq!(n, msg.required_size());
+        assert_eq!(n, msg.encoded_size().unwrap());
         let view = MessageView::parse(&buf[..n]).unwrap();
         assert!(view.is_sd());
         assert_eq!(view.header().to_owned(), *msg.header());
@@ -277,7 +345,7 @@ mod tests {
             entries,
             options: heapless::Vec::new(),
         };
-        let msg = Msg::new_sd(0x42, &sd_hdr);
+        let msg = Msg::new_sd(0x42, &sd_hdr).expect("in-tree SdHeader cannot fail");
         let mut buf = [0u8; 64];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
         let view = MessageView::parse(&buf[..n]).unwrap();
@@ -285,6 +353,47 @@ mod tests {
         assert_eq!(sd_view.entry_count(), 1);
         let entry = sd_view.entries().next().unwrap();
         assert_eq!(entry.service_id(), 0xABCD);
+    }
+
+    // --- Decode: trailing bytes are the next message ---
+
+    #[test]
+    fn decode_returns_trailing_bytes_as_remainder() {
+        let msg = make_sd_message();
+        let mut buf = [0u8; 128];
+        let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
+        // Append 5 trailing bytes past the message.
+        for (i, b) in [0xDE, 0xAD, 0xBE, 0xEF, 0x42].into_iter().enumerate() {
+            buf[n + i] = b;
+        }
+        let (view, rest) = MessageView::decode(&buf[..n + 5]).unwrap();
+        assert_eq!(view.header().to_owned(), *msg.header());
+        assert_eq!(rest, &[0xDE, 0xAD, 0xBE, 0xEF, 0x42]);
+    }
+
+    #[test]
+    fn parse_silently_discards_trailing_bytes() {
+        let msg = make_sd_message();
+        let mut buf = [0u8; 128];
+        let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
+        buf[n] = 0xFF;
+        // parse (the thin wrapper) drops the remainder without error.
+        let view = MessageView::parse(&buf[..=n]).unwrap();
+        assert_eq!(view.header().to_owned(), *msg.header());
+    }
+
+    #[test]
+    fn decode_exact_rejects_trailing_bytes() {
+        let msg = make_sd_message();
+        let mut buf = [0u8; 128];
+        let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
+        buf[n] = 0xFF;
+        assert!(matches!(
+            MessageView::decode_exact(&buf[..=n]),
+            Err(Error::Trailing(_))
+        ));
+        // Exactly-sized succeeds.
+        assert!(MessageView::decode_exact(&buf[..n]).is_ok());
     }
 
     // --- parse with exactly-sized slice ---
@@ -307,7 +416,46 @@ mod tests {
         let buf: [u8; 4] = [0; 4];
         assert!(matches!(
             MessageView::parse(&buf[..]),
-            Err(Error::UnexpectedEof)
+            Err(Error::Incomplete(automotive_wire_codec::Incomplete {
+                needed: 16,
+                available: 4,
+            }))
+        ));
+    }
+
+    #[test]
+    fn parse_payload_truncated_reports_needed_and_available() {
+        let msg = make_sd_message();
+        let mut buf = [0u8; 64];
+        let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
+        let payload_size = msg.header().payload_size();
+        // Keep the full 16-byte header but chop one byte off the payload.
+        let short = &buf[..n - 1];
+        assert!(matches!(
+            MessageView::parse(short),
+            Err(Error::Incomplete(automotive_wire_codec::Incomplete {
+                needed,
+                available,
+            })) if needed == payload_size && available == payload_size - 1
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_length_below_8() {
+        let msg = make_sd_message();
+        let mut buf = [0u8; 64];
+        msg.encode(&mut buf.as_mut_slice()).unwrap();
+        // Overwrite the length field (bytes 4..8) with a value below the
+        // 8-byte minimum. This must be rejected, not underflow/panic.
+        let bad_len: u32 = 4;
+        buf[4..8].copy_from_slice(&bad_len.to_be_bytes());
+        assert!(matches!(
+            MessageView::decode(&buf[..]),
+            Err(Error::InvalidLength(4))
+        ));
+        assert!(matches!(
+            MessageView::decode_exact(&buf[..16]),
+            Err(Error::InvalidLength(4))
         ));
     }
 

@@ -121,7 +121,8 @@ pub fn protect_profile5(
     // Compute CRC over: Counter + Payload + DataID (LE)
     let crc = compute_crc16_p5(config.data_id, counter, payload);
 
-    // Header: CRC (2, little-endian) + Counter (1)
+    // Header: CRC (2, little-endian per E2E Profile 5 — see `crc` module doc;
+    // intentional, do not change to big-endian) + Counter (1)
     output[0..2].copy_from_slice(&crc.to_le_bytes());
     output[2] = counter;
 
@@ -178,7 +179,8 @@ pub fn protect_profile5_with_header(
     let counter = state.protect_counter;
     let crc = compute_crc16_p5_with_header(config.data_id, counter, payload, upper_header);
 
-    // Header: CRC (2, little-endian) + Counter (1)
+    // Header: CRC (2, little-endian per E2E Profile 5 — see `crc` module doc;
+    // intentional, do not change to big-endian) + Counter (1)
     output[0..2].copy_from_slice(&crc.to_le_bytes());
     output[2] = counter;
 

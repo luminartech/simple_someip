@@ -6,10 +6,9 @@ use super::subscription_manager::{SUBSCRIBERS_PER_GROUP, SubscriptionHandle};
 use crate::CapacityKind;
 use crate::e2e::E2EKey;
 use crate::protocol::{Header, Message};
-use crate::traits::{PayloadWireFormat, WireFormat};
+use crate::traits::PayloadWireFormat;
 use crate::transport::{E2ERegistryHandle, SharedHandle, TransportSocket};
-#[cfg(test)]
-use alloc::sync::Arc;
+use automotive_wire_codec::Encode;
 use core::marker::PhantomData;
 use core::net::SocketAddrV4;
 use heapless::Vec as HeaplessVec;
@@ -194,7 +193,7 @@ where
         // `encode_to_slice` report a less-actionable protocol I/O error
         // when it runs out of buffer. Matches the raw-event path below
         // and the client socket_manager path.
-        let required_size = message.required_size();
+        let required_size = message.encoded_size()?;
         if required_size > msg_buf.len() {
             crate::log::error!(
                 "Message size ({} bytes) exceeds msg_buf.len() ({}); dropping publish",
@@ -207,7 +206,9 @@ where
         // Serialize the message into the caller-provided buffer.
         // (PR-3 #125 change: no longer uses an in-future `[u8; UDP_BUFFER_SIZE]`;
         // the caller decides the buffer size and lifetime.)
-        let mut message_length = message.encode_to_slice(msg_buf)?;
+        let mut message_length = message
+            .encode_to_slice(msg_buf)
+            .map_err(crate::protocol::Error::from)?;
 
         // Apply E2E protect if configured. `protected_buf` is disjoint from
         // `msg_buf`, so we can read the unprotected payload directly out of
@@ -225,6 +226,22 @@ where
                     protected_buf,
                 );
                 match result {
+                    // Post-hoc length backfill (intentional, not an `Encode` gap):
+                    // the SOME/IP length field at `msg_buf[4..8]` was already
+                    // written by `encode_to_slice` above, but E2E protection
+                    // changes the payload's size (header + CRC overhead), so
+                    // the final on-wire length isn't known until *after*
+                    // `protect` runs. A single-pass `Encode` impl cannot
+                    // express "go back and rewrite bytes already emitted
+                    // based on bytes written later" — that's exactly the
+                    // size-changing, post-hoc transform the codec's README
+                    // scopes out of `Encode`, recommending a two-phase
+                    // consumer-owned API instead. That two-phase API is
+                    // protect/check, which is why E2E stays off the
+                    // `Encode`/`Decode` traits rather than being forced onto
+                    // them. This rewrite does not change any on-wire bytes
+                    // that `Encode` would have produced without E2E; it only
+                    // patches the length field to reflect the protected size.
                     Some(Ok(protected_len)) => {
                         if 16 + protected_len > msg_buf.len() {
                             crate::log::error!(
@@ -439,7 +456,9 @@ where
 
         // Serialize header + payload into the caller-provided buffer.
         // (PR-3 #125 change: no longer uses an in-future `[u8; UDP_BUFFER_SIZE]`.)
-        let header_len = header.encode_to_slice(buf)?;
+        let header_len = header
+            .encode_to_slice(buf)
+            .map_err(crate::protocol::Error::from)?;
         let Some(total_len) = header_len.checked_add(payload.len()) else {
             crate::log::error!(
                 "raw event length computation overflowed usize (header_len={}, payload.len()={}); dropping publish",
@@ -742,7 +761,9 @@ where
             payload.len(),
         );
 
-        let header_len = header.encode_to_slice(buf)?;
+        let header_len = header
+            .encode_to_slice(buf)
+            .map_err(crate::protocol::Error::from)?;
         let Some(total_len) = header_len.checked_add(payload.len()) else {
             crate::log::error!(
                 "raw event length computation overflowed usize (header_len={}, payload.len()={}); dropping publish",
@@ -868,7 +889,7 @@ mod tests {
     use crate::server::SubscriptionManager;
     use crate::tokio_transport::TokioSocket;
     use std::net::{Ipv4Addr, SocketAddrV4};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::vec;
     use std::vec::Vec;
     use tokio::net::UdpSocket;
@@ -915,7 +936,7 @@ mod tests {
     }
 
     fn make_test_message() -> Message<TestPayload> {
-        Message::new_sd(0x0001, &empty_sd_header())
+        Message::new_sd(0x0001, &empty_sd_header()).expect("in-tree SdHeader sizing is infallible")
     }
 
     #[tokio::test]
@@ -1182,7 +1203,7 @@ mod tests {
         );
         let message = Message::new(header, payload);
         assert!(
-            message.required_size() > UDP_BUFFER_SIZE,
+            message.encoded_size().unwrap() > UDP_BUFFER_SIZE,
             "fixture must exceed cap",
         );
 
@@ -1244,7 +1265,7 @@ mod tests {
         );
         let message = Message::new(header, payload);
         assert!(
-            message.required_size() <= UDP_BUFFER_SIZE,
+            message.encoded_size().unwrap() <= UDP_BUFFER_SIZE,
             "fixture's raw size must fit the cap so the pre-encode check passes and \
              we actually exercise the post-protect guard",
         );

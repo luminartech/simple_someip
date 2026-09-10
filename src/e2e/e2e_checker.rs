@@ -102,6 +102,7 @@ pub fn check_profile5<'a>(
     }
 
     // Parse header: CRC (2, little-endian) + Counter (1)
+    // CRC field is little-endian per E2E Profile 5 (see `crc` module doc); intentional.
     let received_crc = u16::from_le_bytes([protected[0], protected[1]]);
     let counter = protected[2];
 
@@ -164,6 +165,7 @@ pub fn check_profile5_with_header<'a>(
         return E2ECheckResult::error(E2ECheckStatus::BadArgument);
     }
 
+    // CRC field is little-endian per E2E Profile 5 (see `crc` module doc); intentional.
     let received_crc = u16::from_le_bytes([protected[0], protected[1]]);
     let counter = protected[2];
     let payload = &protected[PROFILE5_HEADER_SIZE..];

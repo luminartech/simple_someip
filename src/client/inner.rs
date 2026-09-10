@@ -863,19 +863,34 @@ where
                             }
                         }
                         Some(discovery_socket) => {
-                            let message = Message::<PayloadDefinitions>::new_sd(
+                            // Sizing the SD header is fallible for a
+                            // downstream `PayloadWireFormat`. Report it rather
+                            // than sending a header whose declared length
+                            // disagrees with the payload that follows it.
+                            match Message::<PayloadDefinitions>::new_sd(
                                 u32::from(discovery_socket.session_id()),
                                 &header,
-                            );
-                            debug!("Sending {:?} to {}", &message, target);
-                            let send_result = self
-                                .discovery_socket
-                                .as_mut()
-                                .unwrap()
-                                .send(target, message)
-                                .await;
-                            if response.send(send_result).is_err() {
-                                debug!("SendSD: caller dropped the response receiver");
+                            ) {
+                                Ok(message) => {
+                                    debug!("Sending {:?} to {}", &message, target);
+                                    let send_result = self
+                                        .discovery_socket
+                                        .as_mut()
+                                        .unwrap()
+                                        .send(target, message)
+                                        .await;
+                                    if response.send(send_result).is_err() {
+                                        debug!("SendSD: caller dropped the response receiver");
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("SendSD: sizing the SD header failed: {e}");
+                                    if response.send(Err(e.into())).is_err() {
+                                        debug!(
+                                            "SendSD (size-err path): caller dropped the response receiver"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1115,21 +1130,34 @@ where
                                 discovery_socket.reboot_flag(),
                             );
                             let session_id = u32::from(discovery_socket.session_id());
-                            let message =
-                                Message::<PayloadDefinitions>::new_sd(session_id, &sd_header);
                             let target =
                                 SocketAddrV4::new(*provider.ip(), protocol::sd::MULTICAST_PORT);
-                            debug!("Sending Subscribe {:?} to {}", &message, target);
-                            let send_result = self
-                                .discovery_socket
-                                .as_mut()
-                                .unwrap()
-                                .send(target, message)
-                                .await;
-                            if response.send(send_result).is_err() {
-                                debug!(
-                                    "Subscribe: caller dropped the response receiver (expected for subscribe_no_wait)"
-                                );
+                            // See the SendSD arm: a downstream SD header can
+                            // fail to size, and a mis-declared length is worse
+                            // on the wire than a reported error.
+                            match Message::<PayloadDefinitions>::new_sd(session_id, &sd_header) {
+                                Ok(message) => {
+                                    debug!("Sending Subscribe {:?} to {}", &message, target);
+                                    let send_result = self
+                                        .discovery_socket
+                                        .as_mut()
+                                        .unwrap()
+                                        .send(target, message)
+                                        .await;
+                                    if response.send(send_result).is_err() {
+                                        debug!(
+                                            "Subscribe: caller dropped the response receiver (expected for subscribe_no_wait)"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("Subscribe: sizing the SD header failed: {e}");
+                                    if response.send(Err(e.into())).is_err() {
+                                        debug!(
+                                            "Subscribe (size-err path): caller dropped the response receiver"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1368,7 +1396,8 @@ mod tests {
         let (_rx, msg) = TestControl::remove_endpoint(lh_key(0x1234, 5000));
         assert!(matches!(msg, ControlMessage::RemoveEndpoint(..)));
 
-        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let (_send_rx, _resp_rx, msg) = TestControl::send_to_service(lh_key(0x1234, 5000), message);
         assert!(matches!(msg, ControlMessage::SendToService { .. }));
 
@@ -1437,7 +1466,8 @@ mod tests {
         // SendToService carries two senders — both must be notified so that
         // neither `send_rx.recv().await.unwrap()?` nor `PendingResponse::response()`
         // panics.
-        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let (send_rx, resp_rx, msg) = TestControl::send_to_service(lh_key(0x1234, 5000), message);
         msg.reject_with_capacity(CapacityKind::RequestQueue);
         expect_capacity(send_rx.recv(), "SendToService.send_complete");
@@ -1482,7 +1512,8 @@ mod tests {
         let s = format!("{msg:?}");
         assert!(s.contains("RemoveEndpoint"));
 
-        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let (_send_rx, _resp_rx, msg) = TestControl::send_to_service(lh_key(0x1234, 5000), message);
         let s = format!("{msg:?}");
         assert!(s.contains("SendToService"));
@@ -2007,7 +2038,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_to_service_constructor_returns_two_receivers() {
-        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let (send_rx, resp_rx, msg) = TestControl::send_to_service(lh_key(0x1234, 5000), message);
 
         // Extract the senders from the control message
@@ -2108,7 +2140,8 @@ mod tests {
         rx.recv().await.unwrap().unwrap();
 
         // Send SendToService with the send_complete receiver dropped
-        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let (send_rx, _resp_rx, msg) = TestControl::send_to_service(lh_key(0x1234, 5000), message);
         drop(send_rx);
         control_sender.send(msg).await.unwrap();
@@ -2217,7 +2250,8 @@ mod tests {
         control_sender.send(msg).await.unwrap();
         rx.recv().await.unwrap().unwrap();
 
-        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let (send_rx, _resp_rx, msg) = TestControl::send_to_service(lh_key(0x1234, 5000), message);
         control_sender.send(msg).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), send_rx.recv())
@@ -2354,13 +2388,15 @@ mod tests {
         rx.recv().await.unwrap().unwrap();
 
         // First send auto-binds unicast
-        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let (send_rx, _resp_rx, msg) = TestControl::send_to_service(lh_key(0x1234, 5000), message);
         control_sender.send(msg).await.unwrap();
         send_rx.recv().await.unwrap().unwrap();
 
         // Second send reuses the existing socket (no auto-bind needed)
-        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let message = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let (send_rx, _resp_rx, msg) = TestControl::send_to_service(lh_key(0x1234, 5000), message);
         control_sender.send(msg).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), send_rx.recv())
@@ -2607,9 +2643,9 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn handle_discovery_datagram_keys_offers_by_device_ip() {
+        use crate::Encode;
         use crate::RawPayload;
         use crate::protocol::sd::{self, Entry, Options, OptionsCount, ServiceEntry};
-        use crate::traits::WireFormat;
         use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
         type RawInner = Inner<
@@ -2675,7 +2711,10 @@ mod tests {
             [(1u32, DEVICE_A, addr_a), (2u32, DEVICE_B, addr_b)]
         {
             let sd_header = offer_header(service_addr, true);
-            let someip_header = protocol::Header::new_sd(request_id, sd_header.required_size());
+            let someip_header = protocol::Header::new_sd(
+                request_id,
+                sd_header.encoded_size().expect("encoded_size"),
+            );
             RawInner::handle_discovery_datagram(
                 SocketAddr::new(source_ip.into(), sd::MULTICAST_PORT),
                 TransportKind::Multicast,
@@ -2706,7 +2745,8 @@ mod tests {
         // ad515c3, the registry was keyed by (service_id, instance_id)
         // alone, so removing A's entry would have removed B's too.
         let stop_header = offer_header(addr_a, false);
-        let someip_header = protocol::Header::new_sd(3, stop_header.required_size());
+        let someip_header =
+            protocol::Header::new_sd(3, stop_header.encoded_size().expect("encoded_size"));
         RawInner::handle_discovery_datagram(
             SocketAddr::new(DEVICE_A.into(), sd::MULTICAST_PORT),
             TransportKind::Multicast,

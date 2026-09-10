@@ -20,7 +20,7 @@ The library supports both `std` and `no_std` environments, making it suitable fo
 ## Modules
 
 - `protocol` — Wire format layer: SOME/IP header, `MessageId`, `MessageType`, `ReturnCode`, SD entries/options
-- `traits` — `WireFormat` and `PayloadWireFormat` traits for custom message types
+- `traits` — `PayloadWireFormat` trait (built on `automotive_wire_codec::Encode`) for custom message types
 - `transport` — Executor-agnostic UDP socket / factory / timer / spawner traits (no_std-compatible)
 - `e2e` — End-to-End protection profiles (always available, no heap allocation)
 - `tokio_transport` — Default `std + tokio` impls of the transport traits (requires `feature = "client-tokio"` or `feature = "server-tokio"`)

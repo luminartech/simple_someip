@@ -12,7 +12,8 @@ use std::vec::Vec;
 use embedded_io::Error as _;
 
 use crate::protocol::{self, MessageId, sd};
-use crate::traits::{PayloadWireFormat, WireFormat};
+use crate::traits::PayloadWireFormat;
+use automotive_wire_codec::Encode;
 
 /// Owned SD header backed by heap-allocated vectors.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,12 +26,14 @@ pub struct VecSdHeader {
     pub options: Vec<sd::Options>,
 }
 
-impl WireFormat for VecSdHeader {
-    fn required_size(&self) -> usize {
-        sd::Header::new(self.flags, &self.entries, &self.options).required_size()
+impl Encode for VecSdHeader {
+    type Error = protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        sd::Header::new(self.flags, &self.entries, &self.options).encoded_size()
     }
 
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, protocol::Error> {
         sd::Header::new(self.flags, &self.entries, &self.options).encode(writer)
     }
 }
@@ -63,6 +66,29 @@ impl RawPayload {
         match &self.kind {
             RawPayloadKind::Raw(bytes) => Some(bytes),
             RawPayloadKind::Sd(_) => None,
+        }
+    }
+}
+
+impl Encode for RawPayload {
+    type Error = protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        match &self.kind {
+            RawPayloadKind::Sd(header) => header.encoded_size(),
+            RawPayloadKind::Raw(bytes) => Ok(bytes.len()),
+        }
+    }
+
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
+        match &self.kind {
+            RawPayloadKind::Sd(header) => header.encode(writer),
+            RawPayloadKind::Raw(bytes) => {
+                writer
+                    .write_all(bytes)
+                    .map_err(|e| protocol::Error::Io(e.kind()))?;
+                Ok(bytes.len())
+            }
         }
     }
 }
@@ -119,25 +145,6 @@ impl PayloadWireFormat for RawPayload {
         match &self.kind {
             RawPayloadKind::Sd(header) => Some(header.flags),
             RawPayloadKind::Raw(_) => None,
-        }
-    }
-
-    fn required_size(&self) -> usize {
-        match &self.kind {
-            RawPayloadKind::Sd(header) => header.required_size(),
-            RawPayloadKind::Raw(bytes) => bytes.len(),
-        }
-    }
-
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
-        match &self.kind {
-            RawPayloadKind::Sd(header) => header.encode(writer),
-            RawPayloadKind::Raw(bytes) => {
-                writer
-                    .write_all(bytes)
-                    .map_err(|e| protocol::Error::Io(e.kind()))?;
-                Ok(bytes.len())
-            }
         }
     }
 
@@ -227,7 +234,7 @@ impl PayloadWireFormat for RawPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::WireFormat;
+    use automotive_wire_codec::Encode;
     use std::net::Ipv4Addr;
 
     fn make_sd_payload() -> RawPayload {
@@ -330,13 +337,13 @@ mod tests {
     #[test]
     fn required_size_raw() {
         let p = make_raw_payload();
-        assert_eq!(p.required_size(), 2);
+        assert_eq!(p.encoded_size().unwrap(), 2);
     }
 
     #[test]
     fn encode_raw_payload() {
         let p = make_raw_payload();
-        let mut buf = std::vec![0u8; p.required_size()];
+        let mut buf = std::vec![0u8; p.encoded_size().unwrap()];
         let n = p.encode(&mut buf.as_mut_slice()).unwrap();
         assert_eq!(n, 2);
         assert_eq!(&buf, &[0xDE, 0xAD]);
@@ -345,9 +352,9 @@ mod tests {
     #[test]
     fn encode_sd_payload() {
         let p = make_sd_payload();
-        let mut buf = std::vec![0u8; p.required_size()];
+        let mut buf = std::vec![0u8; p.encoded_size().unwrap()];
         let n = p.encode(&mut buf.as_mut_slice()).unwrap();
-        assert_eq!(n, p.required_size());
+        assert_eq!(n, p.encoded_size().unwrap());
     }
 
     #[test]
@@ -360,7 +367,7 @@ mod tests {
             &entries,
             &[],
         );
-        let mut buf = std::vec![0u8; header.required_size()];
+        let mut buf = std::vec![0u8; header.encoded_size().unwrap()];
         header.encode(&mut buf.as_mut_slice()).unwrap();
 
         let p = RawPayload::from_payload_bytes(MessageId::SD, &buf).unwrap();
@@ -528,7 +535,7 @@ mod tests {
             entries: std::vec![],
             options: std::vec![],
         };
-        let size = header.required_size();
+        let size = header.encoded_size().unwrap();
         assert!(size > 0);
         let mut buf = std::vec![0u8; size];
         let n = header.encode(&mut buf.as_mut_slice()).unwrap();

@@ -30,8 +30,6 @@ use crate::Timer;
 use crate::e2e::{E2EKey, E2EProfile};
 #[cfg(feature = "_alloc")]
 use crate::protocol::sd;
-#[cfg(test)]
-use crate::protocol::sd::{Entry, Flags, ServiceEntry};
 #[cfg(feature = "_alloc")]
 use crate::transport::SocketOptions;
 #[cfg(feature = "_alloc")]
@@ -42,8 +40,6 @@ use alloc::sync::Arc;
 use core::net::Ipv4Addr;
 #[cfg(feature = "_alloc")]
 use core::net::SocketAddrV4;
-#[cfg(test)]
-use std::vec::Vec;
 
 #[cfg(feature = "server-tokio")]
 use crate::e2e::E2ERegistry;
@@ -1708,14 +1704,16 @@ where
 #[cfg(all(test, feature = "server-tokio"))]
 mod tests {
     use super::*;
+    use crate::protocol::sd::{Entry, Flags, ServiceEntry};
     use crate::protocol::{
         Header as SomeIpHeader, MessageType, MessageTypeField, MessageView, ReturnCode,
     };
     use crate::tokio_transport::{TokioTimer, TokioTransport};
-    use crate::traits::WireFormat;
+    use automotive_wire_codec::Encode;
     use std::format;
     use std::net::IpAddr;
     use std::vec;
+    use std::vec::Vec;
     use tokio::net::UdpSocket;
 
     /// Type alias bringing the tokio-flavor concrete type parameters back
@@ -3008,13 +3006,13 @@ mod tests {
     ) -> usize {
         let opt = sd::Options::IpV4Endpoint { ip, protocol, port };
         let mut slot = buf;
-        opt.write(&mut slot).unwrap()
+        opt.encode(&mut slot).unwrap()
     }
 
     fn write_load_balancing_option(buf: &mut [u8], priority: u16, weight: u16) -> usize {
         let opt = sd::Options::LoadBalancing { priority, weight };
         let mut slot = buf;
-        opt.write(&mut slot).unwrap()
+        opt.encode(&mut slot).unwrap()
     }
 
     /// Build a byte buffer holding `count` `IpV4Endpoint` options with

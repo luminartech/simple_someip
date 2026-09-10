@@ -46,7 +46,7 @@ use crate::{
     buffer_pool::BufferLease,
     e2e::{E2ECheckStatus, E2EKey},
     protocol::{Message, MessageView, sd},
-    traits::{PayloadWireFormat, WireFormat},
+    traits::PayloadWireFormat,
     transport::{
         ChannelFactory, E2ERegistryHandle, LocalSpawner, MpscRecv, MpscSend, OneshotRecv,
         OneshotSend, ReceivedDatagram, SocketOptions, Spawner, TransportFactory, TransportSocket,
@@ -55,6 +55,7 @@ use crate::{
 
 use super::error::Error;
 use crate::log::{debug, error, info, trace, warn};
+use automotive_wire_codec::Encode;
 use core::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     task::{Context, Poll},
@@ -557,7 +558,10 @@ where
         // overload signal regardless of which path produced the oversize
         // message. Without this, an oversize encode would surface as a
         // protocol-level I/O error from inside the socket loop.
-        let required = message.required_size();
+        // Propagated, not unwrapped: `encoded_size` is fallible for any
+        // downstream `PayloadWireFormat`, and this runs in the client's async
+        // socket task. `server::EventPublisher` already uses `?` here.
+        let required = message.encoded_size()?;
         // Coarse fail-fast: `send()` has no leased buffer in scope, so
         // UDP_BUFFER_SIZE is the only bound available here.  The socket
         // loop's `buf.len()` check is the authoritative guard; E2E
@@ -727,7 +731,17 @@ where
                     // a caller-sized bare-metal pool may hand out a buffer
                     // smaller than `UDP_BUFFER_SIZE`, and the message must fit
                     // the buffer we actually encode into.
-                    let required = send_message.message.required_size();
+                    // Same fallibility as the `send` path above, but this
+                    // is the loop: report to the waiting caller and carry on
+                    // rather than panicking the socket task.
+                    let required = match send_message.message.encoded_size() {
+                        Ok(required) => required,
+                        Err(e) => {
+                            warn!("outgoing message could not be sized: {e}");
+                            let _ = send_message.response.send(Err(e.into()));
+                            continue;
+                        }
+                    };
                     if required > buf.len() {
                         warn!(
                             "outgoing message size {required} exceeds claimed buffer ({}); rejecting with Capacity(\"udp_buffer\")",
@@ -988,6 +1002,30 @@ mod tests {
         TokioBufferProvider::new().claim().expect("fresh pool slot")
     }
 
+    /// A payload whose `encoded_size` fails must surface as an error, not
+    /// panic the caller. `.expect()` here was safe only for the two in-tree
+    /// payloads; `PayloadWireFormat` is public. The server side already does
+    /// this correctly with `?` in `event_publisher`. (PR #153 review.)
+    #[tokio::test]
+    async fn send_surfaces_a_failing_encoded_size_instead_of_panicking() {
+        use crate::protocol::sd::test_support::{FailingPayload, FailingSdHeader};
+
+        let mut sm = SocketManager::<FailingPayload, TokioChannels>::bind(0, test_registry())
+            .await
+            .expect("bind ephemeral");
+        let message = Message::new(
+            crate::protocol::Header::new_sd(1, 0),
+            FailingPayload {
+                header: FailingSdHeader,
+            },
+        );
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30490);
+        assert!(
+            sm.send(target, message).await.is_err(),
+            "a failing encoded_size must be reported, not panicked on",
+        );
+    }
+
     async fn bind_ephemeral_spawned() -> TestSocketManager {
         TestSocketManager::bind(0, test_registry()).await.unwrap()
     }
@@ -1136,7 +1174,8 @@ mod tests {
     async fn test_send_message_new() {
         use crate::transport::OneshotRecv;
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
-        let msg = Message::new_sd(1, &empty_sd_header());
+        let msg =
+            Message::new_sd(1, &empty_sd_header()).expect("in-tree SdHeader sizing is infallible");
         let (rx, send_msg) = SendMessage::<TestPayload, TokioChannels>::new(target, msg);
         assert_eq!(send_msg.target_addr, target);
         // Verify the oneshot channel works
@@ -1159,7 +1198,8 @@ mod tests {
         let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // Build and encode an SD message
-        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let mut buf = vec![0u8; 128];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
 
@@ -1189,7 +1229,8 @@ mod tests {
 
         // Send a message to the socket manager from a raw socket
         let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let mut buf = vec![0u8; 128];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
         raw_socket
@@ -1221,19 +1262,22 @@ mod tests {
         let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let raw_port = raw_socket.local_addr().unwrap().port();
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_port);
-        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         sm.send(target, msg).await.unwrap();
         assert_eq!(sm.session_id(), 2);
 
         // Second send increments session
-        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         sm.send(target, msg).await.unwrap();
         assert_eq!(sm.session_id(), 3);
     }
 
     #[tokio::test]
     async fn test_received_message_debug() {
-        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let received = ReceivedMessage {
             message: msg,
             source: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 5000),
@@ -1246,7 +1290,8 @@ mod tests {
     #[tokio::test]
     async fn test_send_message_debug() {
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234);
-        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let (_rx, send_msg) = SendMessage::<TestPayload, TokioChannels>::new(target, msg);
         let s = format!("{send_msg:?}");
         assert!(s.contains("SendMessage"));
@@ -1268,7 +1313,8 @@ mod tests {
         let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let raw_port = raw_socket.local_addr().unwrap().port();
 
-        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_port);
 
         sm.send(target, msg.clone()).await.unwrap();
@@ -1313,7 +1359,10 @@ mod tests {
         let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target =
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_socket.local_addr().unwrap().port());
-        let msg = || Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let msg = || {
+            Message::<TestPayload>::new_sd(1, &empty_sd_header())
+                .expect("in-tree SdHeader sizing is infallible")
+        };
 
         // Set session_id to one before the wrap point
         sm.session_id = u16::MAX - 1;
@@ -1470,7 +1519,8 @@ mod tests {
         let recv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let recv_port = recv.local_addr().unwrap().port();
 
-        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         sm.send(SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port), msg)
             .await
             .expect("send_to via custom-factory-built socket");
@@ -1586,7 +1636,8 @@ mod tests {
         let recv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let recv_port = recv.local_addr().unwrap().port();
 
-        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
         sm.send(SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port), msg)
             .await
             .expect("send via wrapping factory");

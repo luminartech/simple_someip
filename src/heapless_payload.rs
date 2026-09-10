@@ -31,7 +31,8 @@ use embedded_io::Error as _;
 use heapless::Vec as HVec;
 
 use crate::protocol::{self, MessageId, sd};
-use crate::traits::{PayloadWireFormat, WireFormat};
+use crate::traits::PayloadWireFormat;
+use automotive_wire_codec::Encode;
 
 /// Max SD entries in a single payload. See module-level docs.
 pub const ENTRY_CAP: usize = 8;
@@ -54,12 +55,14 @@ pub struct HeaplessSdHeader {
     pub options: HVec<sd::Options, OPT_CAP>,
 }
 
-impl WireFormat for HeaplessSdHeader {
-    fn required_size(&self) -> usize {
-        sd::Header::new(self.flags, &self.entries, &self.options).required_size()
+impl Encode for HeaplessSdHeader {
+    type Error = protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        sd::Header::new(self.flags, &self.entries, &self.options).encoded_size()
     }
 
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, protocol::Error> {
         sd::Header::new(self.flags, &self.entries, &self.options).encode(writer)
     }
 }
@@ -96,6 +99,29 @@ impl HeaplessPayload {
         match &self.kind {
             HeaplessPayloadKind::Raw(bytes) => Some(bytes),
             HeaplessPayloadKind::Sd(_) => None,
+        }
+    }
+}
+
+impl Encode for HeaplessPayload {
+    type Error = protocol::Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        match &self.kind {
+            HeaplessPayloadKind::Sd(header) => header.encoded_size(),
+            HeaplessPayloadKind::Raw(bytes) => Ok(bytes.len()),
+        }
+    }
+
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
+        match &self.kind {
+            HeaplessPayloadKind::Sd(header) => header.encode(writer),
+            HeaplessPayloadKind::Raw(bytes) => {
+                writer
+                    .write_all(bytes)
+                    .map_err(|e| protocol::Error::Io(e.kind()))?;
+                Ok(bytes.len())
+            }
         }
     }
 }
@@ -162,25 +188,6 @@ impl PayloadWireFormat for HeaplessPayload {
         match &self.kind {
             HeaplessPayloadKind::Sd(header) => Some(header.flags),
             HeaplessPayloadKind::Raw(_) => None,
-        }
-    }
-
-    fn required_size(&self) -> usize {
-        match &self.kind {
-            HeaplessPayloadKind::Sd(header) => header.required_size(),
-            HeaplessPayloadKind::Raw(bytes) => bytes.len(),
-        }
-    }
-
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, protocol::Error> {
-        match &self.kind {
-            HeaplessPayloadKind::Sd(header) => header.encode(writer),
-            HeaplessPayloadKind::Raw(bytes) => {
-                writer
-                    .write_all(bytes)
-                    .map_err(|e| protocol::Error::Io(e.kind()))?;
-                Ok(bytes.len())
-            }
         }
     }
 

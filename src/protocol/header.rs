@@ -1,7 +1,5 @@
-use crate::{
-    protocol::{Error, MessageId, MessageTypeField, ReturnCode, byte_order::WriteBytesExt},
-    traits::WireFormat,
-};
+use crate::protocol::{Error, MessageId, MessageTypeField, ReturnCode, byte_order::WriteBytesExt};
+use automotive_wire_codec::Decode;
 
 /// SOME/IP header
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,7 +193,7 @@ impl Header {
     /// Returns the payload size in bytes (`length - 8`).
     #[must_use]
     pub const fn payload_size(&self) -> usize {
-        self.length as usize - 8
+        (self.length as usize).saturating_sub(8)
     }
 
     /// Sets the request ID field.
@@ -220,24 +218,11 @@ impl<'a> HeaderView<'a> {
     /// # Panics
     ///
     /// Cannot panic — the `expect` is guarded by a length check above it.
+    ///
+    /// This is a thin wrapper over the [`Decode`] impl, which is the single
+    /// source of decode logic for this type.
     pub fn parse(buf: &'a [u8]) -> Result<(Self, &'a [u8]), Error> {
-        if buf.len() < 16 {
-            return Err(Error::UnexpectedEof);
-        }
-        let header_bytes: &[u8; 16] = buf[..16].try_into().expect("length checked above");
-        let view = Self(header_bytes);
-
-        // Validate protocol version
-        let pv = view.protocol_version();
-        if pv != 0x01 {
-            return Err(Error::InvalidProtocolVersion(pv));
-        }
-        // Validate message type
-        MessageTypeField::try_from(header_bytes[14])?;
-        // Validate return code
-        ReturnCode::try_from(header_bytes[15])?;
-
-        Ok((view, &buf[16..]))
+        Self::decode(buf)
     }
 
     /// Returns the message ID (service ID + method ID).
@@ -263,7 +248,7 @@ impl<'a> HeaderView<'a> {
     /// Returns the payload size in bytes (`length - 8`).
     #[must_use]
     pub fn payload_size(&self) -> usize {
-        self.length() as usize - 8
+        (self.length() as usize).saturating_sub(8)
     }
 
     /// Returns header bytes 8..16: the request ID, protocol and interface
@@ -332,12 +317,54 @@ impl<'a> HeaderView<'a> {
     }
 }
 
-impl WireFormat for Header {
-    fn required_size(&self) -> usize {
-        16
+impl<'a> Decode<'a> for HeaderView<'a> {
+    type Error = Error;
+
+    /// Decode and validate a SOME/IP header from the front of `buf`.
+    ///
+    /// Returns `(view, remaining_bytes)` on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `buf` is shorter than 16 bytes, the protocol version is
+    /// not `0x01`, the message type byte is unrecognized, or the return code is invalid.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic — the `expect` is guarded by a length check above it.
+    fn decode(buf: &'a [u8]) -> Result<(Self, &'a [u8]), Error> {
+        if buf.len() < 16 {
+            return Err(automotive_wire_codec::Incomplete {
+                needed: 16,
+                available: buf.len(),
+            }
+            .into());
+        }
+        let header_bytes: &[u8; 16] = buf[..16].try_into().expect("length checked above");
+        let view = Self(header_bytes);
+
+        // Validate protocol version
+        let pv = view.protocol_version();
+        if pv != 0x01 {
+            return Err(Error::InvalidProtocolVersion(pv));
+        }
+        // Validate message type
+        MessageTypeField::try_from(header_bytes[14])?;
+        // Validate return code
+        ReturnCode::try_from(header_bytes[15])?;
+
+        Ok((view, &buf[16..]))
+    }
+}
+
+impl automotive_wire_codec::Encode for Header {
+    type Error = Error;
+
+    fn encoded_size(&self) -> Result<usize, Self::Error> {
+        Ok(16)
     }
 
-    fn encode<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, Error> {
+    fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Error> {
         writer.write_u32_be(self.message_id.message_id())?;
         writer.write_u32_be(self.length)?;
         writer.write_u32_be(self.request_id)?;
@@ -353,6 +380,8 @@ impl WireFormat for Header {
 mod tests {
     use super::*;
     use crate::protocol::{Error, MessageId, MessageTypeField, ReturnCode};
+    use crate::traits::EncodeExt;
+    use automotive_wire_codec::Encode;
 
     fn make_header() -> Header {
         Header {
@@ -437,7 +466,7 @@ mod tests {
 
     #[test]
     fn required_size_is_16() {
-        assert_eq!(make_header().required_size(), 16);
+        assert_eq!(make_header().encoded_size().unwrap(), 16);
     }
 
     // --- encode / parse round-trip ---
@@ -527,8 +556,38 @@ mod tests {
         let buf: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
         assert!(matches!(
             HeaderView::parse(&buf[..]),
-            Err(Error::UnexpectedEof)
+            Err(Error::Incomplete(automotive_wire_codec::Incomplete {
+                needed: 16,
+                available: 4,
+            }))
         ));
+    }
+
+    // --- Decode trait (Phase 3) ---
+
+    #[test]
+    fn decode_returns_header_and_remainder() {
+        use automotive_wire_codec::Decode;
+        let h = make_header();
+        let mut buf = [0u8; 20];
+        buf[..16].copy_from_slice(&encode_header(&h));
+        buf[16..].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let (view, rest) = HeaderView::decode(&buf).unwrap();
+        assert_eq!(view.to_owned(), h);
+        assert_eq!(rest, &[0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn decode_exact_rejects_trailing() {
+        use automotive_wire_codec::Decode;
+        let h = make_header();
+        let mut buf = [0u8; 17];
+        buf[..16].copy_from_slice(&encode_header(&h));
+        assert!(matches!(
+            HeaderView::decode_exact(&buf),
+            Err(Error::Trailing(_))
+        ));
+        assert!(HeaderView::decode_exact(&buf[..16]).is_ok());
     }
 
     // --- from_fields ---
@@ -597,7 +656,7 @@ mod tests {
         assert_eq!(view.is_sd(), h.is_sd());
     }
 
-    // --- WireFormat default methods ---
+    // --- Encode/EncodeExt default methods (encode_to_slice / encode_to_vec) ---
 
     #[test]
     fn encode_to_slice_works() {
@@ -617,5 +676,32 @@ mod tests {
         assert_eq!(buf.len(), 16);
         let (view, _) = HeaderView::parse(&buf).unwrap();
         assert_eq!(view.to_owned(), h);
+    }
+
+    // --- Encode size-exactness invariant ---
+
+    #[test]
+    fn encoded_size_matches_bytes_written() {
+        use automotive_wire_codec::CountingSink;
+        let h = make_header();
+        let mut sink = CountingSink::new();
+        let written = h.encode(&mut sink).unwrap();
+        assert_eq!(written, h.encoded_size().unwrap());
+        assert_eq!(written, sink.count());
+    }
+
+    #[test]
+    fn encode_to_slice_too_small_yields_insufficient_buffer() {
+        use automotive_wire_codec::{EncodeToSliceError, InsufficientBuffer};
+        let h = make_header();
+        let mut buf = [0u8; 4];
+        let err = h.encode_to_slice(&mut buf).unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeToSliceError::InsufficientBuffer(InsufficientBuffer {
+                needed: 16,
+                available: 4,
+            })
+        ));
     }
 }

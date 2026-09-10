@@ -26,9 +26,9 @@ use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};
 
+use simple_someip::Encode;
 use simple_someip::PayloadWireFormat;
 use simple_someip::ServiceEndpointKey;
-use simple_someip::WireFormat;
 use simple_someip::client::Error as ClientError;
 use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::define_static_channels;
@@ -859,7 +859,8 @@ async fn inbound_datagram_larger_than_claimed_buffer_is_dropped_not_fatal() {
     rx.push(vec![0xFFu8; BUF_LEN], 256, source);
 
     // Then a valid small SD message that fits the 64-byte buffer.
-    let sd_msg = Message::<RawPayload>::new_sd(1, &empty_vec_sd_header());
+    let sd_msg = Message::<RawPayload>::new_sd(1, &empty_vec_sd_header())
+        .expect("in-tree SdHeader sizing is infallible");
     let mut wire = vec![0u8; BUF_LEN];
     let len = sd_msg.encode(&mut wire.as_mut_slice()).expect("encode sd");
     assert!(

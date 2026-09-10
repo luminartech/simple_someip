@@ -18,7 +18,7 @@
 //! |--------|----------|-------------|
 //! | [`protocol`] | Yes | Wire format: headers, messages, message types, return codes, and service discovery (SD) entries/options |
 //! | [`e2e`] | Yes | End-to-End protection — Profile 4 (CRC-32) and Profile 5 (CRC-16) |
-//! | [`WireFormat`] / [`PayloadWireFormat`] | Yes | Traits for serializing messages and defining custom payload types |
+//! | [`Encode`] / [`PayloadWireFormat`] | Yes | Traits for serializing messages and defining custom payload types |
 //! | `client` | No | Async client trait surface — service discovery, subscriptions, request/response (feature `client`; add `client-tokio` for `Client::new`) |
 //! | `server` | No | Async server trait surface — service offering, event publishing, subscription management (feature `server`; add `server-tokio` for `Server::new`) |
 //!
@@ -51,7 +51,7 @@
 //! ### Encoding a SOME/IP-SD header (`no_std`)
 //!
 //! ```rust
-//! use simple_someip::WireFormat;
+//! use simple_someip::Encode;
 //! use simple_someip::protocol::sd::{self, Entry, RebootFlag, ServiceEntry};
 //!
 //! // Build an SD header with a FindService entry
@@ -257,12 +257,13 @@ mod traits;
 /// because the target module is feature-gated and would break
 /// default-feature rustdoc builds.
 pub mod transport;
+pub use automotive_wire_codec::{Decode, DecodeIter, DecodeIterator, Encode, EncodeToSliceError};
 #[cfg(feature = "bare_metal")]
 pub use heapless_payload::{HeaplessPayload, HeaplessSdHeader};
 pub use net_endpoint::{NetEndpoint, TransportProtocol};
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
-pub use traits::{OfferedEndpoint, PayloadWireFormat, WireFormat};
+pub use traits::{EncodeExt, OfferedEndpoint, PayloadWireFormat};
 
 #[cfg(feature = "client")]
 pub use client::{
