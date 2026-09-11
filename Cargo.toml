@@ -29,6 +29,14 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A lightweight SOME/IP serialization and communication library"
 repository = "https://github.com/luminartech/simple_someip"
+homepage = "https://github.com/luminartech/simple_someip"
+documentation = "https://docs.rs/simple-someip"
+readme = "README.md"
+keywords = ["someip", "automotive", "no-std", "embedded", "serialization"]
+categories = ["network-programming", "embedded", "no-std", "encoding"]
+# No `rust-version` on purpose: choosing an MSRV is a support-policy
+# decision, not a packaging one. CI's MSRV job stays off until one is
+# chosen deliberately (see .github/workflows/main.yml).
 
 [dependencies]
 crc = "3.4"
