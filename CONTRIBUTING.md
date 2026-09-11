@@ -29,8 +29,7 @@ flowchart TD
     F_ec --> F_alloc
 ```
 
-The arrows are the mechanical part. These are the things the graph cannot tell
-you:
+What the graph doesn't show:
 
 - **`client` / `server` are the executor-agnostic trait surface** — no tokio, no
   socket2. You supply `Spawner`, `Timer`, `ChannelFactory` and
