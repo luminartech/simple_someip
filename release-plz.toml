@@ -1,9 +1,49 @@
+# release-plz owns versioning, the changelog, tags, GitHub releases, and the
+# crates.io publish. The jobs that run it live in the org-wide reusable
+# workflow (`use-release-plz: true` in `.github/workflows/main.yml`), so there
+# is no release workflow in this repository.
+#
+# The `[changelog]` parsers below are byte-identical to `simple_doip`,
+# `uds_protocol` and `automotive_wire_codec`. Keep them that way: the point of
+# the shared config is that a reader of one protocol repo already knows the
+# others.
+#
+# What is NOT shared, and why:
+#
+# - `git_tag_name` -- this is a workspace, so release-plz would otherwise tag
+#   `simple-someip-v0.13.0`. The sibling repos are single-crate and get `v…`
+#   for free.
+# - `pr_draft` -- release PRs open as drafts here.
+# - the `discovery_client` package stanza -- an example crate that is a
+#   workspace member and must never be released or published.
+#
+# How a version gets decided: unlike the sibling repos, this one merges with
+# merge commits rather than squash (`allow_squash_merge` is off), so the
+# parsers below read the *branch's own commit subjects*, not the PR title.
+# Conventional-commit discipline therefore has to hold on each commit.
 [workspace]
 changelog_update = true
 git_tag_name = "v{{ version }}"
 git_release_enable = true
 publish = true
 pr_draft = true
+
+[changelog]
+commit_parsers = [
+    { message = "^feat", group = "Added" },
+    { message = "^fix", group = "Fixed" },
+    { message = "^perf", group = "Performance" },
+    { message = "^docs?", group = "Documentation" },
+    { message = "^refactor", group = "Changed" },
+    { message = "^revert", group = "Reverted" },
+    { message = "^style", skip = true },
+    { message = "^test", skip = true },
+    { message = "^chore\\(release\\)", skip = true },
+    { message = "^chore", skip = true },
+    { message = "^ci", skip = true },
+    { message = "^build", skip = true },
+    { message = ".*", group = "Other" },
+]
 
 [[package]]
 name = "discovery_client"

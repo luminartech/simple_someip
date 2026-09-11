@@ -1,4 +1,38 @@
-name: CI
+# Lanes the org-wide reusable workflow cannot express.
+#
+# `main.yml` is the thin caller for `luminartech/rust_workflow`. It contributes
+# release-plz, docs, the security audit, a publish dry run, a release build and
+# a no_std smoke build -- all of which this repo previously lacked.
+#
+# It takes over none of the jobs below. Every one of them stayed, each for a
+# concrete reason:
+#
+# - `Build, Test & Coverage` -- the shared workflow applies ONE `feature-flags`
+#   value to build, test, clippy and docs. Lint wants `bare_metal` in; tests
+#   want it out, because the server's runtime caps default tight under
+#   `bare_metal` and generous otherwise. Two regimes, one knob, so the test
+#   lane stays here at `$HOST_FEATURES`.
+# - `Build & Test (Windows)` -- every job in the shared workflow is
+#   `runs-on: ubuntu-latest`, and its header states that is deliberate.
+# - `no_std target build` -- builds four separate bare-metal feature
+#   combinations and audits each rlib for allocator symbols. The shared
+#   workflow's `run-no-std` builds one target with and without the alloc
+#   feature; it is a smoke test, this is the gate. Both run.
+# - `build-std core gate` -- certifies against a core-only sysroot. No
+#   equivalent input exists.
+# - `Bare-metal runtime (nightly)` -- the `bare-metal-runtime` feature needs
+#   nightly and is mutually exclusive with the alloc features. The shared
+#   workflow's nightly toolchain is used only for fuzz and miri.
+# - `Format & Lint` -- the shared lint job hardcodes `cargo clippy
+#   --all-targets`, which this pipeline never did. That surfaces ~89
+#   pre-existing pedantic/style findings in test and example code, and
+#   `clippy-args` only appends after `--`, so the scope cannot be narrowed
+#   from the caller.
+# - `SemVer Check` -- `cargo-semver-checks` builds rustdoc with ALL features
+#   and takes no feature input, so it trips this crate's own `compile_error!`
+#   guard for `bare-metal-runtime`. The job here passes a feature set.
+# - `Linear PR History` -- not provided.
+name: Bare-metal & Platform CI
 
 on:
   push:
@@ -57,6 +91,26 @@ jobs:
       - run: cargo clippy -p simple-someip --no-default-features --features server,bare_metal -- -D warnings -D clippy::pedantic
       - run: cargo clippy -p simple-someip --no-default-features --features client,server,bare_metal -- -D warnings -D clippy::pedantic
 
+  semver:
+    name: SemVer Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Scope to the alloc/host feature set: the default `all-features`
+      # group pulls `bare-metal-runtime`, which is no-alloc + nightly and
+      # fails to build (and document) alongside the alloc features, so
+      # rustdoc — and thus the whole check — aborts. The host API is what
+      # we semver-gate; the bare-metal lane is nightly-only.
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: only-explicit-features
+          features: std,tracing,client,client-tokio,server,server-tokio,bare_metal,embassy_channels
+
   bare-metal-runtime:
     name: Bare-metal runtime (nightly)
     runs-on: ubuntu-latest
@@ -112,26 +166,6 @@ jobs:
             echo "$merge_commits"
             exit 1
           fi
-
-  semver:
-    name: SemVer Check
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # Scope to the alloc/host feature set: the default `all-features`
-      # group pulls `bare-metal-runtime`, which is no-alloc + nightly and
-      # fails to build (and document) alongside the alloc features, so
-      # rustdoc — and thus the whole check — aborts. The host API is what
-      # we semver-gate; the bare-metal lane is nightly-only.
-      - uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          feature-group: only-explicit-features
-          features: std,tracing,client,client-tokio,server,server-tokio,bare_metal,embassy_channels
 
   no_std_target:
     # Cross-build for a true no_std target (cortex-m4f, no allocator,
