@@ -10,12 +10,11 @@ build that are easy to get wrong.
 
 ## The feature graph
 
-`default = ["std"]`. An arrow means *enables*:
+`default = ["std"]`. Among the features themselves, an arrow means *enables*:
 
 ```mermaid
 flowchart TD
-    F_default(["default"]) --> F_std["std"]
-    F_std --> F_tracing["tracing"]
+    F_std["std"] --> F_tracing["tracing"]
     F_std --> F_alloc["_alloc"]
 
     F_ctokio["client-tokio"] --> F_client["client"]
