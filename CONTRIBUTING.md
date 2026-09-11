@@ -10,29 +10,44 @@ build that are easy to get wrong.
 
 ## The feature graph
 
-`default = ["std"]`, and the feature set is the most intricate thing about this
-crate. The client and server each split into a trait surface and a tokio
-convenience layer:
+`default = ["std"]`. An arrow means *enables*:
 
-- `client` / `server` — the executor-agnostic trait surface. No tokio, no
-  socket2. Callers supply their own `Spawner`, `Timer`, `ChannelFactory` and
-  `TransportFactory`.
-- `client-tokio` / `server-tokio` — the same, plus the tokio defaults that make
-  `Client::new` and `Server::new` work. Both force `std`.
-- `bare_metal` — activates embassy-sync as the channel backend along with
-  `static_channels`, `AtomicInterfaceHandle` and `StaticE2EHandle`. Enabling it
-  alone does **not** make the crate bare-metal-complete: `client` and `server`
-  still need user-provided `Spawner` and `TransportFactory` impls.
-- `bare-metal-runtime` — the composed embassy runtime on top of that.
-- `embassy_channels` — heap-backed channel backend, useful before static pools
-  are sized.
-- `_alloc` — private marker for "this build needs `extern crate alloc`". It is
-  tied to the declaration in `lib.rs` so both sides move together. Do not
-  enable it directly.
+```mermaid
+flowchart TD
+    F_default(["default"]) --> F_std["std"]
+    F_std --> F_tracing["tracing"]
+    F_std --> F_alloc["_alloc"]
 
-`tracing` is feature-gated rather than always-on because `tracing-core` declares
-`extern crate alloc` unconditionally, which bare-metal targets shipping a
-`core`-only sysroot cannot satisfy.
+    F_ctokio["client-tokio"] --> F_client["client"]
+    F_ctokio --> F_std
+    F_stokio["server-tokio"] --> F_server["server"]
+    F_stokio --> F_std
+
+    F_bmr["bare-metal-runtime"] --> F_bm["bare_metal"]
+    F_bmr --> F_server
+    F_ec["embassy_channels"] --> F_bm
+    F_ec --> F_alloc
+```
+
+The arrows are the mechanical part. These are the things the graph cannot tell
+you:
+
+- **`client` / `server` are the executor-agnostic trait surface** — no tokio, no
+  socket2. You supply `Spawner`, `Timer`, `ChannelFactory` and
+  `TransportFactory`. The `-tokio` variants add the defaults that make
+  `Client::new` and `Server::new` work, and force `std`.
+- **`bare_metal` alone is not bare-metal-complete.** It activates embassy-sync as
+  the channel backend along with `static_channels`, `AtomicInterfaceHandle` and
+  `StaticE2EHandle` — but `client` and `server` still need your own `Spawner` and
+  `TransportFactory` impls.
+- **`_alloc` is private; do not enable it directly.** It marks "this build needs
+  `extern crate alloc`" and is tied to the declaration in `lib.rs` so both sides
+  move in lockstep.
+- **`tracing` is gated rather than always-on** because `tracing-core` declares
+  `extern crate alloc` unconditionally, which bare-metal targets shipping a
+  `core`-only sysroot cannot satisfy.
+- **`embassy_channels` is the heap-backed channel backend** — useful for tests or
+  early prototypes, before static pools are sized.
 
 ## Testing
 
