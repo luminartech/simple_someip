@@ -10,12 +10,17 @@ build that are easy to get wrong.
 
 ## The feature graph
 
-`default = ["std"]`. Among the features themselves, an arrow means *enables*:
+`#![no_std]` is unconditional: `std` is the feature that adds `std` back, not a
+switch that turns `no_std` on. `default = ["std"]`.
+
+A solid arrow means *enables*; the dashed link marks a pair that refuses to
+compile. `_alloc` is double-bordered because it is private — every other node
+is a feature you are meant to turn on.
 
 ```mermaid
 flowchart TD
     F_std["std"] --> F_tracing["tracing"]
-    F_std --> F_alloc["_alloc"]
+    F_std --> F_alloc[["_alloc"]]
 
     F_ctokio["client-tokio"] --> F_client["client"]
     F_ctokio --> F_std
@@ -26,6 +31,8 @@ flowchart TD
     F_bmr --> F_server
     F_ec["embassy_channels"] --> F_bm
     F_ec --> F_alloc
+
+    F_bmr -. "cannot combine" .- F_alloc
 ```
 
 What the graph doesn't show:
@@ -38,6 +45,15 @@ What the graph doesn't show:
   the channel backend along with `static_channels`, `AtomicInterfaceHandle` and
   `StaticE2EHandle` — but `client` and `server` still need your own `Spawner` and
   `TransportFactory` impls.
+- **`bare-metal-runtime` is server-side only.** It pulls in `server`, not
+  `client` — it composes the embassy executor and the single task around the
+  server. A bare-metal *client* is `client` + `bare_metal` with an executor you
+  supply; see `examples/bare_metal_client/`.
+- **`bare-metal-runtime` cannot be combined with the alloc features.** A
+  `compile_error!` rejects it alongside `_alloc`, and therefore alongside `std`,
+  `embassy_channels` and both `*-tokio` features. It also needs nightly, for
+  `impl_trait_in_assoc_type`. Build it alone:
+  `cargo +nightly check --no-default-features --features bare-metal-runtime,server`.
 - **`_alloc` is private; do not enable it directly.** It marks "this build needs
   `extern crate alloc`" and is tied to the declaration in `lib.rs` so both sides
   move in lockstep.
@@ -56,8 +72,11 @@ silently skips them. Run the configurations, not just the default:
 cargo test --features client-tokio,server-tokio       # the async engines
 cargo test --features client,bare_metal               # the bare-metal client
 cargo test --features server,bare_metal               # the bare-metal server
-cargo test --all-features
+cargo test --no-default-features                      # the no_std core alone
 ```
+
+There is deliberately no `--all-features` line: it enables
+`bare-metal-runtime` alongside `std` and hits the `compile_error!` above.
 
 Two tests are allocation witnesses (`no_alloc_witness`,
 `no_alloc_server_witness`) and run with `harness = false`: they fail if the
