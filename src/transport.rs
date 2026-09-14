@@ -1441,8 +1441,7 @@ impl<const SLOTS: usize, const LEN: usize> BufferProvider for StaticBufferProvid
 /// signatures are implementable without async machinery, (2)
 /// **layout probing** — `tools/size_probe` instantiates `Client`
 /// with these on `thumbv7em-none-eabihf` so `-Zprint-type-sizes`
-/// reports the real on-target future layouts (see
-/// `docs/simple_someip/plans/2026-06-09-phase22-125-memory-reduction-design.md`).
+/// reports the real on-target future layouts.
 ///
 /// NOT for production use: sockets error, and the spawner panics
 /// outright — probe code is compiled, never executed, and a loud

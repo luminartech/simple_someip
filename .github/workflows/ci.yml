@@ -275,8 +275,7 @@ jobs:
     # absent from the sysroot entirely. The prebuilt-sysroot thumb job
     # above SHIPS alloc, so an `extern crate alloc` regression passes
     # there and still breaks halo. This job is the halo-certification
-    # gate (phase 22 / measurement PR 0 — see
-    # docs/simple_someip/plans/2026-06-09-phase22-125-memory-reduction-design.md).
+    # gate.
     name: build-std core gate (no alloc in sysroot)
     needs: check
     runs-on: ubuntu-latest
