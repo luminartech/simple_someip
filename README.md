@@ -3,6 +3,9 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/luminartech/simple_someip/ci.yml?style=for-the-badge&label=CI)](https://github.com/luminartech/simple_someip/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/codecov/c/github/luminartech/simple_someip?style=for-the-badge)](https://app.codecov.io/gh/luminartech/simple_someip)
 [![Crates.io](https://img.shields.io/crates/v/simple-someip?style=for-the-badge)](https://crates.io/crates/simple-someip)
+[![Docs.rs](https://img.shields.io/docsrs/simple-someip?style=for-the-badge)](https://docs.rs/simple-someip)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg?style=for-the-badge)](./LICENSE-MIT)
+[![APACHE License](https://img.shields.io/badge/license-APACHE-blue.svg?style=for-the-badge)](./LICENSE-APACHE)
 
 Simple SOME/IP is a Rust library implementing the SOME/IP automotive communication protocol — remote procedure calls, event notifications, and wire format serialization. Based on the [Open SOME/IP Specification](https://github.com/some-ip-com/open-someip-spec).
 
