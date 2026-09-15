@@ -34,8 +34,6 @@
 //! absolute header minimum: the practical floor is the largest expected
 //! message (header + payload), realistically one full UDP datagram
 //! ([`UDP_BUFFER_SIZE`]).
-//!
-//! See `docs/simple_someip/plans/2026-06-09-phase22-125-memory-reduction-design.md`.
 mod bind_dispatch;
 mod error;
 mod inner;
@@ -2337,9 +2335,9 @@ mod tests {
     /// thumbv7em layouts differ (pointer width/alignment) — the
     /// authoritative numbers come from `tools/capture_type_sizes.sh`.
     /// Values are observed-at-capture × 1.25 rounded up to a multiple
-    /// of 64 (see docs/simple_someip/plans/baselines/pr0-size-baseline.md).
+    /// of 64.
     /// If this trips: run the capture script and compare against the
-    /// baseline before raising the budget — a layout regression in a PR
+    /// values below before raising the budget — a layout regression in a PR
     /// is exactly what this witness exists to catch.
     const TOKIO_CLIENT_RUN_FUTURE_BUDGET: usize = 132736; // = ceil64(106152 × 1.25)
     /// See [`TOKIO_CLIENT_RUN_FUTURE_BUDGET`] — same proxy-budget rules.
