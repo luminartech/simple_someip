@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Client socket loop no longer deadlocks against the client run loop when
+  its inbound channel fills.** Each socket's I/O loop forwards received
+  datagrams into a bounded channel of 16 and used to `.await` that hand-off
+  inline, which stopped it from servicing its outgoing-send queue. The client
+  run loop is the only reader of the SD socket's inbound channel and awaits
+  the completion of every SD send (Subscribe, `SendSD`) on that same socket,
+  handling control messages ahead of discovery. So once more than 16 SD
+  datagrams arrived during a run of Subscribes, each loop waited on the other
+  forever: no further sends, events or subscription renewals. The socket loop
+  now keeps the pending delivery as a future and selects over it alongside the
+  send queue, with receiving paused until the delivery lands. Sends keep
+  flowing while the reader is busy, at most one parsed datagram is held,
+  nothing is dropped, and both inbound and outbound ordering are unchanged.
+
 ## [0.13.0]
 
 Contains a breaking change to the serialization trait surface, so this release
