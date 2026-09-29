@@ -59,7 +59,11 @@ use core::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     task::{Context, Poll},
 };
-use futures_util::{FutureExt, pin_mut, select_biased};
+use futures_util::{
+    FutureExt,
+    future::{Fuse, FusedFuture},
+    pin_mut, select_biased,
+};
 
 /// A received message together with the source address it came from.
 ///
@@ -100,6 +104,9 @@ impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> core::fmt::Debug
 enum Outcome<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> {
     Send(Option<SendMessage<P, C>>),
     Recv(Result<ReceivedDatagram, crate::transport::TransportError>),
+    /// The pending inbound delivery finished; `Err(())` means the owner
+    /// dropped its receiver.
+    Delivered(Result<(), ()>),
 }
 
 impl<PayloadDefinitions, C> SendMessage<PayloadDefinitions, C>
@@ -693,6 +700,18 @@ where
         // Flipping the priority each iteration approximates the
         // fairness `select!` would give without pulling std.
         let mut prefer_recv_first = false;
+        // The parsed datagram waiting for room in the inbound channel, as the
+        // in-flight `send` future that owns it. It lives across iterations
+        // instead of being awaited inline: the owner of this socket is often
+        // also the only reader of the inbound channel, and it may be blocked
+        // awaiting one of *our* send completions (the client run loop awaits
+        // every SD send on the discovery socket). Awaiting delivery inline
+        // would stop the send arm, and the two would wait on each other
+        // forever. While a delivery is pending the receive arm is disabled,
+        // so at most one datagram is held here and arrival order is kept;
+        // the kernel queues the rest.
+        let deliver = Fuse::terminated();
+        pin_mut!(deliver);
 
         loop {
             // The fresh `.fuse()`'d per-iteration futures are pinned
@@ -703,15 +722,24 @@ where
             // below runs, so the body can re-borrow `buf` freely.
             let outcome: Outcome<MessageDefinitions, C> = {
                 let send_fut = MpscRecv::recv(&mut tx_rx).fuse();
-                let recv_fut = socket.recv_from(&mut buf[..]).fuse();
+                // A terminated future is never selected, so this disables
+                // the receive arm until the pending delivery completes.
+                let recv_fut = if deliver.is_terminated() {
+                    socket.recv_from(&mut buf[..]).fuse()
+                } else {
+                    Fuse::terminated()
+                };
                 pin_mut!(send_fut, recv_fut);
+                let mut deliver_fut = deliver.as_mut();
                 if prefer_recv_first {
                     select_biased! {
+                        delivered = deliver_fut => Outcome::Delivered(delivered),
                         result = recv_fut => Outcome::Recv(result),
                         message = send_fut => Outcome::Send(message),
                     }
                 } else {
                     select_biased! {
+                        delivered = deliver_fut => Outcome::Delivered(delivered),
                         message = send_fut => Outcome::Send(message),
                         result = recv_fut => Outcome::Recv(result),
                     }
@@ -912,12 +940,15 @@ where
                             })
                         })
                         .map_err(Error::from);
-                    if rx_tx.send(parse_result).await.is_ok() {
-                    } else {
-                        info!("Socket Dropping");
-                        // The receiver has been dropped, so we should exit
-                        break;
-                    }
+                    // Hand off to a later iteration's select rather than
+                    // awaiting here; see `deliver` above.
+                    deliver.set(rx_tx.send(parse_result).fuse());
+                }
+                Outcome::Delivered(Ok(())) => {}
+                Outcome::Delivered(Err(())) => {
+                    info!("Socket Dropping");
+                    // The receiver has been dropped, so we should exit
+                    break;
                 }
                 Outcome::Recv(Err(recv_err)) => {
                     // Classify by transport kind: transient kinds
@@ -1290,6 +1321,70 @@ mod tests {
             view.header().to_owned().message_id(),
             msg.header().message_id()
         );
+    }
+
+    /// The socket loop must keep servicing outgoing sends while its inbound
+    /// channel is full. The owner of a `SocketManager` is often also the only
+    /// reader of its inbound channel (the client run loop is, for the SD
+    /// socket), so if a send cannot complete until the owner drains inbound
+    /// traffic, the owner and the socket loop wait on each other forever.
+    ///
+    /// Floods the socket with three channels' worth of datagrams without
+    /// reading any of them, then issues a burst of sends. Every send must
+    /// complete, and afterwards every inbound datagram must still arrive, in
+    /// the order it was sent.
+    #[tokio::test]
+    async fn sends_complete_while_inbound_channel_is_full() {
+        const INBOUND: u16 = 48;
+        const OUTBOUND: usize = 24;
+
+        let mut sm = bind_ephemeral_spawned().await;
+        let sm_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, sm.port());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, peer.local_addr().unwrap().port());
+
+        let mut wire = vec![0u8; 128];
+        for session in 1..=INBOUND {
+            let msg = Message::<TestPayload>::new_sd(u32::from(session), &empty_sd_header());
+            let n = msg.encode(&mut wire.as_mut_slice()).unwrap();
+            peer.send_to(&wire[..n], sm_addr).await.unwrap();
+        }
+        // Let the socket loop pull datagrams off the kernel queue until the
+        // bounded inbound channel is full and it is holding one more.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for _ in 0..OUTBOUND {
+                let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header());
+                sm.send(peer_addr, msg).await.unwrap();
+            }
+        })
+        .await
+        .expect("send stalled behind a full inbound channel (socket loop deadlock)");
+
+        let mut recv_buf = vec![0u8; 1400];
+        for i in 0..OUTBOUND {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                peer.recv_from(&mut recv_buf),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("outbound datagram {i} never reached the peer"))
+            .unwrap();
+        }
+
+        for session in 1..=INBOUND {
+            let received = tokio::time::timeout(std::time::Duration::from_secs(2), sm.receive())
+                .await
+                .unwrap_or_else(|_| panic!("inbound datagram {session} was lost"))
+                .expect("socket loop closed")
+                .expect("inbound datagram parses");
+            assert_eq!(
+                received.message.header().request_id() & 0xFFFF,
+                u32::from(session),
+                "inbound datagrams must be delivered in arrival order",
+            );
+        }
     }
 
     #[tokio::test]

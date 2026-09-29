@@ -2517,6 +2517,107 @@ mod tests {
         );
     }
 
+    /// A burst of Subscribes must complete while the SD socket's inbound
+    /// channel is saturated. Each Subscribe is sent on the discovery socket
+    /// and the run loop awaits that send, while the run loop is also the only
+    /// reader of the discovery socket's inbound channel. If the socket loop
+    /// stops servicing sends once that channel fills, the first Subscribe
+    /// after an SD burst hangs the run loop for good.
+    ///
+    /// The SD burst lands before the run loop starts so the channel is
+    /// deterministically full when the first Subscribe is handled.
+    #[tokio::test]
+    async fn subscribe_burst_completes_while_sd_inbound_is_saturated() {
+        const SD_BURST: u32 = 48;
+        const SUBSCRIBES: u16 = 24;
+
+        let (control_sender, control_receiver) = mpsc::channel(4);
+        let (update_sender, _update_receiver) = mpsc::unbounded_channel();
+        let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
+        let mut inner: TestInner = Inner {
+            control_receiver,
+            request_queue: Deque::new(),
+            pending_responses: FnvIndexMap::new(),
+            update_sender,
+            interface: Ipv4Addr::LOCALHOST,
+            discovery_socket: None,
+            discovery_unicast_socket: None,
+            unicast_sockets: FnvIndexMap::new(),
+            session_tracker: SessionTracker::default(),
+            service_registry: ServiceRegistry::default(),
+            run: true,
+            client_id: 0x1234,
+            session_counter: 1,
+            sd_session_id: 1,
+            sd_session_has_wrapped: false,
+            e2e_registry: e2e_registry.clone(),
+            multicast_loopback: false,
+            dispatch: crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
+            },
+            timer: TokioTimer,
+            phantom: core::marker::PhantomData,
+        };
+
+        // An ephemeral socket stands in for the SD socket so the test does
+        // not contend for the fixed SD port with the rest of the suite.
+        let discovery = SocketManager::bind(0, e2e_registry).await.unwrap();
+        let discovery_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, discovery.port());
+        inner.discovery_socket = Some(discovery);
+        // One unicast socket shared by every Subscribe, so the burst is not
+        // capped by the unicast-socket limit.
+        let client_port = inner.bind_unicast(0).await.unwrap();
+
+        let offerer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut wire = std::vec![0u8; 128];
+        for session in 1..=SD_BURST {
+            use crate::WireFormat;
+            let msg = Message::<TestPayload>::new_sd(session, &empty_sd_header());
+            let n = msg.encode(&mut wire.as_mut_slice()).unwrap();
+            offerer.send_to(&wire[..n], discovery_addr).await.unwrap();
+        }
+        // Let the discovery socket loop fill its inbound channel.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Queue the endpoint and the first Subscribes before the run loop
+        // starts: it handles control ahead of discovery, so it reaches the
+        // first Subscribe without draining a single SD datagram.
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        let (endpoint_rx, msg) = TestControl::add_endpoint(
+            ServiceEndpointKey::udp(0x1234, SocketAddr::V4(addr)),
+            0x0001,
+            0,
+        );
+        control_sender.send(msg).await.unwrap();
+        let mut subscribes = (1..=SUBSCRIBES).map(|event_group| {
+            TestControl::subscribe(lh_key(0x1234, 5000), 1, 3, event_group, client_port)
+        });
+        let mut responses = std::vec::Vec::new();
+        while control_sender.capacity() > 0 {
+            let (rx, msg) = subscribes.next().unwrap();
+            control_sender.send(msg).await.unwrap();
+            responses.push(rx);
+        }
+        let _run_handle = tokio::spawn(inner.run_future());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for (rx, msg) in subscribes {
+                control_sender.send(msg).await.unwrap();
+                responses.push(rx);
+            }
+            endpoint_rx.recv().await.unwrap().unwrap();
+            for rx in responses {
+                rx.recv().await.unwrap().unwrap();
+            }
+        })
+        .await
+        .expect("Subscribe burst stalled behind a saturated SD socket (run loop deadlock)");
+
+        assert_inner_alive(&control_sender).await;
+    }
+
     #[tokio::test]
     async fn test_sd_session_id_persists_across_rebind() {
         // Verify that unbind_discovery + bind_discovery carries the session counter
