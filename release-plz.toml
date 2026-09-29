@@ -16,6 +16,9 @@
 # - `pr_draft` -- release PRs open as drafts here.
 # - the `discovery_client` package stanza -- an example crate that is a
 #   workspace member and must never be released or published.
+# - the `simple-someip` package stanza -- `semver_check = false`, because the
+#   crate's mutually exclusive bare-metal feature makes the all-features
+#   semver check fail (see the stanza).
 #
 # How a version gets decided: unlike the sibling repos, this one merges with
 # merge commits rather than squash (`allow_squash_merge` is off), so the
@@ -44,6 +47,17 @@ commit_parsers = [
     { message = "^build", skip = true },
     { message = ".*", group = "Other" },
 ]
+
+# cargo-semver-checks documents the crate with every feature enabled, and
+# simple-someip's `bare-metal-runtime` feature refuses to build next to the
+# alloc features (a `compile_error!` in `src/lib.rs`). With the check on,
+# release-plz fails before it can compute a version and never opens a release
+# PR. The same check still gates every pull request: the `SemVer Check` job in
+# `.github/workflows/ci.yml` runs cargo-semver-checks with an explicit feature
+# set, and a breaking change bumps the `version` by hand (see CONTRIBUTING.md).
+[[package]]
+name = "simple-someip"
+semver_check = false
 
 [[package]]
 name = "discovery_client"
