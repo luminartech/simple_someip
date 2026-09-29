@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.1](https://github.com/luminartech/simple_someip/compare/v0.12.0...v0.12.1) - 2026-09-29
+
 ### Fixed
 
 - **Client socket loop no longer deadlocks against the client run loop when
