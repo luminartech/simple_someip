@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.13.1](https://github.com/luminartech/simple_someip/compare/v0.13.0...v0.13.1) - 2026-09-29
+
+### Documentation
+
+- say where the semver gate lives and that breaking changes bump by hand
+- correct the feature graph and drop the --all-features line
+- drop default from the feature graph
+- drop the editorialising above the feature-graph notes
+- draw the feature graph instead of describing it
+- add health files and complete the crate metadata
+- drop the in-repo pointers into the internal plans directory
+
+### Fixed
+
+- *(client)* keep servicing sends while an inbound delivery is blocked
+
 ### Fixed
 
 - **Client socket loop no longer deadlocks against the client run loop when

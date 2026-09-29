@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/luminartech/simple_someip/compare/v0.1.0...v0.2.0) - 2026-09-29
+
+### Added
+
+- [**breaking**] mark the public error enums non-exhaustive, make the E2E caps configurable
+- *(client)* [**breaking**] key service registry by device IP
+
+### Documentation
+
+- Phase 7 cleanup — sweep WireFormat prose, tighten tests, add 0.9.0 CHANGELOG
+
+### Fixed
+
+- *(server)* [**breaking**] return a GAT from for_each_subscriber so EventPublisher futures are Send
+
 ## [0.1.0](https://github.com/luminartech/simple_someip/releases/tag/v0.1.0) - 2026-06-29
 
 ### Added
