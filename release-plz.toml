@@ -52,8 +52,9 @@ commit_parsers = [
 # simple-someip's `bare-metal-runtime` feature refuses to build next to the
 # alloc features (a `compile_error!` in `src/lib.rs`). With the check on,
 # release-plz fails before it can compute a version and never opens a release
-# PR. Bump the `version` by hand for a breaking change, as the CHANGELOG
-# already describes for 0.10.0 onward.
+# PR. The same check still gates every pull request: the `SemVer Check` job in
+# `.github/workflows/ci.yml` runs cargo-semver-checks with an explicit feature
+# set, and a breaking change bumps the `version` by hand (see CONTRIBUTING.md).
 [[package]]
 name = "simple-someip"
 semver_check = false

@@ -118,12 +118,16 @@ Two pipelines currently run side by side: this repository's own workflow, which
 produces `Format & Lint`, `Build, Test & Coverage`, the Windows and
 bare-metal/no_std builds and `SemVer Check`; and the org-wide reusable workflow
 from [`luminartech/rust_workflow`](https://github.com/luminartech/rust_workflow),
-which produces the `ci / *` checks. The three required checks come from the
-former.
+which produces the `ci / *` checks. The required checks come from the former.
 
 ## Releases
 
-[release-plz](https://release-plz.dev) owns versioning, the changelog, tags,
-GitHub releases, and the crates.io publish. There is no version to bump by
-hand: a push to `main` maintains an open release PR, and merging that PR
-publishes.
+[release-plz](https://release-plz.dev) owns the changelog, tags, GitHub
+releases, and the crates.io publish: a push to `main` maintains an open release
+PR, and merging that PR publishes.
+
+A breaking change also bumps the `version` in `Cargo.toml` in the same PR, to
+the next major position under the crate's 0.x convention (0.13.x to 0.14.0).
+release-plz does not run its own semver check for this crate (see
+`release-plz.toml`), so the required `SemVer Check` on the pull request is what
+catches a breaking change that did not bump the version.
