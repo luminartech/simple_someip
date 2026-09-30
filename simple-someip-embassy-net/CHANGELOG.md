@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
-- Phase 7 cleanup — sweep WireFormat prose, tighten tests, add 0.9.0 CHANGELOG
+- Sweep WireFormat prose, tighten tests, add 0.9.0 CHANGELOG
 
 ### Fixed
 
