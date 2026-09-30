@@ -19,6 +19,8 @@
 # - the `simple-someip` package stanza -- `semver_check = false`, because the
 #   crate's mutually exclusive bare-metal feature makes the all-features
 #   semver check fail (see the stanza).
+# - the `simple-someip-embassy-net` package stanza -- its own `git_tag_name`,
+#   because `v{{ version }}` names tags that simple-someip already owns.
 #
 # How a version gets decided: unlike the sibling repos, this one merges with
 # merge commits rather than squash (`allow_squash_merge` is off), so the
@@ -58,6 +60,10 @@ commit_parsers = [
 [[package]]
 name = "simple-someip"
 semver_check = false
+
+[[package]]
+name = "simple-someip-embassy-net"
+git_tag_name = "simple-someip-embassy-net-v{{ version }}"
 
 [[package]]
 name = "discovery_client"
