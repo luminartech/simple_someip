@@ -3,22 +3,31 @@
 /// `scenario!(name, std = run, bare_metal = ignore("reason"), { body })`
 ///
 /// Expands to one `#[test] fn name()` that runs the loopback preflight check
-/// and then `body`. `ignore("reason")` ignores the test on that runtime; `run`
-/// runs it. Leading attributes (such as the doc comment naming the
-/// requirement) are kept on the test function. Scenario modules declared below
-/// this definition see it by textual scope.
+/// and then `body`. Each runtime takes exactly `run` or `ignore("reason")`;
+/// anything else is a compile error. Leading attributes (such as the doc
+/// comment naming the requirement) are kept on the test function. Scenario
+/// modules declared below this definition see it by textual scope.
 macro_rules! scenario {
-    (
-        $(#[$attr:meta])*
-        $name:ident,
-        std = $s:ident $(($sr:literal))?,
-        bare_metal = $b:ident $(($br:literal))?,
-        $body:block
-    ) => {
-        $(#[$attr])*
+    ($(#[$attr:meta])* $name:ident, std = $($rest:tt)*) => {
+        scenario!(@std [$(#[$attr])*] $name; $($rest)*);
+    };
+    (@std [$($a:tt)*] $name:ident; run, bare_metal = $($rest:tt)*) => {
+        scenario!(@bare_metal [$($a)*] $name; $($rest)*);
+    };
+    (@std [$($a:tt)*] $name:ident; ignore($r:literal), bare_metal = $($rest:tt)*) => {
+        scenario!(@bare_metal
+            [$($a)* #[cfg_attr(not(feature = "bare-metal-runtime"), ignore = $r)]]
+            $name; $($rest)*);
+    };
+    (@bare_metal [$($a:tt)*] $name:ident; run, $body:block) => {
+        scenario!(@emit [$($a)*] $name; $body);
+    };
+    (@bare_metal [$($a:tt)*] $name:ident; ignore($r:literal), $body:block) => {
+        scenario!(@emit [$($a)* #[cfg_attr(feature = "bare-metal-runtime", ignore = $r)]] $name; $body);
+    };
+    (@emit [$($a:tt)*] $name:ident; $body:block) => {
+        $($a)*
         #[test]
-        $( #[cfg_attr(not(feature = "bare-metal-runtime"), ignore = $sr)] )?
-        $( #[cfg_attr(feature = "bare-metal-runtime", ignore = $br)] )?
         fn $name() {
             crate::interop::preflight();
             $body

@@ -32,11 +32,13 @@ pub struct Consume {
 #[derive(Debug, Clone)]
 pub struct E2eSpec {
     pub data_id: u16,
+    /// The protected data's length in bits, as the specification states it.
     pub data_length_bits: u16,
-    pub max_delta: u16,
+    pub max_delta: u8,
 }
 
-/// Something the runtime under test reported.
+/// Something the runtime under test reported. A `None` field is one the
+/// runtime does not expose.
 #[derive(Debug, Clone)]
 pub enum Observation {
     ServiceAvailable {
@@ -61,17 +63,27 @@ pub enum Observation {
     Request {
         service: u16,
         method: u16,
-        no_return: bool,
-        session: u16,
+        no_return: Option<bool>,
+        session: Option<u16>,
         payload: Vec<u8>,
+    },
+    /// An error the runtime reported on its own (not in reply to a call).
+    RuntimeError {
+        message: String,
     },
 }
 
-/// The result of a method call made by the runtime under test.
+/// The result of a method call made by the runtime under test. A `None`
+/// field is one the runtime does not expose.
 #[derive(Debug, Clone)]
 pub enum CallOutcome {
-    Response { return_code: u8, payload: Vec<u8> },
-    Error { return_code: u8 },
+    Response {
+        return_code: Option<u8>,
+        payload: Vec<u8>,
+    },
+    Error {
+        return_code: u8,
+    },
     NoReply,
 }
 
