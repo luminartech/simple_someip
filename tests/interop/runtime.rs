@@ -33,7 +33,9 @@ pub struct Consume {
 #[derive(Debug, Clone)]
 pub struct E2eSpec {
     pub data_id: u16,
-    /// The protected data's length in bits, as the specification states it.
+    /// The payload's length in bits, excluding the 3-byte E2E header. This
+    /// is not AUTOSAR's DataLength, which also counts the E2E header and
+    /// the upper header bits before it.
     pub data_length_bits: u16,
     pub max_delta: u8,
 }

@@ -23,9 +23,9 @@ use super::discovery::first_offer;
 use super::{CALL_WAIT, QUIET, SD_WAIT};
 
 /// SOME/IP message types.
-const REQUEST: u8 = 0x00;
+pub(super) const REQUEST: u8 = 0x00;
 const REQUEST_NO_RETURN: u8 = 0x01;
-const RESPONSE: u8 = 0x80;
+pub(super) const RESPONSE: u8 = 0x80;
 
 /// Return codes.
 const E_NOT_OK: u8 = 0x01;
@@ -53,7 +53,7 @@ const UNANSWERED: usize = 70;
 const SHORT_CALL: Duration = Duration::from_millis(50);
 
 /// The runtime as the server of `SVC`, with `METHOD` and `FIRE_METHOD`.
-fn server() -> Setup {
+pub(super) fn server() -> Setup {
     Setup {
         offer: Some(Offer {
             service: SVC,
@@ -127,7 +127,7 @@ fn method(d: &[u8]) -> u16 {
     u16::from_be_bytes([d[2], d[3]])
 }
 
-fn session(d: &[u8]) -> u16 {
+pub(super) fn session(d: &[u8]) -> u16 {
     u16::from_be_bytes([d[10], d[11]])
 }
 
@@ -137,7 +137,7 @@ fn is_for(d: &[u8], method: u16) -> bool {
 }
 
 /// A request for `SVC`/`method` from the frame peer.
-fn request_frame(method: u16, msg_type: u8, session: u16, payload: &[u8]) -> Vec<u8> {
+pub(super) fn request_frame(method: u16, msg_type: u8, session: u16, payload: &[u8]) -> Vec<u8> {
     let mut d = build::someip_header(
         SVC,
         method,
@@ -170,7 +170,7 @@ fn response_to(d: &[u8]) -> Vec<u8> {
 
 /// Every datagram for `SVC`/`method` that reaches the frame peer's service
 /// port within `within`, stopping early after one for which `last` holds.
-fn replies(
+pub(super) fn replies(
     fp: &FramePeer,
     method: u16,
     within: Duration,
