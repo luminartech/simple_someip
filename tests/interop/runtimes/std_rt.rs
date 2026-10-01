@@ -1,6 +1,5 @@
 //! `SomeipUnderTest` over simple-someip's tokio `Client` and `Server`.
 
-use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -124,9 +123,8 @@ impl SomeipUnderTest for StdRt {
             .block_on(tokio::time::timeout(timeout, client.request(key, msg)))
         {
             Err(_elapsed) => CallOutcome::NoReply,
-            // The Client returns only the response payload, not its return code.
             Ok(Ok(p)) => CallOutcome::Response {
-                return_code: 0,
+                return_code: None,
                 payload: p.raw_bytes().unwrap_or_default().to_vec(),
             },
             Ok(Err(e)) => panic!("{}: request 0x{method:04X} failed: {e:?}", Self::NAME),
@@ -189,14 +187,18 @@ async fn start_client(
         .await
         .expect("std runtime: bind_discovery failed");
     if let Some(e2e) = &consume.e2e {
-        let max_delta = u8::try_from(e2e.max_delta).expect("Profile 5 max_delta fits in a u8");
+        assert!(
+            e2e.data_length_bits % 8 == 0,
+            "E2E data length {} bits is not a whole number of bytes",
+            e2e.data_length_bits
+        );
         client
             .register_e2e(
                 E2EKey::from_message_id(MessageId::new_from_service_and_method(SVC, EVENT)),
                 E2EProfile::Profile5WithHeader(Profile5Config::new(
                     e2e.data_id,
-                    e2e.data_length_bits,
-                    max_delta,
+                    e2e.data_length_bits / 8,
+                    e2e.max_delta,
                 )),
             )
             .expect("std runtime: E2E registry is full");
@@ -211,10 +213,14 @@ async fn start_client(
     client
 }
 
-/// Turns client updates into observations. When `SVC`/`INST` appears, it
-/// registers the endpoint (so method calls can reach it) and, if asked,
-/// subscribes to `EG` — before reporting it, so a scenario that sees
-/// `ServiceAvailable` can call straight away.
+/// Turns client updates into observations. The first time `SVC`/`INST` is
+/// offered, it registers the endpoint (so method calls can reach it) and, if
+/// asked, subscribes to `EG` — before reporting the offer, so a scenario that
+/// sees `ServiceAvailable` can call straight away.
+///
+/// Entries are reported as the library delivers them: every `OfferService`
+/// (whatever its TTL) is a `ServiceAvailable`, and only a `StopOfferService`
+/// is a `ServiceGone`.
 async fn report_updates(
     client: StdClient,
     mut updates: ClientUpdates<RawPayload, TokioChannels>,
@@ -222,7 +228,7 @@ async fn report_updates(
     tx: mpsc::Sender<Observation>,
     service: Arc<Mutex<Option<ServiceEndpointKey>>>,
 ) {
-    let mut available = HashSet::new();
+    let mut found = false;
     while let Some(update) = updates.recv().await {
         let mut out = Vec::new();
         match update {
@@ -233,16 +239,16 @@ async fn report_updates(
                 }
                 for entry in &msg.sd_header.entries {
                     match entry {
-                        Entry::OfferService(s) if s.ttl > 0 => {
+                        Entry::OfferService(s) => {
                             let Some(endpoint) = udp_endpoint(s, &msg.sd_header.options) else {
                                 eprintln!("std runtime: offer without a UDP endpoint: {s:?}");
                                 continue;
                             };
-                            let first = available.insert((s.service_id, s.instance_id));
-                            if first && s.service_id == SVC && s.instance_id == INST {
+                            if !found && s.service_id == SVC && s.instance_id == INST {
+                                found = true;
                                 let key = ServiceEndpointKey::udp(SVC, SocketAddr::V4(endpoint));
-                                use_service(&client, key, subscribe).await;
                                 *service.lock().unwrap() = Some(key);
+                                out.extend(use_service(&client, key, subscribe).await);
                             }
                             out.push(Observation::ServiceAvailable {
                                 service: s.service_id,
@@ -250,21 +256,15 @@ async fn report_updates(
                                 endpoint,
                             });
                         }
-                        Entry::OfferService(s) | Entry::StopOfferService(s) => {
-                            available.remove(&(s.service_id, s.instance_id));
-                            if s.service_id == SVC && s.instance_id == INST {
-                                *service.lock().unwrap() = None;
-                            }
-                            out.push(Observation::ServiceGone {
-                                service: s.service_id,
-                                instance: s.instance_id,
-                            });
-                        }
+                        Entry::StopOfferService(s) => out.push(Observation::ServiceGone {
+                            service: s.service_id,
+                            instance: s.instance_id,
+                        }),
                         Entry::SubscribeAckEventGroup(eg) => out.push(Observation::Subscribed {
                             eventgroup: eg.event_group_id,
                             accepted: eg.ttl > 0,
                         }),
-                        _ => {}
+                        Entry::FindService(_) | Entry::SubscribeEventGroup(_) => {}
                     }
                 }
             }
@@ -272,16 +272,33 @@ async fn report_updates(
                 message,
                 e2e_status,
                 ..
-            } if message.header().message_type().message_type() == MessageType::Notification => {
-                let id = message.header().message_id();
-                out.push(Observation::Event {
-                    service: id.service_id(),
-                    event: id.method_id(),
-                    payload: message.payload().raw_bytes().unwrap_or_default().to_vec(),
-                    e2e_ok: e2e_status.map(|s| s == E2ECheckStatus::Ok),
-                });
+            } => {
+                let header = message.header();
+                let id = header.message_id();
+                let kind = header.message_type().message_type();
+                if kind == MessageType::Notification {
+                    out.push(Observation::Event {
+                        service: id.service_id(),
+                        event: id.method_id(),
+                        payload: message.payload().raw_bytes().unwrap_or_default().to_vec(),
+                        e2e_ok: e2e_status.map(|s| s == E2ECheckStatus::Ok),
+                    });
+                } else {
+                    eprintln!(
+                        "std runtime: unicast 0x{:04X}/0x{:04X} {kind:?} return code {:?} \
+                         is not a notification; not reported",
+                        id.service_id(),
+                        id.method_id(),
+                        header.return_code(),
+                    );
+                }
             }
-            _ => {}
+            ClientUpdate::Error(e) => out.push(Observation::RuntimeError {
+                message: e.to_string(),
+            }),
+            ClientUpdate::SenderRebooted(addr) => {
+                eprintln!("std runtime: client reported that {addr} rebooted");
+            }
         }
         for o in out {
             if tx.send(o).is_err() {
@@ -291,18 +308,26 @@ async fn report_updates(
     }
 }
 
-async fn use_service(client: &StdClient, key: ServiceEndpointKey, subscribe: bool) {
+/// Registers `key` and subscribes if asked, reporting any library error.
+async fn use_service(
+    client: &StdClient,
+    key: ServiceEndpointKey,
+    subscribe: bool,
+) -> Option<Observation> {
+    let error = |what: &str, e: simple_someip::client::Error| Observation::RuntimeError {
+        message: format!("{what}: {e}"),
+    };
     if let Err(e) = client.add_endpoint(key, INST, CLIENT_PORT).await {
-        eprintln!("std runtime: add_endpoint failed: {e:?}");
-        return;
+        return Some(error("add_endpoint", e));
     }
     if subscribe
         && let Err(e) = client
             .subscribe(key, MAJOR, SUBSCRIBE_TTL_S, EG, CLIENT_PORT)
             .await
     {
-        eprintln!("std runtime: subscribe failed: {e:?}");
+        return Some(error("subscribe", e));
     }
+    None
 }
 
 /// The UDP IPv4 endpoint among the options `entry` references.
@@ -354,10 +379,6 @@ async fn start_server(
 
 /// The server's non-SD request callback: reports the request and echoes its
 /// payload as the response.
-///
-/// The callback is not given the message type or request id, so `no_return`
-/// and `session` are reported as `false` and `0`, and a fire-and-forget
-/// request is answered like any other.
 fn on_request(
     _ctx: usize,
     _source: SocketAddrV4,
@@ -373,8 +394,8 @@ fn on_request(
         let _ = tx.send(Observation::Request {
             service,
             method,
-            no_return: false,
-            session: 0,
+            no_return: None,
+            session: None,
             payload: payload.to_vec(),
         });
     }

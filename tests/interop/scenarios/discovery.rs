@@ -51,6 +51,8 @@ scenario!(
             offer: Some(offer()),
             consume: None,
         });
-        peer.expect_where("AVAILABLE", SD_WAIT, |l| l.hex("service") == u32::from(SVC));
+        peer.expect_where("AVAILABLE", SD_WAIT, |l| {
+            l.hex("service") == u32::from(SVC) && l.hex("instance") == u32::from(INST)
+        });
     }
 );
