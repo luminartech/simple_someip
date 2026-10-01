@@ -3,6 +3,10 @@
 #![allow(dead_code)] // each target uses a different subset
 
 pub mod peers;
+pub mod runtime;
+pub mod runtimes;
+#[cfg(all(feature = "client-tokio", feature = "server-tokio"))]
+pub mod scenarios;
 
 use std::process::Command;
 
