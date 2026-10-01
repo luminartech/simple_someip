@@ -48,4 +48,5 @@ pub const CALL_WAIT: Duration = Duration::from_secs(3);
 
 pub mod discovery;
 pub mod pubsub;
+pub mod rpc;
 pub mod wire;
