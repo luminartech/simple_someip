@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use super::super::consts::PEER_IP;
@@ -69,18 +69,11 @@ impl PeerLine {
 }
 
 /// A running vsomeip peer container. Dropping it removes the container.
-///
-/// Lines the peer prints are kept until a call consumes them, so a line that
-/// arrives while waiting for something else (for example `AVAILABLE` before
-/// `OK offer`) is still there for a later [`expect`](Self::expect).
 pub struct VsomeipPeer {
     name: String,
     child: Child,
     stdin: ChildStdin,
-    lines: Receiver<String>,
-    pending: VecDeque<PeerLine>,
-    seen: Vec<String>,
-    exited: bool,
+    output: PeerOutput,
 }
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -118,12 +111,9 @@ impl VsomeipPeer {
             name,
             child,
             stdin,
-            lines,
-            pending: VecDeque::new(),
-            seen: Vec::new(),
-            exited: false,
+            output: PeerOutput::new(lines),
         };
-        peer.expect_with_hint(
+        peer.output.expect_with_hint(
             "READY",
             Duration::from_secs(20),
             &format!(
@@ -138,23 +128,99 @@ impl VsomeipPeer {
     pub fn send(&mut self, cmd: &str) {
         writeln!(self.stdin, "{cmd}").expect("peer stdin closed");
         let verb = cmd.split_whitespace().next().expect("empty peer command");
-        let line = self.next_matching(
+        let line = self.output.next_matching(
             |l| l.kind == "OK" || l.kind == "ERR",
             Duration::from_secs(5),
         );
         match line {
             Some(l) if l.raw.strip_prefix("OK ") == Some(verb) => {}
             Some(l) => panic!("peer rejected `{cmd}`: {}", l.raw),
-            None => panic!("peer did not acknowledge `{cmd}`; {}", self.transcript()),
+            None => panic!(
+                "peer did not acknowledge `{cmd}`; {}",
+                self.output.transcript()
+            ),
         }
     }
 
-    /// Waits for the next line whose kind is `kind`.
+    /// See [`PeerOutput::clear`].
+    pub fn clear(&mut self) {
+        self.output.clear();
+    }
+
+    /// See [`PeerOutput::expect`].
+    pub fn expect(&mut self, kind: &str, timeout: Duration) -> PeerLine {
+        self.output.expect(kind, timeout)
+    }
+
+    /// See [`PeerOutput::expect_where`].
+    pub fn expect_where(
+        &mut self,
+        kind: &str,
+        timeout: Duration,
+        pred: impl Fn(&PeerLine) -> bool,
+    ) -> PeerLine {
+        self.output.expect_where(kind, timeout, pred)
+    }
+
+    /// See [`PeerOutput::expect_none`].
+    pub fn expect_none(&mut self, kind: &str, within: Duration) {
+        self.output.expect_none(kind, within);
+    }
+}
+
+/// The lines a peer prints, read from a channel.
+///
+/// Lines are kept until a call consumes them, so a line that arrives while
+/// waiting for something else (for example `AVAILABLE` before `OK offer`) is
+/// still there for a later [`expect`](Self::expect). To look only at lines
+/// that follow an action, call [`clear`](Self::clear) before the action.
+pub struct PeerOutput {
+    lines: Receiver<String>,
+    pending: VecDeque<PeerLine>,
+    seen: Vec<String>,
+    exited: bool,
+}
+
+impl PeerOutput {
+    pub fn new(lines: Receiver<String>) -> Self {
+        Self {
+            lines,
+            pending: VecDeque::new(),
+            seen: Vec::new(),
+            exited: false,
+        }
+    }
+
+    /// Discards every line received so far, consumed or not. Later calls
+    /// match only lines that arrive after this one. The discarded lines stay
+    /// in the failure transcript.
+    pub fn clear(&mut self) {
+        loop {
+            match self.lines.try_recv() {
+                Ok(raw) => self.seen.push(raw),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.exited = true;
+                    break;
+                }
+            }
+        }
+        self.pending.clear();
+    }
+
+    /// Waits for the oldest unconsumed line whose kind is `kind`.
+    ///
+    /// The match may be a line received before this call; call
+    /// [`clear`](Self::clear) first to look only at later lines.
     pub fn expect(&mut self, kind: &str, timeout: Duration) -> PeerLine {
         self.expect_with_hint(kind, timeout, "")
     }
 
-    /// Waits for a line of `kind` that also satisfies `pred`.
+    /// Waits for the oldest unconsumed line of `kind` that also satisfies
+    /// `pred`.
+    ///
+    /// The match may be a line received before this call; call
+    /// [`clear`](Self::clear) first to look only at later lines.
     pub fn expect_where(
         &mut self,
         kind: &str,
@@ -170,14 +236,23 @@ impl VsomeipPeer {
             })
     }
 
-    /// Asserts no line of `kind` arrives within `within`.
+    /// Asserts no unconsumed line of `kind` exists or arrives within
+    /// `within`, and that the peer is still running afterwards.
+    ///
+    /// A line received before this call counts; call [`clear`](Self::clear)
+    /// first to look only at later lines.
     pub fn expect_none(&mut self, kind: &str, within: Duration) {
-        if let Some(l) = self.next_matching(|l| l.kind == kind, within) {
-            panic!(
+        match self.next_matching(|l| l.kind == kind, within) {
+            Some(l) => panic!(
                 "peer unexpectedly reported: {}; {}",
                 l.raw,
                 self.transcript()
-            );
+            ),
+            None if self.exited => panic!(
+                "peer exited during expect_none({kind}); {}",
+                self.transcript()
+            ),
+            None => {}
         }
     }
 
