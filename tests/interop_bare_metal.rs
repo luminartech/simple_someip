@@ -25,7 +25,7 @@ extern "C" fn send(_local: u16, buf: *const u8, len: usize, dst: u32, dst_port: 
     let bytes = unsafe { std::slice::from_raw_parts(buf, len) };
     let sock = TX.get_or_init(|| UdpSocket::bind("127.0.0.1:0").unwrap());
     let to = SocketAddrV4::new(Ipv4Addr::from(dst), dst_port);
-    sock.send_to(bytes, to).map_or(-1, |n| n as i32)
+    sock.send_to(bytes, to).map_or(-1, |_| 0)
 }
 extern "C" fn bind(_port: u16, _is_sd: bool, _mcast: u32) -> i32 {
     0
