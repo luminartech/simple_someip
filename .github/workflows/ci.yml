@@ -420,16 +420,16 @@ jobs:
 
   vsomeip-peer-image:
     # The vsomeip peer the interop jobs run against, tagged with a hash of the
-    # files that go into it. `main` publishes it to ghcr.io. Every other event
-    # reuses that copy when it can read it, and otherwise builds it here and
-    # hands it over as an artifact, so a private, missing or unreadable
-    # package never fails a PR.
+    # files that go into it. It reuses the copy on ghcr.io when this run can
+    # read it, and otherwise builds it here and hands it over as an artifact,
+    # so a private, missing or unreadable package never fails a PR. On `main`
+    # `vsomeip-peer-publish` then pushes that artifact.
     name: vsomeip peer image
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
-      # Used to push on `main` only; every other event just reads.
-      packages: write
+      packages: read
     outputs:
       image: ${{ steps.tag.outputs.image }}
       source: ${{ steps.source.outputs.source }}
@@ -450,44 +450,32 @@ jobs:
           fi
           # ghcr.io rejects upper-case repository names.
           echo "image=ghcr.io/${OWNER,,}/simple-someip-vsomeip-peer:${PEER_HASH}" >> "$GITHUB_OUTPUT"
-      - name: Log in to ghcr.io
-        env:
-          ACTOR: ${{ github.actor }}
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # Best effort: a fork's token may not be able to read the package, and
-        # the image is then built below instead.
-        run: |
-          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin \
-            || echo "::notice::Could not log in to ghcr.io; the peer image will be built in this run."
       - id: source
         env:
           IMAGE: ${{ steps.tag.outputs.image }}
-          EVENT: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # The login is best effort (a fork's token may not read the package)
+        # and is dropped again as soon as the lookup is done.
         run: |
+          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin || true
           if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            found=true
+          else
+            found=false
+          fi
+          docker logout ghcr.io || true
+          if [ "$found" = true ]; then
             echo "Found $IMAGE on ghcr.io."
-            build=none source=registry
-          elif [ "$EVENT" = push ]; then
-            build=push source=registry
+            echo "source=registry" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::$IMAGE is not readable on ghcr.io; building it in this run."
-            build=artifact source=artifact
+            echo "source=artifact" >> "$GITHUB_OUTPUT"
           fi
-          echo "build=$build" >> "$GITHUB_OUTPUT"
-          echo "source=$source" >> "$GITHUB_OUTPUT"
-      - if: steps.source.outputs.build != 'none'
+      - if: steps.source.outputs.source == 'artifact'
         uses: docker/setup-buildx-action@v4
-      - name: Build and push the peer image
-        if: steps.source.outputs.build == 'push'
-        uses: docker/build-push-action@v7
-        with:
-          context: tests/data/vsomeip-peer
-          tags: ${{ steps.tag.outputs.image }}
-          push: true
-          cache-from: type=gha,scope=vsomeip-peer
-          cache-to: type=gha,mode=max,scope=vsomeip-peer
       - name: Build the peer image
-        if: steps.source.outputs.build == 'artifact'
+        if: steps.source.outputs.source == 'artifact'
         uses: docker/build-push-action@v7
         with:
           context: tests/data/vsomeip-peer
@@ -495,13 +483,40 @@ jobs:
           outputs: type=docker,dest=${{ runner.temp }}/vsomeip-peer.tar
           cache-from: type=gha,scope=vsomeip-peer
           cache-to: type=gha,mode=max,scope=vsomeip-peer
-      - if: steps.source.outputs.build == 'artifact'
+      - if: steps.source.outputs.source == 'artifact'
         uses: actions/upload-artifact@v7
         with:
           name: vsomeip-peer-image
           path: ${{ runner.temp }}/vsomeip-peer.tar
           if-no-files-found: error
           retention-days: 1
+
+  vsomeip-peer-publish:
+    # The only job with a token that can write packages, and only on `main`.
+    # Nothing depends on it, so a failed push cannot skip the interop runs;
+    # they use this run's artifact either way.
+    name: Publish vsomeip peer image
+    needs: vsomeip-peer-image
+    if: github.event_name == 'push' && needs.vsomeip-peer-image.outputs.source == 'artifact'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: vsomeip-peer-image
+          path: ${{ runner.temp }}/vsomeip-peer
+      - name: Push the peer image to ghcr.io
+        env:
+          IMAGE: ${{ needs.vsomeip-peer-image.outputs.image }}
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker load -i "$RUNNER_TEMP/vsomeip-peer/vsomeip-peer.tar"
+          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          trap 'docker logout ghcr.io' EXIT
+          docker push "$IMAGE"
 
   interop:
     # The interop scenarios against the vsomeip peer, for each runtime. A
@@ -512,6 +527,7 @@ jobs:
     # `interop-nightly` runs the same tests five times on the schedule.
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: read
@@ -535,10 +551,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
-      # Legs that share a cache key overwrite each other's cache.
+      # One cache per runtime, shared by `interop`, `interop-pending` and
+      # `interop-nightly`: they build the same test binary for it.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: interop-${{ matrix.runtime }}
+          shared-key: interop-${{ matrix.runtime }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -562,8 +579,12 @@ jobs:
             docker load -i "$tarball"
             exit 0
           fi
+          # Log out again before any test code runs.
           echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin || true
-          if ! docker pull "$SIMPLE_SOMEIP_VSOMEIP_IMAGE"; then
+          pulled=true
+          docker pull "$SIMPLE_SOMEIP_VSOMEIP_IMAGE" || pulled=false
+          docker logout ghcr.io || true
+          if [ "$pulled" = false ]; then
             echo "::notice::Could not pull $SIMPLE_SOMEIP_VSOMEIP_IMAGE; building it in this job."
             echo "build=true" >> "$GITHUB_OUTPUT"
           fi
@@ -589,9 +610,10 @@ jobs:
         env:
           TOOLCHAIN: ${{ matrix.toolchain }}
           ARGS: ${{ matrix.args }}
+        # `--no-fail-fast` so a red run lists every failing scenario.
         run: |
           read -ra args <<< "$ARGS"
-          cargo "+$TOOLCHAIN" nextest run --profile interop "${args[@]}"
+          cargo "+$TOOLCHAIN" nextest run --profile interop --no-fail-fast "${args[@]}"
 
   interop-pending:
     # Runs only the `#[ignore]`d known gaps and lists in the job summary any
@@ -601,6 +623,7 @@ jobs:
     if: github.event_name != 'schedule'
     continue-on-error: true
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: read
@@ -624,10 +647,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
-      # Legs that share a cache key overwrite each other's cache.
+      # One cache per runtime, shared by `interop`, `interop-pending` and
+      # `interop-nightly`: they build the same test binary for it.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: interop-pending-${{ matrix.runtime }}
+          shared-key: interop-${{ matrix.runtime }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -651,8 +675,12 @@ jobs:
             docker load -i "$tarball"
             exit 0
           fi
+          # Log out again before any test code runs.
           echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin || true
-          if ! docker pull "$SIMPLE_SOMEIP_VSOMEIP_IMAGE"; then
+          pulled=true
+          docker pull "$SIMPLE_SOMEIP_VSOMEIP_IMAGE" || pulled=false
+          docker logout ghcr.io || true
+          if [ "$pulled" = false ]; then
             echo "::notice::Could not pull $SIMPLE_SOMEIP_VSOMEIP_IMAGE; building it in this job."
             echo "build=true" >> "$GITHUB_OUTPUT"
           fi
@@ -688,11 +716,16 @@ jobs:
           if [ "$code" -ne 0 ] && [ "$code" -ne 100 ]; then
             exit "$code"
           fi
+      # The table goes to the job summary; a `::warning::` per gap that now
+      # passes goes to stdout, so it also shows on the PR's checks page.
       - name: Summarize the known gaps
         if: ${{ !cancelled() }}
         env:
           RUNTIME: ${{ matrix.runtime }}
-        run: python3 tests/data/vsomeip-peer/summarize.py target/nextest/interop/junit-interop.xml "$RUNTIME" >> "$GITHUB_STEP_SUMMARY"
+          JUNIT: target/nextest/interop/junit-interop.xml
+        run: |
+          python3 tests/data/vsomeip-peer/summarize.py "$JUNIT" "$RUNTIME" >> "$GITHUB_STEP_SUMMARY"
+          python3 tests/data/vsomeip-peer/summarize.py --annotations "$JUNIT" "$RUNTIME"
 
   interop-nightly:
     # Repeats the interop tests five times to catch flaky scenarios, against
@@ -702,6 +735,7 @@ jobs:
     needs: vsomeip-peer-image
     if: github.event_name == 'schedule' || startsWith(github.head_ref, 'release-plz-')
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: read
@@ -725,10 +759,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
-      # Legs that share a cache key overwrite each other's cache.
+      # One cache per runtime, shared by `interop`, `interop-pending` and
+      # `interop-nightly`: they build the same test binary for it.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: interop-nightly-${{ matrix.runtime }}-${{ matrix.peer }}
+          shared-key: interop-${{ matrix.runtime }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -755,8 +790,12 @@ jobs:
             docker load -i "$tarball"
             exit 0
           fi
+          # Log out again before any test code runs.
           echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin || true
-          if ! docker pull "$IMAGE"; then
+          pulled=true
+          docker pull "$IMAGE" || pulled=false
+          docker logout ghcr.io || true
+          if [ "$pulled" = false ]; then
             echo "::notice::Could not pull $IMAGE; building it in this job."
             echo "build=true" >> "$GITHUB_OUTPUT"
           fi
