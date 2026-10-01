@@ -68,7 +68,10 @@ mod loopback_check {
         assert!(!addrs.contains("127.0.0.2"));
         let err = check_loopback(LINK_OK, ROUTE_OK, &addrs).unwrap_err();
         assert!(err.contains("127.0.0.2 is not assigned to lo"), "{err}");
-        assert!(err.contains("sudo ip addr add 127.0.0.2/8 dev lo"), "{err}");
+        assert!(
+            err.contains("sudo ip addr replace 127.0.0.2/8 dev lo"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -77,7 +80,7 @@ mod loopback_check {
         for cmd in [
             "sudo ip link set lo multicast on",
             "sudo ip route replace 239.255.0.255/32 dev lo",
-            "sudo ip addr add 127.0.0.2/8 dev lo",
+            "sudo ip addr replace 127.0.0.2/8 dev lo",
         ] {
             assert!(err.contains(cmd), "{err}");
         }
