@@ -69,11 +69,16 @@ Most integration tests declare `required-features`, so a bare `cargo test`
 silently skips them. Run the configurations, not just the default:
 
 ```sh
-cargo test --features client-tokio,server-tokio       # the async engines
-cargo test --features client,bare_metal               # the bare-metal client
-cargo test --features server,bare_metal               # the bare-metal server
-cargo test --no-default-features                      # the no_std core alone
+cargo nextest run --features client-tokio,server-tokio  # the async engines
+cargo test --features client,bare_metal                 # the bare-metal client
+cargo test --features server,bare_metal                 # the bare-metal server
+cargo test --no-default-features                        # the no_std core alone
 ```
+
+The async engines run under [cargo-nextest](https://nexte.st): its default
+profile leaves out the interop tests, which plain `cargo test` would also
+build and run, and which need Docker, host setup and nextest's `interop`
+profile. To run the interop tests, see `tests/data/vsomeip-peer/README.md`.
 
 There is deliberately no `--all-features` line: it enables
 `bare-metal-runtime` alongside `std` and hits the `compile_error!` above.

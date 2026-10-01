@@ -29,11 +29,22 @@ pub mod consts {
 const LOOPBACK_SETUP: &str = "run:\n  \
     sudo ip link set lo multicast on\n  \
     sudo ip route replace 239.255.0.255/32 dev lo\n  \
-    sudo ip addr add 127.0.0.2/8 dev lo";
+    sudo ip addr replace 127.0.0.2/8 dev lo";
 
-/// Fails fast, with the commands to run, when the host isn't set up for
-/// loopback multicast or the peer's address isn't assigned to `lo`.
+/// Fails fast unless the test runs under cargo nextest, which gives each test
+/// its own process, and then, with the commands to run, when the host isn't
+/// set up for loopback multicast or the peer's address isn't assigned to `lo`.
+///
+/// Under plain `cargo test` the tests would share one process and its ports,
+/// and fail in ways that point at the wrong cause.
 pub fn preflight() {
+    if std::env::var_os("NEXTEST").is_none() {
+        panic!(
+            "interop tests run under cargo nextest: \
+             `cargo nextest run --profile interop ...`; \
+             see tests/data/vsomeip-peer/README.md"
+        );
+    }
     let link = ip(&["link", "show", "lo"]);
     let route = ip(&["route", "get", "239.255.0.255"]);
     let addrs = ip(&["-4", "addr", "show", "dev", "lo"]);
