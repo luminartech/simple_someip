@@ -1,4 +1,7 @@
 [profile.default]
+# Interop tests need Docker and loopback multicast; they run only under the
+# `interop` profile (see tests/data/vsomeip-peer/README.md).
+default-filter = 'not binary(/^interop_/)'
 
 # Synchronous tests in the main binary share a process with tokio-based tests.
 # The tokio worker threads can take slightly longer to tear down under load,
@@ -31,3 +34,14 @@ serial-static-pools = { max-threads = 1 }
 
 [profile.default.junit]  # Output the junit coverage for tools
 path = "junit.xml"
+
+[profile.interop]
+default-filter = 'binary(/^interop_/)'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[[profile.interop.overrides]]
+filter = 'binary(/^interop_/)'
+test-group = 'serial-sd-port'
+
+[profile.interop.junit]
+path = "junit-interop.xml"
