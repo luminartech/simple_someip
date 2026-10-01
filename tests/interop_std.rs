@@ -1,5 +1,9 @@
 //! Interop tests for the std runtime against vsomeip and spec-derived frames.
-#![cfg(all(feature = "client-tokio", feature = "server-tokio"))]
+#![cfg(all(
+    target_os = "linux",
+    feature = "client-tokio",
+    feature = "server-tokio"
+))]
 
 mod interop;
 
