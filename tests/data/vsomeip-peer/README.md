@@ -29,6 +29,14 @@ Run the bare-metal runtime's interop tests (nightly toolchain):
 Add `--run-ignored only` to see which known gaps are still open; each ignored
 test names the issue that tracks it.
 
+## Licenses and source
+
+The image contains vsomeip (MPL-2.0) and Boost (BSL-1.0). vsomeip's license and
+a pointer to its source are inside the image at `/usr/share/doc/vsomeip/LICENSE`
+and `/usr/share/doc/vsomeip/SOURCE`. It is built unmodified, so the source for
+the version in use is the matching upstream tag at
+`https://github.com/COVESA/vsomeip/tree/<version>`.
+
 ## Command protocol
 
 One command per line on stdin; ids are hex without `0x`, payloads are hex, `-`
