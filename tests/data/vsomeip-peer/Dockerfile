@@ -66,6 +66,13 @@ RUN mkdir build && cd build \
 FROM ${BASE_IMAGE}
 
 ARG BOOST_VERSION=1.74.0
+ARG VSOMEIP_VERSION=3.4.10
+
+LABEL org.opencontainers.image.source="https://github.com/luminartech/simple_someip" \
+      org.opencontainers.image.licenses="(MIT OR Apache-2.0) AND MPL-2.0 AND BSL-1.0" \
+      org.opencontainers.image.description="vsomeip peer driven by stdin commands, for simple-someip interop tests" \
+      com.github.luminartech.simple-someip.vsomeip.version="${VSOMEIP_VERSION}" \
+      com.github.luminartech.simple-someip.vsomeip.source="https://github.com/COVESA/vsomeip/tree/${VSOMEIP_VERSION}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         "libboost-system${BOOST_VERSION}" \
@@ -77,6 +84,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy installed vsomeip libs, the peer, its config template and the entrypoint.
 COPY --from=build /usr/local/lib/libvsomeip3*.so* /usr/local/lib/
 COPY --from=build /src/peer/build/peer /usr/local/bin/peer
+# vsomeip is MPL-2.0: ship its license and say where its source lives.
+COPY --from=build /src/vsomeip-${VSOMEIP_VERSION}/LICENSE /usr/share/doc/vsomeip/LICENSE
+RUN printf '%s\n' \
+        "vsomeip ${VSOMEIP_VERSION}" \
+        "License: MPL-2.0 (see LICENSE in this directory)" \
+        "Source: https://github.com/COVESA/vsomeip/tree/${VSOMEIP_VERSION}" \
+        "Built unmodified from the upstream release tarball." \
+        > /usr/share/doc/vsomeip/SOURCE
 COPY peer.json.in /etc/vsomeip-peer.json.in
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
