@@ -32,6 +32,9 @@
 #   and takes no feature input, so it trips this crate's own `compile_error!`
 #   guard for `bare-metal-runtime`. The job here passes a feature set.
 # - `Linear PR History` -- not provided.
+# - `vsomeip peer image` and the `Interop` jobs -- they need Docker, a vsomeip
+#   peer image and loopback multicast set up with sudo. Nothing in the shared
+#   workflow provides any of them.
 name: Bare-metal & Platform CI
 
 on:
@@ -40,6 +43,14 @@ on:
   pull_request:
     branches: [main]
   merge_group:
+  # Repeats the interop tests nightly (`interop-nightly`). Jobs that only
+  # re-check an unchanged commit, or that upload coverage, skip this event.
+  schedule:
+    - cron: '17 6 * * *'
+
+# The jobs that need more say so themselves.
+permissions:
+  contents: read
 
 # Every public feature EXCEPT `bare-metal-runtime`. That feature is no-alloc
 # and pulls a nightly-only crate feature (`impl_trait_in_assoc_type`), so it
@@ -278,6 +289,9 @@ jobs:
     # gate.
     name: build-std core gate (no alloc in sysroot)
     needs: check
+    # Floats on `@nightly`, so a scheduled run would go red on upstream
+    # nightly breakage that has nothing to do with the commit.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -296,6 +310,9 @@ jobs:
   test:
     name: Build, Test & Coverage
     needs: check
+    # A scheduled run would re-upload coverage for a commit `push` already
+    # covered, and a Codecov outage would fail it (`fail_ci_if_error`).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -334,20 +351,6 @@ jobs:
         # two embassy-net stacks in-process — no TUN, no privilege) so the
         # reference adapter stays wired to the current API.
         run: cargo test -p simple-someip-embassy-net
-      - name: SD wire-format conformance (TX direction)
-        # `tx_announcement_loop_emits_wire_format_offer` is `#[ignore]`'d by
-        # default because it needs an interface with the `MULTICAST` link
-        # flag. CI's `lo` lacks it; flip it on, point the test at
-        # 127.0.0.1, and run just this one test (the rest of the file's
-        # ignored tests need an external vsomeip docker container — they
-        # stay skipped).
-        run: |
-          sudo ip link set lo multicast on
-          SIMPLE_SOMEIP_TEST_INTERFACE=127.0.0.1 \
-            cargo test --features client-tokio,server-tokio \
-              --test vsomeip_sd_compat \
-              tx_announcement_loop_emits_wire_format_offer \
-              -- --ignored --exact --nocapture
       # Coverage is split so the std-default and bare-metal-default cap regimes
       # are each exercised under their own feature config (they share one set of
       # consts and cannot be unified into a single build — see `HOST_FEATURES`):
@@ -395,6 +398,9 @@ jobs:
     # here: it binds fixed SD ports and is flaky under parallel execution on
     # every platform (reproduces on `main`; tracked separately, #84), so running
     # it would add cross-platform noise unrelated to this fix.
+    #
+    # Skipped on the schedule: the slowest job, re-checking an unchanged commit.
+    if: github.event_name != 'schedule'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -411,3 +417,414 @@ jobs:
         shell: bash
       - run: cargo test --no-default-features --features $HOST_FEATURES --lib
         shell: bash
+
+  vsomeip-peer-image:
+    # The vsomeip peer the interop jobs run against, tagged with a hash of the
+    # files that go into it. `main` publishes it to ghcr.io. Every other event
+    # reuses that copy when it can read it, and otherwise builds it here and
+    # hands it over as an artifact, so a private, missing or unreadable
+    # package never fails a PR.
+    name: vsomeip peer image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Used to push on `main` only; every other event just reads.
+      packages: write
+    outputs:
+      image: ${{ steps.tag.outputs.image }}
+      source: ${{ steps.source.outputs.source }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - id: tag
+        env:
+          OWNER: ${{ github.repository_owner }}
+          # Only the files that go into the image, so editing the README or
+          # summarize.py does not force a rebuild.
+          PEER_HASH: ${{ hashFiles('tests/data/vsomeip-peer/Dockerfile', 'tests/data/vsomeip-peer/CMakeLists.txt', 'tests/data/vsomeip-peer/peer.cpp', 'tests/data/vsomeip-peer/peer.json.in', 'tests/data/vsomeip-peer/entrypoint.sh') }}
+        run: |
+          if [ -z "$PEER_HASH" ]; then
+            echo "::error::None of the vsomeip peer's files were found under tests/data/vsomeip-peer/."
+            exit 1
+          fi
+          # ghcr.io rejects upper-case repository names.
+          echo "image=ghcr.io/${OWNER,,}/simple-someip-vsomeip-peer:${PEER_HASH}" >> "$GITHUB_OUTPUT"
+      - name: Log in to ghcr.io
+        env:
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Best effort: a fork's token may not be able to read the package, and
+        # the image is then built below instead.
+        run: |
+          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin \
+            || echo "::notice::Could not log in to ghcr.io; the peer image will be built in this run."
+      - id: source
+        env:
+          IMAGE: ${{ steps.tag.outputs.image }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "Found $IMAGE on ghcr.io."
+            build=none source=registry
+          elif [ "$EVENT" = push ]; then
+            build=push source=registry
+          else
+            echo "::notice::$IMAGE is not readable on ghcr.io; building it in this run."
+            build=artifact source=artifact
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "source=$source" >> "$GITHUB_OUTPUT"
+      - if: steps.source.outputs.build != 'none'
+        uses: docker/setup-buildx-action@v4
+      - name: Build and push the peer image
+        if: steps.source.outputs.build == 'push'
+        uses: docker/build-push-action@v7
+        with:
+          context: tests/data/vsomeip-peer
+          tags: ${{ steps.tag.outputs.image }}
+          push: true
+          cache-from: type=gha,scope=vsomeip-peer
+          cache-to: type=gha,mode=max,scope=vsomeip-peer
+      - name: Build the peer image
+        if: steps.source.outputs.build == 'artifact'
+        uses: docker/build-push-action@v7
+        with:
+          context: tests/data/vsomeip-peer
+          tags: ${{ steps.tag.outputs.image }}
+          outputs: type=docker,dest=${{ runner.temp }}/vsomeip-peer.tar
+          cache-from: type=gha,scope=vsomeip-peer
+          cache-to: type=gha,mode=max,scope=vsomeip-peer
+      - if: steps.source.outputs.build == 'artifact'
+        uses: actions/upload-artifact@v7
+        with:
+          name: vsomeip-peer-image
+          path: ${{ runner.temp }}/vsomeip-peer.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  interop:
+    # The interop scenarios against the vsomeip peer, for each runtime. A
+    # known gap is `#[ignore]`d with its tracking issue and runs in
+    # `interop-pending` instead.
+    name: Interop (${{ matrix.runtime }})
+    needs: vsomeip-peer-image
+    # `interop-nightly` runs the same tests five times on the schedule.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: std
+            toolchain: stable
+            args: --features std,tracing,client,client-tokio,server,server-tokio --test interop_std
+          - runtime: bare-metal
+            # Same pin as the `bare-metal-runtime` job; see the reason there.
+            toolchain: nightly-2026-08-21
+            args: --no-default-features --features bare-metal-runtime --test interop_bare_metal
+    env:
+      SIMPLE_SOMEIP_VSOMEIP_IMAGE: ${{ needs.vsomeip-peer-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      # Legs that share a cache key overwrite each other's cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: interop-${{ matrix.runtime }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # The image comes from this run's artifact, else ghcr.io, else a local
+      # build, so a package this job cannot read never fails it.
+      - name: Download the peer image
+        if: needs.vsomeip-peer-image.outputs.source == 'artifact'
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: vsomeip-peer-image
+          path: ${{ runner.temp }}/vsomeip-peer
+      - name: Load or pull the peer image
+        id: peer
+        env:
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tarball="$RUNNER_TEMP/vsomeip-peer/vsomeip-peer.tar"
+          if [ -f "$tarball" ]; then
+            docker load -i "$tarball"
+            exit 0
+          fi
+          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin || true
+          if ! docker pull "$SIMPLE_SOMEIP_VSOMEIP_IMAGE"; then
+            echo "::notice::Could not pull $SIMPLE_SOMEIP_VSOMEIP_IMAGE; building it in this job."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.peer.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v4
+      - name: Build the peer image
+        if: steps.peer.outputs.build == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: tests/data/vsomeip-peer
+          tags: ${{ env.SIMPLE_SOMEIP_VSOMEIP_IMAGE }}
+          load: true
+          cache-from: type=gha,scope=vsomeip-peer
+      # vsomeip starts discovery only once its unicast address is on an
+      # interface. `ip addr replace` rather than `add`, which fails if the
+      # address is already there.
+      - name: Set up loopback multicast and the peer's address
+        run: |
+          sudo ip link set lo multicast on
+          sudo ip route replace 239.255.0.255/32 dev lo
+          sudo ip addr replace 127.0.0.2/8 dev lo
+      - name: Run the interop tests
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+          ARGS: ${{ matrix.args }}
+        run: |
+          read -ra args <<< "$ARGS"
+          cargo "+$TOOLCHAIN" nextest run --profile interop "${args[@]}"
+
+  interop-pending:
+    # Runs only the `#[ignore]`d known gaps and lists in the job summary any
+    # that now pass, so a fix that closes a gap is noticed. Never blocks.
+    name: Interop known gaps (${{ matrix.runtime }})
+    needs: vsomeip-peer-image
+    if: github.event_name != 'schedule'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: std
+            toolchain: stable
+            args: --features std,tracing,client,client-tokio,server,server-tokio --test interop_std
+          - runtime: bare-metal
+            # Same pin as the `bare-metal-runtime` job; see the reason there.
+            toolchain: nightly-2026-08-21
+            args: --no-default-features --features bare-metal-runtime --test interop_bare_metal
+    env:
+      SIMPLE_SOMEIP_VSOMEIP_IMAGE: ${{ needs.vsomeip-peer-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      # Legs that share a cache key overwrite each other's cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: interop-pending-${{ matrix.runtime }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # The image comes from this run's artifact, else ghcr.io, else a local
+      # build, so a package this job cannot read never fails it.
+      - name: Download the peer image
+        if: needs.vsomeip-peer-image.outputs.source == 'artifact'
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: vsomeip-peer-image
+          path: ${{ runner.temp }}/vsomeip-peer
+      - name: Load or pull the peer image
+        id: peer
+        env:
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tarball="$RUNNER_TEMP/vsomeip-peer/vsomeip-peer.tar"
+          if [ -f "$tarball" ]; then
+            docker load -i "$tarball"
+            exit 0
+          fi
+          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin || true
+          if ! docker pull "$SIMPLE_SOMEIP_VSOMEIP_IMAGE"; then
+            echo "::notice::Could not pull $SIMPLE_SOMEIP_VSOMEIP_IMAGE; building it in this job."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.peer.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v4
+      - name: Build the peer image
+        if: steps.peer.outputs.build == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: tests/data/vsomeip-peer
+          tags: ${{ env.SIMPLE_SOMEIP_VSOMEIP_IMAGE }}
+          load: true
+          cache-from: type=gha,scope=vsomeip-peer
+      # vsomeip starts discovery only once its unicast address is on an
+      # interface. `ip addr replace` rather than `add`, which fails if the
+      # address is already there.
+      - name: Set up loopback multicast and the peer's address
+        run: |
+          sudo ip link set lo multicast on
+          sudo ip route replace 239.255.0.255/32 dev lo
+          sudo ip addr replace 127.0.0.2/8 dev lo
+      - name: Run the ignored interop tests
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+          ARGS: ${{ matrix.args }}
+        run: |
+          read -ra args <<< "$ARGS"
+          # nextest exits 100 when tests fail, which is what a known gap
+          # does. Any other failure (a build error, say) fails the step.
+          code=0
+          cargo "+$TOOLCHAIN" nextest run --profile interop --run-ignored only \
+            --no-fail-fast --no-tests=pass "${args[@]}" || code=$?
+          if [ "$code" -ne 0 ] && [ "$code" -ne 100 ]; then
+            exit "$code"
+          fi
+      - name: Summarize the known gaps
+        if: ${{ !cancelled() }}
+        env:
+          RUNTIME: ${{ matrix.runtime }}
+        run: python3 tests/data/vsomeip-peer/summarize.py target/nextest/interop/junit-interop.xml "$RUNTIME" >> "$GITHUB_STEP_SUMMARY"
+
+  interop-nightly:
+    # Repeats the interop tests five times to catch flaky scenarios, against
+    # the pinned peer and against the newest vsomeip release. Runs nightly,
+    # and on release-plz's release PRs so a release is checked first.
+    name: Interop repeat (${{ matrix.runtime }}, ${{ matrix.peer }})
+    needs: vsomeip-peer-image
+    if: github.event_name == 'schedule' || startsWith(github.head_ref, 'release-plz-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [std, bare-metal]
+        peer: [pinned, latest]
+        include:
+          - runtime: std
+            toolchain: stable
+            args: --features std,tracing,client,client-tokio,server,server-tokio --test interop_std
+          - runtime: bare-metal
+            # Same pin as the `bare-metal-runtime` job; see the reason there.
+            toolchain: nightly-2026-08-21
+            args: --no-default-features --features bare-metal-runtime --test interop_bare_metal
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      # Legs that share a cache key overwrite each other's cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: interop-nightly-${{ matrix.runtime }}-${{ matrix.peer }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # Pinned peer: the image comes from this run's artifact, else ghcr.io,
+      # else a local build, as in `interop`.
+      - name: Download the peer image
+        if: matrix.peer == 'pinned' && needs.vsomeip-peer-image.outputs.source == 'artifact'
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: vsomeip-peer-image
+          path: ${{ runner.temp }}/vsomeip-peer
+      - name: Load or pull the peer image
+        id: peer
+        if: matrix.peer == 'pinned'
+        env:
+          IMAGE: ${{ needs.vsomeip-peer-image.outputs.image }}
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          tarball="$RUNNER_TEMP/vsomeip-peer/vsomeip-peer.tar"
+          if [ -f "$tarball" ]; then
+            docker load -i "$tarball"
+            exit 0
+          fi
+          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin || true
+          if ! docker pull "$IMAGE"; then
+            echo "::notice::Could not pull $IMAGE; building it in this job."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+      # Newest peer: an API failure must fail the leg, never fall through to
+      # building an empty or unexpected version.
+      - name: Find the newest vsomeip release
+        id: latest
+        if: matrix.peer == 'latest'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! tag=$(gh api repos/COVESA/vsomeip/releases/latest --jq '.tag_name // ""'); then
+            echo "::error::Could not look up the newest vsomeip release from the GitHub API."
+            exit 1
+          fi
+          # The Dockerfile derives the source directory from the tag, which
+          # only works for a bare version number.
+          if ! [[ "$tag" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+            echo "::error::The newest vsomeip release has tag '$tag', which is not a version number."
+            exit 1
+          fi
+          echo "Newest vsomeip release: $tag"
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+          echo "image=simple-someip-vsomeip-peer:vsomeip-$tag" >> "$GITHUB_OUTPUT"
+      - if: steps.peer.outputs.build == 'true' || matrix.peer == 'latest'
+        uses: docker/setup-buildx-action@v4
+      - name: Build the peer image
+        if: steps.peer.outputs.build == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: tests/data/vsomeip-peer
+          tags: ${{ steps.peer.outputs.image }}
+          load: true
+          cache-from: type=gha,scope=vsomeip-peer
+      # vsomeip 3.7 needs Boost >= 1.75, newer than Ubuntu 22.04 ships.
+      - name: Build the peer image against the newest vsomeip release
+        if: matrix.peer == 'latest'
+        uses: docker/build-push-action@v7
+        with:
+          context: tests/data/vsomeip-peer
+          tags: ${{ steps.latest.outputs.image }}
+          load: true
+          build-args: |
+            VSOMEIP_VERSION=${{ steps.latest.outputs.version }}
+            BASE_IMAGE=ubuntu:24.04
+            BOOST_VERSION=1.83.0
+          cache-from: type=gha,scope=vsomeip-peer-latest
+          cache-to: type=gha,mode=max,scope=vsomeip-peer-latest
+      # vsomeip starts discovery only once its unicast address is on an
+      # interface. `ip addr replace` rather than `add`, which fails if the
+      # address is already there.
+      - name: Set up loopback multicast and the peer's address
+        run: |
+          sudo ip link set lo multicast on
+          sudo ip route replace 239.255.0.255/32 dev lo
+          sudo ip addr replace 127.0.0.2/8 dev lo
+      - name: Run the interop tests five times
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+          ARGS: ${{ matrix.args }}
+          SIMPLE_SOMEIP_VSOMEIP_IMAGE: ${{ matrix.peer == 'latest' && steps.latest.outputs.image || steps.peer.outputs.image }}
+        run: |
+          read -ra args <<< "$ARGS"
+          for i in 1 2 3 4 5; do
+            echo "::group::Run $i of 5"
+            if ! cargo "+$TOOLCHAIN" nextest run --profile interop "${args[@]}"; then
+              echo "::error::Run $i of 5 failed."
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
