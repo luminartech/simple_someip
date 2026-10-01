@@ -333,6 +333,9 @@ pub(super) struct FrameServer {
     schedule: Vec<Duration>,
     offers: Vec<Instant>,
     subscribes: Vec<ReceivedSubscribe>,
+    /// Datagrams sent from the peer's service port, in order, right after
+    /// its first Ack.
+    pub(super) after_first_ack: Vec<(SocketAddrV4, Vec<u8>)>,
 }
 
 impl FrameServer {
@@ -347,6 +350,7 @@ impl FrameServer {
             schedule: Vec::new(),
             offers: Vec::new(),
             subscribes: Vec::new(),
+            after_first_ack: Vec::new(),
         }
     }
 
@@ -398,6 +402,11 @@ impl FrameServer {
                     src,
                     &build::sd_message_with_flags(self.unicast_session, self.flags, &answers, &[]),
                 );
+                if matches!(self.answer, Answer::Ack) {
+                    for (to, d) in std::mem::take(&mut self.after_first_ack) {
+                        self.fp.send_unicast(to, &d);
+                    }
+                }
             }
         }
     }

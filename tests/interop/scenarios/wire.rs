@@ -306,4 +306,24 @@ mod builders {
         assert_eq!(parse::sd_entry_types(&d), []);
         assert_eq!(parse::sd_entry_types(&d[..10]), []);
     }
+
+    #[test]
+    fn messages_are_split_by_their_length_fields() {
+        let message = |session: u16, payload: &[u8]| {
+            let mut d =
+                build::someip_header(SVC, METHOD, 0x0001, session, 0x00, 0x00, payload.len());
+            d.extend(payload);
+            d
+        };
+        let (first, second) = (message(1, &[1]), message(2, &[2, 2]));
+        let d = [first.clone(), second.clone()].concat();
+        assert_eq!(parse::someip_messages(&d), [&first[..], &second[..]]);
+        // A truncated tail: too short for a header, then a header whose
+        // Length runs past the end of the datagram.
+        let short = [d.clone(), vec![0xEE; 3]].concat();
+        assert_eq!(parse::someip_messages(&short), [&first[..], &second[..]]);
+        let overlong = [first.clone(), message(3, &[3; 10])[..20].to_vec()].concat();
+        assert_eq!(parse::someip_messages(&overlong), [&first[..]]);
+        assert!(parse::someip_messages(&first[..10]).is_empty());
+    }
 }

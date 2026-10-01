@@ -398,6 +398,27 @@ pub mod parse {
             .collect()
     }
 
+    /// The SOME/IP messages in a datagram, split by their Length fields
+    /// (PRS_SOMEIP_00140). Splitting stops at the first remainder that is
+    /// shorter than a header or than its own Length field says, so a
+    /// truncated tail yields nothing.
+    pub fn someip_messages(datagram: &[u8]) -> Vec<&[u8]> {
+        let mut messages = Vec::new();
+        let mut rest = datagram;
+        while let Some(&[a, b, c, d]) = rest.get(4..8) {
+            let Some(end) = (u32::from_be_bytes([a, b, c, d]) as usize).checked_add(8) else {
+                break;
+            };
+            if end < 16 || end > rest.len() {
+                break;
+            }
+            let (message, tail) = rest.split_at(end);
+            messages.push(message);
+            rest = tail;
+        }
+        messages
+    }
+
     /// The `(type, ttl)` of each entry in an SD datagram, or nothing if the
     /// datagram is not SD.
     pub fn sd_entry_types(datagram: &[u8]) -> Vec<(u8, u32)> {

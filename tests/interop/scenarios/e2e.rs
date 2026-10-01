@@ -189,7 +189,7 @@ scenario!(
         // Negative control: the next frame, in sequence, with one CRC byte
         // corrupted, must fail the check, so the check above was not a pass
         // by default.
-        let mut corrupted = next;
+        let mut corrupted = next.clone();
         corrupted[E2E_AT] ^= 0xFF;
         server.fp.send_unicast(client_endpoint(), &corrupted);
         match next_matching(&mut rt, QUIET, is_event) {
@@ -200,7 +200,27 @@ scenario!(
                 "{}: the corrupted frame was delivered with e2e_ok Some(false)",
                 Rt::NAME
             ),
-            Err(_) => eprintln!("{}: the corrupted frame was not delivered", Rt::NAME),
+            Err(_) => {
+                eprintln!("{}: the corrupted frame was not delivered", Rt::NAME);
+                // Dropping it is correct only if the runtime still receives:
+                // the same frame uncorrupted must then pass. Its counter is
+                // 1, one past the last valid frame's, so it is Ok; counter
+                // 2 would be OkSomeLost (PRS_E2E_00880), not Ok.
+                server.fp.send_unicast(client_endpoint(), &next);
+                let event = next_matching(&mut rt, DELIVERY_WAIT, is_event);
+                let passed = matches!(
+                    &event,
+                    Ok(Observation::Event { e2e_ok: Some(true), payload, .. }) if payload[..] == PAYLOAD
+                );
+                assert!(
+                    passed,
+                    "{}: control failed: after the corrupted frame was dropped, the same frame \
+                     uncorrupted (counter 1) gave {event:?}; want an Event with e2e_ok \
+                     Some(true) and payload {PAYLOAD:02X?}, so the drop may have been a \
+                     receive failure; datagram: {next:02X?}",
+                    Rt::NAME
+                );
+            }
             Ok(o) => panic!(
                 "{}: control failed: a frame whose CRC is corrupted was reported as {o:?}; want \
                  e2e_ok Some(false), or no Event, so the E2E check is not running; datagram: \
