@@ -3,6 +3,8 @@
 
 mod interop;
 
+type Rt = interop::runtimes::std_rt::StdRt;
+
 use std::time::Duration;
 
 use interop::peers::vsomeip::VsomeipPeer;
