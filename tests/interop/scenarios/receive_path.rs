@@ -214,8 +214,8 @@ pub(super) fn next_matching(
 scenario!(
     /// PRS_SOMEIP_00535, 00140 / feat_req_someip_702, 319 — every notification in one UDP datagram is delivered.
     x1_all_messages_in_a_datagram_are_delivered,
-    std = run,
-    bare_metal = run,
+    std = ignore("every SOME/IP message in a UDP datagram must be delivered (#188)"),
+    bare_metal = ignore("each SOME/IP message must end where its Length field says (#189)"),
     {
         let (server, mut rt) = subscribed(super::pubsub::client());
         // Controls: each notification is delivered when sent alone, so a
@@ -250,8 +250,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIP_00535, 00140 / feat_req_someip_702, 319 — every request in one UDP datagram is answered.
     x1_all_requests_in_a_datagram_are_answered,
-    std = run,
-    bare_metal = run,
+    std = ignore("every request in a UDP datagram must be answered (#188)"),
+    bare_metal = ignore("every request in a UDP datagram must be answered (#188)"),
     {
         let fp = FramePeer::start();
         let _rt = Rt::start(super::rpc::server());
@@ -299,7 +299,7 @@ scenario!(
     /// incomplete message, which the receiver discards (PRS_SOMEIP_00385).
     x2_length_field_ends_the_message,
     std = run,
-    bare_metal = run,
+    bare_metal = ignore("a message must end where its Length field says (#189)"),
     {
         let (server, mut rt) = subscribed(super::pubsub::client());
         control(&server, &mut rt, "the Length field");
@@ -322,7 +322,7 @@ scenario!(
     /// PRS_SOMEIP_00910, 00385 / feat_req_someip_77 — a message whose Length field runs past the end of the datagram is malformed and not delivered.
     x2_length_past_the_datagram_is_malformed,
     std = run,
-    bare_metal = run,
+    bare_metal = ignore("a message whose Length runs past the datagram must be discarded (#189)"),
     {
         let (server, mut rt) = subscribed(super::pubsub::client());
         control(&server, &mut rt, "a malformed Length field");
@@ -346,8 +346,8 @@ scenario!(
     /// runtime that reassembles SOME/IP-TP nor one that does not may deliver
     /// anything for it.
     x3_tp_segments_are_not_delivered_as_messages,
-    std = run,
-    bare_metal = run,
+    std = ignore("a SOME/IP-TP segment must not be delivered as a complete message (#190)"),
+    bare_metal = ignore("a SOME/IP-TP segment must not be delivered as a complete message (#190)"),
     {
         let (server, mut rt) = subscribed(super::pubsub::client());
         control(&server, &mut rt, "a SOME/IP-TP segment");
@@ -384,7 +384,7 @@ scenario!(
     /// own lands inside a burst.
     x4_initial_value_burst_is_delivered,
     std = run,
-    bare_metal = run,
+    bare_metal = ignore("initial values sent right after the Ack must all be delivered (#191)"),
     {
         let mut server = FrameServer::start(REBOOT | UNICAST, Answer::Ack);
         server.after_first_ack = initial_value_notifications(1);

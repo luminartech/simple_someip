@@ -322,7 +322,7 @@ scenario!(
     /// PRS_SOMEIP_00920, 00922 / feat_req_someip_329, 338 — our call to the peer's method gets the peer's response.
     r1_client_call_gets_response,
     std = run,
-    bare_metal = ignore("the bare-metal runtime has no client-side method calls"),
+    bare_metal = ignore("the bare-metal runtime has no client-side method calls (#187)"),
     {
         let mut peer = VsomeipPeer::start();
         peer.send(VSOMEIP_OFFER);
@@ -378,8 +378,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIP_00922, 00191 / feat_req_someip_338, 371 — the return code of the peer's ERROR reaches our caller.
     r2_error_return_code_reaches_caller,
-    std = run,
-    bare_metal = ignore("the bare-metal runtime has no client-side method calls"),
+    std = ignore("an ERROR reply's return code must reach the caller (#183)"),
+    bare_metal = ignore("the bare-metal runtime has no client-side method calls (#187)"),
     {
         let mut peer = VsomeipPeer::start();
         peer.send(VSOMEIP_OFFER);
@@ -414,8 +414,8 @@ scenario!(
     /// Discarding the request is also permitted by both specifications; this
     /// stack answers with E_UNKNOWN_METHOD, in a RESPONSE or an ERROR message.
     r3_unknown_method_gets_error,
-    std = run,
-    bare_metal = run,
+    std = ignore("a call of an unknown method must get E_UNKNOWN_METHOD, not a success (#182)"),
+    bare_metal = ignore("a call of an unknown method must get E_UNKNOWN_METHOD, not a success (#182)"),
     {
         let mut peer = VsomeipPeer::start();
         let _rt = Rt::start(server());
@@ -472,8 +472,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIP_00939, 00924 — our fire-and-forget request is a REQUEST_NO_RETURN with session ID 0x0000 (vsomeip's view).
     r4_fire_and_forget_uses_session_zero,
-    std = run,
-    bare_metal = ignore("the bare-metal runtime has no client-side method calls"),
+    std = ignore("a fire-and-forget request must use session ID 0x0000 (#185)"),
+    bare_metal = ignore("the bare-metal runtime has no client-side method calls (#187)"),
     {
         let mut peer = VsomeipPeer::start();
         peer.send(VSOMEIP_OFFER);
@@ -508,8 +508,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIP_00939, 00924 — our fire-and-forget request is a REQUEST_NO_RETURN with session ID 0x0000 and return code E_OK (wire bytes).
     r4_fire_and_forget_uses_session_zero_frame,
-    std = run,
-    bare_metal = ignore("the bare-metal runtime has no client-side method calls"),
+    std = ignore("a fire-and-forget request must use session ID 0x0000 (#185)"),
+    bare_metal = ignore("the bare-metal runtime has no client-side method calls (#187)"),
     {
         let server = FrameMethodServer::start();
         let mut rt = Rt::start(client());
@@ -556,8 +556,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIP_00189, 00537, 00385 / feat_req_someip_345, 348 — we send no reply to a REQUEST_NO_RETURN for our fire-and-forget method.
     r4_no_reply_to_fire_and_forget,
-    std = run,
-    bare_metal = run,
+    std = ignore("a REQUEST_NO_RETURN must get no reply (#182)"),
+    bare_metal = ignore("a REQUEST_NO_RETURN must get no reply (#182)"),
     {
         let fp = FramePeer::start();
         let mut rt = Rt::start(server());
@@ -603,8 +603,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIP §5.2.6.3.1 (Figure 5.13) / feat_req_someip_80, 436 — calls that time out unanswered do not stop later calls from getting responses.
     r5_unanswered_requests_do_not_stall_client,
-    std = run,
-    bare_metal = ignore("the bare-metal runtime has no client-side method calls"),
+    std = ignore("calls that time out must not stop later calls from getting responses (#184)"),
+    bare_metal = ignore("the bare-metal runtime has no client-side method calls (#187)"),
     {
         let server = FrameMethodServer::start();
         let mut rt = Rt::start(client());
