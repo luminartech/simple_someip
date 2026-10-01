@@ -32,18 +32,64 @@ pub(super) const DELIVERY_WAIT: Duration = Duration::from_secs(1);
 /// else. The Ack can arrive together with one of the frame peer's Offers, and
 /// a runtime with a small receive queue may drop a third datagram that
 /// follows them at once. X1–X3 measure how one datagram is read; X4
-/// measures that burst on purpose and does not wait.
+/// measures that burst on purpose and does not wait within it.
 const SETTLE: Duration = Duration::from_millis(200);
 
 /// The payload of each control notification.
 const CONTROL: [u8; 1] = [0x10];
 
-/// X4: the two fields of `SVC` and their initial values, then the values
-/// its controls send.
-const INITIAL_VALUES: [(u16, [u8; 1]); 2] = [(FIELD, [0x2A]), (FIELD_2, [0x2B])];
+/// X4: how many times the burst is sent.
+const ROUNDS: u8 = 10;
+/// X4: the values its controls send.
 const CONTROL_VALUES: [(u16, [u8; 1]); 2] = [(FIELD, [0x3A]), (FIELD_2, [0x3B])];
 /// A second field of `SVC`.
 const FIELD_2: u16 = 0x8003;
+
+/// X4: the initial value of each field of `SVC` in burst `round`. The first
+/// byte is the round, so no two bursts send the same value.
+fn initial_values(round: u8) -> [(u16, Vec<u8>); 2] {
+    [(FIELD, vec![round, 0x2A]), (FIELD_2, vec![round, 0x2B])]
+}
+
+/// X4: burst `round`'s notifications, one datagram each.
+fn initial_value_notifications(round: u8) -> Vec<(SocketAddrV4, Vec<u8>)> {
+    (0..)
+        .zip(initial_values(round))
+        .map(|(i, (field, value))| {
+            let session = (u16::from(round) << 4) | i;
+            (client_endpoint(), notification_for(field, session, &value))
+        })
+        .collect()
+}
+
+/// X4: every event for `SVC` the runtime reports, as (field, payload), until
+/// it has reported each of `want` or `within` has passed, and everything
+/// else it reports, for failure messages.
+fn fields_until(
+    rt: &mut Rt,
+    want: &[(u16, Vec<u8>)],
+    within: Duration,
+) -> (Vec<(u16, Vec<u8>)>, Vec<String>) {
+    let mut delivered = Vec::new();
+    let mut other = Vec::new();
+    let deadline = Instant::now() + within;
+    while !want.iter().all(|w| delivered.contains(w)) {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match rt.next(left) {
+            Some(Observation::Event {
+                service: SVC,
+                event,
+                payload,
+                ..
+            }) => delivered.push((event, payload)),
+            Some(o) => other.push(format!("{o:?}")),
+            None => break,
+        }
+    }
+    (delivered, other)
+}
 
 /// Where the runtime under test receives notifications.
 pub(super) fn client_endpoint() -> SocketAddrV4 {
@@ -324,36 +370,42 @@ scenario!(
     /// requirement sets how many datagrams a receiver must be able to queue.
     /// This checks that the runtime keeps every initial value, each of which
     /// is sent only once.
+    ///
+    /// The burst is sent `ROUNDS` times, with new values each time, and every
+    /// burst must be delivered in full, so a runtime that drops a datagram
+    /// only some of the time still fails. The first burst follows the Ack of
+    /// the runtime's Subscribe; each later one follows the same Ack sent
+    /// again, because not every runtime sends a new Subscribe on its own.
     x4_initial_value_burst_is_delivered,
     std = run,
     bare_metal = run,
     {
         let mut server = FrameServer::start(REBOOT | UNICAST, Answer::Ack);
-        server.after_first_ack = (1..)
-            .zip(INITIAL_VALUES)
-            .map(|(s, (field, value))| (client_endpoint(), notification_for(field, s, &value)))
-            .collect();
+        server.after_first_ack = initial_value_notifications(1);
         let mut rt = Rt::start(super::pubsub::client());
         server.first_subscribe();
-        let mut delivered = Vec::new();
-        let mut other = Vec::new();
-        let deadline = Instant::now() + DELIVERY_WAIT;
-        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            match rt.next(left) {
-                Some(Observation::Event {
-                    service: SVC,
-                    event,
-                    payload,
-                    ..
-                }) => delivered.push((event, payload)),
-                Some(o) => other.push(format!("{o:?}")),
-                None => break,
+        // For each burst that lost a value: the round, what was missing,
+        // what was delivered, and the other observations.
+        let mut lost = Vec::new();
+        for round in 1..=ROUNDS {
+            if round > 1 {
+                server.answer_again_then(&initial_value_notifications(round));
             }
+            let want = initial_values(round);
+            let (delivered, other) = fields_until(&mut rt, &want, DELIVERY_WAIT);
+            let missing: Vec<(u16, Vec<u8>)> = want
+                .into_iter()
+                .filter(|w| !delivered.contains(w))
+                .collect();
+            if !missing.is_empty() {
+                lost.push((round, missing, delivered, other));
+            }
+            // The next burst starts with the runtime idle.
+            std::thread::sleep(SETTLE);
         }
         // Controls: each field's notification is delivered when sent alone,
         // so a value missing above was lost in the burst.
-        std::thread::sleep(SETTLE);
-        for (s, (field, value)) in (10..).zip(CONTROL_VALUES) {
+        for (s, (field, value)) in (0x0100..).zip(CONTROL_VALUES) {
             server
                 .fp
                 .send_unicast(client_endpoint(), &notification_for(field, s, &value));
@@ -370,17 +422,24 @@ scenario!(
                 );
             }
         }
-        let missing: Vec<(u16, [u8; 1])> = INITIAL_VALUES
-            .into_iter()
-            .filter(|(field, value)| !delivered.contains(&(*field, value.to_vec())))
+        let report: Vec<String> = lost
+            .iter()
+            .map(|(round, missing, delivered, other)| {
+                format!(
+                    "round {round}: missing {missing:02X?}, delivered {delivered:02X?}, \
+                     other observations {other:?}"
+                )
+            })
             .collect();
         assert!(
-            missing.is_empty(),
-            "{}: the Ack and then one initial value for each of 0x{FIELD:04X} and \
-             0x{FIELD_2:04X}, sent back to back, delivered (field, payload) {delivered:02X?} \
-             within {DELIVERY_WAIT:?}; missing {missing:02X?}. Each field's notification was \
-             delivered when sent alone. Other observations: {other:?}",
-            Rt::NAME
+            lost.is_empty(),
+            "{}: {} of {ROUNDS} bursts, each the Ack and then one initial value for each of \
+             0x{FIELD:04X} and 0x{FIELD_2:04X} sent back to back, were not delivered in full \
+             within {DELIVERY_WAIT:?}; values are (field, payload), and a payload's first byte \
+             is its round. Each field's notification was delivered when sent alone. {}",
+            Rt::NAME,
+            lost.len(),
+            report.join("; ")
         );
     }
 );

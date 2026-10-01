@@ -300,6 +300,8 @@ pub(super) enum Answer {
 /// received.
 pub(super) struct ReceivedSubscribe {
     at: Instant,
+    /// Where it came from, and where its answer went.
+    src: SocketAddrV4,
     delivery: Delivery,
     datagram: Vec<u8>,
     /// Where the entry starts in `datagram`.
@@ -391,6 +393,7 @@ impl FrameServer {
                 answers.push(answer_entry(e, self.answer));
                 self.subscribes.push(ReceivedSubscribe {
                     at,
+                    src,
                     delivery,
                     datagram: d.clone(),
                     offset,
@@ -421,6 +424,23 @@ impl FrameServer {
             &[peer_endpoint()],
         ));
         self.offers.push(Instant::now());
+    }
+
+    /// Sends the answer to the first Subscribe again, in an SD message of its
+    /// own, and at once after it each of `then` from the peer's service
+    /// port. Panics if no Subscribe has arrived yet.
+    pub(super) fn answer_again_then(&mut self, then: &[(SocketAddrV4, Vec<u8>)]) {
+        let first = &self.subscribes[0];
+        let entry = first.entry().try_into().expect("an SD entry is 16 bytes");
+        let (to, answer) = (first.src, answer_entry(entry, self.answer));
+        self.unicast_session += 1;
+        self.fp.send_sd_unicast(
+            to,
+            &build::sd_message_with_flags(self.unicast_session, self.flags, &[answer], &[]),
+        );
+        for (to, d) in then {
+            self.fp.send_unicast(*to, d);
+        }
     }
 
     /// Serves until the first Subscribe arrives; panics after `SD_WAIT`.
