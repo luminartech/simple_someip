@@ -69,6 +69,7 @@ ARG BOOST_VERSION=1.74.0
 ARG VSOMEIP_VERSION=3.4.10
 
 LABEL org.opencontainers.image.source="https://github.com/luminartech/simple_someip" \
+      org.opencontainers.image.version="${VSOMEIP_VERSION}" \
       org.opencontainers.image.licenses="(MIT OR Apache-2.0) AND MPL-2.0 AND BSL-1.0" \
       org.opencontainers.image.description="vsomeip peer driven by stdin commands, for simple-someip interop tests" \
       com.github.luminartech.simple-someip.vsomeip.version="${VSOMEIP_VERSION}" \
