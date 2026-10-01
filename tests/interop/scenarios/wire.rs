@@ -2,15 +2,10 @@
 
 use crate::Rt;
 use crate::interop::consts::*;
-use crate::interop::peers::frames::{FramePeer, parse};
+use crate::interop::peers::frames::{FramePeer, IPV4_ENDPOINT, OFFER_SERVICE, UDP, parse};
 use crate::interop::runtime::{Offer, Setup, SomeipUnderTest};
 
 use super::SD_WAIT;
-
-const OFFER_SERVICE: u8 = 0x01;
-const SUBSCRIBE_EVENTGROUP: u8 = 0x06;
-const IPV4_ENDPOINT: u8 = 0x04;
-const UDP: u8 = 0x11;
 
 fn offer() -> Offer {
     Offer {
@@ -63,6 +58,7 @@ scenario!(
                     .any(|&(t, _)| t == OFFER_SERVICE)
             })
             .unwrap_or_else(|| panic!("{}: no {which} OfferService within {SD_WAIT:?}", Rt::NAME))
+            .0
         };
         let d = next_offer("first");
         let d2 = next_offer("second");
@@ -151,7 +147,7 @@ mod builders {
     use simple_someip::protocol::{MessageType, MessageView, ReturnCode};
 
     use super::*;
-    use crate::interop::peers::frames::build;
+    use crate::interop::peers::frames::{SUBSCRIBE_EVENTGROUP, build};
 
     #[test]
     fn an_offer_decodes_field_for_field() {
@@ -273,6 +269,12 @@ mod builders {
     fn an_unknown_option_keeps_its_bytes() {
         let o = build::raw_option(0x77, &[0xDE, 0xAD]);
         assert_eq!(o, [0x00, 0x03, 0x77, 0x00, 0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn a_discardable_option_sets_only_the_flag() {
+        let o = build::discardable_option(0x77, &[0xDE, 0xAD]);
+        assert_eq!(o, [0x00, 0x03, 0x77, 0x80, 0xDE, 0xAD]);
     }
 
     #[test]
