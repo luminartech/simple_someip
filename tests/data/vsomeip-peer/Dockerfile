@@ -9,9 +9,14 @@
 #       simple-someip-vsomeip-peer
 #
 # Pinned to vsomeip 3.4.10 to stay wire-version-aligned with the
-# deployments simple-someip interoperates with.
+# deployments simple-someip interoperates with. CI's nightly run also
+# builds it against the newest upstream release, which needs a newer Boost
+# than Ubuntu 22.04 ships (vsomeip 3.7 wants >= 1.75):
+#   --build-arg VSOMEIP_VERSION=3.7.6 --build-arg BASE_IMAGE=ubuntu:24.04 \
+#   --build-arg BOOST_VERSION=1.83.0
+ARG BASE_IMAGE=ubuntu:22.04
 
-FROM ubuntu:22.04 AS build
+FROM ${BASE_IMAGE} AS build
 
 # vsomeip's CMake build needs: gcc, cmake, boost, and a few utilities
 # for the patch-and-build flow. dlt is optional and we skip it.
@@ -27,14 +32,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libboost-log-dev \
     && rm -rf /var/lib/apt/lists/*
 
+ARG VSOMEIP_VERSION=3.4.10
+
 WORKDIR /src
 
-# Pull vsomeip 3.4.10 from upstream.
-RUN wget -q https://github.com/COVESA/vsomeip/archive/refs/tags/3.4.10.tar.gz \
-    && tar xzf 3.4.10.tar.gz \
-    && rm 3.4.10.tar.gz
+# Pull the vsomeip release from upstream.
+RUN wget -q "https://github.com/COVESA/vsomeip/archive/refs/tags/${VSOMEIP_VERSION}.tar.gz" \
+    && tar xzf "${VSOMEIP_VERSION}.tar.gz" \
+    && rm "${VSOMEIP_VERSION}.tar.gz"
 
-WORKDIR /src/vsomeip-3.4.10
+WORKDIR /src/vsomeip-${VSOMEIP_VERSION}
 
 # Build vsomeip as shared libs (default). Skip building the test/
 # example trees — we'll compile our own peer against the installed
@@ -56,13 +63,15 @@ RUN mkdir build && cd build \
     && make -j"$(nproc)"
 
 # ── Runtime image ────────────────────────────────────────────────────
-FROM ubuntu:22.04
+FROM ${BASE_IMAGE}
+
+ARG BOOST_VERSION=1.74.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libboost-system1.74.0 \
-        libboost-filesystem1.74.0 \
-        libboost-thread1.74.0 \
-        libboost-log1.74.0 \
+        "libboost-system${BOOST_VERSION}" \
+        "libboost-filesystem${BOOST_VERSION}" \
+        "libboost-thread${BOOST_VERSION}" \
+        "libboost-log${BOOST_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed vsomeip libs, the peer, its config template and the entrypoint.
