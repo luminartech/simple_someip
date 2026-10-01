@@ -77,3 +77,67 @@ mod loopback_check {
         }
     }
 }
+
+mod peer_output {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::interop::peers::vsomeip::PeerOutput;
+
+    const SHORT: Duration = Duration::from_millis(50);
+
+    /// A peer output whose `OK offer` has been consumed, leaving an
+    /// `AVAILABLE` pending and another still unread in the channel.
+    fn after_offer() -> (mpsc::Sender<String>, PeerOutput) {
+        let (tx, rx) = mpsc::channel();
+        let mut out = PeerOutput::new(rx);
+        for line in [
+            "AVAILABLE service=0x1234 instance=0x0001",
+            "OK offer",
+            "AVAILABLE service=0x1234 instance=0x0001 unread",
+        ] {
+            tx.send(line.to_owned()).unwrap();
+        }
+        out.expect("OK", SHORT);
+        (tx, out)
+    }
+
+    #[test]
+    fn a_stale_line_satisfies_expect_without_clear() {
+        let (_tx, mut out) = after_offer();
+        let line = out.expect("AVAILABLE", SHORT);
+        assert_eq!(line.raw, "AVAILABLE service=0x1234 instance=0x0001");
+    }
+
+    #[test]
+    fn clear_discards_pending_and_unread_lines() {
+        let (tx, mut out) = after_offer();
+        out.clear();
+        out.expect_none("AVAILABLE", SHORT);
+        tx.send("AVAILABLE service=0x1234 instance=0x0001 fresh".to_owned())
+            .unwrap();
+        let line = out.expect("AVAILABLE", SHORT);
+        assert_eq!(line.raw, "AVAILABLE service=0x1234 instance=0x0001 fresh");
+    }
+
+    #[test]
+    #[should_panic(expected = "peer unexpectedly reported: EVENT")]
+    fn a_stale_line_fails_expect_none_without_clear() {
+        let (tx, rx) = mpsc::channel();
+        let mut out = PeerOutput::new(rx);
+        tx.send("EVENT service=0x1234 instance=0x0001 event=0x8001 payload=01".to_owned())
+            .unwrap();
+        tx.send("OK unsubscribe".to_owned()).unwrap();
+        out.expect("OK", SHORT);
+        out.expect_none("EVENT", SHORT);
+    }
+
+    #[test]
+    #[should_panic(expected = "peer exited during expect_none")]
+    fn expect_none_fails_when_the_peer_exits() {
+        let (tx, rx) = mpsc::channel::<String>();
+        let mut out = PeerOutput::new(rx);
+        drop(tx);
+        out.expect_none("EVENT", SHORT);
+    }
+}
