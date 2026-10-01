@@ -12,9 +12,10 @@ pub struct Setup {
     pub consume: Option<Consume>,
 }
 
-/// Offer `SVC`/`INST` with the given TTL, events, fields and methods.
+/// Offer `service`/`INST` with the given TTL, events, fields and methods.
 #[derive(Debug, Clone)]
 pub struct Offer {
+    pub service: u16,
     pub ttl_s: u32,
     pub events: Vec<u16>,
     pub fields: Vec<(u16, Vec<u8>)>,
@@ -50,6 +51,9 @@ pub enum Observation {
         service: u16,
         instance: u16,
     },
+    /// The result of the runtime's own subscription to `eventgroup`, as
+    /// the runtime reports it. Adapters never derive it from SD entries
+    /// seen on the wire.
     Subscribed {
         eventgroup: u16,
         accepted: bool,

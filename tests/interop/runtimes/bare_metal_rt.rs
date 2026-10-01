@@ -51,6 +51,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// after `init`.
 enum Cmd {
     Publish {
+        service: u16,
         event: u16,
         payload: Vec<u8>,
         reply: Sender<i32>,
@@ -59,6 +60,8 @@ enum Cmd {
 }
 
 pub struct BareMetalRt {
+    /// The offered service, which `publish` publishes on.
+    service: u16,
     obs: Receiver<Observation>,
     cmds: Sender<Cmd>,
     poller: Option<JoinHandle<()>>,
@@ -75,7 +78,7 @@ impl SomeipUnderTest for BareMetalRt {
             )
         };
         let offers = vec![rt::OfferEntry {
-            service_id: SVC,
+            service_id: offer.service,
             instance_id: INST,
             event_group_id: EG,
             unicast_port: SERVER_PORT,
@@ -128,6 +131,7 @@ impl SomeipUnderTest for BareMetalRt {
             .spawn(move || run_poller(&rx))
             .expect("could not spawn the poller thread");
         Self {
+            service: offer.service,
             obs,
             cmds,
             poller: Some(poller),
@@ -143,6 +147,7 @@ impl SomeipUnderTest for BareMetalRt {
     fn publish(&mut self, event: u16, payload: &[u8]) {
         let (reply, rc) = mpsc::channel();
         let cmd = Cmd::Publish {
+            service: self.service,
             event,
             payload: payload.to_vec(),
             reply,
@@ -220,6 +225,7 @@ fn run_poller(cmds: &Receiver<Cmd>) {
         loop {
             match cmds.try_recv() {
                 Ok(Cmd::Publish {
+                    service,
                     event,
                     payload,
                     reply,
@@ -227,7 +233,7 @@ fn run_poller(cmds: &Receiver<Cmd>) {
                     // SAFETY: `payload` is valid for `payload.len()` bytes for
                     // the duration of the call.
                     let rc = unsafe {
-                        rt::publish(SVC, INST, EG, event, payload.as_ptr(), payload.len())
+                        rt::publish(service, INST, EG, event, payload.as_ptr(), payload.len())
                     };
                     let _ = reply.send(rc);
                 }
@@ -393,6 +399,7 @@ mod tests {
         let fp = FramePeer::start();
         let _rt = BareMetalRt::start(Setup {
             offer: Some(Offer {
+                service: SVC,
                 ttl_s: 3,
                 events: vec![EVENT],
                 fields: vec![],

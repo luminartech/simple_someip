@@ -18,6 +18,15 @@ pub const OFFER_SERVICE: u8 = 0x01;
 pub const SUBSCRIBE_EVENTGROUP: u8 = 0x06;
 pub const SUBSCRIBE_EVENTGROUP_ACK: u8 = 0x07;
 
+/// SD header flag: the sender's session counter has not wrapped since it
+/// started.
+pub const REBOOT: u8 = 0x80;
+/// SD header flag: the sender can receive unicast SD.
+pub const UNICAST: u8 = 0x40;
+/// SD header flag: the sender processes the Initial Data Requested flag of eventgroup
+/// entries (Open SOME/IP feat_req_someipsd_1187).
+pub const EXPLICIT_INITIAL_DATA_CONTROL: u8 = 0x20;
+
 /// SD option types.
 pub const CONFIGURATION: u8 = 0x01;
 pub const IPV4_ENDPOINT: u8 = 0x04;
@@ -212,10 +221,21 @@ pub mod build {
         entries: &[[u8; 16]],
         options: &[Vec<u8>],
     ) -> Vec<u8> {
+        let flags = (u8::from(reboot) << 7) | (u8::from(unicast) << 6);
+        sd_message_with_flags(session, flags, entries, options)
+    }
+
+    /// [`sd_message`] with the whole SD flags byte given, for flags beyond
+    /// reboot and unicast.
+    pub fn sd_message_with_flags(
+        session: u16,
+        flags: u8,
+        entries: &[[u8; 16]],
+        options: &[Vec<u8>],
+    ) -> Vec<u8> {
         let entries: Vec<u8> = entries.concat();
         let options: Vec<u8> = options.concat();
         let len = |b: &[u8]| u32::try_from(b.len()).expect("SD array too long");
-        let flags = (u8::from(reboot) << 7) | (u8::from(unicast) << 6);
 
         let mut sd = vec![flags, 0, 0, 0];
         sd.extend(len(&entries).to_be_bytes());
@@ -353,24 +373,37 @@ pub mod build {
 /// Readers for captured datagrams. They read only what the datagram holds,
 /// so a truncated or malformed datagram yields fewer results, never a panic.
 pub mod parse {
+    /// Where an SD datagram's entries array starts: after the SOME/IP
+    /// header (16 bytes), the SD flags and reserved bytes (4) and the
+    /// entries array's length (4).
+    pub const SD_ENTRIES_OFFSET: usize = 24;
+
+    /// Each entry in an SD datagram with its offset in the datagram, or
+    /// nothing if the datagram is not SD.
+    pub fn sd_entries(datagram: &[u8]) -> Vec<(usize, [u8; 16])> {
+        if !datagram.starts_with(&[0xFF, 0xFF, 0x81, 0x00]) {
+            return Vec::new();
+        }
+        let Some(&[a, b, c, d]) = datagram.get(SD_ENTRIES_OFFSET - 4..SD_ENTRIES_OFFSET) else {
+            return Vec::new();
+        };
+        let len = u32::from_be_bytes([a, b, c, d]) as usize;
+        let end = SD_ENTRIES_OFFSET.saturating_add(len).min(datagram.len());
+        (SD_ENTRIES_OFFSET..end)
+            .step_by(16)
+            .filter_map(|at| {
+                let entry = datagram.get(at..at + 16)?.try_into().ok()?;
+                Some((at, entry))
+            })
+            .collect()
+    }
+
     /// The `(type, ttl)` of each entry in an SD datagram, or nothing if the
     /// datagram is not SD.
     pub fn sd_entry_types(datagram: &[u8]) -> Vec<(u8, u32)> {
-        let Some(sd) = datagram.strip_prefix(&[0xFF, 0xFF, 0x81, 0x00][..]) else {
-            return Vec::new();
-        };
-        // `sd` starts at the length field: 12 more header bytes, then flags
-        // and reserved (4), then the entries length (4).
-        let Some(len) = sd.get(16..20) else {
-            return Vec::new();
-        };
-        let len = u32::from_be_bytes([len[0], len[1], len[2], len[3]]) as usize;
-        let entries = &sd[20..];
-        let entries = &entries[..len.min(entries.len())];
-        let (entries, _partial) = entries.as_chunks::<16>();
-        entries
+        sd_entries(datagram)
             .iter()
-            .map(|e| (e[0], u32::from_be_bytes([0, e[9], e[10], e[11]])))
+            .map(|(_, e)| (e[0], u32::from_be_bytes([0, e[9], e[10], e[11]])))
             .collect()
     }
 }

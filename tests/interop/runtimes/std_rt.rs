@@ -1,11 +1,15 @@
 //! `SomeipUnderTest` over simple-someip's tokio `Client` and `Server`.
+//!
+//! The Client's `subscribe` completes once the Subscribe is sent, and the
+//! Client does not report the server's Ack or Nack, so this adapter never
+//! produces `Subscribed`.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use simple_someip::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, Profile5Config};
-use simple_someip::protocol::sd::{Entry, TransportProtocol};
+use simple_someip::protocol::sd::TransportProtocol;
 use simple_someip::protocol::{
     Header, Message, MessageId, MessageType, MessageTypeField, ReturnCode,
 };
@@ -43,7 +47,8 @@ pub struct StdRt {
     client: Option<StdClient>,
     /// The discovered `SVC`/`INST` endpoint, set by the update task.
     service: Arc<Mutex<Option<ServiceEndpointKey>>>,
-    publisher: Option<Publisher>,
+    /// The offered service and its publisher.
+    publisher: Option<(u16, Publisher)>,
     event_session: u16,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -67,9 +72,10 @@ impl SomeipUnderTest for StdRt {
                 &mut tasks,
             ))
         });
-        let publisher = setup
-            .offer
-            .map(|offer| rt.block_on(start_server(&offer, tx.clone(), &mut tasks)));
+        let publisher = setup.offer.map(|offer| {
+            let publisher = rt.block_on(start_server(&offer, tx.clone(), &mut tasks));
+            (offer.service, publisher)
+        });
         Self {
             rt,
             obs,
@@ -91,13 +97,14 @@ impl SomeipUnderTest for StdRt {
     fn publish(&mut self, event: u16, payload: &[u8]) {
         self.event_session = self.event_session.wrapping_add(1).max(1);
         let request_id = u32::from(self.event_session);
-        let publisher = self
+        let (service, publisher) = self
             .publisher
             .as_ref()
             .unwrap_or_else(|| panic!("{}: publish without an offer", Self::NAME));
         self.rt
             .block_on(
-                publisher.publish_raw_event(SVC, INST, EG, event, request_id, 1, MAJOR, payload),
+                publisher
+                    .publish_raw_event(*service, INST, EG, event, request_id, 1, MAJOR, payload),
             )
             .unwrap_or_else(|e| panic!("{}: publishing 0x{event:04X} failed: {e:?}", Self::NAME));
     }
@@ -281,14 +288,6 @@ async fn report_updates(
                         endpoint,
                     });
                 }
-                for entry in &msg.sd_header.entries {
-                    if let Entry::SubscribeAckEventGroup(eg) = entry {
-                        out.push(Observation::Subscribed {
-                            eventgroup: eg.event_group_id,
-                            accepted: eg.ttl > 0,
-                        });
-                    }
-                }
             }
             ClientUpdate::Unicast {
                 message,
@@ -358,7 +357,7 @@ async fn start_server(
     tasks: &mut Vec<JoinHandle<()>>,
 ) -> Publisher {
     *REQUESTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
-    let config = ServerConfig::new(SVC, INST)
+    let config = ServerConfig::new(offer.service, INST)
         .with_interface(OUR_IP)
         .with_local_port(SERVER_PORT)
         .with_major_version(MAJOR)
