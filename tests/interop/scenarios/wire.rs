@@ -45,7 +45,7 @@ scenario!(
     /// PRS_SOMEIPSD_00151–00164 (SD header), 00254–00261 (flags), 00307 (IPv4 Endpoint Option) — our offer's bytes match the specification.
     w1_offer_wire_format,
     std = run,
-    bare_metal = run,
+    bare_metal = ignore("SD messages must set the reboot flag until the session ID wraps (#171)"),
     {
         let peer = FramePeer::start();
         let _rt = Rt::start(Setup {

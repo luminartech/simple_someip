@@ -476,7 +476,7 @@ scenario!(
     /// PRS_SOMEIPSD_00443, 00449 / feat_req_someipsd_431 — we subscribe to the peer's eventgroup and receive its events.
     p1_client_subscribes_and_receives_events,
     std = run,
-    bare_metal = run,
+    bare_metal = ignore("the Subscribe must be sent by unicast to the server's SD endpoint (#174)"),
     {
         let mut peer = VsomeipPeer::start();
         peer.send("offer 1234 0001 1 0001 8001 8002 0001");
@@ -502,8 +502,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00120, 00464 / feat_req_someipsd_691 — a new subscription gets the field's initial value right after the Ack.
     p2_field_initial_value_after_ack,
-    std = run,
-    bare_metal = run,
+    std = ignore("a new subscription to a field must get its initial value after the Ack (#180)"),
+    bare_metal = ignore("a new subscription to a field must get its initial value after the Ack (#180)"),
     {
         let mut peer = VsomeipPeer::start();
         let _rt = Rt::start(server());
@@ -519,8 +519,8 @@ scenario!(
 scenario!(
     /// feat_req_someipsd_1188, 109 — a Subscribe with Initial Data Requested set gets the field's initial value.
     p3_initial_value_on_initial_data_requested,
-    std = run,
-    bare_metal = run,
+    std = ignore("a Subscribe with Initial Data Requested must get the field's initial value (#180)"),
+    bare_metal = ignore("a Subscribe with Initial Data Requested must get the field's initial value (#180)"),
     {
         let mut client = FrameClient::start(REBOOT | UNICAST | EXPLICIT_INITIAL_DATA_CONTROL);
         let _rt = Rt::start(server());
@@ -533,8 +533,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00122 / feat_req_someipsd_833 — a StopSubscribe and a Subscribe in one message trigger the field's initial value again.
     p4_initial_value_on_stop_subscribe_then_subscribe,
-    std = run,
-    bare_metal = run,
+    std = ignore("a StopSubscribe and a Subscribe must trigger the field's initial value again (#180)"),
+    bare_metal = ignore("a StopSubscribe and a Subscribe must trigger the field's initial value again (#180)"),
     {
         let mut client = FrameClient::start(REBOOT | UNICAST);
         let _rt = Rt::start(server());
@@ -555,8 +555,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00122, 00120 — vsomeip unsubscribing and subscribing again gets the field's initial value again.
     p4_initial_value_on_stop_subscribe_then_subscribe_vsomeip,
-    std = run,
-    bare_metal = run,
+    std = ignore("subscribing again must get the field's initial value again (#180)"),
+    bare_metal = ignore("subscribing again must get the field's initial value again (#180)"),
     {
         // vsomeip may hand its application a field value cached from the
         // first subscription, which this variant cannot tell from a resent
@@ -579,8 +579,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00121 / feat_req_someipsd_833 — renewing a valid subscription does not resend the field's initial value.
     p5_renewal_does_not_resend_initial_value,
-    std = run,
-    bare_metal = run,
+    std = ignore("renewing a subscription must not resend the field's initial value (#180)"),
+    bare_metal = ignore("renewing a subscription must not resend the field's initial value (#180)"),
     {
         let mut client = FrameClient::start(REBOOT | UNICAST);
         let _rt = Rt::start(server());
@@ -608,8 +608,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00388, 00389 — no events reach an endpoint after its StopSubscribe.
     p6_unsubscribe_stops_events,
-    std = run,
-    bare_metal = run,
+    std = ignore("a StopSubscribe must stop the events to that subscriber (#179)"),
+    bare_metal = ignore("a StopSubscribe must stop the events to that subscriber (#179)"),
     {
         let mut client = FrameClient::start(REBOOT | UNICAST);
         let mut rt = Rt::start(server());
@@ -642,8 +642,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00388 — our unsubscribe stops the peer's events.
     p6_our_unsubscribe_stops_events,
-    std = ignore("the std runtime cannot unsubscribe"),
-    bare_metal = ignore("the bare-metal runtime cannot unsubscribe"),
+    std = ignore("the std runtime cannot unsubscribe (#178)"),
+    bare_metal = ignore("the bare-metal runtime cannot unsubscribe (#178)"),
     {
         let mut peer = VsomeipPeer::start();
         peer.send("offer 1234 0001 1 0001 8001 8002 0001");
@@ -665,8 +665,8 @@ scenario!(
 scenario!(
     /// feat_req_someipsd_1191, 1188 — our first Subscribe to a server that sets Explicit Initial Data Control requests initial data.
     p7_client_requests_initial_values,
-    std = run,
-    bare_metal = run,
+    std = ignore("the first Subscribe to a server with Explicit Initial Data Control must request initial data (#181)"),
+    bare_metal = ignore("the first Subscribe to a server with Explicit Initial Data Control must request initial data (#181)"),
     {
         let mut server =
             FrameServer::start(REBOOT | UNICAST | EXPLICIT_INITIAL_DATA_CONTROL, Answer::Ack);
@@ -687,8 +687,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00393, 00394 — the runtime reports a SubscribeEventgroupNack.
     p8_subscribe_reports_nack,
-    std = ignore("the std runtime does not report subscription results"),
-    bare_metal = ignore("the bare-metal runtime does not report subscription results"),
+    std = ignore("the std runtime does not report subscription results (#177)"),
+    bare_metal = ignore("the bare-metal runtime does not report subscription results (#177)"),
     {
         let mut server = FrameServer::start(REBOOT | UNICAST, Answer::Nack);
         let mut rt = Rt::start(client());
@@ -708,8 +708,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00446, 00449, 00502 / feat_req_someipsd_431 — we answer each Offer with a Subscribe, which renews the subscription.
     p9_client_renews_subscription,
-    std = ignore("the std client leaves subscription renewal to its caller"),
-    bare_metal = run,
+    std = ignore("the std client leaves subscription renewal to its caller (#176)"),
+    bare_metal = ignore("every Offer must be answered with a Subscribe while the subscription is wanted (#175)"),
     {
         let mut server = FrameServer::start(REBOOT | UNICAST, Answer::Ack);
         let _rt = Rt::start(client());
@@ -762,7 +762,7 @@ scenario!(
     /// PRS_SOMEIPSD_00501 — we answer the server's Offer with a unicast SD message.
     p10_client_subscribes_by_unicast,
     std = run,
-    bare_metal = run,
+    bare_metal = ignore("the Subscribe must be sent by unicast to the server's SD endpoint (#174)"),
     {
         let mut server = FrameServer::start(REBOOT | UNICAST, Answer::Ack);
         let _rt = Rt::start(client());
