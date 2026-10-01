@@ -70,7 +70,7 @@ fn server() -> Setup {
 /// unrelated service. The std runtime runs a Client alone: a std Server in
 /// the same process would bind the SD port too and split unicast SD with
 /// the Client.
-fn client() -> Setup {
+pub(super) fn client() -> Setup {
     let unrelated = Offer {
         service: UNRELATED_SVC,
         ttl_s: 3,
@@ -291,14 +291,14 @@ fn expect_no_repeat(repeats: &[Vec<u8>]) {
 
 /// How the frame peer answers a Subscribe when it is the server.
 #[derive(Clone, Copy)]
-enum Answer {
+pub(super) enum Answer {
     Ack,
     Nack,
 }
 
 /// A Subscribe (TTL other than 0) for `SVC`/`EG` that the frame peer
 /// received.
-struct ReceivedSubscribe {
+pub(super) struct ReceivedSubscribe {
     at: Instant,
     delivery: Delivery,
     datagram: Vec<u8>,
@@ -321,8 +321,8 @@ impl ReceivedSubscribe {
 /// and answers each Subscribe for `EG`. Its multicast and unicast SD
 /// messages are numbered separately, each from 1. It records when it sent
 /// each Offer and when each Subscribe arrived.
-struct FrameServer {
-    fp: FramePeer,
+pub(super) struct FrameServer {
+    pub(super) fp: FramePeer,
     flags: u8,
     answer: Answer,
     multicast_session: u16,
@@ -336,7 +336,7 @@ struct FrameServer {
 }
 
 impl FrameServer {
-    fn start(flags: u8, answer: Answer) -> Self {
+    pub(super) fn start(flags: u8, answer: Answer) -> Self {
         Self {
             fp: FramePeer::start(),
             flags,
@@ -415,7 +415,7 @@ impl FrameServer {
     }
 
     /// Serves until the first Subscribe arrives; panics after `SD_WAIT`.
-    fn first_subscribe(&mut self) -> &ReceivedSubscribe {
+    pub(super) fn first_subscribe(&mut self) -> &ReceivedSubscribe {
         let found = self.serve_until(Instant::now() + SD_WAIT, |s| !s.is_empty());
         assert!(
             found,
