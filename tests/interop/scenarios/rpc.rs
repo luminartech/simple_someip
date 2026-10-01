@@ -33,6 +33,9 @@ const E_UNKNOWN_METHOD: u8 = 0x03;
 
 /// A method that `SVC` does not have.
 const UNKNOWN_METHOD: u16 = 0x0099;
+/// `SVC`'s fire-and-forget method. A REQUEST_NO_RETURN for a method
+/// defined for REQUEST is discarded, so R4 needs a method of its own.
+const FIRE_METHOD: u16 = 0x0002;
 
 /// The client ID in the frame peer's requests.
 const PEER_CLIENT: u16 = 0x0042;
@@ -49,7 +52,7 @@ const POLL: Duration = Duration::from_millis(10);
 const UNANSWERED: usize = 70;
 const SHORT_CALL: Duration = Duration::from_millis(50);
 
-/// The runtime as the server of `SVC`, with `METHOD`.
+/// The runtime as the server of `SVC`, with `METHOD` and `FIRE_METHOD`.
 fn server() -> Setup {
     Setup {
         offer: Some(Offer {
@@ -57,7 +60,7 @@ fn server() -> Setup {
             ttl_s: 3,
             events: vec![EVENT],
             fields: vec![],
-            methods: vec![METHOD],
+            methods: vec![METHOD, FIRE_METHOD],
         }),
         consume: None,
     }
@@ -128,16 +131,16 @@ fn session(d: &[u8]) -> u16 {
     u16::from_be_bytes([d[10], d[11]])
 }
 
-/// Whether `d` is a SOME/IP message for `SVC`/`METHOD`.
-fn is_for_method(d: &[u8]) -> bool {
-    d.len() >= 16 && d[0..2] == SVC.to_be_bytes() && d[2..4] == METHOD.to_be_bytes()
+/// Whether `d` is a SOME/IP message for `SVC`/`method`.
+fn is_for(d: &[u8], method: u16) -> bool {
+    d.len() >= 16 && d[0..2] == SVC.to_be_bytes() && d[2..4] == method.to_be_bytes()
 }
 
-/// A request for `SVC`/`METHOD` from the frame peer.
-fn request_frame(msg_type: u8, session: u16, payload: &[u8]) -> Vec<u8> {
+/// A request for `SVC`/`method` from the frame peer.
+fn request_frame(method: u16, msg_type: u8, session: u16, payload: &[u8]) -> Vec<u8> {
     let mut d = build::someip_header(
         SVC,
-        METHOD,
+        method,
         PEER_CLIENT,
         session,
         msg_type,
@@ -165,14 +168,19 @@ fn response_to(d: &[u8]) -> Vec<u8> {
     r
 }
 
-/// Every datagram for `SVC`/`METHOD` that reaches the frame peer's service
+/// Every datagram for `SVC`/`method` that reaches the frame peer's service
 /// port within `within`, stopping early after one for which `last` holds.
-fn replies(fp: &FramePeer, within: Duration, last: impl Fn(&[u8]) -> bool) -> Vec<Vec<u8>> {
+fn replies(
+    fp: &FramePeer,
+    method: u16,
+    within: Duration,
+    last: impl Fn(&[u8]) -> bool,
+) -> Vec<Vec<u8>> {
     let mut found = Vec::new();
     let deadline = Instant::now() + within;
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         match fp.recv_unicast(left) {
-            Some((d, _)) if is_for_method(&d) => {
+            Some((d, _)) if is_for(&d, method) => {
                 let done = last(&d);
                 found.push(d);
                 if done {
@@ -375,6 +383,8 @@ scenario!(
     {
         let mut peer = VsomeipPeer::start();
         peer.send(VSOMEIP_OFFER);
+        // `send` returns only once vsomeip has acknowledged the command with
+        // `OK error-reply`.
         peer.send("error-reply 0001 01");
         let mut rt = Rt::start(client());
         await_service(&mut rt);
@@ -399,7 +409,10 @@ scenario!(
 );
 
 scenario!(
-    /// PRS_SOMEIP_00195 (Figure 5.12), 00191 / feat_req_someip_816 — a call of a method we do not have gets an ERROR with E_UNKNOWN_METHOD.
+    /// PRS_SOMEIP_00195 (Figure 5.12), 00701, 00190 / feat_req_someip_141, 816 — a call of a method we do not have gets return code E_UNKNOWN_METHOD.
+    ///
+    /// Discarding the request is also permitted by both specifications; this
+    /// stack answers with E_UNKNOWN_METHOD, in a RESPONSE or an ERROR message.
     r3_unknown_method_gets_error,
     std = run,
     bare_metal = run,
@@ -407,25 +420,27 @@ scenario!(
         let mut peer = VsomeipPeer::start();
         let _rt = Rt::start(server());
         vsomeip_finds_us(&mut peer);
-        // Control: a call of the method we have is answered, so the server
-        // is up and replying.
+        // Control: a call of the method we have succeeds, so the server is up,
+        // and it does not answer every method with an error.
         peer.send("call 1234 0001 0001 03");
-        if peer
-            .next_where("RESPONSE", CALL_WAIT, |l| l.hex("method") == u32::from(METHOD))
-            .is_none()
-        {
-            panic!(
-                "{}: control failed: no reply within {CALL_WAIT:?} to a call of 0x{METHOD:04X}, \
-                 which we offer, so the unknown method cannot be checked",
-                Rt::NAME
-            );
-        }
+        let control =
+            peer.next_where("RESPONSE", CALL_WAIT, |l| l.hex("method") == u32::from(METHOD));
+        let succeeded = control
+            .as_ref()
+            .is_some_and(|l| field(l, "type") == "response" && l.hex("return_code") == 0);
+        assert!(
+            succeeded,
+            "{}: control failed: a call of 0x{METHOD:04X}, which we offer, got {}; want \
+             type=response return_code=0x00, so the unknown method cannot be checked",
+            Rt::NAME,
+            control.map_or(format!("no reply within {CALL_WAIT:?}"), |l| l.raw)
+        );
         peer.clear();
         peer.send("call 1234 0001 0099 03");
         let reply = peer.next_where("RESPONSE", CALL_WAIT, |l| {
             l.hex("method") == u32::from(UNKNOWN_METHOD)
         });
-        let want = "want type=error return_code=0x03 (E_UNKNOWN_METHOD)";
+        let want = "want return_code=0x03 (E_UNKNOWN_METHOD) in a RESPONSE or an ERROR message";
         let Some(reply) = reply else {
             panic!(
                 "{}: no reply within {CALL_WAIT:?} to a call of 0x{UNKNOWN_METHOD:04X}, \
@@ -433,19 +448,24 @@ scenario!(
                 Rt::NAME
             )
         };
-        let is_error = field(&reply, "type") == "error";
-        assert!(
-            is_error && reply.hex("return_code") == u32::from(E_UNKNOWN_METHOD),
-            "{}: a call of 0x{UNKNOWN_METHOD:04X}, a method 0x{SVC:04X} does not have, was {}: \
-             {}; {want}",
-            Rt::NAME,
-            if is_error {
-                "answered with another return code"
-            } else {
-                "answered as a success"
-            },
-            reply.raw
-        );
+        let return_code = reply.hex("return_code");
+        let verdict = if return_code == u32::from(E_UNKNOWN_METHOD) {
+            // An ERROR message carries no payload; a RESPONSE may.
+            (field(&reply, "type") == "error" && !reply.payload().is_empty())
+                .then(|| "answered with an ERROR message that carries a payload".to_owned())
+        } else if return_code == 0 {
+            Some("answered as a success".to_owned())
+        } else {
+            Some(format!("answered with return code {return_code:#04x}"))
+        };
+        if let Some(verdict) = verdict {
+            panic!(
+                "{}: a call of 0x{UNKNOWN_METHOD:04X}, a method 0x{SVC:04X} does not have, was \
+                 {verdict}: {}; {want}",
+                Rt::NAME,
+                reply.raw
+            );
+        }
     }
 );
 
@@ -496,7 +516,7 @@ scenario!(
         await_service(&mut rt);
         rt.fire_and_forget(METHOD, &[7]);
         let d = server
-            .wait_for_request(CALL_WAIT, |d| is_for_method(d) && d[16..] == [7])
+            .wait_for_request(CALL_WAIT, |d| is_for(d, METHOD) && d[16..] == [7])
             .unwrap_or_else(|| {
                 panic!(
                     "{}: no request for 0x{METHOD:04X} with payload [07] reached the peer within \
@@ -534,7 +554,7 @@ scenario!(
 );
 
 scenario!(
-    /// PRS_SOMEIP §5.2.3, 00171 / feat_req_someip_345, 348 — we send no reply to a REQUEST_NO_RETURN.
+    /// PRS_SOMEIP_00189, 00537, 00385 / feat_req_someip_345, 348 — we send no reply to a REQUEST_NO_RETURN for our fire-and-forget method.
     r4_no_reply_to_fire_and_forget,
     std = run,
     bare_metal = run,
@@ -544,30 +564,38 @@ scenario!(
         first_offer(&fp);
         let to = SocketAddrV4::new(OUR_IP, SERVER_PORT);
         // Control: a REQUEST is answered, so the server is up and replying.
-        let control = request_frame(REQUEST, 0x0001, &[1]);
+        let control = request_frame(METHOD, REQUEST, 0x0001, &[1]);
         fp.send_unicast(to, &control);
         let answers = |d: &[u8]| d[14] == RESPONSE && d[8..12] == control[8..12];
-        let answered = replies(&fp, CALL_WAIT, answers).iter().any(|d| answers(d));
+        let answered = replies(&fp, METHOD, CALL_WAIT, answers)
+            .iter()
+            .any(|d| answers(d));
         assert!(
             answered,
             "{}: control failed: no RESPONSE within {CALL_WAIT:?} to a REQUEST for \
              0x{METHOD:04X}, so silence after a REQUEST_NO_RETURN would mean nothing",
             Rt::NAME
         );
-        fp.send_unicast(to, &request_frame(REQUEST_NO_RETURN, 0x0000, &[7]));
-        let sent = replies(&fp, QUIET, |_| false);
+        fp.send_unicast(
+            to,
+            &request_frame(FIRE_METHOD, REQUEST_NO_RETURN, 0x0000, &[7]),
+        );
+        let sent = replies(&fp, FIRE_METHOD, QUIET, |_| false);
         let types: Vec<u8> = sent.iter().map(|d| d[14]).collect();
         assert!(
             sent.is_empty(),
-            "{}: we replied to a REQUEST_NO_RETURN for 0x{METHOD:04X} within {QUIET:?} \
+            "{}: we replied to a REQUEST_NO_RETURN for 0x{FIRE_METHOD:04X} within {QUIET:?} \
              ({} datagrams, message types {types:02X?}): {sent:02X?}",
             Rt::NAME,
             sent.len()
         );
-        // Control: the request reached the server, so its silence was not a
-        // lost datagram.
+        // Control: the request reached the server's application, so its
+        // silence was not a lost datagram.
         rt.expect("the REQUEST_NO_RETURN as a Request", CALL_WAIT, |o| {
-            matches!(o, Observation::Request { method: METHOD, payload, .. } if payload[..] == [7])
+            matches!(
+                o,
+                Observation::Request { method: FIRE_METHOD, payload, .. } if payload[..] == [7]
+            )
         });
     }
 );
