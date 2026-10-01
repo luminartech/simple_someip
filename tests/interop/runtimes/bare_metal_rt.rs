@@ -243,11 +243,11 @@ fn run_poller(cmds: &Receiver<Cmd>) {
     }
 }
 
-/// Binds the host socket for `port` and starts its reader thread. The
+/// Binds the host sockets for `port` and starts their reader threads. The
 /// runtime cannot restart in-process, so sockets and readers live until the
 /// process exits.
 extern "C" fn bind(port: u16, is_sd: bool, mcast: u32) -> i32 {
-    match bind_socket(port, is_sd, Ipv4Addr::from(mcast)) {
+    match bind_port(port, is_sd, Ipv4Addr::from(mcast)) {
         Ok(sock) => {
             lock(&SOCKETS).push((port, sock));
             0
@@ -259,30 +259,53 @@ extern "C" fn bind(port: u16, is_sd: bool, mcast: u32) -> i32 {
     }
 }
 
-fn bind_socket(port: u16, is_sd: bool, mcast: Ipv4Addr) -> io::Result<UdpSocket> {
+/// Binds `OUR_IP:port`, the socket every send from `port` uses, and for the
+/// SD port also a socket for multicast SD. Returns the sending socket.
+///
+/// The SD port gets the frame peer's layout. Multicast is received on a
+/// socket bound to the group address `mcast` itself and joined on `OUR_IP`;
+/// unicast SD arrives on the `OUR_IP` socket, which also sends all SD.
+/// Nothing is bound to `0.0.0.0`: a wildcard socket on the SD port competes
+/// with other wildcard sockets there, such as vsomeip's, and the kernel
+/// hands unicast SD to only one of them. A socket bound to `OUR_IP` always
+/// takes precedence over a wildcard one.
+fn bind_port(port: u16, is_sd: bool, mcast: Ipv4Addr) -> io::Result<UdpSocket> {
+    let sock = reusable(SocketAddrV4::new(OUR_IP, port))?;
+    if is_sd {
+        sock.set_multicast_if_v4(&OUR_IP)?;
+        sock.set_multicast_loop_v4(true)?;
+        let group = reusable(SocketAddrV4::new(mcast, port))?;
+        group.join_multicast_v4(&mcast, &OUR_IP)?;
+        spawn_reader(UdpSocket::from(group), port, "mcast")?;
+    }
+    let sock = UdpSocket::from(sock);
+    spawn_reader(sock.try_clone()?, port, "ucast")?;
+    Ok(sock)
+}
+
+/// A UDP socket bound to `addr` with `SO_REUSEADDR` and `SO_REUSEPORT`, so
+/// it can share its port with the peers.
+fn reusable(addr: SocketAddrV4) -> io::Result<socket2::Socket> {
     let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
     s.set_reuse_address(true)?;
     s.set_reuse_port(true)?;
-    let addr = if is_sd { Ipv4Addr::UNSPECIFIED } else { OUR_IP };
-    s.bind(&SocketAddrV4::new(addr, port).into())?;
-    if is_sd {
-        s.join_multicast_v4(&mcast, &OUR_IP)?;
-        s.set_multicast_if_v4(&OUR_IP)?;
-        s.set_multicast_loop_v4(true)?;
-    }
-    let sock = UdpSocket::from(s);
-    let reader = sock.try_clone()?;
+    s.bind(&addr.into())?;
+    Ok(s)
+}
+
+fn spawn_reader(sock: UdpSocket, port: u16, kind: &str) -> io::Result<()> {
     std::thread::Builder::new()
-        .name(format!("bare-metal-rx-{port}"))
-        .spawn(move || read_into_mailbox(&reader, port))?;
-    Ok(sock)
+        .name(format!("bare-metal-rx-{port}-{kind}"))
+        .spawn(move || read_into_mailbox(&sock, port))?;
+    Ok(())
 }
 
 fn read_into_mailbox(sock: &UdpSocket, port: u16) {
     let mut buf = [0u8; rt::RX_CAP];
     while let Ok((n, src)) = sock.recv_from(&mut buf) {
         let SocketAddr::V4(src) = src else { continue };
-        // With multicast loopback on, the SD socket also hears our own sends.
+        // With multicast loopback on, the group socket also hears our own
+        // multicast sends.
         if *src.ip() == OUR_IP && src.port() == port {
             continue;
         }
@@ -347,4 +370,71 @@ fn dispatch(
         let _ = tx.send(observation);
     }
     rc
+}
+
+/// The adapter's own transport checks, run against the real runtime.
+mod tests {
+    use super::*;
+    use crate::interop::peers::frames::{
+        Delivery, FIND_SERVICE, FramePeer, OFFER_SERVICE, build, parse,
+    };
+
+    /// Unicast SD addressed to the runtime still reaches it when another
+    /// wildcard socket is bound to the SD port after it, as vsomeip's is.
+    ///
+    /// vsomeip's root-owned socket is not in a reuseport group with ours, so
+    /// the kernel gives all unicast SD on the port to whichever wildcard
+    /// socket was bound last. A same-user socket with `SO_REUSEPORT` would
+    /// join our group and get a hash-chosen share instead, so the stand-in
+    /// sets only `SO_REUSEADDR`, which reproduces vsomeip's case every time.
+    #[test]
+    fn unicast_sd_reaches_the_runtime_past_a_wildcard_socket() {
+        crate::interop::preflight();
+        let fp = FramePeer::start();
+        let _rt = BareMetalRt::start(Setup {
+            offer: Some(Offer {
+                ttl_s: 3,
+                events: vec![EVENT],
+                fields: vec![],
+                methods: vec![METHOD],
+            }),
+            consume: None,
+        });
+        let stand_in = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)
+            .and_then(|s| {
+                s.set_reuse_address(true)?;
+                s.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, SD_PORT).into())?;
+                Ok(s)
+            })
+            .unwrap_or_else(|e| panic!("could not bind the wildcard stand-in: {e}"));
+
+        let find = build::service_entry(FIND_SERVICE, 0, 0, 0, 0, SVC, INST, MAJOR, 3, 0);
+        let is_offer = |d: &[u8]| {
+            parse::sd_entry_types(d)
+                .iter()
+                .any(|&(t, ttl)| t == OFFER_SERVICE && ttl > 0)
+        };
+        for session in 1..=5 {
+            fp.send_sd_unicast(
+                SocketAddrV4::new(OUR_IP, SD_PORT),
+                &build::sd_message(session, true, true, &[find], &[]),
+            );
+            // A unicast Offer can only be the answer to this Find.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let answered = loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match fp.recv_sd(left, is_offer) {
+                    Some((_, _, Delivery::Unicast)) => break true,
+                    Some((_, _, Delivery::Multicast)) => {}
+                    None => break false,
+                }
+            };
+            assert!(
+                answered,
+                "Find {session} of 5 sent to {OUR_IP}:{SD_PORT} got no unicast Offer within 1 s; \
+                 the wildcard socket took it"
+            );
+        }
+        drop(stand_in);
+    }
 }
