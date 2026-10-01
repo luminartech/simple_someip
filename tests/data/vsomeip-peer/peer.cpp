@@ -7,6 +7,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -18,6 +19,8 @@ namespace {
 
 std::shared_ptr<vsomeip::application> app;
 std::mutex out_mutex;
+// Written by the stdin reader, read by vsomeip's dispatcher threads.
+std::mutex error_replies_mutex;
 std::map<vsomeip::method_t, vsomeip::return_code_e> error_replies;
 // The major version each service was offered with; stop_offer_service must match it.
 std::map<std::pair<uint16_t, uint16_t>, vsomeip::major_version_t> offered_majors;
@@ -55,15 +58,43 @@ std::string to_hex(const vsomeip::byte_t *d, vsomeip::length_t n) {
     return s;
 }
 
+bool is_digit_in(char c, int base) {
+    if (c >= '0' && c <= '9') return c - '0' < base;
+    if (base != 16) return false;
+    return (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+// Parses all of `s` as an unsigned number in `base`, at most `max`. Throws
+// std::invalid_argument otherwise, so the command fails with an ERR line.
+uint32_t parse_num(const std::string &s, int base, uint32_t max) {
+    if (s.empty()) throw std::invalid_argument("empty number");
+    for (char c : s)
+        if (!is_digit_in(c, base))
+            throw std::invalid_argument("not a base-" + std::to_string(base) + " number: " + s);
+    unsigned long v = 0;
+    try {
+        v = std::stoul(s, nullptr, base);
+    } catch (const std::out_of_range &) {
+        throw std::invalid_argument("out of range: " + s);
+    }
+    if (v > max) throw std::invalid_argument("out of range: " + s);
+    return static_cast<uint32_t>(v);
+}
+
 std::vector<vsomeip::byte_t> from_hex(const std::string &s) {
     std::vector<vsomeip::byte_t> v;
     if (s == "-") return v;
-    for (size_t i = 0; i + 1 < s.size(); i += 2)
-        v.push_back(static_cast<vsomeip::byte_t>(std::stoul(s.substr(i, 2), nullptr, 16)));
+    if (s.size() % 2 != 0) throw std::invalid_argument("odd-length hex payload: " + s);
+    for (size_t i = 0; i < s.size(); i += 2)
+        v.push_back(static_cast<vsomeip::byte_t>(parse_num(s.substr(i, 2), 16, 0xff)));
     return v;
 }
 
-uint16_t id(const std::string &s) { return static_cast<uint16_t>(std::stoul(s, nullptr, 16)); }
+uint16_t id(const std::string &s) { return static_cast<uint16_t>(parse_num(s, 16, 0xffff)); }
+
+vsomeip::major_version_t major(const std::string &s) {
+    return static_cast<vsomeip::major_version_t>(parse_num(s, 10, 0xff));
+}
 
 std::vector<uint16_t> ids(const std::string &s) {
     std::vector<uint16_t> v;
@@ -97,10 +128,19 @@ void on_message(const std::shared_ptr<vsomeip::message> &m) {
              " session=" + hex16(m->get_session()) + " payload=" + payload);
         if (!no_return) {
             auto resp = vsomeip::runtime::get()->create_response(m);
-            auto it = error_replies.find(m->get_method());
-            if (it != error_replies.end()) {
+            bool is_error = false;
+            vsomeip::return_code_e code = vsomeip::return_code_e::E_OK;
+            {
+                std::lock_guard<std::mutex> lock(error_replies_mutex);
+                auto it = error_replies.find(m->get_method());
+                if (it != error_replies.end()) {
+                    is_error = true;
+                    code = it->second;
+                }
+            }
+            if (is_error) {
                 resp->set_message_type(vsomeip::message_type_e::MT_ERROR);
-                resp->set_return_code(it->second);
+                resp->set_return_code(code);
             } else {
                 resp->set_payload(pl);  // echo
             }
@@ -143,13 +183,16 @@ bool handle(const std::string &line) {
     for (std::string t; ss >> t;) a.push_back(t);
     try {
         if (cmd == "offer" && a.size() == 7) {
+            // Parse every argument before acting, so a rejected command changes nothing.
             uint16_t svc = id(a[0]), inst = id(a[1]), eg = id(a[3]);
-            offer_events(svc, inst, eg, ids(a[4]), vsomeip::event_type_e::ET_EVENT);
-            offer_events(svc, inst, eg, ids(a[5]), vsomeip::event_type_e::ET_FIELD);
-            auto major = static_cast<vsomeip::major_version_t>(std::stoul(a[2]));
+            auto offered_major = major(a[2]);
+            auto events = ids(a[4]), fields = ids(a[5]);
+            ids(a[6]);  // methods: validated only; the handler accepts any method
+            offer_events(svc, inst, eg, events, vsomeip::event_type_e::ET_EVENT);
+            offer_events(svc, inst, eg, fields, vsomeip::event_type_e::ET_FIELD);
             app->register_message_handler(svc, inst, vsomeip::ANY_METHOD, on_message);
-            app->offer_service(svc, inst, major, 0);
-            offered_majors[{svc, inst}] = major;
+            app->offer_service(svc, inst, offered_major, 0);
+            offered_majors[{svc, inst}] = offered_major;
         } else if (cmd == "stop-offer" && a.size() == 2) {
             uint16_t svc = id(a[0]), inst = id(a[1]);
             auto it = offered_majors.find({svc, inst});
@@ -162,15 +205,17 @@ bool handle(const std::string &line) {
         } else if ((cmd == "notify" || cmd == "set-field") && a.size() == 4) {
             app->notify(id(a[0]), id(a[1]), id(a[2]), make_payload(a[3]), true);
         } else if (cmd == "require" && a.size() == 3) {
-            app->register_message_handler(id(a[0]), id(a[1]), vsomeip::ANY_METHOD, on_message);
-            app->request_service(id(a[0]), id(a[1]),
-                                 static_cast<vsomeip::major_version_t>(std::stoul(a[2])),
-                                 vsomeip::ANY_MINOR);
+            uint16_t svc = id(a[0]), inst = id(a[1]);
+            auto required_major = major(a[2]);
+            app->register_message_handler(svc, inst, vsomeip::ANY_METHOD, on_message);
+            app->request_service(svc, inst, required_major, vsomeip::ANY_MINOR);
         } else if (cmd == "subscribe" && a.size() == 6) {
             uint16_t svc = id(a[0]), inst = id(a[1]), eg = id(a[2]);
-            request_events(svc, inst, eg, ids(a[4]), vsomeip::event_type_e::ET_EVENT);
-            request_events(svc, inst, eg, ids(a[5]), vsomeip::event_type_e::ET_FIELD);
-            app->subscribe(svc, inst, eg, static_cast<vsomeip::major_version_t>(std::stoul(a[3])));
+            auto subscribed_major = major(a[3]);
+            auto events = ids(a[4]), fields = ids(a[5]);
+            request_events(svc, inst, eg, events, vsomeip::event_type_e::ET_EVENT);
+            request_events(svc, inst, eg, fields, vsomeip::event_type_e::ET_FIELD);
+            app->subscribe(svc, inst, eg, subscribed_major);
         } else if (cmd == "unsubscribe" && a.size() == 3) {
             app->unsubscribe(id(a[0]), id(a[1]), id(a[2]));
         } else if ((cmd == "call" || cmd == "fire") && a.size() == 4) {
@@ -182,7 +227,10 @@ bool handle(const std::string &line) {
             m->set_payload(make_payload(a[3]));
             app->send(m);
         } else if (cmd == "error-reply" && a.size() == 2) {
-            error_replies[id(a[0])] = static_cast<vsomeip::return_code_e>(std::stoul(a[1], nullptr, 16));
+            auto method = id(a[0]);
+            auto code = static_cast<vsomeip::return_code_e>(parse_num(a[1], 16, 0xff));
+            std::lock_guard<std::mutex> lock(error_replies_mutex);
+            error_replies[method] = code;
         } else if (cmd == "quit") {
             return false;
         } else {
