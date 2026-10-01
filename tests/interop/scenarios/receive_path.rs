@@ -40,8 +40,11 @@ const CONTROL: [u8; 1] = [0x10];
 
 /// X4: how many times the burst is sent.
 const ROUNDS: u8 = 10;
-/// X4: the values its controls send.
+/// X4: the values its controls send, and the session ID of the first.
+/// Burst `round` uses session IDs from `round << 4`, so the controls start
+/// after the last burst's.
 const CONTROL_VALUES: [(u16, [u8; 1]); 2] = [(FIELD, [0x3A]), (FIELD_2, [0x3B])];
+const CONTROL_SESSION: u16 = (ROUNDS as u16 + 1) << 4;
 /// A second field of `SVC`.
 const FIELD_2: u16 = 0x8003;
 
@@ -376,6 +379,9 @@ scenario!(
     /// only some of the time still fails. The first burst follows the Ack of
     /// the runtime's Subscribe; each later one follows the same Ack sent
     /// again, because not every runtime sends a new Subscribe on its own.
+    /// Between bursts the frame server keeps offering and answering
+    /// Subscribes, then stays quiet for `SETTLE`, so no Offer or Ack of its
+    /// own lands inside a burst.
     x4_initial_value_burst_is_delivered,
     std = run,
     bare_metal = run,
@@ -400,12 +406,31 @@ scenario!(
             if !missing.is_empty() {
                 lost.push((round, missing, delivered, other));
             }
-            // The next burst starts with the runtime idle.
+            // Keep the service offered, then start the next burst with the
+            // runtime idle.
+            server.serve_for(SETTLE);
             std::thread::sleep(SETTLE);
         }
+        let report: Vec<String> = lost
+            .iter()
+            .map(|(round, missing, delivered, other)| {
+                format!(
+                    "round {round}: missing {missing:02X?}, delivered {delivered:02X?}, \
+                     other observations {other:?}"
+                )
+            })
+            .collect();
+        let report = format!(
+            "{} of {ROUNDS} bursts, each the Ack and then one initial value for each of \
+             0x{FIELD:04X} and 0x{FIELD_2:04X} sent back to back, were not delivered in full \
+             within {DELIVERY_WAIT:?}; values are (field, payload), and a payload's first byte \
+             is its round. {}",
+            lost.len(),
+            report.join("; ")
+        );
         // Controls: each field's notification is delivered when sent alone,
         // so a value missing above was lost in the burst.
-        for (s, (field, value)) in (0x0100..).zip(CONTROL_VALUES) {
+        for (s, (field, value)) in (CONTROL_SESSION..).zip(CONTROL_VALUES) {
             server
                 .fp
                 .send_unicast(client_endpoint(), &notification_for(field, s, &value));
@@ -417,29 +442,15 @@ scenario!(
                 panic!(
                     "{}: control failed: a notification for 0x{field:04X} with payload \
                      {value:02X?}, sent alone, was not delivered within {DELIVERY_WAIT:?}; \
-                     observed: {seen:?}",
+                     observed: {seen:?}. Before it, {report}",
                     Rt::NAME
                 );
             }
         }
-        let report: Vec<String> = lost
-            .iter()
-            .map(|(round, missing, delivered, other)| {
-                format!(
-                    "round {round}: missing {missing:02X?}, delivered {delivered:02X?}, \
-                     other observations {other:?}"
-                )
-            })
-            .collect();
         assert!(
             lost.is_empty(),
-            "{}: {} of {ROUNDS} bursts, each the Ack and then one initial value for each of \
-             0x{FIELD:04X} and 0x{FIELD_2:04X} sent back to back, were not delivered in full \
-             within {DELIVERY_WAIT:?}; values are (field, payload), and a payload's first byte \
-             is its round. Each field's notification was delivered when sent alone. {}",
-            Rt::NAME,
-            lost.len(),
-            report.join("; ")
+            "{}: {report} Each field's notification was delivered when sent alone.",
+            Rt::NAME
         );
     }
 );

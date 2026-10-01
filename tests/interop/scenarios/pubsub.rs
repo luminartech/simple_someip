@@ -426,6 +426,12 @@ impl FrameServer {
         self.offers.push(Instant::now());
     }
 
+    /// Serves for `d`: offers every `OFFER_PERIOD` and answers each
+    /// Subscribe.
+    pub(super) fn serve_for(&mut self, d: Duration) {
+        self.serve_until(Instant::now() + d, |_| false);
+    }
+
     /// Sends the answer to the first Subscribe again, in an SD message of its
     /// own, and at once after it each of `then` from the peer's service
     /// port. Panics if no Subscribe has arrived yet.
