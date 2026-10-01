@@ -5,14 +5,14 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use simple_someip::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, Profile5Config};
-use simple_someip::protocol::sd::{Entry, Options, ServiceEntry, TransportProtocol};
+use simple_someip::protocol::sd::{Entry, TransportProtocol};
 use simple_someip::protocol::{
     Header, Message, MessageId, MessageType, MessageTypeField, ReturnCode,
 };
 use simple_someip::server::{EventPublisher, ServerConfig, SubscriptionManager};
 use simple_someip::{
-    Client, ClientUpdate, ClientUpdates, PayloadWireFormat, RawPayload, Server, ServerDeps,
-    ServiceEndpointKey, TokioChannels, TokioSocket,
+    Client, ClientUpdate, ClientUpdates, NetEndpoint, PayloadWireFormat, RawPayload, Server,
+    ServerDeps, ServiceEndpointKey, TokioChannels, TokioSocket,
 };
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -218,9 +218,10 @@ async fn start_client(
 /// asked, subscribes to `EG` — before reporting the offer, so a scenario that
 /// sees `ServiceAvailable` can call straight away.
 ///
-/// Entries are reported as the library delivers them: every `OfferService`
-/// (whatever its TTL) is a `ServiceAvailable`, and only a `StopOfferService`
-/// is a `ServiceGone`.
+/// Entries are reported as the library interprets them: every `OfferService`
+/// (whatever its TTL) is a `ServiceAvailable` at the endpoint the library's
+/// own offered-endpoint mapping assigns it (the one its client registers),
+/// and only a `StopOfferService` is a `ServiceGone`.
 async fn report_updates(
     client: StdClient,
     mut updates: ClientUpdates<RawPayload, TokioChannels>,
@@ -237,34 +238,46 @@ async fn report_updates(
                 if msg.source.ip() == IpAddr::V4(OUR_IP) {
                     continue;
                 }
-                for entry in &msg.sd_header.entries {
-                    match entry {
-                        Entry::OfferService(s) => {
-                            let Some(endpoint) = udp_endpoint(s, &msg.sd_header.options) else {
-                                eprintln!("std runtime: offer without a UDP endpoint: {s:?}");
-                                continue;
-                            };
-                            if !found && s.service_id == SVC && s.instance_id == INST {
-                                found = true;
-                                let key = ServiceEndpointKey::udp(SVC, SocketAddr::V4(endpoint));
-                                *service.lock().unwrap() = Some(key);
-                                out.extend(use_service(&client, key, subscribe).await);
-                            }
-                            out.push(Observation::ServiceAvailable {
-                                service: s.service_id,
-                                instance: s.instance_id,
-                                endpoint,
-                            });
+                let sd = RawPayload::new_sd_payload(&msg.sd_header);
+                for ep in sd.offered_endpoints() {
+                    if !ep.is_offer {
+                        out.push(Observation::ServiceGone {
+                            service: ep.service_id,
+                            instance: ep.instance_id,
+                        });
+                        continue;
+                    }
+                    let endpoint = match ep.endpoint {
+                        Some(NetEndpoint {
+                            addr: SocketAddr::V4(addr),
+                            protocol: TransportProtocol::Udp,
+                        }) => addr,
+                        other => {
+                            eprintln!(
+                                "std runtime: offer for 0x{:04X} without a UDP IPv4 endpoint: {other:?}",
+                                ep.service_id
+                            );
+                            continue;
                         }
-                        Entry::StopOfferService(s) => out.push(Observation::ServiceGone {
-                            service: s.service_id,
-                            instance: s.instance_id,
-                        }),
-                        Entry::SubscribeAckEventGroup(eg) => out.push(Observation::Subscribed {
+                    };
+                    if !found && ep.service_id == SVC && ep.instance_id == INST {
+                        found = true;
+                        let key = ServiceEndpointKey::udp(SVC, SocketAddr::V4(endpoint));
+                        *service.lock().unwrap() = Some(key);
+                        out.extend(use_service(&client, key, subscribe).await);
+                    }
+                    out.push(Observation::ServiceAvailable {
+                        service: ep.service_id,
+                        instance: ep.instance_id,
+                        endpoint,
+                    });
+                }
+                for entry in &msg.sd_header.entries {
+                    if let Entry::SubscribeAckEventGroup(eg) = entry {
+                        out.push(Observation::Subscribed {
                             eventgroup: eg.event_group_id,
                             accepted: eg.ttl > 0,
-                        }),
-                        Entry::FindService(_) | Entry::SubscribeEventGroup(_) => {}
+                        });
                     }
                 }
             }
@@ -328,27 +341,6 @@ async fn use_service(
         return Some(error("subscribe", e));
     }
     None
-}
-
-/// The UDP IPv4 endpoint among the options `entry` references.
-fn udp_endpoint(entry: &ServiceEntry, options: &[Options]) -> Option<SocketAddrV4> {
-    let run = |first: u8, count: u8| usize::from(first)..usize::from(first) + usize::from(count);
-    let runs = run(
-        entry.index_first_options_run,
-        entry.options_count.first_options_count,
-    )
-    .chain(run(
-        entry.index_second_options_run,
-        entry.options_count.second_options_count,
-    ));
-    runs.filter_map(|i| options.get(i)).find_map(|o| match o {
-        Options::IpV4Endpoint {
-            ip,
-            protocol: TransportProtocol::Udp,
-            port,
-        } => Some(SocketAddrV4::new(*ip, *port)),
-        _ => None,
-    })
 }
 
 async fn start_server(

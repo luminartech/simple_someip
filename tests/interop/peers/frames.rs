@@ -12,6 +12,30 @@ use std::time::{Duration, Instant};
 
 use crate::interop::consts::*;
 
+/// SD entry types.
+pub const FIND_SERVICE: u8 = 0x00;
+pub const OFFER_SERVICE: u8 = 0x01;
+pub const SUBSCRIBE_EVENTGROUP: u8 = 0x06;
+pub const SUBSCRIBE_EVENTGROUP_ACK: u8 = 0x07;
+
+/// SD option types.
+pub const CONFIGURATION: u8 = 0x01;
+pub const IPV4_ENDPOINT: u8 = 0x04;
+pub const IPV4_MULTICAST: u8 = 0x14;
+
+/// IANA protocol numbers, as an endpoint option carries them.
+pub const UDP: u8 = 0x11;
+pub const TCP: u8 = 0x06;
+
+/// How an SD datagram reached the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Sent to the SD multicast group.
+    Multicast,
+    /// Sent to the peer's own address.
+    Unicast,
+}
+
 /// How long `recv_sd` waits on one SD socket before checking the other.
 const POLL: Duration = Duration::from_millis(10);
 
@@ -82,18 +106,29 @@ impl FramePeer {
     }
 
     /// The first SD datagram, multicast or unicast to the peer, for which
-    /// `pred` holds, or `None` if none arrives within `timeout`. The peer's
-    /// own multicast sends, looped back to it, are skipped.
-    pub fn recv_sd(&self, timeout: Duration, pred: impl Fn(&[u8]) -> bool) -> Option<Vec<u8>> {
+    /// `pred` holds, with its source and how it was delivered, or `None` if
+    /// none arrives within `timeout`. The peer's own multicast sends, looped
+    /// back to it, are skipped.
+    ///
+    /// The group socket receives only multicast and the `PEER_IP` socket
+    /// only unicast, so the socket a datagram arrives on tells the two apart.
+    pub fn recv_sd(
+        &self,
+        timeout: Duration,
+        pred: impl Fn(&[u8]) -> bool,
+    ) -> Option<(Vec<u8>, SocketAddrV4, Delivery)> {
         let own = SocketAddrV4::new(PEER_IP, SD_PORT);
         let deadline = Instant::now() + timeout;
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            for sock in [&self.sd_group, &self.sd] {
+            for (sock, delivery) in [
+                (&self.sd_group, Delivery::Multicast),
+                (&self.sd, Delivery::Unicast),
+            ] {
                 if let Some((datagram, src)) = recv_from(sock, left.min(POLL))
                     && src != own
                     && pred(&datagram)
                 {
-                    return Some(datagram);
+                    return Some((datagram, src, delivery));
                 }
             }
         }
@@ -286,12 +321,21 @@ pub mod build {
         ]
     }
 
-    /// An IPv4 endpoint option (type `0x04`, length 9). `l4` is the IANA
-    /// protocol number: `0x11` for UDP, `0x06` for TCP.
+    /// An IPv4 endpoint option (length 9). `l4` is the IANA protocol
+    /// number, [`UDP`](super::UDP) or [`TCP`](super::TCP).
     pub fn ipv4_endpoint_option(ip: Ipv4Addr, l4: u8, port: u16) -> Vec<u8> {
         let [a, b, c, d] = ip.octets();
         let [p0, p1] = port.to_be_bytes();
-        raw_option(0x04, &[a, b, c, d, 0, l4, p0, p1])
+        raw_option(super::IPV4_ENDPOINT, &[a, b, c, d, 0, l4, p0, p1])
+    }
+
+    /// An option of any type with its discardable flag set, so a receiver
+    /// that does not know the type ignores the option rather than the
+    /// entry referencing it.
+    pub fn discardable_option(option_type: u8, body: &[u8]) -> Vec<u8> {
+        let mut o = raw_option(option_type, body);
+        o[3] = 0x80;
+        o
     }
 
     /// An option of any type: length, type, a reserved byte, then `body`.
