@@ -2,6 +2,8 @@
 //! emits an OfferService on a host transport).
 #![cfg(feature = "bare-metal-runtime")]
 
+mod interop;
+
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -38,7 +40,7 @@ fn dispatch(_: usize, _: SocketAddrV4, _: u16, _: u16, _: &[u8], _: u8, _: &mut 
 }
 
 #[test]
-fn runtime_emits_offer_on_host() {
+fn probe_runtime_emits_offer_on_host() {
     // Listen where the runtime sends its offer: the SD group and port.
     let rx = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
     rx.set_reuse_address(true).unwrap();
