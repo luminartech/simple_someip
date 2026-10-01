@@ -162,6 +162,16 @@ impl VsomeipPeer {
         self.output.expect_where(kind, timeout, pred)
     }
 
+    /// See [`PeerOutput::next_where`].
+    pub fn next_where(
+        &mut self,
+        kind: &str,
+        timeout: Duration,
+        pred: impl Fn(&PeerLine) -> bool,
+    ) -> Option<PeerLine> {
+        self.output.next_where(kind, timeout, pred)
+    }
+
     /// See [`PeerOutput::expect_none`].
     pub fn expect_none(&mut self, kind: &str, within: Duration) {
         self.output.expect_none(kind, within);
@@ -234,6 +244,18 @@ impl PeerOutput {
                     self.transcript()
                 )
             })
+    }
+
+    /// Like [`expect_where`](Self::expect_where), but returns `None` when no
+    /// matching line arrives within `timeout`, for a caller that reports the
+    /// absence itself.
+    pub fn next_where(
+        &mut self,
+        kind: &str,
+        timeout: Duration,
+        pred: impl Fn(&PeerLine) -> bool,
+    ) -> Option<PeerLine> {
+        self.next_matching(|l| l.kind == kind && pred(l), timeout)
     }
 
     /// Asserts no unconsumed line of `kind` exists or arrives within
