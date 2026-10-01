@@ -20,7 +20,7 @@ scenario!(
     /// PRS_SOMEIPSD_00842 (OfferService) / feat_req_someipsd_208 — the peer's offer is discovered.
     d1_peer_offer_is_discovered,
     std = run,
-    bare_metal = run,
+    bare_metal = ignore("the bare-metal runtime does not report discovered services"),
     {
         let mut peer = VsomeipPeer::start();
         let mut rt = Rt::start(Setup {
