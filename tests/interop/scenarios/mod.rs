@@ -47,4 +47,5 @@ pub const QUIET: Duration = Duration::from_millis(1500);
 pub const CALL_WAIT: Duration = Duration::from_secs(3);
 
 pub mod discovery;
+pub mod pubsub;
 pub mod wire;

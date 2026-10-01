@@ -16,6 +16,7 @@ use super::{QUIET, SD_WAIT, TTL_WAIT};
 
 fn offer() -> Offer {
     Offer {
+        service: SVC,
         ttl_s: 3,
         events: vec![EVENT],
         fields: vec![(FIELD, vec![0x2A])],
@@ -118,7 +119,7 @@ fn is_svc_gone(o: &Observation) -> bool {
 }
 
 /// Waits for the runtime's first OfferService, so it is known to be running.
-fn first_offer(fp: &FramePeer) -> Vec<u8> {
+pub(super) fn first_offer(fp: &FramePeer) -> Vec<u8> {
     let (d, _, _) = fp
         .recv_sd(SD_WAIT, |d| {
             parse::sd_entry_types(d)

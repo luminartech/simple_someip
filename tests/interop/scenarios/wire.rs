@@ -9,6 +9,7 @@ use super::SD_WAIT;
 
 fn offer() -> Offer {
     Offer {
+        service: SVC,
         ttl_s: 3,
         events: vec![EVENT],
         fields: vec![],
@@ -263,6 +264,27 @@ mod builders {
             parse::sd_entry_types(&d),
             [(SUBSCRIBE_EVENTGROUP, 0x00AB_CDEF)]
         );
+    }
+
+    #[test]
+    fn entries_are_found_at_their_offsets() {
+        use crate::interop::peers::frames::{
+            EXPLICIT_INITIAL_DATA_CONTROL, FIND_SERVICE, REBOOT, UNICAST,
+        };
+        let find = build::service_entry(FIND_SERVICE, 0, 0, 0, 0, SVC, INST, MAJOR, 3, 0);
+        let subscribe =
+            build::eventgroup_entry(SUBSCRIBE_EVENTGROUP, 0, 0, SVC, INST, MAJOR, 3, true, 2, EG);
+        let d = build::sd_message_with_flags(
+            1,
+            REBOOT | UNICAST | EXPLICIT_INITIAL_DATA_CONTROL,
+            &[find, subscribe],
+            &[],
+        );
+        assert_eq!(d[16], 0xE0);
+        let entries = parse::sd_entries(&d);
+        assert_eq!(entries, [(24, find), (40, subscribe)]);
+        assert_eq!(d[entries[1].0 + 13], 0x82);
+        assert_eq!(parse::sd_entries(&d[..50]), [(24, find)]);
     }
 
     #[test]
