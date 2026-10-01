@@ -35,9 +35,18 @@ const OFFER_PERIOD: Duration = Duration::from_secs(1);
 /// How soon after an Offer the Subscribe answering it must arrive.
 const ANSWER_WAIT: Duration = Duration::from_millis(500);
 /// When the frame peer sends the Offers after the first Subscribe that
-/// must each be answered: about a second apart, but unevenly, so a client
-/// renewing on a timer of its own cannot land in both answer windows.
+/// must each be answered within `ANSWER_WAIT`: about a second apart, but
+/// unevenly, so a client renewing every second on a timer of its own misses
+/// the second window. Other timers still land in both windows (any period
+/// from 1.05 s to 1.3 s does), so P9 also checks `OFFER_GAP`.
 const RENEWING_OFFERS: [Duration; 2] = [Duration::from_millis(800), Duration::from_millis(2100)];
+/// How long the frame peer sends no Offer after the last of
+/// `RENEWING_OFFERS`. It is shorter than the Offers' 3 s TTL, so the service
+/// stays offered, and a client that answers Offers sends no Subscribe after
+/// the last answer window. The 2 s from that window's end to the end of the
+/// gap is longer than the 1.3 s longest timer period the answer windows let
+/// through, so no timer of any period can pass both checks.
+const OFFER_GAP: Duration = Duration::from_millis(2500);
 
 /// A service of the runtime's own that has nothing to do with `SVC`.
 const UNRELATED_SVC: u16 = 0x5678;
@@ -473,7 +482,7 @@ fn answer_entry(mut e: [u8; 16], answer: Answer) -> [u8; 16] {
 }
 
 scenario!(
-    /// PRS_SOMEIPSD_00443, 00449 / feat_req_someipsd_431 — we subscribe to the peer's eventgroup and receive its events.
+    /// PRS_SOMEIPSD_00443, 00449 — we subscribe to the peer's eventgroup and receive its events.
     p1_client_subscribes_and_receives_events,
     std = run,
     bare_metal = ignore("the Subscribe must be sent by unicast to the server's SD endpoint (#174)"),
@@ -706,7 +715,10 @@ scenario!(
 );
 
 scenario!(
-    /// PRS_SOMEIPSD_00446, 00449, 00502 / feat_req_someipsd_431 — we answer each Offer with a Subscribe, which renews the subscription.
+    /// PRS_SOMEIPSD_00446, 00449, 00502 — we answer each Offer with a Subscribe, which renews the subscription, and send none while no Offer arrives.
+    ///
+    /// feat_req_someipsd_431 differs: a client whose subscription has the
+    /// maximum TTL answers Offers only after a server reboot.
     p9_client_renews_subscription,
     std = ignore("the std client leaves subscription renewal to its caller (#176)"),
     bare_metal = ignore("every Offer must be answered with a Subscribe while the subscription is wanted (#175)"),
@@ -754,6 +766,30 @@ scenario!(
              within {ANSWER_WAIT:?}; (Offer sent, answered after), relative to the first \
              Subscribe: {answers:.2?}; Subscribes: {subscribes:.2?}",
             Rt::NAME
+        );
+
+        // Control: no Offer for `OFFER_GAP`, so no Subscribe may follow the
+        // last answer window.
+        let last_offer = offers[offers.len() - 1];
+        server.next_offer = last_offer + OFFER_GAP;
+        server.serve_until(last_offer + OFFER_GAP, |_| false);
+        assert!(
+            server.offers.iter().all(|&o| o <= last_offer),
+            "the frame peer offered during its {OFFER_GAP:?} gap"
+        );
+        let unprompted: Vec<Duration> = server
+            .subscribes
+            .iter()
+            .filter(|s| s.at > last_offer + ANSWER_WAIT)
+            .map(|s| s.at - first_at)
+            .collect();
+        assert!(
+            unprompted.is_empty(),
+            "{}: Subscribe sent without an Offer (blind/self-timed renewal): no Offer for \
+             {OFFER_GAP:?} after the one sent at {:.2?}, yet Subscribes arrived at \
+             {unprompted:.2?}, relative to the first Subscribe",
+            Rt::NAME,
+            last_offer - first_at
         );
     }
 );
