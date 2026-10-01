@@ -12,7 +12,7 @@ address (127.0.0.2) assigned to the loopback interface:
 
     sudo ip link set lo multicast on
     sudo ip route replace 239.255.0.255/32 dev lo
-    sudo ip addr add 127.0.0.2/8 dev lo
+    sudo ip addr replace 127.0.0.2/8 dev lo
 
 Build the image once (5–10 minutes):
 
@@ -44,7 +44,7 @@ means empty.
 
 | Command | Effect |
 |---|---|
-| `offer <svc> <inst> <major> <eg> <events> <fields> <methods>` | Offer a service with the given events, fields and methods (comma-separated or `-`) |
+| `offer <svc> <inst> <major> <eg> <events> <fields> <methods>` | Offer a service with the given events and fields (comma-separated or `-`). The method list is checked for well-formed ids but not otherwise used: the peer answers a request for any method |
 | `stop-offer <svc> <inst>` | Stop offering |
 | `notify <svc> <inst> <event> <payload>` / `set-field …` | Send an event / set a field value |
 | `require <svc> <inst> <major>` | Look for a service |

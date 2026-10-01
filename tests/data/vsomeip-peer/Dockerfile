@@ -18,8 +18,9 @@ ARG BASE_IMAGE=ubuntu:22.04
 
 FROM ${BASE_IMAGE} AS build
 
-# vsomeip's CMake build needs: gcc, cmake, boost, and a few utilities
-# for the patch-and-build flow. dlt is optional and we skip it.
+# vsomeip's CMake build needs gcc, cmake and boost, plus git: its configure
+# step clones googletest. wget fetches the release tarball. dlt is optional
+# and we skip it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         cmake \

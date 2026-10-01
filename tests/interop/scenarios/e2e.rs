@@ -8,15 +8,11 @@
 //! with that code, and a second test checks that it produces the pinned
 //! bytes.
 
-use std::time::{Duration, Instant};
-
 use crate::Rt;
-use crate::interop::consts::*;
-use crate::interop::peers::vsomeip::VsomeipPeer;
 use crate::interop::runtime::{Consume, E2eSpec, Observation, Setup, SomeipUnderTest};
 
+use super::QUIET;
 use super::receive_path::{DELIVERY_WAIT, client_endpoint, is_event, next_matching, subscribed};
-use super::{QUIET, SD_WAIT};
 
 /// The Data ID and maximum counter delta of the protected event.
 const DATA_ID: u16 = 0x9C6E;
@@ -50,9 +46,6 @@ const PROTECTED_1: [u8; 24] = [
     0x01, 0x02, 0x03, 0x04, 0x05,
 ];
 
-/// The vsomeip command that offers `SVC` with `EVENT` in `EG`.
-const VSOMEIP_OFFER: &str = "offer 1234 0001 1 0001 8001 8002 0001";
-
 /// The runtime as a client of `SVC`, subscribing to `EG` and checking
 /// `EVENT` with Profile 5.
 fn e2e_client() -> Setup {
@@ -73,6 +66,7 @@ fn e2e_client() -> Setup {
 fn protected_frames() -> [Vec<u8>; 2] {
     use simple_someip::e2e::{Profile5Config, Profile5State, protect_profile5_with_header};
 
+    use crate::interop::consts::{EVENT, SVC};
     use crate::interop::peers::frames::build;
 
     let config = Profile5Config::new(DATA_ID, PAYLOAD.len() as u16, MAX_DELTA);
@@ -228,43 +222,5 @@ scenario!(
                 Rt::NAME
             ),
         }
-    }
-);
-
-scenario!(
-    /// PRS_E2E_00399–00401 / feat_req_someip_102 — a Profile 5 event that vsomeip protects passes our check.
-    e1_profile5_event_at_offset_64_vsomeip,
-    std = ignore("needs the vsomeip E2E plugin configured for Profile 5"),
-    bare_metal = ignore("needs the vsomeip E2E plugin configured for Profile 5"),
-    {
-        // vsomeip sends `PAYLOAD` as given; its E2E plugin, configured for
-        // Profile 5 with Data ID 0x9C6E on 0x1234/0x8001, would protect it.
-        let mut peer = VsomeipPeer::start();
-        peer.send(VSOMEIP_OFFER);
-        let mut rt = Rt::start(e2e_client());
-        let hex: String = PAYLOAD.iter().map(|b| format!("{b:02x}")).collect();
-        let deadline = Instant::now() + SD_WAIT;
-        let mut seen = Vec::new();
-        while Instant::now() < deadline {
-            peer.send(&format!("notify 1234 0001 8001 {hex}"));
-            let tick = (Instant::now() + Duration::from_millis(200)).min(deadline);
-            while let Some(left) = tick.checked_duration_since(Instant::now()) {
-                match rt.next(left) {
-                    Some(Observation::Event {
-                        service: SVC,
-                        event: EVENT,
-                        payload,
-                        e2e_ok: Some(true),
-                    }) if payload[..] == PAYLOAD => return,
-                    Some(o) => seen.push(format!("{o:?}")),
-                    None => break,
-                }
-            }
-        }
-        panic!(
-            "{}: no Event with e2e_ok Some(true) and payload {PAYLOAD:02X?} within {SD_WAIT:?}; \
-             observed: {seen:?}",
-            Rt::NAME
-        )
     }
 );
