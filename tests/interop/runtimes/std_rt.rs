@@ -221,7 +221,7 @@ async fn start_client(
 /// Entries are reported as the library interprets them: every `OfferService`
 /// (whatever its TTL) is a `ServiceAvailable` at the endpoint the library's
 /// own offered-endpoint mapping assigns it (the one its client registers),
-/// and only a `StopOfferService` is a `ServiceGone`.
+/// and only a `StopOfferService` that names an endpoint is a `ServiceGone`.
 async fn report_updates(
     client: StdClient,
     mut updates: ClientUpdates<RawPayload, TokioChannels>,
@@ -240,11 +240,20 @@ async fn report_updates(
                 }
                 let sd = RawPayload::new_sd_payload(&msg.sd_header);
                 for ep in sd.offered_endpoints() {
+                    // Like the library's registry, which skips a stop that
+                    // names no endpoint: it cannot tell which provider left.
                     if !ep.is_offer {
-                        out.push(Observation::ServiceGone {
-                            service: ep.service_id,
-                            instance: ep.instance_id,
-                        });
+                        if ep.endpoint.is_some() {
+                            out.push(Observation::ServiceGone {
+                                service: ep.service_id,
+                                instance: ep.instance_id,
+                            });
+                        } else {
+                            eprintln!(
+                                "std runtime: stop for 0x{:04X} without an endpoint; not reported",
+                                ep.service_id
+                            );
+                        }
                         continue;
                     }
                     let endpoint = match ep.endpoint {

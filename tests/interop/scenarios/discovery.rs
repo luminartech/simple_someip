@@ -12,7 +12,7 @@ use crate::interop::peers::frames::{
 use crate::interop::peers::vsomeip::VsomeipPeer;
 use crate::interop::runtime::{Consume, Observation, Offer, Setup, SomeipUnderTest};
 
-use super::{SD_WAIT, TTL_WAIT};
+use super::{QUIET, SD_WAIT, TTL_WAIT};
 
 fn offer() -> Offer {
     Offer {
@@ -179,7 +179,9 @@ scenario!(
         peer.send("offer 1234 0001 1 0001 8001 8002 0001");
         rt.expect("ServiceAvailable", SD_WAIT, is_svc_available);
         peer.send("stop-offer 1234 0001");
-        rt.expect("ServiceGone", SD_WAIT, is_svc_gone);
+        // Well inside vsomeip's 3 s offer TTL, so only the StopOffer explains
+        // the service going.
+        rt.expect("ServiceGone", QUIET, is_svc_gone);
     }
 );
 
@@ -201,7 +203,7 @@ scenario!(
 );
 
 scenario!(
-    /// PRS_SOMEIPSD_00842, 00364 — our StopOffer is understood by vsomeip.
+    /// PRS_SOMEIPSD_00427 — vsomeip drops our service when we stop offering it.
     d4_our_stop_offer_is_understood,
     std = ignore("the std runtime cannot stop offering a service"),
     bare_metal = run,
@@ -227,6 +229,72 @@ scenario!(
 );
 
 scenario!(
+    /// PRS_SOMEIPSD_00842, 00364, 00157, 00255 / feat_req_someipsd_208 — our StopOffer is an Offer entry with TTL 0 that continues the offers' session and reboot flag.
+    d4_our_stop_offer_wire_format,
+    std = ignore("the std runtime cannot stop offering a service"),
+    bare_metal = run,
+    {
+        let fp = FramePeer::start();
+        let mut rt = Rt::start(offer_only());
+        let mut last = first_offer(&fp);
+        rt.stop_offer();
+        // The first SD message with a TTL 0 entry; any offer before it
+        // becomes the one the stop must follow.
+        let deadline = Instant::now() + SD_REPLY;
+        let stop = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let (d, _, _) = fp.recv_sd(left, |_| true).unwrap_or_else(|| {
+                panic!(
+                    "{}: no SD entry with TTL 0 within {SD_REPLY:?} of stopping",
+                    Rt::NAME
+                )
+            });
+            let entries = parse::sd_entry_types(&d);
+            if entries.iter().any(|&(_, ttl)| ttl == 0) {
+                break d;
+            }
+            if entries.iter().any(|&(t, _)| t == OFFER_SERVICE) {
+                last = d;
+            }
+        };
+
+        let mut problems = Vec::new();
+        let entries = parse::sd_entry_types(&stop);
+        if entries != [(OFFER_SERVICE, 0)] {
+            problems.push(format!(
+                "entries (type, TTL): got {entries:02X?}, want [(01, 00)]"
+            ));
+        }
+        let reboot = |d: &[u8]| d[16] & 0x80 != 0;
+        // A handful of messages cannot wrap the session counter.
+        if !reboot(&stop) {
+            problems.push("reboot flag: got clear, want set".to_owned());
+        }
+        if reboot(&stop) != reboot(&last) {
+            problems.push(format!(
+                "reboot flag: {} on the stop but {} on the last offer",
+                reboot(&stop),
+                reboot(&last)
+            ));
+        }
+        let want = session(&last).wrapping_add(1).max(1);
+        if session(&stop) != want {
+            problems.push(format!(
+                "session ID: got {:#06X}, want {want:#06X} (the last offer's was {:#06X})",
+                session(&stop),
+                session(&last)
+            ));
+        }
+        assert!(
+            problems.is_empty(),
+            "{}: our StopOffer does not match the SD wire format:\n  {}\nlast offer: {last:02X?}\nstop:       {stop:02X?}",
+            Rt::NAME,
+            problems.join("\n  ")
+        );
+    }
+);
+
+scenario!(
     /// PRS_SOMEIPSD_00268 (index of the first options run) — each Offer in one message uses the endpoint it references.
     d5_each_offer_uses_its_own_endpoint,
     std = run,
@@ -234,37 +302,47 @@ scenario!(
     {
         let fp = FramePeer::start();
         let mut rt = Rt::start(consume_only());
-        let other = build::service_entry(OFFER_SERVICE, 1, 0, 1, 0, OTHER_SVC, INST, MAJOR, 3, 0);
+        // Crossed: entry 0 uses option 1 and entry 1 uses option 0, so
+        // neither "the first option for every entry" nor "entry i uses
+        // option i" gives both services the right endpoint.
+        let other = build::service_entry(OFFER_SERVICE, 0, 0, 1, 0, OTHER_SVC, INST, MAJOR, 3, 0);
         let other_ep = build::ipv4_endpoint_option(PEER_IP, UDP, OTHER_PORT);
         fp.send_sd_multicast(&build::sd_message(
             1,
             true,
             true,
-            &[svc_offer(0, 1, 3), other],
-            &[peer_endpoint(), other_ep],
+            &[svc_offer(1, 1, 3), other],
+            &[other_ep, peer_endpoint()],
         ));
-        let endpoint_of = |o: &Observation, service: u16| match o {
-            Observation::ServiceAvailable {
-                service: s,
-                endpoint,
-                ..
-            } if *s == service => Some(*endpoint),
-            _ => None,
-        };
-        let svc = rt.expect("ServiceAvailable for 0x1234", SD_WAIT, |o| {
-            endpoint_of(o, SVC).is_some()
-        });
-        let other = rt.expect("ServiceAvailable for 0x5678", SD_REPLY, |o| {
-            endpoint_of(o, OTHER_SVC).is_some()
-        });
-        let (svc, other) = (endpoint_of(&svc, SVC), endpoint_of(&other, OTHER_SVC));
+        // The first ServiceAvailable for each service, in whatever order.
+        let mut found: [Option<SocketAddrV4>; 2] = [None, None];
+        let mut skipped = Vec::new();
+        let deadline = Instant::now() + SD_WAIT;
+        while found.contains(&None) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let Some(o) = rt.next(left) else { break };
+            match o {
+                Observation::ServiceAvailable {
+                    service: SVC,
+                    endpoint,
+                    ..
+                } if found[0].is_none() => found[0] = Some(endpoint),
+                Observation::ServiceAvailable {
+                    service: OTHER_SVC,
+                    endpoint,
+                    ..
+                } if found[1].is_none() => found[1] = Some(endpoint),
+                o => skipped.push(format!("{o:?}")),
+            }
+        }
         assert_eq!(
-            (svc, other),
-            (
+            found,
+            [
                 Some(SocketAddrV4::new(PEER_IP, SERVER_PORT)),
                 Some(SocketAddrV4::new(PEER_IP, OTHER_PORT))
-            ),
-            "{}: the two offers' endpoints (0x1234, 0x5678)",
+            ],
+            "{}: the endpoints of 0x1234 and 0x5678 (None: not reported within {SD_WAIT:?}); \
+             other observations: {skipped:?}",
             Rt::NAME
         );
     }
@@ -309,7 +387,7 @@ scenario!(
 );
 
 scenario!(
-    /// PRS_SOMEIPSD_00842 (supported entry types) — an Offer still applies when it follows an entry of unknown type.
+    /// PRS_SOMEIPSD_00841 — an Offer still applies when it follows an entry of unknown type.
     d7_unknown_entry_type_is_skipped_client,
     std = run,
     bare_metal = ignore("the bare-metal runtime does not report discovered services"),
@@ -329,7 +407,7 @@ scenario!(
 );
 
 scenario!(
-    /// PRS_SOMEIPSD_00842 (supported entry types) — a Subscribe still gets an Ack when it follows an entry of unknown type.
+    /// PRS_SOMEIPSD_00841 — a Subscribe still gets an Ack when it follows an entry of unknown type.
     d7_unknown_entry_type_is_skipped_server,
     std = run,
     bare_metal = run,
@@ -354,6 +432,9 @@ scenario!(
         let offer = || [svc_offer(0, 1, 3)];
         fp.send_sd_multicast(&build::sd_message(5, true, true, &offer(), &[peer_endpoint()]));
         rt.expect("ServiceAvailable", SD_WAIT, is_svc_available);
+        // Control: the session ID moving on is not a reboot.
+        fp.send_sd_multicast(&build::sd_message(6, true, true, &offer(), &[peer_endpoint()]));
+        rt.expect_none("ServiceGone without a reboot", QUIET, is_svc_gone);
         // Reboot flag set both times and the session ID going back: a reboot.
         fp.send_sd_multicast(&build::sd_message(1, true, true, &offer(), &[peer_endpoint()]));
         rt.expect("ServiceGone after the reboot", SD_REPLY, is_svc_gone);
@@ -362,8 +443,8 @@ scenario!(
 );
 
 scenario!(
-    /// PRS_SOMEIPSD_00422 / feat_req_someipsd_824, feat_req_someipsd_91 — a Find with the unicast flag 0 is answered with an Offer.
-    d9_find_without_unicast_flag_is_answered,
+    /// PRS_SOMEIPSD_00422 / feat_req_someipsd_824 — a Find is answered with an Offer.
+    d9_find_is_answered,
     std = run,
     bare_metal = run,
     {
@@ -374,7 +455,7 @@ scenario!(
         let find = build::service_entry(FIND_SERVICE, 0, 0, 0, 0, SVC, INST, MAJOR, 3, 0);
         fp.send_sd_unicast(
             SocketAddrV4::new(OUR_IP, SD_PORT),
-            &build::sd_message(1, true, false, &[find], &[]),
+            &build::sd_message(1, true, true, &[find], &[]),
         );
         let sent = Instant::now();
         let (reply, src, delivery) = fp
@@ -407,8 +488,21 @@ scenario!(
         let fp = FramePeer::start();
         let mut rt = Rt::start(consume_only());
         fp.send_sd_multicast(&build::sd_message(1, true, true, &[svc_offer(0, 1, 3)], &[peer_endpoint()]));
+        let sent = Instant::now();
         rt.expect("ServiceAvailable", SD_WAIT, is_svc_available);
-        rt.expect("ServiceGone once the 3 s TTL expires", TTL_WAIT, is_svc_gone);
+        // Not before the TTL is nearly up...
+        let early = Duration::from_millis(2500);
+        rt.expect_none(
+            "ServiceGone before the 3 s TTL expires",
+            early.saturating_sub(sent.elapsed()),
+            is_svc_gone,
+        );
+        // ...but once it has.
+        rt.expect(
+            "ServiceGone once the 3 s TTL expires",
+            TTL_WAIT.saturating_sub(sent.elapsed()),
+            is_svc_gone,
+        );
     }
 );
 
