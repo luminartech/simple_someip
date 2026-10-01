@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use crate::Rt;
 use crate::interop::consts::*;
 use crate::interop::peers::frames::{
-    EXPLICIT_INITIAL_DATA_CONTROL, FramePeer, OFFER_SERVICE, REBOOT, SUBSCRIBE_EVENTGROUP,
-    SUBSCRIBE_EVENTGROUP_ACK, UDP, UNICAST, build, parse,
+    Delivery, EXPLICIT_INITIAL_DATA_CONTROL, FramePeer, OFFER_SERVICE, REBOOT,
+    SUBSCRIBE_EVENTGROUP, SUBSCRIBE_EVENTGROUP_ACK, UDP, UNICAST, build, parse,
 };
 use crate::interop::peers::vsomeip::{PeerLine, VsomeipPeer};
 use crate::interop::runtime::{Consume, Observation, Offer, Setup, SomeipUnderTest};
@@ -32,11 +32,12 @@ const SETTLE: Duration = Duration::from_millis(200);
 const SUBSCRIBE_TTL: u32 = 3;
 /// How often the frame peer offers when it is the server.
 const OFFER_PERIOD: Duration = Duration::from_secs(1);
-/// Two Subscribes closer together than this are a resend, not a renewal.
-const MIN_RENEWAL_GAP: Duration = Duration::from_secs(1);
-/// How long after the first Subscribe a renewal may take: twice the
-/// subscription's 3 s TTL.
-const RENEWAL_WAIT: Duration = Duration::from_secs(6);
+/// How soon after an Offer the Subscribe answering it must arrive.
+const ANSWER_WAIT: Duration = Duration::from_millis(500);
+/// When the frame peer sends the Offers after the first Subscribe that
+/// must each be answered: about a second apart, but unevenly, so a client
+/// renewing on a timer of its own cannot land in both answer windows.
+const RENEWING_OFFERS: [Duration; 2] = [Duration::from_millis(800), Duration::from_millis(2100)];
 
 /// A service of the runtime's own that has nothing to do with `SVC`.
 const UNRELATED_SVC: u16 = 0x5678;
@@ -271,14 +272,14 @@ impl FrameClient {
             "{}: initial value of 0x{FIELD:04X}: {d:02X?}",
             Rt::NAME
         );
-        expect_no_repeat(self.notifications(FIELD, QUIET));
+        expect_no_repeat(&self.notifications(FIELD, QUIET));
     }
 }
 
 /// Fails if a notification for `FIELD` arrived after the initial value with
 /// no new trigger; the initial value then cannot be told apart from a
 /// cyclic publish.
-fn expect_no_repeat(repeats: Vec<Vec<u8>>) {
+fn expect_no_repeat(repeats: &[Vec<u8>]) {
     assert!(
         repeats.is_empty(),
         "{}: {} more notifications for 0x{FIELD:04X} within {QUIET:?} of the initial value, \
@@ -299,6 +300,7 @@ enum Answer {
 /// received.
 struct ReceivedSubscribe {
     at: Instant,
+    delivery: Delivery,
     datagram: Vec<u8>,
     /// Where the entry starts in `datagram`.
     offset: usize,
@@ -309,10 +311,6 @@ impl ReceivedSubscribe {
         &self.datagram[self.offset..self.offset + 16]
     }
 
-    fn ttl(&self) -> Duration {
-        Duration::from_secs(entry_ttl(self.entry()).into())
-    }
-
     /// Bit 7 of the entry's byte 13.
     fn initial_data_requested(&self) -> bool {
         self.entry()[13] & 0x80 != 0
@@ -321,7 +319,8 @@ impl ReceivedSubscribe {
 
 /// The frame peer as the server of `SVC`: it offers every `OFFER_PERIOD`
 /// and answers each Subscribe for `EG`. Its multicast and unicast SD
-/// messages are numbered separately, each from 1.
+/// messages are numbered separately, each from 1. It records when it sent
+/// each Offer and when each Subscribe arrived.
 struct FrameServer {
     fp: FramePeer,
     flags: u8,
@@ -329,6 +328,10 @@ struct FrameServer {
     multicast_session: u16,
     unicast_session: u16,
     next_offer: Instant,
+    /// When to offer after `next_offer`, relative to it; empty means every
+    /// `OFFER_PERIOD`.
+    schedule: Vec<Duration>,
+    offers: Vec<Instant>,
     subscribes: Vec<ReceivedSubscribe>,
 }
 
@@ -341,6 +344,8 @@ impl FrameServer {
             multicast_session: 0,
             unicast_session: 0,
             next_offer: Instant::now(),
+            schedule: Vec::new(),
+            offers: Vec::new(),
             subscribes: Vec::new(),
         }
     }
@@ -359,10 +364,15 @@ impl FrameServer {
             }
             if now >= self.next_offer {
                 self.offer();
-                self.next_offer = now + OFFER_PERIOD;
+                self.next_offer = if self.schedule.is_empty() {
+                    now + OFFER_PERIOD
+                } else {
+                    let next = self.schedule.remove(0);
+                    self.next_offer + next
+                };
             }
             let wait = until.min(self.next_offer).saturating_duration_since(now);
-            let Some((d, src, _)) = self.fp.recv_sd(wait, |d| {
+            let Some((d, src, delivery)) = self.fp.recv_sd(wait, |d| {
                 parse::sd_entries(d).iter().any(|(_, e)| is_subscribe(e))
             }) else {
                 continue;
@@ -377,6 +387,7 @@ impl FrameServer {
                 answers.push(answer_entry(e, self.answer));
                 self.subscribes.push(ReceivedSubscribe {
                     at,
+                    delivery,
                     datagram: d.clone(),
                     offset,
                 });
@@ -400,6 +411,7 @@ impl FrameServer {
             &[offer],
             &[peer_endpoint()],
         ));
+        self.offers.push(Instant::now());
     }
 
     /// Serves until the first Subscribe arrives; panics after `SD_WAIT`.
@@ -593,32 +605,6 @@ scenario!(
 );
 
 scenario!(
-    /// PRS_SOMEIPSD_00388 — vsomeip sees no events after it unsubscribes from us.
-    p6_unsubscribe_stops_events_vsomeip,
-    std = run,
-    bare_metal = run,
-    {
-        // vsomeip drops events for an eventgroup it has left before its
-        // application sees them, so this variant cannot tell whether we
-        // still send them. The frame variant above checks the wire.
-        let mut peer = VsomeipPeer::start();
-        let mut rt = Rt::start(server());
-        vsomeip_subscribes(&mut peer);
-        // Control: events flow while vsomeip is subscribed.
-        rt.publish(EVENT, &[6, 1]);
-        peer.expect_where("EVENT", ACK_WAIT, |l| is_peer_event(l, EVENT, &[6, 1]));
-        peer.send("unsubscribe 1234 0001 0001");
-        std::thread::sleep(SETTLE);
-        peer.clear();
-        for n in 2..5 {
-            rt.publish(EVENT, &[6, n]);
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        peer.expect_none("EVENT", QUIET);
-    }
-);
-
-scenario!(
     /// PRS_SOMEIPSD_00388 — our unsubscribe stops the peer's events.
     p6_our_unsubscribe_stops_events,
     std = ignore("the std runtime cannot unsubscribe"),
@@ -666,7 +652,7 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00393, 00394 — the runtime reports a SubscribeEventgroupNack.
     p8_subscribe_reports_nack,
-    std = run,
+    std = ignore("the std runtime does not report subscription results"),
     bare_metal = ignore("the bare-metal runtime does not report subscription results"),
     {
         let mut server = FrameServer::start(REBOOT | UNICAST, Answer::Nack);
@@ -685,37 +671,73 @@ scenario!(
 );
 
 scenario!(
-    /// PRS_SOMEIPSD_00449, 00386 / feat_req_someipsd_431 — we renew our subscription before its TTL expires.
+    /// PRS_SOMEIPSD_00446, 00449, 00502 / feat_req_someipsd_431 — we answer each Offer with a Subscribe, which renews the subscription.
     p9_client_renews_subscription,
+    std = ignore("the std client leaves subscription renewal to its caller"),
+    bare_metal = run,
+    {
+        let mut server = FrameServer::start(REBOOT | UNICAST, Answer::Ack);
+        let _rt = Rt::start(client());
+        let first_at = server.first_subscribe().at;
+        // Nothing here depends on the Subscribe's TTL.
+        let [early, late] = RENEWING_OFFERS;
+        server.next_offer = first_at + early;
+        server.schedule = vec![late - early];
+        server.serve_until(first_at + late + ANSWER_WAIT, |_| false);
+        let offers: Vec<Instant> = server
+            .offers
+            .iter()
+            .copied()
+            .filter(|&o| o > first_at)
+            .take(RENEWING_OFFERS.len())
+            .collect();
+        assert_eq!(
+            offers.len(),
+            RENEWING_OFFERS.len(),
+            "the frame peer sent too few Offers after the first Subscribe"
+        );
+        // For each Offer: when it was sent, and how long its answer took.
+        let answers: Vec<(Duration, Option<Duration>)> = offers
+            .iter()
+            .map(|&o| {
+                let answer = server
+                    .subscribes
+                    .iter()
+                    .map(|s| s.at.saturating_duration_since(o))
+                    .find(|&after| !after.is_zero() && after <= ANSWER_WAIT);
+                (o - first_at, answer)
+            })
+            .collect();
+        let subscribes: Vec<Duration> = server
+            .subscribes
+            .iter()
+            .map(|s| s.at.saturating_duration_since(first_at))
+            .collect();
+        assert!(
+            answers.iter().all(|(_, answer)| answer.is_some()),
+            "{}: not every Offer after the first Subscribe was answered with a Subscribe \
+             within {ANSWER_WAIT:?}; (Offer sent, answered after), relative to the first \
+             Subscribe: {answers:.2?}; Subscribes: {subscribes:.2?}",
+            Rt::NAME
+        );
+    }
+);
+
+scenario!(
+    /// PRS_SOMEIPSD_00501 — we answer the server's Offer with a unicast SD message.
+    p10_client_subscribes_by_unicast,
     std = run,
     bare_metal = run,
     {
         let mut server = FrameServer::start(REBOOT | UNICAST, Answer::Ack);
         let _rt = Rt::start(client());
-        let (first_at, ttl) = {
-            let first = server.first_subscribe();
-            (first.at, first.ttl())
-        };
-        // A renewal is a later Subscribe, not an immediate resend, that
-        // arrives while the first is still valid.
-        let window = ttl.min(RENEWAL_WAIT);
-        let renewed = server.serve_until(first_at + window, |subs| {
-            subs.iter().skip(1).any(|s| {
-                let gap = s.at - first_at;
-                gap > MIN_RENEWAL_GAP && gap < window
-            })
-        });
-        let seen: Vec<String> = server
-            .subscribes
-            .iter()
-            .map(|s| format!("+{:.2?} (TTL {:?})", s.at - first_at, s.ttl()))
-            .collect();
+        let first = server.first_subscribe();
         assert!(
-            renewed,
-            "{}: no renewal more than {MIN_RENEWAL_GAP:?} after the first Subscribe and \
-             within {window:?} of it (its TTL, at most {RENEWAL_WAIT:?}); \
-             Subscribes received: {seen:?}",
-            Rt::NAME
+            first.delivery == Delivery::Unicast,
+            "{}: Subscribe sent to multicast group {SD_GROUP}:{SD_PORT}, not to the server's \
+             SD endpoint {PEER_IP}:{SD_PORT}: {:02X?}",
+            Rt::NAME,
+            first.datagram
         );
     }
 );

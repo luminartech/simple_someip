@@ -385,16 +385,16 @@ mod tests {
         Delivery, FIND_SERVICE, FramePeer, OFFER_SERVICE, build, parse,
     };
 
-    /// Unicast SD addressed to the runtime still reaches it when another
+    /// Unicast and multicast SD both still reach the runtime when another
     /// wildcard socket is bound to the SD port after it, as vsomeip's is.
     ///
     /// vsomeip's root-owned socket is not in a reuseport group with ours, so
-    /// the kernel gives all unicast SD on the port to whichever wildcard
-    /// socket was bound last. A same-user socket with `SO_REUSEPORT` would
+    /// the kernel usually gives all unicast SD on the port to the wildcard
+    /// socket bound last. A same-user socket with `SO_REUSEPORT` would
     /// join our group and get a hash-chosen share instead, so the stand-in
     /// sets only `SO_REUSEADDR`, which reproduces vsomeip's case every time.
     #[test]
-    fn unicast_sd_reaches_the_runtime_past_a_wildcard_socket() {
+    fn sd_reaches_the_runtime_past_a_wildcard_socket() {
         crate::interop::preflight();
         let fp = FramePeer::start();
         let _rt = BareMetalRt::start(Setup {
@@ -421,11 +421,19 @@ mod tests {
                 .iter()
                 .any(|&(t, ttl)| t == OFFER_SERVICE && ttl > 0)
         };
-        for session in 1..=5 {
-            fp.send_sd_unicast(
-                SocketAddrV4::new(OUR_IP, SD_PORT),
-                &build::sd_message(session, true, true, &[find], &[]),
-            );
+        // Five Finds to the runtime's own address, then one to the group,
+        // which only the runtime's group socket receives.
+        let group = SocketAddrV4::new(SD_GROUP, SD_PORT);
+        let to = (1..=5)
+            .map(|_| SocketAddrV4::new(OUR_IP, SD_PORT))
+            .chain([group]);
+        for (session, to) in (1..).zip(to) {
+            let find = build::sd_message(session, true, true, &[find], &[]);
+            if to == group {
+                fp.send_sd_multicast(&find);
+            } else {
+                fp.send_sd_unicast(to, &find);
+            }
             // A unicast Offer can only be the answer to this Find.
             let deadline = Instant::now() + Duration::from_secs(1);
             let answered = loop {
@@ -438,8 +446,7 @@ mod tests {
             };
             assert!(
                 answered,
-                "Find {session} of 5 sent to {OUR_IP}:{SD_PORT} got no unicast Offer within 1 s; \
-                 the wildcard socket took it"
+                "Find {session} of 6, sent to {to}, got no unicast Offer within 1 s"
             );
         }
         drop(stand_in);
