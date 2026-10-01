@@ -1,5 +1,5 @@
 //! Interop tests for the bare-metal runtime against vsomeip and spec-derived frames.
-#![cfg(feature = "bare-metal-runtime")]
+#![cfg(all(target_os = "linux", feature = "bare-metal-runtime"))]
 
 mod interop;
 

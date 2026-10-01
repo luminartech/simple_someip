@@ -56,23 +56,28 @@ scenario!(
             offer: Some(offer()),
             consume: None,
         });
-        let d = peer
-            .recv_sd(SD_WAIT, |d| {
+        let next_offer = |which: &str| {
+            peer.recv_sd(SD_WAIT, |d| {
                 parse::sd_entry_types(d)
                     .iter()
                     .any(|&(t, _)| t == OFFER_SERVICE)
             })
-            .unwrap_or_else(|| panic!("{}: no OfferService within {SD_WAIT:?}", Rt::NAME));
+            .unwrap_or_else(|| panic!("{}: no {which} OfferService within {SD_WAIT:?}", Rt::NAME))
+        };
+        let d = next_offer("first");
+        let d2 = next_offer("second");
 
         // SOME/IP header (16) + SD flags and lengths (12) + one entry (16)
         // + one IPv4 endpoint option (12).
         const LEN: usize = 56;
-        assert!(
-            d.len() >= LEN,
-            "{}: offer is {} bytes, want {LEN}: {d:02X?}",
-            Rt::NAME,
-            d.len()
-        );
+        for (which, d) in [("first", &d), ("second", &d2)] {
+            assert!(
+                d.len() >= LEN,
+                "{}: {which} offer is {} bytes, want {LEN}: {d:02X?}",
+                Rt::NAME,
+                d.len()
+            );
+        }
         let mut f = Fields::default();
         f.check("datagram length", d.len(), LEN);
 
@@ -112,9 +117,25 @@ scenario!(
         f.check("endpoint L4 protocol", o[9], UDP);
         f.check("endpoint port", u16_at(o, 10), SERVER_PORT);
 
+        // The next offer: a new session ID, the reboot flag still set (two
+        // offers cannot wrap the counter), and the same service, instance,
+        // TTL and endpoint.
+        let (s1, s2) = (u16_at(&d, 10), u16_at(&d2, 10));
+        if s2 <= s1 {
+            f.0.push(format!(
+                "second offer's session ID: got {s2:#06X}, want more than {s1:#06X}"
+            ));
+        }
+        f.check("second offer's reboot flag", d2[16] & 0x80 != 0, true);
+        let e2 = &d2[24..40];
+        f.check("second offer's service ID", u16_at(e2, 4), u16_at(e, 4));
+        f.check("second offer's instance ID", u16_at(e2, 6), u16_at(e, 6));
+        f.check("second offer's TTL", u24_at(e2, 9), u24_at(e, 9));
+        f.check("second offer's endpoint option", &d2[44..56], o);
+
         assert!(
             f.0.is_empty(),
-            "{}: offer does not match the SD wire format:\n  {}\ndatagram: {d:02X?}",
+            "{}: offers do not match the SD wire format:\n  {}\nfirst:  {d:02X?}\nsecond: {d2:02X?}",
             Rt::NAME,
             f.0.join("\n  ")
         );
