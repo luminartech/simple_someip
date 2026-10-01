@@ -125,9 +125,11 @@ impl SomeipUnderTest for StdRt {
     fn call(&mut self, method: u16, payload: &[u8], timeout: Duration) -> CallOutcome {
         let (client, key) = self.client_and_service();
         let msg = request(method, payload, MessageType::Request);
+        // `timeout` registers its timer when it is created, so it must be
+        // created inside the runtime.
         match self
             .rt
-            .block_on(tokio::time::timeout(timeout, client.request(key, msg)))
+            .block_on(async { tokio::time::timeout(timeout, client.request(key, msg)).await })
         {
             Err(_elapsed) => CallOutcome::NoReply,
             Ok(Ok(p)) => CallOutcome::Response {
