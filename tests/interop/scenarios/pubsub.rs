@@ -89,10 +89,7 @@ pub(super) fn client() -> Setup {
     };
     Setup {
         offer: cfg!(feature = "bare-metal-runtime").then_some(unrelated),
-        consume: Some(Consume {
-            subscribe: true,
-            e2e: None,
-        }),
+        consume: Some(Consume { subscribe: true }),
     }
 }
 

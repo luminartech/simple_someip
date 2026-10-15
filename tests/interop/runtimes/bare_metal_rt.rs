@@ -88,7 +88,7 @@ impl SomeipUnderTest for BareMetalRt {
         let subscriptions: Vec<_> = setup
             .consume
             .filter(|c| c.subscribe)
-            .map(|c| subscription(c.e2e.as_ref()))
+            .map(|_| subscription())
             .into_iter()
             .collect();
 
@@ -193,16 +193,8 @@ impl Drop for BareMetalRt {
     }
 }
 
-/// The one `SubEntry` for `EG`, E2E-protected if `e2e` is given.
-fn subscription(e2e: Option<&E2eSpec>) -> rt::SubEntry {
-    let (data_id, data_length, max_delta) = e2e.map_or((0, 0, 0), |e2e| {
-        assert!(
-            e2e.data_length_bits % 8 == 0,
-            "E2E data length {} bits is not a whole number of bytes",
-            e2e.data_length_bits
-        );
-        (e2e.data_id, e2e.data_length_bits / 8, e2e.max_delta)
-    });
+/// The one `SubEntry` for `EG`, without E2E protection.
+fn subscription() -> rt::SubEntry {
     rt::SubEntry {
         service_id: SVC,
         instance_id: INST,
@@ -210,11 +202,10 @@ fn subscription(e2e: Option<&E2eSpec>) -> rt::SubEntry {
         method_id: EVENT,
         local_rx_port: CLIENT_PORT,
         major_version: MAJOR,
-        e2e_enabled: e2e.is_some(),
-        e2e_data_id: data_id,
-        // Bytes of protected data, excluding the E2E header.
-        e2e_data_length: data_length,
-        e2e_max_delta: u16::from(max_delta),
+        e2e_enabled: false,
+        e2e_data_id: 0,
+        e2e_data_length: 0,
+        e2e_max_delta: 0,
     }
 }
 
@@ -349,7 +340,7 @@ fn dispatch(
     service: u16,
     method: u16,
     payload: &[u8],
-    e2e_status: u8,
+    _e2e_status: u8,
     response_out: &mut [u8],
 ) -> i32 {
     let (observation, rc) = if response_out.is_empty() {
@@ -357,7 +348,6 @@ fn dispatch(
             service,
             event: method,
             payload: payload.to_vec(),
-            e2e_ok: (e2e_status != 0).then_some(e2e_status == 1),
         };
         (event, -1)
     } else {

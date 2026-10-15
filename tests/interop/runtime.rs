@@ -26,18 +26,6 @@ pub struct Offer {
 #[derive(Debug, Clone)]
 pub struct Consume {
     pub subscribe: bool,
-    pub e2e: Option<E2eSpec>,
-}
-
-/// E2E Profile 5 parameters for the consumed event.
-#[derive(Debug, Clone)]
-pub struct E2eSpec {
-    pub data_id: u16,
-    /// The payload's length in bits, excluding the 3-byte E2E header. This
-    /// is not AUTOSAR's DataLength, which also counts the E2E header and
-    /// the upper header bits before it.
-    pub data_length_bits: u16,
-    pub max_delta: u8,
 }
 
 /// Something the runtime under test reported. A `None` field is one the
@@ -64,7 +52,6 @@ pub enum Observation {
         service: u16,
         event: u16,
         payload: Vec<u8>,
-        e2e_ok: Option<bool>,
     },
     Request {
         service: u16,

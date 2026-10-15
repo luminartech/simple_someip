@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use simple_someip::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, Profile5Config};
+use simple_someip::e2e::E2ERegistry;
 use simple_someip::protocol::sd::TransportProtocol;
 use simple_someip::protocol::{
     Header, Message, MessageId, MessageType, MessageTypeField, ReturnCode,
@@ -195,23 +195,6 @@ async fn start_client(
         .bind_discovery()
         .await
         .expect("std runtime: bind_discovery failed");
-    if let Some(e2e) = &consume.e2e {
-        assert!(
-            e2e.data_length_bits % 8 == 0,
-            "E2E data length {} bits is not a whole number of bytes",
-            e2e.data_length_bits
-        );
-        client
-            .register_e2e(
-                E2EKey::from_message_id(MessageId::new_from_service_and_method(SVC, EVENT)),
-                E2EProfile::Profile5WithHeader(Profile5Config::new(
-                    e2e.data_id,
-                    e2e.data_length_bits / 8,
-                    e2e.max_delta,
-                )),
-            )
-            .expect("std runtime: E2E registry is full");
-    }
     tasks.push(tokio::spawn(report_updates(
         client.clone(),
         updates,
@@ -291,11 +274,7 @@ async fn report_updates(
                     });
                 }
             }
-            ClientUpdate::Unicast {
-                message,
-                e2e_status,
-                ..
-            } => {
+            ClientUpdate::Unicast { message, .. } => {
                 let header = message.header();
                 let id = header.message_id();
                 let kind = header.message_type().message_type();
@@ -304,7 +283,6 @@ async fn report_updates(
                         service: id.service_id(),
                         event: id.method_id(),
                         payload: message.payload().raw_bytes().unwrap_or_default().to_vec(),
-                        e2e_ok: e2e_status.map(|s| s == E2ECheckStatus::Ok),
                     });
                 } else {
                     eprintln!(
