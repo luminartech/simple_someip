@@ -11,11 +11,43 @@ pub struct OfferedEndpoint {
     pub major_version: u8,
     /// The minor version of the offered service interface.
     pub minor_version: u32,
-    /// The full endpoint (IPv4 socket + transport protocol) extracted
-    /// from the SD options, if present.
+    /// The endpoint (IPv4 socket + transport protocol) from the options the
+    /// entry references, if one of them is an IPv4 endpoint. See
+    /// [`ServiceEntry::ipv4_endpoint`](crate::protocol::sd::ServiceEntry::ipv4_endpoint).
     pub endpoint: Option<crate::NetEndpoint>,
     /// `true` for `OfferService`, `false` for `StopOfferService`.
     pub is_offer: bool,
+}
+
+/// Visits an [`OfferedEndpoint`] for every offer and stop offer in `entries`,
+/// taking each one's endpoint from the options it references in `options`:
+/// its UDP endpoint, or its TCP endpoint if it references no UDP one.
+#[cfg(any(feature = "std", feature = "bare_metal"))]
+pub(crate) fn for_each_offered_endpoint(
+    entries: &[crate::protocol::sd::Entry],
+    options: &[crate::protocol::sd::Options],
+    mut f: impl FnMut(OfferedEndpoint),
+) {
+    use crate::protocol::sd::{Entry, TransportProtocol};
+    for entry in entries {
+        let (Entry::OfferService(svc) | Entry::StopOfferService(svc)) = entry else {
+            continue;
+        };
+        let endpoint = [TransportProtocol::Udp, TransportProtocol::Tcp]
+            .into_iter()
+            .find_map(|protocol| {
+                svc.ipv4_endpoint(options, protocol)
+                    .map(|addr| crate::NetEndpoint::new(core::net::SocketAddr::V4(addr), protocol))
+            });
+        f(OfferedEndpoint {
+            service_id: svc.service_id,
+            instance_id: svc.instance_id,
+            major_version: svc.major_version,
+            minor_version: svc.minor_version,
+            endpoint,
+            is_offer: matches!(entry, Entry::OfferService(_)),
+        });
+    }
 }
 
 /// Crate-local conveniences over any codec [`Encode`](automotive_wire_codec::Encode) type.
@@ -171,5 +203,47 @@ pub trait PayloadWireFormat:
         let mut out = std::vec::Vec::new();
         self.for_each_service_instance(|svc, inst| out.push((svc, inst)));
         out
+    }
+}
+
+#[cfg(all(test, any(feature = "std", feature = "bare_metal")))]
+mod tests {
+    use super::*;
+    use crate::protocol::sd::{Entry, Options, OptionsCount, ServiceEntry, TransportProtocol};
+    use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    #[test]
+    fn offered_endpoint_prefers_the_udp_endpoint_the_offer_references() {
+        let ip = Ipv4Addr::new(192, 0, 2, 1);
+        let options = [
+            Options::IpV4Endpoint {
+                ip,
+                protocol: TransportProtocol::Tcp,
+                port: 30501,
+            },
+            Options::IpV4Endpoint {
+                ip,
+                protocol: TransportProtocol::Udp,
+                port: 30502,
+            },
+        ];
+        let offer = Entry::OfferService(ServiceEntry {
+            index_first_options_run: 0,
+            index_second_options_run: 0,
+            options_count: OptionsCount::new(2, 0),
+            service_id: 0x1234,
+            instance_id: 1,
+            major_version: 1,
+            ttl: 3,
+            minor_version: 0,
+        });
+        let mut seen = None;
+        for_each_offered_endpoint(&[offer], &options, |ep| seen = ep.endpoint);
+        assert_eq!(
+            seen,
+            Some(crate::NetEndpoint::udp(SocketAddr::V4(SocketAddrV4::new(
+                ip, 30502
+            ))))
+        );
     }
 }
