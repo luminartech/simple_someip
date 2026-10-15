@@ -944,7 +944,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error if the service is not found or subscription fails.
+    /// Returns an error if the service is not found or subscription fails,
+    /// including when `ttl` is above [`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::UnsupportedEndpoint`] if the key's endpoint is
     /// not an IPv4/UDP socket.
     /// Returns [`Error::Shutdown`] if the client's run-loop future has

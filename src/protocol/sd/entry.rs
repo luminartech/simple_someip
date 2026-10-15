@@ -4,11 +4,16 @@ use automotive_wire_codec::{Decode, DecodeIter, Encode, take};
 
 pub const ENTRY_SIZE: usize = 16;
 
+/// The largest TTL an SD entry's 24-bit TTL field holds, in seconds. An offer
+/// with this TTL stays valid until the offering node reboots.
+pub const MAX_TTL: u32 = 0x00FF_FFFF;
+
 /// The type byte of an SD entry.
 ///
 /// A stop offer shares [`EntryType::OfferService`] and differs only by a TTL of
 /// 0; [`Entry`] carries that distinction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum EntryType {
     /// Find a service (0x00).
     FindService,
@@ -141,6 +146,9 @@ impl Encode for EventGroupEntry {
     }
 
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
+        if self.ttl > MAX_TTL {
+            return Err(Error::InvalidTtl(self.ttl).into());
+        }
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;
         writer.write_u8(u8::from(self.options_count))?;
@@ -169,7 +177,8 @@ pub struct ServiceEntry {
     pub instance_id: u16,
     /// The major version of the service interface.
     pub major_version: u8,
-    /// Time-to-live in seconds (24-bit value).
+    /// Time-to-live in seconds, at most [`MAX_TTL`]; at least 1 for an
+    /// [`Entry::OfferService`].
     pub ttl: u32,
     /// The minor version of the service interface.
     pub minor_version: u32,
@@ -186,7 +195,7 @@ impl ServiceEntry {
             service_id,
             instance_id: 0xFFFF,
             major_version: 0xFF,
-            ttl: 0x00FF_FFFF,
+            ttl: MAX_TTL,
             minor_version: 0xFFFF_FFFF,
         }
     }
@@ -200,6 +209,9 @@ impl Encode for ServiceEntry {
     }
 
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
+        if self.ttl > MAX_TTL {
+            return Err(Error::InvalidTtl(self.ttl).into());
+        }
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;
         writer.write_u8(u8::from(self.options_count))?;
@@ -214,11 +226,12 @@ impl Encode for ServiceEntry {
 
 /// A decoded SD entry, wrapping a [`ServiceEntry`] or [`EventGroupEntry`].
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Entry {
     /// Find a service.
     FindService(ServiceEntry),
-    /// Offer a service. On the wire, an offer with a TTL of 0 is a
-    /// [`Entry::StopOfferService`] and decodes as one.
+    /// Offer a service. The TTL is 1 to [`MAX_TTL`]; a TTL of 0 is an
+    /// [`Entry::StopOfferService`] on the wire.
     OfferService(ServiceEntry),
     /// Stop offering a service: an [`EntryType::OfferService`] entry with a
     /// TTL of 0. It encodes with a TTL of 0 whatever [`ServiceEntry::ttl`]
@@ -279,6 +292,13 @@ impl Encode for Entry {
     }
 
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
+        let ttl = match self {
+            Entry::FindService(s) | Entry::OfferService(s) | Entry::StopOfferService(s) => s.ttl,
+            Entry::SubscribeEventGroup(e) | Entry::SubscribeAckEventGroup(e) => e.ttl,
+        };
+        if ttl > MAX_TTL || (ttl == 0 && matches!(self, Entry::OfferService(_))) {
+            return Err(Error::InvalidTtl(ttl).into());
+        }
         let body = match self {
             Entry::FindService(service_entry) => {
                 writer.write_u8(u8::from(EntryType::FindService))?;
@@ -380,6 +400,14 @@ impl EntryView<'_> {
         u32::from_be_bytes([0, self.0[9], self.0[10], self.0[11]])
     }
 
+    /// Returns `true` if this entry is a stop offer: an
+    /// [`EntryType::OfferService`] entry with a TTL of 0. [`EntryView::to_owned`]
+    /// decodes it as an [`Entry::StopOfferService`].
+    #[must_use]
+    pub fn is_stop_offer(&self) -> bool {
+        self.0[0] == u8::from(EntryType::OfferService) && self.ttl() == 0
+    }
+
     /// Minor version (only valid for service entries).
     #[must_use]
     pub fn minor_version(&self) -> u32 {
@@ -409,7 +437,7 @@ impl EntryView<'_> {
         let entry_type = self.entry_type()?;
         match entry_type {
             EntryType::FindService => Ok(Entry::FindService(self.to_service_entry())),
-            EntryType::OfferService if self.ttl() == 0 => {
+            EntryType::OfferService if self.is_stop_offer() => {
                 Ok(Entry::StopOfferService(self.to_service_entry()))
             }
             EntryType::OfferService => Ok(Entry::OfferService(self.to_service_entry())),
@@ -751,6 +779,74 @@ mod tests {
             view.to_owned().unwrap(),
             Entry::StopOfferService(ServiceEntry { ttl: 0, .. })
         ));
+    }
+
+    #[test]
+    fn offer_service_with_zero_ttl_is_rejected() {
+        let entry = Entry::OfferService(ServiceEntry {
+            ttl: 0,
+            ..make_service_entry()
+        });
+        assert!(matches!(
+            entry.encode(&mut [0u8; 17].as_mut_slice()),
+            Err(crate::protocol::Error::Sd(Error::InvalidTtl(0)))
+        ));
+    }
+
+    #[test]
+    fn entry_with_ttl_above_max_is_rejected() {
+        let too_long = MAX_TTL + 1;
+        let service = Entry::FindService(ServiceEntry {
+            ttl: too_long,
+            ..make_service_entry()
+        });
+        let event_group = Entry::SubscribeEventGroup(EventGroupEntry {
+            ttl: too_long,
+            ..make_event_group_entry()
+        });
+        for entry in [service, event_group] {
+            assert!(matches!(
+                entry.encode(&mut [0u8; 17].as_mut_slice()),
+                Err(crate::protocol::Error::Sd(Error::InvalidTtl(t))) if t == too_long
+            ));
+        }
+    }
+
+    #[test]
+    fn entry_with_invalid_ttl_writes_nothing() {
+        let entry = Entry::SubscribeEventGroup(EventGroupEntry {
+            ttl: MAX_TTL + 1,
+            ..make_event_group_entry()
+        });
+        let mut buf = [0u8; 17];
+        assert!(entry.encode(&mut buf.as_mut_slice()).is_err());
+        assert_eq!(buf, [0u8; 17]);
+    }
+
+    #[test]
+    fn offer_service_with_max_ttl_encodes() {
+        let entry = Entry::OfferService(ServiceEntry {
+            ttl: MAX_TTL,
+            ..make_service_entry()
+        });
+        let buf = encode_entry(&entry);
+        assert_eq!(
+            EntryView(buf[..ENTRY_SIZE].try_into().unwrap()).ttl(),
+            MAX_TTL
+        );
+    }
+
+    #[test]
+    fn entry_view_is_stop_offer_only_for_offer_type_with_zero_ttl() {
+        let stop = encode_entry(&Entry::StopOfferService(make_service_entry()));
+        let offer = encode_entry(&Entry::OfferService(make_service_entry()));
+        let mut stop_subscribe =
+            encode_entry(&Entry::SubscribeEventGroup(make_event_group_entry()));
+        stop_subscribe[9..12].fill(0);
+        let view = |b: &[u8; 17]| EntryView(b[..ENTRY_SIZE].try_into().unwrap()).is_stop_offer();
+        assert!(view(&stop));
+        assert!(!view(&offer));
+        assert!(!view(&stop_subscribe));
     }
 
     #[test]
