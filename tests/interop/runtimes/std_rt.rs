@@ -136,6 +136,19 @@ impl SomeipUnderTest for StdRt {
                 return_code: None,
                 payload: p.raw_bytes().unwrap_or_default().to_vec(),
             },
+            Ok(Err(simple_someip::client::Error::ErrorReply {
+                message_type: MessageType::Response,
+                return_code,
+                ..
+            })) => CallOutcome::Response {
+                return_code: Some(return_code.as_u8()),
+                payload: Vec::new(),
+            },
+            Ok(Err(simple_someip::client::Error::ErrorReply { return_code, .. })) => {
+                CallOutcome::Error {
+                    return_code: return_code.as_u8(),
+                }
+            }
             Ok(Err(e)) => panic!("{}: request 0x{method:04X} failed: {e:?}", Self::NAME),
         }
     }

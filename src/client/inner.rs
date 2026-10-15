@@ -22,7 +22,7 @@ use crate::{
         session::{SessionTracker, SessionVerdict, TransportKind},
         socket_manager::{ReceivedMessage, SocketManager},
     },
-    protocol::{self, Message},
+    protocol::{self, Message, MessageType},
     traits::PayloadWireFormat,
     transport::{ChannelFactory, E2ERegistryHandle, MpscRecv, OneshotSend, UnboundedSend},
 };
@@ -530,8 +530,9 @@ where
     /// silently dropped — the caller awaiting the previous request
     /// sees a clean error instead of a `RecvError` panic. Any reply
     /// that later arrives for a dropped `request_id` is surfaced on
-    /// the update stream via `ClientUpdate::Unicast` instead of
-    /// matching a pending entry.
+    /// the update stream via `ClientUpdate::Unicast`, or
+    /// `ClientUpdate::Error` for an error reply whose payload does not
+    /// decode, instead of matching a pending entry.
     fn track_or_reject_pending_response(
         &mut self,
         request_id: u32,
@@ -1306,14 +1307,29 @@ where
                      match unicast {
                          Ok(received) => {
                              let ReceivedMessage { message: received_message, e2e_status, source } = received;
-                             // Check if this matches a pending request-response by request_id
-                             let request_id = received_message.header().request_id();
-                             if let Some(sender) = pending_responses.remove(&request_id) {
-                                 let _ = sender.send(Ok(received_message.payload().clone()));
+                             let header = received_message.header();
+                             let outcome = match Error::error_reply(header) {
+                                 Some(err) => Some(Err(err)),
+                                 None if header.message_type().message_type() == MessageType::Response => {
+                                     Some(Ok(received_message.payload().clone()))
+                                 }
+                                 None => None,
+                             };
+                             if let Some(outcome) = outcome
+                                 && let Some(sender) = pending_responses.remove(&header.request_id())
+                             {
+                                 let _ = sender.send(outcome);
                                  continue;
                              }
                              // Not a response — forward as ClientUpdate::Unicast
                              let _ = update_sender.send_now(ClientUpdate::Unicast { message: received_message, e2e_status, source });
+                         }
+                         Err(err @ Error::ErrorReply { request_id, .. }) => {
+                             if let Some(sender) = pending_responses.remove(&request_id) {
+                                 let _ = sender.send(Err(err));
+                             } else {
+                                 let _ = update_sender.send_now(ClientUpdate::Error(err));
+                             }
                          }
                          Err(err) => {
                              let _ = update_sender.send_now(ClientUpdate::Error(err));
