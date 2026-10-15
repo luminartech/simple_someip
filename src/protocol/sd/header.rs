@@ -36,48 +36,49 @@ impl<'a> Header<'a> {
 
 /// Zero-copy view into an SD header payload.
 ///
-/// Created by [`SdHeaderView::parse`], which fully validates the SD header,
-/// entries, and options upfront. This makes the entry and option iterators
-/// infallible.
+/// Created by [`SdHeaderView::parse`], which validates the SD header and its
+/// options upfront. This makes the entry and option iterators infallible.
+/// Entries of unknown type are skipped; options of unknown type keep their
+/// place.
 ///
 /// # Validation-proof invariant (candidate "c")
 ///
 /// The type system carries no proof tying the cached `entry_count` /
-/// `option_count` to `entries_buf` / `options_buf`. `parse` runs ONE eager
-/// validating walk (draining the lazy L1 [`DecodeIterator`]s) and caches the
-/// element counts; the infallible accessors ([`entries`](SdHeaderView::entries)
-/// / [`options`](SdHeaderView::options)) then re-slice those *already-validated*
-/// buffers with purpose-built iterators that advance by stride/length WITHOUT
-/// re-running the type/length/transport checks. They TRUST the construction-time
-/// walk. Nothing but this `parse`-only construction path may populate the
-/// buffers, so the trust holds — the same invariant `OptionIter` has always
-/// relied on.
+/// `option_count` to `entries_buf` / `options_buf`. `parse` validates the
+/// options once (draining the lazy L1 [`DecodeIterator`]) and caches both
+/// counts; [`entries`](SdHeaderView::entries) and
+/// [`options`](SdHeaderView::options) then re-slice the buffers without
+/// re-running the option length/transport checks, trusting that walk, and
+/// `entries` reads each type byte only to skip unknown types. Nothing but
+/// `parse` constructs this type, so the trust holds.
 #[derive(Clone, Copy, Debug)]
 pub struct SdHeaderView<'a> {
     flags: Flags,
     entries_buf: &'a [u8],
     options_buf: &'a [u8],
-    /// Number of valid entries found during the construction-time walk.
+    /// Number of entries of known type.
     entry_count: usize,
-    /// Number of valid options found during the construction-time walk.
+    /// Number of options, including those of unknown type.
     option_count: usize,
 }
 
 impl<'a> SdHeaderView<'a> {
-    /// Parse and fully validate an SD header from `buf`.
+    /// Parse and validate an SD header from `buf`.
     ///
     /// Validates:
     /// - Buffer has enough data for flags + `entries_size` + entries + `options_size` + options
     /// - `entries_size` is a multiple of `ENTRY_SIZE` (16)
-    /// - All entry type bytes are valid
-    /// - All options have valid types and lengths, and IP-bearing options have a
-    ///   recognized transport protocol byte
+    /// - Every option of a known type has a valid length, and IP-bearing options
+    ///   have a recognized transport protocol byte
+    ///
+    /// An entry of unknown type is skipped and an option of unknown type keeps
+    /// its place, so the message's other entries still apply and option
+    /// indices still line up.
     ///
     /// # Errors
     ///
     /// Returns an error if the buffer is too short, `entries_size` is not a multiple of 16,
-    /// any entry type byte is invalid, or any option has an invalid type, length, or
-    /// transport protocol byte.
+    /// or an option of a known type has an invalid length or transport protocol byte.
     pub fn parse(buf: &'a [u8]) -> Result<Self, crate::protocol::Error> {
         // The O(1) slicing + length checks (flags/reserved, entries_size,
         // options_size, and the section bounds, incl. overflow hardening) live
@@ -90,19 +91,12 @@ impl<'a> SdHeaderView<'a> {
         // (candidate "c" — see the type-level docs for the trust invariant).
         let (body, _rest) = SdBody::decode(buf)?;
 
-        // Eager validating walk over the entries section. `EntryView`'s L1
-        // decode only slices the fixed 16-byte stride (surfacing truncation);
-        // `entry_type()` validates the type byte. A partial trailing entry is
-        // surfaced here as an `Err`, not silently truncated at accessor time.
-        let mut entry_count = 0usize;
-        for entry in body.entries() {
-            entry?.entry_type()?;
-            entry_count += 1;
-        }
+        let entry_count = EntryIter::new(body.entries_buf).len();
 
         // Eager validating walk over the options section. `OptionView`'s L1
         // decode only slices by the length field (surfacing truncation);
-        // `validate()` checks type / per-type length / transport-protocol byte.
+        // `validate()` checks a known type's length and transport-protocol
+        // byte, and passes an unknown type.
         let mut option_count = 0usize;
         for option in body.options() {
             option?.validate()?;
@@ -126,21 +120,22 @@ impl<'a> SdHeaderView<'a> {
 
     /// Returns an infallible iterator over the SD entries.
     ///
-    /// Re-slices the already-validated `entries_buf` at the fixed 16-byte
-    /// stride; it never re-runs entry-type validation (done once in
-    /// [`parse`](SdHeaderView::parse)).
-    /// The returned [`EntryIter`] is [`ExactSizeIterator`] — its length comes
-    /// for free from the fixed stride.
+    /// Re-slices `entries_buf` at the fixed 16-byte stride, skipping entries
+    /// of unknown type, so [`EntryView::entry_type`] of every yielded entry is
+    /// `Ok`.
+    /// The returned [`EntryIter`] is [`ExactSizeIterator`], its length being
+    /// [`entry_count`](SdHeaderView::entry_count).
     #[must_use]
     pub fn entries(&self) -> EntryIter<'a> {
-        EntryIter::new(self.entries_buf)
+        EntryIter::with_known(self.entries_buf, self.entry_count)
     }
 
     /// Returns an infallible iterator over the SD options.
     ///
     /// Re-slices the already-validated `options_buf` by each option's length
     /// field; it never re-runs option validation (done once in
-    /// [`parse`](SdHeaderView::parse)).
+    /// [`parse`](SdHeaderView::parse)). An option of unknown type is included
+    /// in its place.
     /// Options have no fixed stride, so [`OptionIter`] is not itself
     /// [`ExactSizeIterator`]; use [`option_count`](SdHeaderView::option_count)
     /// for the cached element count.
@@ -149,19 +144,17 @@ impl<'a> SdHeaderView<'a> {
         OptionIter::new(self.options_buf)
     }
 
-    /// Returns the number of entries in this SD header.
-    ///
-    /// This is the count cached by the construction-time validating walk.
+    /// Returns the number of entries of known type in this SD header.
     #[must_use]
     pub fn entry_count(&self) -> usize {
         self.entry_count
     }
 
-    /// Returns the number of options in this SD header.
+    /// Returns the number of options in this SD header, including those of
+    /// unknown type.
     ///
-    /// This is the count cached by the construction-time validating walk.
-    /// Because options have no fixed stride, this cached count is the analogue
-    /// of `EntryIter`'s free `ExactSizeIterator::len` for the options section.
+    /// This is the count cached by the construction-time validating walk, the
+    /// options' analogue of [`entry_count`](SdHeaderView::entry_count).
     #[must_use]
     pub fn option_count(&self) -> usize {
         self.option_count
@@ -175,10 +168,10 @@ impl<'a> SdHeaderView<'a> {
 /// walk the entries validating their type bytes, nor the options validating
 /// their type / length / transport-protocol bytes. That per-element validation
 /// is the job of the lazy [`DecodeIter`] adapters returned by [`SdBody::entries`]
-/// / [`SdBody::options`], or of the L2 validation pass ([`SdHeaderView::parse`]).
+/// / [`SdBody::options`], or of [`SdHeaderView::parse`].
 ///
-/// Contrast with [`SdHeaderView`], which validates everything upfront so its
-/// iterators are infallible.
+/// Contrast with [`SdHeaderView`], which validates its options upfront and
+/// skips entries of unknown type, so its iterators are infallible.
 #[derive(Clone, Copy, Debug)]
 pub struct SdBody<'a> {
     flags: Flags,
@@ -313,7 +306,7 @@ impl Encode for Header<'_> {
     fn encoded_size(&self) -> Result<usize, Self::Error> {
         let mut size = 12 + self.entries.len() * ENTRY_SIZE;
         for option in self.options {
-            size += option.size();
+            size += option.encoded_size()?;
         }
         Ok(size)
     }
@@ -329,7 +322,7 @@ impl Encode for Header<'_> {
         }
         let mut options_size = 0;
         for option in self.options {
-            options_size += option.size();
+            options_size += option.encoded_size()?;
         }
         writer.write_u32_be(u32::try_from(options_size).expect("options size fits u32"))?;
         for option in self.options {
@@ -618,6 +611,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn parse_keeps_an_entry_and_an_option_of_unknown_type() {
+        use crate::protocol::sd::test_support::{
+            UNKNOWN_OPTION_TYPE, endpoint_after_unknown_option, offer_after_unknown_entry,
+            sd_body_with_unknown_entry_and_option,
+        };
+        let body = sd_body_with_unknown_entry_and_option();
+        let view = SdHeaderView::parse(&body).expect("unknown types do not reject the message");
+
+        let entries: heapless::Vec<_, 2> = view.entries().map(|e| e.to_owned().unwrap()).collect();
+        assert_eq!(entries, [offer_after_unknown_entry()]);
+        assert_eq!(view.entry_count(), 1);
+        assert_eq!(view.entries().len(), 1);
+
+        let options: heapless::Vec<_, 2> = view.options().collect();
+        assert!(matches!(
+            options[0].option_type(),
+            Err(SdError::InvalidOptionType(UNKNOWN_OPTION_TYPE))
+        ));
+        assert_eq!(
+            options[1].to_owned().unwrap(),
+            endpoint_after_unknown_option()
+        );
+    }
+
     // --- SdBody (Phase 3 lazy L1 decode) ---
 
     #[test]
@@ -687,11 +705,10 @@ mod tests {
             entry_view.to_owned(),
             Err(SdError::InvalidEntryType(0x03))
         ));
-        // But SdHeaderView::parse (the eager L2 walk) DOES reject it.
-        assert!(matches!(
-            SdHeaderView::parse(&buf),
-            Err(crate::protocol::Error::Sd(SdError::InvalidEntryType(0x03)))
-        ));
+        // SdHeaderView::parse accepts the body and skips the entry.
+        let view = SdHeaderView::parse(&buf).unwrap();
+        assert_eq!(view.entry_count(), 0);
+        assert_eq!(view.entries().count(), 0);
     }
 
     #[test]
