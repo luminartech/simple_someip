@@ -526,15 +526,30 @@ impl<'a> DecodeIter<'a> for EntryView<'a> {
     }
 }
 
-/// Iterator over 16-byte SD entries in a validated buffer.
-/// Entries are guaranteed valid (validated upfront in `SdHeaderView::parse`).
+/// Iterator over the 16-byte SD entries of a known [`EntryType`] in a buffer;
+/// entries of unknown type are skipped.
 pub struct EntryIter<'a> {
     remaining: &'a [u8],
+    known: usize,
 }
 
 impl<'a> EntryIter<'a> {
     pub(crate) fn new(buf: &'a [u8]) -> Self {
-        Self { remaining: buf }
+        let known = buf
+            .as_chunks::<ENTRY_SIZE>()
+            .0
+            .iter()
+            .filter(|entry| EntryView(entry).entry_type().is_ok())
+            .count();
+        Self::with_known(buf, known)
+    }
+
+    /// `known` is the number of entries of known type in `buf`.
+    pub(crate) fn with_known(buf: &'a [u8], known: usize) -> Self {
+        Self {
+            remaining: buf,
+            known,
+        }
     }
 }
 
@@ -542,19 +557,22 @@ impl<'a> Iterator for EntryIter<'a> {
     type Item = EntryView<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining.len() < ENTRY_SIZE {
-            return None;
+        while self.remaining.len() >= ENTRY_SIZE {
+            let entry_bytes: &[u8; ENTRY_SIZE] = self.remaining[..ENTRY_SIZE]
+                .try_into()
+                .expect("length checked above");
+            self.remaining = &self.remaining[ENTRY_SIZE..];
+            let entry = EntryView(entry_bytes);
+            if entry.entry_type().is_ok() {
+                self.known -= 1;
+                return Some(entry);
+            }
         }
-        let entry_bytes: &[u8; ENTRY_SIZE] = self.remaining[..ENTRY_SIZE]
-            .try_into()
-            .expect("length checked above");
-        self.remaining = &self.remaining[ENTRY_SIZE..];
-        Some(EntryView(entry_bytes))
+        None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.remaining.len() / ENTRY_SIZE;
-        (n, Some(n))
+        (self.known, Some(self.known))
     }
 }
 

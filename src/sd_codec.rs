@@ -685,14 +685,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_sd_datagram_structurally_invalid_entry_is_sd_error() {
-        // Length-consistent SD datagram (unlike the truncation case above,
-        // which short-circuits as `Incomplete` before `SdHeaderView::parse`
-        // ever reaches the entry walk): corrupt the first entry's type byte
-        // to an unrecognized value while leaving every length field intact,
-        // so parsing gets past the `Incomplete` checks and hits
-        // `EntryView::entry_type()`'s validation, surfacing
-        // `protocol::Error::Sd(sd::Error::InvalidEntryType(_))`.
+    fn parse_sd_datagram_malformed_known_option_is_sd_error() {
+        let mut buf = [0u8; 128];
+        let len = build_offer_service_datagram(&mut buf, &req(0x0001, 30501), 1).unwrap();
+        // The IPv4 endpoint option is the last 12 bytes; its transport byte is
+        // the third-to-last.
+        buf[len - 3] = 0x84;
+        let err = parse_someip_sd_datagram(&buf[..len]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::protocol::Error::Sd(
+                    crate::protocol::sd::Error::InvalidOptionTransportProtocol(0x84)
+                )
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_sd_datagram_skips_an_entry_of_unknown_type() {
         let request = SubscribeEventgroupRequest {
             service_id: 0x0042,
             instance_id: 1,
@@ -707,21 +719,13 @@ mod tests {
             build_subscribe_eventgroup_datagram(&mut sd_buf, &request, 3, RebootFlag::Continuous)
                 .unwrap();
 
-        // Byte layout: 16-byte SOME/IP header, then flags/reserved(4) +
-        // entries_size(4), then the entries array (options_size + options
-        // follow after the entries). The first entry's type byte is
-        // therefore at offset 24.
-        let entry_type_offset: usize = 16 + 8;
-        sd_buf[entry_type_offset] = 0xFF;
+        // The first entry's type byte follows the 16-byte SOME/IP header and
+        // the SD flags/reserved and entries_size fields.
+        sd_buf[16 + 8] = 0xFF;
 
-        let err = parse_someip_sd_datagram(&sd_buf[..sd_len]).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                crate::protocol::Error::Sd(crate::protocol::sd::Error::InvalidEntryType(0xFF))
-            ),
-            "expected Sd(InvalidEntryType(0xFF)), got {err:?}"
-        );
+        let view =
+            parse_someip_sd_datagram(&sd_buf[..sd_len]).expect("an unknown entry is skipped");
+        assert_eq!(view.entries().count(), 0);
     }
 
     #[test]

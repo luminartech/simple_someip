@@ -348,7 +348,7 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00231 / feat_req_someipsd_1142 — an Offer still applies when it also references a discardable option of unknown type.
     d6_unknown_option_is_skipped_client,
-    std = ignore("an unknown discardable option must be ignored, not reject the SD message (#167)"),
+    std = run,
     bare_metal = ignore("the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"),
     {
         let fp = FramePeer::start();
@@ -371,8 +371,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00231 / feat_req_someipsd_1142 — a Subscribe still gets an Ack when it also references a discardable option of unknown type.
     d6_unknown_option_is_skipped_server,
-    std = ignore("an unknown discardable option must be ignored, not reject the SD message (#167)"),
-    bare_metal = ignore("an unknown discardable option must be ignored, not reject the SD message (#167)"),
+    std = run,
+    bare_metal = run,
     {
         let fp = FramePeer::start();
         let _rt = Rt::start(offer_only());
@@ -386,7 +386,7 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00841 — an Offer still applies when it follows an entry of unknown type.
     d7_unknown_entry_type_is_skipped_client,
-    std = ignore("an SD entry of unknown type must be ignored, not reject the SD message (#167)"),
+    std = run,
     bare_metal = ignore("the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"),
     {
         let fp = FramePeer::start();
@@ -406,8 +406,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00841 — a Subscribe still gets an Ack when it follows an entry of unknown type.
     d7_unknown_entry_type_is_skipped_server,
-    std = ignore("an SD entry of unknown type must be ignored, not reject the SD message (#167)"),
-    bare_metal = ignore("an SD entry of unknown type must be ignored, not reject the SD message (#167)"),
+    std = run,
+    bare_metal = run,
     {
         let fp = FramePeer::start();
         let _rt = Rt::start(offer_only());
