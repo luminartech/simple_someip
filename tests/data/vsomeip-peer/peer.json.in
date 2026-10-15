@@ -1,0 +1,23 @@
+{
+    "unicast": "VSOMEIP_UNICAST_PLACEHOLDER",
+    "netmask": "255.0.0.0",
+    "logging": { "level": "info", "console": "true" },
+    "applications": [ { "name": "peer", "id": "0x1277" } ],
+    "services": [
+        { "service": "0x1234", "instance": "0x0001", "unreliable": "30509" }
+    ],
+    "routing": "peer",
+    "service-discovery": {
+        "enable": "true",
+        "multicast": "239.255.0.255",
+        "port": "30490",
+        "protocol": "udp",
+        "initial_delay_min": "10",
+        "initial_delay_max": "50",
+        "repetitions_base_delay": "100",
+        "repetitions_max": "2",
+        "ttl": "3",
+        "cyclic_offer_delay": "1000",
+        "request_response_delay": "0"
+    }
+}

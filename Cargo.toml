@@ -94,6 +94,9 @@ tracing = { version = "0.1", default-features = false, optional = true }
 critical-section = { version = "1", features = ["std"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing-subscriber = "0.3"
+# Raw socket options (SO_REUSEADDR/SO_REUSEPORT, multicast join) for the
+# interop tests' bare-metal host transport and frame peer.
+socket2 = { version = "0.5", features = ["all"] }
 
 [features]
 default = ["std"]
@@ -169,17 +172,6 @@ embassy_channels = ["bare_metal", "_alloc"]
 
 [[test]]
 name = "client_server"
-required-features = ["client-tokio", "server-tokio"]
-
-[[test]]
-# Without `required-features`, `cargo test` would silently report
-# "0 tests" when client-tokio/server-tokio aren't enabled — the
-# vsomeip-conformance file is unconditionally compiled but every
-# function inside it depends on `Client::new_with_loopback` /
-# `Server::new_with_loopback` (tokio path) and on
-# `tracing-subscriber` / `socket2`. Pinning the required-features
-# makes the test cleanly skipped under the wrong feature set.
-name = "vsomeip_sd_compat"
 required-features = ["client-tokio", "server-tokio"]
 
 [[test]]
