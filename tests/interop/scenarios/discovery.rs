@@ -168,7 +168,7 @@ fn eg_subscribe(idx1: u8, n1: u8) -> [u8; 16] {
 scenario!(
     /// PRS_SOMEIPSD_00842, 00364 / feat_req_someipsd_208 — a StopOffer (type 0x01, TTL 0) from vsomeip removes the service.
     d3_stop_offer_removes_service_vsomeip,
-    std = ignore("a StopOffer (entry type 0x01, TTL 0) must remove the service (#166)"),
+    std = run,
     bare_metal = ignore("the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"),
     {
         let mut peer = VsomeipPeer::start();
@@ -185,7 +185,7 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00842, 00364 / feat_req_someipsd_208 — a StopOffer (type 0x01, TTL 0) from a hand-built frame removes the service.
     d3_stop_offer_removes_service_frame,
-    std = ignore("a StopOffer (entry type 0x01, TTL 0) must remove the service (#166)"),
+    std = run,
     bare_metal = ignore("the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"),
     {
         let fp = FramePeer::start();
@@ -229,7 +229,7 @@ scenario!(
     /// PRS_SOMEIPSD_00842, 00364, 00157, 00255 / feat_req_someipsd_208 — our StopOffer is an Offer entry with TTL 0 that continues the offers' session and reboot flag.
     d4_our_stop_offer_wire_format,
     std = ignore("the std runtime cannot stop offering a service (#173)"),
-    bare_metal = ignore("a StopOffer must be entry type 0x01 with TTL 0 and continue the offers' session ID and reboot flag (#166, #171)"),
+    bare_metal = ignore("a StopOffer must continue the offers' session ID and reboot flag (#171)"),
     {
         let fp = FramePeer::start();
         let mut rt = Rt::start(offer_only());

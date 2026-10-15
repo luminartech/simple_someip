@@ -220,6 +220,7 @@ impl DiscoveryState {
                     );
                 }
             }
+            _ => {}
         }
     }
 

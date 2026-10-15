@@ -16,7 +16,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use crate::bare_metal_tasks::{SomeipRun, publish_notification, run_someip};
 use crate::e2e::{E2ERegistry, Profile5Config};
 use crate::protocol::MessageId;
-use crate::protocol::sd::RebootFlag;
+use crate::protocol::sd::{self, RebootFlag};
 use crate::sd_codec::{
     OfferServiceRequest, SubscribeEventgroupRequest, build_multi_stop_offer_service_datagram,
     next_sd_session,
@@ -104,6 +104,8 @@ pub struct OfferEntry {
     pub event_group_id: u16,
     pub unicast_port: u16,
     pub major_version: u8,
+    /// Offer TTL in seconds. 0 sends 3 seconds, and a value above
+    /// [`MAX_TTL`](crate::protocol::sd::MAX_TTL) is capped to it.
     pub ttl_seconds: u32,
 }
 
@@ -292,13 +294,19 @@ fn find_offer(
 }
 
 /// Node SD TTL in seconds (from the catalog; one node-wide value surfaced
-/// per offer). Drives the offer + subscribe cadence. Falls back to 3 s.
+/// per offer). Drives the offer + subscribe cadence.
 fn node_sd_ttl_secs() -> u64 {
-    offers()
-        .first()
-        .map(|o| u64::from(o.ttl_seconds))
-        .filter(|&t| t != 0)
-        .unwrap_or(3)
+    u64::from(offer_ttl(offers().first().map_or(0, |o| o.ttl_seconds)))
+}
+
+/// The TTL an offer is sent with: `ttl_seconds`, with 0 meaning 3 seconds and
+/// anything above [`sd::MAX_TTL`] capped to it.
+fn offer_ttl(ttl_seconds: u32) -> u32 {
+    if ttl_seconds == 0 {
+        3
+    } else {
+        ttl_seconds.min(sd::MAX_TTL)
+    }
 }
 
 fn platform() -> Platform<'static, RX_SLOTS, RX_CAP> {
@@ -356,7 +364,7 @@ fn offer_requests(out: &mut [OfferServiceRequest; MAX_OFFERS]) -> usize {
             instance_id: src.instance_id,
             major_version: src.major_version,
             minor_version: 0,
-            ttl: src.ttl_seconds,
+            ttl: offer_ttl(src.ttl_seconds),
             local_ip: iface,
             unicast_port: src.unicast_port,
         };
@@ -405,7 +413,9 @@ fn build_server() -> bool {
         .with_interface(iface)
         .with_local_port(primary.unicast_port)
         .with_major_version(primary.major_version)
-        .with_ttl(Duration::from_secs(u64::from(primary.ttl_seconds)))
+        .with_ttl(Duration::from_secs(u64::from(offer_ttl(
+            primary.ttl_seconds,
+        ))))
         .with_event_group(primary.event_group_id)
         // The runtime drives a combined multi-offer OfferService announce
         // (all catalog offers in one SD datagram) from its own future, so
@@ -498,7 +508,7 @@ async fn someip_task() {
         instance_id: s.instance_id,
         major_version: s.major_version,
         event_group_id: s.event_group_id,
-        ttl: 0x00FF_FFFF,
+        ttl: sd::MAX_TTL,
         local_ip: Ipv4Addr::from(IFACE.load(Ordering::Acquire).to_be_bytes()),
         local_rx_port: s.local_rx_port,
     });

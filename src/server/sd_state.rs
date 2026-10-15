@@ -235,7 +235,7 @@ impl SdStateManager {
         }
         let sd_data_len = sd_payload
             .encode_to_slice(&mut buf[16..])
-            .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
+            .map_err(super::sd_encode_error)?;
         let total_len = 16 + sd_data_len;
         // The `< 16` guard plus `encode_to_slice`'s own over-capacity
         // error already cover the fit; this stays as a debug-only
@@ -442,7 +442,7 @@ mod tests {
     // the encoding lines.
     //
     // The `#[ignore]`d multicast tests further down test the SAME
-    // properties (session-id advancement, wrap, TTL=0 round-trip)
+    // properties (session-id advancement, wrap)
     // through a real kernel-loopback multicast socket. Those tests
     // remain because they additionally exercise the
     // `socket.send_to(multicast_addr, ...)` kernel path, which the
@@ -688,22 +688,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_offer_service_through_mock_preserves_zero_ttl() {
+    async fn send_offer_service_rejects_zero_ttl_without_sending() {
         let mut config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
             .with_interface(Ipv4Addr::LOCALHOST)
             .with_local_port(TEST_ADVERTISED_PORT);
         config.ttl = 0;
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = CapturingSocket::new();
-        sd_state
+        let result = sd_state
             .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
-            .await
-            .unwrap();
+            .await;
 
-        let sent = sock.drain_sent();
-        let view = MessageView::parse(&sent[0].1).unwrap();
-        let entry = view.sd_header().unwrap().entries().next().unwrap();
-        assert_eq!(entry.ttl(), 0, "TTL=0 must round-trip end-to-end");
+        assert!(
+            matches!(
+                result,
+                Err(Error::Protocol(crate::protocol::Error::Sd(
+                    sd::Error::InvalidTtl(0)
+                )))
+            ),
+            "got {result:?}"
+        );
+        assert!(sock.drain_sent().is_empty());
     }
 
     #[tokio::test]
@@ -1016,32 +1021,5 @@ mod tests {
             RebootFlag::Continuous,
             "post-wrap emit must advertise Continuous",
         );
-    }
-
-    #[ignore = "requires MULTICAST on loopback; skipped on hosts whose `lo` \
-                lacks the MULTICAST flag. Runs in any environment where \
-                loopback multicast is available."]
-    #[tokio::test]
-    async fn send_offer_service_preserves_zero_ttl() {
-        // TTL=0 is a legitimate SOME/IP-SD value meaning "stop offering";
-        // `send_offer_service` must preserve it end-to-end rather than,
-        // say, defaulting it back to the ServerConfig::new value of 3.
-        let mut config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(TEST_ADVERTISED_PORT);
-        config.ttl = 0;
-        let (rx, tx) = mcast_rx_tx().await;
-
-        let sd_state = SdStateManager::with_initial(0x1233);
-        sd_state
-            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx)
-            .await
-            .unwrap();
-
-        let offer = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
-        assert_offer_matches(&offer, &config, 0x0000_1234, RebootFlag::RecentlyRebooted);
-        // Belt-and-suspenders: assert_offer_matches already checks this,
-        // but the purpose of this test is specifically the zero case.
-        assert_eq!(offer.entry_ttl, 0);
     }
 }

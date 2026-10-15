@@ -236,7 +236,7 @@ fn sd_header_offer_service_with_ipv4_endpoint_golden_bytes() {
 
 #[test]
 fn sd_header_stop_offer_service_with_load_balancing_golden_bytes() {
-    // StopOfferService entry (TTL forced to 0 by convention) referencing
+    // StopOfferService entry (an OfferService entry with TTL 0) referencing
     // one LoadBalancing option.
     let entry = Entry::StopOfferService(ServiceEntry {
         index_first_options_run: 0,
@@ -265,7 +265,7 @@ fn sd_header_stop_offer_service_with_load_balancing_golden_bytes() {
         0x40, 0x00, 0x00, 0x00, // flags: unicast only (Continuous reboot)
         0x00, 0x00, 0x00, 0x10, // entries_size = 16
         // --- StopOfferService entry (16 bytes) ---
-        0x02,                   // entry type: StopOfferService
+        0x01,                   // entry type: OfferService
         0x00, 0x00,             // index_first/second_options_run
         0x10,                   // options_count: first=1, second=0
         0xAB, 0xCD,             // service_id

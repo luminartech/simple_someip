@@ -72,7 +72,7 @@ where
     }
     let sd_data_len = sd_payload
         .encode_to_slice(&mut buf[16..])
-        .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
+        .map_err(super::sd_encode_error)?;
     let total_len = 16 + sd_data_len;
     // The `< 16` guard plus `encode_to_slice`'s own over-capacity error
     // already cover the fit; this stays as a debug-only sanity check
@@ -135,7 +135,7 @@ where
     }
     let sd_data_len = sd_payload
         .encode_to_slice(&mut buf[16..])
-        .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
+        .map_err(super::sd_encode_error)?;
     let total_len = 16 + sd_data_len;
     // The `< 16` guard plus `encode_to_slice`'s own over-capacity error
     // already cover the fit; this stays as a debug-only sanity check
@@ -201,7 +201,7 @@ where
     }
     let sd_data_len = sd_payload
         .encode_to_slice(&mut buf[16..])
-        .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
+        .map_err(super::sd_encode_error)?;
     let total_len = 16 + sd_data_len;
     // The `< 16` guard plus `encode_to_slice`'s own over-capacity error
     // already cover the fit; this stays as a debug-only sanity check
