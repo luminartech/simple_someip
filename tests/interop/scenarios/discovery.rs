@@ -35,6 +35,7 @@ scenario!(
             offer: None,
             consume: Some(Consume {
                 subscribe: false,
+                e2e: None,
             }),
         });
         peer.send("offer 1234 0001 1 0001 8001 8002 0001");
@@ -80,7 +81,10 @@ const UNKNOWN_ENTRY: u8 = 0x42;
 fn consume_only() -> Setup {
     Setup {
         offer: None,
-        consume: Some(Consume { subscribe: false }),
+        consume: Some(Consume {
+            subscribe: false,
+            e2e: None,
+        }),
     }
 }
 
