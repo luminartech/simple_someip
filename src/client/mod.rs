@@ -162,11 +162,15 @@ impl<P: Send + 'static, C: ChannelFactory> PendingResponse<P, C> {
     ///
     /// # Errors
     ///
-    /// Returns the same errors as the request itself (e.g. deserialization
-    /// failure). Returns [`Error::Capacity`] with tag `"pending_responses"`
+    /// Returns [`Error::ErrorReply`] if the reply is an ERROR message or
+    /// carries a return code other than
+    /// [`ReturnCode::Ok`](crate::protocol::ReturnCode::Ok).
+    /// Returns [`Error::Capacity`] with tag `"pending_responses"`
     /// if the inner loop's response-tracking map was full when the request
     /// was sent — the UDP send still went out, but the reply (if any)
     /// arrives on [`ClientUpdates`] rather than this oneshot.
+    /// A RESPONSE whose payload does not decode arrives on [`ClientUpdates`]
+    /// as an error and does not resolve this handle.
     /// Returns [`Error::Shutdown`] only if the client's run-loop future
     /// exits before the response is delivered — the caller's
     /// `PendingResponse` handle outlived its driver. Reserving `Shutdown`
@@ -1160,7 +1164,8 @@ where
     /// `Err(Error::Capacity(CapacityKind::PendingResponses))`. Any reply that later
     /// arrives for that `request_id` is delivered as
     /// [`ClientUpdate::Unicast`] on the update stream instead of through the
-    /// `PendingResponse`. Treat this error as "reply lost to saturation",
+    /// `PendingResponse`, or as [`ClientUpdate::Error`] carrying
+    /// [`Error::ErrorReply`] for an error reply whose payload does not decode. Treat this error as "reply lost to saturation",
     /// not "send failed". A `warn!`-level log accompanies the drop.
     ///
     /// # Errors
@@ -1198,7 +1203,11 @@ where
     /// # Errors
     ///
     /// Returns an error if the service is not found, unicast binding fails,
-    /// the UDP send fails, or the response payload fails to deserialize.
+    /// or the UDP send fails. A RESPONSE whose payload does not decode arrives
+    /// on [`ClientUpdates`] as an error and does not resolve the request.
+    /// Returns [`Error::ErrorReply`] if the reply is an ERROR message or
+    /// carries a return code other than
+    /// [`ReturnCode::Ok`](crate::protocol::ReturnCode::Ok).
     /// Returns [`Error::UnsupportedEndpoint`] if the key's endpoint is
     /// not an IPv4/UDP socket.
     /// Returns [`Error::Capacity`] with tag `"pending_responses"` if the
@@ -1616,6 +1625,54 @@ mod tests {
         assert!(
             matches!(result, Err(Error::ServiceNotFound)),
             "expected ServiceNotFound, got {result:?}"
+        );
+        client.shut_down();
+    }
+
+    #[tokio::test]
+    async fn request_resolves_an_error_reply_its_payload_type_cannot_decode() {
+        let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let key = ServiceEndpointKey::udp(0x005B, peer.local_addr().unwrap());
+        let replier = tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            let (_, from) = peer.recv_from(&mut buf).await.unwrap();
+            let (request, _) = crate::protocol::HeaderView::parse(&buf).unwrap();
+            let reply = crate::protocol::Header::new(
+                crate::protocol::MessageId::new_from_service_and_method(0x005B, 0x0001),
+                request.request_id(),
+                1,
+                1,
+                crate::protocol::MessageTypeField::new(crate::protocol::MessageType::Error, false),
+                crate::protocol::ReturnCode::NotOk,
+                0,
+            );
+            let mut bytes = [0u8; 16];
+            reply.encode_to_slice(&mut bytes).unwrap();
+            peer.send_to(&bytes, from).await.unwrap();
+        });
+
+        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let _run_handle = tokio::spawn(run_fut);
+        client.add_endpoint(key, 1, 0).await.unwrap();
+        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client.request(key, msg))
+                .await
+                .expect("an ERROR reply resolves the request");
+        replier.await.unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(Error::ErrorReply {
+                    message_type: crate::protocol::MessageType::Error,
+                    return_code: crate::protocol::ReturnCode::NotOk,
+                    ..
+                })
+            ),
+            "got {result:?}"
         );
         client.shut_down();
     }

@@ -924,6 +924,7 @@ where
                     }
                     let source_address = SocketAddr::V4(source);
                     let parse_result = MessageView::parse(&buf[..bytes_received])
+                        .map_err(Error::from)
                         .and_then(|view| {
                             let header = view.header().to_owned();
                             let upper_header = header.upper_header_bytes();
@@ -943,17 +944,20 @@ where
                                 None => (None, payload_bytes),
                             };
 
-                            let payload = MessageDefinitions::from_payload_bytes(
+                            match MessageDefinitions::from_payload_bytes(
                                 header.message_id(),
                                 effective_payload,
-                            )?;
-                            Ok(ReceivedMessage {
-                                message: Message::new(header, payload),
-                                source: source_address,
-                                e2e_status,
-                            })
-                        })
-                        .map_err(Error::from);
+                            ) {
+                                Ok(payload) => Ok(ReceivedMessage {
+                                    message: Message::new(header, payload),
+                                    source: source_address,
+                                    e2e_status,
+                                }),
+                                Err(e) => {
+                                    Err(Error::error_reply(&header).unwrap_or_else(|| e.into()))
+                                }
+                            }
+                        });
                     // Hand off to a later iteration's select rather than
                     // awaiting here; see `deliver` above.
                     deliver.set(rx_tx.send(parse_result).fuse());
