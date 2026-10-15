@@ -229,7 +229,7 @@ impl PayloadWireFormat for HeaplessPayload {
         header.flags = sd::Flags::new(bool::from(reboot), header.flags.unicast());
     }
 
-    fn for_each_offered_endpoint<F>(&self, mut f: F)
+    fn for_each_offered_endpoint<F>(&self, f: F)
     where
         F: FnMut(crate::OfferedEndpoint),
     {
@@ -237,23 +237,7 @@ impl PayloadWireFormat for HeaplessPayload {
             HeaplessPayloadKind::Sd(header) => header,
             HeaplessPayloadKind::Raw(_) => return,
         };
-        for entry in &header.entries {
-            if let sd::Entry::OfferService(svc) | sd::Entry::StopOfferService(svc) = entry {
-                let is_offer = matches!(entry, sd::Entry::OfferService(_));
-                let endpoint =
-                    sd::extract_ipv4_endpoint(&header.options).map(|(addr, protocol)| {
-                        crate::NetEndpoint::new(core::net::SocketAddr::V4(addr), protocol)
-                    });
-                f(crate::OfferedEndpoint {
-                    service_id: svc.service_id,
-                    instance_id: svc.instance_id,
-                    major_version: svc.major_version,
-                    minor_version: svc.minor_version,
-                    endpoint,
-                    is_offer,
-                });
-            }
-        }
+        crate::traits::for_each_offered_endpoint(&header.entries, &header.options, f);
     }
 
     fn for_each_service_instance<F>(&self, mut f: F)

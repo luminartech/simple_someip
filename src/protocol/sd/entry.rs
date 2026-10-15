@@ -196,6 +196,43 @@ pub struct ServiceEntry {
 }
 
 impl ServiceEntry {
+    /// The address of the first
+    /// [`Options::IpV4Endpoint`](super::Options::IpV4Endpoint) over `protocol`
+    /// among the options this entry references in `options`, the message's
+    /// option array.
+    ///
+    /// The first options run is searched before the second; indices past the
+    /// end of `options` reference nothing.
+    #[must_use]
+    pub fn ipv4_endpoint(
+        &self,
+        options: &[super::Options],
+        protocol: super::TransportProtocol,
+    ) -> Option<core::net::SocketAddrV4> {
+        let run = |index: u8, count: u8| {
+            options
+                .iter()
+                .skip(usize::from(index))
+                .take(usize::from(count))
+        };
+        run(
+            self.index_first_options_run,
+            self.options_count.first_options_count,
+        )
+        .chain(run(
+            self.index_second_options_run,
+            self.options_count.second_options_count,
+        ))
+        .find_map(|option| match option {
+            super::Options::IpV4Endpoint {
+                ip,
+                protocol: p,
+                port,
+            } if *p == protocol => Some(core::net::SocketAddrV4::new(*ip, *port)),
+            _ => None,
+        })
+    }
+
     /// Creates a `FindService` entry with wildcard instance/version fields.
     #[must_use]
     pub const fn find(service_id: u16) -> Self {
@@ -639,6 +676,78 @@ mod tests {
             counter: 0x0003,
             event_group_id: 0x0010,
         }
+    }
+
+    // --- ServiceEntry::ipv4_endpoint ---
+
+    fn endpoint_over(
+        protocol: super::super::TransportProtocol,
+        port: u16,
+    ) -> super::super::Options {
+        super::super::Options::IpV4Endpoint {
+            ip: core::net::Ipv4Addr::new(192, 0, 2, 1),
+            protocol,
+            port,
+        }
+    }
+
+    fn endpoint(port: u16) -> super::super::Options {
+        endpoint_over(super::super::TransportProtocol::Udp, port)
+    }
+
+    fn entry_with_runs(first: (u8, u8), second: (u8, u8)) -> ServiceEntry {
+        ServiceEntry {
+            index_first_options_run: first.0,
+            index_second_options_run: second.0,
+            options_count: OptionsCount::new(first.1, second.1),
+            ..make_service_entry()
+        }
+    }
+
+    #[test]
+    fn ipv4_endpoint_comes_from_the_options_the_entry_references() {
+        let options = [endpoint(30509), endpoint(30600)];
+        let at = |e: ServiceEntry| {
+            e.ipv4_endpoint(&options, super::super::TransportProtocol::Udp)
+                .map(|a| a.port())
+        };
+        assert_eq!(at(entry_with_runs((1, 1), (0, 0))), Some(30600));
+        assert_eq!(at(entry_with_runs((0, 1), (0, 0))), Some(30509));
+        assert_eq!(at(entry_with_runs((0, 0), (1, 1))), Some(30600));
+        assert_eq!(at(entry_with_runs((0, 0), (0, 0))), None);
+    }
+
+    #[test]
+    fn ipv4_endpoint_skips_other_options_and_out_of_range_indices() {
+        let options = [
+            super::super::Options::LoadBalancing {
+                priority: 1,
+                weight: 1,
+            },
+            endpoint(30600),
+        ];
+        let at = |e: ServiceEntry| {
+            e.ipv4_endpoint(&options, super::super::TransportProtocol::Udp)
+                .map(|a| a.port())
+        };
+        assert_eq!(at(entry_with_runs((0, 1), (1, 1))), Some(30600));
+        assert_eq!(at(entry_with_runs((2, 1), (0, 0))), None);
+        assert_eq!(at(entry_with_runs((1, 3), (0, 0))), Some(30600));
+    }
+
+    #[test]
+    fn ipv4_endpoint_matches_the_requested_protocol() {
+        use super::super::TransportProtocol::{Tcp, Udp};
+        let options = [endpoint_over(Tcp, 30501), endpoint_over(Udp, 30502)];
+        let entry = entry_with_runs((0, 2), (0, 0));
+        assert_eq!(
+            entry.ipv4_endpoint(&options, Udp).map(|a| a.port()),
+            Some(30502)
+        );
+        assert_eq!(
+            entry.ipv4_endpoint(&options, Tcp).map(|a| a.port()),
+            Some(30501)
+        );
     }
 
     // --- EntryType ---

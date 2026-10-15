@@ -294,7 +294,7 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00268 (index of the first options run) — each Offer in one message uses the endpoint it references.
     d5_each_offer_uses_its_own_endpoint,
-    std = ignore("each Offer must use the endpoint option it references (#168)"),
+    std = run,
     bare_metal = ignore("the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"),
     {
         let fp = FramePeer::start();

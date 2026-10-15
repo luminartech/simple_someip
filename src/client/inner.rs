@@ -654,10 +654,22 @@ where
             // instance id is data, stored in the value for use by
             // SubscribeEventgroup entries.
             let Some(endpoint) = ep.endpoint else {
-                debug!(
-                    "SD entry for 0x{:04X}.0x{:04X} carried no endpoint option; cannot identify the provider socket, skipping",
-                    ep.service_id, ep.instance_id,
-                );
+                if ep.is_offer {
+                    debug!(
+                        "Offer for 0x{:04X}.0x{:04X} carried no endpoint option; cannot identify the provider socket, skipping",
+                        ep.service_id, ep.instance_id,
+                    );
+                } else {
+                    let removed = service_registry.remove_instance_at(
+                        ep.service_id,
+                        ep.instance_id,
+                        source.ip(),
+                    );
+                    trace!(
+                        "Registry: removed {} endpoint(s) of 0x{:04X}.0x{:04X} at {}",
+                        removed, ep.service_id, ep.instance_id, source.ip(),
+                    );
+                }
                 return;
             };
             let key = ServiceEndpointKey {
@@ -2753,6 +2765,85 @@ mod tests {
             reboot_flag_after, reboot_flag_before,
             "reboot_flag should be preserved across rebind"
         );
+    }
+
+    #[test]
+    fn stop_offer_without_endpoint_removes_the_senders_instance() {
+        use crate::Encode;
+        use crate::RawPayload;
+        use crate::protocol::sd::{self, Entry, Options, OptionsCount, ServiceEntry};
+        use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+        type RawInner = Inner<
+            RawPayload,
+            TokioTimer,
+            Arc<Mutex<E2ERegistry>>,
+            TokioChannels,
+            crate::client::bind_dispatch::SpawnerDispatch<
+                TokioTransport,
+                TokioSpawner,
+                TokioBufferProvider,
+            >,
+        >;
+
+        const DEVICE_A: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 10);
+        const DEVICE_B: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 11);
+
+        fn header(device: Ipv4Addr, is_offer: bool) -> crate::VecSdHeader {
+            let entry = ServiceEntry {
+                index_first_options_run: 0,
+                index_second_options_run: 0,
+                options_count: OptionsCount::new(u8::from(is_offer), 0),
+                service_id: 0x1234,
+                instance_id: 1,
+                major_version: 1,
+                ttl: 3,
+                minor_version: 0,
+            };
+            crate::VecSdHeader {
+                flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+                entries: std::vec![if is_offer {
+                    Entry::OfferService(entry)
+                } else {
+                    Entry::StopOfferService(entry)
+                }],
+                options: std::vec![Options::IpV4Endpoint {
+                    ip: device,
+                    protocol: sd::TransportProtocol::Udp,
+                    port: 30_509,
+                }],
+            }
+        }
+
+        let mut session_tracker = SessionTracker::default();
+        let mut service_registry = ServiceRegistry::default();
+        let e2e_registry: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+        let (update_sender, _update_receiver) =
+            TokioChannels::unbounded::<ClientUpdate<RawPayload>>();
+        let mut deliver = |request_id: u32, device: Ipv4Addr, is_offer: bool| {
+            let sd_header = header(device, is_offer);
+            let someip_header =
+                protocol::Header::new_sd(request_id, sd_header.encoded_size().unwrap());
+            RawInner::handle_discovery_datagram(
+                SocketAddr::new(device.into(), sd::MULTICAST_PORT),
+                TransportKind::Multicast,
+                someip_header,
+                sd_header,
+                &mut session_tracker,
+                &mut service_registry,
+                &e2e_registry,
+                &update_sender,
+            );
+        };
+        deliver(1, DEVICE_A, true);
+        deliver(1, DEVICE_B, true);
+        deliver(2, DEVICE_A, false);
+
+        let key = |device| {
+            ServiceEndpointKey::udp(0x1234, SocketAddr::V4(SocketAddrV4::new(device, 30_509)))
+        };
+        assert!(service_registry.get(key(DEVICE_A)).is_none());
+        assert!(service_registry.get(key(DEVICE_B)).is_some());
     }
 
     /// Regression for ad515c3 (source-keyed registry): drives
