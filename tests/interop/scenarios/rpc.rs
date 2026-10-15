@@ -375,7 +375,7 @@ scenario!(
 scenario!(
     /// PRS_SOMEIP_00922, 00191 / feat_req_someip_338, 371 — the return code of the peer's ERROR reaches our caller.
     r2_error_return_code_reaches_caller,
-    std = ignore("an ERROR reply's return code must reach the caller (#183)"),
+    std = run,
     bare_metal = ignore("the bare-metal runtime has no client-side method calls (#187)"),
     {
         let mut peer = VsomeipPeer::start();
