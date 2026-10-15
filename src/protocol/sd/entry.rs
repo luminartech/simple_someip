@@ -4,15 +4,16 @@ use automotive_wire_codec::{Decode, DecodeIter, Encode, take};
 
 pub const ENTRY_SIZE: usize = 16;
 
-/// The type of an SD entry.
+/// The type byte of an SD entry.
+///
+/// A stop offer shares [`EntryType::OfferService`] and differs only by a TTL of
+/// 0; [`Entry`] carries that distinction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryType {
     /// Find a service (0x00).
     FindService,
-    /// Offer a service (0x01).
+    /// Offer a service, or stop offering one when the TTL is 0 (0x01).
     OfferService,
-    /// Stop offering a service (0x02).
-    StopOfferService,
     /// Subscribe to an event group (0x06).
     Subscribe,
     /// Acknowledge an event group subscription (0x07).
@@ -25,7 +26,6 @@ impl TryFrom<u8> for EntryType {
         match value {
             0x00 => Ok(EntryType::FindService),
             0x01 => Ok(EntryType::OfferService),
-            0x02 => Ok(EntryType::StopOfferService),
             0x06 => Ok(EntryType::Subscribe),
             0x07 => Ok(EntryType::SubscribeAck),
             _ => Err(Error::InvalidEntryType(value)),
@@ -38,7 +38,6 @@ impl From<EntryType> for u8 {
         match service_entry_type {
             EntryType::FindService => 0x00,
             EntryType::OfferService => 0x01,
-            EntryType::StopOfferService => 0x02,
             EntryType::Subscribe => 0x06,
             EntryType::SubscribeAck => 0x07,
         }
@@ -218,9 +217,12 @@ impl Encode for ServiceEntry {
 pub enum Entry {
     /// Find a service.
     FindService(ServiceEntry),
-    /// Offer a service.
+    /// Offer a service. On the wire, an offer with a TTL of 0 is a
+    /// [`Entry::StopOfferService`] and decodes as one.
     OfferService(ServiceEntry),
-    /// Stop offering a service.
+    /// Stop offering a service: an [`EntryType::OfferService`] entry with a
+    /// TTL of 0. It encodes with a TTL of 0 whatever [`ServiceEntry::ttl`]
+    /// holds.
     StopOfferService(ServiceEntry),
     /// Subscribe to an event group.
     SubscribeEventGroup(EventGroupEntry),
@@ -287,8 +289,12 @@ impl Encode for Entry {
                 service_entry.encode(writer)?
             }
             Entry::StopOfferService(service_entry) => {
-                writer.write_u8(u8::from(EntryType::StopOfferService))?;
-                service_entry.encode(writer)?
+                writer.write_u8(u8::from(EntryType::OfferService))?;
+                ServiceEntry {
+                    ttl: 0,
+                    ..*service_entry
+                }
+                .encode(writer)?
             }
             Entry::SubscribeEventGroup(event_group_entry) => {
                 writer.write_u8(u8::from(EntryType::Subscribe))?;
@@ -392,7 +398,9 @@ impl EntryView<'_> {
         u16::from_be_bytes([self.0[14], self.0[15]])
     }
 
-    /// Converts this view into an owned [`Entry`].
+    /// Converts this view into an owned [`Entry`]; an
+    /// [`EntryType::OfferService`] entry with a TTL of 0 becomes an
+    /// [`Entry::StopOfferService`].
     ///
     /// # Errors
     ///
@@ -401,8 +409,10 @@ impl EntryView<'_> {
         let entry_type = self.entry_type()?;
         match entry_type {
             EntryType::FindService => Ok(Entry::FindService(self.to_service_entry())),
+            EntryType::OfferService if self.ttl() == 0 => {
+                Ok(Entry::StopOfferService(self.to_service_entry()))
+            }
             EntryType::OfferService => Ok(Entry::OfferService(self.to_service_entry())),
-            EntryType::StopOfferService => Ok(Entry::StopOfferService(self.to_service_entry())),
             EntryType::Subscribe => Ok(Entry::SubscribeEventGroup(self.to_event_group_entry())),
             EntryType::SubscribeAck => {
                 Ok(Entry::SubscribeAckEventGroup(self.to_event_group_entry()))
@@ -565,10 +575,6 @@ mod tests {
     fn entry_type_try_from_all_valid_values() {
         assert_eq!(EntryType::try_from(0x00).unwrap(), EntryType::FindService);
         assert_eq!(EntryType::try_from(0x01).unwrap(), EntryType::OfferService);
-        assert_eq!(
-            EntryType::try_from(0x02).unwrap(),
-            EntryType::StopOfferService
-        );
         assert_eq!(EntryType::try_from(0x06).unwrap(), EntryType::Subscribe);
         assert_eq!(EntryType::try_from(0x07).unwrap(), EntryType::SubscribeAck);
     }
@@ -582,10 +588,17 @@ mod tests {
     }
 
     #[test]
+    fn entry_type_0x02_is_unassigned() {
+        assert!(matches!(
+            EntryType::try_from(0x02),
+            Err(Error::InvalidEntryType(0x02))
+        ));
+    }
+
+    #[test]
     fn entry_type_into_u8_all_variants() {
         assert_eq!(u8::from(EntryType::FindService), 0x00);
         assert_eq!(u8::from(EntryType::OfferService), 0x01);
-        assert_eq!(u8::from(EntryType::StopOfferService), 0x02);
         assert_eq!(u8::from(EntryType::Subscribe), 0x06);
         assert_eq!(u8::from(EntryType::SubscribeAck), 0x07);
     }
@@ -702,11 +715,53 @@ mod tests {
 
     #[test]
     fn stop_offer_service_entry_round_trips() {
-        let entry = Entry::StopOfferService(make_service_entry());
+        let entry = Entry::StopOfferService(ServiceEntry {
+            ttl: 0,
+            ..make_service_entry()
+        });
         let buf = encode_entry(&entry);
         let entry_bytes: &[u8; ENTRY_SIZE] = buf[..ENTRY_SIZE].try_into().unwrap();
         let view = EntryView(entry_bytes);
         assert_eq!(view.to_owned().unwrap(), entry);
+    }
+
+    #[test]
+    fn stop_offer_service_encodes_as_offer_type_with_zero_ttl() {
+        // `make_service_entry` carries a non-zero TTL; the encoder ignores it.
+        let buf = encode_entry(&Entry::StopOfferService(make_service_entry()));
+        let view = EntryView(buf[..ENTRY_SIZE].try_into().unwrap());
+        assert_eq!(buf[0], 0x01);
+        assert_eq!(view.ttl(), 0);
+        assert_eq!(
+            view.to_owned().unwrap(),
+            Entry::StopOfferService(ServiceEntry {
+                ttl: 0,
+                ..make_service_entry()
+            })
+        );
+    }
+
+    #[test]
+    fn offer_type_with_zero_ttl_decodes_as_stop_offer() {
+        let mut buf = encode_entry(&Entry::OfferService(make_service_entry()));
+        buf[9..12].fill(0);
+        let view = EntryView(buf[..ENTRY_SIZE].try_into().unwrap());
+        assert_eq!(view.entry_type().unwrap(), EntryType::OfferService);
+        assert!(matches!(
+            view.to_owned().unwrap(),
+            Entry::StopOfferService(ServiceEntry { ttl: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn entry_view_type_0x02_returns_error() {
+        let mut buf = encode_entry(&Entry::OfferService(make_service_entry()));
+        buf[0] = 0x02;
+        let view = EntryView(buf[..ENTRY_SIZE].try_into().unwrap());
+        assert!(matches!(
+            view.to_owned(),
+            Err(Error::InvalidEntryType(0x02))
+        ));
     }
 
     #[test]
