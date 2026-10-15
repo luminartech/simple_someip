@@ -37,8 +37,8 @@ name: Bare-metal & Platform CI
 on:
   push:
     branches: [main]
+  # Every pull request, including one stacked on another pull request's branch.
   pull_request:
-    branches: [main]
   merge_group:
 
 # Every public feature EXCEPT `bare-metal-runtime`. That feature is no-alloc
