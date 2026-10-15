@@ -354,22 +354,6 @@ fn write_ipv6_option<T: embedded_io::Write>(
     Ok(IPV6_OPTION_WIRE_SIZE)
 }
 
-/// Extract the first `IpV4Endpoint` (socket address + transport
-/// protocol) from a slice of owned options.
-///
-/// Returns `None` if no `IpV4Endpoint` option is present.
-#[must_use]
-pub fn extract_ipv4_endpoint(
-    options: &[Options],
-) -> Option<(core::net::SocketAddrV4, TransportProtocol)> {
-    options.iter().find_map(|opt| match opt {
-        Options::IpV4Endpoint { ip, protocol, port } => {
-            Some((core::net::SocketAddrV4::new(*ip, *port), *protocol))
-        }
-        _ => None,
-    })
-}
-
 // --- Zero-copy view types ---
 
 /// Zero-copy view into a variable-length SD option in a buffer.

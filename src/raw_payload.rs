@@ -182,7 +182,7 @@ impl PayloadWireFormat for RawPayload {
         header.flags = sd::Flags::new(bool::from(reboot), header.flags.unicast());
     }
 
-    fn for_each_offered_endpoint<F>(&self, mut f: F)
+    fn for_each_offered_endpoint<F>(&self, f: F)
     where
         F: FnMut(crate::OfferedEndpoint),
     {
@@ -190,23 +190,7 @@ impl PayloadWireFormat for RawPayload {
             RawPayloadKind::Sd(header) => header,
             RawPayloadKind::Raw(_) => return,
         };
-        for entry in &header.entries {
-            if let sd::Entry::OfferService(svc) | sd::Entry::StopOfferService(svc) = entry {
-                let is_offer = matches!(entry, sd::Entry::OfferService(_));
-                let endpoint =
-                    sd::extract_ipv4_endpoint(&header.options).map(|(addr, protocol)| {
-                        crate::NetEndpoint::new(core::net::SocketAddr::V4(addr), protocol)
-                    });
-                f(crate::OfferedEndpoint {
-                    service_id: svc.service_id,
-                    instance_id: svc.instance_id,
-                    major_version: svc.major_version,
-                    minor_version: svc.minor_version,
-                    endpoint,
-                    is_offer,
-                });
-            }
-        }
+        crate::traits::for_each_offered_endpoint(&header.entries, &header.options, f);
     }
 
     fn for_each_service_instance<F>(&self, mut f: F)
@@ -458,6 +442,32 @@ mod tests {
             ttl: 100,
             minor_version: 0,
         }
+    }
+
+    #[test]
+    fn offered_endpoints_use_the_option_each_offer_references() {
+        let endpoint = |port| sd::Options::IpV4Endpoint {
+            ip: Ipv4Addr::new(192, 0, 2, 1),
+            protocol: sd::TransportProtocol::Udp,
+            port,
+        };
+        let crossed = |service_id, index| {
+            sd::Entry::OfferService(sd::ServiceEntry {
+                index_first_options_run: index,
+                ..make_offer_entry(service_id, 1)
+            })
+        };
+        let payload = RawPayload::new_sd_payload(&VecSdHeader {
+            flags: sd::Flags::new_sd(sd::RebootFlag::Continuous),
+            entries: std::vec![crossed(0x1234, 1), crossed(0x5678, 0)],
+            options: std::vec![endpoint(30600), endpoint(30509)],
+        });
+        let ports: Vec<_> = payload
+            .offered_endpoints()
+            .iter()
+            .map(|ep| (ep.service_id, ep.endpoint.map(|e| e.addr.port())))
+            .collect();
+        assert_eq!(ports, [(0x1234, Some(30509)), (0x5678, Some(30600))]);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::NetEndpoint;
+use core::net::IpAddr;
 use heapless::index_map::FnvIndexMap;
 
 /// Maximum number of service-endpoint entries the registry can track.
@@ -92,6 +93,18 @@ impl ServiceRegistry {
 
     pub fn remove(&mut self, key: ServiceEndpointKey) -> Option<ServiceEndpointInfo> {
         self.endpoints.swap_remove(&key)
+    }
+
+    /// Removes every entry of `service_id` instance `instance_id` whose
+    /// endpoint is at `ip`, returning how many were removed.
+    pub fn remove_instance_at(&mut self, service_id: u16, instance_id: u16, ip: IpAddr) -> usize {
+        let before = self.endpoints.len();
+        self.endpoints.retain(|key, info| {
+            !(key.service_id == service_id
+                && info.instance_id == instance_id
+                && key.endpoint.addr.ip() == ip)
+        });
+        before - self.endpoints.len()
     }
 
     pub fn get(&self, key: ServiceEndpointKey) -> Option<&ServiceEndpointInfo> {
@@ -192,6 +205,18 @@ mod tests {
         assert!(reg.remove(key(0x47, A, 30001)).is_some());
         assert!(reg.get(key(0x47, A, 30001)).is_none());
         assert!(reg.get(key(0x47, B, 30002)).is_some());
+    }
+
+    #[test]
+    fn remove_instance_at_removes_only_that_instance_from_that_ip() {
+        let mut reg = ServiceRegistry::default();
+        reg.insert(key(0x47, A, 30001), info(54)).unwrap();
+        reg.insert(key(0x47, A, 30002), info(55)).unwrap();
+        reg.insert(key(0x47, B, 30001), info(54)).unwrap();
+        assert_eq!(reg.remove_instance_at(0x47, 54, A.into()), 1);
+        assert!(reg.get(key(0x47, A, 30001)).is_none());
+        assert!(reg.get(key(0x47, A, 30002)).is_some());
+        assert!(reg.get(key(0x47, B, 30001)).is_some());
     }
 
     #[test]
