@@ -12,8 +12,9 @@
 //! `#[embassy_executor::task]` body relies on). The server's inbound
 //! path (SD subscribe-accept + request dispatch) is handled by
 //! [`crate::server::Server::run_with_buffers`] and is not duplicated
-//! here; these cover the announce, the notification-only client, and the
-//! synchronous publish.
+//! here; that path also answers Offers with Subscribes for the
+//! [`crate::server::ServerConfig::consumed_eventgroups`]. These cover the
+//! announce, the notification receive, and the synchronous publish.
 
 use core::future::Future;
 use core::net::SocketAddrV4;
@@ -22,11 +23,9 @@ use core::sync::atomic::AtomicU16;
 use core::task::{Context, RawWaker, RawWakerVTable, Waker};
 use core::time::Duration;
 
-use crate::protocol::sd::RebootFlag;
 use crate::sd_codec::{
-    OfferServiceRequest, SubscribeEventgroupRequest, build_multi_offer_service_datagram,
-    build_notification_datagram, build_subscribe_eventgroup_datagram, check_parsed_e2e,
-    next_sd_session, parse_someip_datagram,
+    OfferServiceRequest, build_multi_offer_service_datagram, build_notification_datagram,
+    check_parsed_e2e, next_sd_session, parse_someip_datagram,
 };
 use crate::server::{ServerConfig, Subscriber, SubscriptionHandle};
 use crate::transport::{E2EHandle, Timer, TransportSocket};
@@ -68,35 +67,6 @@ pub async fn announce_offers_future<'a, S, Tm, const N: usize>(
     loop {
         let s = next_sd_session(session);
         if let Ok(len) = build_multi_offer_service_datagram::<N>(scratch, offers, s) {
-            let _ = sd_socket.send_to(&scratch[..len], sd_multicast).await;
-        }
-        timer.sleep(period).await;
-    }
-}
-
-/// Periodically multicast a `SubscribeEventgroup` for `request` to the SD
-/// endpoint, re-sent every `period`. Subscribing proactively (rather
-/// than waiting for an `OfferService`) supports providers that don't
-/// announce cyclically. `reboot` is carried in each datagram's SD flags.
-// One SD-request shape spread across distinct scalars + borrows; bundling
-// them into a struct would just move the argument list to the call site.
-#[allow(clippy::too_many_arguments)]
-pub async fn subscribe_announce_future<'a, S, Tm>(
-    sd_socket: &'a S,
-    timer: &'a Tm,
-    request: SubscribeEventgroupRequest,
-    sd_multicast: SocketAddrV4,
-    session: &'a AtomicU16,
-    reboot: RebootFlag,
-    period: Duration,
-    scratch: &'a mut [u8],
-) where
-    S: TransportSocket,
-    Tm: Timer,
-{
-    loop {
-        let s = next_sd_session(session);
-        if let Ok(len) = build_subscribe_eventgroup_datagram(scratch, &request, s, reboot) {
             let _ = sd_socket.send_to(&scratch[..len], sd_multicast).await;
         }
         timer.sleep(period).await;
@@ -147,38 +117,30 @@ pub async fn event_rx_dispatch_future<'a, S, R>(
 const RUN_OFFER_CAP: usize = crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_OFFERS"), 4);
 
 /// Everything [`run_someip`] needs besides the server receive future:
-/// the shared SD socket (for announce + subscribe), the client RX socket,
-/// timer, E2E handle, and the per-future config/state/scratch. All borrows
-/// share one lifetime; the scratch buffers must be distinct (no aliasing).
+/// the shared SD socket (for the announce), the client RX socket, timer,
+/// E2E handle, and the per-future config/state/scratch. All borrows share
+/// one lifetime; the scratch buffers must be distinct (no aliasing).
 pub struct SomeipRun<'a, S, Tm, R>
 where
     S: TransportSocket,
     Tm: Timer,
     R: E2EHandle + Clone,
 {
-    /// SD socket used to send offers and subscribes (send-only here).
+    /// SD socket used to send offers (send-only here).
     pub sd_socket: &'a S,
-    /// Unicast socket the client receives notifications on.
-    pub rx_socket: &'a S,
+    /// Unicast socket the client receives notifications on; `None` for a
+    /// provider-only node.
+    pub rx_socket: Option<&'a S>,
     pub timer: &'a Tm,
     pub e2e: &'a R,
-    /// SD multicast endpoint (offers + subscribes are sent here).
+    /// SD multicast endpoint the offers are sent to.
     pub sd_multicast: SocketAddrV4,
-    /// Re-announce / re-subscribe period (the node SD TTL).
+    /// Re-announce period (the node SD TTL).
     pub period: Duration,
     /// Offered services packed into one combined `OfferService`.
     pub offers: &'a [OfferServiceRequest],
     pub offer_session: &'a AtomicU16,
     pub offer_scratch: &'a mut [u8],
-    /// `Some` to run the notification-only client (subscribe + RX);
-    /// `None` for a provider-only node.
-    pub subscribe: Option<SubscribeEventgroupRequest>,
-    pub sub_session: &'a AtomicU16,
-    pub sub_scratch: &'a mut [u8],
-    pub sub_reboot: RebootFlag,
-    /// One-shot delay before the first subscribe, to phase it off the
-    /// offer announce (both run at `period`).
-    pub sub_offset: Duration,
     pub rx_buf: &'a mut [u8],
     pub dispatch: RequestDispatchFn,
     /// Opaque context word forwarded verbatim as `dispatch`'s first arg.
@@ -190,8 +152,7 @@ where
 /// Drive the full bare-metal SOME/IP integration as ONE future: the
 /// caller-supplied server receive future (`recv`, typically
 /// `Server::run_with_buffers`) concurrently with the combined-offer
-/// announce, the proactive subscribe (offset off the announce), and the
-/// notification RX+dispatch. Spawn this from a single
+/// announce and the notification RX+dispatch. Spawn this from a single
 /// `#[embassy_executor::task]` so the firmware holds no per-future task
 /// glue.
 ///
@@ -215,11 +176,6 @@ where
         offers,
         offer_session,
         offer_scratch,
-        subscribe,
-        sub_session,
-        sub_scratch,
-        sub_reboot,
-        sub_offset,
         rx_buf,
         dispatch,
         dispatch_ctx,
@@ -235,37 +191,18 @@ where
         offer_scratch,
     );
 
-    // Subscribe (phased off the announce) + RX run only for a consumer
-    // node; for a provider-only node they idle forever so the join arity
-    // stays fixed.
-    let subscribe_fut = async move {
-        if let Some(request) = subscribe {
-            timer.sleep(sub_offset).await;
-            subscribe_announce_future(
-                sd_socket,
-                timer,
-                request,
-                sd_multicast,
-                sub_session,
-                sub_reboot,
-                period,
-                sub_scratch,
-            )
-            .await;
-        } else {
-            core::future::pending::<()>().await;
-        }
-    };
+    // RX runs only for a consumer node; for a provider-only node it idles
+    // forever so the join arity stays fixed.
     let rx_fut = async move {
-        if subscribe.is_some() {
+        if let Some(rx_socket) = rx_socket {
             event_rx_dispatch_future(rx_socket, e2e, dispatch, dispatch_ctx, rx_buf).await;
         } else {
             core::future::pending::<()>().await;
         }
     };
 
-    // All four loop forever; the join never resolves.
-    futures_util::join!(recv, announce, subscribe_fut, rx_fut);
+    // All three loop forever; the join never resolves.
+    futures_util::join!(recv, announce, rx_fut);
 }
 
 // No-op waker to drive the synchronous `for_each_subscriber` future in

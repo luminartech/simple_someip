@@ -29,6 +29,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::Timer;
 #[cfg(feature = "_alloc")]
 use crate::protocol::sd;
+use crate::sd_codec::SubscribeEventgroupRequest;
 #[cfg(feature = "_alloc")]
 use crate::transport::SocketOptions;
 #[cfg(feature = "_alloc")]
@@ -66,6 +67,11 @@ const _DEFAULT_ACCEPTED_OFFERS: usize = 4;
 #[cfg(not(feature = "bare_metal"))]
 const _DEFAULT_ACCEPTED_OFFERS: usize = 16;
 
+#[cfg(feature = "bare_metal")]
+const _DEFAULT_CONSUMED_EVENTGROUPS: usize = 1;
+#[cfg(not(feature = "bare_metal"))]
+const _DEFAULT_CONSUMED_EVENTGROUPS: usize = 16;
+
 const _SERVER_EVENT_GROUP_IDS_CAP: usize = crate::from_env_or(
     option_env!("SIMPLE_SOMEIP_MAX_SUBS"),
     _DEFAULT_EVENT_GROUP_IDS,
@@ -73,6 +79,10 @@ const _SERVER_EVENT_GROUP_IDS_CAP: usize = crate::from_env_or(
 const _SERVER_ACCEPTED_OFFERS_CAP: usize = crate::from_env_or(
     option_env!("SIMPLE_SOMEIP_MAX_OFFERS"),
     _DEFAULT_ACCEPTED_OFFERS,
+);
+const _SERVER_CONSUMED_EVENTGROUPS_CAP: usize = crate::from_env_or(
+    option_env!("SIMPLE_SOMEIP_MAX_SUBS"),
+    _DEFAULT_CONSUMED_EVENTGROUPS,
 );
 
 /// Configuration for a SOME/IP service provider
@@ -123,6 +133,13 @@ pub struct ServerConfig {
     /// events never reach a subscriber. Populate via [`Self::with_accepted_offer`];
     /// empty preserves single-service behaviour.
     pub accepted_offers: heapless::Vec<AcceptedOffer, { ServerConfig::ACCEPTED_OFFERS_CAP }>,
+    /// Eventgroups this node subscribes to. The receive loop answers each
+    /// Offer of a matching service, instance and major version with a
+    /// unicast Subscribe to the Offer's sender. Use it on a node that runs
+    /// no `Client`; a `Client` sends its own Subscribes. Populate via
+    /// [`Self::with_consumed_eventgroup`].
+    pub consumed_eventgroups:
+        heapless::Vec<SubscribeEventgroupRequest, { ServerConfig::CONSUMED_EVENTGROUPS_CAP }>,
 }
 
 /// A `(service, instance, event_group)` tuple a receive loop will accept
@@ -152,6 +169,10 @@ impl ServerConfig {
     /// [`Self::accepted_offers`]. Covers any realistic shared-socket
     /// provider catalog.
     pub const ACCEPTED_OFFERS_CAP: usize = _SERVER_ACCEPTED_OFFERS_CAP;
+
+    /// Maximum number of entries in [`Self::consumed_eventgroups`], set by
+    /// `SIMPLE_SOMEIP_MAX_SUBS`.
+    pub const CONSUMED_EVENTGROUPS_CAP: usize = _SERVER_CONSUMED_EVENTGROUPS_CAP;
 
     /// Maximum number of subscribers tracked per event group. Matches
     /// `SUBSCRIBERS_PER_GROUP` in the subscription manager (sized via
@@ -209,6 +230,7 @@ impl ServerConfig {
             event_group_ids: heapless::Vec::new(),
             announce: true,
             accepted_offers: heapless::Vec::new(),
+            consumed_eventgroups: heapless::Vec::new(),
         }
     }
 
@@ -302,6 +324,41 @@ impl ServerConfig {
         }
     }
 
+    /// Subscribe to `request`'s eventgroup whenever its service is offered.
+    /// See [`Self::consumed_eventgroups`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`Self::CONSUMED_EVENTGROUPS_CAP`] eventgroups are already
+    /// registered. Use [`Self::try_with_consumed_eventgroup`] for the
+    /// fallible variant.
+    #[must_use]
+    pub fn with_consumed_eventgroup(mut self, request: SubscribeEventgroupRequest) -> Self {
+        self.consumed_eventgroups
+            .push(request)
+            .expect("consumed_eventgroups capacity exceeded");
+        self
+    }
+
+    /// Fallible counterpart to [`Self::with_consumed_eventgroup`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the unmodified config (in `Err`) if registering would exceed
+    /// [`Self::CONSUMED_EVENTGROUPS_CAP`].
+    #[allow(clippy::result_large_err)]
+    #[must_use = "the returned `Result` carries the (possibly-modified) config — drop is silent"]
+    pub fn try_with_consumed_eventgroup(
+        mut self,
+        request: SubscribeEventgroupRequest,
+    ) -> Result<Self, Self> {
+        if self.consumed_eventgroups.push(request).is_ok() {
+            Ok(self)
+        } else {
+            Err(self)
+        }
+    }
+
     /// Returns `true` if `(service_id, instance_id, major_version,
     /// event_group_id)` is registered in [`Self::accepted_offers`].
     #[must_use]
@@ -359,14 +416,17 @@ impl ServerConfig {
     }
 
     fn check_ttl(&self) -> Result<(), Error> {
-        if (1..=crate::protocol::sd::MAX_TTL).contains(&self.ttl) {
-            Ok(())
-        } else {
-            Err(
-                crate::protocol::Error::from(crate::protocol::sd::Error::InvalidTtl(self.ttl))
-                    .into(),
-            )
+        let ttls =
+            core::iter::once(self.ttl).chain(self.consumed_eventgroups.iter().map(|r| r.ttl));
+        for ttl in ttls {
+            if !(1..=crate::protocol::sd::MAX_TTL).contains(&ttl) {
+                return Err(
+                    crate::protocol::Error::from(crate::protocol::sd::Error::InvalidTtl(ttl))
+                        .into(),
+                );
+            }
         }
+        Ok(())
     }
 
     /// Append an event-group ID to the registered set. Subscriptions
@@ -902,8 +962,9 @@ impl
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] carrying
-    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl` is
-    /// outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
+    /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
+    /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns an error if binding the unicast or SD socket fails, or if joining the
     /// SD multicast group fails.
     pub async fn new(
@@ -942,8 +1003,9 @@ impl
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] carrying
-    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl` is
-    /// outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
+    /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
+    /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns an error if binding the unicast or SD socket fails, or if joining the
     /// SD multicast group fails.
     pub async fn new_with_loopback(
@@ -988,8 +1050,9 @@ impl
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] carrying
-    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl` is
-    /// outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
+    /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
+    /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns an error if binding either socket fails.
     pub async fn new_passive(
         config: ServerConfig,
@@ -1041,8 +1104,9 @@ where
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] carrying
-    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl` is
-    /// outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
+    /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
+    /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns an error if binding the unicast or SD socket via
     /// [`TransportFactory::bind`] fails, or if joining the SD multicast
     /// group fails.
@@ -1141,8 +1205,9 @@ where
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] carrying
-    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl` is
-    /// outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
+    /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
+    /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns an error if binding either socket fails.
     pub async fn new_passive_with_deps(
         deps: ServerDeps<F, Tm, R, Sub>,
@@ -1255,8 +1320,9 @@ where
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] carrying
-    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl` is
-    /// outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
+    /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
+    /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns an error if querying `unicast_socket.local_addr()`
     /// fails on the underlying transport, or
     /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
@@ -1321,8 +1387,9 @@ where
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] carrying
-    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl` is
-    /// outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
+    /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
+    /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns an error if querying `unicast_socket.local_addr()`
     /// fails on the underlying transport, or
     /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
@@ -1816,6 +1883,31 @@ mod tests {
         let cfg = ServerConfig::new(0x5B, 1)
             .with_ttl(core::time::Duration::from_secs(u64::from(sd::MAX_TTL) + 1));
         assert_eq!(cfg.ttl, sd::MAX_TTL);
+    }
+
+    #[tokio::test]
+    async fn server_new_rejects_a_consumed_eventgroup_ttl_outside_the_entry_range() {
+        for ttl in [0, sd::MAX_TTL + 1] {
+            let config =
+                ServerConfig::new(0x5B, 1).with_consumed_eventgroup(SubscribeEventgroupRequest {
+                    service_id: 0x5C,
+                    instance_id: 1,
+                    major_version: 1,
+                    event_group_id: 1,
+                    ttl,
+                    local_ip: Ipv4Addr::LOCALHOST,
+                    local_rx_port: 40100,
+                });
+            let result = Server::new(config).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::Protocol(crate::protocol::Error::Sd(sd::Error::InvalidTtl(t)))) if t == ttl
+                ),
+                "ttl {ttl}: got {:?}",
+                result.err()
+            );
+        }
     }
 
     #[tokio::test]
