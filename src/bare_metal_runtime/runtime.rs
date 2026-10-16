@@ -535,7 +535,7 @@ async fn someip_task() {
 
 // ── Public runtime API (the platform's C-FFI forwards to these) ──────────
 
-/// Stand up the runtime from `config`, build the server, register E2E, and
+/// Stand up the runtime from `config`, build the server, and
 /// spawn the composed task.
 ///
 /// Returns `0` on success, or a negative error code: `-1` server build

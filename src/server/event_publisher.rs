@@ -123,8 +123,8 @@ where
     /// needed for the send path:
     ///
     /// - `msg_buf` — receives the serialized SOME/IP frame (including any
-    ///   post-E2E copy-back). Must be large enough to hold the full
-    ///   protected datagram: at minimum `16 + E2E_header_overhead + payload_len`.
+    ///   protected payload's copy-back). Must be large enough to hold the full
+    ///   protected datagram: 16 header bytes plus the protected payload.
     ///   On the bare-metal path, callers typically supply a `static [u8; N]`.
     ///
     /// - `protected_buf` — temporary scratch for the
@@ -138,7 +138,7 @@ where
     /// * `event_group_id` - Event group ID
     /// * `message` - The SOME/IP message to send (must be a notification/event)
     /// * `msg_buf` - Caller-supplied scratch for the outgoing datagram
-    /// * `protected_buf` - Caller-supplied scratch for E2E protect output
+    /// * `protected_buf` - Caller-supplied scratch for the protected payload
     ///
     /// # Errors
     ///

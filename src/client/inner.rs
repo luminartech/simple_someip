@@ -327,7 +327,7 @@ pub(super) struct Inner<
     /// `unbind_discovery` + `bind_discovery` does not emit a false reboot signal.
     sd_session_id: u16,
     sd_session_has_wrapped: bool,
-    /// Shared E2E registry for runtime E2E configuration
+    /// Checks received and protects sent payloads.
     e2e_registry: R,
     /// Enable multicast loopback on SD sockets for same-host testing
     multicast_loopback: bool,

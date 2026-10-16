@@ -36,9 +36,8 @@ pub enum CapacityKind {
     /// rejected because the encoded form exceeds the application-level
     /// UDP cap.
     ///
-    /// With E2E protect configured for the destination key, the
-    /// post-protect payload may add up to the protect profile's overhead
-    /// bytes (Profile 1: 4, Profile 4: 16). The pre-encode check uses the
+    /// When the [`E2EHandle`](crate::E2EHandle) protects the message, the
+    /// protected payload is larger than the raw one. The pre-encode check uses the
     /// raw size; the post-protect re-check inside the spawned send loop
     /// produces this kind if the protected datagram would overflow the
     /// cap.

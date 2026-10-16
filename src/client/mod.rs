@@ -207,13 +207,13 @@ pub enum ClientUpdate<P: PayloadWireFormat> {
     SenderRebooted(SocketAddr),
     /// Unicast message received.
     ///
-    /// When E2E is configured for this message's key, `e2e_status` contains
-    /// the check result and the payload has its E2E header stripped.
-    /// When no E2E is configured, `e2e_status` is `None`.
+    /// When the client's [`E2EHandle`] checks this
+    /// message, `e2e_status` carries the code it returned, and the payload
+    /// is the one the check produced. Otherwise `e2e_status` is `None`.
     Unicast {
         /// The received SOME/IP message.
         message: Message<P>,
-        /// E2E check status, if E2E was configured for this message.
+        /// The [`E2EHandle`]'s status code, if it checked this message.
         e2e_status: Option<core::num::NonZeroU8>,
         /// The sender's source address. On a shared subnet this is the only
         /// way to attribute a unicast event to a specific device, since the
@@ -301,7 +301,8 @@ where
     pub factory: F,
     /// Async sleep primitive used by the run-loop's idle tick.
     pub timer: Tm,
-    /// Shared E2E registry handle for runtime E2E configuration.
+    /// The [`E2EHandle`] that checks received and
+    /// protects sent payloads; [`crate::NoE2E`] for neither.
     pub e2e_registry: R,
     /// Shared interface-address handle. The run-loop reads its current
     /// value when `bind_*` is invoked.

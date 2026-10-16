@@ -36,7 +36,7 @@
 //!   `SendFuture` / `RecvFuture` associated types express `Send` bounds
 //!   for spawnable socket loops.
 //!
-//! For `no_alloc` SOME/IP usage, consume `protocol`, `e2e`, and the
+//! For `no_alloc` SOME/IP usage, consume `protocol` and the
 //! `transport` trait layer directly — the `bare_metal_client` /
 //! `bare_metal_server` example workspace members demonstrate that surface.
 
