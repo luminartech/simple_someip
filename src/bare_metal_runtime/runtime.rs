@@ -73,8 +73,8 @@ type RtServer = Server<
 /// contract — so a platform can use one handler for both the server's
 /// non-SD observer and the runtime's notification RX path. `ctx` is the
 /// opaque word registered at [`init`]; `source` is the sender;
-/// `e2e_status` is real on the RX path (Profile-5 check) and `0`
-/// (unchecked) on the server-request path.
+/// `e2e_status` is `0` when not checked, otherwise the code the
+/// [`RuntimeConfig::e2e`] handle returned.
 pub type DispatchFn = fn(
     ctx: usize,
     source: core::net::SocketAddrV4,
@@ -188,7 +188,8 @@ pub struct RuntimeConfig {
     pub mailbox: &'static Mailbox,
     /// Runtime buffer memory (platform-owned, placement-controlled).
     pub buffers: &'static mut RuntimeBuffers,
-    /// Checks received and protects sent payloads; `None` for neither.
+    /// Checks the notifications the runtime receives; `None` for no check.
+    /// Notifications the runtime publishes are not protected.
     pub e2e: Option<&'static dyn E2EHandle>,
 }
 

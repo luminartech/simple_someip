@@ -1296,3 +1296,11 @@ async fn a_protected_request_that_does_not_fit_is_rejected() {
     );
     assert_eq!(arrived, None, "nothing is sent");
 }
+
+#[tokio::test]
+async fn a_hook_for_every_message_leaves_service_discovery_alone() {
+    let service_id = next_service_id();
+    let hook = TagE2E::every_message();
+    let received = publish_and_receive(hook, hook, service_id, &[(TAGGED_EVENT, &[0x01])]).await;
+    assert_eq!(received, [(TAGGED_EVENT, Some(PASSED), vec![0x01])]);
+}

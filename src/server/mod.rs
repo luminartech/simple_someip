@@ -541,7 +541,7 @@ where
     }
 
     /// Replace the `e2e_registry` field, returning a `ServerDeps` over
-    /// the new registry-handle type.
+    /// the new [`E2EHandle`] type.
     pub fn with_e2e_registry<R2: E2EHandle + Clone>(
         self,
         e2e_registry: R2,
@@ -697,7 +697,7 @@ where
 /// - `F: TransportFactory` — socket primitive (carried as a stored
 ///   unit-struct in the tokio path; bare-metal impls may carry state)
 /// - `Tm: Timer` — async sleep used by the announcement loop
-/// - `R: E2EHandle + Clone` — runtime E2E configuration registry
+/// - `R: E2EHandle + Clone` — the E2E hook
 /// - `Sub: SubscriptionHandle` — event-group subscription state
 ///
 /// The generic order mirrors [`ServerDeps`] (and, for the shared
@@ -1418,7 +1418,7 @@ where
     /// The returned future is independent of `&self` — the cheap
     /// shared-handle clones it captures own everything it needs to
     /// drive both loops, so the caller can keep using `Server` to
-    /// register E2E profiles, query `unicast_local_addr`, etc. while
+    /// query `unicast_local_addr`, etc. while
     /// the future runs.
     ///
     /// # Errors
