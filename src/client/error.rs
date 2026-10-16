@@ -36,9 +36,9 @@ pub enum Error {
     /// subscribing to them fails with this variant.
     #[error("Endpoint not supported by this client's transports (IPv4/UDP only): {0:?}")]
     UnsupportedEndpoint(crate::NetEndpoint),
-    /// An E2E protection or checking error occurred.
+    /// An [`E2EHandle`](crate::E2EHandle) could not protect an outgoing payload.
     #[error(transparent)]
-    E2e(#[from] crate::e2e::Error),
+    E2e(#[from] crate::transport::E2EProtectError),
     /// A fixed-capacity internal structure is full.
     ///
     /// [`CapacityKind`](crate::CapacityKind) names which one, and its variant docs name the

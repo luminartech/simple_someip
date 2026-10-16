@@ -14,8 +14,6 @@ use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 use crate::bare_metal_tasks::{SomeipRun, publish_notification, run_someip};
-use crate::e2e::{E2ERegistry, Profile5Config};
-use crate::protocol::MessageId;
 use crate::protocol::sd::{self, RebootFlag};
 use crate::sd_codec::{
     OfferServiceRequest, SubscribeEventgroupRequest, build_multi_stop_offer_service_datagram,
@@ -25,8 +23,7 @@ use crate::server::{
     EventPublisher, SdStateManager, Server, ServerConfig, ServerStorage, StaticSubscriptionHandle,
     StaticSubscriptionStorage, SubscriptionManager,
 };
-use crate::transport::E2ERegistryHandle;
-use crate::{E2EKey, E2EProfile, StaticE2EHandle, StaticE2EStorage};
+use crate::transport::{E2EHandle, NoE2E};
 
 use super::mailbox::RxMailbox;
 use super::transport::{CallbackFactory, CallbackSocket, CallbackTimer, NowMsFn, Platform, SendFn};
@@ -59,11 +56,12 @@ const DEFAULT_SD_MCAST: u32 = 0xEFFF_00FF; // 239.255.0.255
 type Mailbox = RxMailbox<RX_SLOTS, RX_CAP>;
 type Sock = CallbackSocket<'static, RX_SLOTS, RX_CAP>;
 type Factory = CallbackFactory<'static, RX_SLOTS, RX_CAP>;
-type Publisher = EventPublisher<StaticE2EHandle, StaticSubscriptionHandle, &'static Sock, Sock>;
+type Publisher =
+    EventPublisher<&'static dyn E2EHandle, StaticSubscriptionHandle, &'static Sock, Sock>;
 type RtServer = Server<
     Factory,
     CallbackTimer,
-    StaticE2EHandle,
+    &'static dyn E2EHandle,
     StaticSubscriptionHandle,
     &'static Sock,
     &'static SdStateManager,
@@ -119,10 +117,6 @@ pub struct SubEntry {
     pub method_id: u16,
     pub local_rx_port: u16,
     pub major_version: u8,
-    pub e2e_enabled: bool,
-    pub e2e_data_id: u16,
-    pub e2e_data_length: u16,
-    pub e2e_max_delta: u16,
 }
 
 /// Buffer memory the platform owns (so it controls link placement) and
@@ -194,15 +188,18 @@ pub struct RuntimeConfig {
     pub mailbox: &'static Mailbox,
     /// Runtime buffer memory (platform-owned, placement-controlled).
     pub buffers: &'static mut RuntimeBuffers,
+    /// Checks received and protects sent payloads; `None` for neither.
+    pub e2e: Option<&'static dyn E2EHandle>,
 }
 
 // ── Library-owned state ──────────────────────────────────────────────────
-#[allow(clippy::declare_interior_mutable_const)]
-const E2E_INIT: StaticE2EStorage =
-    BlockingMutex::<CriticalSectionRawMutex, RefCell<E2ERegistry>>::new(RefCell::new(
-        E2ERegistry::new(),
-    ));
-static E2E_STORAGE: StaticE2EStorage = E2E_INIT;
+static NO_E2E: NoE2E = NoE2E;
+static mut E2E: &'static dyn E2EHandle = &NO_E2E;
+
+fn e2e() -> &'static dyn E2EHandle {
+    // SAFETY: written once in `init` before any task reads it.
+    unsafe { *core::ptr::addr_of!(E2E) }
+}
 static SUBS_STORAGE: StaticSubscriptionStorage = BlockingMutex::<
     CriticalSectionRawMutex,
     RefCell<SubscriptionManager>,
@@ -238,10 +235,6 @@ static mut SUBS: [SubEntry; MAX_SUBS] = [SubEntry {
     method_id: 0,
     local_rx_port: 0,
     major_version: 0,
-    e2e_enabled: false,
-    e2e_data_id: 0,
-    e2e_data_length: 0,
-    e2e_max_delta: 0,
 }; MAX_SUBS];
 
 static mut UNICAST_SOCK: MaybeUninit<Sock> = MaybeUninit::uninit();
@@ -399,7 +392,7 @@ fn build_server() -> bool {
         (*core::ptr::addr_of_mut!(UNICAST_SOCK)).write(factory.socket(unicast_port));
         (*core::ptr::addr_of_mut!(SD_SOCK)).write(factory.socket(sd_port));
         let unicast_ref: &'static Sock = (*core::ptr::addr_of!(UNICAST_SOCK)).assume_init_ref();
-        let e2e = StaticE2EHandle::new(&E2E_STORAGE);
+        let e2e = e2e();
         let subs_handle = StaticSubscriptionHandle::new(&SUBS_STORAGE);
         (*core::ptr::addr_of_mut!(PUBLISHER)).write(EventPublisher::new(
             subs_handle,
@@ -436,7 +429,7 @@ fn build_server() -> bool {
         ServerStorage {
             factory,
             timer: CallbackTimer::new(platform().now_ms),
-            e2e_registry: StaticE2EHandle::new(&E2E_STORAGE),
+            e2e_registry: e2e(),
             subscriptions: StaticSubscriptionHandle::new(&SUBS_STORAGE),
             unicast_socket: (*core::ptr::addr_of!(UNICAST_SOCK)).assume_init_ref(),
             sd_socket: (*core::ptr::addr_of!(SD_SOCK)).assume_init_ref(),
@@ -497,7 +490,7 @@ async fn someip_task() {
         SD_PORT.load(Ordering::Acquire),
     );
     let timer = CallbackTimer::new(plat.now_ms);
-    let e2e = StaticE2EHandle::new(&E2E_STORAGE);
+    let e2e = e2e();
 
     let sub = subs().first().copied();
     // Client RX socket marker (its PCB is pre-bound by the platform).
@@ -512,7 +505,6 @@ async fn someip_task() {
         local_ip: Ipv4Addr::from(IFACE.load(Ordering::Acquire).to_be_bytes()),
         local_rx_port: s.local_rx_port,
     });
-    let sub_e2e_enabled = sub.is_some_and(|s| s.e2e_enabled);
     let period = Duration::from_secs(node_sd_ttl_secs());
 
     run_someip(
@@ -532,7 +524,6 @@ async fn someip_task() {
             sub_scratch,
             sub_reboot: RebootFlag::RecentlyRebooted,
             sub_offset: Duration::from_secs(CLIENT_SUB_OFFSET_SECS),
-            sub_e2e_enabled,
             rx_buf: rx,
             dispatch,
             // The trampoline injects DISPATCH_CTX itself; pass 0 here.
@@ -592,6 +583,7 @@ pub fn init(config: RuntimeConfig) -> i32 {
     DISPATCH_CTX.store(config.dispatch_ctx, Ordering::Release);
     unsafe {
         *core::ptr::addr_of_mut!(MAILBOX) = Some(config.mailbox);
+        *core::ptr::addr_of_mut!(E2E) = config.e2e.unwrap_or(&NO_E2E);
         *core::ptr::addr_of_mut!(BUFS) = core::ptr::from_mut(config.buffers);
     }
 
@@ -606,27 +598,6 @@ pub fn init(config: RuntimeConfig) -> i32 {
         unsafe { (*core::ptr::addr_of_mut!(SUBS))[i] = *e };
     }
     SUBS_LEN.store(n_subs, Ordering::Release);
-
-    // E2E Profile 5 for opted-in subscriptions.
-    let e2e = StaticE2EHandle::new(&E2E_STORAGE);
-    for s in subs() {
-        if !s.e2e_enabled {
-            continue;
-        }
-        let p5 = E2EProfile::Profile5WithHeader(Profile5Config::new(
-            s.e2e_data_id,
-            s.e2e_data_length,
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                s.e2e_max_delta as u8
-            },
-        ));
-        let key = E2EKey::from_message_id(MessageId::new_from_service_and_method(
-            s.service_id,
-            s.method_id,
-        ));
-        let _ = e2e.register(key, p5);
-    }
 
     // Bind PCBs via the platform (registers the RX path → `on_rx`): the SD
     // port, each unique offered unicast port, and each subscription RX port.

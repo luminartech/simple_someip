@@ -112,6 +112,7 @@ impl SomeipUnderTest for BareMetalRt {
             // `init` fails before spawning the task that borrows these
             // buffers, so this is the one live reference to `BUFFERS`.
             buffers: unsafe { &mut *std::ptr::addr_of_mut!(BUFFERS) },
+            e2e: None,
         });
         match rc {
             0 => {}
@@ -202,10 +203,6 @@ fn subscription() -> rt::SubEntry {
         method_id: EVENT,
         local_rx_port: CLIENT_PORT,
         major_version: MAJOR,
-        e2e_enabled: false,
-        e2e_data_id: 0,
-        e2e_data_length: 0,
-        e2e_max_delta: 0,
     }
 }
 

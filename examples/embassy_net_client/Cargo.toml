@@ -17,8 +17,8 @@ publish = false
 [dependencies]
 # Adapter pulls `simple-someip` with `default-features = false,
 # features = ["client", "server", "bare_metal"]` transitively.
-# We add `std` here for `RawPayload` / `Arc<Mutex<E2ERegistry>>`
-# default impls — the host-side conveniences.
+# We add `std` here for `RawPayload` and the `Arc<RwLock<…>>`
+# interface handle — the host-side conveniences.
 simple-someip = { path = "../..", default-features = false, features = [
     "std",
     "client",

@@ -233,9 +233,6 @@ use core::num::NonZeroU8;
 use crate::protocol::MessageId;
 use core::time::Duration;
 
-use crate::e2e::Error as E2EError;
-use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile};
-
 /// Portable I/O error kinds surfaced by transport implementations.
 ///
 /// This is a deliberately small vocabulary — anything that does not fit
@@ -876,77 +873,6 @@ impl E2EHandle for NoE2E {
     fn reset_source(&self, _source: IpAddr) {}
 }
 
-/// Shared handle to the runtime E2E configuration registry.
-///
-/// Abstracts over `Arc<Mutex<E2ERegistry>>` on `std` and over
-/// critical-section-backed primitives (e.g. `embassy_sync::blocking_mutex`)
-/// on bare metal. All methods take `&self` and provide interior-mutable
-/// access. Implementations are required to be `Clone` so the handle can be
-/// cheaply shared between the `Client` (or `Server`) handle and its inner
-/// event loop.
-pub trait E2ERegistryHandle: Clone + Send + Sync + 'static {
-    /// Register an E2E profile for the given key, replacing any prior entry.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::e2e::E2ERegistryFull`] when the underlying registry has no
-    /// capacity for a new key. Replacing an already-registered key
-    /// always succeeds (the existing slot is reused). Implementations
-    /// that wrap [`crate::e2e::E2ERegistry`] forward this error
-    /// directly; backends with their own storage should pick an
-    /// equivalent overflow contract.
-    fn register(&self, key: E2EKey, profile: E2EProfile)
-    -> Result<(), crate::e2e::E2ERegistryFull>;
-
-    /// Remove the E2E configuration for the given key. No-op if absent.
-    fn unregister(&self, key: &E2EKey);
-
-    /// Returns `true` if a profile is registered for `key`.
-    fn contains_key(&self, key: &E2EKey) -> bool;
-
-    /// Run E2E protect for `key` if configured, writing to `output`.
-    ///
-    /// Returns `None` if no profile is registered for `key`.
-    /// Returns `Some(Err(_))` if protection fails (e.g. buffer too small).
-    /// Returns `Some(Ok(len))` on success; `len` is the number of bytes
-    /// written to `output`.
-    fn protect(
-        &self,
-        key: E2EKey,
-        payload: &[u8],
-        upper_header: [u8; 8],
-        output: &mut [u8],
-    ) -> Option<Result<usize, E2EError>>;
-
-    /// Run E2E check for `key` against `source`'s receive counter state,
-    /// if configured.
-    ///
-    /// Returns `None` if no profile is registered for `key`. Otherwise
-    /// returns the check status and the effective payload slice — the
-    /// E2E header is stripped on success; the original bytes are returned
-    /// on check failure so the caller can decide how to handle it.
-    ///
-    /// `source` keys the receive counter state: on a shared subnet several
-    /// devices send the same `(service, method)` under one instance id, so
-    /// each sender's sequence counter must be tracked independently. See
-    /// [`crate::e2e::E2ERegistry`].
-    ///
-    /// The returned slice borrows from `payload`, not from this handle.
-    fn check<'a>(
-        &self,
-        source: IpAddr,
-        key: E2EKey,
-        payload: &'a [u8],
-        upper_header: [u8; 8],
-    ) -> Option<(E2ECheckStatus, &'a [u8])>;
-
-    /// Drop all per-source receive counter state for `source` (e.g. when
-    /// its reboot is detected via Service Discovery), so its next frame
-    /// starts a fresh sequence. Configuration and transmit state are
-    /// untouched.
-    fn reset_source(&self, source: IpAddr);
-}
-
 /// Shared handle to the local interface address.
 ///
 /// Abstracts over `Arc<RwLock<Ipv4Addr>>` on `std`. All clones of a
@@ -1053,74 +979,16 @@ impl<T: 'static> WrappableSharedHandle<T> for alloc::sync::Arc<T> {
     }
 }
 
-/// Default `std`-flavoured impls of [`E2ERegistryHandle`] /
-/// [`InterfaceHandle`] / [`SocketHandle`] backed by
+/// Default `std`-flavoured impls of [`InterfaceHandle`] /
+/// [`SocketHandle`] backed by
 /// `std::sync::{Arc, Mutex, RwLock}`. Pure std — no tokio
 /// dependency — so they live in the executor-agnostic transport
 /// module rather than the tokio backend.
 #[cfg(feature = "std")]
 mod std_handle_impls {
-    use super::{E2ERegistryHandle, InterfaceHandle};
-    use crate::e2e::Error as E2EError;
-    use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, E2ERegistryFull};
-    use core::net::{IpAddr, Ipv4Addr};
-    use std::sync::{Arc, Mutex, RwLock};
-
-    impl E2ERegistryHandle for Arc<Mutex<E2ERegistry>> {
-        fn register(&self, key: E2EKey, profile: E2EProfile) -> Result<(), E2ERegistryFull> {
-            self.lock()
-                .expect("e2e registry lock poisoned")
-                .register(key, profile)
-        }
-
-        fn unregister(&self, key: &E2EKey) {
-            self.lock()
-                .expect("e2e registry lock poisoned")
-                .unregister(key);
-        }
-
-        fn contains_key(&self, key: &E2EKey) -> bool {
-            self.lock()
-                .expect("e2e registry lock poisoned")
-                .contains_key(key)
-        }
-
-        fn protect(
-            &self,
-            key: E2EKey,
-            payload: &[u8],
-            upper_header: [u8; 8],
-            output: &mut [u8],
-        ) -> Option<Result<usize, E2EError>> {
-            self.lock().expect("e2e registry lock poisoned").protect(
-                key,
-                payload,
-                upper_header,
-                output,
-            )
-        }
-
-        fn check<'a>(
-            &self,
-            source: IpAddr,
-            key: E2EKey,
-            payload: &'a [u8],
-            upper_header: [u8; 8],
-        ) -> Option<(E2ECheckStatus, &'a [u8])> {
-            self.lock().expect("e2e registry lock poisoned").check(
-                source,
-                key,
-                payload,
-                upper_header,
-            )
-        }
-
-        fn reset_source(&self, source: IpAddr) {
-            self.lock()
-                .expect("e2e registry lock poisoned")
-                .reset_source(source);
-        }
-    }
+    use super::InterfaceHandle;
+    use core::net::Ipv4Addr;
+    use std::sync::{Arc, RwLock};
 
     impl InterfaceHandle for Arc<RwLock<Ipv4Addr>> {
         fn get(&self) -> Ipv4Addr {
@@ -1133,7 +1001,7 @@ mod std_handle_impls {
     }
 }
 
-/// Bare-metal no-alloc impls of [`E2ERegistryHandle`] and [`InterfaceHandle`].
+/// Bare-metal no-alloc impl of [`InterfaceHandle`].
 ///
 /// These types satisfy `Clone + Send + Sync + 'static` without any heap
 /// allocation. The backing storage lives in a caller-owned `static`; the
@@ -1142,44 +1010,17 @@ mod std_handle_impls {
 /// # Production pattern
 ///
 /// ```ignore
-/// use core::cell::RefCell;
-/// use core::sync::atomic::{AtomicU32, Ordering};
-/// use embassy_sync::blocking_mutex::Mutex;
-/// use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-/// use simple_someip::e2e::E2ERegistry;
-/// use simple_someip::transport::{StaticE2EHandle, AtomicInterfaceHandle};
+/// use core::sync::atomic::AtomicU32;
+/// use simple_someip::transport::AtomicInterfaceHandle;
 ///
-/// // Initialize once in main() before spawning tasks.
-/// fn init() -> (StaticE2EHandle, AtomicInterfaceHandle) {
-///     static IFACE_ADDR: AtomicU32 = AtomicU32::new(0);
-///     // E2ERegistry::new() is not const so the storage is heap-placed once.
-///     let registry_storage: &'static _ = Box::leak(Box::new(
-///         Mutex::<CriticalSectionRawMutex, RefCell<E2ERegistry>>::new(
-///             RefCell::new(E2ERegistry::new()),
-///         ),
-///     ));
-///     (StaticE2EHandle::new(registry_storage), AtomicInterfaceHandle::new(&IFACE_ADDR))
-/// }
+/// static IFACE_ADDR: AtomicU32 = AtomicU32::new(0);
+/// let iface = AtomicInterfaceHandle::new(&IFACE_ADDR);
 /// ```
-///
-/// # No-allocator targets
-///
-/// The example above uses `Box::leak` because [`crate::e2e::E2ERegistry::new()`] is not
-/// currently `const`. On a target with no allocator, swap that for a
-/// `static`-cell pattern (e.g. `static_cell::StaticCell::init`) once the
-/// registry constructor becomes `const`-friendly. The handle layer itself
-/// never allocates — only the one-time storage materialization does.
 #[cfg(feature = "bare_metal")]
 pub mod bare_metal_handle_impls {
     use super::InterfaceHandle;
     use core::net::Ipv4Addr;
     use core::sync::atomic::{AtomicU32, Ordering};
-
-    // `StaticE2EHandle` wraps `E2ERegistry`, which currently requires
-    // `feature = "std"` because its backing storage is `HashMap`. Ported
-    // separately below so the rest of this module — in particular
-    // `AtomicInterfaceHandle` — is available in pure `no_std` bare-metal
-    // builds.
 
     /// No-alloc [`InterfaceHandle`] backed by a `&'static AtomicU32`.
     ///
@@ -1231,91 +1072,8 @@ pub mod bare_metal_handle_impls {
     // pass `&SOCKET` directly into Server's no-wrap constructors.
 }
 
-/// `StaticE2EHandle` — no-alloc `E2ERegistryHandle` backed by a
-/// `&'static` critical-section mutex.
-///
-/// Available in pure `no_std` builds: [`crate::e2e::E2ERegistry`] is
-/// backed by [`heapless::index_map::FnvIndexMap`], so no allocator is
-/// required.
-#[cfg(feature = "bare_metal")]
-pub mod bare_metal_e2e_impl {
-    use super::E2ERegistryHandle;
-    use crate::e2e::{
-        E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, E2ERegistryFull, Error as E2EError,
-    };
-    use core::cell::RefCell;
-    use core::net::IpAddr;
-    use embassy_sync::blocking_mutex::Mutex;
-    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-
-    /// Convenience type alias for the embassy-sync critical-section mutex
-    /// backing [`StaticE2EHandle`].
-    pub type StaticE2EStorage = Mutex<CriticalSectionRawMutex, RefCell<E2ERegistry>>;
-
-    /// No-alloc [`E2ERegistryHandle`] backed by a `&'static` critical-section
-    /// mutex.
-    ///
-    /// All clones are the same thin pointer. Construct via [`StaticE2EHandle::new`]
-    /// and supply a `&'static StaticE2EStorage` (typically obtained via
-    /// `Box::leak` during system init, since [`E2ERegistry::new`] is not const).
-    #[derive(Clone, Copy)]
-    pub struct StaticE2EHandle(&'static StaticE2EStorage);
-
-    impl StaticE2EHandle {
-        /// Wraps a static reference to the backing mutex.
-        pub const fn new(storage: &'static StaticE2EStorage) -> Self {
-            Self(storage)
-        }
-    }
-
-    impl E2ERegistryHandle for StaticE2EHandle {
-        fn register(&self, key: E2EKey, profile: E2EProfile) -> Result<(), E2ERegistryFull> {
-            self.0.lock(|cell| cell.borrow_mut().register(key, profile))
-        }
-
-        fn unregister(&self, key: &E2EKey) {
-            self.0.lock(|cell| cell.borrow_mut().unregister(key));
-        }
-
-        fn contains_key(&self, key: &E2EKey) -> bool {
-            self.0.lock(|cell| cell.borrow().contains_key(key))
-        }
-
-        fn protect(
-            &self,
-            key: E2EKey,
-            payload: &[u8],
-            upper_header: [u8; 8],
-            output: &mut [u8],
-        ) -> Option<Result<usize, E2EError>> {
-            self.0.lock(|cell| {
-                cell.borrow_mut()
-                    .protect(key, payload, upper_header, output)
-            })
-        }
-
-        fn check<'a>(
-            &self,
-            source: IpAddr,
-            key: E2EKey,
-            payload: &'a [u8],
-            upper_header: [u8; 8],
-        ) -> Option<(E2ECheckStatus, &'a [u8])> {
-            self.0
-                .lock(|cell| cell.borrow_mut().check(source, key, payload, upper_header))
-        }
-
-        fn reset_source(&self, source: IpAddr) {
-            self.0.lock(|cell| cell.borrow_mut().reset_source(source));
-        }
-    }
-}
-
 #[cfg(feature = "bare_metal")]
 pub use bare_metal_handle_impls::AtomicInterfaceHandle;
-
-#[cfg(feature = "bare_metal")]
-pub use bare_metal_e2e_impl::{StaticE2EHandle, StaticE2EStorage};
 
 // ── Channel-handle abstraction ────────────────────────────────────────────
 //
@@ -1563,12 +1321,11 @@ impl<const SLOTS: usize, const LEN: usize> BufferProvider for StaticBufferProvid
 #[cfg(any(test, feature = "bare_metal"))]
 pub mod probe {
     use super::{
-        E2ERegistryHandle, InterfaceHandle, ReceivedDatagram, SocketOptions, Spawner, Timer,
-        TransportError, TransportFactory, TransportSocket,
+        InterfaceHandle, ReceivedDatagram, SocketOptions, Spawner, Timer, TransportError,
+        TransportFactory, TransportSocket,
     };
-    use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, Error as E2EError};
     use core::future::Future;
-    use core::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+    use core::net::{Ipv4Addr, SocketAddrV4};
     use core::time::Duration;
 
     /// Socket whose I/O futures resolve immediately with
@@ -1644,43 +1401,6 @@ pub mod probe {
         }
     }
 
-    /// E2E registry handle that registers nothing and checks nothing.
-    #[derive(Clone)]
-    pub struct NullE2ERegistry;
-
-    impl E2ERegistryHandle for NullE2ERegistry {
-        fn register(
-            &self,
-            _key: E2EKey,
-            _profile: E2EProfile,
-        ) -> Result<(), crate::e2e::E2ERegistryFull> {
-            Ok(())
-        }
-        fn unregister(&self, _key: &E2EKey) {}
-        fn contains_key(&self, _key: &E2EKey) -> bool {
-            false
-        }
-        fn protect(
-            &self,
-            _key: E2EKey,
-            _payload: &[u8],
-            _upper_header: [u8; 8],
-            _output: &mut [u8],
-        ) -> Option<Result<usize, E2EError>> {
-            None
-        }
-        fn check<'a>(
-            &self,
-            _source: IpAddr,
-            _key: E2EKey,
-            _payload: &'a [u8],
-            _upper_header: [u8; 8],
-        ) -> Option<(E2ECheckStatus, &'a [u8])> {
-            None
-        }
-        fn reset_source(&self, _source: IpAddr) {}
-    }
-
     /// Interface handle pinned to a fixed address.
     #[derive(Clone)]
     pub struct NullInterface(pub Ipv4Addr);
@@ -1711,7 +1431,7 @@ mod tests {
     //! trivial mock implementations compile and that defaults behave as
     //! documented.
 
-    use super::probe::{NullE2ERegistry, NullFactory, NullInterface, NullSocket, NullTimer};
+    use super::probe::{NullFactory, NullInterface, NullSocket, NullTimer};
     use super::*;
 
     mod e2e_handle {
@@ -1877,23 +1597,6 @@ mod tests {
         let e = TransportError::Io(IoErrorKind::TimedOut);
         assert_eq!(e, TransportError::Io(IoErrorKind::TimedOut));
         assert_ne!(e, TransportError::AddressInUse);
-    }
-
-    #[test]
-    fn null_e2e_registry_compiles() {
-        let r = NullE2ERegistry;
-        let key = E2EKey::new(0, 0);
-        r.register(
-            key,
-            crate::e2e::E2EProfile::Profile4(crate::e2e::Profile4Config::new(0, 8)),
-        )
-        .expect("NullE2ERegistry::register is infallible");
-        assert!(!r.contains_key(&key));
-        assert!(
-            r.check(Ipv4Addr::LOCALHOST.into(), key, b"hello", [0; 8])
-                .is_none()
-        );
-        r.reset_source(Ipv4Addr::LOCALHOST.into()); // no-op in null impl
     }
 
     #[test]

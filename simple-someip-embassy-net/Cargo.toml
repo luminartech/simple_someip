@@ -58,9 +58,8 @@ heapless = "0.9"
 # `simple-someip` with `default-features = false`, so the adapter
 # library itself stays no_std. The dev-dep override only widens
 # what the *tests* can import — `RawPayload`, `VecSdHeader`, and
-# the `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<…>>` default
-# handle impls — all of which are gated on `feature = "std"` in
-# the parent crate.
+# the `Arc<RwLock<…>>` default handle impl — all of which are gated
+# on `feature = "std"` in the parent crate.
 simple-someip = { path = "..", default-features = false, features = [
     "client",
     "server",
