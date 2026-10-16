@@ -289,9 +289,10 @@ pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, 
 #[cfg(feature = "bare_metal")]
 pub use transport::AtomicInterfaceHandle;
 pub use transport::{
-    ChannelFactory, E2ERegistryHandle, InterfaceHandle, IoErrorKind, LocalSpawner, MpscRecv,
-    MpscSend, OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram, SocketOptions, Spawner,
-    Timer, TransportError, TransportFactory, TransportSocket, UnboundedRecv, UnboundedSend,
+    ChannelFactory, E2EHandle, E2EProtectError, E2ERegistryHandle, InterfaceHandle, IoErrorKind,
+    LocalSpawner, MpscRecv, MpscSend, NoE2E, OneshotCancelled, OneshotRecv, OneshotSend,
+    ReceivedDatagram, SocketOptions, Spawner, Timer, TransportError, TransportFactory,
+    TransportSocket, UnboundedRecv, UnboundedSend,
 };
 #[cfg(feature = "bare_metal")]
 pub use transport::{StaticE2EHandle, StaticE2EStorage};

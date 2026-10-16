@@ -228,6 +228,9 @@
 
 use core::future::Future;
 use core::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use core::num::NonZeroU8;
+
+use crate::protocol::MessageId;
 use core::time::Duration;
 
 use crate::e2e::Error as E2EError;
@@ -761,6 +764,116 @@ pub trait Spawner {
     /// release MAY add a `spawn_local`-style variant gated on a cargo
     /// feature for those targets.
     fn spawn(&self, future: impl Future<Output = ()> + Send + 'static);
+}
+
+/// A hook that checks received payloads and protects sent ones, for example
+/// with an end-to-end header between the SOME/IP header and the payload.
+///
+/// The client, the server and the bare-metal runtime call it for every
+/// non-SD message. The status code a check returns is opaque: it is passed to
+/// the application unchanged. [`NoE2E`] checks and protects nothing.
+pub trait E2EHandle: Send + Sync + 'static {
+    /// Checks a payload received from `source`.
+    ///
+    /// Returns `None` when no check applies to `message_id`, otherwise the
+    /// status code and the payload to decode: without its protection header
+    /// when the check passes, the original bytes when it fails.
+    /// `upper_header` is the SOME/IP header's bytes 8..16.
+    fn check<'a>(
+        &self,
+        source: IpAddr,
+        message_id: MessageId,
+        payload: &'a [u8],
+        upper_header: [u8; 8],
+    ) -> Option<(NonZeroU8, &'a [u8])>;
+
+    /// Protects `payload` into `out`.
+    ///
+    /// Returns `None` when no protection applies to `message_id`, otherwise
+    /// the number of bytes written to `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`E2EProtectError::BufferTooSmall`] when `out` cannot hold the
+    /// protected payload.
+    fn protect(
+        &self,
+        message_id: MessageId,
+        payload: &[u8],
+        upper_header: [u8; 8],
+        out: &mut [u8],
+    ) -> Option<Result<usize, E2EProtectError>>;
+
+    /// Drops receive state kept for `source`, after `source` rebooted.
+    fn reset_source(&self, source: IpAddr);
+}
+
+impl<T: E2EHandle + ?Sized> E2EHandle for &'static T {
+    fn check<'a>(
+        &self,
+        source: IpAddr,
+        message_id: MessageId,
+        payload: &'a [u8],
+        upper_header: [u8; 8],
+    ) -> Option<(NonZeroU8, &'a [u8])> {
+        (**self).check(source, message_id, payload, upper_header)
+    }
+
+    fn protect(
+        &self,
+        message_id: MessageId,
+        payload: &[u8],
+        upper_header: [u8; 8],
+        out: &mut [u8],
+    ) -> Option<Result<usize, E2EProtectError>> {
+        (**self).protect(message_id, payload, upper_header, out)
+    }
+
+    fn reset_source(&self, source: IpAddr) {
+        (**self).reset_source(source);
+    }
+}
+
+/// Why an [`E2EHandle`] could not protect a payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum E2EProtectError {
+    /// The output buffer is smaller than the protected payload.
+    #[error("protected payload needs {needed} bytes, the buffer holds {available}")]
+    BufferTooSmall {
+        /// Bytes the protected payload needs.
+        needed: usize,
+        /// Bytes the output buffer holds.
+        available: usize,
+    },
+}
+
+/// An [`E2EHandle`] that checks and protects nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoE2E;
+
+impl E2EHandle for NoE2E {
+    fn check<'a>(
+        &self,
+        _source: IpAddr,
+        _message_id: MessageId,
+        _payload: &'a [u8],
+        _upper_header: [u8; 8],
+    ) -> Option<(NonZeroU8, &'a [u8])> {
+        None
+    }
+
+    fn protect(
+        &self,
+        _message_id: MessageId,
+        _payload: &[u8],
+        _upper_header: [u8; 8],
+        _out: &mut [u8],
+    ) -> Option<Result<usize, E2EProtectError>> {
+        None
+    }
+
+    fn reset_source(&self, _source: IpAddr) {}
 }
 
 /// Shared handle to the runtime E2E configuration registry.
@@ -1600,6 +1713,65 @@ mod tests {
 
     use super::probe::{NullE2ERegistry, NullFactory, NullInterface, NullSocket, NullTimer};
     use super::*;
+
+    mod e2e_handle {
+        use super::super::{E2EHandle, E2EProtectError, NoE2E};
+        use crate::protocol::MessageId;
+        use core::net::{IpAddr, Ipv4Addr};
+        use core::num::NonZeroU8;
+
+        const ID: MessageId = MessageId::new_from_service_and_method(0x1234, 0x0001);
+        const SOURCE: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        struct Strip1;
+        impl E2EHandle for Strip1 {
+            fn check<'a>(
+                &self,
+                _source: IpAddr,
+                _message_id: MessageId,
+                payload: &'a [u8],
+                _upper_header: [u8; 8],
+            ) -> Option<(NonZeroU8, &'a [u8])> {
+                Some((NonZeroU8::MIN, &payload[1..]))
+            }
+            fn protect(
+                &self,
+                _message_id: MessageId,
+                _payload: &[u8],
+                _upper_header: [u8; 8],
+                out: &mut [u8],
+            ) -> Option<Result<usize, E2EProtectError>> {
+                Some(Err(E2EProtectError::BufferTooSmall {
+                    needed: out.len() + 1,
+                    available: out.len(),
+                }))
+            }
+            fn reset_source(&self, _source: IpAddr) {}
+        }
+        static STRIP1: Strip1 = Strip1;
+
+        #[test]
+        fn no_e2e_checks_and_protects_nothing() {
+            assert_eq!(NoE2E.check(SOURCE, ID, &[1, 2], [0; 8]), None);
+            assert_eq!(NoE2E.protect(ID, &[1, 2], [0; 8], &mut [0; 4]), None);
+        }
+
+        #[test]
+        fn a_static_reference_is_a_handle() {
+            let handle: &'static dyn E2EHandle = &STRIP1;
+            assert_eq!(
+                handle.check(SOURCE, ID, &[9, 8, 7], [0; 8]),
+                Some((NonZeroU8::MIN, &[8u8, 7][..]))
+            );
+            assert_eq!(
+                handle.protect(ID, &[1], [0; 8], &mut [0; 2]),
+                Some(Err(E2EProtectError::BufferTooSmall {
+                    needed: 3,
+                    available: 2
+                }))
+            );
+        }
+    }
 
     /// `IoErrorKind::is_transient_recv` must classify the well-known
     /// transient kinds as `true` (so they do not count toward
