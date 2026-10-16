@@ -1314,7 +1314,7 @@ where
     /// ```no_run
     /// # use simple_someip::{Client, RawPayload, TokioChannels, VecSdHeader};
     /// # use simple_someip::protocol::sd::{self, RebootFlag, Flags};
-    /// # use std::sync::{Arc, Mutex, RwLock};
+    /// # use std::sync::{Arc, RwLock};
     /// # use std::net::Ipv4Addr;
     /// # async fn demo(
     /// #     client: Client<

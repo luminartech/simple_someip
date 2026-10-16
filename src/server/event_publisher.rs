@@ -127,10 +127,10 @@ where
     ///   protected datagram: at minimum `16 + E2E_header_overhead + payload_len`.
     ///   On the bare-metal path, callers typically supply a `static [u8; N]`.
     ///
-    /// - `protected_buf` — temporary scratch for the E2E protect output
-    ///   (`E2ERegistry::protect` requires disjoint in/out slices). Must be
-    ///   at least as large as the protected payload. Ignored when no E2E key
-    ///   is registered for the message.
+    /// - `protected_buf` — temporary scratch for the
+    ///   [`E2EHandle::protect`](crate::E2EHandle::protect) output, disjoint
+    ///   from `msg_buf`. Must be at least as large as the protected payload.
+    ///   Unused when the handle does not protect the message.
     ///
     /// # Arguments
     /// * `service_id` - Service ID
