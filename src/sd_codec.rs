@@ -151,23 +151,56 @@ pub fn build_subscribe_eventgroup_datagram(
     session: u16,
     reboot: RebootFlag,
 ) -> Result<usize, BuildError> {
-    let entry = Entry::SubscribeEventGroup(EventGroupEntry {
-        index_first_options_run: 0,
-        index_second_options_run: 0,
-        options_count: OptionsCount::new(1, 0),
-        service_id: request.service_id,
-        instance_id: request.instance_id,
-        major_version: request.major_version,
-        ttl: request.ttl,
-        counter: 0,
-        event_group_id: request.event_group_id,
-    });
-    let option = SdOptions::IpV4Endpoint {
-        ip: request.local_ip,
-        port: request.local_rx_port,
-        protocol: TransportProtocol::Udp,
-    };
-    encode_sd_datagram(buf, &[entry], &[option], session, reboot)
+    build_multi_subscribe_eventgroup_datagram::<1>(
+        buf,
+        core::slice::from_ref(request),
+        session,
+        reboot,
+    )
+}
+
+/// Encode a single SD datagram carrying one `SubscribeEventgroup` entry per
+/// element of `requests`, each referencing its own IPv4 endpoint option.
+/// `reboot` sets the SD reboot flag, as in
+/// [`build_subscribe_eventgroup_datagram`].
+///
+/// # Errors
+/// Returns [`BuildError::ListFull`] if `requests` holds more than `N`
+/// elements; otherwise see [`BuildError`].
+pub fn build_multi_subscribe_eventgroup_datagram<const N: usize>(
+    buf: &mut [u8],
+    requests: &[SubscribeEventgroupRequest],
+    session: u16,
+    reboot: RebootFlag,
+) -> Result<usize, BuildError> {
+    const { assert!(N <= 256, "SD option indices are one byte") };
+    if requests.len() > N {
+        return Err(BuildError::ListFull {
+            needed: requests.len(),
+            capacity: N,
+        });
+    }
+    let mut entries: heapless::Vec<Entry, N> = heapless::Vec::new();
+    let mut options: heapless::Vec<SdOptions, N> = heapless::Vec::new();
+    for (index, request) in (0..=u8::MAX).zip(requests) {
+        let _ = entries.push(Entry::SubscribeEventGroup(EventGroupEntry {
+            index_first_options_run: index,
+            index_second_options_run: 0,
+            options_count: OptionsCount::new(1, 0),
+            service_id: request.service_id,
+            instance_id: request.instance_id,
+            major_version: request.major_version,
+            ttl: request.ttl,
+            counter: 0,
+            event_group_id: request.event_group_id,
+        }));
+        let _ = options.push(SdOptions::IpV4Endpoint {
+            ip: request.local_ip,
+            port: request.local_rx_port,
+            protocol: TransportProtocol::Udp,
+        });
+    }
+    encode_sd_datagram(buf, &entries, &options, session, reboot)
 }
 
 /// Encode an `OfferService` datagram into `buf`. Returns its length in
@@ -724,5 +757,73 @@ mod tests {
             assert_eq!(entry.entry_type().unwrap(), EntryType::Subscribe);
             assert_eq!(entry.service_id(), 0x0042);
         }
+    }
+
+    #[test]
+    fn multi_subscribe_entries_each_reference_their_own_endpoint() {
+        let request = |event_group_id, local_rx_port| SubscribeEventgroupRequest {
+            service_id: 0x0042,
+            instance_id: 1,
+            major_version: 1,
+            event_group_id,
+            ttl: 5,
+            local_ip: Ipv4Addr::new(192, 0, 2, 2),
+            local_rx_port,
+        };
+        let requests = [request(1, 30600), request(2, 30601)];
+        let mut buf = [0u8; 256];
+        let len = build_multi_subscribe_eventgroup_datagram::<2>(
+            &mut buf,
+            &requests,
+            3,
+            RebootFlag::Continuous,
+        )
+        .unwrap();
+        let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+        let endpoints: std::vec::Vec<_> = view
+            .entries()
+            .map(|e| {
+                assert_eq!(e.entry_type().unwrap(), EntryType::Subscribe);
+                let (_, _, port) = view
+                    .options()
+                    .nth(usize::from(e.index_first_options_run()))
+                    .expect("the referenced option exists")
+                    .as_ipv4()
+                    .expect("an IPv4 endpoint");
+                (e.event_group_id(), port)
+            })
+            .collect();
+        assert_eq!(endpoints.len(), 2);
+        let expected: std::vec::Vec<_> = requests
+            .iter()
+            .map(|r| (r.event_group_id, r.local_rx_port))
+            .collect();
+        assert_eq!(endpoints, expected);
+    }
+
+    #[test]
+    fn multi_subscribe_rejects_more_requests_than_its_capacity() {
+        let request = SubscribeEventgroupRequest {
+            service_id: 0x0042,
+            instance_id: 1,
+            major_version: 1,
+            event_group_id: 1,
+            ttl: 5,
+            local_ip: Ipv4Addr::new(192, 0, 2, 2),
+            local_rx_port: 30600,
+        };
+        let mut buf = [0u8; 256];
+        assert_eq!(
+            build_multi_subscribe_eventgroup_datagram::<1>(
+                &mut buf,
+                &[request, request],
+                3,
+                RebootFlag::Continuous
+            ),
+            Err(BuildError::ListFull {
+                needed: 2,
+                capacity: 1
+            })
+        );
     }
 }

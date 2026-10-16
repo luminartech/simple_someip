@@ -225,9 +225,9 @@ pub mod tokio_transport;
 /// platform integrates by supplying only its catalog + I/O callbacks.
 #[cfg(feature = "bare_metal")]
 pub mod bare_metal_runtime;
-/// Spawnable, embassy-agnostic async futures (offer announce, subscribe
-/// announce, event RX+dispatch) plus a sync publish helper, so a
-/// bare-metal firmware only spawns futures and provides socket I/O.
+/// Spawnable, embassy-agnostic async futures (offer announce, event
+/// RX+dispatch) plus a sync publish helper, so a bare-metal firmware only
+/// spawns futures and provides socket I/O.
 #[cfg(all(feature = "bare_metal", feature = "server"))]
 pub mod bare_metal_tasks;
 /// `embassy-sync`-backed implementation of [`transport::ChannelFactory`].

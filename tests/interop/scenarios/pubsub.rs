@@ -482,7 +482,7 @@ scenario!(
     /// PRS_SOMEIPSD_00443, 00449 — we subscribe to the peer's eventgroup and receive its events.
     p1_client_subscribes_and_receives_events,
     std = run,
-    bare_metal = ignore("the Subscribe must be sent by unicast to the server's SD endpoint (#174)"),
+    bare_metal = run,
     {
         let mut peer = VsomeipPeer::start();
         peer.send("offer 1234 0001 1 0001 8001 8002 0001");
@@ -718,7 +718,7 @@ scenario!(
     /// maximum TTL answers Offers only after a server reboot.
     p9_client_renews_subscription,
     std = ignore("the std client leaves subscription renewal to its caller (#176)"),
-    bare_metal = ignore("every Offer must be answered with a Subscribe while the subscription is wanted (#175)"),
+    bare_metal = run,
     {
         let mut server = FrameServer::start(REBOOT | UNICAST, Answer::Ack);
         let _rt = Rt::start(client());
@@ -795,7 +795,7 @@ scenario!(
     /// PRS_SOMEIPSD_00501 — we answer the server's Offer with a unicast SD message.
     p10_client_subscribes_by_unicast,
     std = run,
-    bare_metal = ignore("the Subscribe must be sent by unicast to the server's SD endpoint (#174)"),
+    bare_metal = run,
     {
         let mut server = FrameServer::start(REBOOT | UNICAST, Answer::Ack);
         let _rt = Rt::start(client());
