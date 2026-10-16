@@ -39,7 +39,6 @@ categories = ["network-programming", "embedded", "no-std", "encoding"]
 # chosen deliberately (see .github/workflows/main.yml).
 
 [dependencies]
-crc = "3.4"
 # embassy-sync provides no_std-compatible bounded channels used as the
 # channel backend when the `bare_metal` feature is active. The
 # `critical-section` and `portable-atomic` deps ship with embassy-sync and
@@ -130,8 +129,8 @@ _alloc = []
 # itself uses `futures::select!` so `dep:futures` lives here.
 # `server-tokio` adds the tokio + socket2 convenience defaults
 # (`Server::new`, `Server::new_with_loopback`, `Server::new_passive`),
-# bringing `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>` /
-# / `TokioTransport` / `TokioTimer` defaults into scope, and forces
+# bringing `NoE2E` / `Arc<RwLock<SubscriptionManager>>` /
+# `TokioTransport` / `TokioTimer` defaults into scope, and forces
 # `std`.
 #
 # `server` itself is alloc-free: the no-alloc path is

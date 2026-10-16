@@ -1280,12 +1280,12 @@ where
     /// ```no_run
     /// # use simple_someip::{Client, RawPayload, TokioChannels, VecSdHeader};
     /// # use simple_someip::protocol::sd::{self, RebootFlag, Flags};
-    /// # use std::sync::{Arc, Mutex, RwLock};
+    /// # use std::sync::{Arc, RwLock};
     /// # use std::net::Ipv4Addr;
     /// # async fn demo(
     /// #     client: Client<
     /// #         RawPayload,
-    /// #         Arc<Mutex<simple_someip::e2e::E2ERegistry>>,
+    /// #         simple_someip::NoE2E,
     /// #         Arc<RwLock<Ipv4Addr>>,
     /// #         TokioChannels,
     /// #     >,

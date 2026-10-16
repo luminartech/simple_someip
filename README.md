@@ -56,7 +56,7 @@ simple-someip = { version = "0.8", features = ["client-tokio", "server-tokio"] }
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `std` | **yes** | Enables `thiserror`, `tracing`, and `embedded-io/std`. The `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<…>>` default lock-handle impls (used by the tokio backends) live behind this gate. |
+| `std` | **yes** | Enables `thiserror`, `tracing`, and `embedded-io/std`. The `Arc<RwLock<…>>` default lock-handle impls (used by the tokio backends) live behind this gate. |
 | `client` | no | Client trait surface. Pure `no_std`-clean (does not pull `extern crate alloc`). Caller supplies trait impls for transport / channels / spawner / timer / lock handles. |
 | `client-tokio` | no | Adds `Client::new` / `TokioSpawner` / `TokioTransport` defaults; implies `client` + std + tokio + socket2. |
 | `server` | no | Server trait surface. Pulls `extern crate alloc` (for `Arc<EventPublisher>` / `Arc<F::Socket>`); on no_std, downstream consumers must provide a `#[global_allocator]`. |
