@@ -27,7 +27,7 @@ use super::error::Error;
 use super::socket_manager::SocketManager;
 use crate::traits::PayloadWireFormat;
 use crate::transport::{
-    BufferProvider, ChannelFactory, E2ERegistryHandle, LocalSpawner, Spawner, TransportFactory,
+    BufferProvider, ChannelFactory, E2EHandle, LocalSpawner, Spawner, TransportFactory,
     TransportSocket,
 };
 
@@ -37,7 +37,7 @@ pub(super) trait BindDispatch<MD, C, R>
 where
     MD: PayloadWireFormat + Clone + core::fmt::Debug + Send + 'static,
     C: ChannelFactory,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     Result<super::socket_manager::ReceivedMessage<MD>, Error>:
         crate::transport::BoundedPooled<C, 16>,
     super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
@@ -95,7 +95,7 @@ impl<MD, C, R, F, S, BP> BindDispatch<MD, C, R> for SpawnerDispatch<F, S, BP>
 where
     MD: PayloadWireFormat + Clone + core::fmt::Debug + Send + 'static,
     C: ChannelFactory,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     F: TransportFactory + Send + Sync + 'static,
     F::Socket: Send + Sync + 'static,
     for<'a> F::BindFuture<'a>: Send,
@@ -201,7 +201,7 @@ impl<MD, C, R, F, S, BP> BindDispatch<MD, C, R> for LocalSpawnerDispatch<F, S, B
 where
     MD: PayloadWireFormat + Clone + core::fmt::Debug + Send + 'static,
     C: ChannelFactory,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     F: TransportFactory + 'static,
     F::Socket: 'static,
     S: LocalSpawner + 'static,

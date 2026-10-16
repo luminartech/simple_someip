@@ -2,7 +2,7 @@
 //!
 //! 1. **Flash-size probe** (phase 20-pre): mirrors halo PR #4429's
 //!    `rust_simple_someip` C-callable FFI surface (header
-//!    encode/decode + E2E protect/check round-trips) to get a
+//!    encode/decode) to get a
 //!    realistic post-link flash-size floor for what a Halo TC4D
 //!    `rust_simple_someip` staticlib would cost.
 //! 2. **Client-future layout probe** (PR 0, issue #125): instantiates
@@ -26,8 +26,8 @@ use core::slice;
 /// Stub allocator that returns null on every `alloc` call. Some
 /// transitive dep pulls `extern crate alloc` even with simple-someip's
 /// `default-features = false`, requiring a `#[global_allocator]`
-/// link target. The codec-only FFI surface (header encode + E2E
-/// protect/check) never actually allocates, and the client layout
+/// link target. The codec-only FFI surface (header encode) never
+/// actually allocates, and the client layout
 /// probe rides the `client,bare_metal` combo certified alloc-free by
 /// the TC4 audit (CI's `nm` alloc-symbol gate), so a `null_mut()`
 /// return is sound for the probe — if any code path ever does try to alloc,
@@ -50,10 +50,6 @@ unsafe impl GlobalAlloc for NullAllocator {
 static ALLOC: NullAllocator = NullAllocator;
 
 use simple_someip::WireFormat;
-use simple_someip::e2e::{
-    Profile4Config, Profile4State, Profile5Config, Profile5State, check_profile4, check_profile5,
-    protect_profile4, protect_profile5,
-};
 use simple_someip::protocol::{Header, MessageId, MessageTypeField, ReturnCode};
 
 /// Required for no_std staticlib targeting thumbv7em.
@@ -123,115 +119,6 @@ pub unsafe extern "C" fn someip_header_encode(
     header.encode(&mut &mut out[..]).unwrap_or(0)
 }
 
-// ── E2E Profile 4 protect + check ───────────────────────────────────
-
-#[repr(C)]
-pub struct E2eRoundTripResult {
-    pub ok: i32,
-    pub protected_len: u32,
-    pub check_status: u8,
-    pub counter: u32,
-    pub payload_match: i32,
-}
-
-/// # Safety
-/// Caller must ensure `payload` points to at least `payload_len`
-/// readable bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn e2e_profile4_round_trip(
-    payload: *const u8,
-    payload_len: usize,
-    initial_counter: u16,
-) -> E2eRoundTripResult {
-    let mut out = E2eRoundTripResult {
-        ok: 0,
-        protected_len: 0,
-        check_status: 0,
-        counter: 0,
-        payload_match: 0,
-    };
-    if payload.is_null() {
-        return out;
-    }
-    let payload = unsafe { slice::from_raw_parts(payload, payload_len) };
-
-    let config = Profile4Config::new(0x1234_5678, 15);
-    let mut protect_state = Profile4State::with_initial_counter(initial_counter);
-
-    // Probe-only stack buffer; production code uses caller-supplied storage.
-    let mut buf = [0u8; 1500];
-    let Some(needed) = payload_len.checked_add(12) else {
-        return out;
-    };
-    if buf.len() < needed {
-        return out;
-    }
-    let Ok(protected_len) = protect_profile4(&config, &mut protect_state, payload, &mut buf) else {
-        return out;
-    };
-
-    let mut check_state = Profile4State::with_initial_counter(initial_counter);
-    let result = check_profile4(&config, &mut check_state, &buf[..protected_len]);
-
-    out.ok = 1;
-    out.protected_len = protected_len as u32;
-    out.check_status = result.status as u8;
-    out.counter = result.counter.unwrap_or(0);
-    out.payload_match = i32::from(result.payload == Some(payload));
-    out
-}
-
-// ── E2E Profile 5 protect + check ───────────────────────────────────
-
-/// # Safety
-/// Caller must ensure `payload` points to at least `payload_len`
-/// readable bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn e2e_profile5_round_trip(
-    payload: *const u8,
-    payload_len: usize,
-    initial_counter: u16,
-) -> E2eRoundTripResult {
-    let mut out = E2eRoundTripResult {
-        ok: 0,
-        protected_len: 0,
-        check_status: 0,
-        counter: 0,
-        payload_match: 0,
-    };
-    if payload.is_null() {
-        return out;
-    }
-    let payload = unsafe { slice::from_raw_parts(payload, payload_len) };
-
-    let Ok(payload_len_u16) = u16::try_from(payload_len) else {
-        return out;
-    };
-    let config = Profile5Config::new(0x1234, payload_len_u16, 15);
-    let mut protect_state = Profile5State::with_initial_counter((initial_counter & 0xFF) as u8);
-
-    let mut buf = [0u8; 1500];
-    let Some(needed) = payload_len.checked_add(4) else {
-        return out;
-    };
-    if buf.len() < needed {
-        return out;
-    }
-    let Ok(protected_len) = protect_profile5(&config, &mut protect_state, payload, &mut buf) else {
-        return out;
-    };
-
-    let mut check_state = Profile5State::with_initial_counter((initial_counter & 0xFF) as u8);
-    let result = check_profile5(&config, &mut check_state, &buf[..protected_len]);
-
-    out.ok = 1;
-    out.protected_len = protected_len as u32;
-    out.check_status = result.status as u8;
-    out.counter = result.counter.unwrap_or(0);
-    out.payload_match = i32::from(result.payload == Some(payload));
-    out
-}
-
 // ── Client-future layout probe (PR 0, issue #125) ────────────────────
 //
 // Instantiates the client's run-future and (transitively) the
@@ -249,9 +136,8 @@ mod client_future_probe {
     use simple_someip::protocol::{MessageId, sd};
     use simple_someip::static_channels::BufferPool;
     use simple_someip::transport::StaticBufferProvider;
-    use simple_someip::transport::probe::{
-        NullE2ERegistry, NullFactory, NullInterface, NullSpawner, NullTimer,
-    };
+    use simple_someip::NoE2E;
+    use simple_someip::transport::probe::{NullFactory, NullInterface, NullSpawner, NullTimer};
     use simple_someip::{Client, ClientDeps, PayloadWireFormat, UDP_BUFFER_SIZE, WireFormat};
 
     // `RawPayload` is std-gated (heap `Vec` SD storage), so the probe
@@ -404,13 +290,13 @@ mod client_future_probe {
             factory: NullFactory,
             spawner: NullSpawner,
             timer: NullTimer,
-            e2e_registry: NullE2ERegistry,
+            e2e_registry: NoE2E,
             interface: NullInterface(core::net::Ipv4Addr::LOCALHOST),
             buffer_provider: StaticBufferProvider(&POOL),
         };
         let (_client, _updates, run_fut) = Client::<
             ProbePayload,
-            NullE2ERegistry,
+            NoE2E,
             NullInterface,
             ProbeChannels,
         >::new_with_deps(deps, false);

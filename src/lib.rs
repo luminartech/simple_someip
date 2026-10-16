@@ -8,7 +8,7 @@
 //! automotive communication protocol — remote procedure calls, event notifications, service
 //! discovery, and wire-format serialization.
 //!
-//! The core protocol layer (`protocol`, `e2e`, and trait modules) is `no_std`-compatible with
+//! The core protocol layer (`protocol` and trait modules) is `no_std`-compatible with
 //! zero heap allocation, making it suitable for embedded targets. Optional `client` and `server`
 //! modules provide async tokio-based networking for `std` environments.
 //!
@@ -17,7 +17,6 @@
 //! | Module | `no_std` | Description |
 //! |--------|----------|-------------|
 //! | [`protocol`] | Yes | Wire format: headers, messages, message types, return codes, and service discovery (SD) entries/options |
-//! | [`e2e`] | Yes | End-to-End protection — Profile 4 (CRC-32) and Profile 5 (CRC-16) |
 //! | [`Encode`] / [`PayloadWireFormat`] | Yes | Traits for serializing messages and defining custom payload types |
 //! | `client` | No | Async client trait surface — service discovery, subscriptions, request/response (feature `client`; add `client-tokio` for `Client::new`) |
 //! | `server` | No | Async server trait surface — service offering, event publishing, subscription management (feature `server`; add `server-tokio` for `Server::new`) |
@@ -26,18 +25,18 @@
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `std` | yes | Enables std-dependent helpers (`RawPayload`, `VecSdHeader`) and the `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<…>>` default lock-handle impls used by the tokio backends. |
-//! | `client` | no | Trait-surface client. Pure `no_std`-clean (does not pull `extern crate alloc`). Caller supplies `Spawner` / `Timer` / `ChannelFactory` / `TransportFactory` / `E2ERegistryHandle` / `InterfaceHandle` impls. |
+//! | `std` | yes | Enables std-dependent helpers (`RawPayload`, `VecSdHeader`) and the `Arc<RwLock<…>>` default lock-handle impl used by the tokio backends. |
+//! | `client` | no | Trait-surface client. Pure `no_std`-clean (does not pull `extern crate alloc`). Caller supplies `Spawner` / `Timer` / `ChannelFactory` / `TransportFactory` / `E2EHandle` / `InterfaceHandle` impls. |
 //! | `client-tokio` | no | Adds the `Client::new` / `TokioSpawner` / `TokioTransport` convenience defaults; implies `client` + std + tokio + socket2. |
 //! | `server` | no | Trait-surface server. Alloc-free since PR #124: the no-alloc path is `Server::new_with_handles` + `run_with_buffers` with static handles. The `Arc`-backed conveniences (`new_with_deps`, `run`) are gated behind the internal `_alloc` feature (pulled in by `std` / `embassy_channels`). |
 //! | `server-tokio` | no | Adds the `Server::new` / `TokioTransport` / `TokioTimer` convenience defaults; implies `server` + std + tokio + socket2. |
-//! | `bare_metal` | no | Activates embassy-sync, the `static_channels` module (no-alloc `ChannelFactory`), `AtomicInterfaceHandle`, `StaticE2EHandle`, and `StaticSubscriptionHandle`. All five are pure `no_std` (no allocator required). See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable bare-metal integration examples. |
+//! | `bare_metal` | no | Activates embassy-sync, the `static_channels` module (no-alloc `ChannelFactory`), `AtomicInterfaceHandle`, and `StaticSubscriptionHandle`. All four are pure `no_std` (no allocator required). See `examples/bare_metal_client/` and `examples/bare_metal_server/` for runnable bare-metal integration examples. |
 //! | `embassy_channels` | no | Heap-backed `EmbassySyncChannels` `ChannelFactory`. Implies `bare_metal` and pulls `extern crate alloc;` into the crate; **on `no_std`, downstream consumers must provide a `#[global_allocator]`**. Useful for tests / early prototypes before sizing static pools. |
 //!
 //! The default feature set is `["std"]`, which links `std` and enables
 //! the `RawPayload` / `VecSdHeader` helpers. For a minimal build with
-//! no allocator requirement — the `protocol`, trait, `transport`, and
-//! `e2e` modules only — pass `--no-default-features`. The
+//! no allocator requirement — the `protocol`, trait and `transport`
+//! modules only — pass `--no-default-features`. The
 //! trait-surface canary workspace members (`examples/bare_metal_client`,
 //! `examples/bare_metal_server`) depend on the crate with
 //! `default-features = false, features = ["bare_metal", "client"]` /
@@ -189,13 +188,12 @@ pub mod capacity;
 /// SOME/IP client for discovering services and exchanging messages.
 #[cfg(feature = "client")]
 pub mod client;
-/// End-to-end (E2E) protection utilities for SOME/IP payloads.
-pub mod e2e;
 /// no_std / no-alloc [`PayloadWireFormat`] mirroring the std-only
 /// `RawPayload` with `heapless::Vec`-backed storage. Available whenever
 /// the `bare_metal` feature is enabled.
 #[cfg(feature = "bare_metal")]
 pub mod heapless_payload;
+#[cfg(any(feature = "client", feature = "server"))]
 mod log;
 mod net_endpoint;
 /// SOME/IP protocol primitives: headers, messages, return codes, and service discovery.
@@ -206,13 +204,13 @@ mod raw_payload;
 /// SOME/IP server for offering services and handling incoming requests.
 ///
 /// The engine is generic over [`transport::TransportFactory`] +
-/// [`transport::Timer`] + [`transport::E2ERegistryHandle`] +
+/// [`transport::Timer`] + [`transport::E2EHandle`] +
 /// [`server::SubscriptionHandle`], so the bare `server` feature exposes the
 /// trait-surface server. The `server-tokio` feature additionally provides
 /// the tokio convenience constructors (`server::Server::new`,
 /// `server::Server::new_with_loopback`, `server::Server::new_passive`)
 /// that default the type parameters to
-/// `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>` /
+/// `NoE2E` / `Arc<RwLock<SubscriptionManager>>` /
 /// `TokioTransport` / `TokioTimer`.
 #[cfg(feature = "server")]
 pub mod server;
@@ -279,7 +277,6 @@ pub use client::{
 // the public-API contract and tempt generic users into hitting the
 // `ClientChannelTypes` elaboration limit at the wrong call site.
 pub use capacity::CapacityKind;
-pub use e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 #[cfg(feature = "server")]
 pub use server::{
     NonSdRequestCallback, Server, ServerDeps, ServerHandles, ServerStorage, SubscriptionHandle,
@@ -289,12 +286,11 @@ pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, 
 #[cfg(feature = "bare_metal")]
 pub use transport::AtomicInterfaceHandle;
 pub use transport::{
-    ChannelFactory, E2ERegistryHandle, InterfaceHandle, IoErrorKind, LocalSpawner, MpscRecv,
-    MpscSend, OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram, SocketOptions, Spawner,
-    Timer, TransportError, TransportFactory, TransportSocket, UnboundedRecv, UnboundedSend,
+    ChannelFactory, E2EHandle, E2EProtectError, InterfaceHandle, IoErrorKind, LocalSpawner,
+    MpscRecv, MpscSend, NoE2E, OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram,
+    SocketOptions, Spawner, Timer, TransportError, TransportFactory, TransportSocket,
+    UnboundedRecv, UnboundedSend,
 };
-#[cfg(feature = "bare_metal")]
-pub use transport::{StaticE2EHandle, StaticE2EStorage};
 
 /// Parse a decimal `usize` from a compile-time optional env var string.
 ///
@@ -303,11 +299,7 @@ pub use transport::{StaticE2EHandle, StaticE2EStorage};
 /// injected by the host build system (e.g. `CMake` via `.cargo/config.toml`).
 /// Returns `default` when the variable is absent or empty.
 /// Panics at compile time if the string contains a non-digit character.
-///
-/// Ungated: `e2e` is compiled unconditionally and sizes its registry caps
-/// through this, so there is no feature combination in which this is dead
-/// code. (It was previously gated on `server`/`client`, back when every
-/// caller lived in one of those modules.)
+#[cfg(any(feature = "client", feature = "server"))]
 pub(crate) const fn from_env_or(var: Option<&'static str>, default: usize) -> usize {
     match var {
         None => default,

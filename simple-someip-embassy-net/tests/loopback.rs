@@ -400,11 +400,11 @@ use core::pin::Pin;
 use core::task::Poll;
 use std::sync::RwLock;
 
+use simple_someip::NoE2E;
 use simple_someip::PayloadWireFormat;
 use simple_someip::client::Error as ClientError;
 use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::define_static_channels;
-use simple_someip::e2e::E2ERegistry;
 use simple_someip::protocol::sd::RebootFlag;
 use simple_someip::protocol::{
     Header as SomeIpHeader, Message, MessageId, MessageType, MessageTypeField, ReturnCode,
@@ -592,8 +592,7 @@ async fn client_receives_server_sd_announcement() {
             let server_pool: &'static SocketPool<8, LINK_MTU, LINK_MTU> =
                 Box::leak(Box::new(SocketPool::new()));
             let server_factory = EmbassyNetFactory::new(stack_a, server_pool);
-            let server_e2e: Arc<std::sync::Mutex<E2ERegistry>> =
-                Arc::new(std::sync::Mutex::new(E2ERegistry::new()));
+            let server_e2e: NoE2E = NoE2E;
             let server_subs = MockSubscriptions::default();
             // Service id 0x5BAA (just a witness) at port 30500 on
             // stack A's interface IP.
@@ -639,8 +638,7 @@ async fn client_receives_server_sd_announcement() {
             let client_pool: &'static SocketPool<8, LINK_MTU, LINK_MTU> =
                 Box::leak(Box::new(SocketPool::new()));
             let client_factory = EmbassyNetFactory::new(stack_b, client_pool);
-            let client_e2e: Arc<std::sync::Mutex<E2ERegistry>> =
-                Arc::new(std::sync::Mutex::new(E2ERegistry::new()));
+            let client_e2e: NoE2E = NoE2E;
             let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(IP_B));
 
             let buf_pool: &'static BufferPool<2, LINK_MTU> = Box::leak(Box::new(BufferPool::new()));
@@ -653,13 +651,14 @@ async fn client_receives_server_sd_announcement() {
                 buffer_provider: StaticBufferProvider(buf_pool),
             };
 
-            let (client, mut updates, run_fut) =
-                Client::<
-                    RawPayload,
-                    Arc<std::sync::Mutex<E2ERegistry>>,
-                    Arc<RwLock<Ipv4Addr>>,
-                    LoopbackTestChannels,
-                >::new_with_deps_local(client_deps, false);
+            let (client, mut updates, run_fut) = Client::<
+                RawPayload,
+                NoE2E,
+                Arc<RwLock<Ipv4Addr>>,
+                LoopbackTestChannels,
+            >::new_with_deps_local(
+                client_deps, false
+            );
             tokio::task::spawn_local(run_fut);
 
             client.bind_discovery().await.expect("bind_discovery");
@@ -719,8 +718,7 @@ async fn client_send_request_server_runloop_stable() {
             let server_pool: &'static SocketPool<8, LINK_MTU, LINK_MTU> =
                 Box::leak(Box::new(SocketPool::new()));
             let server_factory = EmbassyNetFactory::new(stack_a, server_pool);
-            let server_e2e: Arc<std::sync::Mutex<E2ERegistry>> =
-                Arc::new(std::sync::Mutex::new(E2ERegistry::new()));
+            let server_e2e: NoE2E = NoE2E;
             let server_subs = MockSubscriptions::default();
             let service_id = 0x5BBB_u16;
             let instance_id = 1_u16;
@@ -763,8 +761,7 @@ async fn client_send_request_server_runloop_stable() {
             let client_pool: &'static SocketPool<8, LINK_MTU, LINK_MTU> =
                 Box::leak(Box::new(SocketPool::new()));
             let client_factory = EmbassyNetFactory::new(stack_b, client_pool);
-            let client_e2e: Arc<std::sync::Mutex<E2ERegistry>> =
-                Arc::new(std::sync::Mutex::new(E2ERegistry::new()));
+            let client_e2e: NoE2E = NoE2E;
             let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(IP_B));
 
             let buf_pool: &'static BufferPool<8, LINK_MTU> = Box::leak(Box::new(BufferPool::new()));
@@ -779,7 +776,7 @@ async fn client_send_request_server_runloop_stable() {
 
             let (client, _updates, run_fut) = Client::<
                 RawPayload,
-                Arc<std::sync::Mutex<E2ERegistry>>,
+                NoE2E,
                 Arc<RwLock<Ipv4Addr>>,
                 LoopbackTestChannels,
             >::new_with_deps_local(client_deps, false);

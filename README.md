@@ -13,9 +13,9 @@ The library supports both `std` and `no_std` environments, making it suitable fo
 
 ## Features
 
-- **`no_std` compatible** — `protocol`, `traits`, `transport`, and `e2e` modules work without the standard library
+- **`no_std` compatible** — `protocol`, `traits`, and `transport` modules work without the standard library
 - **Service Discovery** — SD entry/option encoding and decoding via fixed-capacity `heapless` collections (no heap allocation)
-- **End-to-End protection** — Profile 4 (CRC-32) and Profile 5 (CRC-16) with zero-allocation APIs
+- **End-to-end protection hook** — an `E2EHandle` checks received and protects sent payloads; `NoE2E` does neither
 - **Executor-agnostic transport traits** — `TransportSocket`, `TransportFactory`, `Timer`, `Spawner` (default `tokio` impls behind feature gates)
 - **Async client and server** — tokio-based, gated behind optional feature flags
 - **`embedded-io`** traits for serialization — abstracts over `std::io::Read`/`Write`
@@ -25,7 +25,6 @@ The library supports both `std` and `no_std` environments, making it suitable fo
 - `protocol` — Wire format layer: SOME/IP header, `MessageId`, `MessageType`, `ReturnCode`, SD entries/options
 - `traits` — `PayloadWireFormat` trait (built on `automotive_wire_codec::Encode`) for custom message types
 - `transport` — Executor-agnostic UDP socket / factory / timer / spawner traits (no_std-compatible)
-- `e2e` — End-to-End protection profiles (always available, no heap allocation)
 - `tokio_transport` — Default `std + tokio` impls of the transport traits (requires `feature = "client-tokio"` or `feature = "server-tokio"`)
 - `client` — High-level async client trait surface (requires `feature = "client"`; add `client-tokio` for the `Client::new` convenience constructor)
 - `server` — Async server with SD announcements and event publishing (requires `feature = "server"`; add `server-tokio` for the `Server::new` convenience constructor)
@@ -39,7 +38,7 @@ Add to your `Cargo.toml`:
 # Default — includes std, thiserror, and tracing
 simple-someip = "0.8"
 
-# no_std only (protocol/transport/E2E/traits, no heap allocation)
+# no_std only (protocol/transport/traits, no heap allocation)
 simple-someip = { version = "0.8", default-features = false }
 
 # Client only (with tokio convenience constructors)
@@ -56,15 +55,15 @@ simple-someip = { version = "0.8", features = ["client-tokio", "server-tokio"] }
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `std` | **yes** | Enables `thiserror`, `tracing`, and `embedded-io/std`. The `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<…>>` default lock-handle impls (used by the tokio backends) live behind this gate. |
+| `std` | **yes** | Enables `thiserror`, `tracing`, and `embedded-io/std`. The `Arc<RwLock<…>>` default lock-handle impls (used by the tokio backends) live behind this gate. |
 | `client` | no | Client trait surface. Pure `no_std`-clean (does not pull `extern crate alloc`). Caller supplies trait impls for transport / channels / spawner / timer / lock handles. |
 | `client-tokio` | no | Adds `Client::new` / `TokioSpawner` / `TokioTransport` defaults; implies `client` + std + tokio + socket2. |
 | `server` | no | Server trait surface. Pulls `extern crate alloc` (for `Arc<EventPublisher>` / `Arc<F::Socket>`); on no_std, downstream consumers must provide a `#[global_allocator]`. |
 | `server-tokio` | no | Adds `Server::new` / `TokioTimer` / `TokioTransport` defaults; implies `server` + std + tokio + socket2. |
-| `bare_metal` | no | Activates embassy-sync, no-alloc `static_channels` module, `AtomicInterfaceHandle`, `StaticE2EHandle`, and `StaticSubscriptionHandle` — all five pure `no_std` (no allocator required). See `examples/bare_metal_client` and `examples/bare_metal_server`; verify with `cargo build -p bare_metal_client` (NOT `cargo build --workspace`, which can unify features). |
+| `bare_metal` | no | Activates embassy-sync, no-alloc `static_channels` module, `AtomicInterfaceHandle`, and `StaticSubscriptionHandle` — all four pure `no_std` (no allocator required). See `examples/bare_metal_client` and `examples/bare_metal_server`; verify with `cargo build -p bare_metal_client` (NOT `cargo build --workspace`, which can unify features). |
 | `embassy_channels` | no | Heap-backed `EmbassySyncChannels` (implies `bare_metal` + `alloc`). Useful for tests before sizing static pools. |
 
-By default the crate enables `std`. To use in a `no_std` environment (e.g., embedded targets), disable default features with `default-features = false`. In that mode the `protocol`, `traits`, `transport`, and `e2e` modules are always available; `client` / `server` are usable too (the trait surfaces compile in pure no_std), but the tokio convenience defaults (`Client::new`, `Server::new`) live behind `client-tokio` / `server-tokio` and require std. The `cargo build --target thumbv7em-none-eabihf --no-default-features --features client,server,bare_metal` cross-build is verified in CI on every PR.
+By default the crate enables `std`. To use in a `no_std` environment (e.g., embedded targets), disable default features with `default-features = false`. In that mode the `protocol`, `traits`, and `transport` modules are always available; `client` / `server` are usable too (the trait surfaces compile in pure no_std), but the tokio convenience defaults (`Client::new`, `Server::new`) live behind `client-tokio` / `server-tokio` and require std. The `cargo build --target thumbv7em-none-eabihf --no-default-features --features client,server,bare_metal` cross-build is verified in CI on every PR.
 
 ## Quick Start
 
@@ -97,7 +96,7 @@ async fn main() {
     while let Some(update) = updates.recv().await {
         match update {
             ClientUpdate::DiscoveryUpdated(msg) => { /* SD message */ }
-            ClientUpdate::Unicast { message, e2e_status } => { /* unicast reply */ }
+            ClientUpdate::Unicast { message, e2e_status, .. } => { /* unicast reply */ }
             ClientUpdate::SenderRebooted(addr) => { /* remote reboot detected */ }
             ClientUpdate::Error(err) => { /* error */ }
         }

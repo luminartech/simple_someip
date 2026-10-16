@@ -27,14 +27,13 @@ pub use sd_state::SdStateManager;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::Timer;
-use crate::e2e::{E2EKey, E2EProfile};
 #[cfg(feature = "_alloc")]
 use crate::protocol::sd;
 #[cfg(feature = "_alloc")]
 use crate::transport::SocketOptions;
 #[cfg(feature = "_alloc")]
 use crate::transport::WrappableSharedHandle;
-use crate::transport::{E2ERegistryHandle, SharedHandle, TransportFactory, TransportSocket};
+use crate::transport::{E2EHandle, SharedHandle, TransportFactory, TransportSocket};
 #[cfg(feature = "_alloc")]
 use alloc::sync::Arc;
 use core::net::Ipv4Addr;
@@ -42,9 +41,7 @@ use core::net::Ipv4Addr;
 use core::net::SocketAddrV4;
 
 #[cfg(feature = "server-tokio")]
-use crate::e2e::E2ERegistry;
-#[cfg(feature = "server-tokio")]
-use std::sync::Mutex;
+use crate::transport::NoE2E;
 #[cfg(feature = "server-tokio")]
 use tokio::sync::RwLock;
 
@@ -435,14 +432,15 @@ pub struct ServerDeps<F, Tm, R, Sub>
 where
     F: TransportFactory,
     Tm: Timer,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     Sub: SubscriptionHandle,
 {
     /// Transport factory used to bind the unicast and SD sockets.
     pub factory: F,
     /// Async sleep primitive used by the announcement loop's 1-second tick.
     pub timer: Tm,
-    /// Shared E2E registry handle for runtime E2E configuration.
+    /// The [`E2EHandle`] that checks received and
+    /// protects sent payloads; [`crate::NoE2E`] for neither.
     pub e2e_registry: R,
     /// Shared subscription manager handle. The convenience constructor
     /// `Server::new` (under `server-tokio`) builds an
@@ -463,7 +461,7 @@ where
 ///
 /// Available under the `server-tokio` feature. Returns a `ServerDeps`
 /// pre-populated with `TokioTransport` / `TokioTimer` and a fresh
-/// `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<SubscriptionManager>>`.
+/// `NoE2E` / `Arc<RwLock<SubscriptionManager>>`.
 /// Combine with the [`ServerDeps::with_factory`] /
 /// [`ServerDeps::with_timer`] / [`ServerDeps::with_e2e_registry`] /
 /// [`ServerDeps::with_subscriptions`] builders to override individual
@@ -489,7 +487,7 @@ impl
     ServerDeps<
         crate::tokio_transport::TokioTransport,
         crate::tokio_transport::TokioTimer,
-        Arc<Mutex<E2ERegistry>>,
+        NoE2E,
         Arc<RwLock<SubscriptionManager>>,
     >
 {
@@ -499,7 +497,7 @@ impl
         Self {
             factory: crate::tokio_transport::TokioTransport,
             timer: crate::tokio_transport::TokioTimer,
-            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            e2e_registry: NoE2E,
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
             non_sd_observer: None,
         }
@@ -515,7 +513,7 @@ impl<F, Tm, R, Sub> ServerDeps<F, Tm, R, Sub>
 where
     F: TransportFactory,
     Tm: Timer,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     Sub: SubscriptionHandle,
 {
     /// Replace the `factory` field, returning a `ServerDeps` over the
@@ -543,8 +541,8 @@ where
     }
 
     /// Replace the `e2e_registry` field, returning a `ServerDeps` over
-    /// the new registry-handle type.
-    pub fn with_e2e_registry<R2: E2ERegistryHandle>(
+    /// the new [`E2EHandle`] type.
+    pub fn with_e2e_registry<R2: E2EHandle + Clone>(
         self,
         e2e_registry: R2,
     ) -> ServerDeps<F, Tm, R2, Sub> {
@@ -645,7 +643,7 @@ pub struct ServerStorage<F, Tm, R, Sub, H, Hsd, Hep>
 where
     F: TransportFactory + 'static,
     Tm: Timer,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     Sub: SubscriptionHandle,
     H: SharedHandle<F::Socket>,
     Hsd: SharedHandle<SdStateManager>,
@@ -659,7 +657,8 @@ where
     /// Async sleep primitive used by the announcement loop's
     /// 1-second tick.
     pub timer: Tm,
-    /// Shared E2E registry handle for runtime E2E configuration.
+    /// The [`E2EHandle`] that checks received and
+    /// protects sent payloads; [`crate::NoE2E`] for neither.
     pub e2e_registry: R,
     /// Shared subscription manager handle.
     pub subscriptions: Sub,
@@ -698,7 +697,7 @@ where
 /// - `F: TransportFactory` — socket primitive (carried as a stored
 ///   unit-struct in the tokio path; bare-metal impls may carry state)
 /// - `Tm: Timer` — async sleep used by the announcement loop
-/// - `R: E2ERegistryHandle` — runtime E2E configuration registry
+/// - `R: E2EHandle + Clone` — the E2E hook
 /// - `Sub: SubscriptionHandle` — event-group subscription state
 ///
 /// The generic order mirrors [`ServerDeps`] (and, for the shared
@@ -707,7 +706,7 @@ where
 ///
 /// The convenience constructors `Self::new` / `Self::new_with_loopback`
 /// / `Self::new_passive` (under the `server-tokio` feature) instantiate
-/// these as `TokioTransport` / `TokioTimer` / `Arc<Mutex<E2ERegistry>>`
+/// these as `TokioTransport` / `TokioTimer` / `NoE2E`
 /// / `Arc<RwLock<SubscriptionManager>>`. Bare-metal callers use
 /// [`Self::new_with_deps`] (under `server`) and supply their own.
 /// Default shared-handle types for the `Server`'s `H` / `Hsd` / `Hep`
@@ -744,7 +743,7 @@ pub struct Server<
     F: TransportFactory + 'static,
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     Sub: SubscriptionHandle,
     H: SharedHandle<F::Socket>,
     Hsd: SharedHandle<SdStateManager>,
@@ -768,7 +767,7 @@ pub struct Server<
     /// shared-storage `Hsd` chose (`Arc<SdStateManager>` on std,
     /// `&'static SdStateManager` on bare-metal-no-alloc).
     sd_state: Hsd,
-    /// Shared E2E registry for runtime E2E configuration
+    /// Checks received and protects sent payloads.
     e2e_registry: R,
     /// Transport factory. Used at construction time to bind sockets;
     /// retained on the struct so bare-metal factories that carry state
@@ -809,8 +808,8 @@ pub struct Server<
 /// requests / fire-and-forget calls to the offered services). The
 /// SOME/IP header is parsed in `recv_loop` and the callback receives
 /// decoded fields — the consumer never parses bytes. `payload` is the
-/// bytes after the 16-byte SOME/IP header. `e2e_status` is `0`
-/// (unchecked) — server-side request E2E is not applied here today.
+/// bytes after the 16-byte SOME/IP header. `e2e_status` is `0` when not
+/// checked, otherwise the code the server's [`E2EHandle`] returned.
 /// `source` is the sender's address, currently unused by known
 /// consumers (future-proofing).
 ///
@@ -858,7 +857,7 @@ type StartedLatch = &'static AtomicBool;
 #[cfg(feature = "server-tokio")]
 type DefaultTokioServerHep = Arc<
     EventPublisher<
-        Arc<Mutex<E2ERegistry>>,
+        NoE2E,
         Arc<RwLock<SubscriptionManager>>,
         Arc<crate::tokio_transport::TokioSocket>,
         crate::tokio_transport::TokioSocket,
@@ -870,14 +869,14 @@ impl
     Server<
         crate::tokio_transport::TokioTransport,
         crate::tokio_transport::TokioTimer,
-        Arc<Mutex<E2ERegistry>>,
+        NoE2E,
         Arc<RwLock<SubscriptionManager>>,
     >
 {
     /// Create a new SOME/IP server.
     ///
     /// Returns the `Server` handle for runtime mutation
-    /// (`register_e2e`, `publisher`, etc.), a [`ServerHandles`] bundle
+    /// (`publisher`, etc.), a [`ServerHandles`] bundle
     /// destructuring the [`EventPublisher`] up front, and a single
     /// combined run-future the caller spawns to drive both the
     /// receive loop and (unless suppressed via
@@ -960,7 +959,7 @@ impl
         let deps = ServerDeps {
             factory: crate::tokio_transport::TokioTransport,
             timer: crate::tokio_transport::TokioTimer,
-            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            e2e_registry: NoE2E,
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
             non_sd_observer: None,
         };
@@ -1004,7 +1003,7 @@ impl
         let deps = ServerDeps {
             factory: crate::tokio_transport::TokioTransport,
             timer: crate::tokio_transport::TokioTimer,
-            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            e2e_registry: NoE2E,
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
             non_sd_observer: None,
         };
@@ -1018,7 +1017,7 @@ where
     F: TransportFactory + 'static,
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     Sub: SubscriptionHandle,
     H: WrappableSharedHandle<F::Socket>,
     Hsd: WrappableSharedHandle<SdStateManager>,
@@ -1224,7 +1223,7 @@ where
     F: TransportFactory + 'static,
     F::Socket: 'static,
     Tm: Timer + Clone + 'static,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     Sub: SubscriptionHandle,
     H: SharedHandle<F::Socket>,
     Hsd: SharedHandle<SdStateManager>,
@@ -1396,29 +1395,6 @@ where
         }
     }
 
-    /// Register an E2E profile for the given key.
-    ///
-    /// Once registered, outgoing events published via `EventPublisher::publish_event`
-    /// will have E2E protection applied automatically.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::e2e::E2ERegistryFull`] when the underlying
-    /// registry has no room for a new key. Replacing the profile of an
-    /// already-registered key always succeeds.
-    pub fn register_e2e(
-        &self,
-        key: E2EKey,
-        profile: E2EProfile,
-    ) -> Result<(), crate::e2e::E2ERegistryFull> {
-        self.e2e_registry.register(key, profile)
-    }
-
-    /// Remove E2E configuration for the given key.
-    pub fn unregister_e2e(&self, key: &E2EKey) {
-        self.e2e_registry.unregister(key);
-    }
-
     /// Run the server event loop with caller-provided receive buffers.
     ///
     /// Drives the receive loop (handling incoming `Subscribe` /
@@ -1442,7 +1418,7 @@ where
     /// The returned future is independent of `&self` — the cheap
     /// shared-handle clones it captures own everything it needs to
     /// drive both loops, so the caller can keep using `Server` to
-    /// register E2E profiles, query `unicast_local_addr`, etc. while
+    /// query `unicast_local_addr`, etc. while
     /// the future runs.
     ///
     /// # Errors
@@ -1759,6 +1735,7 @@ mod tests {
     use automotive_wire_codec::Encode;
     use std::format;
     use std::net::IpAddr;
+    use std::sync::Mutex;
     use std::vec;
     use std::vec::Vec;
     use tokio::net::UdpSocket;
@@ -1767,12 +1744,7 @@ mod tests {
     /// into scope so tests can spell `TestServer::new(...)` without
     /// chasing the four-type-parameter signature on every call site.
     /// Mirrors the `TestClient` pattern from `tests/client_server.rs`.
-    type TestServer = Server<
-        TokioTransport,
-        TokioTimer,
-        Arc<Mutex<E2ERegistry>>,
-        Arc<RwLock<SubscriptionManager>>,
-    >;
+    type TestServer = Server<TokioTransport, TokioTimer, NoE2E, Arc<RwLock<SubscriptionManager>>>;
 
     #[tokio::test]
     async fn test_server_creation() {
@@ -1903,13 +1875,13 @@ mod tests {
         ServerStorage<
             TokioTransport,
             TokioTimer,
-            Arc<Mutex<E2ERegistry>>,
+            NoE2E,
             Arc<RwLock<SubscriptionManager>>,
             Arc<crate::tokio_transport::TokioSocket>,
             Arc<SdStateManager>,
             Arc<
                 EventPublisher<
-                    Arc<Mutex<E2ERegistry>>,
+                    NoE2E,
                     Arc<RwLock<SubscriptionManager>>,
                     Arc<crate::tokio_transport::TokioSocket>,
                     crate::tokio_transport::TokioSocket,
@@ -1936,7 +1908,7 @@ mod tests {
                 .await
                 .expect("bind sd"),
         );
-        let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
+        let e2e_registry = NoE2E;
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
         let publisher = Arc::new(EventPublisher::new(
             subscriptions.clone(),
@@ -2192,7 +2164,7 @@ mod tests {
         let deps = ServerDeps {
             factory,
             timer: TokioTimer,
-            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            e2e_registry: NoE2E,
             subscriptions: subscriptions.clone(),
             non_sd_observer: None,
         };

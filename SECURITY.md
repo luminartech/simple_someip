@@ -34,13 +34,12 @@ in this crate:
   assertion. A host able to send SD messages on the segment can offer a service
   it does not own and draw subscriptions to itself. This crate encodes and
   decodes SD entries; it cannot tell a legitimate offer from a spoofed one.
-- **E2E protection is a safety mechanism, not a security one.** Profile 4
-  (CRC-32) and Profile 5 (CRC-16) detect accidental corruption — bit flips,
-  truncation, a stale or duplicated frame. A CRC is not a message
-  authentication code: it is unkeyed, so anyone who can alter a payload can
-  recompute the checksum over it. E2E protection does not make a channel
-  tamper-resistant, and a report that it can be forged describes the profile
-  rather than a bug here.
+- **E2E protection is a safety mechanism, not a security one.** An
+  `E2EHandle` that checks a checksum and a counter detects accidental
+  corruption — bit flips, truncation, a stale or duplicated frame. An unkeyed
+  checksum is not a message authentication code: anyone who can alter a
+  payload can recompute it. E2E protection does not make a channel
+  tamper-resistant.
 
 What is in scope: anything that makes the crate misbehave on attacker-supplied
 bytes — a panic, an out-of-bounds read, an unbounded allocation, a decode that
