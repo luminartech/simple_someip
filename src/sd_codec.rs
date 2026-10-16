@@ -454,8 +454,8 @@ pub fn next_sd_session(counter: &AtomicU16) -> u16 {
 pub struct ParsedDatagram<'a> {
     pub service_id: u16,
     pub method_id: u16,
-    /// Header bytes 8..16. Consumed by E2E Profile 5 with-header CRC for
-    /// protected messages.
+    /// Header bytes 8..16, passed to the
+    /// [`E2EHandle`] check.
     pub upper_header: [u8; 8],
     pub payload: &'a [u8],
 }

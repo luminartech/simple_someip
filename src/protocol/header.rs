@@ -60,7 +60,8 @@ impl Header {
         self.return_code
     }
 
-    /// Return the 8-byte "upper header" used by E2E UPPER-HEADER-BITS-TO-SHIFT.
+    /// Return the 8-byte "upper header": header bytes 8..16, which an
+    /// [`E2EHandle`](crate::E2EHandle) may cover with its protection.
     ///
     /// Layout (big-endian): `request_id(4)` + `protocol_version(1)` + `interface_version(1)`
     ///                      + `message_type(1)` + `return_code(1)`
@@ -252,8 +253,9 @@ impl<'a> HeaderView<'a> {
     }
 
     /// Returns header bytes 8..16: the request ID, protocol and interface
-    /// versions, message type, and return code. E2E Profile 5 with-header
-    /// CRC covers these bytes.
+    /// versions, message type, and return code. An
+    /// [`E2EHandle`](crate::E2EHandle) may cover these bytes with its
+    /// protection.
     #[must_use]
     pub const fn upper_header_bytes(&self) -> [u8; 8] {
         [

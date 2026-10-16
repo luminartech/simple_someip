@@ -439,7 +439,8 @@ where
     pub factory: F,
     /// Async sleep primitive used by the announcement loop's 1-second tick.
     pub timer: Tm,
-    /// Shared E2E registry handle for runtime E2E configuration.
+    /// The [`E2EHandle`] that checks received and
+    /// protects sent payloads; [`crate::NoE2E`] for neither.
     pub e2e_registry: R,
     /// Shared subscription manager handle. The convenience constructor
     /// `Server::new` (under `server-tokio`) builds an
@@ -656,7 +657,8 @@ where
     /// Async sleep primitive used by the announcement loop's
     /// 1-second tick.
     pub timer: Tm,
-    /// Shared E2E registry handle for runtime E2E configuration.
+    /// The [`E2EHandle`] that checks received and
+    /// protects sent payloads; [`crate::NoE2E`] for neither.
     pub e2e_registry: R,
     /// Shared subscription manager handle.
     pub subscriptions: Sub,
@@ -765,7 +767,7 @@ pub struct Server<
     /// shared-storage `Hsd` chose (`Arc<SdStateManager>` on std,
     /// `&'static SdStateManager` on bare-metal-no-alloc).
     sd_state: Hsd,
-    /// Shared E2E registry for runtime E2E configuration
+    /// Checks received and protects sent payloads.
     e2e_registry: R,
     /// Transport factory. Used at construction time to bind sockets;
     /// retained on the struct so bare-metal factories that carry state

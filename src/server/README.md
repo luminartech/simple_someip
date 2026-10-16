@@ -9,7 +9,7 @@ The server implementation provides:
 1. **Service Announcement** - Periodically broadcast OfferService messages via Service Discovery (SD)
 2. **Event Publishing** - Send events to subscribed clients
 3. **Subscription Management** - Track who's subscribed to which event groups
-4. **End-to-End Protection** - Automatic E2E protection/checking per message key
+4. **End-to-End Protection** - A caller-supplied `E2EHandle` checks requests and protects events
 5. **UDP Socket Management** - Handle unicast and multicast communication
 
 ## Architecture
@@ -157,8 +157,6 @@ Main server struct:
 - `announcement_loop() -> Result<impl Future<Output = ()> + Send + 'static, Error>` - Build the SD announcement future; caller spawns on the Tokio runtime
 - `publisher() -> Arc<EventPublisher>` - Get event publisher
 - `run() -> Result<(), Error>` - Run event loop (handles subscriptions)
-- `register_e2e(key, profile)` - Register E2E protection for a message key
-- `unregister_e2e(key)` - Remove E2E protection for a message key
 
 ### `EventPublisher`
 
@@ -166,7 +164,7 @@ Publishes events to subscribers:
 
 - `publish_event(service_id, instance_id, event_group_id, message) -> Result<usize>`
   - Type-safe event publishing using `Message<P>`
-  - Automatically applies E2E protection if configured for the message key
+  - Applies the server's `E2EHandle` protection when it protects the message
   - Returns number of subscribers that received the event
 - `publish_raw_event(service_id, instance_id, event_group_id, event_id, session_id, protocol_version, interface_version, payload) -> Result<usize>`
   - Low-level event publishing using raw bytes

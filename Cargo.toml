@@ -143,7 +143,7 @@ server = ["dep:futures-util"]
 server-tokio = ["server", "std", "dep:tokio", "dep:socket2"]
 # Marks a build as intended for bare-metal / no_std consumption.
 # Activates embassy-sync as the channel backend, the `static_channels`
-# module, `AtomicInterfaceHandle`, and `StaticE2EHandle`.
+# module, and `AtomicInterfaceHandle`.
 #
 # **To demonstrate the bare-metal trait surface, use the
 # `examples/bare_metal_client` / `examples/bare_metal_server` workspace
