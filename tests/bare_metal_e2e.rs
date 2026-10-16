@@ -51,7 +51,7 @@ use simple_someip::transport::{
 use simple_someip::{
     CapacityKind, Client, ClientDeps, NoE2E, RawPayload, Server, ServerDeps, UDP_BUFFER_SIZE,
 };
-use tag_e2e::TagE2E;
+use tag_e2e::{OverReportE2E, TagE2E};
 
 // ── Static-pool channel factory ───────────────────────────────────────
 //
@@ -1086,6 +1086,65 @@ async fn e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_err
     assert!(
         matches!(result, Err(ClientError::Capacity(CapacityKind::UdpBuffer))),
         "expected Err(Capacity(\"udp_buffer\")), got {result:?}"
+    );
+
+    client.shut_down();
+    run_handle.abort();
+}
+
+/// A hook that reports more protected bytes than its scratch holds must
+/// yield `Capacity`, even when the send buffer itself is large enough.
+#[tokio::test]
+async fn hook_over_reporting_its_length_returns_capacity_not_panic() {
+    static POOL: BufferPool<4, 2048> = BufferPool::new();
+
+    let network = SharedNetwork::new();
+    let client_factory = MockFactory {
+        tx_pipe: Arc::clone(&network.client_to_server),
+        rx_pipe: Arc::clone(&network.server_to_client),
+        next_port: Arc::new(Mutex::new(300)),
+    };
+    let deps = ClientDeps {
+        factory: client_factory,
+        spawner: TokioBackedSpawner,
+        timer: MockTimer,
+        e2e_registry: OverReportE2E,
+        interface: Arc::new(RwLock::new(Ipv4Addr::LOCALHOST)),
+        buffer_provider: StaticBufferProvider(&POOL),
+    };
+    let (client, _updates, run_fut) =
+        Client::<RawPayload, OverReportE2E, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
+            deps, false,
+        );
+    let run_handle = tokio::spawn(run_fut);
+
+    let key = ServiceEndpointKey::udp(
+        0xABCD,
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30801)),
+    );
+    client
+        .add_endpoint(key, 1, 42001)
+        .await
+        .expect("add_endpoint");
+
+    let msg_id = MessageId::new_from_service_and_method(0xABCD, 0x0001);
+    let request = Message::<RawPayload>::new(
+        Header::new(
+            msg_id,
+            0x0001_0001,
+            1,
+            1,
+            MessageTypeField::new(MessageType::Request, false),
+            ReturnCode::Ok,
+            4,
+        ),
+        RawPayload::from_payload_bytes(msg_id, &[1, 2, 3, 4]).expect("create payload"),
+    );
+    let result = client.send_to_service(key, request).await;
+
+    assert!(
+        matches!(result, Err(ClientError::Capacity(CapacityKind::UdpBuffer))),
+        "expected Err(Capacity(UdpBuffer)), got {result:?}"
     );
 
     client.shut_down();

@@ -801,17 +801,24 @@ where
                         let upper_header: [u8; 8] =
                             buf[8..16].try_into().expect("upper header slice");
                         let mut protected = [0u8; UDP_BUFFER_SIZE];
-                        match e2e_registry.protect(
-                            message_id,
-                            &buf[16..message_length],
-                            upper_header,
-                            &mut protected,
-                        ) {
+                        let protection = if message_id.is_sd() {
+                            None
+                        } else {
+                            e2e_registry.protect(
+                                message_id,
+                                &buf[16..message_length],
+                                upper_header,
+                                &mut protected,
+                            )
+                        };
+                        match protection {
                             Some(Ok(protected_len)) => {
-                                if 16 + protected_len > buf.len() {
+                                if protected_len > protected.len() || 16 + protected_len > buf.len()
+                                {
                                     error!(
-                                        "Protected payload ({} bytes) exceeds claimed buffer ({}); rejecting send",
-                                        16 + protected_len,
+                                        "Protected payload ({} bytes) exceeds the scratch ({}) or claimed buffer ({}); rejecting send",
+                                        protected_len,
+                                        protected.len(),
                                         buf.len()
                                     );
                                     let _ = send_message
@@ -919,12 +926,17 @@ where
                             let header = view.header().to_owned();
                             let upper_header = header.upper_header_bytes();
                             let payload_bytes = view.payload_bytes();
-                            let (e2e_status, effective_payload) = match e2e_registry.check(
-                                source_address.ip(),
-                                header.message_id(),
-                                payload_bytes,
-                                upper_header,
-                            ) {
+                            let check = if header.message_id().is_sd() {
+                                None
+                            } else {
+                                e2e_registry.check(
+                                    source_address.ip(),
+                                    header.message_id(),
+                                    payload_bytes,
+                                    upper_header,
+                                )
+                            };
+                            let (e2e_status, effective_payload) = match check {
                                 Some((status, stripped)) => (Some(status), stripped),
                                 None => (None, payload_bytes),
                             };

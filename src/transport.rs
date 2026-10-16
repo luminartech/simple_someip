@@ -766,9 +766,17 @@ pub trait Spawner {
 /// A hook that checks received payloads and protects sent ones, for example
 /// with an end-to-end header between the SOME/IP header and the payload.
 ///
-/// The client, the server and the bare-metal runtime call it for every
-/// non-SD message. The status code a check returns is opaque: it is passed to
-/// the application unchanged. [`NoE2E`] checks and protects nothing.
+/// SD messages never reach it. The client checks every message it receives
+/// and protects every message it sends; the server checks the requests it
+/// hands to its request callback and protects the events it publishes; the
+/// bare-metal runtime
+/// checks the notifications it receives. Responses the server sends and
+/// notifications the bare-metal runtime publishes are not protected. The
+/// status code a check returns is opaque: it is passed to the application
+/// unchanged. [`NoE2E`] checks and protects nothing.
+///
+/// The client and the server clone the handle into each socket loop, so
+/// clones must share their state.
 pub trait E2EHandle: Send + Sync + 'static {
     /// Checks a payload received from `source`.
     ///
@@ -801,7 +809,8 @@ pub trait E2EHandle: Send + Sync + 'static {
         out: &mut [u8],
     ) -> Option<Result<usize, E2EProtectError>>;
 
-    /// Drops receive state kept for `source`, after `source` rebooted.
+    /// Drops receive state kept for `source`. The client calls it when SD
+    /// shows that `source` rebooted.
     fn reset_source(&self, source: IpAddr);
 }
 

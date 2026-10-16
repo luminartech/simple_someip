@@ -426,7 +426,7 @@ where
     }
 
     /// Replace the `e2e_registry` field, returning a `ClientDeps` over
-    /// the new registry-handle type.
+    /// the new [`E2EHandle`] type.
     pub fn with_e2e_registry<R2: E2EHandle + Clone>(
         self,
         e2e_registry: R2,

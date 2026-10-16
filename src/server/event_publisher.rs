@@ -148,8 +148,8 @@ where
     ///
     /// # Panics
     ///
-    /// May panic if the underlying [`E2EHandle`](crate::transport::E2EHandle)
-    /// implementation panics (e.g., `NoE2E` on mutex poison).
+    /// May panic if the [`E2EHandle`](crate::transport::E2EHandle)
+    /// implementation panics.
     #[allow(clippy::too_many_lines)]
     pub async fn publish_event_with_buffers<P: PayloadWireFormat>(
         &self,
@@ -220,10 +220,11 @@ where
                 protected_buf,
             ) {
                 Some(Ok(protected_len)) => {
-                    if 16 + protected_len > msg_buf.len() {
+                    if protected_len > protected_buf.len() || 16 + protected_len > msg_buf.len() {
                         crate::log::error!(
-                            "Protected datagram ({} bytes) exceeds msg_buf.len() ({}); dropping publish",
-                            16 + protected_len,
+                            "Protected payload ({} bytes) exceeds protected_buf ({}) or msg_buf ({}); dropping publish",
+                            protected_len,
+                            protected_buf.len(),
                             msg_buf.len()
                         );
                         return Err(Error::Capacity(CapacityKind::UdpBuffer));
@@ -437,7 +438,7 @@ where
         };
         // Defence-in-depth: the pre-build guard above already rejects
         // oversize payloads, but a future caller adding optional
-        // post-encode tail bytes (e.g. another protect profile) would
+        // post-encode tail bytes (e.g. payload protection) would
         // need this branch. Cheap to keep.
         if total_len > buf.len() {
             crate::log::error!(
@@ -1259,6 +1260,64 @@ mod tests {
             Error::Capacity(tag) => assert_eq!(tag, CapacityKind::UdpBuffer),
             other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
         }
+    }
+
+    /// A hook that reports more protected bytes than `protected_buf` holds
+    /// yields `Capacity`, even when `msg_buf` is large enough.
+    #[tokio::test]
+    async fn test_publish_with_a_hook_over_reporting_its_length_returns_capacity() {
+        use crate::RawPayload;
+        use crate::protocol::MessageId;
+        use crate::transport::{E2EHandle, E2EProtectError};
+
+        #[derive(Clone)]
+        struct OverReport;
+        impl E2EHandle for OverReport {
+            fn check<'a>(
+                &self,
+                _: core::net::IpAddr,
+                _: MessageId,
+                _: &'a [u8],
+                _: [u8; 8],
+            ) -> Option<(core::num::NonZeroU8, &'a [u8])> {
+                None
+            }
+            fn protect(
+                &self,
+                _: MessageId,
+                _: &[u8],
+                _: [u8; 8],
+                out: &mut [u8],
+            ) -> Option<Result<usize, E2EProtectError>> {
+                Some(Ok(out.len() + 1))
+            }
+            fn reset_source(&self, _: core::net::IpAddr) {}
+        }
+
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        {
+            let mut mgr = subscriptions.write().await;
+            mgr.subscribe(0x5B, 1, 0x01, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9998))
+                .unwrap();
+        }
+        let socket = bind_tokio_socket().await;
+        let publisher = EventPublisher::new(subscriptions, socket, OverReport);
+
+        let message_id = MessageId::new_from_service_and_method(0x5B, 0x8001);
+        let payload = RawPayload::from_payload_bytes(message_id, &[1, 2, 3, 4]).unwrap();
+        let header = Header::new_event(0x5B, 0x8001, 0x0001_0001, 0x01, 0x01, 4);
+        let message = Message::new(header, payload);
+
+        let mut msg_buf = [0u8; 200];
+        let mut protected_buf = [0u8; 20];
+        let err = publisher
+            .publish_event_with_buffers(0x5B, 1, 0x01, &message, &mut msg_buf, &mut protected_buf)
+            .await
+            .expect_err("an over-reported length must error, not panic");
+        assert!(
+            matches!(err, Error::Capacity(CapacityKind::UdpBuffer)),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
