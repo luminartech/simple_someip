@@ -58,7 +58,6 @@ name = "bare_metal_client"
 version = "0.0.0"
 dependencies = [
  "critical-section",
- "embassy-sync 0.6.2",
  "simple-someip",
  "tokio",
 ]

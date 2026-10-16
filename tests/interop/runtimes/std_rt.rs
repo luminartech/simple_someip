@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use simple_someip::e2e::E2ERegistry;
+use simple_someip::NoE2E;
 use simple_someip::protocol::sd::TransportProtocol;
 use simple_someip::protocol::{
     Header, Message, MessageId, MessageType, MessageTypeField, ReturnCode,
@@ -24,7 +24,7 @@ use tokio::task::JoinHandle;
 use crate::interop::consts::*;
 use crate::interop::runtime::*;
 
-type E2eHandle = Arc<Mutex<E2ERegistry>>;
+type E2eHandle = NoE2E;
 type StdClient = Client<RawPayload, E2eHandle, Arc<std::sync::RwLock<Ipv4Addr>>, TokioChannels>;
 type Publisher = Arc<
     EventPublisher<

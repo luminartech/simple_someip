@@ -6,7 +6,7 @@
 //! - A shared `MockPipe` for transport (bytes sent by one side appear in
 //!   the other's inbound queue)
 //! - `define_static_channels!` for the client's channel factory
-//! - `Arc<Mutex<E2ERegistry>>` for E2E (the std-backed impl)
+//! - `NoE2E` for E2E (checks and protects nothing)
 //! - A test-runtime tokio spawner/timer (proving the *trait* compiles,
 //!   not that tokio is absent from the test harness)
 //!
@@ -32,7 +32,9 @@ use simple_someip::ServiceEndpointKey;
 use simple_someip::client::Error as ClientError;
 use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::define_static_channels;
-use simple_someip::e2e::{E2EProfile, E2ERegistry, Profile4Config};
+
+#[path = "support/tag_e2e.rs"]
+mod tag_e2e;
 use simple_someip::protocol::sd::RebootFlag;
 use simple_someip::protocol::{
     Header, Message, MessageId, MessageType, MessageTypeField, ReturnCode,
@@ -43,12 +45,13 @@ use simple_someip::server::{
 };
 use simple_someip::static_channels::BufferPool;
 use simple_someip::transport::{
-    E2ERegistryHandle, ReceivedDatagram, SocketOptions, Spawner, StaticBufferProvider, Timer,
-    TransportError, TransportFactory, TransportSocket,
+    ReceivedDatagram, SocketOptions, Spawner, StaticBufferProvider, Timer, TransportError,
+    TransportFactory, TransportSocket,
 };
 use simple_someip::{
-    CapacityKind, Client, ClientDeps, E2EKey, RawPayload, Server, ServerDeps, UDP_BUFFER_SIZE,
+    CapacityKind, Client, ClientDeps, NoE2E, RawPayload, Server, ServerDeps, UDP_BUFFER_SIZE,
 };
+use tag_e2e::TagE2E;
 
 // ── Static-pool channel factory ───────────────────────────────────────
 //
@@ -372,7 +375,7 @@ async fn client_receives_server_sd_announcement() {
     };
 
     // Create server
-    let server_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let server_e2e: NoE2E = NoE2E;
     let server_subs = MockSubscriptions::default();
     let server_config = ServerConfig::new(0x1234, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
@@ -387,7 +390,7 @@ async fn client_receives_server_sd_announcement() {
     };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(server_deps, server_config, false)
@@ -398,7 +401,7 @@ async fn client_receives_server_sd_announcement() {
     let announce_handle = tokio::spawn(run);
 
     // Create client
-    let client_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let client_e2e: NoE2E = NoE2E;
     let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(Ipv4Addr::LOCALHOST));
 
     static POOL_SD: BufferPool<9, UDP_BUFFER_SIZE> = BufferPool::new();
@@ -411,12 +414,11 @@ async fn client_receives_server_sd_announcement() {
         buffer_provider: StaticBufferProvider(&POOL_SD),
     };
 
-    let (client, mut updates, run_fut) = Client::<
-        RawPayload,
-        Arc<Mutex<E2ERegistry>>,
-        Arc<RwLock<Ipv4Addr>>,
-        E2ETestChannels,
-    >::new_with_deps(client_deps, false);
+    let (client, mut updates, run_fut) =
+        Client::<RawPayload, NoE2E, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
+            client_deps,
+            false,
+        );
 
     let run_handle = tokio::spawn(run_fut);
 
@@ -468,7 +470,7 @@ async fn client_send_request_server_runloop_stable() {
     };
 
     // Create server (passive — no SD announcements)
-    let server_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let server_e2e: NoE2E = NoE2E;
     let server_subs = MockSubscriptions::default();
     let service_id = 0x5678_u16;
     let instance_id = 1_u16;
@@ -486,7 +488,7 @@ async fn client_send_request_server_runloop_stable() {
     };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_passive_with_deps(server_deps, server_config)
@@ -499,7 +501,7 @@ async fn client_send_request_server_runloop_stable() {
     });
 
     // Create client
-    let client_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let client_e2e: NoE2E = NoE2E;
     let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(Ipv4Addr::LOCALHOST));
 
     static POOL_REQ: BufferPool<9, UDP_BUFFER_SIZE> = BufferPool::new();
@@ -512,12 +514,11 @@ async fn client_send_request_server_runloop_stable() {
         buffer_provider: StaticBufferProvider(&POOL_REQ),
     };
 
-    let (client, mut updates, client_run_fut) = Client::<
-        RawPayload,
-        Arc<Mutex<E2ERegistry>>,
-        Arc<RwLock<Ipv4Addr>>,
-        E2ETestChannels,
-    >::new_with_deps(client_deps, false);
+    let (client, mut updates, client_run_fut) =
+        Client::<RawPayload, NoE2E, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
+            client_deps,
+            false,
+        );
 
     let client_run_handle = tokio::spawn(client_run_fut);
 
@@ -645,7 +646,7 @@ async fn future_size_witness_bare_metal_channels() {
         rx_pipe: Arc::clone(&network.client_to_server),
         next_port: Arc::new(Mutex::new(0)),
     };
-    let server_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let server_e2e: NoE2E = NoE2E;
     let server_config = ServerConfig::new(0x1234, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(30600);
@@ -657,7 +658,7 @@ async fn future_size_witness_bare_metal_channels() {
         non_sd_observer: None,
     };
     let (_server, _handles, server_run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(server_deps, server_config, false)
@@ -680,16 +681,15 @@ async fn future_size_witness_bare_metal_channels() {
             max_spawned: Arc::clone(&max_spawned),
         },
         timer: MockTimer,
-        e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+        e2e_registry: NoE2E,
         interface: Arc::new(RwLock::new(Ipv4Addr::LOCALHOST)),
         buffer_provider: StaticBufferProvider(&POOL_WITNESS),
     };
-    let (client, _updates, run_fut) = Client::<
-        RawPayload,
-        Arc<Mutex<E2ERegistry>>,
-        Arc<RwLock<Ipv4Addr>>,
-        E2ETestChannels,
-    >::new_with_deps(client_deps, false);
+    let (client, _updates, run_fut) =
+        Client::<RawPayload, NoE2E, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
+            client_deps,
+            false,
+        );
 
     let run_size = core::mem::size_of_val(&run_fut);
     let _run_handle = tokio::spawn(run_fut);
@@ -869,7 +869,7 @@ async fn inbound_datagram_larger_than_claimed_buffer_is_dropped_not_fatal() {
     );
     rx.push(wire[..len].to_vec(), len, source);
 
-    let client_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let client_e2e: NoE2E = NoE2E;
     let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(Ipv4Addr::LOCALHOST));
     let deps = ClientDeps {
         factory,
@@ -879,12 +879,10 @@ async fn inbound_datagram_larger_than_claimed_buffer_is_dropped_not_fatal() {
         interface: client_iface,
         buffer_provider: StaticBufferProvider(&POOL),
     };
-    let (client, mut updates, run_fut) = Client::<
-        RawPayload,
-        Arc<Mutex<E2ERegistry>>,
-        Arc<RwLock<Ipv4Addr>>,
-        E2ETestChannels,
-    >::new_with_deps(deps, false);
+    let (client, mut updates, run_fut) =
+        Client::<RawPayload, NoE2E, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
+            deps, false,
+        );
     let run_handle = tokio::spawn(run_fut);
 
     client.bind_discovery().await.expect("bind_discovery");
@@ -934,7 +932,7 @@ async fn binding_sockets_claims_one_buffer_each_until_pool_exhausted() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let client_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let client_e2e: NoE2E = NoE2E;
     let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(Ipv4Addr::LOCALHOST));
     let deps = ClientDeps {
         factory: client_factory,
@@ -944,12 +942,10 @@ async fn binding_sockets_claims_one_buffer_each_until_pool_exhausted() {
         interface: client_iface,
         buffer_provider: StaticBufferProvider(&POOL),
     };
-    let (client, _updates, run_fut) = Client::<
-        RawPayload,
-        Arc<Mutex<E2ERegistry>>,
-        Arc<RwLock<Ipv4Addr>>,
-        E2ETestChannels,
-    >::new_with_deps(deps, false);
+    let (client, _updates, run_fut) =
+        Client::<RawPayload, NoE2E, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
+            deps, false,
+        );
     let run_handle = tokio::spawn(run_fut);
 
     let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30700);
@@ -1017,20 +1013,13 @@ async fn binding_sockets_claims_one_buffer_each_until_pool_exhausted() {
 ///
 /// # Why the window is deterministic
 ///
-/// Profile 4 protect prepends a 12-byte E2E header.  With a 20-byte payload:
-/// - Unprotected SOME/IP frame: 16 (header) + 20 (payload) = 36 bytes.
-/// - Post-protect SOME/IP frame: 16 (header) + (12 + 20) (P4 output) = 48 bytes.
-/// - Buffer slot: 40 bytes.
-///
-/// Pre-guard (unprotected) : 36 ≤ 40 → passes.
-/// Post-protect guard (before fix): 48 > UDP_BUFFER_SIZE (1500) → false → no guard fires.
-/// `copy_from_slice` into buf[16..48] on a 40-byte buf → out-of-bounds panic (RED).
-///
-/// Post-protect guard (after fix): 48 > 40 → true → `Capacity` error returned (GREEN).
+/// The tag adds one byte. Unprotected frame: 16 + 24 = 40 bytes; tagged:
+/// 16 + 25 = 41 bytes; buffer slot: 40 bytes. The post-protect guard must
+/// return `Capacity` instead of writing past the slot.
 #[tokio::test]
 async fn e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_error() {
-    // 40-byte slots: big enough for the 36-byte unprotected frame but not
-    // for the 48-byte post-P4-protect frame.
+    // 40-byte slots: big enough for the 40-byte unprotected frame but not
+    // for the 41-byte tagged frame.
     const BUF_LEN: usize = 40;
     static POOL: BufferPool<4, BUF_LEN> = BufferPool::new();
 
@@ -1041,7 +1030,7 @@ async fn e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_err
         next_port: Arc::new(Mutex::new(200)),
     };
 
-    let client_e2e: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let client_e2e = TagE2E::new(MessageId::new_from_service_and_method(0xABCD, 0x0001));
     let client_iface: Arc<RwLock<Ipv4Addr>> = Arc::new(RwLock::new(Ipv4Addr::LOCALHOST));
     let deps = ClientDeps {
         factory: client_factory,
@@ -1051,28 +1040,14 @@ async fn e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_err
         interface: client_iface,
         buffer_provider: StaticBufferProvider(&POOL),
     };
-    let (client, _updates, run_fut) = Client::<
-        RawPayload,
-        Arc<Mutex<E2ERegistry>>,
-        Arc<RwLock<Ipv4Addr>>,
-        E2ETestChannels,
-    >::new_with_deps(deps, false);
+    let (client, _updates, run_fut) =
+        Client::<RawPayload, TagE2E, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
+            deps, false,
+        );
     let run_handle = tokio::spawn(run_fut);
 
-    // Register E2E Profile 4 for service 0xABCD, method 0x0001.
-    // Profile 4 adds 12 bytes of header to every protected payload.
     let service_id: u16 = 0xABCD;
     let method_id: u16 = 0x0001;
-    let e2e_key = simple_someip::E2EKey::new(service_id, method_id);
-    client
-        .register_e2e(
-            e2e_key,
-            simple_someip::E2EProfile::Profile4(simple_someip::e2e::Profile4Config::new(
-                0xDEAD_BEEF,
-                15,
-            )),
-        )
-        .expect("register E2E key");
 
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30800);
     client
@@ -1084,9 +1059,7 @@ async fn e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_err
         .await
         .expect("add_endpoint");
 
-    // 20-byte payload: unprotected frame = 36 B ≤ 40 B (fits buf), but
-    // post-protect frame = 48 B > 40 B (exceeds buf).
-    let payload_bytes = [0x55u8; 20];
+    let payload_bytes = [0x55u8; 24];
     let msg_id = MessageId::new_from_service_and_method(service_id, method_id);
     let payload = RawPayload::from_payload_bytes(msg_id, &payload_bytes).expect("create payload");
     let request = Message::<RawPayload>::new(
@@ -1158,20 +1131,13 @@ fn empty_vec_sd_header() -> simple_someip::VecSdHeader {
 ///
 /// # Why the window is deterministic
 ///
-/// Profile 4 protect prepends a 12-byte E2E header.  With a 20-byte payload:
-/// - Unprotected SOME/IP frame: 16 (header) + 20 (payload) = 36 bytes.
-/// - Post-protect SOME/IP frame: 16 (header) + (12 + 20) (P4 output) = 48 bytes.
-/// - Both scratch buffers: 40 bytes each.
-///
-/// Pre-guard (unprotected) : 36 ≤ 40 → passes.
-/// Post-protect guard (before fix): 48 > UDP_BUFFER_SIZE (1500) → false → no guard fires.
-/// `copy_from_slice` into msg_buf[16..48] on a 40-byte buf → out-of-bounds panic (RED).
-///
-/// Post-protect guard (after fix): 48 > 40 → true → `Capacity` returned (GREEN).
+/// The tag adds one byte. Unprotected frame: 16 + 24 = 40 bytes; tagged:
+/// 16 + 25 = 41 bytes; both scratch buffers: 40 bytes. Publishing must
+/// return `Capacity` instead of writing past the scratch buffer.
 #[tokio::test]
 async fn e2e_publish_with_undersized_scratch_returns_capacity_not_panic() {
     // Construct a bare-metal EventPublisher using mock infrastructure from
-    // this test file (MockSocket / MockSubscriptions / Arc<Mutex<E2ERegistry>>).
+    // this test file (MockSocket / MockSubscriptions / TagE2E).
 
     // ── Build a MockSocket that discards sends (we never reach the send step) ──
     let network = SharedNetwork::new();
@@ -1196,26 +1162,15 @@ async fn e2e_publish_with_undersized_scratch_returns_capacity_not_panic() {
         .await
         .expect("subscribe");
 
-    // ── E2E: register Profile 4 for service 0xABCD, method 0x0001 ──
-    let registry: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
-    let e2e_key = E2EKey::new(0xABCD, 0x0001);
-    registry
-        .register(e2e_key, E2EProfile::Profile4(Profile4Config::new(0, 15)))
-        .expect("register E2E key");
+    let hook = TagE2E::new(MessageId::new_from_service_and_method(0xABCD, 0x0001));
 
-    let publisher: EventPublisher<
-        Arc<Mutex<E2ERegistry>>,
-        MockSubscriptions,
-        Arc<MockSocket>,
-        MockSocket,
-    > = EventPublisher::new(subs, socket, registry);
+    let publisher: EventPublisher<TagE2E, MockSubscriptions, Arc<MockSocket>, MockSocket> =
+        EventPublisher::new(subs, socket, hook);
 
-    // ── Build the SOME/IP message with 20-byte payload ──
-    // Unprotected: 16 + 20 = 36 B ≤ 40 B (fits msg_buf).
-    // Post-P4-protect: 16 + 12 + 20 = 48 B > 40 B (exceeds msg_buf) → must Capacity.
+    // ── Build the SOME/IP message with a 24-byte payload ──
     let service_id: u16 = 0xABCD;
     let method_id: u16 = 0x0001;
-    let payload_bytes = [0x55u8; 20];
+    let payload_bytes = [0x55u8; 24];
     let msg_id = MessageId::new_from_service_and_method(service_id, method_id);
     let payload = RawPayload::from_payload_bytes(msg_id, &payload_bytes).expect("create payload");
     let message = Message::<RawPayload>::new(
@@ -1230,7 +1185,7 @@ async fn e2e_publish_with_undersized_scratch_returns_capacity_not_panic() {
         payload,
     );
 
-    // ── 40-byte scratch buffers: fits unprotected (36 B), too small for P4 (48 B) ──
+    // ── 40-byte scratch buffers: fit the unprotected frame, not the tagged one ──
     let mut msg_buf = [0u8; 40];
     let mut protected_buf = [0u8; 40];
 
@@ -1286,14 +1241,10 @@ async fn publish_raw_event_with_undersized_buf_returns_capacity_not_panic() {
         .await
         .expect("subscribe");
 
-    let registry: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let registry: NoE2E = NoE2E;
 
-    let publisher: EventPublisher<
-        Arc<Mutex<E2ERegistry>>,
-        MockSubscriptions,
-        Arc<MockSocket>,
-        MockSocket,
-    > = EventPublisher::new(subs, socket, registry);
+    let publisher: EventPublisher<NoE2E, MockSubscriptions, Arc<MockSocket>, MockSocket> =
+        EventPublisher::new(subs, socket, registry);
 
     // 20-byte buf, 10-byte payload: 16 + 10 = 26 > 20 → must Capacity.
     let mut buf = [0u8; 20];
@@ -1382,14 +1333,10 @@ async fn future_size_witness_bm_server_publish_future() {
     let socket = Arc::new(socket);
 
     let subs = MockSubscriptions::default();
-    let registry: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let registry: NoE2E = NoE2E;
 
-    let publisher: EventPublisher<
-        Arc<Mutex<E2ERegistry>>,
-        MockSubscriptions,
-        Arc<MockSocket>,
-        MockSocket,
-    > = EventPublisher::new(subs, socket, registry);
+    let publisher: EventPublisher<NoE2E, MockSubscriptions, Arc<MockSocket>, MockSocket> =
+        EventPublisher::new(subs, socket, registry);
 
     // ── Build the message payload ──
     let service_id: u16 = 0x1234;

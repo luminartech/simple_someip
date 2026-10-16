@@ -22,9 +22,3 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 # Provides the host platform critical-section implementation required by
 # embassy-sync (pulled in via simple-someip's bare_metal feature).
 critical-section = { version = "1", features = ["std"] }
-# Used directly by this example's `static StaticE2EStorage`
-# declaration to spell the `BlockingMutex<CriticalSectionRawMutex,
-# RefCell<E2ERegistry>>` type. Version pin matches what
-# simple-someip's `bare_metal` feature pulls transitively (so we
-# don't accidentally fork the dep tree).
-embassy-sync = "0.6"

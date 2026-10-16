@@ -24,9 +24,9 @@ pub enum Error {
     /// or [`crate::transport::TransportSocket`] operation.
     #[error("transport error: {0}")]
     Transport(#[from] crate::transport::TransportError),
-    /// An E2E protection or checking error occurred.
+    /// An [`E2EHandle`](crate::E2EHandle) could not protect an outgoing payload.
     #[error(transparent)]
-    E2e(#[from] crate::e2e::Error),
+    E2e(#[from] crate::transport::E2EProtectError),
     /// A fixed-capacity internal structure is full (e.g. a stack send
     /// buffer smaller than the outgoing message).
     ///

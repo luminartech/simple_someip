@@ -8,7 +8,7 @@
 //! # What this test asserts
 //!
 //! 1. `Client::new_with_deps` is allowed to allocate — the std-flavored
-//!    `Arc<Mutex<E2ERegistry>>` and `Arc<RwLock<Ipv4Addr>>` handles
+//!    `NoE2E` and `Arc<RwLock<Ipv4Addr>>` handles
 //!    used here, plus tokio's task-spawning machinery, all heap-backed.
 //!    The strategic-goal claim is "zero heap **after** `Client::new`
 //!    returns," not "zero heap, period."
@@ -25,7 +25,7 @@
 //! on allocation after `Client::new` returns. That requires a no-alloc
 //! test executor (tokio's runtime allocates on its own), no-alloc
 //! `Spawner` impl for the per-socket loops, and stack-based
-//! `E2ERegistryHandle` / `InterfaceHandle` impls. Each of those is a
+//! `E2EHandle` / `InterfaceHandle` impls. Each of those is a
 //! real piece of work and lives under the CI harness umbrella.
 //!
 //! The counting allocator here is a softer witness: it instruments
@@ -47,10 +47,10 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use simple_someip::NoE2E;
 use simple_someip::client::Error as ClientError;
 use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::define_static_channels;
-use simple_someip::e2e::E2ERegistry;
 use simple_someip::protocol::sd::RebootFlag;
 use simple_someip::static_channels::BufferPool;
 use simple_someip::transport::{
@@ -298,13 +298,13 @@ async fn client_interface_read_after_construction_does_not_allocate() {
     };
     let interface_handle: Arc<std::sync::RwLock<Ipv4Addr>> =
         Arc::new(std::sync::RwLock::new(Ipv4Addr::LOCALHOST));
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
 
     static POOL: BufferPool<9, UDP_BUFFER_SIZE> = BufferPool::new();
 
     let (client, _updates, run_fut) = Client::<
         RawPayload,
-        Arc<Mutex<E2ERegistry>>,
+        NoE2E,
         Arc<std::sync::RwLock<Ipv4Addr>>,
         WitnessChannels,
     >::new_with_deps(

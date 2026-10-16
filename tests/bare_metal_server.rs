@@ -1,6 +1,6 @@
 //! Witness test: prove that `Server` can be constructed and
 //! driven without the `server-tokio` feature, using only the trait
-//! surface (`TransportFactory`, `Timer`, `E2ERegistryHandle`,
+//! surface (`TransportFactory`, `Timer`, `E2EHandle`,
 //! `SubscriptionHandle`).
 //!
 //! `simple-someip` is compiled with `default-features = false,
@@ -11,7 +11,7 @@
 //! `simple-someip::Server::new_with_deps` comes from the no-tokio side:
 //! a hand-rolled mock `TransportFactory`, a hand-rolled `Timer`, a
 //! hand-rolled `SubscriptionHandle`, and the std-backed
-//! `Arc<Mutex<E2ERegistry>>` impl that ships under the bare `transport`
+//! `NoE2E` impl that ships under the bare `transport`
 //! module.
 //!
 //! This is the gate witness for the claim that `Server` is reachable
@@ -31,7 +31,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
-use simple_someip::e2e::E2ERegistry;
+use simple_someip::NoE2E;
+use simple_someip::protocol::MessageId;
 use simple_someip::server::NonSdRequestCallback;
 use simple_someip::server::ServerConfig;
 use simple_someip::server::{SubscribeError, Subscriber, SubscriptionHandle};
@@ -39,6 +40,10 @@ use simple_someip::transport::{
     ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory, TransportSocket,
 };
 use simple_someip::{Server, ServerDeps};
+
+#[path = "support/tag_e2e.rs"]
+mod tag_e2e;
+use tag_e2e::{TAG, TagE2E};
 
 // ── Mock transport ─────────────────────────────────────────────────────
 
@@ -290,24 +295,23 @@ async fn server_constructible_without_server_tokio_feature() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let subs = MockSubscriptions::default();
 
     let config = ServerConfig::new(0x5B, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(30490);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: subs,
-            non_sd_observer: None,
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e_registry: e2e_handle,
+        subscriptions: subs,
+        non_sd_observer: None,
+    };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -338,24 +342,23 @@ async fn passive_server_constructible_without_server_tokio_feature() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let subs = MockSubscriptions::default();
 
     let config = ServerConfig::new(0x5C, 2)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(0);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: subs,
-            non_sd_observer: None,
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e_registry: e2e_handle,
+        subscriptions: subs,
+        non_sd_observer: None,
+    };
 
     let (_server, _handles, _run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_passive_with_deps(deps, config)
@@ -520,24 +523,23 @@ async fn non_sd_observer_some_receives_unicast_method_request() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let subs = MockSubscriptions::default();
 
     let config = ServerConfig::new(0x1234, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(30700);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: subs,
-            non_sd_observer: Some((record_some as NonSdRequestCallback, 0xC0FF_EE00)),
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e_registry: e2e_handle,
+        subscriptions: subs,
+        non_sd_observer: Some((record_some as NonSdRequestCallback, 0xC0FF_EE00)),
+    };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -607,22 +609,21 @@ async fn non_sd_observer_ignores_sd_message_on_unicast_socket() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let config = ServerConfig::new(0x1234, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(30702);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: MockSubscriptions::default(),
-            non_sd_observer: Some((record_sd_unicast as NonSdRequestCallback, 7)),
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e_registry: e2e_handle,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: Some((record_sd_unicast as NonSdRequestCallback, 7)),
+    };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -674,22 +675,21 @@ async fn non_sd_observer_ignores_non_sd_on_multicast_socket() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let config = ServerConfig::new(0x1234, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(30703);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: MockSubscriptions::default(),
-            non_sd_observer: Some((record_multicast as NonSdRequestCallback, 9)),
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e_registry: e2e_handle,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: Some((record_multicast as NonSdRequestCallback, 9)),
+    };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -741,22 +741,21 @@ async fn non_sd_observer_none_preserves_ignore_behavior() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let config = ServerConfig::new(0x1234, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(30701);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: MockSubscriptions::default(),
-            non_sd_observer: None,
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e_registry: e2e_handle,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: None,
+    };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -863,22 +862,21 @@ async fn non_sd_responder_frames_and_sends_response() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let config = ServerConfig::new(0x1234, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(30702);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: MockSubscriptions::default(),
-            non_sd_observer: Some((respond_with_body as NonSdRequestCallback, 0)),
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e_registry: e2e_handle,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: Some((respond_with_body as NonSdRequestCallback, 0)),
+    };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -938,22 +936,21 @@ async fn non_sd_responder_oversized_length_is_rejected_not_panicked() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let config = ServerConfig::new(0x1234, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(30703);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: MockSubscriptions::default(),
-            non_sd_observer: Some((respond_oversized as NonSdRequestCallback, 0)),
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e_registry: e2e_handle,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: Some((respond_oversized as NonSdRequestCallback, 0)),
+    };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -1014,7 +1011,7 @@ async fn drive_co_offer_subscribe(local_port: u16, subscribe_major: u8) -> Vec<S
         sd_pipe: Arc::clone(&sd_pipe),
         next_port: Arc::new(Mutex::new(0)),
     };
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let subs_log: Arc<Mutex<Vec<SubKey>>> = Arc::new(Mutex::new(Vec::new()));
     let subs = MockSubscriptions(subs_log.clone());
 
@@ -1024,16 +1021,15 @@ async fn drive_co_offer_subscribe(local_port: u16, subscribe_major: u8) -> Vec<S
         .with_local_port(local_port)
         .with_accepted_offer(0x5678, 1, 2, 0x0001);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: subs,
-            non_sd_observer: None,
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e_registry: e2e_handle,
+        subscriptions: subs,
+        non_sd_observer: None,
+    };
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -1103,4 +1099,131 @@ async fn co_offered_subscribe_with_wrong_major_version_is_rejected() {
         "co-offered subscribe with a mismatched major version must be rejected, \
          not silently accepted by skipping the version guard"
     );
+}
+
+static OBSERVED_TAGGED: OnceLock<Mutex<Vec<(u16, Vec<u8>, u8)>>> = OnceLock::new();
+
+fn record_tagged(
+    _ctx: usize,
+    _source: SocketAddrV4,
+    _service_id: u16,
+    method_id: u16,
+    payload: &[u8],
+    e2e_status: u8,
+    _response_out: &mut [u8],
+) -> i32 {
+    OBSERVED_TAGGED
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push((method_id, payload.to_vec(), e2e_status));
+    -1
+}
+
+#[tokio::test]
+async fn non_sd_observer_receives_the_hooks_status_and_stripped_payload() {
+    let unicast_pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        unicast_pipe: Arc::clone(&unicast_pipe),
+        sd_pipe: Arc::new(MockPipe::default()),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+    let hook = TagE2E::new(MessageId::new_from_service_and_method(0x2345, 0x0001));
+    let config = ServerConfig::new(0x2345, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30701);
+    let deps: ServerDeps<MockFactory, MockTimer, TagE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e_registry: hook,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: Some((record_tagged as NonSdRequestCallback, 0)),
+    };
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, TagE2E, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+    let handle = tokio::spawn(run);
+
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 101), 40001);
+    for datagram in [
+        build_method_request(0x2345, 0x0001, &[TAG, 0xAB]),
+        build_method_request(0x2345, 0x0002, &[0xCD]),
+    ] {
+        unicast_pipe
+            .inbound
+            .lock()
+            .unwrap()
+            .push_back((datagram, src));
+    }
+    if let Some(w) = unicast_pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    drive_until(|| {
+        OBSERVED_TAGGED
+            .get()
+            .is_some_and(|m| m.lock().unwrap().len() == 2)
+    })
+    .await;
+    let seen = OBSERVED_TAGGED.get().unwrap().lock().unwrap().clone();
+    assert!(seen.contains(&(0x0001, vec![0xAB], 1)), "tagged: {seen:?}");
+    assert!(
+        seen.contains(&(0x0002, vec![0xCD], 0)),
+        "untouched: {seen:?}"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+static OBSERVED_EVENTS: OnceLock<Mutex<Vec<(u16, Vec<u8>, u8)>>> = OnceLock::new();
+
+fn record_event(
+    _ctx: usize,
+    _source: SocketAddrV4,
+    _service_id: u16,
+    method_id: u16,
+    payload: &[u8],
+    e2e_status: u8,
+    _response_out: &mut [u8],
+) -> i32 {
+    OBSERVED_EVENTS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push((method_id, payload.to_vec(), e2e_status));
+    -1
+}
+
+#[tokio::test]
+async fn event_rx_dispatch_passes_the_hooks_status() {
+    let pipe = Arc::new(MockPipe::default());
+    let socket = MockSocket {
+        pipe: Arc::clone(&pipe),
+        local: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40100),
+    };
+    let hook = TagE2E::new(MessageId::new_from_service_and_method(0x3456, 0x8001));
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 7), 30509);
+    for datagram in [
+        build_method_request(0x3456, 0x8001, &[TAG, 0x11]),
+        build_method_request(0x3456, 0x8002, &[0x22]),
+    ] {
+        pipe.inbound.lock().unwrap().push_back((datagram, src));
+    }
+    let mut buf = vec![0u8; 1500];
+    let rx = simple_someip::bare_metal_tasks::event_rx_dispatch_future(
+        &socket,
+        &hook,
+        record_event,
+        0,
+        &mut buf,
+    );
+    // The receive loop never returns; give it time to drain the two datagrams.
+    let _ = tokio::time::timeout(Duration::from_millis(200), rx).await;
+    let seen = OBSERVED_EVENTS.get().unwrap().lock().unwrap().clone();
+    assert_eq!(seen, [(0x8001, vec![0x11], 1), (0x8002, vec![0x22], 0)]);
 }
