@@ -226,6 +226,47 @@ where
     Ok(())
 }
 
+/// Encode into `buf` one SD message carrying a Subscribe entry for each
+/// consumed eventgroup marked in `answered`; returns its length.
+fn encode_subscribes(
+    buf: &mut [u8],
+    config: &ServerConfig,
+    sd_state: &SdStateManager,
+    answered: &[bool],
+) -> Result<usize, Error> {
+    let mut requests = config.consumed_eventgroups.clone();
+    let mut answered = answered.iter();
+    requests.retain(|_| answered.next().copied().unwrap_or(false));
+    let (sid, reboot_flag) = sd_state.next_session_id_with_reboot_flag();
+    #[allow(clippy::cast_possible_truncation)]
+    let session = sid as u16;
+    crate::sd_codec::build_multi_subscribe_eventgroup_datagram::<
+        { ServerConfig::CONSUMED_EVENTGROUPS_CAP },
+    >(buf, &requests, session, reboot_flag)
+    .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))
+}
+
+/// Send `server` one SD message carrying a Subscribe entry for each
+/// consumed eventgroup marked in `answered`.
+async fn send_subscribes<T>(
+    buf: &mut [u8],
+    config: &ServerConfig,
+    sd_socket: &T,
+    sd_state: &SdStateManager,
+    answered: &[bool],
+    server: core::net::SocketAddr,
+) -> Result<(), Error>
+where
+    T: TransportSocket,
+{
+    let len = encode_subscribes(buf, config, sd_state, answered)?;
+    sd_socket
+        .send_to(&buf[..len], socket_addr_v4(server)?)
+        .await?;
+    crate::log::debug!("Sent Subscribe to {}", server);
+    Ok(())
+}
+
 /// Handle a Service Discovery message (Subscribe / `FindService` etc.).
 #[allow(clippy::too_many_lines)]
 pub(super) async fn handle_sd_message<T, Sub>(
@@ -249,6 +290,7 @@ where
     // It replaces the former future-resident `[u8; UDP_BUFFER_SIZE]`,
     // keeping that buffer out of the run future's frame.
 
+    let mut answered = [false; ServerConfig::CONSUMED_EVENTGROUPS_CAP];
     for entry_view in sd_view.entries() {
         let Ok(entry_type) = entry_view.entry_type() else {
             continue;
@@ -284,7 +326,7 @@ where
                         config.service_id,
                         entry_view.service_id()
                     );
-                    send_subscribe_nack_from_view(
+                    if let Err(e) = send_subscribe_nack_from_view(
                         send_buf,
                         config,
                         sd_socket,
@@ -293,14 +335,17 @@ where
                         sender,
                         "wrong_service_id",
                     )
-                    .await?;
+                    .await
+                    {
+                        crate::log::warn!("SubscribeNack send failed: {e}");
+                    }
                 } else if !co_offered && entry_view.instance_id() != config.instance_id {
                     crate::log::warn!(
                         "Subscribe for wrong instance: expected {}, got {}",
                         config.instance_id,
                         entry_view.instance_id()
                     );
-                    send_subscribe_nack_from_view(
+                    if let Err(e) = send_subscribe_nack_from_view(
                         send_buf,
                         config,
                         sd_socket,
@@ -309,7 +354,10 @@ where
                         sender,
                         "wrong_instance_id",
                     )
-                    .await?;
+                    .await
+                    {
+                        crate::log::warn!("SubscribeNack send failed: {e}");
+                    }
                 } else if !co_offered && entry_view.major_version() != config.major_version {
                     crate::log::warn!(
                         "Subscribe for wrong major_version: expected {}, got {}",
@@ -461,10 +509,24 @@ where
                     );
                 }
             }
+            sd::EntryType::OfferService if !entry_view.is_stop_offer() => {
+                for (request, answered) in config.consumed_eventgroups.iter().zip(&mut answered) {
+                    *answered |= request.service_id == entry_view.service_id()
+                        && request.instance_id == entry_view.instance_id()
+                        && request.major_version == entry_view.major_version();
+                }
+            }
             _ => {
                 crate::log::trace!("Ignoring SD entry type: {:?}", entry_type);
             }
         }
+    }
+
+    if answered.contains(&true)
+        && let Err(e) =
+            send_subscribes(send_buf, config, sd_socket, sd_state, &answered, sender).await
+    {
+        crate::log::warn!("Subscribe send failed: {e}");
     }
 
     Ok(())
@@ -1164,5 +1226,369 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "full-size buf must succeed, got {result:?}");
+    }
+
+    #[cfg(feature = "server-tokio")]
+    mod answering_offers {
+        use super::*;
+
+        /// Records every datagram sent through it.
+        #[derive(Default)]
+        struct RecordingSocket {
+            sent: std::sync::Mutex<std::vec::Vec<(std::vec::Vec<u8>, SocketAddrV4)>>,
+        }
+
+        impl TransportSocket for RecordingSocket {
+            type SendFuture<'a> = NullSend;
+            type RecvFuture<'a> = NullRecv;
+
+            fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddrV4) -> Self::SendFuture<'a> {
+                self.sent.lock().unwrap().push((buf.to_vec(), target));
+                NullSend
+            }
+            fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+                NullRecv
+            }
+            fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
+                Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            }
+            fn join_multicast_v4(
+                &self,
+                _group: Ipv4Addr,
+                _iface: Ipv4Addr,
+            ) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn leave_multicast_v4(
+                &self,
+                _group: Ipv4Addr,
+                _iface: Ipv4Addr,
+            ) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        const PEER_SD: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 30490);
+
+        fn consumed() -> crate::sd_codec::SubscribeEventgroupRequest {
+            crate::sd_codec::SubscribeEventgroupRequest {
+                service_id: 0x5678,
+                instance_id: 1,
+                major_version: 1,
+                event_group_id: 0x0001,
+                ttl: 5,
+                local_ip: Ipv4Addr::LOCALHOST,
+                local_rx_port: 40100,
+            }
+        }
+
+        /// An SD payload with one Offer entry for `service_id` with `ttl`; a TTL of
+        /// 0 makes it a `StopOffer`.
+        fn offer_wire_bytes(service_id: u16, ttl: u32) -> ([u8; 512], usize) {
+            use automotive_wire_codec::Encode;
+
+            let service = sd::ServiceEntry {
+                index_first_options_run: 0,
+                index_second_options_run: 0,
+                options_count: sd::OptionsCount::new(1, 0),
+                service_id,
+                instance_id: 1,
+                major_version: 1,
+                ttl,
+                minor_version: 0,
+            };
+            let entry = if ttl == 0 {
+                sd::Entry::StopOfferService(service)
+            } else {
+                sd::Entry::OfferService(service)
+            };
+            let option = sd::Options::IpV4Endpoint {
+                ip: *PEER_SD.ip(),
+                port: 30509,
+                protocol: sd::TransportProtocol::Udp,
+            };
+            let entries = [entry];
+            let options = [option];
+            let sd_payload = sd::Header::new(
+                sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+                &entries,
+                &options,
+            );
+            let mut wire = [0u8; 512];
+            let sd_len = sd_payload.encode_to_slice(&mut wire).expect("encode");
+            (wire, sd_len)
+        }
+
+        async fn handle_offer(config: &ServerConfig, service_id: u16, ttl: u32) -> RecordingSocket {
+            let socket = RecordingSocket::default();
+            let (wire, sd_len) = offer_wire_bytes(service_id, ttl);
+            let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+            let subscriptions = crate::server::SubscriptionManager::new();
+            let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(subscriptions));
+            handle_sd_message(
+                config,
+                &socket,
+                &make_sd_state(),
+                &subscriptions,
+                &sd_view,
+                core::net::SocketAddr::V4(PEER_SD),
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+            )
+            .await
+            .expect("handle_sd_message");
+            socket
+        }
+
+        #[tokio::test]
+        async fn offer_of_a_consumed_eventgroup_is_answered_with_a_unicast_subscribe() {
+            let config = make_config().with_consumed_eventgroup(consumed());
+
+            let socket = handle_offer(&config, 0x5678, 3).await;
+
+            let sent = socket.sent.lock().unwrap();
+            assert_eq!(sent.len(), 1, "one SD message answers the Offer");
+            let (datagram, to) = &sent[0];
+            assert_eq!(*to, PEER_SD, "the Subscribe goes to the Offer's sender");
+            let view = crate::protocol::MessageView::parse(datagram).expect("SOME/IP");
+            let sd_view = view.sd_header().expect("SD");
+            let entries: std::vec::Vec<_> = sd_view.entries().collect();
+            assert_eq!(entries.len(), 1);
+            let e = &entries[0];
+            assert!(matches!(e.entry_type(), Ok(sd::EntryType::Subscribe)));
+            assert_eq!(
+                (e.service_id(), e.instance_id(), e.major_version()),
+                (0x5678, 1, 1)
+            );
+            assert_eq!((e.event_group_id(), e.ttl()), (0x0001, 5));
+            let endpoint = extract_subscriber_endpoint(
+                &sd_view.options(),
+                e.index_first_options_run() as usize,
+                e.options_count().first_options_count as usize,
+                e.index_second_options_run() as usize,
+                e.options_count().second_options_count as usize,
+            );
+            assert_eq!(
+                endpoint,
+                Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40100))
+            );
+        }
+
+        #[tokio::test]
+        async fn offer_of_an_unconsumed_service_is_not_answered() {
+            let config = make_config().with_consumed_eventgroup(consumed());
+
+            let socket = handle_offer(&config, 0x9999, 3).await;
+
+            assert!(socket.sent.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn stop_offer_of_a_consumed_eventgroup_is_not_answered() {
+            let config = make_config().with_consumed_eventgroup(consumed());
+
+            let socket = handle_offer(&config, 0x5678, 0).await;
+
+            assert!(socket.sent.lock().unwrap().is_empty());
+        }
+
+        /// Fails every send.
+        struct FailingSocket;
+
+        struct FailSend;
+        impl core::future::Future for FailSend {
+            type Output = Result<(), TransportError>;
+            fn poll(
+                self: core::pin::Pin<&mut Self>,
+                _cx: &mut core::task::Context<'_>,
+            ) -> core::task::Poll<Self::Output> {
+                core::task::Poll::Ready(Err(TransportError::Io(
+                    crate::transport::IoErrorKind::Other,
+                )))
+            }
+        }
+
+        impl TransportSocket for FailingSocket {
+            type SendFuture<'a> = FailSend;
+            type RecvFuture<'a> = NullRecv;
+
+            fn send_to<'a>(
+                &'a self,
+                _buf: &'a [u8],
+                _target: SocketAddrV4,
+            ) -> Self::SendFuture<'a> {
+                FailSend
+            }
+            fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+                NullRecv
+            }
+            fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
+                Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            }
+            fn join_multicast_v4(
+                &self,
+                _group: Ipv4Addr,
+                _iface: Ipv4Addr,
+            ) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn leave_multicast_v4(
+                &self,
+                _group: Ipv4Addr,
+                _iface: Ipv4Addr,
+            ) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        /// An SD payload with an Offer entry for each of `offers`
+        /// (`service_id`, `instance_id`, `major_version`).
+        fn offers_wire_bytes(offers: &[(u16, u16, u8)]) -> ([u8; 512], usize) {
+            use automotive_wire_codec::Encode;
+
+            let entries: std::vec::Vec<_> = offers
+                .iter()
+                .map(|&(service_id, instance_id, major_version)| {
+                    sd::Entry::OfferService(sd::ServiceEntry {
+                        index_first_options_run: 0,
+                        index_second_options_run: 0,
+                        options_count: sd::OptionsCount::new(1, 0),
+                        service_id,
+                        instance_id,
+                        major_version,
+                        ttl: 3,
+                        minor_version: 0,
+                    })
+                })
+                .collect();
+            let options = [sd::Options::IpV4Endpoint {
+                ip: *PEER_SD.ip(),
+                port: 30509,
+                protocol: sd::TransportProtocol::Udp,
+            }];
+            let sd_payload = sd::Header::new(
+                sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+                &entries,
+                &options,
+            );
+            let mut wire = [0u8; 512];
+            let sd_len = sd_payload.encode_to_slice(&mut wire).expect("encode");
+            (wire, sd_len)
+        }
+
+        /// The (eventgroup, endpoint port) of each Subscribe in the one SD
+        /// message `config` sends in answer to `offers`, or `None` if it
+        /// sends nothing.
+        async fn answer(
+            config: &ServerConfig,
+            offers: &[(u16, u16, u8)],
+        ) -> Option<std::vec::Vec<(u16, u16)>> {
+            let socket = RecordingSocket::default();
+            let (wire, sd_len) = offers_wire_bytes(offers);
+            let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+            let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::server::SubscriptionManager::new(),
+            ));
+            handle_sd_message(
+                config,
+                &socket,
+                &make_sd_state(),
+                &subscriptions,
+                &sd_view,
+                core::net::SocketAddr::V4(PEER_SD),
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+            )
+            .await
+            .expect("handle_sd_message");
+            let sent = socket.sent.lock().unwrap();
+            assert!(
+                sent.len() <= 1,
+                "at most one SD message answers one message"
+            );
+            let (datagram, _) = sent.first()?;
+            let view = crate::protocol::MessageView::parse(datagram).expect("SOME/IP");
+            let sd_view = view.sd_header().expect("SD");
+            Some(
+                sd_view
+                    .entries()
+                    .map(|e| {
+                        let endpoint = extract_subscriber_endpoint(
+                            &sd_view.options(),
+                            e.index_first_options_run() as usize,
+                            e.options_count().first_options_count as usize,
+                            e.index_second_options_run() as usize,
+                            e.options_count().second_options_count as usize,
+                        )
+                        .expect("an endpoint");
+                        (e.event_group_id(), endpoint.port())
+                    })
+                    .collect(),
+            )
+        }
+
+        #[tokio::test]
+        async fn offer_of_another_instance_or_major_version_is_not_answered() {
+            let config = make_config().with_consumed_eventgroup(consumed());
+
+            assert_eq!(answer(&config, &[(0x5678, 2, 1)]).await, None);
+            assert_eq!(answer(&config, &[(0x5678, 1, 2)]).await, None);
+        }
+
+        #[tokio::test]
+        async fn every_eventgroup_of_an_offered_service_is_subscribed_in_one_message() {
+            let second = crate::sd_codec::SubscribeEventgroupRequest {
+                event_group_id: 0x0002,
+                local_rx_port: 40101,
+                ..consumed()
+            };
+            let config = make_config()
+                .with_consumed_eventgroup(consumed())
+                .with_consumed_eventgroup(second);
+
+            assert_eq!(
+                answer(&config, &[(0x5678, 1, 1)]).await,
+                Some(std::vec![(0x0001, 40100), (0x0002, 40101)])
+            );
+        }
+
+        #[tokio::test]
+        async fn only_the_offered_services_are_subscribed() {
+            let other = crate::sd_codec::SubscribeEventgroupRequest {
+                service_id: 0x5679,
+                event_group_id: 0x0003,
+                local_rx_port: 40102,
+                ..consumed()
+            };
+            let config = make_config()
+                .with_consumed_eventgroup(consumed())
+                .with_consumed_eventgroup(other);
+
+            assert_eq!(
+                answer(&config, &[(0x9999, 1, 1), (0x5679, 1, 1)]).await,
+                Some(std::vec![(0x0003, 40102)])
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failed_subscribe_nack_send_does_not_end_sd_handling() {
+            let config = ServerConfig::new(0x9999, 1);
+            let (wire, sd_len) = subscribe_wire_bytes();
+            let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+            let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::server::SubscriptionManager::new(),
+            ));
+
+            let result = handle_sd_message(
+                &config,
+                &FailingSocket,
+                &make_sd_state(),
+                &subscriptions,
+                &sd_view,
+                subscriber_addr(),
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+            )
+            .await;
+
+            assert!(result.is_ok(), "{result:?}");
+        }
     }
 }
