@@ -10,13 +10,10 @@
 //! parameter on [`SdStateManager::send_offer_service`] becomes the single
 //! migration point for the announcement path.
 
-use crate::CapacityKind;
 use core::net::SocketAddrV4;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::protocol::sd::{
-    self, Entry, Flags, OptionsCount, RebootFlag, ServiceEntry, TransportProtocol,
-};
+use crate::protocol::sd::{self, RebootFlag};
 use crate::transport::TransportSocket;
 
 use super::{Error, ServerConfig};
@@ -191,6 +188,27 @@ impl SdStateManager {
         }
     }
 
+    /// Encode `config`'s `OfferService` into `buf` as the next SD message
+    /// of this manager; returns its length.
+    pub(super) fn encode_offer(
+        &self,
+        buf: &mut [u8],
+        config: &ServerConfig,
+    ) -> Result<usize, Error> {
+        let request = crate::sd_codec::OfferServiceRequest {
+            service_id: config.service_id,
+            instance_id: config.instance_id,
+            major_version: config.major_version,
+            minor_version: config.minor_version,
+            ttl: config.ttl,
+            local_ip: config.interface,
+            unicast_port: config.local_port,
+        };
+        let (session, reboot_flag) = self.next_session();
+        crate::sd_codec::build_offer_service_datagram(buf, &request, session, reboot_flag)
+            .map_err(super::build_error)
+    }
+
     /// Send a multicast `OfferService` announcement for the given config.
     ///
     /// `buf` is a caller-provided scratch buffer used for encoding the
@@ -202,54 +220,7 @@ impl SdStateManager {
         config: &ServerConfig,
         socket: &T,
     ) -> Result<(), Error> {
-        use crate::protocol::Header as SomeIpHeader;
-        use automotive_wire_codec::Encode;
-
-        let entry = Entry::OfferService(ServiceEntry {
-            index_first_options_run: 0,
-            index_second_options_run: 0,
-            options_count: OptionsCount::new(1, 0),
-            service_id: config.service_id,
-            instance_id: config.instance_id,
-            major_version: config.major_version,
-            ttl: config.ttl,
-            minor_version: config.minor_version,
-        });
-
-        let option = sd::Options::IpV4Endpoint {
-            ip: config.interface,
-            port: config.local_port,
-            protocol: TransportProtocol::Udp,
-        };
-
-        let entries = [entry];
-        let options = [option];
-        // Atomic (sid, reboot_flag) pair so that concurrent emissions
-        // around the wrap boundary cannot disagree about whether this
-        // very message advertises `RecentlyRebooted` or `Continuous`.
-        // See `next_session_id_with_reboot_flag` docs for the race.
-        let (sid, reboot_flag) = self.next_session_id_with_reboot_flag();
-        let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &options);
-
-        // Caller-provided send scratch — keeps the per-tick path
-        // alloc-free without parking a `[u8; UDP_BUFFER_SIZE]` in the
-        // announce future. 16-byte SOME/IP header + the SD payload.
-        if buf.len() < 16 {
-            return Err(Error::Capacity(CapacityKind::UdpBuffer));
-        }
-        let sd_data_len = sd_payload
-            .encode_to_slice(&mut buf[16..])
-            .map_err(super::sd_encode_error)?;
-        let total_len = 16 + sd_data_len;
-        // The `< 16` guard plus `encode_to_slice`'s own over-capacity
-        // error already cover the fit; this stays as a debug-only
-        // sanity check rather than a live branch.
-        debug_assert!(total_len <= buf.len());
-        let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
-        someip_header
-            .encode_to_slice(&mut buf[..16])
-            .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
-
+        let total_len = self.encode_offer(buf, config)?;
         let multicast_addr = SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT);
 
         crate::log::trace!(
