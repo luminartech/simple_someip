@@ -85,9 +85,9 @@ impl Default for SdStateManager {
 
 impl SdStateManager {
     /// Construct as if `initial` was the session ID last sent: the next SD
-    /// message gets `initial + 1`, or 1 after 0xFFFF. 0 means none was
-    /// sent, as in [`Self::new`]. For tests that start near the wrap;
-    /// production code uses [`Self::new`].
+    /// message gets `initial + 1`. After 0xFFFF it gets 1, and the reboot
+    /// flag is [`RebootFlag::Continuous`] from then on. 0 means none was
+    /// sent, as in [`Self::new`].
     #[must_use]
     pub const fn with_initial(initial: u16) -> Self {
         Self {
@@ -311,8 +311,20 @@ mod tests {
     #[test]
     fn the_first_session_id_from_new_is_one() {
         let sd = SdStateManager::new();
-        assert_eq!(sd.next_session_id(), 1);
+        assert_eq!(
+            sd.next_session_id_with_reboot_flag(),
+            (1, RebootFlag::RecentlyRebooted)
+        );
         assert_eq!(sd.next_session_id(), 2);
+    }
+
+    #[test]
+    fn the_session_after_0xffff_is_one_with_the_reboot_flag_cleared() {
+        let sd = SdStateManager::with_initial(0xFFFF);
+        assert_eq!(
+            sd.next_session_id_with_reboot_flag(),
+            (1, RebootFlag::Continuous)
+        );
     }
 
     /// Concurrent emitters around the wrap boundary must never produce
