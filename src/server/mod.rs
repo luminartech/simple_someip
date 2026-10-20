@@ -37,9 +37,7 @@ use crate::transport::WrappableSharedHandle;
 use crate::transport::{E2EHandle, SharedHandle, TransportFactory, TransportSocket};
 #[cfg(feature = "_alloc")]
 use alloc::sync::Arc;
-use core::net::Ipv4Addr;
-#[cfg(feature = "_alloc")]
-use core::net::SocketAddrV4;
+use core::net::{Ipv4Addr, SocketAddrV4};
 
 #[cfg(feature = "server-tokio")]
 use crate::transport::NoE2E;
@@ -137,9 +135,13 @@ pub struct ServerConfig {
     /// Offer of a matching service, instance and major version with a
     /// unicast Subscribe to the Offer's sender. Use it on a node that runs
     /// no `Client`; a `Client` sends its own Subscribes. Populate via
-    /// [`Self::with_consumed_eventgroup`].
+    /// [`Self::with_consumed_eventgroup`]. A passive server runs no receive
+    /// loop, so it neither finds nor answers Offers.
     pub consumed_eventgroups:
         heapless::Vec<SubscribeEventgroupRequest, { ServerConfig::CONSUMED_EVENTGROUPS_CAP }>,
+    /// When `FindService` is sent for [`Self::consumed_eventgroups`]; see
+    /// [`FindTiming`]. Defaults to [`FindTiming::DEFAULT`].
+    pub find_timing: FindTiming,
 }
 
 /// A `(service, instance, event_group)` tuple a receive loop will accept
@@ -156,6 +158,36 @@ pub struct AcceptedOffer {
     pub major_version: u8,
     /// Offered event-group ID.
     pub event_group_id: u16,
+}
+
+/// When the receive loop sends `FindService` for the
+/// [`ServerConfig::consumed_eventgroups`] not yet offered: once after
+/// `initial_delay`, then after `repetitions_base_delay` doubled each time,
+/// `repetitions_max` more times. No `FindService` is sent after that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FindTiming {
+    /// Delay before the first `FindService`.
+    pub initial_delay: core::time::Duration,
+    /// Delay before the first repetition; each later one doubles it.
+    pub repetitions_base_delay: core::time::Duration,
+    /// Number of repetitions after the first `FindService`; 0 sends one.
+    pub repetitions_max: u8,
+    /// Where `FindService` is sent: the SD multicast group and port.
+    pub sd_multicast: SocketAddrV4,
+}
+
+impl FindTiming {
+    /// 10 ms initial delay, 100 ms base delay, 3 repetitions, sent to
+    /// [`MULTICAST_IP`](crate::protocol::sd::MULTICAST_IP):[`MULTICAST_PORT`](crate::protocol::sd::MULTICAST_PORT).
+    pub const DEFAULT: Self = Self {
+        initial_delay: core::time::Duration::from_millis(10),
+        repetitions_base_delay: core::time::Duration::from_millis(100),
+        repetitions_max: 3,
+        sd_multicast: SocketAddrV4::new(
+            crate::protocol::sd::MULTICAST_IP,
+            crate::protocol::sd::MULTICAST_PORT,
+        ),
+    };
 }
 
 impl ServerConfig {
@@ -231,6 +263,7 @@ impl ServerConfig {
             announce: true,
             accepted_offers: heapless::Vec::new(),
             consumed_eventgroups: heapless::Vec::new(),
+            find_timing: FindTiming::DEFAULT,
         }
     }
 
@@ -337,6 +370,13 @@ impl ServerConfig {
         self.consumed_eventgroups
             .push(request)
             .expect("consumed_eventgroups capacity exceeded");
+        self
+    }
+
+    /// Set when `FindService` is sent for [`Self::consumed_eventgroups`].
+    #[must_use]
+    pub fn with_find_timing(mut self, find_timing: FindTiming) -> Self {
+        self.find_timing = find_timing;
         self
     }
 
@@ -2297,6 +2337,7 @@ mod tests {
             &sd_view,
             sender,
             &mut [0u8; crate::UDP_BUFFER_SIZE],
+            &[],
         )
         .await;
         assert!(
@@ -2468,6 +2509,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -2532,6 +2574,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -2593,6 +2636,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -2652,6 +2696,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -2714,6 +2759,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -2773,6 +2819,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -2825,6 +2872,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -3049,6 +3097,7 @@ mod tests {
             &sd_view,
             "127.0.0.1:12345".parse().unwrap(),
             &mut [0u8; crate::UDP_BUFFER_SIZE],
+            &[],
         )
         .await;
         assert!(result.is_ok());
@@ -3079,6 +3128,7 @@ mod tests {
             &sd_view,
             "127.0.0.1:45000".parse().unwrap(),
             &mut [0u8; crate::UDP_BUFFER_SIZE],
+            &[],
         )
         .await;
 
@@ -3117,6 +3167,7 @@ mod tests {
             &sd_view,
             "127.0.0.1:12345".parse().unwrap(),
             &mut [0u8; crate::UDP_BUFFER_SIZE],
+            &[],
         )
         .await;
         assert!(result.is_ok());
@@ -3158,6 +3209,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -3467,6 +3519,7 @@ mod tests {
             &sd_view,
             sender,
             &mut [0u8; crate::UDP_BUFFER_SIZE],
+            &[],
         )
         .await
         .unwrap();
