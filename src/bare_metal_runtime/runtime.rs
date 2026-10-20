@@ -761,9 +761,12 @@ pub fn deinit() {
     // Reborrowed through `addr_of_mut!` to retag only this field's bytes.
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).publish_scratch) };
     let session = next_sd_session(&STOP_SESSION);
-    if let Ok(total) =
-        build_multi_stop_offer_service_datagram::<MAX_OFFERS>(scratch, &reqs[..n], session)
-    {
+    if let Ok(total) = build_multi_stop_offer_service_datagram::<MAX_OFFERS>(
+        scratch,
+        &reqs[..n],
+        session,
+        sd::RebootFlag::Continuous,
+    ) {
         let dst = SD_MCAST.load(Ordering::Acquire);
         let sd_port = SD_PORT.load(Ordering::Acquire);
         (plat.send)(sd_port, scratch.as_ptr(), total, dst, sd_port);
