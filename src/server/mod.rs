@@ -45,7 +45,7 @@ use crate::transport::NoE2E;
 use tokio::sync::RwLock;
 
 /// The server error for a datagram the SD codec could not build.
-pub(super) fn build_error(e: crate::sd_codec::BuildError) -> Error {
+fn build_error(e: crate::sd_codec::BuildError) -> Error {
     use crate::sd_codec::BuildError;
     match e {
         BuildError::InvalidTtl(ttl) => {
@@ -464,15 +464,25 @@ impl ServerConfig {
         self
     }
 
+    /// The `OfferService` request for this config's service.
+    pub(crate) fn offer_request(&self) -> crate::sd_codec::OfferServiceRequest {
+        crate::sd_codec::OfferServiceRequest {
+            service_id: self.service_id,
+            instance_id: self.instance_id,
+            major_version: self.major_version,
+            minor_version: self.minor_version,
+            ttl: self.ttl,
+            local_ip: self.interface,
+            unicast_port: self.local_port,
+        }
+    }
+
     fn check_ttl(&self) -> Result<(), Error> {
         let ttls =
             core::iter::once(self.ttl).chain(self.consumed_eventgroups.iter().map(|r| r.ttl));
         for ttl in ttls {
             if !(1..=crate::protocol::sd::MAX_TTL).contains(&ttl) {
-                return Err(
-                    crate::protocol::Error::from(crate::protocol::sd::Error::InvalidTtl(ttl))
-                        .into(),
-                );
+                return Err(build_error(crate::sd_codec::BuildError::InvalidTtl(ttl)));
             }
         }
         Ok(())

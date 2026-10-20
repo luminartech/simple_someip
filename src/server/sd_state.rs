@@ -1,14 +1,9 @@
 //! Service Discovery session-state tracking, decoupled from socket ownership.
 //!
-//! [`SdStateManager`] owns the session-ID counter used by every outgoing
-//! SOME/IP-SD message this server emits (`OfferService` announcements,
-//! unicast Offer replies, `SubscribeAck`, `SubscribeNack`). It also builds
-//! and sends `OfferService` announcements when given a socket.
-//!
-//! Keeping this state in its own type prepares the server for upcoming
-//! transport abstraction: once `TransportSocket` lands, the `&UdpSocket`
-//! parameter on [`SdStateManager::send_offer_service`] becomes the single
-//! migration point for the announcement path.
+//! [`SdStateManager`] owns the session ID and reboot flag of every
+//! SOME/IP-SD message this server sends: `OfferService` (multicast and
+//! unicast), `FindService`, `SubscribeEventgroup`, `SubscribeAck` and
+//! `SubscribeNack`. It also builds the server's `OfferService`.
 
 use core::net::SocketAddrV4;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -27,9 +22,9 @@ use super::{Error, ServerConfig};
 /// once, then [`RebootFlag::Continuous`] permanently — `SdStateManager`
 /// tracks that transition and bundles the `(session_id, reboot_flag)` pair
 /// atomically through
-/// [`Self::next_session_id_with_reboot_flag`] so every server-side SD
-/// emission path reads from a single source of truth and concurrent
-/// emitters cannot race around the wrap boundary.
+/// [`Self::next_session_id_with_reboot_flag`], so every SD message the
+/// server sends takes both from one source and concurrent emitters cannot
+/// race around the wrap boundary.
 #[derive(Debug)]
 pub struct SdStateManager {
     /// Packed `(has_wrapped, session_id)` state.
@@ -174,9 +169,9 @@ impl SdStateManager {
     ///
     /// Returns [`RebootFlag::RecentlyRebooted`] until the session counter
     /// has wrapped past `0xFFFF` at least once, then
-    /// [`RebootFlag::Continuous`] permanently. Production emission paths
-    /// must use [`Self::next_session_id_with_reboot_flag`] instead to
-    /// avoid a TOCTOU race around the wrap boundary; this accessor is
+    /// [`RebootFlag::Continuous`] permanently. Emission paths take the
+    /// session ID and flag together instead, to avoid a TOCTOU race around
+    /// the wrap boundary; this accessor is
     /// `#[cfg(test)]`-only so future code cannot accidentally reach for
     /// the racy pair.
     #[cfg(test)]
@@ -195,25 +190,23 @@ impl SdStateManager {
         buf: &mut [u8],
         config: &ServerConfig,
     ) -> Result<usize, Error> {
-        let request = crate::sd_codec::OfferServiceRequest {
-            service_id: config.service_id,
-            instance_id: config.instance_id,
-            major_version: config.major_version,
-            minor_version: config.minor_version,
-            ttl: config.ttl,
-            local_ip: config.interface,
-            unicast_port: config.local_port,
-        };
         let (session, reboot_flag) = self.next_session();
-        crate::sd_codec::build_offer_service_datagram(buf, &request, session, reboot_flag)
-            .map_err(super::build_error)
+        crate::sd_codec::build_offer_service_datagram(
+            buf,
+            &config.offer_request(),
+            session,
+            reboot_flag,
+        )
+        .map_err(super::build_error)
     }
 
     /// Send a multicast `OfferService` announcement for the given config.
     ///
     /// `buf` is a caller-provided scratch buffer used for encoding the
     /// outgoing frame. Returns [`Error::Capacity`]`("udp_buffer")` if the
-    /// encoded frame does not fit in `buf`.
+    /// encoded frame does not fit in `buf`, a protocol error if
+    /// `config.ttl` is outside 1..=[`MAX_TTL`](sd::MAX_TTL), or the
+    /// socket's transport error.
     pub(super) async fn send_offer_service<T: TransportSocket>(
         &self,
         buf: &mut [u8],
