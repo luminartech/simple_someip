@@ -136,13 +136,15 @@ pub struct ServerConfig {
     /// events never reach a subscriber. Populate via [`Self::with_accepted_offer`];
     /// empty preserves single-service behaviour.
     pub accepted_offers: heapless::Vec<AcceptedOffer, { ServerConfig::ACCEPTED_OFFERS_CAP }>,
-    /// Eventgroups this node subscribes to. The receive loop answers each
-    /// Offer of a matching service, instance and major version with a
-    /// unicast Subscribe to the Offer's sender. Use it on a node that runs
-    /// no `Client`; a `Client` sends its own Subscribes. Each entry names a
-    /// concrete service ID, instance ID and major version, not a wildcard.
-    /// Populate via [`Self::with_consumed_eventgroup`]. A passive server runs
-    /// no receive loop, so it neither finds nor answers Offers.
+    /// Eventgroups this node subscribes to. The run future sends `FindService`
+    /// for their service instances until each is offered (see
+    /// [`Self::find_timing`]), and answers each Offer of a matching service,
+    /// instance and major version with a unicast Subscribe to its sender.
+    /// Use it on a node that runs no `Client`; a `Client` sends its own
+    /// Subscribes. Each entry names a concrete service ID, instance ID and
+    /// major version, not a wildcard. Populate via
+    /// [`Self::with_consumed_eventgroup`]. A passive server runs no receive
+    /// loop, so it neither finds nor answers Offers.
     pub consumed_eventgroups:
         heapless::Vec<SubscribeEventgroupRequest, { ServerConfig::CONSUMED_EVENTGROUPS_CAP }>,
     /// When `FindService` is sent for [`Self::consumed_eventgroups`]; see
