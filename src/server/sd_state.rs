@@ -38,7 +38,8 @@ use super::{Error, ServerConfig};
 pub struct SdStateManager {
     /// Packed `(has_wrapped, session_id)` state.
     ///
-    /// - bits 0..16: current session id (1..=0xFFFF, never 0).
+    /// - bits 0..16: the session id last sent (1..=0xFFFF), or 0 before the
+    ///   first.
     /// - bit 16: `has_wrapped` flag — once set, never cleared.
     /// - bits 17..32: reserved, must remain 0.
     ///
@@ -55,8 +56,9 @@ const SID_MASK: u32 = 0xFFFF;
 const WRAPPED_BIT: u32 = 1 << 16;
 
 impl SdStateManager {
-    /// Construct an `SdStateManager` with a fresh session counter
-    /// (starts at `1`, reboot flag = `RecentlyRebooted`).
+    /// Construct an `SdStateManager` with a fresh session counter: the
+    /// first SD message gets session ID 1 and the reboot flag
+    /// `RecentlyRebooted`.
     ///
     /// `const fn` so consumers can declare a `static`-storage instance
     /// without an allocator:
@@ -68,7 +70,7 @@ impl SdStateManager {
     /// ```
     #[must_use]
     pub const fn new() -> Self {
-        Self::with_initial(1)
+        Self::with_initial(0)
     }
 }
 
@@ -83,16 +85,13 @@ impl Default for SdStateManager {
 }
 
 impl SdStateManager {
-    /// Construct with a specific starting session counter. `pub`
-    /// (rather than `pub(super)`) so external test harnesses — e.g.
-    /// `tests/vsomeip_sd_compat.rs`'s wire-format checks — can
-    /// pre-seed counter state to validate wrap-around behaviour
-    /// without driving a full Server lifecycle. Production callers
-    /// should use [`Self::new`].
+    /// Construct as if `initial` was the session ID last sent: the next SD
+    /// message gets `initial + 1`, or 1 after 0xFFFF. 0 means none was
+    /// sent, as in [`Self::new`]. For tests that start near the wrap;
+    /// production code uses [`Self::new`].
     #[must_use]
     pub const fn with_initial(initial: u16) -> Self {
         Self {
-            // has_wrapped starts false; session_id starts at `initial`.
             session_state: AtomicU32::new(initial as u32),
         }
     }
@@ -311,9 +310,9 @@ mod tests {
     }
 
     #[test]
-    fn next_session_id_starts_at_two_from_default_new() {
+    fn the_first_session_id_from_new_is_one() {
         let sd = SdStateManager::new();
-        // new() seeds at 1; first next_session_id increments to 2
+        assert_eq!(sd.next_session_id(), 1);
         assert_eq!(sd.next_session_id(), 2);
     }
 
