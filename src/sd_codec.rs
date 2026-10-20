@@ -65,8 +65,9 @@ pub struct OfferServiceRequest {
     pub unicast_port: u16,
 }
 
-/// One `SubscribeAckEventgroup` entry. Fields echo the inbound
-/// `Subscribe`.
+/// One `SubscribeAckEventgroup` entry. The service, instance, eventgroup,
+/// major version and counter echo the `Subscribe` it answers; `ttl` is the
+/// lifetime the server grants, 0 for a `SubscribeNack`.
 #[derive(Clone, Copy, Debug)]
 pub struct SubscribeAckRequest {
     pub service_id: u16,
@@ -74,7 +75,8 @@ pub struct SubscribeAckRequest {
     pub event_group_id: u16,
     pub major_version: u8,
     pub ttl: u32,
-    /// The counter of the `Subscribe` being answered.
+    /// The counter of the `Subscribe` being answered. Only its low 4 bits
+    /// are sent; the bits above them are reserved.
     pub counter: u16,
 }
 
@@ -386,7 +388,7 @@ pub fn build_subscribe_ack_datagram(
         instance_id: request.instance_id,
         major_version: request.major_version,
         ttl: request.ttl,
-        counter: request.counter,
+        counter: request.counter & 0x000F,
         event_group_id: request.event_group_id,
     });
     encode_sd_datagram(buf, &[entry], &[], session, reboot)
@@ -1072,5 +1074,21 @@ mod tests {
             build_subscribe_ack_datagram(&mut buf, &request, 2, RebootFlag::Continuous).unwrap();
         let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
         assert_eq!(view.entries().next().expect("one entry").counter(), 3);
+    }
+
+    #[test]
+    fn subscribe_ack_sends_only_the_low_four_counter_bits() {
+        let request = SubscribeAckRequest {
+            service_id: 0x0042,
+            instance_id: 1,
+            major_version: 1,
+            event_group_id: 1,
+            ttl: 3,
+            counter: 0x0013,
+        };
+        let mut buf = [0u8; 64];
+        build_subscribe_ack_datagram(&mut buf, &request, 2, RebootFlag::Continuous).unwrap();
+        let entry = 16 + 8;
+        assert_eq!(buf[entry + 12..entry + 14], [0x00, 0x03]);
     }
 }
