@@ -230,8 +230,9 @@ pub fn build_multi_subscribe_eventgroup_datagram<const N: usize>(
 
 /// Encode an `OfferService` datagram into `buf`. Returns its length in
 /// bytes. `reboot` sets the SD reboot flag: pass
-/// [`RebootFlag::RecentlyRebooted`] until the sender's SD session ID first
-/// wraps from 0xFFFF to 1, and [`RebootFlag::Continuous`] after.
+/// [`RebootFlag::RecentlyRebooted`] until the counter `session` comes from
+/// first wraps from 0xFFFF to 1, and [`RebootFlag::Continuous`] after.
+/// Multicast and each unicast peer have a counter of their own.
 ///
 /// # Errors
 /// See [`BuildError`].
@@ -363,7 +364,9 @@ pub(crate) fn build_find_service_datagram<const N: usize>(
 }
 
 /// Encode a `SubscribeAckEventgroup` datagram into `buf`. Caller
-/// transmits to the original `Subscribe` sender's SD endpoint.
+/// transmits to the original `Subscribe` sender's SD endpoint. `reboot`
+/// sets the SD reboot flag of that peer's unicast session counter, as
+/// described for [`build_offer_service_datagram`].
 ///
 /// # Errors
 /// See [`BuildError`].
@@ -371,6 +374,7 @@ pub fn build_subscribe_ack_datagram(
     buf: &mut [u8],
     request: &SubscribeAckRequest,
     session: u16,
+    reboot: RebootFlag,
 ) -> Result<usize, BuildError> {
     let entry = Entry::SubscribeAckEventGroup(EventGroupEntry {
         index_first_options_run: 0,
@@ -383,7 +387,7 @@ pub fn build_subscribe_ack_datagram(
         counter: 0,
         event_group_id: request.event_group_id,
     });
-    encode_sd_datagram(buf, &[entry], &[], session, RebootFlag::Continuous)
+    encode_sd_datagram(buf, &[entry], &[], session, reboot)
 }
 
 fn encode_service_entry_datagram(
@@ -1031,5 +1035,22 @@ mod tests {
             ),
             full
         );
+    }
+
+    #[test]
+    fn subscribe_ack_builder_writes_the_reboot_flag_it_is_given() {
+        let request = SubscribeAckRequest {
+            service_id: 0x0042,
+            instance_id: 1,
+            major_version: 1,
+            event_group_id: 1,
+            ttl: 3,
+        };
+        for reboot in [RebootFlag::RecentlyRebooted, RebootFlag::Continuous] {
+            let mut buf = [0u8; 64];
+            let len = build_subscribe_ack_datagram(&mut buf, &request, 2, reboot).unwrap();
+            let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+            assert_eq!(view.flags().reboot(), reboot);
+        }
     }
 }

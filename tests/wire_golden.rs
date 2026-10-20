@@ -651,7 +651,8 @@ mod sd_codec_golden {
             ttl: 10,
         };
         let mut buf = [0u8; 64];
-        let n = build_subscribe_ack_datagram(&mut buf, &request, 2).unwrap();
+        let n =
+            build_subscribe_ack_datagram(&mut buf, &request, 2, RebootFlag::Continuous).unwrap();
         assert_eq!(n, 44);
 
         #[rustfmt::skip]
