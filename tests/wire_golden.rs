@@ -649,6 +649,7 @@ mod sd_codec_golden {
             event_group_id: 0x0005,
             major_version: 1,
             ttl: 10,
+            counter: 0,
         };
         let mut buf = [0u8; 64];
         let n =

@@ -67,6 +67,8 @@ pub struct SubscribeAckRequest {
     pub event_group_id: u16,
     pub major_version: u8,
     pub ttl: u32,
+    /// The counter of the `Subscribe` being answered.
+    pub counter: u16,
 }
 
 /// Packet-construction errors.
@@ -359,7 +361,7 @@ pub fn build_subscribe_ack_datagram(
         instance_id: request.instance_id,
         major_version: request.major_version,
         ttl: request.ttl,
-        counter: 0,
+        counter: request.counter,
         event_group_id: request.event_group_id,
     });
     encode_sd_datagram(buf, &[entry], &[], session, reboot)
@@ -991,6 +993,7 @@ mod tests {
             major_version: 1,
             event_group_id: 1,
             ttl: 3,
+            counter: 0,
         };
         for reboot in [RebootFlag::RecentlyRebooted, RebootFlag::Continuous] {
             let mut buf = [0u8; 64];
@@ -998,5 +1001,22 @@ mod tests {
             let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
             assert_eq!(view.flags().reboot(), reboot);
         }
+    }
+
+    #[test]
+    fn subscribe_ack_echoes_the_subscribe_counter() {
+        let request = SubscribeAckRequest {
+            service_id: 0x0042,
+            instance_id: 1,
+            major_version: 1,
+            event_group_id: 1,
+            ttl: 3,
+            counter: 3,
+        };
+        let mut buf = [0u8; 64];
+        let len =
+            build_subscribe_ack_datagram(&mut buf, &request, 2, RebootFlag::Continuous).unwrap();
+        let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+        assert_eq!(view.entries().next().expect("one entry").counter(), 3);
     }
 }
