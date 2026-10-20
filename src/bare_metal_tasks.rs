@@ -12,9 +12,10 @@
 //! `#[embassy_executor::task]` body relies on). The server's inbound
 //! path (SD subscribe-accept + request dispatch) is handled by
 //! [`crate::server::Server::run_with_buffers`] and is not duplicated
-//! here; that path also answers Offers with Subscribes for the
-//! [`crate::server::ServerConfig::consumed_eventgroups`]. These cover the
-//! announce, the notification receive, and the synchronous publish.
+//! here; that path also finds the
+//! [`crate::server::ServerConfig::consumed_eventgroups`] and answers their
+//! Offers with Subscribes. These cover the announce, the notification
+//! receive, and the synchronous publish.
 
 use core::future::Future;
 use core::net::SocketAddrV4;
