@@ -29,7 +29,8 @@ use super::{Error, ServerConfig};
 ///
 /// `buf` is a caller-provided scratch buffer used for encoding the outgoing
 /// frame. Returns [`Error::Capacity`]`("udp_buffer")` if the encoded frame
-/// does not fit in `buf`.
+/// does not fit in `buf`, a protocol error if `config.ttl` is outside
+/// 1..=[`MAX_TTL`](sd::MAX_TTL), or the socket's transport error.
 pub(super) async fn send_unicast_offer<T>(
     buf: &mut [u8],
     config: &ServerConfig,
@@ -1914,19 +1915,10 @@ mod tests {
 
         /// The codec's `OfferService` for `config`, as the first SD message.
         fn codec_offer(config: &ServerConfig) -> std::vec::Vec<u8> {
-            let request = crate::sd_codec::OfferServiceRequest {
-                service_id: config.service_id,
-                instance_id: config.instance_id,
-                major_version: config.major_version,
-                minor_version: config.minor_version,
-                ttl: config.ttl,
-                local_ip: config.interface,
-                unicast_port: config.local_port,
-            };
             let mut buf = [0u8; 64];
             let len = crate::sd_codec::build_offer_service_datagram(
                 &mut buf,
-                &request,
+                &config.offer_request(),
                 1,
                 sd::RebootFlag::RecentlyRebooted,
             )
@@ -1957,10 +1949,7 @@ mod tests {
             let unicast = unicast.sent.lock().unwrap();
             let multicast = multicast.sent.lock().unwrap();
             assert_eq!(unicast[0].0, codec_offer(&config), "unicast");
-            assert_eq!(
-                unicast[0].1,
-                SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 40000)
-            );
+            assert_eq!(unicast[0].1, socket_addr_v4(subscriber_addr()).unwrap());
             assert_eq!(multicast[0].0, codec_offer(&config), "multicast");
             assert_eq!(
                 multicast[0].1,
