@@ -229,8 +229,9 @@ pub fn build_multi_subscribe_eventgroup_datagram<const N: usize>(
 }
 
 /// Encode an `OfferService` datagram into `buf`. Returns its length in
-/// bytes. `reboot` sets the SD reboot flag: set it until the session
-/// counter wraps.
+/// bytes. `reboot` sets the SD reboot flag: pass
+/// [`RebootFlag::RecentlyRebooted`] until the sender's SD session ID first
+/// wraps from 0xFFFF to 1, and [`RebootFlag::Continuous`] after.
 ///
 /// # Errors
 /// See [`BuildError`].
@@ -244,7 +245,8 @@ pub fn build_offer_service_datagram(
 }
 
 /// Encode a `StopOfferService` datagram into `buf` (same shape as
-/// [`build_offer_service_datagram`], TTL forced to `0`).
+/// [`build_offer_service_datagram`], TTL forced to `0`). `reboot` sets the
+/// SD reboot flag, as in [`build_offer_service_datagram`].
 ///
 /// # Errors
 /// See [`BuildError`].
@@ -275,7 +277,8 @@ pub fn build_multi_offer_service_datagram<const N: usize>(
 }
 
 /// Encode a single SD datagram carrying one `StopOfferService` entry per
-/// element of `requests` (up to `N`). `reboot` sets the SD reboot flag.
+/// element of `requests` (up to `N`). `reboot` sets the SD reboot flag, as
+/// in [`build_offer_service_datagram`].
 ///
 /// # Errors
 /// See [`build_multi_offer_service_datagram`].
@@ -295,14 +298,18 @@ fn build_multi_service_entry_datagram<const N: usize>(
     stop: bool,
     reboot: RebootFlag,
 ) -> Result<usize, BuildError> {
+    const { assert!(N <= 256, "SD option indices are one byte") };
+    if requests.len() > N {
+        return Err(BuildError::ListFull {
+            needed: requests.len(),
+            capacity: N,
+        });
+    }
     let mut entries: heapless::Vec<Entry, N> = heapless::Vec::new();
     let mut options: heapless::Vec<SdOptions, N> = heapless::Vec::new();
-    for (i, req) in requests.iter().enumerate().take(N) {
-        #[allow(clippy::cast_possible_truncation)]
+    for (index, req) in (0..=u8::MAX).zip(requests) {
         let svc = ServiceEntry {
-            // Each entry owns exactly one option at position `i` in the
-            // flat options array.
-            index_first_options_run: i as u8,
+            index_first_options_run: index,
             index_second_options_run: 0,
             options_count: OptionsCount::new(1, 0),
             service_id: req.service_id,
@@ -311,29 +318,16 @@ fn build_multi_service_entry_datagram<const N: usize>(
             ttl: req.ttl,
             minor_version: req.minor_version,
         };
-        let entry = if stop {
+        let _ = entries.push(if stop {
             Entry::StopOfferService(svc)
         } else {
             Entry::OfferService(svc)
-        };
-        // `take(N)` bounds the loop to the vecs' capacity, so these pushes
-        // cannot actually fail; the mapping keeps the fallible signature honest
-        // and reports capacity as needed/available if that invariant is ever
-        // broken.
-        entries.push(entry).map_err(|_| BuildError::ListFull {
-            needed: requests.len(),
-            capacity: N,
-        })?;
-        options
-            .push(SdOptions::IpV4Endpoint {
-                ip: req.local_ip,
-                port: req.unicast_port,
-                protocol: TransportProtocol::Udp,
-            })
-            .map_err(|_| BuildError::ListFull {
-                needed: requests.len(),
-                capacity: N,
-            })?;
+        });
+        let _ = options.push(SdOptions::IpV4Endpoint {
+            ip: req.local_ip,
+            port: req.unicast_port,
+            protocol: TransportProtocol::Udp,
+        });
     }
     encode_sd_datagram(buf, &entries, &options, session, reboot)
 }
@@ -837,6 +831,7 @@ mod tests {
             let entry = entries.next().expect("one entry");
             assert_eq!(entry.entry_type().unwrap(), EntryType::Subscribe);
             assert_eq!(entry.service_id(), 0x0042);
+            assert_eq!(view.flags().reboot(), reboot);
         }
     }
 
@@ -1013,5 +1008,28 @@ mod tests {
                 assert_eq!(view.flags().reboot(), reboot, "{name}");
             }
         }
+    }
+
+    #[test]
+    fn multi_offer_builders_reject_more_requests_than_their_capacity() {
+        let mut buf = [0u8; 256];
+        let requests = [req(0x0001, 30501), req(0x0002, 30502)];
+        let full = Err(BuildError::ListFull {
+            needed: 2,
+            capacity: 1,
+        });
+        assert_eq!(
+            build_multi_offer_service_datagram::<1>(&mut buf, &requests, 1, RebootFlag::Continuous),
+            full
+        );
+        assert_eq!(
+            build_multi_stop_offer_service_datagram::<1>(
+                &mut buf,
+                &requests,
+                1,
+                RebootFlag::Continuous
+            ),
+            full
+        );
     }
 }
