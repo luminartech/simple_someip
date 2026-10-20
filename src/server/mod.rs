@@ -44,12 +44,16 @@ use crate::transport::NoE2E;
 #[cfg(feature = "server-tokio")]
 use tokio::sync::RwLock;
 
-fn sd_encode_error(e: automotive_wire_codec::EncodeToSliceError<crate::protocol::Error>) -> Error {
+/// The server error for a datagram the SD codec could not build.
+pub(super) fn build_error(e: crate::sd_codec::BuildError) -> Error {
+    use crate::sd_codec::BuildError;
     match e {
-        automotive_wire_codec::EncodeToSliceError::InsufficientBuffer(_) => {
+        BuildError::InvalidTtl(ttl) => {
+            crate::protocol::Error::from(crate::protocol::sd::Error::InvalidTtl(ttl)).into()
+        }
+        BuildError::BufferTooSmall(_) | BuildError::ListFull { .. } | BuildError::EncodeFailed => {
             Error::Capacity(crate::CapacityKind::UdpBuffer)
         }
-        automotive_wire_codec::EncodeToSliceError::Encode(e) => Error::Protocol(e),
     }
 }
 

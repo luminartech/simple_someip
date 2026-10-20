@@ -12,13 +12,12 @@
 //! [`Server::run`](super::Server::run) /
 //! [`Server::run_with_buffers`](super::Server::run_with_buffers).
 
-use crate::CapacityKind;
 use core::net::SocketAddrV4;
 
 use futures_util::{FutureExt, future::Either, pin_mut, select_biased};
 
 use crate::Timer;
-use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
+use crate::protocol::sd;
 use crate::transport::{E2EHandle, SharedHandle, TransportSocket};
 
 use super::sd_state::SdStateManager;
@@ -41,49 +40,8 @@ pub(super) async fn send_unicast_offer<T>(
 where
     T: TransportSocket,
 {
-    use crate::protocol::Header as SomeIpHeader;
-    use automotive_wire_codec::Encode;
-
-    let entry = Entry::OfferService(ServiceEntry {
-        index_first_options_run: 0,
-        index_second_options_run: 0,
-        options_count: OptionsCount::new(1, 0),
-        service_id: config.service_id,
-        instance_id: config.instance_id,
-        major_version: config.major_version,
-        ttl: config.ttl,
-        minor_version: config.minor_version,
-    });
-
-    let option = sd::Options::IpV4Endpoint {
-        ip: config.interface,
-        port: config.local_port,
-        protocol: TransportProtocol::Udp,
-    };
-
-    let entries = [entry];
-    let options = [option];
-    let (sid, reboot_flag) = sd_state.next_session_id_with_reboot_flag();
-    let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &options);
-
-    // Guard: SOME/IP header needs 16 bytes; SD payload needs the rest.
-    if buf.len() < 16 {
-        return Err(Error::Capacity(CapacityKind::UdpBuffer));
-    }
-    let sd_data_len = sd_payload
-        .encode_to_slice(&mut buf[16..])
-        .map_err(super::sd_encode_error)?;
-    let total_len = 16 + sd_data_len;
-    // The `< 16` guard plus `encode_to_slice`'s own over-capacity error
-    // already cover the fit; this stays as a debug-only sanity check
-    // rather than a live (dead) branch.
-    debug_assert!(total_len <= buf.len());
-    let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
-    someip_header
-        .encode_to_slice(&mut buf[..16])
-        .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
-
     let target_v4 = socket_addr_v4(target)?;
+    let total_len = sd_state.encode_offer(buf, config)?;
     sd_socket.send_to(&buf[..total_len], target_v4).await?;
     crate::log::debug!(
         "Sent unicast OfferService to {} for service 0x{:04X}",
@@ -92,19 +50,6 @@ where
     );
 
     Ok(())
-}
-
-/// The server error for a datagram the SD codec could not build.
-fn build_error(e: crate::sd_codec::BuildError) -> Error {
-    use crate::sd_codec::BuildError;
-    match e {
-        BuildError::InvalidTtl(ttl) => {
-            crate::protocol::Error::from(sd::Error::InvalidTtl(ttl)).into()
-        }
-        BuildError::BufferTooSmall(_) | BuildError::ListFull { .. } | BuildError::EncodeFailed => {
-            Error::Capacity(CapacityKind::UdpBuffer)
-        }
-    }
 }
 
 /// Send `peer` the `SubscribeAckEventGroup` answering `entry_view`, with
@@ -132,7 +77,7 @@ where
     let peer = socket_addr_v4(peer)?;
     let (session, reboot_flag) = sd_state.next_session();
     let len = crate::sd_codec::build_subscribe_ack_datagram(buf, &request, session, reboot_flag)
-        .map_err(build_error)?;
+        .map_err(super::build_error)?;
     sd_socket.send_to(&buf[..len], peer).await?;
     Ok(())
 }
@@ -206,7 +151,7 @@ fn encode_subscribes(
     crate::sd_codec::build_multi_subscribe_eventgroup_datagram::<
         { ServerConfig::CONSUMED_EVENTGROUPS_CAP },
     >(buf, &requests, session, reboot_flag)
-    .map_err(build_error)
+    .map_err(super::build_error)
 }
 
 /// Send `server` one SD message carrying a Subscribe entry for each
@@ -796,7 +741,7 @@ fn encode_finds(
         reboot_flag,
     )
     .map(Some)
-    .map_err(build_error)
+    .map_err(super::build_error)
 }
 
 const FIND_BUF_LEN: usize = 16 + 12 + 16 * ServerConfig::CONSUMED_EVENTGROUPS_CAP;
@@ -990,6 +935,7 @@ pub(super) fn extract_subscriber_endpoint<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CapacityKind;
 
     use core::net::{Ipv4Addr, SocketAddrV4};
 
@@ -1964,6 +1910,62 @@ mod tests {
             let sent = socket.sent.lock().unwrap();
             assert_eq!(sent[0].0, codec_answer(config.ttl), "ack");
             assert_eq!(sent[1].0, codec_answer(0), "nack");
+        }
+
+        /// The codec's `OfferService` for `config`, as the first SD message.
+        fn codec_offer(config: &ServerConfig) -> std::vec::Vec<u8> {
+            let request = crate::sd_codec::OfferServiceRequest {
+                service_id: config.service_id,
+                instance_id: config.instance_id,
+                major_version: config.major_version,
+                minor_version: config.minor_version,
+                ttl: config.ttl,
+                local_ip: config.interface,
+                unicast_port: config.local_port,
+            };
+            let mut buf = [0u8; 64];
+            let len = crate::sd_codec::build_offer_service_datagram(
+                &mut buf,
+                &request,
+                1,
+                sd::RebootFlag::RecentlyRebooted,
+            )
+            .expect("build");
+            buf[..len].to_vec()
+        }
+
+        #[tokio::test]
+        async fn the_server_offers_are_the_codec_offer() {
+            let config = make_config().with_minor_version(7);
+
+            let unicast = RecordingSocket::default();
+            send_unicast_offer(
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &config,
+                &unicast,
+                &make_sd_state(),
+                subscriber_addr(),
+            )
+            .await
+            .expect("unicast offer");
+            let multicast = RecordingSocket::default();
+            make_sd_state()
+                .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &multicast)
+                .await
+                .expect("multicast offer");
+
+            let unicast = unicast.sent.lock().unwrap();
+            let multicast = multicast.sent.lock().unwrap();
+            assert_eq!(unicast[0].0, codec_offer(&config), "unicast");
+            assert_eq!(
+                unicast[0].1,
+                SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 40000)
+            );
+            assert_eq!(multicast[0].0, codec_offer(&config), "multicast");
+            assert_eq!(
+                multicast[0].1,
+                SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT)
+            );
         }
     }
 }
