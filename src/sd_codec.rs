@@ -331,6 +331,36 @@ fn build_multi_service_entry_datagram<const N: usize>(
     encode_sd_datagram(buf, &entries, &options, session, RebootFlag::Continuous)
 }
 
+/// Encode one SD datagram with a `FindService` entry, any minor version and
+/// no options, for each element of `wanted`.
+#[cfg(feature = "server")]
+pub(crate) fn build_find_service_datagram<const N: usize>(
+    buf: &mut [u8],
+    wanted: &[SubscribeEventgroupRequest],
+    session: u16,
+    reboot: RebootFlag,
+) -> Result<usize, BuildError> {
+    let mut entries: heapless::Vec<Entry, N> = heapless::Vec::new();
+    for request in wanted {
+        entries
+            .push(Entry::FindService(ServiceEntry {
+                index_first_options_run: 0,
+                index_second_options_run: 0,
+                options_count: OptionsCount::new(0, 0),
+                service_id: request.service_id,
+                instance_id: request.instance_id,
+                major_version: request.major_version,
+                ttl: request.ttl,
+                minor_version: 0xFFFF_FFFF,
+            }))
+            .map_err(|_| BuildError::ListFull {
+                needed: wanted.len(),
+                capacity: N,
+            })?;
+    }
+    encode_sd_datagram(buf, &entries, &[], session, reboot)
+}
+
 /// Encode a `SubscribeAckEventgroup` datagram into `buf`. Caller
 /// transmits to the original `Subscribe` sender's SD endpoint.
 ///
@@ -876,6 +906,62 @@ mod tests {
                 &mut buf,
                 &[request, request],
                 3,
+                RebootFlag::Continuous
+            ),
+            Err(BuildError::ListFull {
+                needed: 2,
+                capacity: 1
+            })
+        );
+    }
+
+    #[cfg(feature = "server")]
+    fn find_request() -> SubscribeEventgroupRequest {
+        SubscribeEventgroupRequest {
+            service_id: 0x0042,
+            instance_id: 3,
+            major_version: 2,
+            event_group_id: 1,
+            ttl: 7,
+            local_ip: Ipv4Addr::new(192, 0, 2, 2),
+            local_rx_port: 30600,
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn find_entries_ask_for_any_minor_version_and_carry_no_options() {
+        let mut buf = [0u8; 64];
+        let len = build_find_service_datagram::<1>(
+            &mut buf,
+            &[find_request()],
+            5,
+            RebootFlag::Continuous,
+        )
+        .unwrap();
+        let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+        let entries: std::vec::Vec<_> = view.entries().collect();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.entry_type().unwrap(), EntryType::FindService);
+        assert_eq!(
+            (e.service_id(), e.instance_id(), e.major_version(), e.ttl()),
+            (0x0042, 3, 2, 7)
+        );
+        assert_eq!(e.minor_version(), 0xFFFF_FFFF);
+        assert_eq!(view.options().count(), 0);
+        assert_eq!(len, 16 + 12 + 16);
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn find_rejects_more_instances_than_its_capacity() {
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            build_find_service_datagram::<1>(
+                &mut buf,
+                &[find_request(), find_request()],
+                5,
                 RebootFlag::Continuous
             ),
             Err(BuildError::ListFull {
