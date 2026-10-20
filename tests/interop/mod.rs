@@ -24,6 +24,10 @@ pub mod consts {
     pub const SD_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 0, 255);
     pub const OUR_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
     pub const PEER_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+    /// The bare-metal runtime's `FindService` timing in these tests.
+    pub const FIND_INITIAL_DELAY_MS: (u32, u32) = (50, 150);
+    pub const FIND_BASE_DELAY_MS: u32 = 100;
+    pub const FIND_REPETITIONS: u8 = 3;
 }
 
 const LOOPBACK_SETUP: &str = "run:\n  \

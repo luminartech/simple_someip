@@ -1,22 +1,14 @@
 //! Service Discovery session-state tracking, decoupled from socket ownership.
 //!
-//! [`SdStateManager`] owns the session-ID counter used by every outgoing
-//! SOME/IP-SD message this server emits (`OfferService` announcements,
-//! unicast Offer replies, `SubscribeAck`, `SubscribeNack`). It also builds
-//! and sends `OfferService` announcements when given a socket.
-//!
-//! Keeping this state in its own type prepares the server for upcoming
-//! transport abstraction: once `TransportSocket` lands, the `&UdpSocket`
-//! parameter on [`SdStateManager::send_offer_service`] becomes the single
-//! migration point for the announcement path.
+//! [`SdStateManager`] owns the session ID and reboot flag of every
+//! SOME/IP-SD message this server sends: `OfferService` (multicast and
+//! unicast), `FindService`, `SubscribeEventgroup`, `SubscribeAck` and
+//! `SubscribeNack`. It also builds the server's `OfferService`.
 
-use crate::CapacityKind;
 use core::net::SocketAddrV4;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::protocol::sd::{
-    self, Entry, Flags, OptionsCount, RebootFlag, ServiceEntry, TransportProtocol,
-};
+use crate::protocol::sd::{self, RebootFlag};
 use crate::transport::TransportSocket;
 
 use super::{Error, ServerConfig};
@@ -30,14 +22,15 @@ use super::{Error, ServerConfig};
 /// once, then [`RebootFlag::Continuous`] permanently — `SdStateManager`
 /// tracks that transition and bundles the `(session_id, reboot_flag)` pair
 /// atomically through
-/// [`Self::next_session_id_with_reboot_flag`] so every server-side SD
-/// emission path reads from a single source of truth and concurrent
-/// emitters cannot race around the wrap boundary.
+/// [`Self::next_session_id_with_reboot_flag`], so every SD message the
+/// server sends takes both from one source and concurrent emitters cannot
+/// race around the wrap boundary.
 #[derive(Debug)]
 pub struct SdStateManager {
     /// Packed `(has_wrapped, session_id)` state.
     ///
-    /// - bits 0..16: current session id (1..=0xFFFF, never 0).
+    /// - bits 0..16: the session id last sent (1..=0xFFFF), or 0 before the
+    ///   first.
     /// - bit 16: `has_wrapped` flag — once set, never cleared.
     /// - bits 17..32: reserved, must remain 0.
     ///
@@ -54,8 +47,9 @@ const SID_MASK: u32 = 0xFFFF;
 const WRAPPED_BIT: u32 = 1 << 16;
 
 impl SdStateManager {
-    /// Construct an `SdStateManager` with a fresh session counter
-    /// (starts at `1`, reboot flag = `RecentlyRebooted`).
+    /// Construct an `SdStateManager` with a fresh session counter: the
+    /// first SD message gets session ID 1 and the reboot flag
+    /// `RecentlyRebooted`.
     ///
     /// `const fn` so consumers can declare a `static`-storage instance
     /// without an allocator:
@@ -67,7 +61,7 @@ impl SdStateManager {
     /// ```
     #[must_use]
     pub const fn new() -> Self {
-        Self::with_initial(1)
+        Self::with_initial(0)
     }
 }
 
@@ -82,16 +76,13 @@ impl Default for SdStateManager {
 }
 
 impl SdStateManager {
-    /// Construct with a specific starting session counter. `pub`
-    /// (rather than `pub(super)`) so external test harnesses — e.g.
-    /// `tests/vsomeip_sd_compat.rs`'s wire-format checks — can
-    /// pre-seed counter state to validate wrap-around behaviour
-    /// without driving a full Server lifecycle. Production callers
-    /// should use [`Self::new`].
+    /// Construct as if `initial` was the session ID last sent: the next SD
+    /// message gets `initial + 1`. After 0xFFFF it gets 1, and the reboot
+    /// flag is [`RebootFlag::Continuous`] from then on. 0 means none was
+    /// sent, as in [`Self::new`].
     #[must_use]
     pub const fn with_initial(initial: u16) -> Self {
         Self {
-            // has_wrapped starts false; session_id starts at `initial`.
             session_state: AtomicU32::new(initial as u32),
         }
     }
@@ -119,6 +110,12 @@ impl SdStateManager {
     /// clippy's `missing_panics_doc` and as a tripwire if the closure
     /// is ever changed to be conditional.
     pub fn next_session_id_with_reboot_flag(&self) -> (u32, RebootFlag) {
+        let (session_id, reboot_flag) = self.next_session();
+        (u32::from(session_id), reboot_flag)
+    }
+
+    /// The next SD session ID and the reboot flag of the same emission.
+    pub(crate) fn next_session(&self) -> (u16, RebootFlag) {
         // Nightly deprecates `fetch_update` in favor of the renamed
         // `try_update`, but `try_update` does not exist on stable yet and
         // this file builds in the stable CI lanes. Switch to `try_update`
@@ -150,13 +147,12 @@ impl SdStateManager {
             n => n,
         };
         let next_wrapped = prev_wrapped || prev_sid == u16::MAX;
-        let session_id = u32::from(next_sid);
         let reboot_flag = if next_wrapped {
             RebootFlag::Continuous
         } else {
             RebootFlag::RecentlyRebooted
         };
-        (session_id, reboot_flag)
+        (next_sid, reboot_flag)
     }
 
     /// Convenience: advance the counter and return only the session id.
@@ -173,9 +169,9 @@ impl SdStateManager {
     ///
     /// Returns [`RebootFlag::RecentlyRebooted`] until the session counter
     /// has wrapped past `0xFFFF` at least once, then
-    /// [`RebootFlag::Continuous`] permanently. Production emission paths
-    /// must use [`Self::next_session_id_with_reboot_flag`] instead to
-    /// avoid a TOCTOU race around the wrap boundary; this accessor is
+    /// [`RebootFlag::Continuous`] permanently. Emission paths take the
+    /// session ID and flag together instead, to avoid a TOCTOU race around
+    /// the wrap boundary; this accessor is
     /// `#[cfg(test)]`-only so future code cannot accidentally reach for
     /// the racy pair.
     #[cfg(test)]
@@ -187,65 +183,37 @@ impl SdStateManager {
         }
     }
 
+    /// Encode `config`'s `OfferService` into `buf` as the next SD message
+    /// of this manager; returns its length.
+    pub(super) fn encode_offer(
+        &self,
+        buf: &mut [u8],
+        config: &ServerConfig,
+    ) -> Result<usize, Error> {
+        let (session, reboot_flag) = self.next_session();
+        crate::sd_codec::build_offer_service_datagram(
+            buf,
+            &config.offer_request(),
+            session,
+            reboot_flag,
+        )
+        .map_err(super::build_error)
+    }
+
     /// Send a multicast `OfferService` announcement for the given config.
     ///
     /// `buf` is a caller-provided scratch buffer used for encoding the
     /// outgoing frame. Returns [`Error::Capacity`]`("udp_buffer")` if the
-    /// encoded frame does not fit in `buf`.
+    /// encoded frame does not fit in `buf`, a protocol error if
+    /// `config.ttl` is outside 1..=[`MAX_TTL`](sd::MAX_TTL), or the
+    /// socket's transport error.
     pub(super) async fn send_offer_service<T: TransportSocket>(
         &self,
         buf: &mut [u8],
         config: &ServerConfig,
         socket: &T,
     ) -> Result<(), Error> {
-        use crate::protocol::Header as SomeIpHeader;
-        use automotive_wire_codec::Encode;
-
-        let entry = Entry::OfferService(ServiceEntry {
-            index_first_options_run: 0,
-            index_second_options_run: 0,
-            options_count: OptionsCount::new(1, 0),
-            service_id: config.service_id,
-            instance_id: config.instance_id,
-            major_version: config.major_version,
-            ttl: config.ttl,
-            minor_version: config.minor_version,
-        });
-
-        let option = sd::Options::IpV4Endpoint {
-            ip: config.interface,
-            port: config.local_port,
-            protocol: TransportProtocol::Udp,
-        };
-
-        let entries = [entry];
-        let options = [option];
-        // Atomic (sid, reboot_flag) pair so that concurrent emissions
-        // around the wrap boundary cannot disagree about whether this
-        // very message advertises `RecentlyRebooted` or `Continuous`.
-        // See `next_session_id_with_reboot_flag` docs for the race.
-        let (sid, reboot_flag) = self.next_session_id_with_reboot_flag();
-        let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &options);
-
-        // Caller-provided send scratch — keeps the per-tick path
-        // alloc-free without parking a `[u8; UDP_BUFFER_SIZE]` in the
-        // announce future. 16-byte SOME/IP header + the SD payload.
-        if buf.len() < 16 {
-            return Err(Error::Capacity(CapacityKind::UdpBuffer));
-        }
-        let sd_data_len = sd_payload
-            .encode_to_slice(&mut buf[16..])
-            .map_err(super::sd_encode_error)?;
-        let total_len = 16 + sd_data_len;
-        // The `< 16` guard plus `encode_to_slice`'s own over-capacity
-        // error already cover the fit; this stays as a debug-only
-        // sanity check rather than a live branch.
-        debug_assert!(total_len <= buf.len());
-        let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
-        someip_header
-            .encode_to_slice(&mut buf[..16])
-            .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
-
+        let total_len = self.encode_offer(buf, config)?;
         let multicast_addr = SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT);
 
         crate::log::trace!(
@@ -305,10 +273,22 @@ mod tests {
     }
 
     #[test]
-    fn next_session_id_starts_at_two_from_default_new() {
+    fn the_first_session_id_from_new_is_one() {
         let sd = SdStateManager::new();
-        // new() seeds at 1; first next_session_id increments to 2
+        assert_eq!(
+            sd.next_session_id_with_reboot_flag(),
+            (1, RebootFlag::RecentlyRebooted)
+        );
         assert_eq!(sd.next_session_id(), 2);
+    }
+
+    #[test]
+    fn the_session_after_0xffff_is_one_with_the_reboot_flag_cleared() {
+        let sd = SdStateManager::with_initial(0xFFFF);
+        assert_eq!(
+            sd.next_session_id_with_reboot_flag(),
+            (1, RebootFlag::Continuous)
+        );
     }
 
     /// Concurrent emitters around the wrap boundary must never produce

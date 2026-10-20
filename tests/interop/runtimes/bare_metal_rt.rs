@@ -59,6 +59,16 @@ enum Cmd {
     Deinit,
 }
 
+/// The runtime's `FindService` timing in these tests.
+fn sd_timing() -> rt::SdTiming {
+    let mut timing = rt::SdTiming::DEFAULT;
+    timing.initial_delay_min_ms = FIND_INITIAL_DELAY_MS.0;
+    timing.initial_delay_max_ms = FIND_INITIAL_DELAY_MS.1;
+    timing.repetitions_base_delay_ms = FIND_BASE_DELAY_MS;
+    timing.repetitions_max = FIND_REPETITIONS;
+    timing
+}
+
 pub struct BareMetalRt {
     /// The offered service, which `publish` publishes on.
     service: u16,
@@ -107,6 +117,7 @@ impl SomeipUnderTest for BareMetalRt {
             bind,
             offers: offers.leak(),
             subscriptions: subscriptions.leak(),
+            sd_timing: sd_timing(),
             mailbox: &MAILBOX,
             // SAFETY: `STARTED` was claimed above and is released only when
             // `init` fails before spawning the task that borrows these

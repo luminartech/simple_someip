@@ -20,12 +20,13 @@ use crate::sd_codec::{
     next_sd_session,
 };
 use crate::server::{
-    EventPublisher, SdStateManager, Server, ServerConfig, ServerStorage, StaticSubscriptionHandle,
-    StaticSubscriptionStorage, SubscriptionManager,
+    EventPublisher, FindTiming, SdStateManager, Server, ServerConfig, ServerStorage,
+    StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager,
 };
 use crate::transport::{E2EHandle, NoE2E};
 
 use super::mailbox::RxMailbox;
+use super::sd_timing::{SdTiming, draw_initial_delay_ms, seed};
 use super::transport::{CallbackFactory, CallbackSocket, CallbackTimer, NowMsFn, Platform, SendFn};
 
 // ── Fixed runtime sizing (catalog-agnostic) ──────────────────────────────
@@ -181,6 +182,8 @@ pub struct RuntimeConfig {
     /// Generated catalog (borrowed for the duration of `init`).
     pub offers: &'static [OfferEntry],
     pub subscriptions: &'static [SubEntry],
+    /// When the runtime sends `FindService` for its subscription.
+    pub sd_timing: SdTiming,
     /// RX mailbox the platform's receive path pushes into.
     pub mailbox: &'static Mailbox,
     /// Runtime buffer memory (platform-owned, placement-controlled).
@@ -211,7 +214,6 @@ static IFACE: AtomicU32 = AtomicU32::new(0);
 
 static DISPATCH: AtomicUsize = AtomicUsize::new(0); // DispatchFn as usize
 static DISPATCH_CTX: AtomicUsize = AtomicUsize::new(0); // opaque ctx word for DISPATCH
-static OFFER_SESSION: AtomicU16 = AtomicU16::new(1);
 static STOP_SESSION: AtomicU16 = AtomicU16::new(1);
 static PUBLISH_SESSION: AtomicU16 = AtomicU16::new(1);
 
@@ -375,7 +377,7 @@ const DEFAULT_OFFER_REQUEST: OfferServiceRequest = OfferServiceRequest {
 /// Build the receive `Server` over the shared callback sockets, accepting
 /// subscribes for every offered service and answering Offers of the first
 /// subscription's service.
-fn build_server() -> bool {
+fn build_server(find_timing: FindTiming) -> bool {
     let o = offers();
     let Some(primary) = o.first() else {
         return false;
@@ -412,7 +414,8 @@ fn build_server() -> bool {
         // (all catalog offers in one SD datagram) from its own future, so
         // the server's recv loop must stay silent on SD — otherwise the
         // primary service would be announced twice.
-        .with_announce(false);
+        .with_announce(false)
+        .with_find_timing(find_timing);
     for entry in o {
         config = config.with_accepted_offer(
             entry.service_id,
@@ -520,7 +523,7 @@ async fn someip_task() {
             sd_multicast: sd_mcast,
             period,
             offers: &reqs[..n_offers],
-            offer_session: &OFFER_SESSION,
+            sd_state: &SD_STATE,
             offer_scratch,
             rx_buf: rx,
             dispatch,
@@ -621,7 +624,20 @@ pub fn init(config: RuntimeConfig) -> i32 {
         bind_once(s.local_rx_port);
     }
 
-    if !build_server() {
+    let timing = config.sd_timing;
+    let find_timing = FindTiming {
+        initial_delay: Duration::from_millis(u64::from(draw_initial_delay_ms(
+            &timing,
+            seed(config.interface, (config.now_ms)()),
+        ))),
+        repetitions_base_delay: Duration::from_millis(u64::from(timing.repetitions_base_delay_ms)),
+        repetitions_max: timing.repetitions_max,
+        sd_multicast: SocketAddrV4::new(
+            Ipv4Addr::from(SD_MCAST.load(Ordering::Acquire).to_be_bytes()),
+            SD_PORT.load(Ordering::Acquire),
+        ),
+    };
+    if !build_server(find_timing) {
         // Release the claim so the platform can retry after fixing config.
         INIT_CLAIMED.store(false, Ordering::Release);
         return -1;
@@ -745,9 +761,12 @@ pub fn deinit() {
     // Reborrowed through `addr_of_mut!` to retag only this field's bytes.
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).publish_scratch) };
     let session = next_sd_session(&STOP_SESSION);
-    if let Ok(total) =
-        build_multi_stop_offer_service_datagram::<MAX_OFFERS>(scratch, &reqs[..n], session)
-    {
+    if let Ok(total) = build_multi_stop_offer_service_datagram::<MAX_OFFERS>(
+        scratch,
+        &reqs[..n],
+        session,
+        sd::RebootFlag::Continuous,
+    ) {
         let dst = SD_MCAST.load(Ordering::Acquire);
         let sd_port = SD_PORT.load(Ordering::Acquire);
         (plat.send)(sd_port, scratch.as_ptr(), total, dst, sd_port);

@@ -37,21 +37,23 @@ use crate::transport::WrappableSharedHandle;
 use crate::transport::{E2EHandle, SharedHandle, TransportFactory, TransportSocket};
 #[cfg(feature = "_alloc")]
 use alloc::sync::Arc;
-use core::net::Ipv4Addr;
-#[cfg(feature = "_alloc")]
-use core::net::SocketAddrV4;
+use core::net::{Ipv4Addr, SocketAddrV4};
 
 #[cfg(feature = "server-tokio")]
 use crate::transport::NoE2E;
 #[cfg(feature = "server-tokio")]
 use tokio::sync::RwLock;
 
-fn sd_encode_error(e: automotive_wire_codec::EncodeToSliceError<crate::protocol::Error>) -> Error {
+/// The server error for a datagram the SD codec could not build.
+fn build_error(e: crate::sd_codec::BuildError) -> Error {
+    use crate::sd_codec::BuildError;
     match e {
-        automotive_wire_codec::EncodeToSliceError::InsufficientBuffer(_) => {
+        BuildError::InvalidTtl(ttl) => {
+            crate::protocol::Error::from(crate::protocol::sd::Error::InvalidTtl(ttl)).into()
+        }
+        BuildError::BufferTooSmall(_) | BuildError::ListFull { .. } | BuildError::EncodeFailed => {
             Error::Capacity(crate::CapacityKind::UdpBuffer)
         }
-        automotive_wire_codec::EncodeToSliceError::Encode(e) => Error::Protocol(e),
     }
 }
 
@@ -133,13 +135,18 @@ pub struct ServerConfig {
     /// events never reach a subscriber. Populate via [`Self::with_accepted_offer`];
     /// empty preserves single-service behaviour.
     pub accepted_offers: heapless::Vec<AcceptedOffer, { ServerConfig::ACCEPTED_OFFERS_CAP }>,
-    /// Eventgroups this node subscribes to. The receive loop answers each
-    /// Offer of a matching service, instance and major version with a
-    /// unicast Subscribe to the Offer's sender. Use it on a node that runs
-    /// no `Client`; a `Client` sends its own Subscribes. Populate via
-    /// [`Self::with_consumed_eventgroup`].
+    /// Eventgroups this node subscribes to. The run future sends `FindService`
+    /// for their service instances until each is offered (see
+    /// [`Self::find_timing`]), and answers each Offer of a matching service,
+    /// instance and major version with a unicast Subscribe to its sender.
+    /// Use it on a node that runs no `Client`; a `Client` sends its own
+    /// Subscribes. Populate via [`Self::with_consumed_eventgroup`]. A passive
+    /// server runs no receive loop, so it neither finds nor answers Offers.
     pub consumed_eventgroups:
         heapless::Vec<SubscribeEventgroupRequest, { ServerConfig::CONSUMED_EVENTGROUPS_CAP }>,
+    /// When `FindService` is sent for [`Self::consumed_eventgroups`]; see
+    /// [`FindTiming`]. Defaults to [`FindTiming::DEFAULT`].
+    pub find_timing: FindTiming,
 }
 
 /// A `(service, instance, event_group)` tuple a receive loop will accept
@@ -156,6 +163,40 @@ pub struct AcceptedOffer {
     pub major_version: u8,
     /// Offered event-group ID.
     pub event_group_id: u16,
+}
+
+/// When the run future sends `FindService` for the
+/// [`ServerConfig::consumed_eventgroups`] not yet offered: once after
+/// `initial_delay`, then after `repetitions_base_delay` doubled each time,
+/// `repetitions_max` more times. No `FindService` is sent after that.
+/// Start from [`FindTiming::DEFAULT`] and set the fields to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FindTiming {
+    /// Delay before the first `FindService`, used as given: nodes started
+    /// together spread their first `FindService` only if each is given a
+    /// different delay.
+    pub initial_delay: core::time::Duration,
+    /// Delay before the first repetition; each later one doubles it.
+    pub repetitions_base_delay: core::time::Duration,
+    /// Number of repetitions after the first `FindService`; 0 sends one.
+    pub repetitions_max: u8,
+    /// Where `FindService` is sent: the SD multicast group and port.
+    pub sd_multicast: SocketAddrV4,
+}
+
+impl FindTiming {
+    /// 10 ms initial delay, 100 ms base delay, 3 repetitions, sent to
+    /// [`MULTICAST_IP`](crate::protocol::sd::MULTICAST_IP):[`MULTICAST_PORT`](crate::protocol::sd::MULTICAST_PORT).
+    pub const DEFAULT: Self = Self {
+        initial_delay: core::time::Duration::from_millis(10),
+        repetitions_base_delay: core::time::Duration::from_millis(100),
+        repetitions_max: 3,
+        sd_multicast: SocketAddrV4::new(
+            crate::protocol::sd::MULTICAST_IP,
+            crate::protocol::sd::MULTICAST_PORT,
+        ),
+    };
 }
 
 impl ServerConfig {
@@ -231,6 +272,7 @@ impl ServerConfig {
             announce: true,
             accepted_offers: heapless::Vec::new(),
             consumed_eventgroups: heapless::Vec::new(),
+            find_timing: FindTiming::DEFAULT,
         }
     }
 
@@ -340,6 +382,13 @@ impl ServerConfig {
         self
     }
 
+    /// Set when `FindService` is sent for [`Self::consumed_eventgroups`].
+    #[must_use]
+    pub fn with_find_timing(mut self, find_timing: FindTiming) -> Self {
+        self.find_timing = find_timing;
+        self
+    }
+
     /// Fallible counterpart to [`Self::with_consumed_eventgroup`].
     ///
     /// # Errors
@@ -415,15 +464,25 @@ impl ServerConfig {
         self
     }
 
+    /// The `OfferService` request for this config's service.
+    pub(crate) fn offer_request(&self) -> crate::sd_codec::OfferServiceRequest {
+        crate::sd_codec::OfferServiceRequest {
+            service_id: self.service_id,
+            instance_id: self.instance_id,
+            major_version: self.major_version,
+            minor_version: self.minor_version,
+            ttl: self.ttl,
+            local_ip: self.interface,
+            unicast_port: self.local_port,
+        }
+    }
+
     fn check_ttl(&self) -> Result<(), Error> {
         let ttls =
             core::iter::once(self.ttl).chain(self.consumed_eventgroups.iter().map(|r| r.ttl));
         for ttl in ttls {
             if !(1..=crate::protocol::sd::MAX_TTL).contains(&ttl) {
-                return Err(
-                    crate::protocol::Error::from(crate::protocol::sd::Error::InvalidTtl(ttl))
-                        .into(),
-                );
+                return Err(build_error(crate::sd_codec::BuildError::InvalidTtl(ttl)));
             }
         }
         Ok(())
@@ -2297,6 +2356,7 @@ mod tests {
             &sd_view,
             sender,
             &mut [0u8; crate::UDP_BUFFER_SIZE],
+            &[],
         )
         .await;
         assert!(
@@ -2468,6 +2528,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -2532,6 +2593,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -2593,6 +2655,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -2652,6 +2715,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -2714,6 +2778,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -2773,6 +2838,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -2825,6 +2891,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -3049,6 +3116,7 @@ mod tests {
             &sd_view,
             "127.0.0.1:12345".parse().unwrap(),
             &mut [0u8; crate::UDP_BUFFER_SIZE],
+            &[],
         )
         .await;
         assert!(result.is_ok());
@@ -3079,6 +3147,7 @@ mod tests {
             &sd_view,
             "127.0.0.1:45000".parse().unwrap(),
             &mut [0u8; crate::UDP_BUFFER_SIZE],
+            &[],
         )
         .await;
 
@@ -3117,6 +3186,7 @@ mod tests {
             &sd_view,
             "127.0.0.1:12345".parse().unwrap(),
             &mut [0u8; crate::UDP_BUFFER_SIZE],
+            &[],
         )
         .await;
         assert!(result.is_ok());
@@ -3158,6 +3228,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &[],
             )
             .await
             .unwrap();
@@ -3467,6 +3538,7 @@ mod tests {
             &sd_view,
             sender,
             &mut [0u8; crate::UDP_BUFFER_SIZE],
+            &[],
         )
         .await
         .unwrap();

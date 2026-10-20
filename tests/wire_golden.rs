@@ -617,7 +617,8 @@ mod sd_codec_golden {
             unicast_port: 30501,
         };
         let mut buf = [0u8; 64];
-        let n = build_offer_service_datagram(&mut buf, &request, 1).unwrap();
+        let n =
+            build_offer_service_datagram(&mut buf, &request, 1, RebootFlag::Continuous).unwrap();
         assert_eq!(n, 56);
 
         #[rustfmt::skip]
@@ -648,9 +649,11 @@ mod sd_codec_golden {
             event_group_id: 0x0005,
             major_version: 1,
             ttl: 10,
+            counter: 0,
         };
         let mut buf = [0u8; 64];
-        let n = build_subscribe_ack_datagram(&mut buf, &request, 2).unwrap();
+        let n =
+            build_subscribe_ack_datagram(&mut buf, &request, 2, RebootFlag::Continuous).unwrap();
         assert_eq!(n, 44);
 
         #[rustfmt::skip]
