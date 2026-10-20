@@ -237,7 +237,7 @@ fn encode_subscribes(
     let mut requests = config.consumed_eventgroups.clone();
     let mut answered = answered.iter();
     requests.retain(|_| answered.next().copied().unwrap_or(false));
-    let (session, reboot_flag) = sd_state.next_sd_session();
+    let (session, reboot_flag) = sd_state.next_session();
     crate::sd_codec::build_multi_subscribe_eventgroup_datagram::<
         { ServerConfig::CONSUMED_EVENTGROUPS_CAP },
     >(buf, &requests, session, reboot_flag)
@@ -829,7 +829,7 @@ fn encode_finds(
     if wanted.is_empty() {
         return Ok(None);
     }
-    let (session, reboot_flag) = sd_state.next_sd_session();
+    let (session, reboot_flag) = sd_state.next_session();
     crate::sd_codec::build_find_service_datagram::<{ ServerConfig::CONSUMED_EVENTGROUPS_CAP }>(
         buf,
         &wanted,

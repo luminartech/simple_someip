@@ -270,7 +270,7 @@ pub fn build_multi_stop_offer_service_datagram<const N: usize>(
 }
 
 /// [`build_multi_offer_service_datagram`] with the SD reboot flag given.
-#[cfg(feature = "server")]
+#[cfg(all(feature = "bare_metal", feature = "server"))]
 pub(crate) fn build_multi_offer_service_datagram_with_reboot<const N: usize>(
     buf: &mut [u8],
     requests: &[OfferServiceRequest],
