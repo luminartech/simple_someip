@@ -20,15 +20,14 @@
 use core::future::Future;
 use core::net::SocketAddrV4;
 use core::pin::pin;
-use core::sync::atomic::AtomicU16;
 use core::task::{Context, RawWaker, RawWakerVTable, Waker};
 use core::time::Duration;
 
 use crate::sd_codec::{
-    OfferServiceRequest, build_multi_offer_service_datagram, build_notification_datagram,
-    check_parsed_e2e, next_sd_session, parse_someip_datagram,
+    OfferServiceRequest, build_multi_offer_service_datagram_with_reboot,
+    build_notification_datagram, check_parsed_e2e, parse_someip_datagram,
 };
-use crate::server::{ServerConfig, Subscriber, SubscriptionHandle};
+use crate::server::{SdStateManager, ServerConfig, Subscriber, SubscriptionHandle};
 use crate::transport::{E2EHandle, Timer, TransportSocket};
 use heapless::Vec as HeaplessVec;
 
@@ -49,8 +48,10 @@ pub type RequestDispatchFn = fn(
 ) -> i32;
 
 /// Periodically multicast one combined `OfferService` SD datagram
-/// carrying every entry in `offers` (each with its own endpoint option,
-/// a single session stream), re-sent every `period`. `N` bounds the
+/// carrying every entry in `offers` (each with its own endpoint option),
+/// re-sent every `period`. Each datagram takes its session ID and reboot
+/// flag from `sd_state`, the server's SD state, so the node's multicast
+/// SD messages form one session stream. `N` bounds the
 /// number of entries packed into the datagram. `scratch` must hold the
 /// encoded datagram.
 pub async fn announce_offers_future<'a, S, Tm, const N: usize>(
@@ -58,7 +59,7 @@ pub async fn announce_offers_future<'a, S, Tm, const N: usize>(
     timer: &'a Tm,
     offers: &'a [OfferServiceRequest],
     sd_multicast: SocketAddrV4,
-    session: &'a AtomicU16,
+    sd_state: &'a SdStateManager,
     period: Duration,
     scratch: &'a mut [u8],
 ) where
@@ -66,8 +67,10 @@ pub async fn announce_offers_future<'a, S, Tm, const N: usize>(
     Tm: Timer,
 {
     loop {
-        let s = next_sd_session(session);
-        if let Ok(len) = build_multi_offer_service_datagram::<N>(scratch, offers, s) {
+        let (session, reboot) = sd_state.next_sd_session();
+        if let Ok(len) =
+            build_multi_offer_service_datagram_with_reboot::<N>(scratch, offers, session, reboot)
+        {
             let _ = sd_socket.send_to(&scratch[..len], sd_multicast).await;
         }
         timer.sleep(period).await;
@@ -140,7 +143,8 @@ where
     pub period: Duration,
     /// Offered services packed into one combined `OfferService`.
     pub offers: &'a [OfferServiceRequest],
-    pub offer_session: &'a AtomicU16,
+    /// The server's SD state: the session ID and reboot flag of each Offer.
+    pub sd_state: &'a SdStateManager,
     pub offer_scratch: &'a mut [u8],
     pub rx_buf: &'a mut [u8],
     pub dispatch: RequestDispatchFn,
@@ -175,7 +179,7 @@ where
         sd_multicast,
         period,
         offers,
-        offer_session,
+        sd_state,
         offer_scratch,
         rx_buf,
         dispatch,
@@ -187,7 +191,7 @@ where
         timer,
         offers,
         sd_multicast,
-        offer_session,
+        sd_state,
         period,
         offer_scratch,
     );
@@ -306,5 +310,87 @@ where
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     {
         targets.len() as i32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::{ReceivedDatagram, TransportError};
+    use core::net::Ipv4Addr;
+    use futures_util::FutureExt;
+
+    #[derive(Default)]
+    struct RecordingSocket {
+        sent: std::sync::Mutex<std::vec::Vec<std::vec::Vec<u8>>>,
+    }
+
+    impl TransportSocket for RecordingSocket {
+        type SendFuture<'a> = core::future::Ready<Result<(), TransportError>>;
+        type RecvFuture<'a> = core::future::Pending<Result<ReceivedDatagram, TransportError>>;
+
+        fn send_to<'a>(&'a self, buf: &'a [u8], _target: SocketAddrV4) -> Self::SendFuture<'a> {
+            self.sent.lock().unwrap().push(buf.to_vec());
+            core::future::ready(Ok(()))
+        }
+        fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+            core::future::pending()
+        }
+        fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
+            Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        }
+        fn join_multicast_v4(&self, _: Ipv4Addr, _: Ipv4Addr) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn leave_multicast_v4(&self, _: Ipv4Addr, _: Ipv4Addr) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    struct NeverTimer;
+
+    impl Timer for NeverTimer {
+        type SleepFuture<'a> = core::future::Pending<()>;
+        fn sleep(&self, _duration: Duration) -> Self::SleepFuture<'_> {
+            core::future::pending()
+        }
+    }
+
+    #[test]
+    fn offers_continue_the_server_sd_session_and_reboot_flag() {
+        let sd_state = SdStateManager::new();
+        let (first_session, _) = sd_state.next_session_id_with_reboot_flag();
+        let socket = RecordingSocket::default();
+        let offers = [OfferServiceRequest {
+            service_id: 0x0042,
+            instance_id: 1,
+            major_version: 1,
+            minor_version: 0,
+            ttl: 3,
+            local_ip: Ipv4Addr::new(192, 0, 2, 1),
+            unicast_port: 30501,
+        }];
+        let mut scratch = [0u8; 256];
+
+        let announce = announce_offers_future::<_, _, 1>(
+            &socket,
+            &NeverTimer,
+            &offers,
+            SocketAddrV4::new(Ipv4Addr::new(239, 255, 0, 255), 30490),
+            &sd_state,
+            Duration::from_secs(1),
+            &mut scratch,
+        );
+        assert!(announce.now_or_never().is_none());
+
+        let sent = socket.sent.lock().unwrap();
+        let datagram = &sent[0];
+        let session = u16::from_be_bytes([datagram[10], datagram[11]]);
+        assert_eq!(u32::from(session), first_session + 1);
+        assert_eq!(
+            datagram[16] & 0x80,
+            0x80,
+            "reboot flag set until the session wraps"
+        );
     }
 }

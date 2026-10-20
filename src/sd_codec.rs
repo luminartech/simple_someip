@@ -266,7 +266,13 @@ pub fn build_multi_offer_service_datagram<const N: usize>(
     requests: &[OfferServiceRequest],
     session: u16,
 ) -> Result<usize, BuildError> {
-    build_multi_service_entry_datagram::<N>(buf, requests, session, /*stop=*/ false)
+    build_multi_service_entry_datagram::<N>(
+        buf,
+        requests,
+        session,
+        /*stop=*/ false,
+        RebootFlag::Continuous,
+    )
 }
 
 /// Encode a single SD datagram carrying one `StopOfferService` entry per
@@ -279,7 +285,24 @@ pub fn build_multi_stop_offer_service_datagram<const N: usize>(
     requests: &[OfferServiceRequest],
     session: u16,
 ) -> Result<usize, BuildError> {
-    build_multi_service_entry_datagram::<N>(buf, requests, session, /*stop=*/ true)
+    build_multi_service_entry_datagram::<N>(
+        buf,
+        requests,
+        session,
+        /*stop=*/ true,
+        RebootFlag::Continuous,
+    )
+}
+
+/// [`build_multi_offer_service_datagram`] with the SD reboot flag given.
+#[cfg(feature = "server")]
+pub(crate) fn build_multi_offer_service_datagram_with_reboot<const N: usize>(
+    buf: &mut [u8],
+    requests: &[OfferServiceRequest],
+    session: u16,
+    reboot: RebootFlag,
+) -> Result<usize, BuildError> {
+    build_multi_service_entry_datagram::<N>(buf, requests, session, /*stop=*/ false, reboot)
 }
 
 fn build_multi_service_entry_datagram<const N: usize>(
@@ -287,6 +310,7 @@ fn build_multi_service_entry_datagram<const N: usize>(
     requests: &[OfferServiceRequest],
     session: u16,
     stop: bool,
+    reboot: RebootFlag,
 ) -> Result<usize, BuildError> {
     let mut entries: heapless::Vec<Entry, N> = heapless::Vec::new();
     let mut options: heapless::Vec<SdOptions, N> = heapless::Vec::new();
@@ -328,7 +352,7 @@ fn build_multi_service_entry_datagram<const N: usize>(
                 capacity: N,
             })?;
     }
-    encode_sd_datagram(buf, &entries, &options, session, RebootFlag::Continuous)
+    encode_sd_datagram(buf, &entries, &options, session, reboot)
 }
 
 /// Encode one SD datagram with a `FindService` entry, any minor version and
