@@ -10,8 +10,8 @@
 //! - **buffer memory** it owns (so the platform controls link placement).
 //!
 //! Everything else — the SD codec, subscribe-accept, the combined-offer
-//! announce, answering Offers with Subscribes, notification dispatch, E2E,
-//! and the embassy executor + task — lives here.
+//! announce, `FindService` and answering Offers with Subscribes,
+//! notification dispatch, E2E, and the embassy executor + task — lives here.
 //!
 //! This phase exposes the callback transport and the mailbox; the executor
 //! + task + C-ABI land in later submodules.
@@ -24,8 +24,12 @@ pub use transport::{CallbackFactory, CallbackSocket, CallbackTimer, NowMsFn, Pla
 
 #[cfg(feature = "bare-metal-runtime")]
 mod runtime;
+#[cfg(any(feature = "bare-metal-runtime", test))]
+mod sd_timing;
 #[cfg(feature = "bare-metal-runtime")]
 pub use runtime::{
     BindFn, DispatchFn, OfferEntry, RX_CAP, RX_SLOTS, RuntimeBuffers, RuntimeConfig, SubEntry,
     deinit, init, on_rx, poll, publish,
 };
+#[cfg(feature = "bare-metal-runtime")]
+pub use sd_timing::SdTiming;
