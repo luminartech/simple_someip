@@ -94,7 +94,48 @@ where
     Ok(())
 }
 
-/// Send `SubscribeAck` derived from a peer's `Subscribe` entry view.
+/// The server error for a datagram the SD codec could not build.
+fn build_error(e: crate::sd_codec::BuildError) -> Error {
+    match e {
+        crate::sd_codec::BuildError::InvalidTtl(ttl) => {
+            crate::protocol::Error::from(sd::Error::InvalidTtl(ttl)).into()
+        }
+        _ => Error::Capacity(CapacityKind::UdpBuffer),
+    }
+}
+
+/// Send `peer` the `SubscribeAckEventGroup` answering `entry_view`, with
+/// `ttl`; a TTL of 0 makes it a `SubscribeNack`. `buf` is the encoding
+/// scratch.
+async fn send_subscribe_answer<T>(
+    buf: &mut [u8],
+    sd_socket: &T,
+    sd_state: &SdStateManager,
+    entry_view: &sd::EntryView<'_>,
+    ttl: u32,
+    peer: core::net::SocketAddr,
+) -> Result<(), Error>
+where
+    T: TransportSocket,
+{
+    let request = crate::sd_codec::SubscribeAckRequest {
+        service_id: entry_view.service_id(),
+        instance_id: entry_view.instance_id(),
+        event_group_id: entry_view.event_group_id(),
+        major_version: entry_view.major_version(),
+        ttl,
+        counter: entry_view.counter(),
+    };
+    let (session, reboot_flag) = sd_state.next_session();
+    let len = crate::sd_codec::build_subscribe_ack_datagram(buf, &request, session, reboot_flag)
+        .map_err(build_error)?;
+    sd_socket
+        .send_to(&buf[..len], socket_addr_v4(peer)?)
+        .await?;
+    Ok(())
+}
+
+/// Send `SubscribeAck` for `entry_view` to `subscriber`.
 ///
 /// `buf` is a caller-provided scratch buffer used for encoding the outgoing
 /// frame. Returns [`Error::Capacity`]`("udp_buffer")` if the encoded frame
@@ -110,52 +151,13 @@ pub(super) async fn send_subscribe_ack_from_view<T>(
 where
     T: TransportSocket,
 {
-    use crate::protocol::Header as SomeIpHeader;
-    use automotive_wire_codec::Encode;
-
-    let ack_entry = Entry::SubscribeAckEventGroup(sd::EventGroupEntry {
-        index_first_options_run: 0,
-        index_second_options_run: 0,
-        options_count: OptionsCount::new(0, 0),
-        service_id: entry_view.service_id(),
-        instance_id: entry_view.instance_id(),
-        major_version: entry_view.major_version(),
-        ttl: config.ttl,
-        counter: entry_view.counter(),
-        event_group_id: entry_view.event_group_id(),
-    });
-
-    let entries = [ack_entry];
-    let (sid, reboot_flag) = sd_state.next_session_id_with_reboot_flag();
-    let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &[]);
-
-    // Guard: SOME/IP header needs 16 bytes; SD payload needs the rest.
-    if buf.len() < 16 {
-        return Err(Error::Capacity(CapacityKind::UdpBuffer));
-    }
-    let sd_data_len = sd_payload
-        .encode_to_slice(&mut buf[16..])
-        .map_err(super::sd_encode_error)?;
-    let total_len = 16 + sd_data_len;
-    // The `< 16` guard plus `encode_to_slice`'s own over-capacity error
-    // already cover the fit; this stays as a debug-only sanity check
-    // rather than a live (dead) branch.
-    debug_assert!(total_len <= buf.len());
-    let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
-    someip_header
-        .encode_to_slice(&mut buf[..16])
-        .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
-
-    let subscriber_v4 = socket_addr_v4(subscriber)?;
-    sd_socket.send_to(&buf[..total_len], subscriber_v4).await?;
-
+    send_subscribe_answer(buf, sd_socket, sd_state, entry_view, config.ttl, subscriber).await?;
     crate::log::debug!(
         "Sent SubscribeAck to {} for service 0x{:04X}, eventgroup 0x{:04X}",
         subscriber,
         entry_view.service_id(),
         entry_view.event_group_id()
     );
-
     Ok(())
 }
 
@@ -176,45 +178,7 @@ pub(super) async fn send_subscribe_nack_from_view<T>(
 where
     T: TransportSocket,
 {
-    use crate::protocol::Header as SomeIpHeader;
-    use automotive_wire_codec::Encode;
-
-    let nack_entry = Entry::SubscribeAckEventGroup(sd::EventGroupEntry {
-        index_first_options_run: 0,
-        index_second_options_run: 0,
-        options_count: OptionsCount::new(0, 0),
-        service_id: entry_view.service_id(),
-        instance_id: entry_view.instance_id(),
-        major_version: entry_view.major_version(),
-        ttl: 0,
-        counter: entry_view.counter(),
-        event_group_id: entry_view.event_group_id(),
-    });
-
-    let entries = [nack_entry];
-    let (sid, reboot_flag) = sd_state.next_session_id_with_reboot_flag();
-    let sd_payload = sd::Header::new(Flags::new_sd(reboot_flag), &entries, &[]);
-
-    // Guard: SOME/IP header needs 16 bytes; SD payload needs the rest.
-    if buf.len() < 16 {
-        return Err(Error::Capacity(CapacityKind::UdpBuffer));
-    }
-    let sd_data_len = sd_payload
-        .encode_to_slice(&mut buf[16..])
-        .map_err(super::sd_encode_error)?;
-    let total_len = 16 + sd_data_len;
-    // The `< 16` guard plus `encode_to_slice`'s own over-capacity error
-    // already cover the fit; this stays as a debug-only sanity check
-    // rather than a live (dead) branch.
-    debug_assert!(total_len <= buf.len());
-    let someip_header = SomeIpHeader::new_sd(sid, sd_data_len);
-    someip_header
-        .encode_to_slice(&mut buf[..16])
-        .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
-
-    let subscriber_v4 = socket_addr_v4(subscriber)?;
-    sd_socket.send_to(&buf[..total_len], subscriber_v4).await?;
-
+    send_subscribe_answer(buf, sd_socket, sd_state, entry_view, 0, subscriber).await?;
     crate::log::warn!(
         "Sent SubscribeNack to {} for service 0x{:04X}, eventgroup 0x{:04X} (reason: {})",
         subscriber,
@@ -222,7 +186,6 @@ where
         entry_view.event_group_id(),
         reason
     );
-
     Ok(())
 }
 
@@ -241,7 +204,7 @@ fn encode_subscribes(
     crate::sd_codec::build_multi_subscribe_eventgroup_datagram::<
         { ServerConfig::CONSUMED_EVENTGROUPS_CAP },
     >(buf, &requests, session, reboot_flag)
-    .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))
+    .map_err(build_error)
 }
 
 /// Send `server` one SD message carrying a Subscribe entry for each
@@ -837,7 +800,7 @@ fn encode_finds(
         reboot_flag,
     )
     .map(Some)
-    .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))
+    .map_err(build_error)
 }
 
 const FIND_BUF_LEN: usize = 16 + 12 + 16 * ServerConfig::CONSUMED_EVENTGROUPS_CAP;
@@ -1188,7 +1151,7 @@ mod tests {
             instance_id: 1,
             major_version: 1,
             ttl: 3,
-            counter: 0,
+            counter: 3,
             event_group_id: 0x0001,
         });
         let option = sd::Options::IpV4Endpoint {
@@ -1973,6 +1936,63 @@ mod tests {
                 4,
                 "the Find arm ran inside run"
             );
+        }
+
+        /// The datagram the codec builds for the answer to
+        /// `subscribe_wire_bytes`' Subscribe with `ttl`.
+        fn codec_answer(ttl: u32) -> std::vec::Vec<u8> {
+            let request = crate::sd_codec::SubscribeAckRequest {
+                service_id: 0x1234,
+                instance_id: 1,
+                event_group_id: 0x0001,
+                major_version: 1,
+                ttl,
+                counter: 3,
+            };
+            let mut buf = [0u8; 64];
+            let len = crate::sd_codec::build_subscribe_ack_datagram(
+                &mut buf,
+                &request,
+                1,
+                sd::RebootFlag::RecentlyRebooted,
+            )
+            .expect("build");
+            buf[..len].to_vec()
+        }
+
+        #[tokio::test]
+        async fn the_server_ack_and_nack_are_the_codec_answers() {
+            let config = make_config();
+            let (wire, sd_len) = subscribe_wire_bytes();
+            let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+            let entry_view = sd_view.entries().next().expect("one entry");
+
+            let socket = RecordingSocket::default();
+            send_subscribe_ack_from_view(
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &config,
+                &socket,
+                &make_sd_state(),
+                &entry_view,
+                subscriber_addr(),
+            )
+            .await
+            .expect("ack");
+            send_subscribe_nack_from_view(
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &config,
+                &socket,
+                &make_sd_state(),
+                &entry_view,
+                subscriber_addr(),
+                "test",
+            )
+            .await
+            .expect("nack");
+
+            let sent = socket.sent.lock().unwrap();
+            assert_eq!(sent[0].0, codec_answer(config.ttl), "ack");
+            assert_eq!(sent[1].0, codec_answer(0), "nack");
         }
     }
 }
