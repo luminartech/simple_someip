@@ -168,13 +168,17 @@ pub struct AcceptedOffer {
     pub event_group_id: u16,
 }
 
-/// When the receive loop sends `FindService` for the
+/// When the run future sends `FindService` for the
 /// [`ServerConfig::consumed_eventgroups`] not yet offered: once after
 /// `initial_delay`, then after `repetitions_base_delay` doubled each time,
 /// `repetitions_max` more times. No `FindService` is sent after that.
+/// Start from [`FindTiming::DEFAULT`] and set the fields to change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FindTiming {
-    /// Delay before the first `FindService`.
+    /// Delay before the first `FindService`, used as given: nodes started
+    /// together spread their first `FindService` only if each is given a
+    /// different delay.
     pub initial_delay: core::time::Duration,
     /// Delay before the first repetition; each later one doubles it.
     pub repetitions_base_delay: core::time::Duration,
