@@ -67,7 +67,7 @@ pub async fn announce_offers_future<'a, S, Tm, const N: usize>(
     Tm: Timer,
 {
     loop {
-        let (session, reboot) = sd_state.next_sd_session();
+        let (session, reboot) = sd_state.next_session();
         if let Ok(len) =
             build_multi_offer_service_datagram_with_reboot::<N>(scratch, offers, session, reboot)
         {

@@ -120,12 +120,12 @@ impl SdStateManager {
     /// clippy's `missing_panics_doc` and as a tripwire if the closure
     /// is ever changed to be conditional.
     pub fn next_session_id_with_reboot_flag(&self) -> (u32, RebootFlag) {
-        let (session_id, reboot_flag) = self.next_sd_session();
+        let (session_id, reboot_flag) = self.next_session();
         (u32::from(session_id), reboot_flag)
     }
 
     /// The next SD session ID and the reboot flag of the same emission.
-    pub(crate) fn next_sd_session(&self) -> (u16, RebootFlag) {
+    pub(crate) fn next_session(&self) -> (u16, RebootFlag) {
         // Nightly deprecates `fetch_update` in favor of the renamed
         // `try_update`, but `try_update` does not exist on stable yet and
         // this file builds in the stable CI lanes. Switch to `try_update`
