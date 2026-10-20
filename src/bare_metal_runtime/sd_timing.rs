@@ -1,13 +1,16 @@
 //! The runtime's `FindService` timing and its per-node initial delay.
 
-/// SD timing for the runtime's `FindService`. `#[repr(C)]`.
+/// SD timing for the runtime's `FindService`. `#[repr(C)]`. Start from
+/// [`SdTiming::DEFAULT`] and set the fields to change.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SdTiming {
     /// Least delay before the first `FindService`, in milliseconds.
     pub initial_delay_min_ms: u32,
     /// Greatest delay before the first `FindService`, in milliseconds; the
-    /// runtime picks one in `initial_delay_min_ms..=initial_delay_max_ms`.
+    /// runtime picks one in `initial_delay_min_ms..=initial_delay_max_ms`,
+    /// and uses `initial_delay_min_ms` when this is below it.
     pub initial_delay_max_ms: u32,
     /// Delay before the first repetition, in milliseconds; each later one
     /// doubles it.
