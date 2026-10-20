@@ -96,11 +96,14 @@ where
 
 /// The server error for a datagram the SD codec could not build.
 fn build_error(e: crate::sd_codec::BuildError) -> Error {
+    use crate::sd_codec::BuildError;
     match e {
-        crate::sd_codec::BuildError::InvalidTtl(ttl) => {
+        BuildError::InvalidTtl(ttl) => {
             crate::protocol::Error::from(sd::Error::InvalidTtl(ttl)).into()
         }
-        _ => Error::Capacity(CapacityKind::UdpBuffer),
+        BuildError::BufferTooSmall(_) | BuildError::ListFull { .. } | BuildError::EncodeFailed => {
+            Error::Capacity(CapacityKind::UdpBuffer)
+        }
     }
 }
 
@@ -126,12 +129,11 @@ where
         ttl,
         counter: entry_view.counter(),
     };
+    let peer = socket_addr_v4(peer)?;
     let (session, reboot_flag) = sd_state.next_session();
     let len = crate::sd_codec::build_subscribe_ack_datagram(buf, &request, session, reboot_flag)
         .map_err(build_error)?;
-    sd_socket
-        .send_to(&buf[..len], socket_addr_v4(peer)?)
-        .await?;
+    sd_socket.send_to(&buf[..len], peer).await?;
     Ok(())
 }
 
