@@ -617,7 +617,8 @@ mod sd_codec_golden {
             unicast_port: 30501,
         };
         let mut buf = [0u8; 64];
-        let n = build_offer_service_datagram(&mut buf, &request, 1).unwrap();
+        let n =
+            build_offer_service_datagram(&mut buf, &request, 1, RebootFlag::Continuous).unwrap();
         assert_eq!(n, 56);
 
         #[rustfmt::skip]

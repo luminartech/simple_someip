@@ -24,8 +24,8 @@ use core::task::{Context, RawWaker, RawWakerVTable, Waker};
 use core::time::Duration;
 
 use crate::sd_codec::{
-    OfferServiceRequest, build_multi_offer_service_datagram_with_reboot,
-    build_notification_datagram, check_parsed_e2e, parse_someip_datagram,
+    OfferServiceRequest, build_multi_offer_service_datagram, build_notification_datagram,
+    check_parsed_e2e, parse_someip_datagram,
 };
 use crate::server::{SdStateManager, ServerConfig, Subscriber, SubscriptionHandle};
 use crate::transport::{E2EHandle, Timer, TransportSocket};
@@ -68,9 +68,7 @@ pub async fn announce_offers_future<'a, S, Tm, const N: usize>(
 {
     loop {
         let (session, reboot) = sd_state.next_session();
-        if let Ok(len) =
-            build_multi_offer_service_datagram_with_reboot::<N>(scratch, offers, session, reboot)
-        {
+        if let Ok(len) = build_multi_offer_service_datagram::<N>(scratch, offers, session, reboot) {
             let _ = sd_socket.send_to(&scratch[..len], sd_multicast).await;
         }
         timer.sleep(period).await;

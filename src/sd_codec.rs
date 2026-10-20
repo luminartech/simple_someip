@@ -229,7 +229,8 @@ pub fn build_multi_subscribe_eventgroup_datagram<const N: usize>(
 }
 
 /// Encode an `OfferService` datagram into `buf`. Returns its length in
-/// bytes.
+/// bytes. `reboot` sets the SD reboot flag: set it until the session
+/// counter wraps.
 ///
 /// # Errors
 /// See [`BuildError`].
@@ -237,8 +238,9 @@ pub fn build_offer_service_datagram(
     buf: &mut [u8],
     request: &OfferServiceRequest,
     session: u16,
+    reboot: RebootFlag,
 ) -> Result<usize, BuildError> {
-    encode_service_entry_datagram(buf, request, session, /*stop=*/ false)
+    encode_service_entry_datagram(buf, request, session, /*stop=*/ false, reboot)
 }
 
 /// Encode a `StopOfferService` datagram into `buf` (same shape as
@@ -250,14 +252,16 @@ pub fn build_stop_offer_service_datagram(
     buf: &mut [u8],
     request: &OfferServiceRequest,
     session: u16,
+    reboot: RebootFlag,
 ) -> Result<usize, BuildError> {
-    encode_service_entry_datagram(buf, request, session, /*stop=*/ true)
+    encode_service_entry_datagram(buf, request, session, /*stop=*/ true, reboot)
 }
 
 /// Encode a single SD datagram carrying one `OfferService` entry per
 /// element of `requests` (up to `N`). Each entry references its own
 /// IPv4 endpoint option at the matching flat index — one coherent SD
-/// message instead of one packet per service.
+/// message instead of one packet per service. `reboot` sets the SD reboot
+/// flag, as in [`build_offer_service_datagram`].
 ///
 /// # Errors
 /// See [`BuildError`].
@@ -265,18 +269,13 @@ pub fn build_multi_offer_service_datagram<const N: usize>(
     buf: &mut [u8],
     requests: &[OfferServiceRequest],
     session: u16,
+    reboot: RebootFlag,
 ) -> Result<usize, BuildError> {
-    build_multi_service_entry_datagram::<N>(
-        buf,
-        requests,
-        session,
-        /*stop=*/ false,
-        RebootFlag::Continuous,
-    )
+    build_multi_service_entry_datagram::<N>(buf, requests, session, /*stop=*/ false, reboot)
 }
 
 /// Encode a single SD datagram carrying one `StopOfferService` entry per
-/// element of `requests` (up to `N`).
+/// element of `requests` (up to `N`). `reboot` sets the SD reboot flag.
 ///
 /// # Errors
 /// See [`build_multi_offer_service_datagram`].
@@ -284,25 +283,9 @@ pub fn build_multi_stop_offer_service_datagram<const N: usize>(
     buf: &mut [u8],
     requests: &[OfferServiceRequest],
     session: u16,
-) -> Result<usize, BuildError> {
-    build_multi_service_entry_datagram::<N>(
-        buf,
-        requests,
-        session,
-        /*stop=*/ true,
-        RebootFlag::Continuous,
-    )
-}
-
-/// [`build_multi_offer_service_datagram`] with the SD reboot flag given.
-#[cfg(all(feature = "bare_metal", feature = "server"))]
-pub(crate) fn build_multi_offer_service_datagram_with_reboot<const N: usize>(
-    buf: &mut [u8],
-    requests: &[OfferServiceRequest],
-    session: u16,
     reboot: RebootFlag,
 ) -> Result<usize, BuildError> {
-    build_multi_service_entry_datagram::<N>(buf, requests, session, /*stop=*/ false, reboot)
+    build_multi_service_entry_datagram::<N>(buf, requests, session, /*stop=*/ true, reboot)
 }
 
 fn build_multi_service_entry_datagram<const N: usize>(
@@ -414,6 +397,7 @@ fn encode_service_entry_datagram(
     request: &OfferServiceRequest,
     session: u16,
     stop: bool,
+    reboot: RebootFlag,
 ) -> Result<usize, BuildError> {
     let svc = ServiceEntry {
         index_first_options_run: 0,
@@ -435,7 +419,7 @@ fn encode_service_entry_datagram(
         port: request.unicast_port,
         protocol: TransportProtocol::Udp,
     };
-    encode_sd_datagram(buf, &[entry], &[option], session, RebootFlag::Continuous)
+    encode_sd_datagram(buf, &[entry], &[option], session, reboot)
 }
 
 /// Encode `entries` + `options` as an SD payload, prefixed with the
@@ -652,11 +636,16 @@ mod tests {
             ..req(0x0001, 30501)
         };
         assert_eq!(
-            build_offer_service_datagram(&mut buf, &request, 1),
+            build_offer_service_datagram(&mut buf, &request, 1, RebootFlag::Continuous),
             Err(BuildError::InvalidTtl(0))
         );
         assert_eq!(
-            build_multi_offer_service_datagram::<4>(&mut buf, &[request], 1),
+            build_multi_offer_service_datagram::<4>(
+                &mut buf,
+                &[request],
+                1,
+                RebootFlag::Continuous
+            ),
             Err(BuildError::InvalidTtl(0))
         );
     }
@@ -669,7 +658,9 @@ mod tests {
                 ttl,
                 ..req(0x0001, 30501)
             };
-            let len = build_stop_offer_service_datagram(&mut buf, &request, 1).unwrap();
+            let len =
+                build_stop_offer_service_datagram(&mut buf, &request, 1, RebootFlag::Continuous)
+                    .unwrap();
             let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
             let entry = view.entries().next().unwrap();
             assert!(entry.is_stop_offer());
@@ -680,7 +671,9 @@ mod tests {
     fn multi_offer_round_trips_through_sd_parser() {
         let offers = [req(0x0001, 30501), req(0x0002, 30502), req(0x0003, 30503)];
         let mut buf = [0u8; 512];
-        let len = build_multi_offer_service_datagram::<8>(&mut buf, &offers, 7).unwrap();
+        let len =
+            build_multi_offer_service_datagram::<8>(&mut buf, &offers, 7, RebootFlag::Continuous)
+                .unwrap();
 
         // Parses as an SD datagram with one OfferService entry per offer,
         // each referencing its own endpoint option.
@@ -780,7 +773,9 @@ mod tests {
     #[test]
     fn parse_sd_datagram_malformed_known_option_is_sd_error() {
         let mut buf = [0u8; 128];
-        let len = build_offer_service_datagram(&mut buf, &req(0x0001, 30501), 1).unwrap();
+        let len =
+            build_offer_service_datagram(&mut buf, &req(0x0001, 30501), 1, RebootFlag::Continuous)
+                .unwrap();
         // The IPv4 endpoint option is the last 12 bytes; its transport byte is
         // the third-to-last.
         buf[len - 3] = 0x84;
@@ -993,5 +988,30 @@ mod tests {
                 capacity: 1
             })
         );
+    }
+
+    #[test]
+    fn offer_builders_write_the_reboot_flag_they_are_given() {
+        type Builder = fn(&mut [u8], &OfferServiceRequest, RebootFlag) -> Result<usize, BuildError>;
+        let builders: [(&str, Builder); 4] = [
+            ("offer", |b, r, f| build_offer_service_datagram(b, r, 1, f)),
+            ("stop", |b, r, f| {
+                build_stop_offer_service_datagram(b, r, 1, f)
+            }),
+            ("multi offer", |b, r, f| {
+                build_multi_offer_service_datagram::<1>(b, core::slice::from_ref(r), 1, f)
+            }),
+            ("multi stop", |b, r, f| {
+                build_multi_stop_offer_service_datagram::<1>(b, core::slice::from_ref(r), 1, f)
+            }),
+        ];
+        for (name, build) in builders {
+            for reboot in [RebootFlag::RecentlyRebooted, RebootFlag::Continuous] {
+                let mut buf = [0u8; 128];
+                let len = build(&mut buf, &req(0x0001, 30501), reboot).unwrap();
+                let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+                assert_eq!(view.flags().reboot(), reboot, "{name}");
+            }
+        }
     }
 }
