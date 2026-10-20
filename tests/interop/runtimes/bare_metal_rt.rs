@@ -105,7 +105,12 @@ impl SomeipUnderTest for BareMetalRt {
             bind,
             offers: offers.leak(),
             subscription,
-            sd_timing: rt::SdTiming::DEFAULT,
+            sd_timing: rt::SdTiming {
+                initial_delay_min_ms: FIND_INITIAL_DELAY_MS.0,
+                initial_delay_max_ms: FIND_INITIAL_DELAY_MS.1,
+                repetitions_base_delay_ms: FIND_BASE_DELAY_MS,
+                repetitions_max: FIND_REPETITIONS,
+            },
             mailbox: &MAILBOX,
             // SAFETY: `STARTED` was claimed above and is released only when
             // `init` fails before spawning the task that borrows these

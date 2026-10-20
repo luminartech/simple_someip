@@ -539,3 +539,86 @@ scenario!(
         );
     }
 );
+
+/// Whether `d` carries a FindService entry for `SVC`/`INST`.
+fn finds_svc(d: &[u8]) -> bool {
+    parse::sd_entries(d).iter().any(|(_, e)| {
+        e[0] == FIND_SERVICE
+            && u16::from_be_bytes([e[4], e[5]]) == SVC
+            && u16::from_be_bytes([e[6], e[7]]) == INST
+    })
+}
+
+scenario!(
+    /// feat_req_someipsd_62, 64, 67, 73, 76, 866 — we find a wanted service after a random initial delay, repeat with doubling delays, then stop; feat_req_someipsd_631 — the Offer that answers a Find is answered with a Subscribe.
+    d12_client_finds_until_offered,
+    std = ignore("the std Client sends FindService only through the caller's periodic announcements (#209)"),
+    bare_metal = run,
+    {
+        let fp = FramePeer::start();
+        let started = Instant::now();
+        let _rt = Rt::start(super::pubsub::client());
+        let repetitions = usize::from(FIND_REPETITIONS);
+        let window = Duration::from_millis(u64::from(FIND_INITIAL_DELAY_MS.1))
+            + Duration::from_millis(u64::from(FIND_BASE_DELAY_MS) * ((1 << repetitions) - 1))
+            + Duration::from_millis(500);
+        let mut at = Vec::new();
+        while let Some((_, _, delivery)) =
+            fp.recv_sd(window.saturating_sub(started.elapsed()), finds_svc)
+        {
+            assert!(
+                delivery == Delivery::Multicast,
+                "{}: a FindService was sent by {delivery:?}",
+                Rt::NAME
+            );
+            at.push(started.elapsed());
+        }
+        assert_eq!(
+            at.len(),
+            1 + repetitions,
+            "{}: FindService count; sent at {at:.0?}",
+            Rt::NAME
+        );
+        let slack = Duration::from_millis(60);
+        let (min, max) = (
+            Duration::from_millis(u64::from(FIND_INITIAL_DELAY_MS.0)),
+            Duration::from_millis(u64::from(FIND_INITIAL_DELAY_MS.1)),
+        );
+        assert!(
+            at[0] + slack >= min && at[0] <= max + slack,
+            "{}: first FindService at {:?}, expected {min:?}..={max:?}",
+            Rt::NAME,
+            at[0]
+        );
+        for k in 0..repetitions {
+            let gap = at[k + 1] - at[k];
+            let expected = Duration::from_millis(u64::from(FIND_BASE_DELAY_MS) << k);
+            assert!(
+                gap + slack >= expected && gap <= expected + slack,
+                "{}: gap {k} was {gap:?}, expected {expected:?}; sent at {at:.0?}",
+                Rt::NAME
+            );
+        }
+        assert!(
+            fp.recv_sd(QUIET, finds_svc).is_none(),
+            "{}: FindService after the last repetition",
+            Rt::NAME
+        );
+
+        let offer = build::service_entry(OFFER_SERVICE, 0, 0, 1, 0, SVC, INST, MAJOR, 3, 0);
+        fp.send_sd_unicast(
+            SocketAddrV4::new(OUR_IP, SD_PORT),
+            &build::sd_message(1, true, true, &[offer], &[peer_endpoint()]),
+        );
+        let subscribed = fp.recv_sd(SD_WAIT, |d| {
+            parse::sd_entries(d)
+                .iter()
+                .any(|(_, e)| e[0] == SUBSCRIBE_EVENTGROUP)
+        });
+        assert!(
+            matches!(subscribed, Some((_, _, Delivery::Unicast))),
+            "{}: no unicast Subscribe after the Offer that answered the Find",
+            Rt::NAME
+        );
+    }
+);
