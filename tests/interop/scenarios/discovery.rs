@@ -506,7 +506,7 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00158 — the first SD message's session ID is 1.
     d11_first_sd_session_id_is_one,
-    std = ignore("the first SD message must have session ID 1 (#172)"),
+    std = run,
     bare_metal = run,
     {
         let fp = FramePeer::start();

@@ -205,7 +205,7 @@ static SUBS_STORAGE: StaticSubscriptionStorage = BlockingMutex::<
     CriticalSectionRawMutex,
     RefCell<SubscriptionManager>,
 >::new(RefCell::new(SubscriptionManager::new()));
-static SD_STATE: SdStateManager = SdStateManager::with_initial(0);
+static SD_STATE: SdStateManager = SdStateManager::new();
 static SERVER_STARTED: AtomicBool = AtomicBool::new(false);
 
 static SD_PORT: AtomicU16 = AtomicU16::new(DEFAULT_SD_PORT);
