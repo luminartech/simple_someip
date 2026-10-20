@@ -591,7 +591,7 @@ scenario!(
             at[0]
         );
         for k in 0..repetitions {
-            let gap = at[k + 1] - at[k];
+            let gap = at[k + 1].saturating_sub(at[k]);
             let expected = Duration::from_millis(u64::from(FIND_BASE_DELAY_MS) << k);
             assert!(
                 gap + slack >= expected && gap <= expected + slack,
