@@ -214,7 +214,6 @@ static IFACE: AtomicU32 = AtomicU32::new(0);
 
 static DISPATCH: AtomicUsize = AtomicUsize::new(0); // DispatchFn as usize
 static DISPATCH_CTX: AtomicUsize = AtomicUsize::new(0); // opaque ctx word for DISPATCH
-static OFFER_SESSION: AtomicU16 = AtomicU16::new(1);
 static STOP_SESSION: AtomicU16 = AtomicU16::new(1);
 static PUBLISH_SESSION: AtomicU16 = AtomicU16::new(1);
 
@@ -524,7 +523,7 @@ async fn someip_task() {
             sd_multicast: sd_mcast,
             period,
             offers: &reqs[..n_offers],
-            offer_session: &OFFER_SESSION,
+            sd_state: &SD_STATE,
             offer_scratch,
             rx_buf: rx,
             dispatch,
