@@ -20,7 +20,7 @@ use crate::protocol::sd::{
     Entry, EventGroupEntry, Flags, Header as SdHeader, Options as SdOptions, OptionsCount,
     RebootFlag, SdHeaderView, ServiceEntry, TransportProtocol,
 };
-use crate::protocol::{Header, HeaderView, MessageId, MessageType, MessageTypeField, ReturnCode};
+use crate::protocol::{Header, MessageId, MessageType, MessageTypeField, MessageView, ReturnCode};
 use crate::transport::{E2EHandle, E2EStatus};
 
 /// SOME/IP header length in bytes — the offset at which an SD or
@@ -665,32 +665,44 @@ pub struct ParsedDatagram<'a> {
     pub payload: &'a [u8],
 }
 
-/// Parse `data` as a SOME/IP datagram.
+impl<'a> From<&MessageView<'a>> for ParsedDatagram<'a> {
+    fn from(view: &MessageView<'a>) -> Self {
+        let header = view.header();
+        let message_id = header.message_id();
+        Self {
+            service_id: message_id.service_id(),
+            method_id: message_id.method_id(),
+            upper_header: header.upper_header_bytes(),
+            payload: view.payload_bytes(),
+        }
+    }
+}
+
+/// Parse the first SOME/IP message in `data`. Its payload ends where its
+/// Length field says; any bytes after it are not returned. Use
+/// [`split_message`](crate::protocol::split_message) to walk every message
+/// in a datagram.
 ///
 /// # Errors
-/// Propagates the [`HeaderView::parse`] error: [`protocol::Error::Incomplete`]
-/// if `data` is shorter than a header can consume, or a validation error if the
-/// header fields are malformed. This is the same error type used throughout the
-/// crate, so callers can distinguish "not enough bytes yet" from "malformed".
+/// Propagates the [`MessageView::parse`] error: [`protocol::Error::Incomplete`]
+/// if `data` is shorter than the header or than the Length field says, or a
+/// validation error if the header fields are malformed. This is the same error
+/// type used throughout the crate, so callers can distinguish "not enough
+/// bytes yet" from "malformed".
 ///
 /// [`protocol::Error::Incomplete`]: crate::protocol::Error::Incomplete
 pub fn parse_someip_datagram(data: &[u8]) -> Result<ParsedDatagram<'_>, crate::protocol::Error> {
-    let (view, payload) = HeaderView::parse(data)?;
-    let message_id = view.message_id();
-    Ok(ParsedDatagram {
-        service_id: message_id.service_id(),
-        method_id: message_id.method_id(),
-        upper_header: view.upper_header_bytes(),
-        payload,
-    })
+    Ok(ParsedDatagram::from(&MessageView::parse(data)?))
 }
 
-/// Parse `data` as a SOME/IP-SD datagram, returning the inner
-/// [`SdHeaderView`] for entry/option iteration.
+/// Parse the first SOME/IP message in `data` as SOME/IP-SD, returning the
+/// inner [`SdHeaderView`] for entry/option iteration. The message ends where
+/// its Length field says.
 ///
 /// # Errors
 /// The three failure modes are distinguishable by variant:
-/// - [`protocol::Error::Incomplete`] — the SOME/IP wrapper needs more bytes.
+/// - [`protocol::Error::Incomplete`] — `data` is shorter than the header or
+///   than the Length field says.
 /// - [`protocol::Error::UnsupportedMessageID`] — a well-formed SOME/IP message
 ///   whose message-ID is not [`MessageId::SD`] (i.e. not an SD message).
 /// - [`protocol::Error::Sd`] (and other validation variants) — the wrapper or
@@ -700,13 +712,13 @@ pub fn parse_someip_datagram(data: &[u8]) -> Result<ParsedDatagram<'_>, crate::p
 /// [`protocol::Error::UnsupportedMessageID`]: crate::protocol::Error::UnsupportedMessageID
 /// [`protocol::Error::Sd`]: crate::protocol::Error::Sd
 pub fn parse_someip_sd_datagram(data: &[u8]) -> Result<SdHeaderView<'_>, crate::protocol::Error> {
-    let (view, sd_payload) = HeaderView::parse(data)?;
+    let view = MessageView::parse(data)?;
     if !view.is_sd() {
         return Err(crate::protocol::Error::UnsupportedMessageID(
-            view.message_id(),
+            view.header().message_id(),
         ));
     }
-    SdHeaderView::parse(sd_payload)
+    view.sd_header()
 }
 
 /// Runs `e2e`'s check on `parsed`, received from `source`. Returns what the
@@ -856,6 +868,18 @@ mod tests {
     fn parse_someip_datagram_incomplete_is_error() {
         // Fewer than SOMEIP_HEADER_LEN bytes -> Incomplete, not a silent None.
         let err = parse_someip_datagram(&[0u8; 4]).unwrap_err();
+        assert!(matches!(err, crate::protocol::Error::Incomplete(_)));
+    }
+
+    #[test]
+    fn parse_someip_datagram_payload_ends_at_the_length_field() {
+        let mut buf = [0u8; 64];
+        let len = build_notification_datagram(&mut buf, 0x0003, 0x8001, 9, &[0x01]).unwrap();
+        buf[len..len + 3].fill(0xEE);
+        let parsed = parse_someip_datagram(&buf[..len + 3]).expect("valid SOME/IP datagram");
+        assert_eq!(parsed.payload, &[0x01]);
+        // The Length field covers a payload byte that is not in `data`.
+        let err = parse_someip_datagram(&buf[..len - 1]).unwrap_err();
         assert!(matches!(err, crate::protocol::Error::Incomplete(_)));
     }
 

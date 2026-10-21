@@ -184,7 +184,9 @@ impl<'a> Decode<'a> for MessageView<'a> {
                 )
                 .into());
             }
-            if header.message_type().message_type() != MessageType::Notification {
+            if header.message_type().message_type() != MessageType::Notification
+                || header.message_type().is_tp()
+            {
                 return Err(
                     crate::protocol::sd::Error::InvalidMessage("SD message type mismatch").into(),
                 );
@@ -200,6 +202,46 @@ impl<'a> Decode<'a> for MessageView<'a> {
         let rest = &remaining[payload_size..];
         Ok((Self { header, payload }, rest))
     }
+}
+
+/// Splits the next SOME/IP message off the front of `datagram`, a received
+/// UDP datagram or the part of one after an earlier message.
+///
+/// Each message ends where its Length field says, and the next one starts
+/// right after it. SOME/IP-TP segments are skipped, since the crate does not
+/// reassemble them. Call it again on the returned bytes to walk every message
+/// in the datagram.
+///
+/// # Arguments
+///
+/// * `datagram` - the bytes still to walk.
+///
+/// # Returns
+///
+/// The next message and the bytes after it, or `None` once `datagram` holds
+/// no message other than SOME/IP-TP segments.
+///
+/// # Errors
+///
+/// Returns the [`MessageView::parse`] error of a malformed message. Its
+/// Length cannot be trusted, so the bytes after it are not returned.
+#[must_use]
+pub fn split_message(mut datagram: &[u8]) -> Option<Result<(MessageView<'_>, &[u8]), Error>> {
+    while !datagram.is_empty() {
+        match MessageView::decode(datagram) {
+            Ok((view, rest)) if view.header().message_type().is_tp() => {
+                #[cfg(any(feature = "client", feature = "server"))]
+                crate::log::warn!(
+                    "Discarding a SOME/IP-TP segment for {:?}",
+                    view.header().message_id()
+                );
+                datagram = rest;
+            }
+            Ok(message) => return Some(Ok(message)),
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    None
 }
 
 impl<PayloadDefinition: PayloadWireFormat> Encode for Message<PayloadDefinition> {
@@ -238,6 +280,96 @@ mod tests {
 
     fn make_sd_message() -> Msg {
         Msg::new_sd(0x0000_0001, &minimal_sd_header()).expect("in-tree SdHeader cannot fail")
+    }
+
+    #[cfg(feature = "std")]
+    mod split_message {
+        use super::*;
+        use std::{vec, vec::Vec};
+
+        /// One raw message for service 0x1234, method 0x8001.
+        fn frame(message_type: u8, session: u8, payload: &[u8]) -> Vec<u8> {
+            let length = u32::try_from(8 + payload.len()).unwrap();
+            let mut f = vec![0x12, 0x34, 0x80, 0x01];
+            f.extend(length.to_be_bytes());
+            f.extend([0x00, 0x00, 0x00, session, 0x01, 0x01, message_type, 0x00]);
+            f.extend(payload);
+            f
+        }
+
+        fn walk(mut datagram: &[u8]) -> Vec<Result<(u32, Vec<u8>), Error>> {
+            let mut got = Vec::new();
+            while let Some(message) = split_message(datagram) {
+                match message {
+                    Ok((v, rest)) => {
+                        got.push(Ok((v.header().request_id(), v.payload_bytes().to_vec())));
+                        datagram = rest;
+                    }
+                    Err(e) => {
+                        got.push(Err(e));
+                        break;
+                    }
+                }
+            }
+            got
+        }
+
+        #[test]
+        fn returns_every_message_in_order() {
+            let datagram = [frame(0x02, 1, &[1]), frame(0x02, 2, &[2, 2])].concat();
+            let got = walk(&datagram);
+            assert!(
+                matches!(&got[..], [Ok((1, a)), Ok((2, b))] if a == &[1] && b == &[2, 2]),
+                "{got:?}"
+            );
+        }
+
+        #[test]
+        fn reports_trailing_bytes_as_a_malformed_message() {
+            let datagram = [frame(0x02, 1, &[1]), vec![0xEE; 3]].concat();
+            let got = walk(&datagram);
+            assert!(
+                matches!(&got[..], [Ok((1, a)), Err(Error::Incomplete(_))] if a == &[1]),
+                "{got:?}"
+            );
+        }
+
+        #[test]
+        fn reports_a_length_past_the_datagram() {
+            let mut short = frame(0x02, 2, &[0x20; 10]);
+            short.truncate(16 + 4);
+            let datagram = [frame(0x02, 1, &[1]), short].concat();
+            let got = walk(&datagram);
+            assert!(
+                matches!(&got[..], [Ok((1, _)), Err(Error::Incomplete(_))]),
+                "{got:?}"
+            );
+        }
+
+        #[test]
+        fn stops_after_a_malformed_message() {
+            let mut bad_version = frame(0x02, 2, &[2]);
+            bad_version[12] = 0x02;
+            let datagram = [frame(0x02, 1, &[1]), bad_version, frame(0x02, 3, &[3])].concat();
+            let got = walk(&datagram);
+            assert!(matches!(&got[..], [Ok((1, _)), Err(_)]), "{got:?}");
+        }
+
+        #[test]
+        fn skips_tp_segments() {
+            let segment = [[0x00, 0x00, 0x00, 0x01].as_slice(), &[0x30; 16]].concat();
+            let datagram = [frame(0x22, 1, &segment), frame(0x02, 2, &[2])].concat();
+            let got = walk(&datagram);
+            assert!(matches!(&got[..], [Ok((2, b))] if b == &[2]), "{got:?}");
+        }
+
+        #[test]
+        fn returns_the_bytes_after_the_message() {
+            let second = frame(0x02, 2, &[2]);
+            let datagram = [frame(0x02, 1, &[1]), second.clone()].concat();
+            let (_, rest) = split_message(&datagram).unwrap().unwrap();
+            assert_eq!(rest, &second[..]);
+        }
     }
 
     /// A failing `SdHeader::encoded_size` must surface as an error, not as a
@@ -511,6 +643,20 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
         buf[14] = 0x00; // Request instead of Notification
+        assert!(matches!(
+            MessageView::parse(&buf[..n]),
+            Err(Error::Sd(crate::protocol::sd::Error::InvalidMessage(
+                "SD message type mismatch"
+            )))
+        ));
+    }
+
+    #[test]
+    fn parse_sd_with_the_tp_flag_returns_error() {
+        let msg = make_sd_message();
+        let mut buf = [0u8; 64];
+        let n = msg.encode(&mut buf.as_mut_slice()).unwrap();
+        buf[14] |= 0x20;
         assert!(matches!(
             MessageView::parse(&buf[..n]),
             Err(Error::Sd(crate::protocol::sd::Error::InvalidMessage(
