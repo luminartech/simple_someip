@@ -923,6 +923,71 @@ async fn non_sd_responder_frames_and_sends_response() {
     let _ = handle.await;
 }
 
+/// Every request in one datagram is answered, in order; a SOME/IP-TP
+/// segment between them is not.
+#[tokio::test]
+async fn non_sd_responder_answers_every_request_in_a_datagram() {
+    let unicast_pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        unicast_pipe: Arc::clone(&unicast_pipe),
+        sd_pipe: Arc::new(MockPipe::default()),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+    let config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30704);
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e_registry: NoE2E,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: Some((respond_with_body as NonSdRequestCallback, 0)),
+    };
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+    let handle = tokio::spawn(run);
+
+    let mut tp_segment = build_method_request_with_id(0x1234, 0x0001, 2, &[0, 0, 0, 1, 0xAA]);
+    tp_segment[14] = 0x20; // REQUEST with the TP flag
+    let datagram = [
+        build_method_request_with_id(0x1234, 0x0001, 1, &[0x01]),
+        tp_segment,
+        build_method_request_with_id(0x1234, 0x0001, 3, &[0x03]),
+    ]
+    .concat();
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 111), 40011);
+    unicast_pipe
+        .inbound
+        .lock()
+        .unwrap()
+        .push_back((datagram, src));
+    if let Some(w) = unicast_pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    drive_until(|| unicast_pipe.sent.lock().unwrap().len() >= 2).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    let answered: Vec<u32> = unicast_pipe
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(resp, _)| u32::from_be_bytes(resp[8..12].try_into().unwrap()))
+        .collect();
+    assert_eq!(answered, [1, 3], "request IDs answered");
+
+    handle.abort();
+    let _ = handle.await;
+}
+
 /// A responder that returns a length larger than the buffer it was given
 /// (a contract violation, but the callback is consumer/FFI code) must be
 /// rejected: no datagram sent, run-future still alive — never an
@@ -1226,4 +1291,68 @@ async fn event_rx_dispatch_passes_the_hooks_status() {
     let _ = tokio::time::timeout(Duration::from_millis(200), rx).await;
     let seen = OBSERVED_EVENTS.get().unwrap().lock().unwrap().clone();
     assert_eq!(seen, [(0x8001, vec![0x11], 1), (0x8002, vec![0x22], 0)]);
+}
+
+/// `(method_id, payload)` of each dispatched event.
+type WalkedEvents = Mutex<Vec<(u16, Vec<u8>)>>;
+
+static WALKED_EVENTS: OnceLock<WalkedEvents> = OnceLock::new();
+
+fn record_walked_event(
+    _ctx: usize,
+    _source: SocketAddrV4,
+    _service_id: u16,
+    method_id: u16,
+    payload: &[u8],
+    _e2e_status: u8,
+    _response_out: &mut [u8],
+) -> i32 {
+    WALKED_EVENTS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push((method_id, payload.to_vec()));
+    -1
+}
+
+/// Each message ends where its Length field says: every message in a
+/// datagram is dispatched with its own payload, a SOME/IP-TP segment and
+/// trailing bytes are not, and neither is a message whose Length runs past
+/// the datagram.
+#[tokio::test]
+async fn event_rx_dispatch_walks_each_message_by_its_length() {
+    let pipe = Arc::new(MockPipe::default());
+    let socket = MockSocket {
+        pipe: Arc::clone(&pipe),
+        local: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40101),
+    };
+    let mut tp_segment = build_method_request(0x3456, 0x8004, &[0, 0, 0, 1, 0x44]);
+    tp_segment[14] = 0x22; // NOTIFICATION with the TP flag
+    let mut past_the_end = build_method_request(0x3456, 0x8006, &[0x66; 10]);
+    past_the_end.truncate(16 + 4);
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 8), 30509);
+    for datagram in [
+        [
+            build_method_request(0x3456, 0x8003, &[0x33]),
+            tp_segment,
+            build_method_request(0x3456, 0x8005, &[0x55]),
+            vec![0xEE; 3],
+        ]
+        .concat(),
+        past_the_end,
+    ] {
+        pipe.inbound.lock().unwrap().push_back((datagram, src));
+    }
+    let mut buf = vec![0u8; 1500];
+    let rx = simple_someip::bare_metal_tasks::event_rx_dispatch_future(
+        &socket,
+        &NoE2E,
+        record_walked_event,
+        0,
+        &mut buf,
+    );
+    // The receive loop never returns; give it time to drain both datagrams.
+    let _ = tokio::time::timeout(Duration::from_millis(200), rx).await;
+    let seen = WALKED_EVENTS.get().unwrap().lock().unwrap().clone();
+    assert_eq!(seen, [(0x8003, vec![0x33]), (0x8005, vec![0x55])]);
 }
