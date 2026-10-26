@@ -3,7 +3,7 @@
 //! Mirrors the std-only `RawPayload` but swaps every `Vec`
 //! for a `heapless::Vec<_, CAP>` so the type is usable on targets
 //! without an allocator. Suitable as the `MessageDefinitions`
-//! parameter for `Client<MessageDefinitions, _, _, _>` /
+//! parameter for `Client<MessageDefinitions, _, _>` /
 //! `Message<MessageDefinitions>` in bare-metal firmware
 //! (`embassy_executor` + static `define_static_channels!`-backed
 //! channels).

@@ -25,7 +25,7 @@ use crate::interop::consts::*;
 use crate::interop::runtime::*;
 
 type E2eHandle = NoE2E;
-type StdClient = Client<RawPayload, E2eHandle, Arc<std::sync::RwLock<Ipv4Addr>>, TokioChannels>;
+type StdClient = Client<RawPayload, Arc<std::sync::RwLock<Ipv4Addr>>, TokioChannels>;
 type Publisher = Arc<
     EventPublisher<
         E2eHandle,

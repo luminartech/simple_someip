@@ -302,22 +302,18 @@ async fn client_interface_read_after_construction_does_not_allocate() {
 
     static POOL: BufferPool<9, UDP_BUFFER_SIZE> = BufferPool::new();
 
-    let (client, _updates, run_fut) = Client::<
-        RawPayload,
-        NoE2E,
-        Arc<std::sync::RwLock<Ipv4Addr>>,
-        WitnessChannels,
-    >::new_with_deps(
-        ClientDeps {
-            factory,
-            spawner: TokioBackedSpawner,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            interface: interface_handle,
-            buffer_provider: StaticBufferProvider(&POOL),
-        },
-        false,
-    );
+    let (client, _updates, run_fut) =
+        Client::<RawPayload, Arc<std::sync::RwLock<Ipv4Addr>>, WitnessChannels>::new_with_deps(
+            ClientDeps {
+                factory,
+                spawner: TokioBackedSpawner,
+                timer: MockTimer,
+                e2e_registry: e2e_handle,
+                interface: interface_handle,
+                buffer_provider: StaticBufferProvider(&POOL),
+            },
+            false,
+        );
     let run_handle = tokio::spawn(run_fut);
 
     // After construction (and after a yield to give the spawn loop a

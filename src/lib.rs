@@ -82,7 +82,7 @@
 //!     // the run-loop future. Spawn the future on the tokio runtime;
 //!     // the returned future depends on `tokio::select!` / `tokio::time`
 //!     // / tokio sockets, so it is not executor-agnostic today.
-//!     let (client, mut updates, run) = Client::<RawPayload, _, _, _>::new([192, 168, 1, 100].into());
+//!     let (client, mut updates, run) = Client::<RawPayload, _, _>::new([192, 168, 1, 100].into());
 //!     let _run_task = tokio::spawn(run);
 //!     client.bind_discovery().await.unwrap();
 //!

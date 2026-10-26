@@ -28,7 +28,7 @@ async fn main(spawner: embassy_executor::Spawner) {
     let stack = /* ... build embassy-net Stack ... */;
     let factory = EmbassyNetFactory::new(stack, &SOCKET_POOL);
 
-    let (client, _updates, run_fut) = Client::<_, _, _, _>::new_with_deps(
+    let (client, _updates, run_fut) = Client::<_, _, _>::new_with_deps(
         ClientDeps {
             factory,
             spawner,           // embassy_executor::Spawner

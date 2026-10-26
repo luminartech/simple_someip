@@ -62,12 +62,7 @@ fn empty_sd_header() -> VecSdHeader {
     }
 }
 
-type TestClient = Client<
-    RawPayload,
-    simple_someip::NoE2E,
-    std::sync::Arc<std::sync::RwLock<Ipv4Addr>>,
-    TokioChannels,
->;
+type TestClient = Client<RawPayload, std::sync::Arc<std::sync::RwLock<Ipv4Addr>>, TokioChannels>;
 
 /// Type alias bringing the tokio-flavor concrete type parameters back into
 /// scope so callers can spell `TestServer::new(...)` without chasing the
@@ -1126,7 +1121,7 @@ where
 
     let deps = ClientDeps::tokio(Ipv4Addr::LOCALHOST).with_e2e_registry(client_hook);
     let (client, mut updates, run_fut) =
-        Client::<RawPayload, _, _, TokioChannels>::new_with_deps(deps, false);
+        Client::<RawPayload, _, TokioChannels>::new_with_deps(deps, false);
     let run_handle = tokio::spawn(run_fut);
     let key = ServiceEndpointKey::udp(
         service_id,
@@ -1188,7 +1183,7 @@ async fn send_request_and_capture<H: E2EHandle + Clone>(
     let key = ServiceEndpointKey::udp(service_id, peer.local_addr().unwrap());
     let deps = ClientDeps::tokio(Ipv4Addr::LOCALHOST).with_e2e_registry(hook);
     let (client, _updates, run_fut) =
-        Client::<RawPayload, _, _, TokioChannels>::new_with_deps(deps, false);
+        Client::<RawPayload, _, TokioChannels>::new_with_deps(deps, false);
     let run_handle = tokio::spawn(run_fut);
     client.add_endpoint(key, 1, 0).await.unwrap();
     let id = MessageId::new_from_service_and_method(service_id, 0x0001);

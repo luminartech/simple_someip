@@ -362,7 +362,7 @@ where
 /// use std::net::Ipv4Addr;
 /// let deps = ClientDeps::tokio(Ipv4Addr::LOCALHOST);
 /// let (_client, _updates, _run) =
-///     Client::<RawPayload, _, _, TokioChannels>::new_with_deps(deps, false);
+///     Client::<RawPayload, _, TokioChannels>::new_with_deps(deps, false);
 /// # }
 /// ```
 #[cfg(feature = "client-tokio")]
@@ -561,8 +561,8 @@ where
 ///
 /// [`ClientDeps`] and `ServerDeps` share their first three
 /// generic positions (`F`, `Tm`, `R`) to read symmetrically, but the
-/// `Client` struct itself carries only `<MessageDefinitions, R, I, C>`
-/// — `F`, `Tm`, and `Sp` (Spawner) live on the run-loop future
+/// `Client` struct itself carries only `<MessageDefinitions, I, C>`
+/// — `F`, `Tm`, `R`, and `Sp` (Spawner) live on the run-loop future
 /// produced by [`Self::new_with_deps`], not on the handle. The
 /// asymmetry between `Client<…>` and `Server<F, Tm, R, Sub, …>` is
 /// structural, not an oversight: a `Client` value retains no reference
@@ -572,19 +572,16 @@ where
 #[derive(Clone)]
 pub struct Client<
     MessageDefinitions: PayloadWireFormat + Send + 'static,
-    R: E2EHandle + Clone,
     I: InterfaceHandle,
     C: ChannelFactory,
 > {
     interface: I,
     control_sender: C::BoundedSender<inner::ControlMessage<MessageDefinitions, C>, 4>,
-    e2e: core::marker::PhantomData<fn() -> R>,
 }
 
-impl<MessageDefinitions, R, I, C> core::fmt::Debug for Client<MessageDefinitions, R, I, C>
+impl<MessageDefinitions, I, C> core::fmt::Debug for Client<MessageDefinitions, I, C>
 where
     MessageDefinitions: PayloadWireFormat + Send + 'static,
-    R: E2EHandle + Clone,
     I: InterfaceHandle,
     C: ChannelFactory,
 {
@@ -602,7 +599,7 @@ where
 /// [`Self::new_with_spawner_and_loopback`] (always available under `client`)
 /// and supply their own channel factory + spawner.
 #[cfg(feature = "client-tokio")]
-impl<MessageDefinitions> Client<MessageDefinitions, NoE2E, Arc<RwLock<Ipv4Addr>>, TokioChannels>
+impl<MessageDefinitions> Client<MessageDefinitions, Arc<RwLock<Ipv4Addr>>, TokioChannels>
 where
     MessageDefinitions: PayloadWireFormat + Clone + core::fmt::Debug + 'static,
 {
@@ -624,7 +621,7 @@ where
     /// # use simple_someip::{Client, RawPayload};
     /// # use std::net::Ipv4Addr;
     /// # async fn demo() {
-    /// let (client, mut updates, run) = Client::<RawPayload, _, _, _>::new(Ipv4Addr::LOCALHOST);
+    /// let (client, mut updates, run) = Client::<RawPayload, _, _>::new(Ipv4Addr::LOCALHOST);
     /// let _run_task = tokio::spawn(run);
     /// // ...interact with `client` and `updates`...
     /// # let _ = (client, updates);
@@ -689,7 +686,7 @@ where
     /// #   fn spawn(&self, _: impl core::future::Future<Output = ()> + Send + 'static) {}
     /// # }
     /// let (client, mut updates, run) =
-    ///     Client::<RawPayload, _, _, _>::new_with_spawner_and_loopback(
+    ///     Client::<RawPayload, _, _>::new_with_spawner_and_loopback(
     ///         Ipv4Addr::LOCALHOST,
     ///         false,
     ///         MySpawner,
@@ -740,11 +737,10 @@ where
     }
 }
 
-/// Methods available on all `Client<M, R, I, C>` regardless of handle types.
-impl<MessageDefinitions, R, I, C> Client<MessageDefinitions, R, I, C>
+/// Methods available on all `Client<M, I, C>` regardless of handle types.
+impl<MessageDefinitions, I, C> Client<MessageDefinitions, I, C>
 where
     MessageDefinitions: PayloadWireFormat + Clone + core::fmt::Debug + Send + 'static,
-    R: E2EHandle + Clone,
     I: InterfaceHandle,
     C: ChannelFactory,
     Result<(), Error>: OneshotPooled<C>,
@@ -783,7 +779,7 @@ where
     /// `LocalSet`-style spawner shim.
     #[allow(clippy::type_complexity)]
     #[must_use = "the returned run-loop future must be spawned (e.g. via the Spawner) for the client to make progress"]
-    pub fn new_with_deps<F, Tm, Sp, BP>(
+    pub fn new_with_deps<F, Tm, R, Sp, BP>(
         deps: ClientDeps<F, Tm, R, I, Sp, BP>,
         multicast_loopback: bool,
     ) -> (
@@ -792,6 +788,7 @@ where
         impl core::future::Future<Output = ()> + Send + 'static,
     )
     where
+        R: E2EHandle + Clone,
         F: TransportFactory + Send + Sync + 'static,
         F::Socket: Send + Sync + 'static,
         for<'a> F::BindFuture<'a>: Send,
@@ -832,7 +829,6 @@ where
         let client = Self {
             interface,
             control_sender,
-            e2e: core::marker::PhantomData,
         };
         let updates = ClientUpdates { update_receiver };
         (client, updates, run_future)
@@ -855,7 +851,7 @@ where
     /// [`Spawner`]: crate::transport::Spawner
     #[allow(clippy::type_complexity)]
     #[must_use = "the returned run-loop future must be spawned (e.g. via the LocalSpawner) for the client to make progress"]
-    pub fn new_with_deps_local<F, Tm, Sp, BP>(
+    pub fn new_with_deps_local<F, Tm, R, Sp, BP>(
         deps: ClientDeps<F, Tm, R, I, Sp, BP>,
         multicast_loopback: bool,
     ) -> (
@@ -864,6 +860,7 @@ where
         impl core::future::Future<Output = ()> + 'static,
     )
     where
+        R: E2EHandle + Clone,
         F: TransportFactory + 'static,
         F::Socket: 'static,
         Sp: crate::transport::LocalSpawner + 'static,
@@ -900,7 +897,6 @@ where
         let client = Self {
             interface,
             control_sender,
-            e2e: core::marker::PhantomData,
         };
         let updates = ClientUpdates { update_receiver };
         (client, updates, run_future)
@@ -1282,10 +1278,9 @@ where
 /// weak-sender shutdown pattern. A bare-metal alternative would need a
 /// different lifecycle mechanism (phase-future).
 #[cfg(feature = "client-tokio")]
-impl<MessageDefinitions, R, I> Client<MessageDefinitions, R, I, TokioChannels>
+impl<MessageDefinitions, I> Client<MessageDefinitions, I, TokioChannels>
 where
     MessageDefinitions: PayloadWireFormat + Clone + core::fmt::Debug + 'static,
-    R: E2EHandle + Clone,
     I: InterfaceHandle,
 {
     /// Start periodic SD announcements on the client's discovery socket.
@@ -1321,7 +1316,6 @@ where
     /// # async fn demo(
     /// #     client: Client<
     /// #         RawPayload,
-    /// #         simple_someip::NoE2E,
     /// #         Arc<RwLock<Ipv4Addr>>,
     /// #         TokioChannels,
     /// #     >,
@@ -1440,7 +1434,7 @@ mod tests {
     use automotive_wire_codec::Encode;
     use std::format;
 
-    type TestClient = Client<TestPayload, NoE2E, Arc<RwLock<Ipv4Addr>>, TokioChannels>;
+    type TestClient = Client<TestPayload, Arc<RwLock<Ipv4Addr>>, TokioChannels>;
 
     #[tokio::test]
     async fn test_client_new_and_interface() {

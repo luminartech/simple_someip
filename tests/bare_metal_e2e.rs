@@ -415,7 +415,7 @@ async fn client_receives_server_sd_announcement() {
     };
 
     let (client, mut updates, run_fut) =
-        Client::<RawPayload, NoE2E, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
+        Client::<RawPayload, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
             client_deps,
             false,
         );
@@ -514,11 +514,11 @@ async fn client_send_request_server_runloop_stable() {
         buffer_provider: StaticBufferProvider(&POOL_REQ),
     };
 
-    let (client, mut updates, client_run_fut) =
-        Client::<RawPayload, NoE2E, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
-            client_deps,
-            false,
-        );
+    let (client, mut updates, client_run_fut) = Client::<
+        RawPayload,
+        Arc<RwLock<Ipv4Addr>>,
+        E2ETestChannels,
+    >::new_with_deps(client_deps, false);
 
     let client_run_handle = tokio::spawn(client_run_fut);
 
@@ -686,7 +686,7 @@ async fn future_size_witness_bare_metal_channels() {
         buffer_provider: StaticBufferProvider(&POOL_WITNESS),
     };
     let (client, _updates, run_fut) =
-        Client::<RawPayload, NoE2E, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
+        Client::<RawPayload, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
             client_deps,
             false,
         );
@@ -880,9 +880,7 @@ async fn inbound_datagram_larger_than_claimed_buffer_is_dropped_not_fatal() {
         buffer_provider: StaticBufferProvider(&POOL),
     };
     let (client, mut updates, run_fut) =
-        Client::<RawPayload, NoE2E, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
-            deps, false,
-        );
+        Client::<RawPayload, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(deps, false);
     let run_handle = tokio::spawn(run_fut);
 
     client.bind_discovery().await.expect("bind_discovery");
@@ -943,9 +941,7 @@ async fn binding_sockets_claims_one_buffer_each_until_pool_exhausted() {
         buffer_provider: StaticBufferProvider(&POOL),
     };
     let (client, _updates, run_fut) =
-        Client::<RawPayload, NoE2E, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
-            deps, false,
-        );
+        Client::<RawPayload, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(deps, false);
     let run_handle = tokio::spawn(run_fut);
 
     let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30700);
@@ -1041,9 +1037,7 @@ async fn e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_err
         buffer_provider: StaticBufferProvider(&POOL),
     };
     let (client, _updates, run_fut) =
-        Client::<RawPayload, TagE2E, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
-            deps, false,
-        );
+        Client::<RawPayload, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(deps, false);
     let run_handle = tokio::spawn(run_fut);
 
     let service_id: u16 = 0xABCD;

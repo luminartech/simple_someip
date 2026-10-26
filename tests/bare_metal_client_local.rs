@@ -201,7 +201,6 @@ async fn client_constructible_with_local_spawner() {
 
             let (client, _updates, run_fut) = Client::<
                 RawPayload,
-                NoE2E,
                 Arc<std::sync::RwLock<Ipv4Addr>>,
                 LocalChannels,
             >::new_with_deps_local(

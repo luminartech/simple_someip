@@ -421,14 +421,11 @@ async fn main() {
                 buffer_provider: StaticBufferProvider(buf_pool),
             };
 
-            let (client, mut updates, run_fut) = Client::<
-                RawPayload,
-                NoE2E,
-                Arc<RwLock<Ipv4Addr>>,
-                ExampleChannels,
-            >::new_with_deps_local(
-                client_deps, false
-            );
+            let (client, mut updates, run_fut) =
+                Client::<RawPayload, Arc<RwLock<Ipv4Addr>>, ExampleChannels>::new_with_deps_local(
+                    client_deps,
+                    false,
+                );
             tokio::task::spawn_local(run_fut);
 
             client

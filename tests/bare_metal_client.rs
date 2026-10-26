@@ -252,22 +252,18 @@ async fn client_constructible_without_client_tokio_feature() {
 
     static POOL: BufferPool<9, UDP_BUFFER_SIZE> = BufferPool::new();
 
-    let (client, _updates, run_fut) = Client::<
-        RawPayload,
-        NoE2E,
-        Arc<std::sync::RwLock<Ipv4Addr>>,
-        TestStaticChannels,
-    >::new_with_deps(
-        ClientDeps {
-            factory,
-            spawner: TokioBackedSpawner,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            interface: interface_handle,
-            buffer_provider: StaticBufferProvider(&POOL),
-        },
-        false,
-    );
+    let (client, _updates, run_fut) =
+        Client::<RawPayload, Arc<std::sync::RwLock<Ipv4Addr>>, TestStaticChannels>::new_with_deps(
+            ClientDeps {
+                factory,
+                spawner: TokioBackedSpawner,
+                timer: MockTimer,
+                e2e_registry: e2e_handle,
+                interface: interface_handle,
+                buffer_provider: StaticBufferProvider(&POOL),
+            },
+            false,
+        );
 
     // Compile-time witness: the constructor accepts no-tokio types,
     // returns a `Client` + updates triple, and the run-loop future

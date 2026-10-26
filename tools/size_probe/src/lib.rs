@@ -296,7 +296,6 @@ mod client_future_probe {
         };
         let (_client, _updates, run_fut) = Client::<
             ProbePayload,
-            NoE2E,
             NullInterface,
             ProbeChannels,
         >::new_with_deps(deps, false);

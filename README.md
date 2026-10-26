@@ -86,7 +86,7 @@ async fn main() {
     // `Error::Shutdown` is returned only once the run-loop future has
     // been dropped or its task cancelled.
     let (client, mut updates, run) =
-        Client::<RawPayload, _, _, _>::new(Ipv4Addr::new(192, 168, 1, 100));
+        Client::<RawPayload, _, _>::new(Ipv4Addr::new(192, 168, 1, 100));
     let _run_task = tokio::spawn(run);
 
     // Bind the SD multicast socket to discover services

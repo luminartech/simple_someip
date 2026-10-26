@@ -653,7 +653,6 @@ async fn client_receives_server_sd_announcement() {
 
             let (client, mut updates, run_fut) = Client::<
                 RawPayload,
-                NoE2E,
                 Arc<RwLock<Ipv4Addr>>,
                 LoopbackTestChannels,
             >::new_with_deps_local(
@@ -776,7 +775,6 @@ async fn client_send_request_server_runloop_stable() {
 
             let (client, _updates, run_fut) = Client::<
                 RawPayload,
-                NoE2E,
                 Arc<RwLock<Ipv4Addr>>,
                 LoopbackTestChannels,
             >::new_with_deps_local(client_deps, false);

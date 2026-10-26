@@ -277,7 +277,7 @@ async fn main() {
     let iface = AtomicInterfaceHandle::new(&IFACE_STORAGE);
 
     let (client, _updates, run_fut) =
-        Client::<RawPayload, NoE2E, AtomicInterfaceHandle, BareMetalChannels>::new_with_deps(
+        Client::<RawPayload, AtomicInterfaceHandle, BareMetalChannels>::new_with_deps(
             ClientDeps {
                 factory,
                 spawner: TokioBackedSpawner,
