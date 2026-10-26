@@ -1338,3 +1338,122 @@ fn publish_notification_protects_the_notification_through_the_hook() {
     );
     assert_eq!(&datagram[16..], &[TAG, 0x55], "tagged payload");
 }
+
+/// With no subscribers, the bare-metal publish path does not run the hook,
+/// so the hook's state does not advance for a notification nobody gets.
+#[test]
+fn publish_notification_without_subscribers_does_not_protect() {
+    use core::cell::RefCell;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use simple_someip::server::{
+        StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager,
+    };
+    use simple_someip::{E2ECheck, E2EHandle, E2EProtectError};
+
+    static PROTECTS: AtomicUsize = AtomicUsize::new(0);
+    struct CountProtects;
+    impl E2EHandle for CountProtects {
+        fn check<'a>(
+            &self,
+            _: core::net::IpAddr,
+            _: MessageId,
+            _: &'a [u8],
+            _: [u8; 8],
+        ) -> Option<E2ECheck<'a>> {
+            None
+        }
+        fn protect<'b>(
+            &self,
+            _: MessageId,
+            buf: &'b mut [u8],
+            payload_len: usize,
+            _: [u8; 8],
+        ) -> Option<Result<&'b [u8], E2EProtectError>> {
+            PROTECTS.fetch_add(1, Ordering::SeqCst);
+            Some(Ok(&buf[..payload_len]))
+        }
+        fn reset_source(&self, _: core::net::IpAddr) {}
+    }
+
+    static SUBS: StaticSubscriptionStorage = BlockingMutex::<
+        CriticalSectionRawMutex,
+        RefCell<SubscriptionManager>,
+    >::new(RefCell::new(SubscriptionManager::new()));
+
+    let mut scratch = [0u8; 64];
+    let count = simple_someip::bare_metal_tasks::publish_notification(
+        &StaticSubscriptionHandle::new(&SUBS),
+        &CountProtects,
+        0x3457,
+        1,
+        0x01,
+        0x8001,
+        1,
+        &[0x55],
+        &mut scratch,
+        |_, _| panic!("nothing to send to"),
+    );
+
+    assert_eq!(count, 0);
+    assert_eq!(PROTECTS.load(Ordering::SeqCst), 0, "protect never ran");
+
+    let oversized = simple_someip::bare_metal_tasks::publish_notification(
+        &StaticSubscriptionHandle::new(&SUBS),
+        &CountProtects,
+        0x3457,
+        1,
+        0x01,
+        0x8001,
+        2,
+        &[0x55; 60],
+        &mut scratch,
+        |_, _| panic!("nothing to send to"),
+    );
+    assert_eq!(oversized, -2, "a frame that cannot fit is reported");
+}
+
+/// A notification that fits `scratch` framed but not protected is reported
+/// only once someone subscribes: with no subscribers it is never protected.
+#[test]
+fn publish_notification_reports_a_protected_overflow_once_subscribed() {
+    use core::cell::RefCell;
+    use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use simple_someip::server::{
+        StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager,
+    };
+
+    static SUBS: StaticSubscriptionStorage = BlockingMutex::<
+        CriticalSectionRawMutex,
+        RefCell<SubscriptionManager>,
+    >::new(RefCell::new(SubscriptionManager::new()));
+    let hook = TagE2E::new(MessageId::new_from_service_and_method(0x3458, 0x8001));
+    // 16-byte header + 4-byte payload fills `scratch`; the tag does not fit.
+    let mut scratch = [0u8; 20];
+    let publish = |scratch: &mut [u8]| {
+        simple_someip::bare_metal_tasks::publish_notification(
+            &StaticSubscriptionHandle::new(&SUBS),
+            &hook,
+            0x3458,
+            1,
+            0x01,
+            0x8001,
+            1,
+            &[1, 2, 3, 4],
+            scratch,
+            |_, _| panic!("a protected overflow sends nothing"),
+        )
+    };
+
+    assert_eq!(publish(&mut scratch), 0, "nobody subscribed");
+    let subscriber = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 121), 40021);
+    SUBS.lock(|m| m.borrow_mut().subscribe(0x3458, 1, 0x01, subscriber))
+        .unwrap();
+    assert_eq!(
+        publish(&mut scratch),
+        -2,
+        "the protected frame does not fit"
+    );
+}

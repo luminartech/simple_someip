@@ -19,7 +19,7 @@ use core::future::Future;
 use core::net::SocketAddrV4;
 use core::pin::pin;
 use core::sync::atomic::AtomicU16;
-use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use core::task::{Context, RawWaker, RawWakerVTable, Waker};
 use core::time::Duration;
 
 use crate::protocol::sd::RebootFlag;
@@ -287,7 +287,9 @@ const NOOP_RAW_WAKER: RawWaker = {
 /// buffer (no per-call stack buffer), which `e2e` protects the notification
 /// in. Returns the number of subscribers sent to (`>= 0`), or a negative
 /// error: `-2` if `scratch` is too small for the header and the payload,
-/// protected or not.
+/// protected or not. With no subscribers it returns `0` without protecting
+/// the notification, so a payload that only overflows `scratch` once
+/// protected is reported once someone subscribes.
 ///
 /// `send` is invoked *after* the subscription handle's critical section is
 /// released, not from inside the visitor: this function snapshots the
@@ -320,10 +322,6 @@ where
     else {
         return -2;
     };
-    let Ok(total) = crate::transport::protect_in_place(e2e, scratch, total) else {
-        return -2;
-    };
-    let datagram = &scratch[..total];
 
     // Two-phase: snapshot the subscriber endpoints under the handle's
     // critical section, then transmit after it is released. The visitor
@@ -339,7 +337,7 @@ where
     // Inner scope so the visitor's mutable borrow of `targets` (and the
     // future's borrow of the visitor) both end before the transmit loop
     // reads `targets` back.
-    let visited = {
+    {
         let mut visit = |sub: &Subscriber| {
             let _ = targets.push(sub.address);
         };
@@ -353,18 +351,22 @@ where
         // the same waker, satisfying the RawWaker contract.
         let waker = unsafe { Waker::from_raw(NOOP_RAW_WAKER) };
         let mut cx = Context::from_waker(&waker);
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(n) => n,
-            Poll::Pending => 0,
-        }
-    };
+        let _ = fut.as_mut().poll(&mut cx);
+    }
 
+    if targets.is_empty() {
+        return 0;
+    }
+    let Ok(total) = crate::transport::protect_in_place(e2e, scratch, total) else {
+        return -2;
+    };
+    let datagram = &scratch[..total];
     for target in &targets {
         send(datagram, *target);
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     {
-        visited as i32
+        targets.len() as i32
     }
 }
