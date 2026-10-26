@@ -889,7 +889,7 @@ mod tests {
     fn entries_with_options_pairs_each_entry_with_the_options_it_references() {
         let (entries, options) = entries_and_options();
         let header = Header::new(Flags::new_sd(RebootFlag::Continuous), &entries, &options);
-        let paired: std::vec::Vec<(&Entry, std::vec::Vec<u16>)> = header
+        let paired: heapless::Vec<(&Entry, heapless::Vec<u16, 3>), 6> = header
             .entries_with_options()
             .map(|(entry, referenced)| {
                 let ports = referenced
@@ -914,10 +914,10 @@ mod tests {
     fn view_entries_with_options_pairs_each_entry_with_the_options_it_references() {
         let (entries, options) = entries_and_options();
         let header = Header::new(Flags::new_sd(RebootFlag::Continuous), &entries, &options);
-        let mut bytes = std::vec![0u8; header.encoded_size().unwrap()];
-        header.encode(&mut bytes.as_mut_slice()).unwrap();
-        let view = SdHeaderView::parse(&bytes).unwrap();
-        let ports: std::vec::Vec<std::vec::Vec<u16>> = view
+        let mut buf = [0u8; 256];
+        header.encode(&mut buf.as_mut_slice()).unwrap();
+        let view = SdHeaderView::parse(&buf[..header.encoded_size().unwrap()]).unwrap();
+        let ports: heapless::Vec<heapless::Vec<u16, 3>, 6> = view
             .entries_with_options()
             .map(|(_, referenced)| {
                 referenced
@@ -925,6 +925,9 @@ mod tests {
                     .collect()
             })
             .collect();
-        assert_eq!(ports, EXPECTED_PORTS.map(<[u16]>::to_vec));
+        assert_eq!(ports.len(), EXPECTED_PORTS.len());
+        for (ports, expected) in ports.iter().zip(EXPECTED_PORTS) {
+            assert_eq!(ports.as_slice(), expected);
+        }
     }
 }
