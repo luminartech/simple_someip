@@ -43,7 +43,8 @@ pub enum CapacityKind {
     /// cap.
     ///
     /// The only kind the server currently produces, where it means a
-    /// stack send buffer smaller than the outgoing message.
+    /// stack send buffer smaller than the outgoing message, before or after
+    /// protection.
     UdpBuffer,
 
     /// Bound by `PENDING_RESPONSES_CAP`. A request was enqueued but the

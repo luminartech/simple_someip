@@ -840,7 +840,9 @@ where
                                     "Protecting {:?} failed: {:?}; refusing to send it unprotected",
                                     message_id, e
                                 );
-                                let _ = send_message.response.send(Err(Error::E2e(e)));
+                                let _ = send_message
+                                    .response
+                                    .send(Err(Error::Capacity(CapacityKind::UdpBuffer)));
                                 continue;
                             }
                             None => {}
