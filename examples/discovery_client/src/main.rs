@@ -331,6 +331,7 @@ async fn main() -> Result<(), Error> {
             simple_someip::ClientUpdate::Error(err) => {
                 error!("Error: {err:?}");
             }
+            _ => {}
         }
     }
     Ok(())

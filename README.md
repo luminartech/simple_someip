@@ -101,6 +101,7 @@ async fn main() {
             ClientUpdate::ErrorReply { header, source, .. } => { /* unmatched error reply */ }
             ClientUpdate::SenderRebooted(addr) => { /* remote reboot detected */ }
             ClientUpdate::Error(err) => { /* error */ }
+            _ => { /* updates added in later versions */ }
         }
     }
 }

@@ -202,6 +202,7 @@ impl<P: PayloadWireFormat> core::fmt::Debug for DiscoveryMessage<P> {
 }
 
 /// An update received from the SOME/IP client event loop.
+#[non_exhaustive]
 pub enum ClientUpdate<P: PayloadWireFormat> {
     /// Discovery message received.
     DiscoveryUpdated(DiscoveryMessage<P>),

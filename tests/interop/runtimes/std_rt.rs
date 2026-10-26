@@ -321,6 +321,7 @@ async fn report_updates(
             ClientUpdate::SenderRebooted(addr) => {
                 eprintln!("std runtime: client reported that {addr} rebooted");
             }
+            other => eprintln!("std runtime: {other:?} not reported"),
         }
         for o in out {
             if tx.send(o).is_err() {

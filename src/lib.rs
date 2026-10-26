@@ -94,6 +94,7 @@
 //!             ClientUpdate::ErrorReply { header, source, .. } => { /* unmatched error reply */ }
 //!             ClientUpdate::SenderRebooted(addr) => { /* remote reboot */ }
 //!             ClientUpdate::Error(err) => { /* error */ }
+//!             _ => { /* updates added in later versions */ }
 //!         }
 //!     }
 //! }

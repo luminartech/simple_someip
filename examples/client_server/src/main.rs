@@ -192,6 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ClientUpdate::Error(e) => {
                 error!("Error: {e:?}");
             }
+            _ => {}
         }
     }
 
