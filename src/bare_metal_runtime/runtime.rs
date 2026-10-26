@@ -188,8 +188,8 @@ pub struct RuntimeConfig {
     pub mailbox: &'static Mailbox,
     /// Runtime buffer memory (platform-owned, placement-controlled).
     pub buffers: &'static mut RuntimeBuffers,
-    /// Checks the notifications the runtime receives; `None` for no check.
-    /// Notifications the runtime publishes are not protected.
+    /// Checks every non-SD message the runtime receives and protects every
+    /// one it sends; `None` for neither.
     pub e2e: Option<&'static dyn E2EHandle>,
 }
 
@@ -710,6 +710,7 @@ pub unsafe fn publish(
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).publish_scratch) };
     publish_notification(
         &subs_handle,
+        e2e(),
         service_id,
         instance_id,
         event_group_id,

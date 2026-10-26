@@ -567,6 +567,13 @@ async fn dispatch_non_sd_request<T: TransportSocket, R: E2EHandle + ?Sized>(
     .is_ok()
     {
         let total = crate::sd_codec::SOMEIP_HEADER_LEN + payload_len;
+        let total = match crate::transport::protect_in_place(e2e, send_buf, total) {
+            Ok(total) => total,
+            Err(e) => {
+                crate::log::warn!("protecting the non-SD response failed: {:?}; dropped", e);
+                return;
+            }
+        };
         if let Err(e) = unicast_socket.send_to(&send_buf[..total], source).await {
             crate::log::warn!("non-SD response send failed: {:?}", e);
         }

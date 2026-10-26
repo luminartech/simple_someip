@@ -9,7 +9,7 @@ The server implementation provides:
 1. **Service Announcement** - Periodically broadcast OfferService messages via Service Discovery (SD)
 2. **Event Publishing** - Send events to subscribed clients
 3. **Subscription Management** - Track who's subscribed to which event groups
-4. **End-to-End Protection** - A caller-supplied `E2EHandle` checks requests and protects events
+4. **End-to-End Protection** - A caller-supplied `E2EHandle` checks every request and protects every event and response
 5. **UDP Socket Management** - Handle unicast and multicast communication
 
 ## Architecture
@@ -168,6 +168,7 @@ Publishes events to subscribers:
   - Returns number of subscribers that received the event
 - `publish_raw_event(service_id, instance_id, event_group_id, event_id, session_id, protocol_version, interface_version, payload) -> Result<usize>`
   - Low-level event publishing using raw bytes
+  - Applies the server's `E2EHandle` protection when it protects the message
   - Returns number of subscribers that received the event
 - `register_subscriber(service_id, instance_id, event_group_id, subscriber_addr) -> Result<(), SubscribeError>`
   - Manually register a subscriber (advanced use; the built-in SD loop calls this for you)

@@ -926,6 +926,59 @@ async fn non_sd_responder_frames_and_sends_response() {
     let _ = handle.await;
 }
 
+/// The server's RESPONSE goes through its `E2EHandle` like any other
+/// non-SD message it sends.
+#[tokio::test]
+async fn non_sd_response_is_protected_by_the_hook() {
+    let unicast_pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        unicast_pipe: Arc::clone(&unicast_pipe),
+        sd_pipe: Arc::new(MockPipe::default()),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+    let hook = TagE2E::new(MessageId::new_from_service_and_method(0x1236, 0x0001));
+    let config = ServerConfig::new(0x1236, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30704);
+    let deps: ServerDeps<MockFactory, MockTimer, TagE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e_registry: hook,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: Some((respond_with_body as NonSdRequestCallback, 0)),
+    };
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, TagE2E, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+    let handle = tokio::spawn(run);
+
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 111), 40011);
+    unicast_pipe.inbound.lock().unwrap().push_back((
+        build_method_request_with_id(0x1236, 0x0001, 0x0102_0304, &[TAG, 0xDE]),
+        src,
+    ));
+    if let Some(w) = unicast_pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    drive_until(|| !unicast_pipe.sent.lock().unwrap().is_empty()).await;
+
+    let (resp, _) = unicast_pipe.sent.lock().unwrap().pop_front().unwrap();
+    assert_eq!(
+        &resp[4..8],
+        &(8u32 + 4).to_be_bytes(),
+        "length covers the tag"
+    );
+    assert_eq!(&resp[16..], &[TAG, 0x11, 0x22, 0x33], "tagged body");
+
+    handle.abort();
+    let _ = handle.await;
+}
+
 /// A responder that returns a length larger than the buffer it was given
 /// (a contract violation, but the callback is consumer/FFI code) must be
 /// rejected: no datagram sent, run-future still alive — never an
@@ -1238,4 +1291,50 @@ async fn event_rx_dispatch_passes_the_hooks_status() {
             (0x8002, vec![0x22], None)
         ]
     );
+}
+
+/// The bare-metal publish path protects the notification through the hook
+/// before it reaches any subscriber.
+#[test]
+fn publish_notification_protects_the_notification_through_the_hook() {
+    use core::cell::RefCell;
+    use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use simple_someip::server::{
+        StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager,
+    };
+
+    static SUBS: StaticSubscriptionStorage = BlockingMutex::<
+        CriticalSectionRawMutex,
+        RefCell<SubscriptionManager>,
+    >::new(RefCell::new(SubscriptionManager::new()));
+    let subscriber = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 120), 40020);
+    SUBS.lock(|m| m.borrow_mut().subscribe(0x3456, 1, 0x01, subscriber))
+        .unwrap();
+    let hook = TagE2E::new(MessageId::new_from_service_and_method(0x3456, 0x8001));
+
+    let mut scratch = [0u8; 64];
+    let mut sent = Vec::new();
+    let count = simple_someip::bare_metal_tasks::publish_notification(
+        &StaticSubscriptionHandle::new(&SUBS),
+        &hook,
+        0x3456,
+        1,
+        0x01,
+        0x8001,
+        1,
+        &[0x55],
+        &mut scratch,
+        |datagram, to| sent.push((datagram.to_vec(), to)),
+    );
+
+    assert_eq!(count, 1);
+    let (datagram, to) = &sent[0];
+    assert_eq!(*to, subscriber);
+    assert_eq!(
+        &datagram[4..8],
+        &(8u32 + 2).to_be_bytes(),
+        "length covers the tag"
+    );
+    assert_eq!(&datagram[16..], &[TAG, 0x55], "tagged payload");
 }

@@ -284,9 +284,10 @@ const NOOP_RAW_WAKER: RawWaker = {
 ///
 /// `send(datagram, subscriber_addr)` performs the actual UDP transmit
 /// (the firmware's lwIP send). `scratch` is the caller's static TX
-/// buffer (no per-call stack buffer). Returns the number of subscribers
-/// sent to (`>= 0`), or a negative error: `-2` if `scratch` is too small
-/// for the header + payload.
+/// buffer (no per-call stack buffer), which `e2e` protects the notification
+/// in. Returns the number of subscribers sent to (`>= 0`), or a negative
+/// error: `-2` if `scratch` is too small for the header and the payload,
+/// protected or not.
 ///
 /// `send` is invoked *after* the subscription handle's critical section is
 /// released, not from inside the visitor: this function snapshots the
@@ -298,8 +299,9 @@ const NOOP_RAW_WAKER: RawWaker = {
 // session) plus payload, scratch, and send sink; a params struct would
 // only relocate the list.
 #[allow(clippy::too_many_arguments)]
-pub fn publish_notification<Sub, FSend>(
+pub fn publish_notification<Sub, R, FSend>(
     subscriptions: &Sub,
+    e2e: &R,
     service_id: u16,
     instance_id: u16,
     event_group_id: u16,
@@ -311,10 +313,14 @@ pub fn publish_notification<Sub, FSend>(
 ) -> i32
 where
     Sub: SubscriptionHandle,
+    R: E2EHandle + ?Sized,
     FSend: FnMut(&[u8], SocketAddrV4),
 {
     let Ok(total) = build_notification_datagram(scratch, service_id, method_id, session, payload)
     else {
+        return -2;
+    };
+    let Ok(total) = crate::transport::protect_in_place(e2e, scratch, total) else {
         return -2;
     };
     let datagram = &scratch[..total];

@@ -766,14 +766,12 @@ pub trait Spawner {
 /// A hook that checks received payloads and protects sent ones, for example
 /// with an end-to-end header between the SOME/IP header and the payload.
 ///
-/// SD messages never reach it. The client checks every message it receives
-/// and protects every message it sends; the server checks the requests it
-/// hands to its request callback and protects the events it publishes; the
-/// bare-metal runtime
-/// checks the notifications it receives. Responses the server sends and
-/// notifications the bare-metal runtime publishes are not protected. The
-/// status code a check returns is opaque: it is passed to the application
-/// unchanged. [`NoE2E`] checks and protects nothing.
+/// The client, the server and the bare-metal runtime pass every non-SD
+/// message they send through [`protect`](Self::protect), and every non-SD
+/// message they hand to the application through [`check`](Self::check);
+/// the hook returns `None` for a message ID it does not cover. A check's
+/// status code is opaque and reaches the application inside an
+/// [`E2EStatus`]. [`NoE2E`] checks and protects nothing.
 ///
 /// The client and the server clone the handle into each socket loop, so
 /// clones must share their state.

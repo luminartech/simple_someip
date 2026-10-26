@@ -305,18 +305,16 @@ where
     /// Publish raw event data using a caller-provided scratch buffer.
     ///
     /// The `buf` slice receives the serialized SOME/IP header + payload
-    /// datagram before being sent to each subscriber. The caller must
-    /// supply a buffer large enough to hold `16 + payload.len()` bytes;
-    /// [`Error::Capacity`]`("udp_buffer")` is returned if the buffer is
-    /// too small, without writing any bytes. On the bare-metal path,
-    /// callers typically supply a `static [u8; N]`.
-    ///
-    /// This is useful when you've already applied E2E protection to the payload.
+    /// datagram, which the [`E2EHandle`](crate::E2EHandle) protects in place,
+    /// before it is sent to each subscriber. The caller must supply a buffer
+    /// large enough to hold the 16 header bytes and the protected payload.
+    /// On the bare-metal path, callers typically supply a `static [u8; N]`.
     ///
     /// # Errors
     ///
     /// Returns an error if the SOME/IP header fails to serialize, or
-    /// [`Error::Capacity`]`("udp_buffer")` if `buf` is too small for the frame.
+    /// [`Error::Capacity`]`(`[`CapacityKind::UdpBuffer`]`)` if `buf` is too
+    /// small for the frame or its protected form.
     #[allow(clippy::too_many_arguments)]
     pub async fn publish_raw_event_with_buffers(
         &self,
@@ -395,10 +393,6 @@ where
             );
             return Err(Error::Capacity(CapacityKind::UdpBuffer));
         };
-        // Defence-in-depth: the pre-build guard above already rejects
-        // oversize payloads, but a future caller adding optional
-        // post-encode tail bytes (e.g. payload protection) would
-        // need this branch. Cheap to keep.
         if total_len > buf.len() {
             crate::log::error!(
                 "raw event ({} bytes) exceeds buf.len() ({}); dropping publish",
@@ -408,6 +402,15 @@ where
             return Err(Error::Capacity(CapacityKind::UdpBuffer));
         }
         buf[header_len..total_len].copy_from_slice(payload);
+        let total_len = crate::transport::protect_in_place(&self.e2e_registry, buf, total_len)
+            .map_err(|e| {
+                crate::log::error!(
+                    "Protecting raw event {:#06x} failed: {:?}; dropping publish",
+                    event_id,
+                    e
+                );
+                Error::Capacity(CapacityKind::UdpBuffer)
+            })?;
         let datagram = &buf[..total_len];
 
         // Send to all snapshotted subscribers; surface total-failure
@@ -435,7 +438,7 @@ where
         Ok(sent_count)
     }
 
-    /// Publish raw event data (already serialized with E2E protection).
+    /// Publish an event from its raw payload bytes.
     ///
     /// Convenience wrapper over [`Self::publish_raw_event_with_buffers`] that
     /// internally allocates the scratch `Vec` required for the send path.
@@ -599,8 +602,8 @@ where
             .await
     }
 
-    /// Publish raw (already-serialized, already-E2E-protected) event data to a
-    /// SINGLE subscriber, addressed by endpoint, using caller-provided scratch.
+    /// Publish an event from its raw payload bytes to a SINGLE subscriber,
+    /// addressed by endpoint, using caller-provided scratch.
     ///
     /// Unlike [`Self::publish_raw_event_with_buffers`], which fans out to every
     /// subscriber of the event group, this targets one — the caller chooses
@@ -610,9 +613,10 @@ where
     /// endpoints (e.g. multiple sensors on one subnet that share a fixed
     /// instance id).
     ///
-    /// `buf` receives the serialized SOME/IP header + payload before the send,
-    /// exactly as in [`Self::publish_raw_event_with_buffers`]; the caller must
-    /// supply at least `16 + payload.len()` bytes.
+    /// `buf` receives the serialized SOME/IP header + payload, protected in
+    /// place, exactly as in [`Self::publish_raw_event_with_buffers`]; the
+    /// caller must supply room for the 16 header bytes and the protected
+    /// payload.
     ///
     /// Returns `Ok(1)` when `target` is a current subscriber of the event group
     /// and the datagram was sent, and `Ok(0)` when `target` is not subscribed
@@ -709,6 +713,15 @@ where
             return Err(Error::Capacity(CapacityKind::UdpBuffer));
         }
         buf[header_len..total_len].copy_from_slice(payload);
+        let total_len = crate::transport::protect_in_place(&self.e2e_registry, buf, total_len)
+            .map_err(|e| {
+                crate::log::error!(
+                    "Protecting raw event {:#06x} failed: {:?}; dropping publish",
+                    event_id,
+                    e
+                );
+                Error::Capacity(CapacityKind::UdpBuffer)
+            })?;
         let datagram = &buf[..total_len];
 
         match self.socket.get().send_to(datagram, target).await {
@@ -1263,6 +1276,78 @@ mod tests {
         assert_eq!(len, 18);
         // Check payload at end
         assert_eq!(&buf[16..18], &payload);
+    }
+
+    /// Both raw publish paths protect the event through the hook.
+    #[tokio::test]
+    async fn test_publish_raw_event_paths_protect_through_the_hook() {
+        use crate::protocol::MessageId;
+        use crate::transport::{E2EHandle, E2EProtectError};
+
+        /// Protects every message by prefixing `0xE2`.
+        #[derive(Clone)]
+        struct PrefixE2;
+        impl E2EHandle for PrefixE2 {
+            fn check<'a>(
+                &self,
+                _: core::net::IpAddr,
+                _: MessageId,
+                _: &'a [u8],
+                _: [u8; 8],
+            ) -> Option<crate::E2ECheck<'a>> {
+                None
+            }
+            fn protect<'b>(
+                &self,
+                _: MessageId,
+                buf: &'b mut [u8],
+                payload_len: usize,
+                _: [u8; 8],
+            ) -> Option<Result<&'b [u8], E2EProtectError>> {
+                buf.copy_within(..payload_len, 1);
+                buf[0] = 0xE2;
+                Some(Ok(&buf[..=payload_len]))
+            }
+            fn reset_source(&self, _: core::net::IpAddr) {}
+        }
+
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let core::net::SocketAddr::V4(recv_addr) = receiver.local_addr().unwrap() else {
+            panic!("expected v4 source address");
+        };
+        subscriptions
+            .write()
+            .await
+            .subscribe(0x5B, 1, 0x01, recv_addr)
+            .unwrap();
+        let publisher = EventPublisher::new(subscriptions, bind_tokio_socket().await, PrefixE2);
+
+        let mut buf = [0u8; 64];
+        publisher
+            .publish_raw_event(0x5B, 1, 0x01, 0x8001, 0x0001, 0x01, 0x01, &[0xDE, 0xAD])
+            .await
+            .unwrap();
+        let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[4..8], &11u32.to_be_bytes());
+        assert_eq!(&buf[16..len], &[0xE2, 0xDE, 0xAD]);
+
+        publisher
+            .publish_raw_event_to(
+                recv_addr,
+                0x5B,
+                1,
+                0x01,
+                0x8001,
+                0x0001,
+                0x01,
+                0x01,
+                &[0xBE],
+            )
+            .await
+            .unwrap();
+        let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[16..len], &[0xE2, 0xBE]);
     }
 
     #[tokio::test]
