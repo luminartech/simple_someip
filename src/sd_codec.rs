@@ -25,6 +25,14 @@ use crate::transport::{E2EHandle, E2EStatus};
 /// notification payload begins.
 pub const SOMEIP_HEADER_LEN: usize = 16;
 
+/// Whether a Subscribe for these IDs names a wildcard service ID (`0xFFFF`),
+/// instance ID (`0xFFFF`) or major version (`0xFF`). A Subscribe names the
+/// service, instance and version it subscribes to.
+#[cfg(feature = "server")]
+pub(crate) const fn names_a_wildcard(service_id: u16, instance_id: u16, major_version: u8) -> bool {
+    service_id == 0xFFFF || instance_id == 0xFFFF || major_version == 0xFF
+}
+
 /// One `SubscribeEventgroup` entry, with the local endpoint the
 /// publisher should deliver events to.
 #[derive(Clone, Copy, Debug)]

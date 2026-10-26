@@ -183,7 +183,8 @@ pub struct RuntimeConfig {
     pub bind: BindFn,
     /// Generated catalog (borrowed for the duration of `init`).
     pub offers: &'static [OfferEntry],
-    /// The eventgroup this node subscribes to, if any: at most one entry.
+    /// The eventgroup this node subscribes to, if any: at most one entry,
+    /// naming a concrete service ID, instance ID and major version.
     pub subscriptions: &'static [SubEntry],
     /// RX mailbox the platform's receive path pushes into.
     pub mailbox: &'static Mailbox,
@@ -543,7 +544,8 @@ async fn someip_task() {
 /// Returns `0` on success, or a negative error code: `-1` server build
 /// failed, `-2` task spawn failed, `-4` the runtime is already initialized
 /// (a repeat or re-entrant `init` — the passed `config` and its buffers are
-/// NOT adopted), `-5` `config.subscriptions` holds more than one entry. The
+/// NOT adopted), `-5` `config.subscriptions` holds more than one entry or
+/// names a wildcard service ID, instance ID or major version. The
 /// `-1`/`-2`/`-5` paths release the init claim so a corrected retry can
 /// proceed; `-4` does not (a runtime is already live).
 #[allow(clippy::missing_panics_doc)]
@@ -563,7 +565,11 @@ pub fn init(config: RuntimeConfig) -> i32 {
     {
         return -4;
     }
-    if config.subscriptions.len() > MAX_SUBS {
+    if config.subscriptions.len() > MAX_SUBS
+        || config.subscriptions.iter().any(|s| {
+            crate::sd_codec::names_a_wildcard(s.service_id, s.instance_id, s.major_version)
+        })
+    {
         INIT_CLAIMED.store(false, Ordering::Release);
         return -5;
     }

@@ -141,8 +141,9 @@ pub struct ServerConfig {
     /// Eventgroups this node subscribes to. The receive loop answers each
     /// Offer of a matching service, instance and major version with a
     /// unicast Subscribe to the Offer's sender. Use it on a node that runs
-    /// no `Client`; a `Client` sends its own Subscribes. Populate via
-    /// [`Self::with_consumed_eventgroup`].
+    /// no `Client`; a `Client` sends its own Subscribes. Each entry names a
+    /// concrete service ID, instance ID and major version, not a wildcard.
+    /// Populate via [`Self::with_consumed_eventgroup`].
     pub consumed_eventgroups:
         heapless::Vec<SubscribeEventgroupRequest, { ServerConfig::CONSUMED_EVENTGROUPS_CAP }>,
 }
@@ -421,6 +422,20 @@ impl ServerConfig {
             .unwrap_or(u32::MAX)
             .clamp(1, crate::protocol::sd::MAX_TTL);
         self
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        self.check_ttl()?;
+        match self.consumed_eventgroups.iter().find(|request| {
+            crate::sd_codec::names_a_wildcard(
+                request.service_id,
+                request.instance_id,
+                request.major_version,
+            )
+        }) {
+            Some(request) => Err(Error::WildcardConsumedEventgroup(*request)),
+            None => Ok(()),
+        }
     }
 
     fn check_ttl(&self) -> Result<(), Error> {
@@ -973,6 +988,9 @@ impl
     /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
+    /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
+    /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
+    /// instance ID or major version.
     /// Returns an error if binding the unicast or SD socket fails, or if joining the
     /// SD multicast group fails.
     pub async fn new(
@@ -1014,6 +1032,9 @@ impl
     /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
+    /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
+    /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
+    /// instance ID or major version.
     /// Returns an error if binding the unicast or SD socket fails, or if joining the
     /// SD multicast group fails.
     pub async fn new_with_loopback(
@@ -1061,6 +1082,9 @@ impl
     /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
+    /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
+    /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
+    /// instance ID or major version.
     /// Returns an error if binding either socket fails.
     pub async fn new_passive(
         config: ServerConfig,
@@ -1115,6 +1139,9 @@ where
     /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
+    /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
+    /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
+    /// instance ID or major version.
     /// Returns an error if binding the unicast or SD socket via
     /// [`TransportFactory::bind`] fails, or if joining the SD multicast
     /// group fails.
@@ -1130,7 +1157,7 @@ where
         ),
         Error,
     > {
-        config.check_ttl()?;
+        config.validate()?;
         let ServerDeps {
             factory,
             timer,
@@ -1216,6 +1243,9 @@ where
     /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
+    /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
+    /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
+    /// instance ID or major version.
     /// Returns an error if binding either socket fails.
     pub async fn new_passive_with_deps(
         deps: ServerDeps<F, Tm, R, Sub>,
@@ -1228,7 +1258,7 @@ where
         ),
         Error,
     > {
-        config.check_ttl()?;
+        config.validate()?;
         let ServerDeps {
             factory,
             timer,
@@ -1331,6 +1361,9 @@ where
     /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
+    /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
+    /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
+    /// instance ID or major version.
     /// Returns an error if querying `unicast_socket.local_addr()`
     /// fails on the underlying transport, or
     /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
@@ -1339,7 +1372,7 @@ where
         deps: ServerStorage<F, Tm, R, Sub, H, Hsd, Hep>,
         mut config: ServerConfig,
     ) -> Result<Self, Error> {
-        config.check_ttl()?;
+        config.validate()?;
         let bound_port = deps.unicast_socket.get().local_addr()?.port();
         if config.local_port == 0 {
             config.local_port = bound_port;
@@ -1398,6 +1431,9 @@ where
     /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
+    /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
+    /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
+    /// instance ID or major version.
     /// Returns an error if querying `unicast_socket.local_addr()`
     /// fails on the underlying transport, or
     /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
@@ -1408,7 +1444,7 @@ where
         deps: ServerStorage<F, Tm, R, Sub, H, Hsd, Hep>,
         mut config: ServerConfig,
     ) -> Result<Self, Error> {
-        config.check_ttl()?;
+        config.validate()?;
         let bound_port = deps.unicast_socket.get().local_addr()?.port();
         if config.local_port == 0 {
             config.local_port = bound_port;
@@ -1490,12 +1526,12 @@ where
     /// these in `static` storage; on std (or any alloc-using
     /// target), `Self::run` is the convenience shim that
     /// heap-allocates 64 KiB buffers and delegates here.
+    ///
     /// `recv_send_buf` is the scratch the receive loop encodes its SD answers
     /// into: `SubscribeAck`, `SubscribeNack`, and the Subscribes that answer
     /// Offers of [`ServerConfig::consumed_eventgroups`]. It must hold
     /// [`UDP_BUFFER_SIZE`](crate::UDP_BUFFER_SIZE) bytes; an answer that does
     /// not fit is not sent and a warning is logged.
-    ///
     ///
     /// The returned future is independent of `&self` — the cheap
     /// shared-handle clones it captures own everything it needs to
@@ -1919,6 +1955,85 @@ mod tests {
                     Err(Error::Protocol(crate::protocol::Error::Sd(sd::Error::InvalidTtl(t)))) if t == ttl
                 ),
                 "ttl {ttl}: got {:?}",
+                result.err()
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_consumed_eventgroup_with_a_wildcard_id() {
+        let concrete = SubscribeEventgroupRequest {
+            service_id: 0x5C,
+            instance_id: 1,
+            major_version: 1,
+            event_group_id: 1,
+            ttl: 5,
+            local_ip: Ipv4Addr::LOCALHOST,
+            local_rx_port: 40100,
+        };
+        let validate = |request| {
+            ServerConfig::new(0x5B, 1)
+                .with_consumed_eventgroup(request)
+                .validate()
+        };
+        assert!(validate(concrete).is_ok());
+        for request in [
+            SubscribeEventgroupRequest {
+                service_id: 0xFFFF,
+                ..concrete
+            },
+            SubscribeEventgroupRequest {
+                instance_id: 0xFFFF,
+                ..concrete
+            },
+            SubscribeEventgroupRequest {
+                major_version: 0xFF,
+                ..concrete
+            },
+        ] {
+            assert!(
+                matches!(validate(request), Err(Error::WildcardConsumedEventgroup(_))),
+                "{request:?} is accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn server_new_rejects_a_consumed_eventgroup_with_a_wildcard_instance_or_version() {
+        let concrete = SubscribeEventgroupRequest {
+            service_id: 0x5C,
+            instance_id: 1,
+            major_version: 1,
+            event_group_id: 1,
+            ttl: 5,
+            local_ip: Ipv4Addr::LOCALHOST,
+            local_rx_port: 40100,
+        };
+        for request in [
+            SubscribeEventgroupRequest {
+                service_id: 0xFFFF,
+                ..concrete
+            },
+            SubscribeEventgroupRequest {
+                instance_id: 0xFFFF,
+                ..concrete
+            },
+            SubscribeEventgroupRequest {
+                major_version: 0xFF,
+                ..concrete
+            },
+        ] {
+            let config = ServerConfig::new(0x5B, 1).with_consumed_eventgroup(request);
+            let result = Server::new(config).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::WildcardConsumedEventgroup(r))
+                        if r.service_id == request.service_id
+                            && r.instance_id == request.instance_id
+                            && r.major_version == request.major_version
+                ),
+                "{request:?}: got {:?}",
                 result.err()
             );
         }
