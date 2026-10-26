@@ -246,20 +246,13 @@ async fn report_updates(
                 }
                 let sd = RawPayload::new_sd_payload(&msg.sd_header);
                 for ep in sd.offered_endpoints() {
-                    // Like the library's registry, which skips a stop that
-                    // names no endpoint: it cannot tell which provider left.
+                    // Like the library's registry, which removes a stopped
+                    // instance whether or not the stop names an endpoint.
                     if !ep.is_offer {
-                        if ep.endpoint.is_some() {
-                            out.push(Observation::ServiceGone {
-                                service: ep.service_id,
-                                instance: ep.instance_id,
-                            });
-                        } else {
-                            eprintln!(
-                                "std runtime: stop for 0x{:04X} without an endpoint; not reported",
-                                ep.service_id
-                            );
-                        }
+                        out.push(Observation::ServiceGone {
+                            service: ep.service_id,
+                            instance: ep.instance_id,
+                        });
                         continue;
                     }
                     let endpoint = match ep.endpoint {

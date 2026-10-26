@@ -200,6 +200,23 @@ scenario!(
 );
 
 scenario!(
+    /// PRS_SOMEIPSD_00842 / feat_req_someipsd_208 — a StopOffer that references no endpoint option removes the service.
+    d3_stop_offer_without_endpoint_removes_service_frame,
+    std = run,
+    bare_metal = ignore("the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"),
+    {
+        let fp = FramePeer::start();
+        let mut rt = Rt::start(consume_only());
+        let offer = svc_offer(0, 1, 3);
+        fp.send_sd_multicast(&build::sd_message(1, true, true, &[offer], &[peer_endpoint()]));
+        rt.expect("ServiceAvailable", SD_WAIT, is_svc_available);
+        let stop = svc_offer(0, 0, 0);
+        fp.send_sd_multicast(&build::sd_message(2, true, true, &[stop], &[]));
+        rt.expect("ServiceGone", SD_REPLY, is_svc_gone);
+    }
+);
+
+scenario!(
     /// PRS_SOMEIPSD_00427 — vsomeip drops our service when we stop offering it.
     d4_our_stop_offer_is_understood,
     std = ignore("the std runtime cannot stop offering a service (#173)"),
