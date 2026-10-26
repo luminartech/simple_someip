@@ -21,10 +21,10 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
     ///
     /// # Errors
     ///
-    /// Returns the error from [`Encode::encoded_size`] on the SD header, which
-    /// for the in-tree headers is
-    /// [`InvalidOptionType`](crate::protocol::sd::Error::InvalidOptionType)
-    /// when the header holds an
+    /// Returns the error from [`Encode::encoded_size`] on the SD header. For the
+    /// in-tree headers that is
+    /// [`UnencodableOption`](crate::protocol::sd::Error::UnencodableOption),
+    /// returned only when the header holds a received option of unknown type,
     /// [`Options::Unknown`](crate::protocol::sd::Options::Unknown).
     pub fn new_sd(
         request_id: u32,

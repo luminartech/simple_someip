@@ -21,6 +21,10 @@ pub(crate) const OPTION_HEADER_SIZE: usize = 4;
 pub(crate) const OPTION_LENGTH_SIZE_DELTA: usize = 3;
 /// Byte offset of the option type byte inside the fixed header.
 const OPTION_TYPE_OFFSET: usize = 2;
+/// Byte offset of the byte that holds the discardable flag.
+const OPTION_DISCARDABLE_OFFSET: usize = 3;
+/// The discardable flag, the high bit of the byte after the option type.
+const OPTION_DISCARDABLE_FLAG: u8 = 0x80;
 /// Byte offset at which per-type payload begins.
 const OPTION_PAYLOAD_OFFSET: usize = 4;
 
@@ -211,17 +215,24 @@ pub enum Options {
     },
     /// A received option of a type this crate does not know. It holds its
     /// place in the option array so later options keep their index; entries
-    /// that reference it ignore it. It cannot be encoded.
+    /// that reference it ignore it. Its body is not kept, so it cannot be
+    /// encoded, and neither can a header that holds it. Only
+    /// [`OptionView::to_owned`] builds one.
+    #[non_exhaustive]
     Unknown {
         /// The option's type byte.
         option_type: u8,
+        /// The discardable flag: set when the sender allows receivers to
+        /// discard the option.
+        discardable: bool,
         /// The option's length field.
         length: u16,
     },
 }
 
 impl Options {
-    /// Returns the total wire size of this option in bytes.
+    /// Returns the total wire size of this option in bytes; for an
+    /// [`Options::Unknown`], the size it had on the wire.
     #[must_use]
     pub fn size(&self) -> usize {
         match self {
@@ -247,11 +258,13 @@ impl Encode for Options {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidOptionType`] for an [`Options::Unknown`], which
-    /// cannot be encoded.
+    /// Returns [`Error::UnencodableOption`] for an [`Options::Unknown`].
     fn encoded_size(&self) -> Result<usize, Self::Error> {
         if let Options::Unknown { option_type, .. } = self {
-            return Err(Error::InvalidOptionType(*option_type).into());
+            return Err(Error::UnencodableOption {
+                option_type: *option_type,
+            }
+            .into());
         }
         Ok(self.size())
     }
@@ -260,7 +273,7 @@ impl Encode for Options {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidOptionType`] for an [`Options::Unknown`], before
+    /// Returns [`Error::UnencodableOption`] for an [`Options::Unknown`], before
     /// writing anything, or an error if writing to the writer fails.
     ///
     /// # Panics
@@ -304,9 +317,10 @@ impl Encode for Options {
             Options::IpV6SD { ip, protocol, port } => {
                 write_ipv6_option(writer, OptionType::IpV6SD, *ip, *protocol, *port)
             }
-            Options::Unknown { option_type, .. } => {
-                Err(Error::InvalidOptionType(*option_type).into())
+            Options::Unknown { option_type, .. } => Err(Error::UnencodableOption {
+                option_type: *option_type,
             }
+            .into()),
         }
     }
 }
@@ -517,6 +531,7 @@ impl<'a> OptionView<'a> {
         let Ok(option_type) = self.option_type() else {
             return Ok(Options::Unknown {
                 option_type: self.0[OPTION_TYPE_OFFSET],
+                discardable: self.0[OPTION_DISCARDABLE_OFFSET] & OPTION_DISCARDABLE_FLAG != 0,
                 length: u16::from_be_bytes([self.0[0], self.0[1]]),
             });
         };
@@ -864,30 +879,38 @@ mod tests {
     fn unknown_option_keeps_its_wire_size_and_does_not_encode() {
         let unknown = Options::Unknown {
             option_type: 0x77,
+            discardable: true,
             length: 5,
         };
         assert_eq!(unknown.size(), 8);
         assert!(matches!(
             unknown.encoded_size(),
-            Err(crate::protocol::Error::Sd(Error::InvalidOptionType(0x77)))
+            Err(crate::protocol::Error::Sd(Error::UnencodableOption {
+                option_type: 0x77
+            }))
         ));
         assert!(matches!(
             unknown.encode(&mut [0u8; 8].as_mut_slice()),
-            Err(crate::protocol::Error::Sd(Error::InvalidOptionType(0x77)))
+            Err(crate::protocol::Error::Sd(Error::UnencodableOption {
+                option_type: 0x77
+            }))
         ));
     }
 
     #[test]
     fn option_view_to_owned_of_unknown_type_is_unknown() {
-        let buf: [u8; 4] = [0x00, 0x01, 0xFF, 0x00];
-        let view = OptionView(&buf);
-        assert_eq!(
-            view.to_owned().unwrap(),
-            Options::Unknown {
-                option_type: 0xFF,
-                length: 1
-            }
-        );
+        for (flag_byte, discardable) in [(0x00, false), (0x80, true)] {
+            let buf: [u8; 4] = [0x00, 0x01, 0xFF, flag_byte];
+            let view = OptionView(&buf);
+            assert_eq!(
+                view.to_owned().unwrap(),
+                Options::Unknown {
+                    option_type: 0xFF,
+                    discardable,
+                    length: 1
+                }
+            );
+        }
     }
 
     // --- Round-trip tests for all option types ---

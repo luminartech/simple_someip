@@ -303,10 +303,25 @@ impl<'a> Decode<'a> for SdBody<'a> {
 impl Encode for Header<'_> {
     type Error = crate::protocol::Error;
 
+    /// Returns this header's wire size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnencodableOption`](super::Error::UnencodableOption) when
+    /// the header holds a received option of unknown type,
+    /// [`Options::Unknown`].
     fn encoded_size(&self) -> Result<usize, Self::Error> {
         Ok(12 + self.entries.len() * ENTRY_SIZE + self.options_size()?)
     }
 
+    /// Writes this header to `writer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnencodableOption`](super::Error::UnencodableOption) before
+    /// writing anything when the header holds an [`Options::Unknown`],
+    /// [`InvalidTtl`](super::Error::InvalidTtl) when an entry's TTL is out of
+    /// range, or the writer's error.
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
         let options_size = self.options_size()?;
         writer.write_u8(u8::from(self.flags))?;

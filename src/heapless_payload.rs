@@ -300,6 +300,7 @@ mod tests {
             [
                 sd::Options::Unknown {
                     option_type: UNKNOWN_OPTION_TYPE,
+                    discardable: false,
                     length: 5
                 },
                 endpoint_after_unknown_option()
