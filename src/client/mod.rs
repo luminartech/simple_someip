@@ -169,8 +169,9 @@ impl<P: Send + 'static, C: ChannelFactory> PendingResponse<P, C> {
     /// if the inner loop's response-tracking map was full when the request
     /// was sent — the UDP send still went out, but the reply (if any)
     /// arrives on [`ClientUpdates`] rather than this oneshot.
-    /// A RESPONSE whose payload does not decode arrives on [`ClientUpdates`]
-    /// as an error and does not resolve this handle.
+    /// Returns [`Error::Protocol`] if the RESPONSE does not decode: its
+    /// Length field is invalid or exceeds the datagram, or its payload does
+    /// not decode as `P`.
     /// Returns [`Error::Shutdown`] only if the client's run-loop future
     /// exits before the response is delivered — the caller's
     /// `PendingResponse` handle outlived its driver. Reserving `Shutdown`
@@ -1229,8 +1230,10 @@ where
     /// # Errors
     ///
     /// Returns an error if the service is not found, unicast binding fails,
-    /// or the UDP send fails. A RESPONSE whose payload does not decode arrives
-    /// on [`ClientUpdates`] as an error and does not resolve the request.
+    /// or the UDP send fails.
+    /// Returns [`Error::Protocol`] if the RESPONSE does not decode: its
+    /// Length field is invalid or exceeds the datagram, or its payload does
+    /// not decode as `MessageDefinitions`.
     /// Returns [`Error::ErrorReply`] if the reply is an ERROR message or
     /// carries a return code other than
     /// [`ReturnCode::Ok`](crate::protocol::ReturnCode::Ok).
@@ -1792,6 +1795,38 @@ mod tests {
                     if header.return_code() == ReturnCode::NotOk && *source == peer_addr
             ),
             "got {update:?}"
+        );
+        client.shut_down();
+    }
+
+    #[tokio::test]
+    async fn request_resolves_a_response_its_payload_type_cannot_decode() {
+        use crate::protocol::{MessageType, ReturnCode};
+        let (result, client, _updates, _) =
+            request_answered_with_headers(&[(MessageType::Response, ReturnCode::Ok, 0)]).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::Protocol(
+                    crate::protocol::Error::UnsupportedMessageID(_)
+                ))
+            ),
+            "got {result:?}"
+        );
+        client.shut_down();
+    }
+
+    #[tokio::test]
+    async fn request_resolves_a_response_whose_length_overruns_the_datagram() {
+        use crate::protocol::{MessageType, ReturnCode};
+        let (result, client, _updates, _) =
+            request_answered_with_headers(&[(MessageType::Response, ReturnCode::Ok, 4)]).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::Protocol(crate::protocol::Error::Incomplete(_)))
+            ),
+            "got {result:?}"
         );
         client.shut_down();
     }

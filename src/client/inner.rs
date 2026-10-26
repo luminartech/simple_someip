@@ -1313,10 +1313,10 @@ where
                      match unicast {
                          Ok(ReceivedMessage { header, payload, source, e2e_status }) => {
                              let error_reply = Error::error_reply(&header);
-                             // A RESPONSE whose payload does not decode leaves its request pending.
-                             let answers_request = error_reply.is_some()
-                                 || (header.message_type().message_type() == MessageType::Response
-                                     && payload.is_ok());
+                             let answers_request = matches!(
+                                 header.message_type().message_type(),
+                                 MessageType::Response | MessageType::Error
+                             );
                              if answers_request
                                  && let Some(sender) = pending_responses.remove(&header.request_id())
                              {
