@@ -35,7 +35,8 @@ pub const RX_SLOTS: usize = crate::from_env_or(option_env!("SIMPLE_SOMEIP_RX_SLO
 /// single datagrams stay under this (TP segmentation not used here).
 pub const RX_CAP: usize = 1500;
 const MAX_OFFERS: usize = crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_OFFERS"), 4);
-const MAX_SUBS: usize = crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_SUBS"), 1);
+/// The catalog holds at most one subscription; `init` rejects more.
+const MAX_SUBS: usize = 1;
 const SD_SCRATCH_CAP: usize = 512;
 /// Capacity of the API-only send scratch (`RuntimeBuffers::publish_scratch`),
 /// shared by `publish` and `deinit`. Sized for modest events rather than a
@@ -182,6 +183,7 @@ pub struct RuntimeConfig {
     pub bind: BindFn,
     /// Generated catalog (borrowed for the duration of `init`).
     pub offers: &'static [OfferEntry],
+    /// The eventgroup this node subscribes to, if any: at most one entry.
     pub subscriptions: &'static [SubEntry],
     /// RX mailbox the platform's receive path pushes into.
     pub mailbox: &'static Mailbox,
@@ -375,7 +377,7 @@ const DEFAULT_OFFER_REQUEST: OfferServiceRequest = OfferServiceRequest {
 };
 
 /// Build the receive `Server` over the shared callback sockets, accepting
-/// subscribes for every offered service and answering Offers of the first
+/// subscribes for every offered service and answering Offers of the
 /// subscription's service.
 fn build_server() -> bool {
     let o = offers();
@@ -454,7 +456,7 @@ fn build_server() -> bool {
     }
 }
 
-/// The Subscribe the server sends for the first subscription in the catalog.
+/// The Subscribe the server sends for the catalog's subscription.
 fn subscribe_request() -> Option<SubscribeEventgroupRequest> {
     subs().first().map(|s| SubscribeEventgroupRequest {
         service_id: s.service_id,
@@ -541,8 +543,9 @@ async fn someip_task() {
 /// Returns `0` on success, or a negative error code: `-1` server build
 /// failed, `-2` task spawn failed, `-4` the runtime is already initialized
 /// (a repeat or re-entrant `init` — the passed `config` and its buffers are
-/// NOT adopted). The `-1`/`-2` paths release the init claim so a corrected
-/// retry can proceed; `-4` does not (a runtime is already live).
+/// NOT adopted), `-5` `config.subscriptions` holds more than one entry. The
+/// `-1`/`-2`/`-5` paths release the init claim so a corrected retry can
+/// proceed; `-4` does not (a runtime is already live).
 #[allow(clippy::missing_panics_doc)]
 // By-value is required, not incidental: `config.buffers` is a `&'static mut`
 // reborrowed into `BUFS` (`ptr::from_mut`), which a shared `&RuntimeConfig`
@@ -559,6 +562,10 @@ pub fn init(config: RuntimeConfig) -> i32 {
         .is_err()
     {
         return -4;
+    }
+    if config.subscriptions.len() > MAX_SUBS {
+        INIT_CLAIMED.store(false, Ordering::Release);
+        return -5;
     }
     IFACE.store(config.interface, Ordering::Release);
     SD_PORT.store(
@@ -593,7 +600,7 @@ pub fn init(config: RuntimeConfig) -> i32 {
         unsafe { (*core::ptr::addr_of_mut!(OFFERS))[i] = *e };
     }
     OFFERS_LEN.store(n_offers, Ordering::Release);
-    let n_subs = config.subscriptions.len().min(MAX_SUBS);
+    let n_subs = config.subscriptions.len();
     for (i, e) in config.subscriptions.iter().take(n_subs).enumerate() {
         unsafe { (*core::ptr::addr_of_mut!(SUBS))[i] = *e };
     }
