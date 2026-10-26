@@ -238,15 +238,15 @@ impl PayloadWireFormat for HeaplessPayload {
         header.flags = sd::Flags::new(bool::from(reboot), header.flags.unicast());
     }
 
-    fn for_each_offered_endpoint<F>(&self, f: F)
+    fn for_each_service_offer<'a, F>(&'a self, f: F)
     where
-        F: FnMut(crate::OfferedEndpoint),
+        F: FnMut(crate::ServiceOffer<'a>),
     {
         let header = match &self.kind {
             HeaplessPayloadKind::Sd(header) => header,
             HeaplessPayloadKind::Raw(_) => return,
         };
-        crate::traits::for_each_offered_endpoint(header.as_header(), f);
+        crate::traits::for_each_service_offer(header.as_header(), f);
     }
 
     fn for_each_service_instance<F>(&self, mut f: F)

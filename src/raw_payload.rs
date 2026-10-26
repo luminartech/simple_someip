@@ -191,15 +191,15 @@ impl PayloadWireFormat for RawPayload {
         header.flags = sd::Flags::new(bool::from(reboot), header.flags.unicast());
     }
 
-    fn for_each_offered_endpoint<F>(&self, f: F)
+    fn for_each_service_offer<'a, F>(&'a self, f: F)
     where
-        F: FnMut(crate::OfferedEndpoint),
+        F: FnMut(crate::ServiceOffer<'a>),
     {
         let header = match &self.kind {
             RawPayloadKind::Sd(header) => header,
             RawPayloadKind::Raw(_) => return,
         };
-        crate::traits::for_each_offered_endpoint(header.as_header(), f);
+        crate::traits::for_each_service_offer(header.as_header(), f);
     }
 
     fn for_each_service_instance<F>(&self, mut f: F)
@@ -436,9 +436,9 @@ mod tests {
     }
 
     #[test]
-    fn offered_endpoints_from_raw_returns_empty() {
+    fn service_offers_from_raw_returns_empty() {
         let p = make_raw_payload();
-        assert!(p.offered_endpoints().is_empty());
+        assert!(p.service_offers().is_empty());
     }
 
     fn make_offer_entry(service_id: u16, instance_id: u16) -> sd::ServiceEntry {
@@ -455,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn offered_endpoints_use_the_option_each_offer_references() {
+    fn service_offers_use_the_option_each_offer_references() {
         let endpoint = |port| sd::Options::IpV4Endpoint {
             ip: Ipv4Addr::new(192, 0, 2, 1),
             protocol: sd::TransportProtocol::Udp,
@@ -473,15 +473,30 @@ mod tests {
             options: std::vec![endpoint(30600), endpoint(30509)],
         });
         let ports: Vec<_> = payload
-            .offered_endpoints()
+            .service_offers()
             .iter()
-            .map(|ep| (ep.service_id, ep.endpoint.map(|e| e.addr.port())))
+            .map(|offer| match offer {
+                crate::ServiceOffer::Offer { instance, options } => {
+                    let ports: Vec<u16> = options
+                        .clone()
+                        .filter_map(|option| match option {
+                            sd::Options::IpV4Endpoint { port, .. } => Some(*port),
+                            _ => None,
+                        })
+                        .collect();
+                    (instance.service_id, ports)
+                }
+                other => panic!("expected an offer, got {other:?}"),
+            })
             .collect();
-        assert_eq!(ports, [(0x1234, Some(30509)), (0x5678, Some(30600))]);
+        assert_eq!(
+            ports,
+            [(0x1234, std::vec![30509]), (0x5678, std::vec![30600])]
+        );
     }
 
     #[test]
-    fn offered_endpoints_with_offer_service() {
+    fn service_offers_with_offer_service() {
         let offer = sd::Entry::OfferService(make_offer_entry(0x5B, 1));
         let endpoint = sd::Options::IpV4Endpoint {
             ip: Ipv4Addr::LOCALHOST,
@@ -491,23 +506,19 @@ mod tests {
         let header = VecSdHeader {
             flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
             entries: std::vec![offer],
-            options: std::vec![endpoint],
+            options: std::vec![endpoint.clone()],
         };
         let p = RawPayload::new_sd_payload(&header);
-        let endpoints = p.offered_endpoints();
-        assert_eq!(endpoints.len(), 1);
-        assert_eq!(endpoints[0].service_id, 0x5B);
-        assert!(endpoints[0].is_offer);
-        let ep = endpoints[0].endpoint.expect("endpoint option present");
-        assert_eq!(ep.protocol, crate::TransportProtocol::Udp);
-        assert_eq!(
-            ep.addr,
-            core::net::SocketAddr::V4(core::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30000))
-        );
+        let offers = p.service_offers();
+        let [crate::ServiceOffer::Offer { instance, options }] = offers.as_slice() else {
+            panic!("expected one offer, got {offers:?}");
+        };
+        assert_eq!(instance.service_id, 0x5B);
+        assert_eq!(options.clone().collect::<Vec<_>>(), [&endpoint]);
     }
 
     #[test]
-    fn offered_endpoints_with_stop_offer() {
+    fn service_offers_with_stop_offer() {
         let mut entry = make_offer_entry(0x5B, 1);
         entry.ttl = 0;
         let stop = sd::Entry::StopOfferService(entry);
@@ -517,14 +528,15 @@ mod tests {
             options: std::vec![],
         };
         let p = RawPayload::new_sd_payload(&header);
-        let endpoints = p.offered_endpoints();
-        assert_eq!(endpoints.len(), 1);
-        assert!(!endpoints[0].is_offer);
-        assert!(endpoints[0].endpoint.is_none());
+        let offers = p.service_offers();
+        let [crate::ServiceOffer::Stop { instance }] = offers.as_slice() else {
+            panic!("expected one stop, got {offers:?}");
+        };
+        assert_eq!(instance.service_id, 0x5B);
     }
 
     #[test]
-    fn offered_endpoints_ignores_non_offer_entries() {
+    fn service_offers_ignore_non_offer_entries() {
         let find = sd::Entry::FindService(sd::ServiceEntry::find(0x5B));
         let header = VecSdHeader {
             flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
@@ -532,7 +544,27 @@ mod tests {
             options: std::vec![],
         };
         let p = RawPayload::new_sd_payload(&header);
-        assert!(p.offered_endpoints().is_empty());
+        assert!(p.service_offers().is_empty());
+    }
+
+    #[test]
+    fn service_offers_visit_an_offer_without_an_ipv4_endpoint() {
+        let offer = sd::Entry::OfferService(make_offer_entry(0x5B, 1));
+        let header = VecSdHeader {
+            flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+            entries: std::vec![offer],
+            options: std::vec![sd::Options::IpV6Endpoint {
+                ip: core::net::Ipv6Addr::LOCALHOST,
+                protocol: sd::TransportProtocol::Udp,
+                port: 30000,
+            }],
+        };
+        let p = RawPayload::new_sd_payload(&header);
+        let offers = p.service_offers();
+        let [crate::ServiceOffer::Offer { options, .. }] = offers.as_slice() else {
+            panic!("expected one offer, got {offers:?}");
+        };
+        assert_eq!(options.clone().count(), 1);
     }
 
     #[test]

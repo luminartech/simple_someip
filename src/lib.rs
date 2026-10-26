@@ -265,7 +265,7 @@ pub use heapless_payload::{HeaplessPayload, HeaplessSdHeader};
 pub use net_endpoint::{NetEndpoint, TransportProtocol};
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
-pub use traits::{EncodeExt, OfferedEndpoint, PayloadWireFormat};
+pub use traits::{EncodeExt, OfferedInstance, PayloadWireFormat, ServiceOffer};
 
 #[cfg(feature = "client")]
 pub use client::{

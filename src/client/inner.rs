@@ -23,11 +23,35 @@ use crate::{
         socket_manager::{ReceivedMessage, SocketManager},
     },
     protocol::{self, Message, MessageType},
-    traits::PayloadWireFormat,
+    traits::{PayloadWireFormat, ServiceOffer},
     transport::{ChannelFactory, E2ERegistryHandle, MpscRecv, OneshotSend, UnboundedSend},
 };
 
 use super::error::Error;
+
+/// The UDP IPv4 endpoint among `options`, or the first TCP one if there is no
+/// UDP one.
+fn udp_or_tcp_ipv4_endpoint<'a>(
+    options: impl Iterator<Item = &'a protocol::sd::Options>,
+) -> Option<crate::NetEndpoint> {
+    use protocol::sd::{Options, TransportProtocol};
+    let mut tcp = None;
+    for option in options {
+        if let Options::IpV4Endpoint { ip, protocol, port } = *option {
+            let endpoint = crate::NetEndpoint::new(
+                core::net::SocketAddr::V4(core::net::SocketAddrV4::new(ip, port)),
+                protocol,
+            );
+            match protocol {
+                TransportProtocol::Udp => return Some(endpoint),
+                _ => {
+                    tcp.get_or_insert(endpoint);
+                }
+            }
+        }
+    }
+    tcp
+}
 
 /// Max depth of the internal control-message queue. Each entry is one
 /// in-flight `ControlMessage`. Must be generous enough to absorb bursts
@@ -648,57 +672,57 @@ where
         });
 
         // Auto-populate service registry from offer/stop-offer SD entries.
-        sd_payload.for_each_offered_endpoint(|ep| {
-            if !ep.is_offer {
+        sd_payload.for_each_service_offer(|offer| match offer {
+            ServiceOffer::Stop { instance } => {
                 let removed = service_registry.remove_offered_instance(
-                    ep.service_id,
-                    ep.instance_id,
-                    ep.major_version,
+                    instance.service_id,
+                    instance.instance_id,
+                    instance.major_version,
                     source.ip(),
                 );
                 trace!(
                     "Registry: removed {} endpoint(s) of 0x{:04X}.0x{:04X} v{} offered by {}",
-                    removed, ep.service_id, ep.instance_id, ep.major_version, source.ip(),
+                    removed,
+                    instance.service_id,
+                    instance.instance_id,
+                    instance.major_version,
+                    source.ip(),
                 );
-                return;
             }
-            let Some(endpoint) = ep.endpoint else {
-                debug!(
-                    "Offer for 0x{:04X}.0x{:04X} carried no endpoint option; cannot identify the provider socket, skipping",
-                    ep.service_id, ep.instance_id,
-                );
-                return;
-            };
-            // Per AUTOSAR §4.2.1.3 the wire identity of a service
-            // instance is the service id + the offered socket; the
-            // instance id is data, stored in the value for use by
-            // SubscribeEventgroup entries.
-            let key = ServiceEndpointKey {
-                service_id: ep.service_id,
-                endpoint,
-            };
-            if service_registry
-                .insert(
-                    key,
-                    ServiceEndpointInfo {
-                        instance_id: ep.instance_id,
-                        local_port: 0,
-                        major_version: ep.major_version,
-                        minor_version: ep.minor_version,
-                        offered_by: Some(source.ip()),
-                    },
-                )
-                .is_ok()
-            {
-                trace!(
-                    "Registry: added 0x{:04X} -> {:?} (instance 0x{:04X})",
-                    ep.service_id, endpoint, ep.instance_id,
-                );
-            } else {
-                warn!(
-                    "Registry full; dropped offer for 0x{:04X} at {:?}",
-                    ep.service_id, endpoint,
-                );
+            ServiceOffer::Offer { instance, options } => {
+                let Some(endpoint) = udp_or_tcp_ipv4_endpoint(options) else {
+                    debug!(
+                        "Offer for 0x{:04X}.0x{:04X} references no IPv4 endpoint, skipping",
+                        instance.service_id, instance.instance_id,
+                    );
+                    return;
+                };
+                // Per AUTOSAR §4.2.1.3 the wire identity of a service
+                // instance is the service id + the offered socket; the
+                // instance id is data, stored in the value for use by
+                // SubscribeEventgroup entries.
+                let key = ServiceEndpointKey {
+                    service_id: instance.service_id,
+                    endpoint,
+                };
+                let info = ServiceEndpointInfo {
+                    instance_id: instance.instance_id,
+                    local_port: 0,
+                    major_version: instance.major_version,
+                    minor_version: instance.minor_version,
+                    offered_by: Some(source.ip()),
+                };
+                if service_registry.insert(key, info).is_ok() {
+                    trace!(
+                        "Registry: added 0x{:04X} -> {:?} (instance 0x{:04X})",
+                        instance.service_id, endpoint, instance.instance_id,
+                    );
+                } else {
+                    warn!(
+                        "Registry full; dropped offer for 0x{:04X} at {:?}",
+                        instance.service_id, endpoint,
+                    );
+                }
             }
         });
 
@@ -2852,6 +2876,32 @@ mod tests {
     const DEVICE_A_SERVICES: core::net::Ipv4Addr = core::net::Ipv4Addr::new(127, 0, 0, 20);
 
     #[test]
+    fn an_offer_is_at_the_udp_endpoint_it_references() {
+        use crate::protocol::sd::TransportProtocol::{Tcp, Udp};
+        let options = [
+            endpoint_option(Tcp, DEVICE_A, 30_501),
+            endpoint_option(Udp, DEVICE_A, 30_502),
+        ];
+        assert_eq!(
+            udp_or_tcp_ipv4_endpoint(options.iter()),
+            Some(endpoint_key(Udp, DEVICE_A, 30_502).endpoint)
+        );
+    }
+
+    #[test]
+    fn an_offer_with_no_udp_endpoint_is_at_its_tcp_endpoint() {
+        use crate::protocol::sd::TransportProtocol::Tcp;
+        let options = [
+            endpoint_option(Tcp, DEVICE_A, 30_501),
+            endpoint_option(Tcp, DEVICE_A, 30_503),
+        ];
+        assert_eq!(
+            udp_or_tcp_ipv4_endpoint(options.iter()),
+            Some(endpoint_key(Tcp, DEVICE_A, 30_501).endpoint)
+        );
+    }
+
+    #[test]
     fn stop_offer_without_endpoint_removes_the_senders_instance() {
         use crate::protocol::sd::TransportProtocol::Udp;
         let registry = registry_after(std::vec![
@@ -2932,7 +2982,7 @@ mod tests {
     /// path — directly with real SD `OfferService` / `StopOfferService`
     /// payloads (via `RawPayload`/`VecSdHeader`, which unlike the
     /// `TestPayload` used elsewhere in this module actually implements
-    /// `for_each_offered_endpoint`), rather than poking the registry
+    /// `for_each_service_offer`), rather than poking the registry
     /// map directly. Two devices offer the identical
     /// `(service_id, instance_id)` — the fixed ECU-Extract-instance-id
     /// scenario — and a `StopOfferService` from one device must evict
