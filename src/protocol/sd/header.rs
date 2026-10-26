@@ -3,7 +3,7 @@ use crate::protocol::byte_order::WriteBytesExt;
 use automotive_wire_codec::{Decode, DecodeIter, DecodeIterator, Encode};
 
 use super::{
-    Entry, EntryView, Flags, OptionView, Options,
+    Entry, EntryView, Flags, OptionView, Options, ReferencedOptions,
     entry::{ENTRY_SIZE, EntryIter},
     options::OptionIter,
 };
@@ -35,6 +35,18 @@ impl<'a> Header<'a> {
 
     fn entries_size(&self) -> Result<usize, crate::protocol::Error> {
         self.entries.iter().map(Entry::encoded_size).sum()
+    }
+
+    /// Each entry of this header with the options it references in this
+    /// header.
+    pub fn entries_with_options(
+        self,
+    ) -> impl Iterator<Item = (&'a Entry, ReferencedOptions<core::slice::Iter<'a, Options>>)> + 'a
+    {
+        let options = self.options;
+        self.entries
+            .iter()
+            .map(move |entry| (entry, entry.option_runs().select(options.iter())))
     }
 
     fn options_size(&self) -> Result<usize, crate::protocol::Error> {
@@ -146,6 +158,16 @@ impl<'a> SdHeaderView<'a> {
     #[must_use]
     pub fn options(&self) -> OptionIter<'a> {
         OptionIter::new(self.options_buf)
+    }
+
+    /// Each entry of known type with the options it references in this
+    /// header.
+    pub fn entries_with_options(
+        &self,
+    ) -> impl Iterator<Item = (EntryView<'a>, ReferencedOptions<OptionIter<'a>>)> + 'a {
+        let options = self.options();
+        self.entries()
+            .map(move |entry| (entry, entry.option_runs().select(options.clone())))
     }
 
     /// Returns the number of entries of known type in this SD header.
@@ -817,5 +839,92 @@ mod tests {
             Err(crate::protocol::Error::Sd(SdError::InvalidTtl(0)))
         ));
         assert_eq!(writer.len(), 64, "nothing was written");
+    }
+
+    // --- entries_with_options ---
+
+    fn endpoint_at(port: u16) -> Options {
+        Options::IpV4Endpoint {
+            ip: Ipv4Addr::new(192, 0, 2, 1),
+            protocol: TransportProtocol::Udp,
+            port,
+        }
+    }
+
+    fn offer_with_runs(first: (u8, u8), second: (u8, u8)) -> Entry {
+        Entry::OfferService(ServiceEntry {
+            index_first_options_run: first.0,
+            index_second_options_run: second.0,
+            options_count: OptionsCount::new(first.1, second.1),
+            ttl: 3,
+            ..ServiceEntry::find(0x1234)
+        })
+    }
+
+    /// Entries whose runs pick: the second option; the first and third; none;
+    /// a run cut short by the end of the options; a run past the end; and an
+    /// eventgroup entry's second option.
+    fn entries_and_options() -> ([Entry; 6], [Options; 3]) {
+        let subscribe = Entry::SubscribeEventGroup(EventGroupEntry {
+            index_first_options_run: 1,
+            options_count: OptionsCount::new(1, 0),
+            ..EventGroupEntry::new(0x1234, 1, 1, 3, 0x0001)
+        });
+        (
+            [
+                offer_with_runs((1, 1), (0, 0)),
+                offer_with_runs((0, 1), (2, 1)),
+                offer_with_runs((0, 0), (0, 0)),
+                offer_with_runs((2, 2), (0, 0)),
+                offer_with_runs((3, 1), (0, 0)),
+                subscribe,
+            ],
+            [endpoint_at(30509), endpoint_at(30600), endpoint_at(30700)],
+        )
+    }
+
+    const EXPECTED_PORTS: [&[u16]; 6] = [&[30600], &[30509, 30700], &[], &[30700], &[], &[30600]];
+
+    #[test]
+    fn entries_with_options_pairs_each_entry_with_the_options_it_references() {
+        let (entries, options) = entries_and_options();
+        let header = Header::new(Flags::new_sd(RebootFlag::Continuous), &entries, &options);
+        let paired: std::vec::Vec<(&Entry, std::vec::Vec<u16>)> = header
+            .entries_with_options()
+            .map(|(entry, referenced)| {
+                let ports = referenced
+                    .map(|option| match option {
+                        Options::IpV4Endpoint { port, .. } => *port,
+                        other => panic!("unexpected option {other:?}"),
+                    })
+                    .collect();
+                (entry, ports)
+            })
+            .collect();
+        assert_eq!(paired.len(), entries.len());
+        for ((entry, ports), (expected_entry, expected_ports)) in
+            paired.iter().zip(entries.iter().zip(EXPECTED_PORTS))
+        {
+            assert_eq!(*entry, expected_entry);
+            assert_eq!(ports.as_slice(), expected_ports, "entry {entry:?}");
+        }
+    }
+
+    #[test]
+    fn view_entries_with_options_pairs_each_entry_with_the_options_it_references() {
+        let (entries, options) = entries_and_options();
+        let header = Header::new(Flags::new_sd(RebootFlag::Continuous), &entries, &options);
+        let mut bytes = std::vec![0u8; header.encoded_size().unwrap()];
+        header.encode(&mut bytes.as_mut_slice()).unwrap();
+        let view = SdHeaderView::parse(&bytes).unwrap();
+        let ports: std::vec::Vec<std::vec::Vec<u16>> = view
+            .entries_with_options()
+            .map(|(_, referenced)| {
+                referenced
+                    .map(|option| option.as_ipv4().unwrap().2)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(ports, EXPECTED_PORTS.map(<[u16]>::to_vec));
     }
 }

@@ -3120,8 +3120,8 @@ mod tests {
 
     // ── extract_subscriber_endpoint ──────────────────────────────────────
     //
-    // These tests cover the helper that walks an entry's first/second
-    // options runs and returns the first IPv4 endpoint. They use
+    // These tests select an entry's first/second options runs and check
+    // that the helper returns the first IPv4 endpoint among them. They use
     // `sd::Options::IpV4Endpoint::write` to build wire bytes directly
     // so we can precisely control what the options array looks like and
     // what indices the entry references.
@@ -3169,7 +3169,9 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 1, 30000);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        let got = runtime::extract_subscriber_endpoint(&iter, 0, 1, 0, 0);
+        let got = runtime::extract_subscriber_endpoint(
+            sd::OptionRuns::new(0, 0, sd::OptionsCount::new(1, 0)).select(iter.clone()),
+        );
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30000))
@@ -3180,7 +3182,9 @@ mod tests {
     fn extract_endpoint_zero_options_in_both_runs_returns_none() {
         let iter = sd::OptionIter::new(&[]);
         assert_eq!(
-            runtime::extract_subscriber_endpoint(&iter, 0, 0, 0, 0),
+            runtime::extract_subscriber_endpoint(
+                sd::OptionRuns::new(0, 0, sd::OptionsCount::new(0, 0)).select(iter.clone())
+            ),
             None
         );
     }
@@ -3195,7 +3199,9 @@ mod tests {
         let iter = sd::OptionIter::new(&buf[..total]);
 
         assert_eq!(
-            runtime::extract_subscriber_endpoint(&iter, 1, 0, 0, 0),
+            runtime::extract_subscriber_endpoint(
+                sd::OptionRuns::new(1, 0, sd::OptionsCount::new(0, 0)).select(iter.clone())
+            ),
             None
         );
     }
@@ -3209,7 +3215,9 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 2, 30200);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        let got = runtime::extract_subscriber_endpoint(&iter, 0, 2, 0, 0);
+        let got = runtime::extract_subscriber_endpoint(
+            sd::OptionRuns::new(0, 0, sd::OptionsCount::new(2, 0)).select(iter.clone()),
+        );
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30200))
@@ -3228,7 +3236,9 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 3, 30300);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        let got = runtime::extract_subscriber_endpoint(&iter, 0, 1, 2, 1);
+        let got = runtime::extract_subscriber_endpoint(
+            sd::OptionRuns::new(0, 2, sd::OptionsCount::new(1, 1)).select(iter.clone()),
+        );
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30300))
@@ -3243,7 +3253,9 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 4, 30400);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        let got = runtime::extract_subscriber_endpoint(&iter, 2, 1, 0, 0);
+        let got = runtime::extract_subscriber_endpoint(
+            sd::OptionRuns::new(2, 0, sd::OptionsCount::new(1, 0)).select(iter.clone()),
+        );
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30402))
@@ -3259,7 +3271,9 @@ mod tests {
         let iter = sd::OptionIter::new(&buf[..total]);
 
         // Take only 1 option starting at index 1 -> port 30501.
-        let got = runtime::extract_subscriber_endpoint(&iter, 1, 1, 0, 0);
+        let got = runtime::extract_subscriber_endpoint(
+            sd::OptionRuns::new(1, 0, sd::OptionsCount::new(1, 0)).select(iter.clone()),
+        );
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30501))
@@ -3283,7 +3297,9 @@ mod tests {
         offset += write_load_balancing_option(&mut buf[offset..], 3, 4);
         let iter = sd::OptionIter::new(&buf[..offset]);
 
-        let got = runtime::extract_subscriber_endpoint(&iter, 0, 3, 0, 0);
+        let got = runtime::extract_subscriber_endpoint(
+            sd::OptionRuns::new(0, 0, sd::OptionsCount::new(3, 0)).select(iter.clone()),
+        );
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30600))
@@ -3299,7 +3315,9 @@ mod tests {
         let iter = sd::OptionIter::new(&buf[..offset]);
 
         assert_eq!(
-            runtime::extract_subscriber_endpoint(&iter, 0, 2, 0, 0),
+            runtime::extract_subscriber_endpoint(
+                sd::OptionRuns::new(0, 0, sd::OptionsCount::new(2, 0)).select(iter.clone())
+            ),
             None
         );
     }
@@ -3312,7 +3330,9 @@ mod tests {
         let total = fill_ipv4_endpoints(&mut buf, 2, 30700);
         let iter = sd::OptionIter::new(&buf[..total]);
 
-        let got = runtime::extract_subscriber_endpoint(&iter, 0, 0, 1, 1);
+        let got = runtime::extract_subscriber_endpoint(
+            sd::OptionRuns::new(0, 1, sd::OptionsCount::new(0, 1)).select(iter.clone()),
+        );
         assert_eq!(
             got,
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 30701))
@@ -3903,7 +3923,10 @@ mod tests {
             // 0 endpoints → warn! "No IPv4 endpoint" branch.
             let iter_empty = sd::OptionIter::new(&[]);
             assert_eq!(
-                runtime::extract_subscriber_endpoint(&iter_empty, 0, 0, 0, 0),
+                runtime::extract_subscriber_endpoint(
+                    sd::OptionRuns::new(0, 0, sd::OptionsCount::new(0, 0))
+                        .select(iter_empty.clone())
+                ),
                 None
             );
 
@@ -3912,7 +3935,9 @@ mod tests {
             let len_one = fill_ipv4_endpoints(&mut buf_one, 1, 31000);
             let iter_one = sd::OptionIter::new(&buf_one[..len_one]);
             assert_eq!(
-                runtime::extract_subscriber_endpoint(&iter_one, 0, 1, 0, 0),
+                runtime::extract_subscriber_endpoint(
+                    sd::OptionRuns::new(0, 0, sd::OptionsCount::new(1, 0)).select(iter_one.clone())
+                ),
                 Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 31000))
             );
 
@@ -3921,7 +3946,10 @@ mod tests {
             let len_many = fill_ipv4_endpoints(&mut buf_many, 3, 31100);
             let iter_many = sd::OptionIter::new(&buf_many[..len_many]);
             assert_eq!(
-                runtime::extract_subscriber_endpoint(&iter_many, 0, 3, 0, 0),
+                runtime::extract_subscriber_endpoint(
+                    sd::OptionRuns::new(0, 0, sd::OptionsCount::new(3, 0))
+                        .select(iter_many.clone())
+                ),
                 Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 31100))
             );
         });

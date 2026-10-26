@@ -249,7 +249,7 @@ where
     // It replaces the former future-resident `[u8; UDP_BUFFER_SIZE]`,
     // keeping that buffer out of the run future's frame.
 
-    for entry_view in sd_view.entries() {
+    for (entry_view, entry_options) in sd_view.entries_with_options() {
         let Ok(entry_type) = entry_view.entry_type() else {
             continue;
         };
@@ -348,95 +348,83 @@ where
                     {
                         crate::log::warn!("SubscribeNack send failed: {e}");
                     }
-                } else {
-                    let first_index = entry_view.index_first_options_run() as usize;
-                    let first_count = entry_view.options_count().first_options_count as usize;
-                    let second_index = entry_view.index_second_options_run() as usize;
-                    let second_count = entry_view.options_count().second_options_count as usize;
-                    if let Some(endpoint_addr) = extract_subscriber_endpoint(
-                        &sd_view.options(),
-                        first_index,
-                        first_count,
-                        second_index,
-                        second_count,
-                    ) {
-                        let subscribe_result = subscriptions
-                            .subscribe(
-                                entry_view.service_id(),
-                                entry_view.instance_id(),
-                                entry_view.event_group_id(),
-                                endpoint_addr,
-                            )
-                            .await;
+                } else if let Some(endpoint_addr) = extract_subscriber_endpoint(entry_options) {
+                    let subscribe_result = subscriptions
+                        .subscribe(
+                            entry_view.service_id(),
+                            entry_view.instance_id(),
+                            entry_view.event_group_id(),
+                            endpoint_addr,
+                        )
+                        .await;
 
-                        match subscribe_result {
-                            Ok(()) => {
-                                if let Err(e) = send_subscribe_ack_from_view(
-                                    send_buf,
-                                    config,
-                                    sd_socket,
-                                    sd_state,
-                                    &entry_view,
-                                    sender,
-                                )
-                                .await
-                                {
-                                    crate::log::warn!(
-                                        "SubscribeAck send failed; rolling back subscription \
+                    match subscribe_result {
+                        Ok(()) => {
+                            if let Err(e) = send_subscribe_ack_from_view(
+                                send_buf,
+                                config,
+                                sd_socket,
+                                sd_state,
+                                &entry_view,
+                                sender,
+                            )
+                            .await
+                            {
+                                crate::log::warn!(
+                                    "SubscribeAck send failed; rolling back subscription \
                                          (service_id=0x{:04X}, instance_id={}, \
                                          event_group_id=0x{:04X}, error={e})",
+                                    entry_view.service_id(),
+                                    entry_view.instance_id(),
+                                    entry_view.event_group_id(),
+                                );
+                                subscriptions
+                                    .unsubscribe(
                                         entry_view.service_id(),
                                         entry_view.instance_id(),
                                         entry_view.event_group_id(),
-                                    );
-                                    subscriptions
-                                        .unsubscribe(
-                                            entry_view.service_id(),
-                                            entry_view.instance_id(),
-                                            entry_view.event_group_id(),
-                                            endpoint_addr,
-                                        )
-                                        .await;
-                                }
-                            }
-                            Err(e) => {
-                                let reason: &'static str = match e {
-                                    SubscribeError::SubscribersPerGroupFull => {
-                                        "subscribers_per_group_full"
-                                    }
-                                    SubscribeError::EventGroupsFull => "event_groups_full",
-                                };
-                                crate::log::debug!("Subscription rejected: {reason}");
-                                if let Err(e) = send_subscribe_nack_from_view(
-                                    send_buf,
-                                    config,
-                                    sd_socket,
-                                    sd_state,
-                                    &entry_view,
-                                    sender,
-                                    reason,
-                                )
-                                .await
-                                {
-                                    crate::log::warn!("SubscribeNack send failed: {e}");
-                                }
+                                        endpoint_addr,
+                                    )
+                                    .await;
                             }
                         }
-                    } else {
-                        crate::log::warn!("No endpoint found in Subscribe message options");
-                        if let Err(e) = send_subscribe_nack_from_view(
-                            send_buf,
-                            config,
-                            sd_socket,
-                            sd_state,
-                            &entry_view,
-                            sender,
-                            "no_endpoint_in_options",
-                        )
-                        .await
-                        {
-                            crate::log::warn!("SubscribeNack send failed: {e}");
+                        Err(e) => {
+                            let reason: &'static str = match e {
+                                SubscribeError::SubscribersPerGroupFull => {
+                                    "subscribers_per_group_full"
+                                }
+                                SubscribeError::EventGroupsFull => "event_groups_full",
+                            };
+                            crate::log::debug!("Subscription rejected: {reason}");
+                            if let Err(e) = send_subscribe_nack_from_view(
+                                send_buf,
+                                config,
+                                sd_socket,
+                                sd_state,
+                                &entry_view,
+                                sender,
+                                reason,
+                            )
+                            .await
+                            {
+                                crate::log::warn!("SubscribeNack send failed: {e}");
+                            }
                         }
+                    }
+                } else {
+                    crate::log::warn!("No endpoint found in Subscribe message options");
+                    if let Err(e) = send_subscribe_nack_from_view(
+                        send_buf,
+                        config,
+                        sd_socket,
+                        sd_state,
+                        &entry_view,
+                        sender,
+                        "no_endpoint_in_options",
+                    )
+                    .await
+                    {
+                        crate::log::warn!("SubscribeNack send failed: {e}");
                     }
                 }
             }
@@ -818,46 +806,34 @@ fn socket_addr_v4(addr: core::net::SocketAddr) -> Result<SocketAddrV4, Error> {
     }
 }
 
-pub(super) fn extract_subscriber_endpoint(
-    options: &sd::OptionIter<'_>,
-    first_index: usize,
-    first_count: usize,
-    second_index: usize,
-    second_count: usize,
+/// The first IPv4 endpoint among `options`, the options a Subscribe entry
+/// references.
+pub(super) fn extract_subscriber_endpoint<'a>(
+    options: impl Iterator<Item = sd::OptionView<'a>>,
 ) -> Option<SocketAddrV4> {
     let mut first_endpoint: Option<SocketAddrV4> = None;
     let mut endpoint_count: usize = 0;
     let mut ignored_other: usize = 0;
 
-    let mut walk_run = |index: usize, count: usize| {
-        if count == 0 {
-            return;
-        }
-        for option_view in options.clone().skip(index).take(count) {
-            match option_view.option_type() {
-                Ok(sd::OptionType::IpV4Endpoint) => {
-                    if let Ok((ip, _, port)) = option_view.as_ipv4() {
-                        endpoint_count += 1;
-                        if first_endpoint.is_none() {
-                            first_endpoint = Some(SocketAddrV4::new(ip, port));
-                        }
+    for option_view in options {
+        match option_view.option_type() {
+            Ok(sd::OptionType::IpV4Endpoint) => {
+                if let Ok((ip, _, port)) = option_view.as_ipv4() {
+                    endpoint_count += 1;
+                    if first_endpoint.is_none() {
+                        first_endpoint = Some(SocketAddrV4::new(ip, port));
                     }
                 }
-                Ok(_) | Err(_) => ignored_other += 1,
             }
+            Ok(_) | Err(_) => ignored_other += 1,
         }
-    };
-
-    walk_run(first_index, first_count);
-    walk_run(second_index, second_count);
+    }
 
     match endpoint_count {
         0 => {
             crate::log::warn!(
-                "No IPv4 endpoint in options runs \
-                 (first: idx={first_index}, count={first_count}; \
-                 second: idx={second_index}, count={second_count}; \
-                 ignored={ignored_other})"
+                "No IPv4 endpoint among the options the Subscribe references \
+                 (ignored={ignored_other})"
             );
             None
         }

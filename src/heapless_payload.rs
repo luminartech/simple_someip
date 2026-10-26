@@ -55,15 +55,24 @@ pub struct HeaplessSdHeader {
     pub options: HVec<sd::Options, OPT_CAP>,
 }
 
+impl HeaplessSdHeader {
+    /// This header as an [`sd::Header`] borrowing its entries and options,
+    /// for example to walk [`sd::Header::entries_with_options`].
+    #[must_use]
+    pub fn as_header(&self) -> sd::Header<'_> {
+        sd::Header::new(self.flags, &self.entries, &self.options)
+    }
+}
+
 impl Encode for HeaplessSdHeader {
     type Error = protocol::Error;
 
     fn encoded_size(&self) -> Result<usize, Self::Error> {
-        sd::Header::new(self.flags, &self.entries, &self.options).encoded_size()
+        self.as_header().encoded_size()
     }
 
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, protocol::Error> {
-        sd::Header::new(self.flags, &self.entries, &self.options).encode(writer)
+        self.as_header().encode(writer)
     }
 }
 
@@ -237,7 +246,7 @@ impl PayloadWireFormat for HeaplessPayload {
             HeaplessPayloadKind::Sd(header) => header,
             HeaplessPayloadKind::Raw(_) => return,
         };
-        crate::traits::for_each_offered_endpoint(&header.entries, &header.options, f);
+        crate::traits::for_each_offered_endpoint(header.as_header(), f);
     }
 
     fn for_each_service_instance<F>(&self, mut f: F)

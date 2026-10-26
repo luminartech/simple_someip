@@ -11,43 +11,58 @@ pub struct OfferedEndpoint {
     pub major_version: u8,
     /// The minor version of the offered service interface.
     pub minor_version: u32,
-    /// The endpoint (IPv4 socket + transport protocol) from the options the
-    /// entry references, if one of them is an IPv4 endpoint. See
-    /// [`ServiceEntry::ipv4_endpoint`](crate::protocol::sd::ServiceEntry::ipv4_endpoint).
+    /// The IPv4 endpoint among the options the entry references, if any: its
+    /// UDP endpoint, or its TCP endpoint if it references no UDP one.
     pub endpoint: Option<crate::NetEndpoint>,
     /// `true` for `OfferService`, `false` for `StopOfferService`.
     pub is_offer: bool,
 }
 
-/// Visits an [`OfferedEndpoint`] for every offer and stop offer in `entries`,
-/// taking each one's endpoint from the options it references in `options`:
-/// its UDP endpoint, or its TCP endpoint if it references no UDP one.
+/// Visits an [`OfferedEndpoint`] for every offer and stop offer in `header`,
+/// taking each one's endpoint from the options it references: its UDP
+/// endpoint, or its TCP endpoint if it references no UDP one.
 #[cfg(any(feature = "std", feature = "bare_metal"))]
 pub(crate) fn for_each_offered_endpoint(
-    entries: &[crate::protocol::sd::Entry],
-    options: &[crate::protocol::sd::Options],
+    header: crate::protocol::sd::Header<'_>,
     mut f: impl FnMut(OfferedEndpoint),
 ) {
-    use crate::protocol::sd::{Entry, TransportProtocol};
-    for entry in entries {
+    use crate::protocol::sd::Entry;
+    for (entry, options) in header.entries_with_options() {
         let (Entry::OfferService(svc) | Entry::StopOfferService(svc)) = entry else {
             continue;
         };
-        let endpoint = [TransportProtocol::Udp, TransportProtocol::Tcp]
-            .into_iter()
-            .find_map(|protocol| {
-                svc.ipv4_endpoint(options, protocol)
-                    .map(|addr| crate::NetEndpoint::new(core::net::SocketAddr::V4(addr), protocol))
-            });
         f(OfferedEndpoint {
             service_id: svc.service_id,
             instance_id: svc.instance_id,
             major_version: svc.major_version,
             minor_version: svc.minor_version,
-            endpoint,
+            endpoint: udp_or_tcp_ipv4_endpoint(options),
             is_offer: matches!(entry, Entry::OfferService(_)),
         });
     }
+}
+
+#[cfg(any(feature = "std", feature = "bare_metal"))]
+fn udp_or_tcp_ipv4_endpoint<'a>(
+    options: impl Iterator<Item = &'a crate::protocol::sd::Options>,
+) -> Option<crate::NetEndpoint> {
+    use crate::protocol::sd::{Options, TransportProtocol};
+    let mut tcp = None;
+    for option in options {
+        if let Options::IpV4Endpoint { ip, protocol, port } = *option {
+            let endpoint = crate::NetEndpoint::new(
+                core::net::SocketAddr::V4(core::net::SocketAddrV4::new(ip, port)),
+                protocol,
+            );
+            match protocol {
+                TransportProtocol::Udp => return Some(endpoint),
+                _ => {
+                    tcp.get_or_insert(endpoint);
+                }
+            }
+        }
+    }
+    tcp
 }
 
 /// Crate-local conveniences over any codec [`Encode`](automotive_wire_codec::Encode) type.
@@ -238,7 +253,11 @@ mod tests {
             minor_version: 0,
         });
         let mut seen = None;
-        for_each_offered_endpoint(&[offer], &options, |ep| seen = ep.endpoint);
+        let flags = crate::protocol::sd::Flags::new_sd(crate::protocol::sd::RebootFlag::Continuous);
+        for_each_offered_endpoint(
+            crate::protocol::sd::Header::new(flags, &[offer], &options),
+            |ep| seen = ep.endpoint,
+        );
         assert_eq!(
             seen,
             Some(crate::NetEndpoint::udp(SocketAddr::V4(SocketAddrV4::new(

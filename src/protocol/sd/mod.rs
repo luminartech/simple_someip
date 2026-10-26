@@ -18,8 +18,11 @@ pub const MESSAGE_ID_VALUE: u32 = 0xffff_8100;
 
 // Export all definitions from the service discovery mod
 
+#[cfg(test)]
+pub(crate) use entry::OptionRuns;
 pub use entry::{
-    Entry, EntryIter, EntryType, EntryView, EventGroupEntry, MAX_TTL, OptionsCount, ServiceEntry,
+    Entry, EntryIter, EntryType, EntryView, EventGroupEntry, MAX_TTL, OptionsCount,
+    ReferencedOptions, ServiceEntry,
 };
 pub use error::Error;
 pub use flags::{Flags, RebootFlag};
