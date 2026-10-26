@@ -534,7 +534,7 @@ async fn dispatch_non_sd_request<T: TransportSocket, R: E2EHandle + ?Sized>(
         service_id,
         method_id,
         body,
-        status.map_or(0, core::num::NonZeroU8::get),
+        status,
         &mut send_buf[crate::sd_codec::SOMEIP_HEADER_LEN..],
     );
     // A negative length means "no response" (a setter / fire-and-forget).

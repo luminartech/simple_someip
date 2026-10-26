@@ -73,15 +73,15 @@ type RtServer = Server<
 /// contract — so a platform can use one handler for both the server's
 /// non-SD observer and the runtime's notification RX path. `ctx` is the
 /// opaque word registered at [`init`]; `source` is the sender;
-/// `e2e_status` is `0` when not checked, otherwise the code the
-/// [`RuntimeConfig::e2e`] handle returned.
+/// `e2e_status` is what the [`RuntimeConfig::e2e`] handle's check found,
+/// or `None` when no check applied.
 pub type DispatchFn = fn(
     ctx: usize,
     source: core::net::SocketAddrV4,
     service_id: u16,
     method_id: u16,
     payload: &[u8],
-    e2e_status: u8,
+    e2e_status: Option<crate::E2EStatus>,
     response_out: &mut [u8],
 ) -> i32;
 
@@ -329,7 +329,7 @@ fn dispatch(
     service_id: u16,
     method_id: u16,
     payload: &[u8],
-    e2e_status: u8,
+    e2e_status: Option<crate::E2EStatus>,
     response_out: &mut [u8],
 ) -> i32 {
     let raw = DISPATCH.load(Ordering::Acquire);

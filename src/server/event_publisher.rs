@@ -1161,7 +1161,7 @@ mod tests {
                 _: MessageId,
                 _: &'a [u8],
                 _: [u8; 8],
-            ) -> Option<(core::num::NonZeroU8, &'a [u8])> {
+            ) -> Option<crate::E2ECheck<'a>> {
                 None
             }
             fn protect<'b>(

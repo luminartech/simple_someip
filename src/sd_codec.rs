@@ -19,8 +19,7 @@ use crate::protocol::sd::{
     RebootFlag, SdHeaderView, ServiceEntry, TransportProtocol,
 };
 use crate::protocol::{Header, HeaderView, MessageId, MessageType, MessageTypeField, ReturnCode};
-use crate::transport::E2EHandle;
-use core::num::NonZeroU8;
+use crate::transport::{E2EHandle, E2EStatus};
 
 /// SOME/IP header length in bytes — the offset at which an SD or
 /// notification payload begins.
@@ -504,19 +503,22 @@ pub fn parse_someip_sd_datagram(data: &[u8]) -> Result<SdHeaderView<'_>, crate::
     SdHeaderView::parse(sd_payload)
 }
 
-/// Runs `e2e`'s check on `parsed`, received from `source`. Returns the
-/// status code, or `None` when no check applies, and the payload to decode.
+/// Runs `e2e`'s check on `parsed`, received from `source`. Returns what the
+/// check found, or `None` for an SD message or when no check applies, and
+/// the payload to decode.
 #[must_use]
 pub fn check_parsed_e2e<'a, R: E2EHandle + ?Sized>(
     e2e: &R,
     source: IpAddr,
     parsed: &ParsedDatagram<'a>,
-) -> (Option<NonZeroU8>, &'a [u8]) {
-    let message_id = MessageId::new_from_service_and_method(parsed.service_id, parsed.method_id);
-    match e2e.check(source, message_id, parsed.payload, parsed.upper_header) {
-        Some((status, body)) => (Some(status), body),
-        None => (None, parsed.payload),
-    }
+) -> (Option<E2EStatus>, &'a [u8]) {
+    crate::transport::check_message(
+        e2e,
+        source,
+        MessageId::new_from_service_and_method(parsed.service_id, parsed.method_id),
+        parsed.upper_header,
+        parsed.payload,
+    )
 }
 
 #[cfg(test)]

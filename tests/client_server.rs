@@ -38,9 +38,8 @@ use simple_someip::{
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU16, Ordering};
 
-use core::num::NonZeroU8;
 use simple_someip::client::Error as ClientError;
-use simple_someip::{CapacityKind, ClientDeps, E2EHandle, NoE2E, ServerDeps};
+use simple_someip::{CapacityKind, ClientDeps, E2EHandle, E2EStatus, NoE2E, ServerDeps};
 
 #[path = "support/tag_e2e.rs"]
 mod tag_e2e;
@@ -1108,7 +1107,7 @@ async fn publish_and_receive<S, C>(
     client_hook: C,
     service_id: u16,
     events: &[(u16, &[u8])],
-) -> Vec<(u16, Option<NonZeroU8>, Vec<u8>)>
+) -> Vec<(u16, Option<E2EStatus>, Vec<u8>)>
 where
     S: E2EHandle + Clone,
     C: E2EHandle + Clone,
@@ -1236,7 +1235,11 @@ async fn hook_protects_on_publish_and_checks_on_receive() {
     assert_eq!(
         received,
         [
-            (TAGGED_EVENT, Some(PASSED), vec![0x01, 0x02]),
+            (
+                TAGGED_EVENT,
+                Some(E2EStatus::Passed(PASSED)),
+                vec![0x01, 0x02]
+            ),
             (OTHER_EVENT, None, vec![0x01, 0x02]),
         ]
     );
@@ -1259,8 +1262,12 @@ async fn a_failed_check_delivers_the_original_bytes() {
     assert_eq!(
         received,
         [
-            (TAGGED_EVENT, Some(TAG_MISSING), vec![0x07]),
-            (TAGGED_EVENT, Some(TAG_MISSING), vec![]),
+            (
+                TAGGED_EVENT,
+                Some(E2EStatus::Failed(TAG_MISSING)),
+                vec![0x07]
+            ),
+            (TAGGED_EVENT, Some(E2EStatus::Failed(TAG_MISSING)), vec![]),
         ]
     );
 }
@@ -1302,5 +1309,8 @@ async fn a_hook_for_every_message_leaves_service_discovery_alone() {
     let service_id = next_service_id();
     let hook = TagE2E::every_message();
     let received = publish_and_receive(hook, hook, service_id, &[(TAGGED_EVENT, &[0x01])]).await;
-    assert_eq!(received, [(TAGGED_EVENT, Some(PASSED), vec![0x01])]);
+    assert_eq!(
+        received,
+        [(TAGGED_EVENT, Some(E2EStatus::Passed(PASSED)), vec![0x01])]
+    );
 }

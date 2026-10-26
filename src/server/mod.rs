@@ -808,8 +808,8 @@ pub struct Server<
 /// requests / fire-and-forget calls to the offered services). The
 /// SOME/IP header is parsed in `recv_loop` and the callback receives
 /// decoded fields — the consumer never parses bytes. `payload` is the
-/// bytes after the 16-byte SOME/IP header. `e2e_status` is `0` when not
-/// checked, otherwise the code the server's [`E2EHandle`] returned.
+/// bytes after the 16-byte SOME/IP header. `e2e_status` is what the
+/// server's [`E2EHandle`] check found, or `None` when no check applied.
 /// `source` is the sender's address, currently unused by known
 /// consumers (future-proofing).
 ///
@@ -839,7 +839,7 @@ pub type NonSdRequestCallback = fn(
     service_id: u16,
     method_id: u16,
     payload: &[u8],
-    e2e_status: u8,
+    e2e_status: Option<crate::E2EStatus>,
     response_out: &mut [u8],
 ) -> i32;
 

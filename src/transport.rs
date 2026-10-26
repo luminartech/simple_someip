@@ -780,9 +780,8 @@ pub trait Spawner {
 pub trait E2EHandle: Send + Sync + 'static {
     /// Checks a payload received from `source`.
     ///
-    /// Returns `None` when no check applies to `message_id`, otherwise the
-    /// status code and the payload to decode: without its protection header
-    /// when the check passes, the original bytes when it fails.
+    /// Returns `None` when no check applies to `message_id`, otherwise
+    /// whether the check passed, with its status code.
     /// `upper_header` is the SOME/IP header's bytes 8..16.
     fn check<'a>(
         &self,
@@ -790,7 +789,7 @@ pub trait E2EHandle: Send + Sync + 'static {
         message_id: MessageId,
         payload: &'a [u8],
         upper_header: [u8; 8],
-    ) -> Option<(NonZeroU8, &'a [u8])>;
+    ) -> Option<E2ECheck<'a>>;
 
     /// Protects, in place, the payload in `buf[..payload_len]`; the rest of
     /// `buf` is free for the protected payload to grow into.
@@ -823,7 +822,7 @@ impl<T: E2EHandle + ?Sized> E2EHandle for &'static T {
         message_id: MessageId,
         payload: &'a [u8],
         upper_header: [u8; 8],
-    ) -> Option<(NonZeroU8, &'a [u8])> {
+    ) -> Option<E2ECheck<'a>> {
         (**self).check(source, message_id, payload, upper_header)
     }
 
@@ -839,6 +838,74 @@ impl<T: E2EHandle + ?Sized> E2EHandle for &'static T {
 
     fn reset_source(&self, source: IpAddr) {
         (**self).reset_source(source);
+    }
+}
+
+/// The outcome of an [`E2EHandle::check`] that applies to a message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum E2ECheck<'a> {
+    /// The check passed.
+    Passed {
+        /// The hook's status code.
+        status: NonZeroU8,
+        /// The payload without its protection header.
+        payload: &'a [u8],
+    },
+    /// The check failed; the received payload is passed on unchanged.
+    Failed {
+        /// The hook's status code.
+        status: NonZeroU8,
+    },
+}
+
+/// What an [`E2EHandle`] check found for a received message, with the
+/// hook's status code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum E2EStatus {
+    /// The check passed, and the payload is the one without its protection
+    /// header.
+    Passed(NonZeroU8),
+    /// The check failed, and the payload is the one received.
+    Failed(NonZeroU8),
+}
+
+impl E2EStatus {
+    /// The hook's status code.
+    #[must_use]
+    pub const fn code(self) -> NonZeroU8 {
+        match self {
+            Self::Passed(code) | Self::Failed(code) => code,
+        }
+    }
+
+    /// Whether the check passed.
+    #[must_use]
+    pub const fn passed(self) -> bool {
+        matches!(self, Self::Passed(_))
+    }
+}
+
+/// Runs `e2e`'s check on a message received from `source`. Returns what the
+/// check found, or `None` for an SD message or when no check applies, and
+/// the payload to decode.
+#[cfg(any(feature = "client", feature = "server", feature = "bare_metal"))]
+pub(crate) fn check_message<'a, R: E2EHandle + ?Sized>(
+    e2e: &R,
+    source: IpAddr,
+    message_id: MessageId,
+    upper_header: [u8; 8],
+    payload: &'a [u8],
+) -> (Option<E2EStatus>, &'a [u8]) {
+    if message_id.is_sd() {
+        return (None, payload);
+    }
+    match e2e.check(source, message_id, payload, upper_header) {
+        None => (None, payload),
+        Some(E2ECheck::Passed {
+            status,
+            payload: checked,
+        }) => (Some(E2EStatus::Passed(status)), checked),
+        Some(E2ECheck::Failed { status }) => (Some(E2EStatus::Failed(status)), payload),
     }
 }
 
@@ -867,7 +934,7 @@ impl E2EHandle for NoE2E {
         _message_id: MessageId,
         _payload: &'a [u8],
         _upper_header: [u8; 8],
-    ) -> Option<(NonZeroU8, &'a [u8])> {
+    ) -> Option<E2ECheck<'a>> {
         None
     }
 
@@ -1477,7 +1544,7 @@ mod tests {
     use super::*;
 
     mod e2e_handle {
-        use super::super::{E2EHandle, E2EProtectError, NoE2E};
+        use super::super::{E2ECheck, E2EHandle, E2EProtectError, NoE2E};
         use crate::protocol::MessageId;
         use core::net::{IpAddr, Ipv4Addr};
         use core::num::NonZeroU8;
@@ -1493,8 +1560,11 @@ mod tests {
                 _message_id: MessageId,
                 payload: &'a [u8],
                 _upper_header: [u8; 8],
-            ) -> Option<(NonZeroU8, &'a [u8])> {
-                Some((NonZeroU8::MIN, &payload[1..]))
+            ) -> Option<E2ECheck<'a>> {
+                Some(E2ECheck::Passed {
+                    status: NonZeroU8::MIN,
+                    payload: &payload[1..],
+                })
             }
             fn protect<'b>(
                 &self,
@@ -1523,7 +1593,7 @@ mod tests {
                 _message_id: MessageId,
                 _payload: &'a [u8],
                 _upper_header: [u8; 8],
-            ) -> Option<(NonZeroU8, &'a [u8])> {
+            ) -> Option<E2ECheck<'a>> {
                 None
             }
             fn protect<'b>(
@@ -1558,7 +1628,7 @@ mod tests {
                 _message_id: MessageId,
                 _payload: &'a [u8],
                 _upper_header: [u8; 8],
-            ) -> Option<(NonZeroU8, &'a [u8])> {
+            ) -> Option<E2ECheck<'a>> {
                 None
             }
             fn protect<'b>(
@@ -1646,7 +1716,10 @@ mod tests {
             let handle: &'static dyn E2EHandle = &STRIP1;
             assert_eq!(
                 handle.check(SOURCE, ID, &[9, 8, 7], [0; 8]),
-                Some((NonZeroU8::MIN, &[8u8, 7][..]))
+                Some(E2ECheck::Passed {
+                    status: NonZeroU8::MIN,
+                    payload: &[8u8, 7][..]
+                })
             );
             assert_eq!(
                 handle.protect(ID, &mut [1, 0], 1, [0; 8]),

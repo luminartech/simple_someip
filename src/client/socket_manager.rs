@@ -78,7 +78,7 @@ pub struct ReceivedMessage<P> {
     pub(crate) header: Header,
     pub(crate) payload: Result<P, Error>,
     pub(crate) source: SocketAddr,
-    pub(crate) e2e_status: Option<core::num::NonZeroU8>,
+    pub(crate) e2e_status: Option<crate::E2EStatus>,
 }
 
 /// Structure representing a request to send a message
@@ -909,22 +909,14 @@ where
                                         };
                                     }
                                 };
-                                let upper_header = header.upper_header_bytes();
-                                let payload_bytes = view.payload_bytes();
-                                let check = if header.message_id().is_sd() {
-                                    None
-                                } else {
-                                    e2e_registry.check(
+                                let (e2e_status, effective_payload) =
+                                    crate::transport::check_message(
+                                        &e2e_registry,
                                         source_address.ip(),
                                         header.message_id(),
-                                        payload_bytes,
-                                        upper_header,
-                                    )
-                                };
-                                let (e2e_status, effective_payload) = match check {
-                                    Some((status, stripped)) => (Some(status), stripped),
-                                    None => (None, payload_bytes),
-                                };
+                                        header.upper_header_bytes(),
+                                        view.payload_bytes(),
+                                    );
 
                                 let payload = MessageDefinitions::from_payload_bytes(
                                     header.message_id(),

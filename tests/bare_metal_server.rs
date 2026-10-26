@@ -31,7 +31,6 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
-use simple_someip::NoE2E;
 use simple_someip::protocol::MessageId;
 use simple_someip::server::NonSdRequestCallback;
 use simple_someip::server::ServerConfig;
@@ -39,11 +38,12 @@ use simple_someip::server::{SubscribeError, Subscriber, SubscriptionHandle};
 use simple_someip::transport::{
     ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory, TransportSocket,
 };
+use simple_someip::{E2EStatus, NoE2E};
 use simple_someip::{Server, ServerDeps};
 
 #[path = "support/tag_e2e.rs"]
 mod tag_e2e;
-use tag_e2e::{TAG, TagE2E};
+use tag_e2e::{PASSED, TAG, TagE2E};
 
 // ── Mock transport ─────────────────────────────────────────────────────
 
@@ -371,7 +371,7 @@ async fn passive_server_constructible_without_server_tokio_feature() {
 // Drives datagrams through the server's `recv_loop` and checks the
 // observer contract: `NonSdRequestCallback` is
 // `fn(ctx: usize, source: SocketAddrV4, service_id: u16, method_id: u16,
-//     payload: &[u8], e2e_status: u8)` — a plain function pointer, so
+//     payload: &[u8], e2e_status: Option<E2EStatus>)` — a plain function pointer, so
 // it can't capture environment. `recv_loop` parses the SOME/IP header
 // and passes decoded fields; the consumer never sees raw datagram bytes.
 // Each test parks its observation in a dedicated `OnceLock`-backed
@@ -385,8 +385,9 @@ async fn passive_server_constructible_without_server_tokio_feature() {
 
 use std::sync::OnceLock;
 
-static OBSERVED_SOME: OnceLock<Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, u8)>>> =
-    OnceLock::new();
+static OBSERVED_SOME: OnceLock<
+    Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, Option<E2EStatus>)>>,
+> = OnceLock::new();
 
 fn record_some(
     ctx: usize,
@@ -394,7 +395,7 @@ fn record_some(
     service_id: u16,
     method_id: u16,
     payload: &[u8],
-    e2e_status: u8,
+    e2e_status: Option<E2EStatus>,
     _response_out: &mut [u8],
 ) -> i32 {
     let slot = OBSERVED_SOME.get_or_init(|| Mutex::new(None));
@@ -409,10 +410,12 @@ fn record_some(
     -1 // observer only — no response
 }
 
-static OBSERVED_SD_UNICAST: OnceLock<Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, u8)>>> =
-    OnceLock::new();
-static OBSERVED_MULTICAST: OnceLock<Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, u8)>>> =
-    OnceLock::new();
+static OBSERVED_SD_UNICAST: OnceLock<
+    Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, Option<E2EStatus>)>>,
+> = OnceLock::new();
+static OBSERVED_MULTICAST: OnceLock<
+    Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, Option<E2EStatus>)>>,
+> = OnceLock::new();
 
 fn record_sd_unicast(
     ctx: usize,
@@ -420,7 +423,7 @@ fn record_sd_unicast(
     service_id: u16,
     method_id: u16,
     payload: &[u8],
-    e2e_status: u8,
+    e2e_status: Option<E2EStatus>,
     _response_out: &mut [u8],
 ) -> i32 {
     let slot = OBSERVED_SD_UNICAST.get_or_init(|| Mutex::new(None));
@@ -441,7 +444,7 @@ fn record_multicast(
     service_id: u16,
     method_id: u16,
     payload: &[u8],
-    e2e_status: u8,
+    e2e_status: Option<E2EStatus>,
     _response_out: &mut [u8],
 ) -> i32 {
     let slot = OBSERVED_MULTICAST.get_or_init(|| Mutex::new(None));
@@ -589,7 +592,7 @@ async fn non_sd_observer_some_receives_unicast_method_request() {
         [0xDE, 0xAD, 0xBE, 0xEF],
         "payload must be the bytes after the 16-byte header"
     );
-    assert_eq!(got_e2e, 0, "server-side requests are not E2E-checked today");
+    assert_eq!(got_e2e, None, "NoE2E checks nothing");
 
     handle.abort();
     let _ = handle.await;
@@ -827,7 +830,7 @@ fn respond_with_body(
     _service_id: u16,
     _method_id: u16,
     _payload: &[u8],
-    _e2e_status: u8,
+    _e2e_status: Option<E2EStatus>,
     response_out: &mut [u8],
 ) -> i32 {
     let body = [0x11u8, 0x22, 0x33];
@@ -844,7 +847,7 @@ fn respond_oversized(
     _service_id: u16,
     _method_id: u16,
     _payload: &[u8],
-    _e2e_status: u8,
+    _e2e_status: Option<E2EStatus>,
     response_out: &mut [u8],
 ) -> i32 {
     (response_out.len() + 100) as i32
@@ -1101,7 +1104,7 @@ async fn co_offered_subscribe_with_wrong_major_version_is_rejected() {
     );
 }
 
-static OBSERVED_TAGGED: OnceLock<Mutex<Vec<(u16, Vec<u8>, u8)>>> = OnceLock::new();
+static OBSERVED_TAGGED: OnceLock<Mutex<Vec<(u16, Vec<u8>, Option<E2EStatus>)>>> = OnceLock::new();
 
 fn record_tagged(
     _ctx: usize,
@@ -1109,7 +1112,7 @@ fn record_tagged(
     _service_id: u16,
     method_id: u16,
     payload: &[u8],
-    e2e_status: u8,
+    e2e_status: Option<E2EStatus>,
     _response_out: &mut [u8],
 ) -> i32 {
     OBSERVED_TAGGED
@@ -1170,9 +1173,12 @@ async fn non_sd_observer_receives_the_hooks_status_and_stripped_payload() {
     })
     .await;
     let seen = OBSERVED_TAGGED.get().unwrap().lock().unwrap().clone();
-    assert!(seen.contains(&(0x0001, vec![0xAB], 1)), "tagged: {seen:?}");
     assert!(
-        seen.contains(&(0x0002, vec![0xCD], 0)),
+        seen.contains(&(0x0001, vec![0xAB], Some(E2EStatus::Passed(PASSED)))),
+        "tagged: {seen:?}"
+    );
+    assert!(
+        seen.contains(&(0x0002, vec![0xCD], None)),
         "untouched: {seen:?}"
     );
 
@@ -1180,7 +1186,7 @@ async fn non_sd_observer_receives_the_hooks_status_and_stripped_payload() {
     let _ = handle.await;
 }
 
-static OBSERVED_EVENTS: OnceLock<Mutex<Vec<(u16, Vec<u8>, u8)>>> = OnceLock::new();
+static OBSERVED_EVENTS: OnceLock<Mutex<Vec<(u16, Vec<u8>, Option<E2EStatus>)>>> = OnceLock::new();
 
 fn record_event(
     _ctx: usize,
@@ -1188,7 +1194,7 @@ fn record_event(
     _service_id: u16,
     method_id: u16,
     payload: &[u8],
-    e2e_status: u8,
+    e2e_status: Option<E2EStatus>,
     _response_out: &mut [u8],
 ) -> i32 {
     OBSERVED_EVENTS
@@ -1225,5 +1231,11 @@ async fn event_rx_dispatch_passes_the_hooks_status() {
     // The receive loop never returns; give it time to drain the two datagrams.
     let _ = tokio::time::timeout(Duration::from_millis(200), rx).await;
     let seen = OBSERVED_EVENTS.get().unwrap().lock().unwrap().clone();
-    assert_eq!(seen, [(0x8001, vec![0x11], 1), (0x8002, vec![0x22], 0)]);
+    assert_eq!(
+        seen,
+        [
+            (0x8001, vec![0x11], Some(E2EStatus::Passed(PASSED))),
+            (0x8002, vec![0x22], None)
+        ]
+    );
 }

@@ -337,7 +337,7 @@ fn dispatch(
     service: u16,
     method: u16,
     payload: &[u8],
-    _e2e_status: u8,
+    _e2e_status: Option<simple_someip::E2EStatus>,
     response_out: &mut [u8],
 ) -> i32 {
     let (observation, rc) = if response_out.is_empty() {

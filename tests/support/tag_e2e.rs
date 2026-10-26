@@ -7,7 +7,7 @@ use core::net::IpAddr;
 use core::num::NonZeroU8;
 
 use simple_someip::protocol::MessageId;
-use simple_someip::{E2EHandle, E2EProtectError};
+use simple_someip::{E2ECheck, E2EHandle, E2EProtectError};
 
 pub const TAG: u8 = 0xE2;
 pub const PASSED: NonZeroU8 = NonZeroU8::new(1).unwrap();
@@ -43,13 +43,18 @@ impl E2EHandle for TagE2E {
         message_id: MessageId,
         payload: &'a [u8],
         _upper_header: [u8; 8],
-    ) -> Option<(NonZeroU8, &'a [u8])> {
+    ) -> Option<E2ECheck<'a>> {
         if !self.applies_to(message_id) {
             return None;
         }
         Some(match payload.split_first() {
-            Some((&TAG, rest)) => (PASSED, rest),
-            _ => (TAG_MISSING, payload),
+            Some((&TAG, rest)) => E2ECheck::Passed {
+                status: PASSED,
+                payload: rest,
+            },
+            _ => E2ECheck::Failed {
+                status: TAG_MISSING,
+            },
         })
     }
 

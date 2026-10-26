@@ -288,10 +288,10 @@ pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, 
 #[cfg(feature = "bare_metal")]
 pub use transport::AtomicInterfaceHandle;
 pub use transport::{
-    ChannelFactory, E2EHandle, E2EProtectError, InterfaceHandle, IoErrorKind, LocalSpawner,
-    MpscRecv, MpscSend, NoE2E, OneshotCancelled, OneshotRecv, OneshotSend, ReceivedDatagram,
-    SocketOptions, Spawner, Timer, TransportError, TransportFactory, TransportSocket,
-    UnboundedRecv, UnboundedSend,
+    ChannelFactory, E2ECheck, E2EHandle, E2EProtectError, E2EStatus, InterfaceHandle, IoErrorKind,
+    LocalSpawner, MpscRecv, MpscSend, NoE2E, OneshotCancelled, OneshotRecv, OneshotSend,
+    ReceivedDatagram, SocketOptions, Spawner, Timer, TransportError, TransportFactory,
+    TransportSocket, UnboundedRecv, UnboundedSend,
 };
 
 /// Parse a decimal `usize` from a compile-time optional env var string.

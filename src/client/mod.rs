@@ -210,14 +210,15 @@ pub enum ClientUpdate<P: PayloadWireFormat> {
     /// Unicast message received. An error reply arrives as
     /// [`ClientUpdate::ErrorReply`] instead.
     ///
-    /// When the client's [`E2EHandle`] checks this
-    /// message, `e2e_status` carries the code it returned, and the payload
-    /// is the one the check produced. Otherwise `e2e_status` is `None`.
+    /// When the client's [`E2EHandle`] checks this message, `e2e_status`
+    /// says whether the check passed, with the hook's status code; the
+    /// payload is the one without its protection header on a pass, and the
+    /// one received on a failure. Otherwise `e2e_status` is `None`.
     Unicast {
         /// The received SOME/IP message.
         message: Message<P>,
-        /// The [`E2EHandle`]'s status code, if it checked this message.
-        e2e_status: Option<core::num::NonZeroU8>,
+        /// What the [`E2EHandle`]'s check found, if it checked this message.
+        e2e_status: Option<crate::E2EStatus>,
         /// The sender's source address. On a shared subnet this is the only
         /// way to attribute a unicast event to a specific device, since the
         /// SOME/IP header carries no instance id.
@@ -231,8 +232,8 @@ pub enum ClientUpdate<P: PayloadWireFormat> {
         header: protocol::Header,
         /// The reply's payload, or `None` if it does not decode as `P`.
         payload: Option<P>,
-        /// The [`E2EHandle`]'s status code, if it checked this message.
-        e2e_status: Option<core::num::NonZeroU8>,
+        /// What the [`E2EHandle`]'s check found, if it checked this message.
+        e2e_status: Option<crate::E2EStatus>,
         /// The sender's source address.
         source: SocketAddr,
     },

@@ -2795,7 +2795,7 @@ mod tests {
             _message_id: crate::protocol::MessageId,
             _payload: &'a [u8],
             _upper_header: [u8; 8],
-        ) -> Option<(core::num::NonZeroU8, &'a [u8])> {
+        ) -> Option<crate::E2ECheck<'a>> {
             None
         }
 

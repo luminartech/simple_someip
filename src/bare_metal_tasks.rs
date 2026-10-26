@@ -44,7 +44,7 @@ pub type RequestDispatchFn = fn(
     service_id: u16,
     method_id: u16,
     payload: &[u8],
-    e2e_status: u8,
+    e2e_status: Option<crate::E2EStatus>,
     response_out: &mut [u8],
 ) -> i32;
 
@@ -106,7 +106,7 @@ pub async fn subscribe_announce_future<'a, S, Tm>(
 /// Receive notifications on `rx_socket`, parse the SOME/IP header, run
 /// `e2e`'s check, and hand the parsed `(service_id, method_id, payload,
 /// e2e_status)` to `dispatch`. `e2e` decides per message ID whether a
-/// check applies; `e2e_status` is `0` when none does. `buf` is the receive
+/// check applies; `e2e_status` is `None` when none does. `buf` is the receive
 /// scratch (sized to the max inbound datagram).
 pub async fn event_rx_dispatch_future<'a, S, R>(
     rx_socket: &'a S,
@@ -136,7 +136,7 @@ pub async fn event_rx_dispatch_future<'a, S, R>(
             parsed.service_id,
             parsed.method_id,
             body,
-            status.map_or(0, core::num::NonZeroU8::get),
+            status,
             &mut [],
         );
     }
