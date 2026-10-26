@@ -4,7 +4,7 @@ use super::Error;
 use super::service_info::Subscriber;
 use super::subscription_manager::{SUBSCRIBERS_PER_GROUP, SubscriptionHandle};
 use crate::CapacityKind;
-use crate::protocol::{Header, Message};
+use crate::protocol::{Header, Message, MessageId};
 use crate::traits::PayloadWireFormat;
 use crate::transport::{E2EHandle, SharedHandle, TransportSocket};
 use automotive_wire_codec::Encode;
@@ -116,6 +116,17 @@ where
         }
     }
 
+    fn protect(&self, message_id: MessageId, buf: &mut [u8], len: usize) -> Result<usize, Error> {
+        crate::transport::protect_in_place(&self.e2e, buf, len).map_err(|e| {
+            crate::log::error!(
+                "Protecting {:?} failed: {:?}; dropping publish",
+                message_id,
+                e
+            );
+            Error::Capacity(CapacityKind::UdpBuffer)
+        })
+    }
+
     /// Publish an event to all subscribers of an event group using caller-provided scratch.
     ///
     /// `msg_buf` receives the serialized SOME/IP frame, which the
@@ -199,15 +210,7 @@ where
             .encode_to_slice(msg_buf)
             .map_err(crate::protocol::Error::from)?;
 
-        message_length = crate::transport::protect_in_place(&self.e2e, msg_buf, message_length)
-            .map_err(|e| {
-                crate::log::error!(
-                    "Protecting {:?} failed: {:?}; dropping publish",
-                    message.header().message_id(),
-                    e
-                );
-                Error::Capacity(CapacityKind::UdpBuffer)
-            })?;
+        message_length = self.protect(message.header().message_id(), msg_buf, message_length)?;
 
         let datagram = &msg_buf[..message_length];
 
@@ -401,15 +404,11 @@ where
             return Err(Error::Capacity(CapacityKind::UdpBuffer));
         }
         buf[header_len..total_len].copy_from_slice(payload);
-        let total_len =
-            crate::transport::protect_in_place(&self.e2e, buf, total_len).map_err(|e| {
-                crate::log::error!(
-                    "Protecting raw event {:#06x} failed: {:?}; dropping publish",
-                    event_id,
-                    e
-                );
-                Error::Capacity(CapacityKind::UdpBuffer)
-            })?;
+        let total_len = self.protect(
+            MessageId::new_from_service_and_method(service_id, event_id),
+            buf,
+            total_len,
+        )?;
         let datagram = &buf[..total_len];
 
         // Send to all snapshotted subscribers; surface total-failure
@@ -712,15 +711,11 @@ where
             return Err(Error::Capacity(CapacityKind::UdpBuffer));
         }
         buf[header_len..total_len].copy_from_slice(payload);
-        let total_len =
-            crate::transport::protect_in_place(&self.e2e, buf, total_len).map_err(|e| {
-                crate::log::error!(
-                    "Protecting raw event {:#06x} failed: {:?}; dropping publish",
-                    event_id,
-                    e
-                );
-                Error::Capacity(CapacityKind::UdpBuffer)
-            })?;
+        let total_len = self.protect(
+            MessageId::new_from_service_and_method(service_id, event_id),
+            buf,
+            total_len,
+        )?;
         let datagram = &buf[..total_len];
 
         match self.socket.get().send_to(datagram, target).await {
