@@ -91,6 +91,7 @@
 //!         match update {
 //!             ClientUpdate::DiscoveryUpdated(msg) => { /* SD message received */ }
 //!             ClientUpdate::Unicast { message, e2e_status, source } => { /* unicast reply */ }
+//!             ClientUpdate::ErrorReply { header, source, .. } => { /* unmatched error reply */ }
 //!             ClientUpdate::SenderRebooted(addr) => { /* remote reboot */ }
 //!             ClientUpdate::Error(err) => { /* error */ }
 //!         }

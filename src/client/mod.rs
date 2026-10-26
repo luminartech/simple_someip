@@ -206,7 +206,8 @@ pub enum ClientUpdate<P: PayloadWireFormat> {
     DiscoveryUpdated(DiscoveryMessage<P>),
     /// A remote sender has rebooted (detected via SD session tracking).
     SenderRebooted(SocketAddr),
-    /// Unicast message received.
+    /// Unicast message received. An error reply arrives as
+    /// [`ClientUpdate::ErrorReply`] instead.
     ///
     /// When E2E is configured for this message's key, `e2e_status` contains
     /// the check result and the payload has its E2E header stripped.
@@ -219,6 +220,19 @@ pub enum ClientUpdate<P: PayloadWireFormat> {
         /// The sender's source address. On a shared subnet this is the only
         /// way to attribute a unicast event to a specific device, since the
         /// SOME/IP header carries no instance id.
+        source: SocketAddr,
+    },
+    /// An ERROR, or a RESPONSE whose return code is not
+    /// [`ReturnCode::Ok`](crate::protocol::ReturnCode::Ok), that answers no
+    /// pending request.
+    ErrorReply {
+        /// The reply's header, which carries its message type and return code.
+        header: protocol::Header,
+        /// The reply's payload, or `None` if it does not decode as `P`.
+        payload: Option<P>,
+        /// E2E check status, if E2E was configured for this message.
+        e2e_status: Option<E2ECheckStatus>,
+        /// The sender's source address.
         source: SocketAddr,
     },
     /// The client encountered an error.
@@ -237,6 +251,18 @@ impl<P: PayloadWireFormat> core::fmt::Debug for ClientUpdate<P> {
             } => f
                 .debug_struct("Unicast")
                 .field("message", message)
+                .field("e2e_status", e2e_status)
+                .field("source", source)
+                .finish(),
+            Self::ErrorReply {
+                header,
+                payload,
+                e2e_status,
+                source,
+            } => f
+                .debug_struct("ErrorReply")
+                .field("header", header)
+                .field("payload", payload)
                 .field("e2e_status", e2e_status)
                 .field("source", source)
                 .finish(),
@@ -1164,8 +1190,8 @@ where
     /// `Err(Error::Capacity(CapacityKind::PendingResponses))`. Any reply that later
     /// arrives for that `request_id` is delivered as
     /// [`ClientUpdate::Unicast`] on the update stream instead of through the
-    /// `PendingResponse`, or as [`ClientUpdate::Error`] carrying
-    /// [`Error::ErrorReply`] for an error reply whose payload does not decode. Treat this error as "reply lost to saturation",
+    /// `PendingResponse`, or as [`ClientUpdate::ErrorReply`] if it is an
+    /// error reply. Treat this error as "reply lost to saturation",
     /// not "send failed". A `warn!`-level log accompanies the drop.
     ///
     /// # Errors
@@ -1673,6 +1699,99 @@ mod tests {
                 })
             ),
             "got {result:?}"
+        );
+        client.shut_down();
+    }
+
+    /// Answers the first request `peer` receives with one 16-byte header per
+    /// entry of `replies`, each echoing the request's request ID with the given
+    /// message type, return code and Length-field payload size. No payload
+    /// bytes are sent.
+    async fn reply_with_headers(
+        peer: tokio::net::UdpSocket,
+        replies: &'static [(
+            crate::protocol::MessageType,
+            crate::protocol::ReturnCode,
+            usize,
+        )],
+    ) {
+        let mut buf = [0u8; 1500];
+        let (_, from) = peer.recv_from(&mut buf).await.unwrap();
+        let (request, _) = crate::protocol::HeaderView::parse(&buf).unwrap();
+        for &(message_type, return_code, payload_len) in replies {
+            let reply = crate::protocol::Header::new(
+                crate::protocol::MessageId::new_from_service_and_method(0x005B, 0x0001),
+                request.request_id(),
+                1,
+                1,
+                crate::protocol::MessageTypeField::new(message_type, false),
+                return_code,
+                payload_len,
+            );
+            let mut bytes = [0u8; 16];
+            reply.encode_to_slice(&mut bytes).unwrap();
+            peer.send_to(&bytes, from).await.unwrap();
+        }
+    }
+
+    /// Sends one request from a fresh client to a peer that answers it with
+    /// `replies` (see [`reply_with_headers`]). Returns what the request
+    /// resolved to, the client, its update stream and the peer's address.
+    async fn request_answered_with_headers(
+        replies: &'static [(
+            crate::protocol::MessageType,
+            crate::protocol::ReturnCode,
+            usize,
+        )],
+    ) -> (
+        Result<TestPayload, Error>,
+        TestClient,
+        ClientUpdates<TestPayload, TokioChannels>,
+        SocketAddr,
+    ) {
+        let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let key = ServiceEndpointKey::udp(0x005B, peer_addr);
+        let peer_task = tokio::spawn(reply_with_headers(peer, replies));
+
+        let (client, updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+        let _run_handle = tokio::spawn(run_fut);
+        client.add_endpoint(key, 1, 0).await.unwrap();
+        let msg = crate::protocol::Message::new_sd(1, &empty_sd_header())
+            .expect("in-tree SdHeader sizing is infallible");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client.request(key, msg))
+                .await
+                .expect("the reply resolves the request");
+        peer_task.await.unwrap();
+        (result, client, updates, peer_addr)
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_error_reply_that_does_not_decode_arrives_as_error_reply() {
+        use crate::protocol::{MessageType, ReturnCode};
+        let (result, client, mut updates, peer_addr) = request_answered_with_headers(&[
+            (MessageType::Error, ReturnCode::NotOk, 0),
+            (MessageType::Error, ReturnCode::NotOk, 0),
+        ])
+        .await;
+        assert!(
+            matches!(result, Err(Error::ErrorReply { .. })),
+            "got {result:?}"
+        );
+        let update = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv())
+            .await
+            .expect("the second reply reaches the update stream")
+            .expect("the update stream is open");
+        assert!(
+            matches!(
+                &update,
+                ClientUpdate::ErrorReply { header, payload: None, source, .. }
+                    if header.return_code() == ReturnCode::NotOk && *source == peer_addr
+            ),
+            "got {update:?}"
         );
         client.shut_down();
     }

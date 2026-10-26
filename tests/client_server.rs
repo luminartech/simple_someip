@@ -1102,6 +1102,74 @@ async fn request_returns_the_return_code_of_a_response_that_is_not_ok() {
 }
 
 #[tokio::test]
+async fn an_unmatched_error_reply_that_decodes_arrives_as_error_reply_with_its_payload() {
+    let service_id = next_service_id();
+    let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let replier = tokio::spawn(reply_with(
+        peer,
+        &[
+            (MessageType::Response, ReturnCode::NotOk, &[0x09]),
+            (MessageType::Response, ReturnCode::NotOk, &[0x09]),
+        ],
+    ));
+
+    let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+    let run_handle = tokio::spawn(run_fut);
+    let key = ServiceEndpointKey::udp(service_id, peer_addr);
+    client.add_endpoint(key, 1, 0).await.unwrap();
+    let id = MessageId::new_from_service_and_method(service_id, 0x0001);
+    let request = Message::new(
+        Header::new(
+            id,
+            0,
+            1,
+            1,
+            MessageTypeField::new(MessageType::Request, false),
+            ReturnCode::Ok,
+            0,
+        ),
+        RawPayload::from_payload_bytes(id, &[]).unwrap(),
+    );
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.request(key, request),
+    )
+    .await
+    .expect("the first reply resolves the request");
+    assert!(
+        matches!(
+            outcome,
+            Err(simple_someip::client::Error::ErrorReply { .. })
+        ),
+        "got {outcome:?}"
+    );
+
+    let update = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv())
+        .await
+        .expect("the second reply reaches the update stream")
+        .expect("the update stream is open");
+    replier.await.unwrap();
+    match update {
+        ClientUpdate::ErrorReply {
+            header,
+            payload: Some(payload),
+            source,
+            ..
+        } => {
+            assert_eq!(header.return_code(), ReturnCode::NotOk);
+            assert_eq!(payload.raw_bytes().unwrap(), &[0x09]);
+            assert_eq!(source, peer_addr);
+        }
+        other => panic!("expected ClientUpdate::ErrorReply with a payload, got {other:?}"),
+    }
+    client.shut_down();
+    run_handle.abort();
+}
+
+#[tokio::test]
 async fn request_is_not_resolved_by_a_notification_with_its_request_id() {
     let payload = request_answered_with(&[
         (MessageType::Notification, ReturnCode::Ok, &[0x01]),

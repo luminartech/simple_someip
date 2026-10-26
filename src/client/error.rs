@@ -53,9 +53,9 @@ pub enum Error {
     Transport(#[from] crate::transport::TransportError),
     /// A reply that is an ERROR message, or a RESPONSE whose return code is
     /// not [`ReturnCode::Ok`](crate::protocol::ReturnCode::Ok). The request it
-    /// answers resolves to this error. An unmatched one whose payload does not
-    /// decode arrives as [`ClientUpdate::Error`](super::ClientUpdate::Error).
-    /// The reply's payload is not delivered.
+    /// answers resolves to this error, without the reply's payload. A reply
+    /// that answers no pending request arrives as
+    /// [`ClientUpdate::ErrorReply`](super::ClientUpdate::ErrorReply).
     #[error(
         "{message_type:?} reply with return code 0x{:02X} for request ID 0x{request_id:08X}",
         .return_code.as_u8()

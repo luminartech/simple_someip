@@ -531,8 +531,8 @@ where
     /// sees a clean error instead of a `RecvError` panic. Any reply
     /// that later arrives for a dropped `request_id` is surfaced on
     /// the update stream via `ClientUpdate::Unicast`, or
-    /// `ClientUpdate::Error` for an error reply whose payload does not
-    /// decode, instead of matching a pending entry.
+    /// `ClientUpdate::ErrorReply` for an error reply, instead of matching a
+    /// pending entry.
     fn track_or_reject_pending_response(
         &mut self,
         request_id: u32,
@@ -589,10 +589,16 @@ where
             *socket_manager = None;
             return Err(Error::SocketClosedUnexpectedly);
         };
-        let received = result?;
-        let someip_header = received.message.header().clone();
-        if let Some(sd_header) = received.message.sd_header() {
-            Ok((received.source, someip_header, Clone::clone(sd_header)))
+        let ReceivedMessage {
+            header,
+            payload,
+            source,
+            ..
+        } = result?;
+        let message = Message::new(header, payload?);
+        let someip_header = message.header().clone();
+        if let Some(sd_header) = message.sd_header() {
+            Ok((source, someip_header, Clone::clone(sd_header)))
         } else {
             Err(Error::UnexpectedDiscoveryMessage(someip_header))
         }
@@ -1305,31 +1311,33 @@ where
                  unicast = unicast_fut => {
                      trace!("Received unicast message: {:?}", unicast);
                      match unicast {
-                         Ok(received) => {
-                             let ReceivedMessage { message: received_message, e2e_status, source } = received;
-                             let header = received_message.header();
-                             let outcome = match Error::error_reply(header) {
-                                 Some(err) => Some(Err(err)),
-                                 None if header.message_type().message_type() == MessageType::Response => {
-                                     Some(Ok(received_message.payload().clone()))
-                                 }
-                                 None => None,
-                             };
-                             if let Some(outcome) = outcome
+                         Ok(ReceivedMessage { header, payload, source, e2e_status }) => {
+                             let error_reply = Error::error_reply(&header);
+                             // A RESPONSE whose payload does not decode leaves its request pending.
+                             let answers_request = error_reply.is_some()
+                                 || (header.message_type().message_type() == MessageType::Response
+                                     && payload.is_ok());
+                             if answers_request
                                  && let Some(sender) = pending_responses.remove(&header.request_id())
                              {
-                                 let _ = sender.send(outcome);
+                                 let _ = sender.send(error_reply.map_or(payload, Err));
                                  continue;
                              }
-                             // Not a response — forward as ClientUpdate::Unicast
-                             let _ = update_sender.send_now(ClientUpdate::Unicast { message: received_message, e2e_status, source });
-                         }
-                         Err(err @ Error::ErrorReply { request_id, .. }) => {
-                             if let Some(sender) = pending_responses.remove(&request_id) {
-                                 let _ = sender.send(Err(err));
-                             } else {
-                                 let _ = update_sender.send_now(ClientUpdate::Error(err));
-                             }
+                             let update = match (error_reply, payload) {
+                                 (Some(_), payload) => ClientUpdate::ErrorReply {
+                                     header,
+                                     payload: payload.ok(),
+                                     e2e_status,
+                                     source,
+                                 },
+                                 (None, Ok(payload)) => ClientUpdate::Unicast {
+                                     message: Message::new(header, payload),
+                                     e2e_status,
+                                     source,
+                                 },
+                                 (None, Err(err)) => ClientUpdate::Error(err),
+                             };
+                             let _ = update_sender.send_now(update);
                          }
                          Err(err) => {
                              let _ = update_sender.send_now(ClientUpdate::Error(err));

@@ -45,7 +45,7 @@ use crate::{
     UDP_BUFFER_SIZE,
     buffer_pool::BufferLease,
     e2e::{E2ECheckStatus, E2EKey},
-    protocol::{Message, MessageView, sd},
+    protocol::{Header, Message, MessageView, sd},
     traits::PayloadWireFormat,
     transport::{
         ChannelFactory, E2ERegistryHandle, LocalSpawner, MpscRecv, MpscSend, OneshotRecv,
@@ -66,18 +66,20 @@ use futures_util::{
     pin_mut, select_biased,
 };
 
-/// A received message together with the source address it came from.
+/// A received message's header, its decoded payload or the error decoding
+/// it returned, and the source address it came from.
 ///
 /// Tracked in #118: narrow `source` to `SocketAddrV4` to match the
 /// `TransportSocket` trait's IPv4-only contract — today the field is
 /// always a `SocketAddr::V4(_)` wrapping, and the V6 variant is
 /// unreachable. The rename ripples through `DiscoveryMessage` and
 /// `ClientUpdate::Unicast`.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ReceivedMessage<P> {
-    pub message: Message<P>,
-    pub source: SocketAddr,
-    pub e2e_status: Option<E2ECheckStatus>,
+    pub(crate) header: Header,
+    pub(crate) payload: Result<P, Error>,
+    pub(crate) source: SocketAddr,
+    pub(crate) e2e_status: Option<E2ECheckStatus>,
 }
 
 /// Structure representing a request to send a message
@@ -925,7 +927,7 @@ where
                     let source_address = SocketAddr::V4(source);
                     let parse_result = MessageView::parse(&buf[..bytes_received])
                         .map_err(Error::from)
-                        .and_then(|view| {
+                        .map(|view| {
                             let header = view.header().to_owned();
                             let upper_header = header.upper_header_bytes();
                             let key = E2EKey::from_message_id(header.message_id());
@@ -944,18 +946,16 @@ where
                                 None => (None, payload_bytes),
                             };
 
-                            match MessageDefinitions::from_payload_bytes(
+                            let payload = MessageDefinitions::from_payload_bytes(
                                 header.message_id(),
                                 effective_payload,
-                            ) {
-                                Ok(payload) => Ok(ReceivedMessage {
-                                    message: Message::new(header, payload),
-                                    source: source_address,
-                                    e2e_status,
-                                }),
-                                Err(e) => {
-                                    Err(Error::error_reply(&header).unwrap_or_else(|| e.into()))
-                                }
+                            )
+                            .map_err(Error::from);
+                            ReceivedMessage {
+                                header,
+                                payload,
+                                source: source_address,
+                                e2e_status,
                             }
                         });
                     // Hand off to a later iteration's select rather than
@@ -1250,11 +1250,8 @@ mod tests {
             .expect("Timed out waiting for message");
 
         let received = result.unwrap().unwrap();
-        assert_eq!(
-            received.message.header().message_id(),
-            msg.header().message_id()
-        );
-        assert!(received.message.is_sd());
+        assert_eq!(received.header.message_id(), msg.header().message_id());
+        assert!(received.header.is_sd());
     }
 
     #[tokio::test]
@@ -1281,7 +1278,7 @@ mod tests {
         .expect("Timed out waiting for poll_receive");
 
         let received = result.unwrap().unwrap();
-        assert!(received.message.is_sd());
+        assert!(received.header.is_sd());
     }
 
     #[tokio::test]
@@ -1314,7 +1311,8 @@ mod tests {
         let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header())
             .expect("in-tree SdHeader sizing is infallible");
         let received = ReceivedMessage {
-            message: msg,
+            header: msg.header().clone(),
+            payload: Ok(msg.payload().clone()),
             source: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 5000),
             e2e_status: None,
         };
@@ -1432,7 +1430,7 @@ mod tests {
                 .expect("socket loop closed")
                 .expect("inbound datagram parses");
             assert_eq!(
-                received.message.header().request_id() & 0xFFFF,
+                received.header.request_id() & 0xFFFF,
                 u32::from(session),
                 "inbound datagrams must be delivered in arrival order",
             );

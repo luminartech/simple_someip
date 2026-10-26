@@ -308,6 +308,13 @@ async fn report_updates(
                     );
                 }
             }
+            ClientUpdate::ErrorReply { header, source, .. } => {
+                eprintln!(
+                    "std runtime: error reply from {source} with return code {:?} \
+                     answers no request; not reported",
+                    header.return_code(),
+                );
+            }
             ClientUpdate::Error(e) => out.push(Observation::RuntimeError {
                 message: e.to_string(),
             }),
