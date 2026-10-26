@@ -66,6 +66,18 @@ pub enum Error {
         message_type: crate::protocol::MessageType,
         /// The return code the reply carried.
         return_code: crate::protocol::ReturnCode,
+        /// What the client's [`E2EHandle`](crate::E2EHandle) check found,
+        /// if it checked the reply. After a failed check the message type and
+        /// return code may themselves be corrupted.
+        e2e_status: Option<crate::E2EStatus>,
+    },
+    /// A reply failed the client's [`E2EHandle`](crate::E2EHandle) check.
+    /// The request it answers resolves to this error, without the reply's
+    /// payload.
+    #[error("reply failed its E2E check with status {status}")]
+    E2eCheckFailed {
+        /// The hook's status code.
+        status: core::num::NonZeroU8,
     },
     /// The client's internal run-loop future has exited — either because
     /// the caller dropped it before or during polling, the executor
@@ -80,8 +92,12 @@ pub enum Error {
 }
 
 impl Error {
-    /// The [`Error::ErrorReply`] a message with `header` is, if it is one.
-    pub(crate) fn error_reply(header: &crate::protocol::Header) -> Option<Self> {
+    /// The [`Error::ErrorReply`] a message with `header` is, if it is one,
+    /// with what the E2E check found for it.
+    pub(crate) fn error_reply(
+        header: &crate::protocol::Header,
+        e2e_status: Option<crate::E2EStatus>,
+    ) -> Option<Self> {
         use crate::protocol::{MessageType, ReturnCode};
         let message_type = header.message_type().message_type();
         let return_code = header.return_code();
@@ -91,6 +107,7 @@ impl Error {
             request_id: header.request_id(),
             message_type,
             return_code,
+            e2e_status,
         })
     }
 }

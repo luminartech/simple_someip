@@ -164,6 +164,8 @@ impl<P: Send + 'static, C: ChannelFactory> PendingResponse<P, C> {
     /// Returns [`Error::ErrorReply`] if the reply is an ERROR message or
     /// carries a return code other than
     /// [`ReturnCode::Ok`](crate::protocol::ReturnCode::Ok).
+    /// Returns [`Error::E2eCheckFailed`] if the reply is not an error reply
+    /// and failed the client's [`E2EHandle`] check.
     /// Returns [`Error::Capacity`] with tag `"pending_responses"`
     /// if the inner loop's response-tracking map was full when the request
     /// was sent — the UDP send still went out, but the reply (if any)
@@ -1235,6 +1237,8 @@ where
     /// Returns [`Error::ErrorReply`] if the reply is an ERROR message or
     /// carries a return code other than
     /// [`ReturnCode::Ok`](crate::protocol::ReturnCode::Ok).
+    /// Returns [`Error::E2eCheckFailed`] if the reply is not an error reply
+    /// and failed the client's [`E2EHandle`] check.
     /// Returns [`Error::UnsupportedEndpoint`] if the key's endpoint is
     /// not an IPv4/UDP socket.
     /// Returns [`Error::Capacity`] with tag `"pending_responses"` if the

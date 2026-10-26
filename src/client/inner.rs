@@ -1332,7 +1332,7 @@ where
                      trace!("Received unicast message: {:?}", unicast);
                      match unicast {
                          Ok(ReceivedMessage { header, payload, source, e2e_status }) => {
-                             let error_reply = Error::error_reply(&header);
+                             let error_reply = Error::error_reply(&header, e2e_status);
                              let answers_request = matches!(
                                  header.message_type().message_type(),
                                  MessageType::Response | MessageType::Error
@@ -1340,7 +1340,14 @@ where
                              if answers_request
                                  && let Some(sender) = pending_responses.remove(&header.request_id())
                              {
-                                 let _ = sender.send(error_reply.map_or(payload, Err));
+                                 let reply = match (error_reply, e2e_status) {
+                                     (Some(error_reply), _) => Err(error_reply),
+                                     (None, Some(crate::E2EStatus::Failed(status))) => {
+                                         Err(Error::E2eCheckFailed { status })
+                                     }
+                                     (None, _) => payload,
+                                 };
+                                 let _ = sender.send(reply);
                                  continue;
                              }
                              let update = match (error_reply, payload) {

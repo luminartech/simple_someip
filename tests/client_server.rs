@@ -933,6 +933,14 @@ async fn reply_with(
 async fn request_answered_with(
     replies: &'static [(MessageType, ReturnCode, &'static [u8])],
 ) -> Result<RawPayload, simple_someip::client::Error> {
+    request_answered_through(NoE2E, replies).await
+}
+
+/// [`request_answered_with`] from a client whose E2E hook is `hook`.
+async fn request_answered_through<H: E2EHandle + Clone>(
+    hook: H,
+    replies: &'static [(MessageType, ReturnCode, &'static [u8])],
+) -> Result<RawPayload, simple_someip::client::Error> {
     let service_id = next_service_id();
     let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -940,7 +948,9 @@ async fn request_answered_with(
     let peer_addr = peer.local_addr().unwrap();
     let replier = tokio::spawn(reply_with(peer, replies));
 
-    let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+    let deps = ClientDeps::tokio(Ipv4Addr::LOCALHOST).with_e2e(hook);
+    let (client, _updates, run_fut) =
+        Client::<RawPayload, _, TokioChannels>::new_with_deps(deps, false);
     let run_handle = tokio::spawn(run_fut);
     let key = ServiceEndpointKey::udp(service_id, peer_addr);
     client.add_endpoint(key, 1, 0).await.unwrap();
@@ -976,6 +986,58 @@ async fn request_returns_the_response_payload() {
         .await
         .expect("a RESPONSE with E_OK is a success");
     assert_eq!(payload.raw_bytes().unwrap(), &[0x07]);
+}
+
+#[tokio::test]
+async fn request_returns_the_checked_payload_of_a_reply_that_passes_the_hook() {
+    let payload = request_answered_through(
+        TagE2E::every_message(),
+        &[(MessageType::Response, ReturnCode::Ok, &[TAG, 0x07])],
+    )
+    .await
+    .expect("a reply that passes the check is a success");
+    assert_eq!(payload.raw_bytes().unwrap(), &[0x07]);
+}
+
+#[tokio::test]
+async fn request_returns_e2e_check_failed_for_a_reply_that_fails_the_hook() {
+    let outcome = request_answered_through(
+        TagE2E::every_message(),
+        &[(MessageType::Response, ReturnCode::Ok, &[0x07])],
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(simple_someip::client::Error::E2eCheckFailed {
+                status: TAG_MISSING
+            })
+        ),
+        "got {outcome:?}"
+    );
+}
+
+/// An ERROR reply returns its return code even when it fails the client's
+/// check, since peers commonly send ERROR replies unprotected; the error
+/// carries the failed check.
+#[tokio::test]
+async fn request_returns_the_return_code_of_an_error_reply_that_fails_the_hook() {
+    let outcome = request_answered_through(
+        TagE2E::every_message(),
+        &[(MessageType::Error, ReturnCode::UnknownMethod, &[])],
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(simple_someip::client::Error::ErrorReply {
+                return_code: ReturnCode::UnknownMethod,
+                e2e_status: Some(E2EStatus::Failed(TAG_MISSING)),
+                ..
+            })
+        ),
+        "got {outcome:?}"
+    );
 }
 
 #[tokio::test]
