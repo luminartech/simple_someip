@@ -81,8 +81,13 @@ const _SERVER_ACCEPTED_OFFERS_CAP: usize = crate::from_env_or(
     _DEFAULT_ACCEPTED_OFFERS,
 );
 const _SERVER_CONSUMED_EVENTGROUPS_CAP: usize = crate::from_env_or(
-    option_env!("SIMPLE_SOMEIP_MAX_SUBS"),
+    option_env!("SIMPLE_SOMEIP_MAX_CONSUMED_EVENTGROUPS"),
     _DEFAULT_CONSUMED_EVENTGROUPS,
+);
+const _: () = assert!(
+    crate::sd_codec::multi_subscribe_datagram_len(_SERVER_CONSUMED_EVENTGROUPS_CAP)
+        <= crate::UDP_BUFFER_SIZE,
+    "SIMPLE_SOMEIP_MAX_CONSUMED_EVENTGROUPS is too large: the Subscribes for that many eventgroups do not fit one UDP datagram"
 );
 
 /// Configuration for a SOME/IP service provider
@@ -171,7 +176,10 @@ impl ServerConfig {
     pub const ACCEPTED_OFFERS_CAP: usize = _SERVER_ACCEPTED_OFFERS_CAP;
 
     /// Maximum number of entries in [`Self::consumed_eventgroups`], set by
-    /// `SIMPLE_SOMEIP_MAX_SUBS`.
+    /// `SIMPLE_SOMEIP_MAX_CONSUMED_EVENTGROUPS` (defaults to 1 with the
+    /// `bare_metal` feature, 16 otherwise). The build fails if the Subscribes for that many
+    /// eventgroups do not fit one [`UDP_BUFFER_SIZE`](crate::UDP_BUFFER_SIZE)
+    /// datagram.
     pub const CONSUMED_EVENTGROUPS_CAP: usize = _SERVER_CONSUMED_EVENTGROUPS_CAP;
 
     /// Maximum number of subscribers tracked per event group. Matches
@@ -1482,6 +1490,12 @@ where
     /// these in `static` storage; on std (or any alloc-using
     /// target), `Self::run` is the convenience shim that
     /// heap-allocates 64 KiB buffers and delegates here.
+    /// `recv_send_buf` is the scratch the receive loop encodes its SD answers
+    /// into: `SubscribeAck`, `SubscribeNack`, and the Subscribes that answer
+    /// Offers of [`ServerConfig::consumed_eventgroups`]. It must hold
+    /// [`UDP_BUFFER_SIZE`](crate::UDP_BUFFER_SIZE) bytes; an answer that does
+    /// not fit is not sent and a warning is logged.
+    ///
     ///
     /// The returned future is independent of `&self` — the cheap
     /// shared-handle clones it captures own everything it needs to

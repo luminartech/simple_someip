@@ -165,6 +165,17 @@ pub fn build_subscribe_eventgroup_datagram(
     )
 }
 
+/// Length of the SD datagram [`build_multi_subscribe_eventgroup_datagram`]
+/// encodes for `requests` Subscribe entries.
+#[cfg(feature = "server")]
+pub(crate) const fn multi_subscribe_datagram_len(requests: usize) -> usize {
+    // SD header: flags and reserved bytes, entries length, options length.
+    const SD_HEADER_LEN: usize = 12;
+    SOMEIP_HEADER_LEN
+        + SD_HEADER_LEN
+        + requests * (crate::protocol::sd::ENTRY_SIZE + crate::protocol::sd::IPV4_OPTION_WIRE_SIZE)
+}
+
 /// Encode a single SD datagram carrying one `SubscribeEventgroup` entry per
 /// element of `requests`, each referencing its own IPv4 endpoint option.
 /// `reboot` sets the SD reboot flag, as in
@@ -812,6 +823,32 @@ mod tests {
             .map(|r| (r.event_group_id, r.local_rx_port))
             .collect();
         assert_eq!(endpoints, expected);
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn multi_subscribe_datagram_len_is_the_encoded_length() {
+        let request = SubscribeEventgroupRequest {
+            service_id: 0x0042,
+            instance_id: 1,
+            major_version: 1,
+            event_group_id: 1,
+            ttl: 5,
+            local_ip: Ipv4Addr::new(192, 0, 2, 2),
+            local_rx_port: 30600,
+        };
+        let mut buf = [0u8; 256];
+        for n in 1..=3 {
+            let requests = [request; 3];
+            let len = build_multi_subscribe_eventgroup_datagram::<3>(
+                &mut buf,
+                &requests[..n],
+                3,
+                RebootFlag::Continuous,
+            )
+            .unwrap();
+            assert_eq!(multi_subscribe_datagram_len(n), len, "{n} requests");
+        }
     }
 
     #[test]

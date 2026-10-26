@@ -18,6 +18,8 @@ pub const MESSAGE_ID_VALUE: u32 = 0xffff_8100;
 
 // Export all definitions from the service discovery mod
 
+#[cfg(feature = "server")]
+pub(crate) use entry::ENTRY_SIZE;
 #[cfg(all(test, feature = "server-tokio"))]
 pub(crate) use entry::OptionRuns;
 pub use entry::{
@@ -27,6 +29,8 @@ pub use entry::{
 pub use error::Error;
 pub use flags::{Flags, RebootFlag};
 pub use header::{Header, SdBody, SdHeaderView};
+#[cfg(feature = "server")]
+pub(crate) use options::IPV4_OPTION_WIRE_SIZE;
 pub use options::{
     MAX_CONFIGURATION_STRING_LENGTH, OptionIter, OptionType, OptionView, Options, TransportProtocol,
 };
