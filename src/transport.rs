@@ -796,6 +796,10 @@ pub trait E2EHandle: Send + Sync + 'static {
     /// the part of `buf` that holds the protected payload.
     /// `upper_header` is the SOME/IP header's bytes 8..16.
     ///
+    /// It is called once for each datagram sent, including each per-target
+    /// publish and each response, so a counter kept per message ID counts
+    /// datagrams, and a receiver that gets only some of them sees gaps.
+    ///
     /// # Errors
     ///
     /// Returns [`E2EProtectError::BufferTooSmall`] when `buf` cannot hold the
@@ -949,6 +953,18 @@ impl E2EHandle for NoE2E {
     fn reset_source(&self, _source: IpAddr) {}
 }
 
+/// Why [`protect_in_place`] could not protect a message.
+#[cfg(any(feature = "client", feature = "server"))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProtectInPlaceError {
+    /// `len` is shorter than a SOME/IP header or longer than `datagram`.
+    NotAMessage,
+    /// The hook could not protect the payload.
+    Hook(E2EProtectError),
+    /// The hook returned bytes outside the buffer it was given.
+    OutsideBuffer,
+}
+
 /// Protects the payload of the SOME/IP message in `datagram[..len]` in
 /// place and rewrites its length field. Returns the message's new length;
 /// an SD message, or one `e2e` does not protect, keeps `len`.
@@ -957,7 +973,10 @@ pub(crate) fn protect_in_place<R: E2EHandle + ?Sized>(
     e2e: &R,
     datagram: &mut [u8],
     len: usize,
-) -> Result<usize, E2EProtectError> {
+) -> Result<usize, ProtectInPlaceError> {
+    if len < 16 || len > datagram.len() {
+        return Err(ProtectInPlaceError::NotAMessage);
+    }
     let message_id = MessageId::from(u32::from_be_bytes(
         datagram[..4].try_into().expect("message ID bytes"),
     ));
@@ -966,14 +985,27 @@ pub(crate) fn protect_in_place<R: E2EHandle + ?Sized>(
     }
     let upper_header: [u8; 8] = datagram[8..16].try_into().expect("upper header bytes");
     let payload_start = datagram[16..].as_ptr().addr();
+    let payload_room = datagram.len() - 16;
     let (offset, protected_len) =
         match e2e.protect(message_id, &mut datagram[16..], len - 16, upper_header) {
             None => return Ok(len),
             Some(result) => {
-                let protected = result?;
-                (protected.as_ptr().addr() - payload_start, protected.len())
+                let protected = result.map_err(ProtectInPlaceError::Hook)?;
+                let offset = if protected.is_empty() {
+                    Some(0)
+                } else {
+                    protected.as_ptr().addr().checked_sub(payload_start)
+                };
+                (offset, protected.len())
             }
         };
+    let Some(offset) = offset.filter(|offset| {
+        offset
+            .checked_add(protected_len)
+            .is_some_and(|end| end <= payload_room)
+    }) else {
+        return Err(ProtectInPlaceError::OutsideBuffer);
+    };
     datagram.copy_within(16 + offset..16 + offset + protected_len, 16);
     let length_field = u32::try_from(8 + protected_len).expect("protected length fits u32");
     datagram[4..8].copy_from_slice(&length_field.to_be_bytes());
@@ -1615,6 +1647,33 @@ mod tests {
             fn reset_source(&self, _source: IpAddr) {}
         }
 
+        /// Returns protected bytes that are not in `buf`.
+        #[cfg(any(feature = "client", feature = "server"))]
+        struct Elsewhere;
+        #[cfg(any(feature = "client", feature = "server"))]
+        impl E2EHandle for Elsewhere {
+            fn check<'a>(
+                &self,
+                _source: IpAddr,
+                _message_id: MessageId,
+                _payload: &'a [u8],
+                _upper_header: [u8; 8],
+            ) -> Option<E2ECheck<'a>> {
+                None
+            }
+            fn protect<'b>(
+                &self,
+                _message_id: MessageId,
+                _buf: &'b mut [u8],
+                _payload_len: usize,
+                _upper_header: [u8; 8],
+            ) -> Option<Result<&'b [u8], E2EProtectError>> {
+                static ELSEWHERE: [u8; 4] = [0xAA; 4];
+                Some(Ok(&ELSEWHERE))
+            }
+            fn reset_source(&self, _source: IpAddr) {}
+        }
+
         /// Leaves the payload unchanged but moves it two bytes into `buf`.
         #[cfg(any(feature = "client", feature = "server"))]
         struct ShiftRight2;
@@ -1675,6 +1734,67 @@ mod tests {
 
         #[test]
         #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_rejects_bytes_the_hook_returns_from_outside_the_payload() {
+            let (mut buf, len) = datagram(ID);
+            let before = buf;
+            assert_eq!(
+                super::super::protect_in_place(&Elsewhere, &mut buf, len),
+                Err(super::super::ProtectInPlaceError::OutsideBuffer)
+            );
+            assert_eq!(&buf[..16], &before[..16], "header untouched");
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_accepts_an_empty_protected_payload_from_anywhere() {
+            /// Protects every payload into nothing, returning an unrelated
+            /// empty slice.
+            struct Empty;
+            impl E2EHandle for Empty {
+                fn check<'a>(
+                    &self,
+                    _source: IpAddr,
+                    _message_id: MessageId,
+                    _payload: &'a [u8],
+                    _upper_header: [u8; 8],
+                ) -> Option<E2ECheck<'a>> {
+                    None
+                }
+                fn protect<'b>(
+                    &self,
+                    _message_id: MessageId,
+                    _buf: &'b mut [u8],
+                    _payload_len: usize,
+                    _upper_header: [u8; 8],
+                ) -> Option<Result<&'b [u8], E2EProtectError>> {
+                    Some(Ok(&[]))
+                }
+                fn reset_source(&self, _source: IpAddr) {}
+            }
+            let (mut buf, len) = datagram(ID);
+            assert_eq!(
+                super::super::protect_in_place(&Empty, &mut buf, len),
+                Ok(16)
+            );
+            assert_eq!(&buf[4..8], &8u32.to_be_bytes());
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_rejects_a_datagram_shorter_than_a_header() {
+            let (mut buf, _) = datagram(ID);
+            assert_eq!(
+                super::super::protect_in_place(&Prefix, &mut buf, 15),
+                Err(super::super::ProtectInPlaceError::NotAMessage)
+            );
+            assert_eq!(
+                super::super::protect_in_place(&Prefix, &mut buf[..17], 18),
+                Err(super::super::ProtectInPlaceError::NotAMessage)
+            );
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
         fn protect_in_place_leaves_sd_and_unprotected_messages_alone() {
             let (mut buf, len) = datagram(MessageId::SD);
             let before = buf;
@@ -1696,10 +1816,12 @@ mod tests {
             let (mut buf, len) = datagram(ID);
             assert_eq!(
                 super::super::protect_in_place(&Prefix, &mut buf[..18], len),
-                Err(E2EProtectError::BufferTooSmall {
-                    needed: 3,
-                    available: 2
-                })
+                Err(super::super::ProtectInPlaceError::Hook(
+                    E2EProtectError::BufferTooSmall {
+                        needed: 3,
+                        available: 2
+                    }
+                ))
             );
         }
 
