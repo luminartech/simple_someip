@@ -35,8 +35,6 @@ pub const RX_SLOTS: usize = crate::from_env_or(option_env!("SIMPLE_SOMEIP_RX_SLO
 /// single datagrams stay under this (TP segmentation not used here).
 pub const RX_CAP: usize = 1500;
 const MAX_OFFERS: usize = crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_OFFERS"), 4);
-/// The catalog holds at most one subscription; `init` rejects more.
-const MAX_SUBS: usize = 1;
 const SD_SCRATCH_CAP: usize = 512;
 /// Capacity of the API-only send scratch (`RuntimeBuffers::publish_scratch`),
 /// shared by `publish` and `deinit`. Sized for modest events rather than a
@@ -183,9 +181,9 @@ pub struct RuntimeConfig {
     pub bind: BindFn,
     /// Generated catalog (borrowed for the duration of `init`).
     pub offers: &'static [OfferEntry],
-    /// The eventgroup this node subscribes to, if any: at most one entry,
-    /// naming a concrete service ID, instance ID and major version.
-    pub subscriptions: &'static [SubEntry],
+    /// The eventgroup this node subscribes to, if any, naming a concrete
+    /// service ID, instance ID and major version.
+    pub subscription: Option<SubEntry>,
     /// RX mailbox the platform's receive path pushes into.
     pub mailbox: &'static Mailbox,
     /// Runtime buffer memory (platform-owned, placement-controlled).
@@ -221,7 +219,7 @@ static STOP_SESSION: AtomicU16 = AtomicU16::new(1);
 static PUBLISH_SESSION: AtomicU16 = AtomicU16::new(1);
 
 static OFFERS_LEN: AtomicUsize = AtomicUsize::new(0);
-static SUBS_LEN: AtomicUsize = AtomicUsize::new(0);
+static SUBSCRIBED: AtomicBool = AtomicBool::new(false);
 static mut OFFERS: [OfferEntry; MAX_OFFERS] = [OfferEntry {
     service_id: 0,
     instance_id: 0,
@@ -230,14 +228,14 @@ static mut OFFERS: [OfferEntry; MAX_OFFERS] = [OfferEntry {
     major_version: 0,
     ttl_seconds: 0,
 }; MAX_OFFERS];
-static mut SUBS: [SubEntry; MAX_SUBS] = [SubEntry {
+static mut SUBSCRIPTION: SubEntry = SubEntry {
     service_id: 0,
     instance_id: 0,
     event_group_id: 0,
     method_id: 0,
     local_rx_port: 0,
     major_version: 0,
-}; MAX_SUBS];
+};
 
 static mut UNICAST_SOCK: MaybeUninit<Sock> = MaybeUninit::uninit();
 static mut SD_SOCK: MaybeUninit<Sock> = MaybeUninit::uninit();
@@ -271,9 +269,11 @@ fn offers() -> &'static [OfferEntry] {
     unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(OFFERS).cast::<OfferEntry>(), len) }
 }
 
-fn subs() -> &'static [SubEntry] {
-    let len = SUBS_LEN.load(Ordering::Acquire).min(MAX_SUBS);
-    unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(SUBS).cast::<SubEntry>(), len) }
+fn subscription() -> Option<SubEntry> {
+    // SAFETY: single writer (init) released SUBSCRIBED before readers run.
+    SUBSCRIBED
+        .load(Ordering::Acquire)
+        .then(|| unsafe { *core::ptr::addr_of!(SUBSCRIPTION) })
 }
 
 fn find_offer(
@@ -459,7 +459,7 @@ fn build_server() -> bool {
 
 /// The Subscribe the server sends for the catalog's subscription.
 fn subscribe_request() -> Option<SubscribeEventgroupRequest> {
-    subs().first().map(|s| SubscribeEventgroupRequest {
+    subscription().map(|s| SubscribeEventgroupRequest {
         service_id: s.service_id,
         instance_id: s.instance_id,
         major_version: s.major_version,
@@ -512,7 +512,7 @@ async fn someip_task() {
 
     // Client RX socket marker (its PCB is pre-bound by the platform).
     let factory = Factory::new(plat);
-    let rx_socket = subs().first().map(|s| factory.socket(s.local_rx_port));
+    let rx_socket = subscription().map(|s| factory.socket(s.local_rx_port));
     let period = Duration::from_secs(node_sd_ttl_secs());
 
     run_someip(
@@ -544,8 +544,8 @@ async fn someip_task() {
 /// Returns `0` on success, or a negative error code: `-1` server build
 /// failed, `-2` task spawn failed, `-4` the runtime is already initialized
 /// (a repeat or re-entrant `init` — the passed `config` and its buffers are
-/// NOT adopted), `-5` `config.subscriptions` holds more than one entry or
-/// names a wildcard service ID, instance ID or major version. The
+/// NOT adopted), `-5` `config.subscription` names a wildcard service ID,
+/// instance ID or major version. The
 /// `-1`/`-2`/`-5` paths release the init claim so a corrected retry can
 /// proceed; `-4` does not (a runtime is already live).
 #[allow(clippy::missing_panics_doc)]
@@ -565,11 +565,9 @@ pub fn init(config: RuntimeConfig) -> i32 {
     {
         return -4;
     }
-    if config.subscriptions.len() > MAX_SUBS
-        || config.subscriptions.iter().any(|s| {
-            crate::sd_codec::names_a_wildcard(s.service_id, s.instance_id, s.major_version)
-        })
-    {
+    if config.subscription.is_some_and(|s| {
+        crate::sd_codec::names_a_wildcard(s.service_id, s.instance_id, s.major_version)
+    }) {
         INIT_CLAIMED.store(false, Ordering::Release);
         return -5;
     }
@@ -606,11 +604,10 @@ pub fn init(config: RuntimeConfig) -> i32 {
         unsafe { (*core::ptr::addr_of_mut!(OFFERS))[i] = *e };
     }
     OFFERS_LEN.store(n_offers, Ordering::Release);
-    let n_subs = config.subscriptions.len();
-    for (i, e) in config.subscriptions.iter().take(n_subs).enumerate() {
-        unsafe { (*core::ptr::addr_of_mut!(SUBS))[i] = *e };
+    if let Some(e) = config.subscription {
+        unsafe { *core::ptr::addr_of_mut!(SUBSCRIPTION) = e };
     }
-    SUBS_LEN.store(n_subs, Ordering::Release);
+    SUBSCRIBED.store(config.subscription.is_some(), Ordering::Release);
 
     // Bind PCBs via the platform (registers the RX path → `on_rx`): the SD
     // port, each unique offered unicast port, and each subscription RX port.
@@ -620,7 +617,7 @@ pub fn init(config: RuntimeConfig) -> i32 {
         true,
         SD_MCAST.load(Ordering::Acquire),
     );
-    let mut bound: [u16; MAX_OFFERS + MAX_SUBS] = [0; MAX_OFFERS + MAX_SUBS];
+    let mut bound: [u16; MAX_OFFERS + 1] = [0; MAX_OFFERS + 1];
     let mut nb = 0usize;
     let mut bind_once = |port: u16| {
         if port != 0 && !bound[..nb].contains(&port) {
@@ -632,7 +629,7 @@ pub fn init(config: RuntimeConfig) -> i32 {
     for o in offers() {
         bind_once(o.unicast_port);
     }
-    for s in subs() {
+    if let Some(s) = subscription() {
         bind_once(s.local_rx_port);
     }
 

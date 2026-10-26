@@ -85,12 +85,10 @@ impl SomeipUnderTest for BareMetalRt {
             major_version: MAJOR,
             ttl_seconds: offer.ttl_s,
         }];
-        let subscriptions: Vec<_> = setup
+        let subscription = setup
             .consume
             .filter(|c| c.subscribe)
-            .map(|_| subscription())
-            .into_iter()
-            .collect();
+            .map(|_| subscription());
 
         assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
         let (tx, obs) = mpsc::channel();
@@ -106,7 +104,7 @@ impl SomeipUnderTest for BareMetalRt {
             dispatch_ctx: 0,
             bind,
             offers: offers.leak(),
-            subscriptions: subscriptions.leak(),
+            subscription,
             mailbox: &MAILBOX,
             // SAFETY: `STARTED` was claimed above and is released only when
             // `init` fails before spawning the task that borrows these

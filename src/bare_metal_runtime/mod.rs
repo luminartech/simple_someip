@@ -2,7 +2,7 @@
 //!
 //! A platform (e.g. an AURIX/lwIP firmware) drives the full SOME/IP
 //! integration by supplying only:
-//! - its **generated catalog** (offered services + subscriptions),
+//! - its **generated catalog** (offered services and an optional subscription),
 //! - **platform callbacks**: send a UDP datagram, read a ms clock, and a
 //!   dispatch sink for inbound messages,
 //! - **RX delivery**: the platform's receive path pushes datagrams into an
