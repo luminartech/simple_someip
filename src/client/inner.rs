@@ -712,7 +712,7 @@ where
                     minor_version: instance.minor_version,
                     offered_by: Some(source.ip()),
                 };
-                if service_registry.insert(key, info).is_ok() {
+                if service_registry.record_offer(key, info).is_ok() {
                     trace!(
                         "Registry: added 0x{:04X} -> {:?} (instance 0x{:04X})",
                         instance.service_id, endpoint, instance.instance_id,
