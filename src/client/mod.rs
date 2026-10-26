@@ -1140,6 +1140,10 @@ where
     /// port, you must call `add_endpoint` explicitly — even if SD has already
     /// registered the service — so that the correct `local_port` is stored.
     ///
+    /// A stop offer removes the endpoints its sender offered for that service
+    /// instance and major version. An endpoint no Offer registered stays until
+    /// [`remove_endpoint`](Self::remove_endpoint).
+    ///
     /// # Errors
     ///
     /// Returns an error if registering the endpoint fails.

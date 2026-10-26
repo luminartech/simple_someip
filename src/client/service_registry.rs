@@ -60,10 +60,12 @@ pub struct ServiceEndpointInfo {
     /// carry it on the wire, so it is stored as data.
     pub instance_id: u16,
     pub local_port: u16,
-    #[allow(dead_code)]
     pub major_version: u8,
     #[allow(dead_code)]
     pub minor_version: u32,
+    /// The address of the SD sender whose Offer registered this entry, or
+    /// `None` for an entry only `Client::add_endpoint` registered.
+    pub offered_by: Option<IpAddr>,
 }
 
 #[derive(Debug, Default)]
@@ -91,18 +93,45 @@ impl ServiceRegistry {
             .map_err(|_| ServiceRegistryFull)
     }
 
+    /// Registers `key` for `Client::add_endpoint`. An entry an Offer already
+    /// registered at `key` keeps that Offer's sender and versions, so that its
+    /// stop offer still removes it.
+    pub fn add_endpoint(
+        &mut self,
+        key: ServiceEndpointKey,
+        instance_id: u16,
+        local_port: u16,
+    ) -> Result<(), ServiceRegistryFull> {
+        let offered = self.endpoints.get(&key);
+        let info = ServiceEndpointInfo {
+            instance_id,
+            local_port,
+            major_version: offered.map_or(0xFF, |offered| offered.major_version),
+            minor_version: offered.map_or(0xFFFF_FFFF, |offered| offered.minor_version),
+            offered_by: offered.and_then(|offered| offered.offered_by),
+        };
+        self.insert(key, info)
+    }
+
     pub fn remove(&mut self, key: ServiceEndpointKey) -> Option<ServiceEndpointInfo> {
         self.endpoints.swap_remove(&key)
     }
 
-    /// Removes every entry of `service_id` instance `instance_id` whose
-    /// endpoint is at `ip`, returning how many were removed.
-    pub fn remove_instance_at(&mut self, service_id: u16, instance_id: u16, ip: IpAddr) -> usize {
+    /// Removes every entry of `service_id` instance `instance_id` at
+    /// `major_version` that `sender` offered, returning how many were removed.
+    pub fn remove_offered_instance(
+        &mut self,
+        service_id: u16,
+        instance_id: u16,
+        major_version: u8,
+        sender: IpAddr,
+    ) -> usize {
         let before = self.endpoints.len();
         self.endpoints.retain(|key, info| {
             !(key.service_id == service_id
                 && info.instance_id == instance_id
-                && key.endpoint.addr.ip() == ip)
+                && info.major_version == major_version
+                && info.offered_by == Some(sender))
         });
         before - self.endpoints.len()
     }
@@ -126,6 +155,7 @@ mod tests {
             local_port: 0,
             major_version: 1,
             minor_version: 0,
+            offered_by: None,
         }
     }
     const A: Ipv4Addr = Ipv4Addr::LOCALHOST;
@@ -208,15 +238,39 @@ mod tests {
     }
 
     #[test]
-    fn remove_instance_at_removes_only_that_instance_from_that_ip() {
+    fn add_endpoint_keeps_the_offer_that_registered_the_endpoint() {
         let mut reg = ServiceRegistry::default();
-        reg.insert(key(0x47, A, 30001), info(54)).unwrap();
-        reg.insert(key(0x47, A, 30002), info(55)).unwrap();
-        reg.insert(key(0x47, B, 30001), info(54)).unwrap();
-        assert_eq!(reg.remove_instance_at(0x47, 54, A.into()), 1);
+        let offered = ServiceEndpointInfo {
+            offered_by: Some(A.into()),
+            ..info(54)
+        };
+        reg.insert(key(0x47, A, 30001), offered).unwrap();
+        reg.add_endpoint(key(0x47, A, 30001), 54, 40001).unwrap();
+        reg.add_endpoint(key(0x47, A, 30002), 54, 40002).unwrap();
+        assert_eq!(reg.get(key(0x47, A, 30001)).unwrap().local_port, 40001);
+        assert_eq!(reg.remove_offered_instance(0x47, 54, 1, A.into()), 1);
         assert!(reg.get(key(0x47, A, 30001)).is_none());
         assert!(reg.get(key(0x47, A, 30002)).is_some());
-        assert!(reg.get(key(0x47, B, 30001)).is_some());
+    }
+
+    #[test]
+    fn remove_offered_instance_removes_only_what_that_sender_offered() {
+        let offered = |instance, major_version, sender: Ipv4Addr| ServiceEndpointInfo {
+            major_version,
+            offered_by: Some(sender.into()),
+            ..info(instance)
+        };
+        let mut reg = ServiceRegistry::default();
+        reg.insert(key(0x47, B, 30001), offered(54, 1, A)).unwrap();
+        reg.insert(key(0x47, B, 30002), offered(55, 1, A)).unwrap();
+        reg.insert(key(0x47, B, 30003), offered(54, 2, A)).unwrap();
+        reg.insert(key(0x47, B, 30004), offered(54, 1, B)).unwrap();
+        reg.insert(key(0x47, B, 30005), info(54)).unwrap();
+        assert_eq!(reg.remove_offered_instance(0x47, 54, 1, A.into()), 1);
+        assert!(reg.get(key(0x47, B, 30001)).is_none());
+        for port in 30002..=30005 {
+            assert!(reg.get(key(0x47, B, port)).is_some(), "port {port}");
+        }
     }
 
     #[test]
