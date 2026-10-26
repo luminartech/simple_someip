@@ -188,7 +188,7 @@ where
     #[cfg(all(test, feature = "client-tokio"))]
     pub async fn bind_discovery_seeded<R: E2EHandle + Clone>(
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
@@ -202,7 +202,7 @@ where
             &TokioTransport,
             &TokioSpawner,
             interface,
-            e2e_registry,
+            e2e,
             session_id,
             session_has_wrapped,
             multicast_loopback,
@@ -249,7 +249,7 @@ where
         factory: &F,
         spawner: &S,
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
@@ -287,7 +287,7 @@ where
         let socket = factory.bind(bind_addr, &options).await?;
         socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
 
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e, buf);
         spawner.spawn(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -307,7 +307,7 @@ where
         factory: &F,
         spawner: &S,
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
@@ -332,7 +332,7 @@ where
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, sd::MULTICAST_PORT);
         let socket = factory.bind(bind_addr, &options).await?;
         socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e, buf);
         spawner.spawn_local(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -362,7 +362,7 @@ where
         factory: &F,
         spawner: &S,
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
         buf: BufferLease,
     ) -> Result<Self, Error>
     where
@@ -387,7 +387,7 @@ where
         // makes the kernel divert unicast SD here.
         let bind_addr = SocketAddrV4::new(interface, sd::MULTICAST_PORT);
         let socket = factory.bind(bind_addr, &options).await?;
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e, buf);
         spawner.spawn(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -404,7 +404,7 @@ where
         factory: &F,
         spawner: &S,
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
         buf: BufferLease,
     ) -> Result<Self, Error>
     where
@@ -423,7 +423,7 @@ where
         };
         let bind_addr = SocketAddrV4::new(interface, sd::MULTICAST_PORT);
         let socket = factory.bind(bind_addr, &options).await?;
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e, buf);
         spawner.spawn_local(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -447,13 +447,13 @@ where
     /// `client-tokio` feature because the convenience defaults live
     /// behind it.
     #[cfg(all(test, feature = "client-tokio"))]
-    pub async fn bind<R: E2EHandle + Clone>(port: u16, e2e_registry: R) -> Result<Self, Error> {
+    pub async fn bind<R: E2EHandle + Clone>(port: u16, e2e: R) -> Result<Self, Error> {
         use crate::tokio_transport::{TokioBufferProvider, TokioSpawner, TokioTransport};
         use crate::transport::BufferProvider;
         let buf = TokioBufferProvider::new()
             .claim()
             .ok_or(Error::Capacity(CapacityKind::UdpBuffer))?;
-        Self::bind_with_transport(&TokioTransport, &TokioSpawner, port, e2e_registry, buf).await
+        Self::bind_with_transport(&TokioTransport, &TokioSpawner, port, e2e, buf).await
     }
 
     /// Variant of [`Self::bind`] that constructs the underlying socket
@@ -471,7 +471,7 @@ where
         factory: &F,
         spawner: &S,
         port: u16,
-        e2e_registry: R,
+        e2e: R,
         buf: BufferLease,
     ) -> Result<Self, Error>
     where
@@ -502,7 +502,7 @@ where
 
         let socket = factory.bind(bind_addr, &options).await?;
         let port = socket.local_addr()?.port();
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e, buf);
         spawner.spawn(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -525,7 +525,7 @@ where
         factory: &F,
         spawner: &S,
         port: u16,
-        e2e_registry: R,
+        e2e: R,
         buf: BufferLease,
     ) -> Result<Self, Error>
     where
@@ -544,7 +544,7 @@ where
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
         let socket = factory.bind(bind_addr, &options).await?;
         let port = socket.local_addr()?.port();
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e, buf);
         spawner.spawn_local(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -677,7 +677,7 @@ where
         socket: T,
         rx_tx: C::BoundedSender<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>,
         mut tx_rx: C::BoundedReceiver<SendMessage<MessageDefinitions, C>, 16>,
-        e2e_registry: R,
+        e2e: R,
         mut buf: BufferLease,
     ) where
         T: TransportSocket + 'static,
@@ -798,11 +798,7 @@ where
                         }
                     };
 
-                    match crate::transport::protect_in_place(
-                        &e2e_registry,
-                        &mut buf,
-                        message_length,
-                    ) {
+                    match crate::transport::protect_in_place(&e2e, &mut buf, message_length) {
                         Ok(protected_length) => message_length = protected_length,
                         Err(e) => {
                             error!(
@@ -911,7 +907,7 @@ where
                                 };
                                 let (e2e_status, effective_payload) =
                                     crate::transport::check_message(
-                                        &e2e_registry,
+                                        &e2e,
                                         source_address.ip(),
                                         header.message_id(),
                                         header.upper_header_bytes(),

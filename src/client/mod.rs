@@ -332,7 +332,7 @@ where
     pub timer: Tm,
     /// The [`E2EHandle`] that checks received and
     /// protects sent payloads; [`crate::NoE2E`] for neither.
-    pub e2e_registry: R,
+    pub e2e: R,
     /// Shared interface-address handle. The run-loop reads its current
     /// value when `bind_*` is invoked.
     pub interface: I,
@@ -351,7 +351,7 @@ where
 /// pre-populated with `TokioTransport` / `TokioTimer` / `TokioSpawner`
 /// and a fresh `NoE2E` / `Arc<RwLock<Ipv4Addr>>`.
 /// Combine with the [`ClientDeps::with_factory`] / [`ClientDeps::with_timer`]
-/// / [`ClientDeps::with_e2e_registry`] / [`ClientDeps::with_interface`]
+/// / [`ClientDeps::with_e2e`] / [`ClientDeps::with_interface`]
 /// / [`ClientDeps::with_spawner`] builders to override individual
 /// fields without spelling out the rest by hand.
 ///
@@ -389,7 +389,7 @@ impl
         Self {
             factory: crate::tokio_transport::TokioTransport,
             timer: TokioTimer,
-            e2e_registry: NoE2E,
+            e2e: NoE2E,
             interface: Arc::new(RwLock::new(interface)),
             spawner: TokioSpawner,
             buffer_provider: crate::tokio_transport::TokioBufferProvider::new(),
@@ -434,7 +434,7 @@ where
         ClientDeps {
             factory,
             timer: self.timer,
-            e2e_registry: self.e2e_registry,
+            e2e: self.e2e,
             interface: self.interface,
             spawner: self.spawner,
             buffer_provider: self.buffer_provider,
@@ -447,23 +447,20 @@ where
         ClientDeps {
             factory: self.factory,
             timer,
-            e2e_registry: self.e2e_registry,
+            e2e: self.e2e,
             interface: self.interface,
             spawner: self.spawner,
             buffer_provider: self.buffer_provider,
         }
     }
 
-    /// Replace the `e2e_registry` field, returning a `ClientDeps` over
+    /// Replace the `e2e` field, returning a `ClientDeps` over
     /// the new [`E2EHandle`] type.
-    pub fn with_e2e_registry<R2: E2EHandle + Clone>(
-        self,
-        e2e_registry: R2,
-    ) -> ClientDeps<F, Tm, R2, I, Sp, BP> {
+    pub fn with_e2e<R2: E2EHandle + Clone>(self, e2e: R2) -> ClientDeps<F, Tm, R2, I, Sp, BP> {
         ClientDeps {
             factory: self.factory,
             timer: self.timer,
-            e2e_registry,
+            e2e,
             interface: self.interface,
             spawner: self.spawner,
             buffer_provider: self.buffer_provider,
@@ -479,7 +476,7 @@ where
         ClientDeps {
             factory: self.factory,
             timer: self.timer,
-            e2e_registry: self.e2e_registry,
+            e2e: self.e2e,
             interface,
             spawner: self.spawner,
             buffer_provider: self.buffer_provider,
@@ -498,7 +495,7 @@ where
         ClientDeps {
             factory: self.factory,
             timer: self.timer,
-            e2e_registry: self.e2e_registry,
+            e2e: self.e2e,
             interface: self.interface,
             spawner,
             buffer_provider: self.buffer_provider,
@@ -518,7 +515,7 @@ where
         ClientDeps {
             factory: self.factory,
             timer: self.timer,
-            e2e_registry: self.e2e_registry,
+            e2e: self.e2e,
             interface: self.interface,
             spawner,
             buffer_provider: self.buffer_provider,
@@ -536,7 +533,7 @@ where
         ClientDeps {
             factory: self.factory,
             timer: self.timer,
-            e2e_registry: self.e2e_registry,
+            e2e: self.e2e,
             interface: self.interface,
             spawner: self.spawner,
             buffer_provider,
@@ -722,7 +719,7 @@ where
             ClientDeps {
                 factory: crate::tokio_transport::TokioTransport,
                 timer: TokioTimer,
-                e2e_registry: NoE2E,
+                e2e: NoE2E,
                 interface: Arc::new(RwLock::new(interface)),
                 spawner,
                 // One `TokioBufferProvider::new()` per client construction.
@@ -802,7 +799,7 @@ where
         let ClientDeps {
             factory,
             timer,
-            e2e_registry,
+            e2e,
             interface,
             spawner,
             buffer_provider,
@@ -821,7 +818,7 @@ where
             bind_dispatch::SpawnerDispatch<F, Sp, BP>,
         >::build(
             initial_addr,
-            e2e_registry,
+            e2e,
             multicast_loopback,
             dispatch,
             timer,
@@ -870,7 +867,7 @@ where
         let ClientDeps {
             factory,
             timer,
-            e2e_registry,
+            e2e,
             interface,
             spawner,
             buffer_provider,
@@ -889,7 +886,7 @@ where
             bind_dispatch::LocalSpawnerDispatch<F, Sp, BP>,
         >::build(
             initial_addr,
-            e2e_registry,
+            e2e,
             multicast_loopback,
             dispatch,
             timer,

@@ -430,7 +430,7 @@ fn build_server() -> bool {
         ServerStorage {
             factory,
             timer: CallbackTimer::new(platform().now_ms),
-            e2e_registry: e2e(),
+            e2e: e2e(),
             subscriptions: StaticSubscriptionHandle::new(&SUBS_STORAGE),
             unicast_socket: (*core::ptr::addr_of!(UNICAST_SOCK)).assume_init_ref(),
             sd_socket: (*core::ptr::addr_of!(SD_SOCK)).assume_init_ref(),

@@ -305,7 +305,7 @@ async fn server_constructible_without_server_tokio_feature() {
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
         timer: MockTimer,
-        e2e_registry: e2e_handle,
+        e2e: e2e_handle,
         subscriptions: subs,
         non_sd_observer: None,
     };
@@ -352,7 +352,7 @@ async fn passive_server_constructible_without_server_tokio_feature() {
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
         timer: MockTimer,
-        e2e_registry: e2e_handle,
+        e2e: e2e_handle,
         subscriptions: subs,
         non_sd_observer: None,
     };
@@ -536,7 +536,7 @@ async fn non_sd_observer_some_receives_unicast_method_request() {
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
         timer: MockTimer,
-        e2e_registry: e2e_handle,
+        e2e: e2e_handle,
         subscriptions: subs,
         non_sd_observer: Some((record_some as NonSdRequestCallback, 0xC0FF_EE00)),
     };
@@ -620,7 +620,7 @@ async fn non_sd_observer_ignores_sd_message_on_unicast_socket() {
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
         timer: MockTimer,
-        e2e_registry: e2e_handle,
+        e2e: e2e_handle,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: Some((record_sd_unicast as NonSdRequestCallback, 7)),
     };
@@ -686,7 +686,7 @@ async fn non_sd_observer_ignores_non_sd_on_multicast_socket() {
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
         timer: MockTimer,
-        e2e_registry: e2e_handle,
+        e2e: e2e_handle,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: Some((record_multicast as NonSdRequestCallback, 9)),
     };
@@ -752,7 +752,7 @@ async fn non_sd_observer_none_preserves_ignore_behavior() {
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
         timer: MockTimer,
-        e2e_registry: e2e_handle,
+        e2e: e2e_handle,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: None,
     };
@@ -873,7 +873,7 @@ async fn non_sd_responder_frames_and_sends_response() {
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
         timer: MockTimer,
-        e2e_registry: e2e_handle,
+        e2e: e2e_handle,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: Some((respond_with_body as NonSdRequestCallback, 0)),
     };
@@ -943,7 +943,7 @@ async fn non_sd_response_is_protected_by_the_hook() {
     let deps: ServerDeps<MockFactory, MockTimer, TagE2E, MockSubscriptions> = ServerDeps {
         factory,
         timer: MockTimer,
-        e2e_registry: hook,
+        e2e: hook,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: Some((respond_with_body as NonSdRequestCallback, 0)),
     };
@@ -1000,7 +1000,7 @@ async fn non_sd_responder_oversized_length_is_rejected_not_panicked() {
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
         timer: MockTimer,
-        e2e_registry: e2e_handle,
+        e2e: e2e_handle,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: Some((respond_oversized as NonSdRequestCallback, 0)),
     };
@@ -1080,7 +1080,7 @@ async fn drive_co_offer_subscribe(local_port: u16, subscribe_major: u8) -> Vec<S
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
         timer: MockTimer,
-        e2e_registry: e2e_handle,
+        e2e: e2e_handle,
         subscriptions: subs,
         non_sd_observer: None,
     };
@@ -1191,7 +1191,7 @@ async fn non_sd_observer_receives_the_hooks_status_and_stripped_payload() {
     let deps: ServerDeps<MockFactory, MockTimer, TagE2E, MockSubscriptions> = ServerDeps {
         factory,
         timer: MockTimer,
-        e2e_registry: hook,
+        e2e: hook,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: Some((record_tagged as NonSdRequestCallback, 0)),
     };

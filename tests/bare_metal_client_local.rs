@@ -208,7 +208,7 @@ async fn client_constructible_with_local_spawner() {
                     factory,
                     spawner: LocalTokioSpawner,
                     timer: MockTimer,
-                    e2e_registry: e2e_handle,
+                    e2e: e2e_handle,
                     interface: interface_handle,
                     buffer_provider: StaticBufferProvider(&POOL),
                 },

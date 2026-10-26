@@ -282,7 +282,7 @@ async fn main() {
                 factory,
                 spawner: TokioBackedSpawner,
                 timer: MockTimer,
-                e2e_registry: NoE2E,
+                e2e: NoE2E,
                 interface: iface,
                 // Caller-declared static buffer pool (#125): UNICAST_SOCKETS_CAP
                 // (8) + 1 discovery + 1 release-lag slack = 10 slots. An evicted

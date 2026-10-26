@@ -33,7 +33,7 @@ async fn main(spawner: embassy_executor::Spawner) {
             factory,
             spawner,           // embassy_executor::Spawner
             timer: EmbassyTimer,
-            e2e_registry: NoE2E,
+            e2e: NoE2E,
             interface: /* AtomicInterfaceHandle */,
         },
         false, // multicast_loopback

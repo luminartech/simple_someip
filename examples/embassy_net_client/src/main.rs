@@ -376,7 +376,7 @@ async fn main() {
             let server_deps = ServerDeps {
                 factory: server_factory,
                 timer: LocalTimer,
-                e2e_registry: server_e2e,
+                e2e: server_e2e,
                 subscriptions: InMemorySubscriptions::default(),
                 non_sd_observer: None,
             };
@@ -416,7 +416,7 @@ async fn main() {
                 factory: client_factory,
                 spawner: LocalTokioSpawner,
                 timer: LocalTimer,
-                e2e_registry: client_e2e,
+                e2e: client_e2e,
                 interface: client_iface,
                 buffer_provider: StaticBufferProvider(buf_pool),
             };

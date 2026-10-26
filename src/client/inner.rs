@@ -352,7 +352,7 @@ pub(super) struct Inner<
     sd_session_id: u16,
     sd_session_has_wrapped: bool,
     /// Checks received and protects sent payloads.
-    e2e_registry: R,
+    e2e: R,
     /// Enable multicast loopback on SD sockets for same-host testing
     multicast_loopback: bool,
     /// Bind dispatch — abstracts the bind-and-spawn step over either a
@@ -417,7 +417,7 @@ where
     #[allow(clippy::type_complexity)]
     pub fn build(
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
         multicast_loopback: bool,
         dispatch: D,
         timer: Tm,
@@ -445,7 +445,7 @@ where
             session_counter: 1,
             sd_session_id: 1,
             sd_session_has_wrapped: false,
-            e2e_registry,
+            e2e,
             multicast_loopback,
             dispatch,
             timer,
@@ -462,7 +462,7 @@ where
                 .dispatch
                 .bind_discovery(
                     self.interface,
-                    self.e2e_registry.clone(),
+                    self.e2e.clone(),
                     self.sd_session_id,
                     self.sd_session_has_wrapped,
                     self.multicast_loopback,
@@ -475,7 +475,7 @@ where
             // unicast-domain split), so don't fail the whole bind.
             match self
                 .dispatch
-                .bind_discovery_unicast(self.interface, self.e2e_registry.clone())
+                .bind_discovery_unicast(self.interface, self.e2e.clone())
                 .await
             {
                 Ok(unicast) => self.discovery_unicast_socket = Some(unicast),
@@ -518,10 +518,7 @@ where
             );
             return Err(Error::Capacity(CapacityKind::UnicastSockets));
         }
-        let unicast_socket = self
-            .dispatch
-            .bind_unicast(port, self.e2e_registry.clone())
-            .await?;
+        let unicast_socket = self.dispatch.bind_unicast(port, self.e2e.clone()).await?;
         let bound_port = unicast_socket.port();
         // Capacity was checked above, so insert cannot report "full" here.
         // A defensive check guards against a future refactor that changes
@@ -645,7 +642,7 @@ where
         sd_header: <PayloadDefinitions as PayloadWireFormat>::SdHeader,
         session_tracker: &mut SessionTracker,
         service_registry: &mut ServiceRegistry,
-        e2e_registry: &R,
+        e2e: &R,
         update_sender: &C::UnboundedSender<ClientUpdate<PayloadDefinitions>>,
     ) {
         // Extract session ID from SOME/IP request_id (lower 16 bits)
@@ -730,7 +727,7 @@ where
             // A rebooted sender restarts its E2E counter at zero, so drop our
             // stored per-source receive state for it; otherwise its first
             // post-reboot frame would read as out-of-sequence.
-            e2e_registry.reset_source(source.ip());
+            e2e.reset_source(source.ip());
             let _ = update_sender.send_now(ClientUpdate::SenderRebooted(source));
         }
 
@@ -1217,7 +1214,7 @@ where
                     request_queue,
                     session_tracker,
                     service_registry,
-                    e2e_registry,
+                    e2e,
                     run,
                     timer,
                     ..
@@ -1298,7 +1295,7 @@ where
                                 sd_header,
                                 session_tracker,
                                 service_registry,
-                                e2e_registry,
+                                e2e,
                                 update_sender,
                             );
                         }
@@ -1321,7 +1318,7 @@ where
                                 sd_header,
                                 session_tracker,
                                 service_registry,
-                                e2e_registry,
+                                e2e,
                                 update_sender,
                             );
                         }
@@ -1597,7 +1594,7 @@ mod tests {
             session_counter: 1,
             sd_session_id: 1,
             sd_session_has_wrapped: false,
-            e2e_registry: NoE2E,
+            e2e: NoE2E,
             multicast_loopback: false,
             dispatch: crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -1843,7 +1840,7 @@ mod tests {
             session_counter: 1,
             sd_session_id: 1,
             sd_session_has_wrapped: false,
-            e2e_registry: NoE2E,
+            e2e: NoE2E,
             multicast_loopback: false,
             dispatch: crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2616,7 +2613,7 @@ mod tests {
 
         let (control_sender, control_receiver) = mpsc::channel(4);
         let (update_sender, _update_receiver) = mpsc::unbounded_channel();
-        let e2e_registry = NoE2E;
+        let e2e = NoE2E;
         let mut inner: TestInner = Inner {
             control_receiver,
             request_queue: Deque::new(),
@@ -2633,7 +2630,7 @@ mod tests {
             session_counter: 1,
             sd_session_id: 1,
             sd_session_has_wrapped: false,
-            e2e_registry: e2e_registry.clone(),
+            e2e: e2e.clone(),
             multicast_loopback: false,
             dispatch: crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2646,7 +2643,7 @@ mod tests {
 
         // An ephemeral socket stands in for the SD socket so the test does
         // not contend for the fixed SD port with the rest of the suite.
-        let discovery = SocketManager::bind(0, e2e_registry).await.unwrap();
+        let discovery = SocketManager::bind(0, e2e).await.unwrap();
         let discovery_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, discovery.port());
         inner.discovery_socket = Some(discovery);
         // One unicast socket shared by every Subscribe, so the burst is not
@@ -2905,7 +2902,7 @@ mod tests {
         use crate::Encode;
         let mut session_tracker = SessionTracker::default();
         let mut registry = ServiceRegistry::default();
-        let e2e_registry = NoE2E;
+        let e2e = NoE2E;
         let (update_sender, _updates) =
             TokioChannels::unbounded::<ClientUpdate<crate::RawPayload>>();
         for (session, (source, sd_header)) in (1..).zip(messages) {
@@ -2918,7 +2915,7 @@ mod tests {
                 sd_header,
                 &mut session_tracker,
                 &mut registry,
-                &e2e_registry,
+                &e2e,
                 &update_sender,
             );
         }
@@ -3150,7 +3147,7 @@ mod tests {
 
         let mut session_tracker = SessionTracker::default();
         let mut service_registry = ServiceRegistry::default();
-        let e2e_registry: NoE2E = NoE2E;
+        let e2e: NoE2E = NoE2E;
         let (update_sender, _update_receiver) =
             TokioChannels::unbounded::<ClientUpdate<RawPayload>>();
 
@@ -3175,7 +3172,7 @@ mod tests {
                 sd_header,
                 &mut session_tracker,
                 &mut service_registry,
-                &e2e_registry,
+                &e2e,
                 &update_sender,
             );
         }
@@ -3207,7 +3204,7 @@ mod tests {
             stop_header,
             &mut session_tracker,
             &mut service_registry,
-            &e2e_registry,
+            &e2e,
             &update_sender,
         );
 

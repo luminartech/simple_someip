@@ -51,7 +51,7 @@ where
 {
     subscriptions: S,
     socket: H,
-    e2e_registry: R,
+    e2e: R,
     /// `T` appears only in the bound `H: SharedHandle<T>`; the
     /// struct doesn't directly hold a `T`. `PhantomData<fn() -> T>`
     /// (rather than `PhantomData<T>`) carries the type without
@@ -107,11 +107,11 @@ where
     /// `socket` is whatever [`SharedHandle<T>`] impl the caller
     /// chose for storage — `Arc<T>` on std/alloc, `&'static T` on
     /// bare-metal-no-alloc.
-    pub fn new(subscriptions: S, socket: H, e2e_registry: R) -> Self {
+    pub fn new(subscriptions: S, socket: H, e2e: R) -> Self {
         Self {
             subscriptions,
             socket,
-            e2e_registry,
+            e2e,
             _phantom: PhantomData,
         }
     }
@@ -199,16 +199,15 @@ where
             .encode_to_slice(msg_buf)
             .map_err(crate::protocol::Error::from)?;
 
-        message_length =
-            crate::transport::protect_in_place(&self.e2e_registry, msg_buf, message_length)
-                .map_err(|e| {
-                    crate::log::error!(
-                        "Protecting {:?} failed: {:?}; dropping publish",
-                        message.header().message_id(),
-                        e
-                    );
-                    Error::Capacity(CapacityKind::UdpBuffer)
-                })?;
+        message_length = crate::transport::protect_in_place(&self.e2e, msg_buf, message_length)
+            .map_err(|e| {
+                crate::log::error!(
+                    "Protecting {:?} failed: {:?}; dropping publish",
+                    message.header().message_id(),
+                    e
+                );
+                Error::Capacity(CapacityKind::UdpBuffer)
+            })?;
 
         let datagram = &msg_buf[..message_length];
 
@@ -402,8 +401,8 @@ where
             return Err(Error::Capacity(CapacityKind::UdpBuffer));
         }
         buf[header_len..total_len].copy_from_slice(payload);
-        let total_len = crate::transport::protect_in_place(&self.e2e_registry, buf, total_len)
-            .map_err(|e| {
+        let total_len =
+            crate::transport::protect_in_place(&self.e2e, buf, total_len).map_err(|e| {
                 crate::log::error!(
                     "Protecting raw event {:#06x} failed: {:?}; dropping publish",
                     event_id,
@@ -713,8 +712,8 @@ where
             return Err(Error::Capacity(CapacityKind::UdpBuffer));
         }
         buf[header_len..total_len].copy_from_slice(payload);
-        let total_len = crate::transport::protect_in_place(&self.e2e_registry, buf, total_len)
-            .map_err(|e| {
+        let total_len =
+            crate::transport::protect_in_place(&self.e2e, buf, total_len).map_err(|e| {
                 crate::log::error!(
                     "Protecting raw event {:#06x} failed: {:?}; dropping publish",
                     event_id,

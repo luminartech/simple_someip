@@ -290,7 +290,7 @@ mod client_future_probe {
             factory: NullFactory,
             spawner: NullSpawner,
             timer: NullTimer,
-            e2e_registry: NoE2E,
+            e2e: NoE2E,
             interface: NullInterface(core::net::Ipv4Addr::LOCALHOST),
             buffer_provider: StaticBufferProvider(&POOL),
         };

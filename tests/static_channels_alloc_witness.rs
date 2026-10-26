@@ -308,7 +308,7 @@ async fn client_interface_read_after_construction_does_not_allocate() {
                 factory,
                 spawner: TokioBackedSpawner,
                 timer: MockTimer,
-                e2e_registry: e2e_handle,
+                e2e: e2e_handle,
                 interface: interface_handle,
                 buffer_provider: StaticBufferProvider(&POOL),
             },

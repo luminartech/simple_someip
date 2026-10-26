@@ -603,7 +603,7 @@ async fn client_receives_server_sd_announcement() {
             let server_deps = ServerDeps {
                 factory: server_factory,
                 timer: LocalTimer,
-                e2e_registry: server_e2e,
+                e2e: server_e2e,
                 subscriptions: server_subs,
                 non_sd_observer: None,
             };
@@ -646,7 +646,7 @@ async fn client_receives_server_sd_announcement() {
                 factory: client_factory,
                 spawner: LocalTokioSpawner,
                 timer: LocalTimer,
-                e2e_registry: client_e2e,
+                e2e: client_e2e,
                 interface: client_iface,
                 buffer_provider: StaticBufferProvider(buf_pool),
             };
@@ -729,7 +729,7 @@ async fn client_send_request_server_runloop_stable() {
             let server_deps = ServerDeps {
                 factory: server_factory,
                 timer: LocalTimer,
-                e2e_registry: server_e2e,
+                e2e: server_e2e,
                 subscriptions: server_subs,
                 non_sd_observer: None,
             };
@@ -768,7 +768,7 @@ async fn client_send_request_server_runloop_stable() {
                 factory: client_factory,
                 spawner: LocalTokioSpawner,
                 timer: LocalTimer,
-                e2e_registry: client_e2e,
+                e2e: client_e2e,
                 interface: client_iface,
                 buffer_provider: StaticBufferProvider(buf_pool),
             };

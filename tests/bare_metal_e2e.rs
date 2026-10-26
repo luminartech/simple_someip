@@ -384,7 +384,7 @@ async fn client_receives_server_sd_announcement() {
     let server_deps = ServerDeps {
         factory: server_factory,
         timer: MockTimer,
-        e2e_registry: server_e2e,
+        e2e: server_e2e,
         subscriptions: server_subs,
         non_sd_observer: None,
     };
@@ -409,7 +409,7 @@ async fn client_receives_server_sd_announcement() {
         factory: client_factory,
         spawner: TokioBackedSpawner,
         timer: MockTimer,
-        e2e_registry: client_e2e,
+        e2e: client_e2e,
         interface: client_iface,
         buffer_provider: StaticBufferProvider(&POOL_SD),
     };
@@ -482,7 +482,7 @@ async fn client_send_request_server_runloop_stable() {
     let server_deps = ServerDeps {
         factory: server_factory,
         timer: MockTimer,
-        e2e_registry: server_e2e,
+        e2e: server_e2e,
         subscriptions: server_subs,
         non_sd_observer: None,
     };
@@ -509,7 +509,7 @@ async fn client_send_request_server_runloop_stable() {
         factory: client_factory,
         spawner: TokioBackedSpawner,
         timer: MockTimer,
-        e2e_registry: client_e2e,
+        e2e: client_e2e,
         interface: client_iface,
         buffer_provider: StaticBufferProvider(&POOL_REQ),
     };
@@ -653,7 +653,7 @@ async fn future_size_witness_bare_metal_channels() {
     let server_deps = ServerDeps {
         factory: server_factory,
         timer: MockTimer,
-        e2e_registry: server_e2e,
+        e2e: server_e2e,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: None,
     };
@@ -681,7 +681,7 @@ async fn future_size_witness_bare_metal_channels() {
             max_spawned: Arc::clone(&max_spawned),
         },
         timer: MockTimer,
-        e2e_registry: NoE2E,
+        e2e: NoE2E,
         interface: Arc::new(RwLock::new(Ipv4Addr::LOCALHOST)),
         buffer_provider: StaticBufferProvider(&POOL_WITNESS),
     };
@@ -875,7 +875,7 @@ async fn inbound_datagram_larger_than_claimed_buffer_is_dropped_not_fatal() {
         factory,
         spawner: TokioBackedSpawner,
         timer: MockTimer,
-        e2e_registry: client_e2e,
+        e2e: client_e2e,
         interface: client_iface,
         buffer_provider: StaticBufferProvider(&POOL),
     };
@@ -936,7 +936,7 @@ async fn binding_sockets_claims_one_buffer_each_until_pool_exhausted() {
         factory: client_factory,
         spawner: TokioBackedSpawner,
         timer: MockTimer,
-        e2e_registry: client_e2e,
+        e2e: client_e2e,
         interface: client_iface,
         buffer_provider: StaticBufferProvider(&POOL),
     };
@@ -1032,7 +1032,7 @@ async fn e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_err
         factory: client_factory,
         spawner: TokioBackedSpawner,
         timer: MockTimer,
-        e2e_registry: client_e2e,
+        e2e: client_e2e,
         interface: client_iface,
         buffer_provider: StaticBufferProvider(&POOL),
     };

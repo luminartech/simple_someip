@@ -441,7 +441,7 @@ where
     pub timer: Tm,
     /// The [`E2EHandle`] that checks received and
     /// protects sent payloads; [`crate::NoE2E`] for neither.
-    pub e2e_registry: R,
+    pub e2e: R,
     /// Shared subscription manager handle. The convenience constructor
     /// `Server::new` (under `server-tokio`) builds an
     /// `Arc<RwLock<SubscriptionManager>>` for this; bare-metal callers
@@ -463,7 +463,7 @@ where
 /// pre-populated with `TokioTransport` / `TokioTimer` and a fresh
 /// `NoE2E` / `Arc<RwLock<SubscriptionManager>>`.
 /// Combine with the [`ServerDeps::with_factory`] /
-/// [`ServerDeps::with_timer`] / [`ServerDeps::with_e2e_registry`] /
+/// [`ServerDeps::with_timer`] / [`ServerDeps::with_e2e`] /
 /// [`ServerDeps::with_subscriptions`] builders to override individual
 /// fields without spelling out the rest by hand.
 ///
@@ -497,7 +497,7 @@ impl
         Self {
             factory: crate::tokio_transport::TokioTransport,
             timer: crate::tokio_transport::TokioTimer,
-            e2e_registry: NoE2E,
+            e2e: NoE2E,
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
             non_sd_observer: None,
         }
@@ -522,7 +522,7 @@ where
         ServerDeps {
             factory,
             timer: self.timer,
-            e2e_registry: self.e2e_registry,
+            e2e: self.e2e,
             subscriptions: self.subscriptions,
             non_sd_observer: self.non_sd_observer,
         }
@@ -534,22 +534,19 @@ where
         ServerDeps {
             factory: self.factory,
             timer,
-            e2e_registry: self.e2e_registry,
+            e2e: self.e2e,
             subscriptions: self.subscriptions,
             non_sd_observer: self.non_sd_observer,
         }
     }
 
-    /// Replace the `e2e_registry` field, returning a `ServerDeps` over
+    /// Replace the `e2e` field, returning a `ServerDeps` over
     /// the new [`E2EHandle`] type.
-    pub fn with_e2e_registry<R2: E2EHandle + Clone>(
-        self,
-        e2e_registry: R2,
-    ) -> ServerDeps<F, Tm, R2, Sub> {
+    pub fn with_e2e<R2: E2EHandle + Clone>(self, e2e: R2) -> ServerDeps<F, Tm, R2, Sub> {
         ServerDeps {
             factory: self.factory,
             timer: self.timer,
-            e2e_registry,
+            e2e,
             subscriptions: self.subscriptions,
             non_sd_observer: self.non_sd_observer,
         }
@@ -564,7 +561,7 @@ where
         ServerDeps {
             factory: self.factory,
             timer: self.timer,
-            e2e_registry: self.e2e_registry,
+            e2e: self.e2e,
             subscriptions,
             non_sd_observer: self.non_sd_observer,
         }
@@ -659,7 +656,7 @@ where
     pub timer: Tm,
     /// The [`E2EHandle`] that checks received and
     /// protects sent payloads; [`crate::NoE2E`] for neither.
-    pub e2e_registry: R,
+    pub e2e: R,
     /// Shared subscription manager handle.
     pub subscriptions: Sub,
     /// Pre-built unicast socket handle. Caller has already bound
@@ -768,7 +765,7 @@ pub struct Server<
     /// `&'static SdStateManager` on bare-metal-no-alloc).
     sd_state: Hsd,
     /// Checks received and protects sent payloads.
-    e2e_registry: R,
+    e2e: R,
     /// Transport factory. Used at construction time to bind sockets;
     /// retained on the struct so bare-metal factories that carry state
     /// (e.g. an embassy-net `Stack` handle) survive the constructor.
@@ -959,7 +956,7 @@ impl
         let deps = ServerDeps {
             factory: crate::tokio_transport::TokioTransport,
             timer: crate::tokio_transport::TokioTimer,
-            e2e_registry: NoE2E,
+            e2e: NoE2E,
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
             non_sd_observer: None,
         };
@@ -1003,7 +1000,7 @@ impl
         let deps = ServerDeps {
             factory: crate::tokio_transport::TokioTransport,
             timer: crate::tokio_transport::TokioTimer,
-            e2e_registry: NoE2E,
+            e2e: NoE2E,
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
             non_sd_observer: None,
         };
@@ -1061,7 +1058,7 @@ where
         let ServerDeps {
             factory,
             timer,
-            e2e_registry,
+            e2e,
             subscriptions,
             non_sd_observer: deps_non_sd_observer,
         } = deps;
@@ -1105,7 +1102,7 @@ where
         let publisher = Hep::wrap(EventPublisher::new(
             subscriptions.clone(),
             unicast_socket.clone(),
-            e2e_registry.clone(),
+            e2e.clone(),
         ));
 
         let server = Self {
@@ -1115,7 +1112,7 @@ where
             subscriptions,
             publisher,
             sd_state: Hsd::wrap(SdStateManager::new()),
-            e2e_registry,
+            e2e,
             factory,
             timer,
             is_passive: false,
@@ -1158,7 +1155,7 @@ where
         let ServerDeps {
             factory,
             timer,
-            e2e_registry,
+            e2e,
             subscriptions,
             non_sd_observer: deps_non_sd_observer,
         } = deps;
@@ -1193,7 +1190,7 @@ where
         let publisher = Hep::wrap(EventPublisher::new(
             subscriptions.clone(),
             unicast_socket.clone(),
-            e2e_registry.clone(),
+            e2e.clone(),
         ));
 
         let server = Self {
@@ -1203,7 +1200,7 @@ where
             subscriptions,
             publisher,
             sd_state: Hsd::wrap(SdStateManager::new()),
-            e2e_registry,
+            e2e,
             factory,
             timer,
             is_passive: true,
@@ -1292,7 +1289,7 @@ where
             subscriptions: deps.subscriptions,
             publisher: deps.publisher,
             sd_state: deps.sd_state,
-            e2e_registry: deps.e2e_registry,
+            e2e: deps.e2e,
             factory: deps.factory,
             timer: deps.timer,
             is_passive: false,
@@ -1362,7 +1359,7 @@ where
             subscriptions: deps.subscriptions,
             publisher: deps.publisher,
             sd_state: deps.sd_state,
-            e2e_registry: deps.e2e_registry,
+            e2e: deps.e2e,
             factory: deps.factory,
             timer: deps.timer,
             is_passive: true,
@@ -1447,7 +1444,7 @@ where
         let unicast_socket = self.unicast_socket.clone();
         let sd_socket = self.sd_socket.clone();
         let subscriptions = self.subscriptions.clone();
-        let e2e_registry = self.e2e_registry.clone();
+        let e2e = self.e2e.clone();
         let sd_state = self.sd_state.clone();
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
@@ -1477,7 +1474,7 @@ where
                 sd_socket,
                 subscriptions,
                 sd_state,
-                e2e_registry,
+                e2e,
                 timer,
                 is_passive,
                 unicast_buf,
@@ -1668,7 +1665,7 @@ where
         let unicast_socket = self.unicast_socket.clone();
         let sd_socket = self.sd_socket.clone();
         let subscriptions = self.subscriptions.clone();
-        let e2e_registry = self.e2e_registry.clone();
+        let e2e = self.e2e.clone();
         let sd_state = self.sd_state.clone();
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
@@ -1710,7 +1707,7 @@ where
                 sd_socket,
                 subscriptions,
                 sd_state,
-                e2e_registry,
+                e2e,
                 timer,
                 is_passive,
                 &mut unicast_buf,
@@ -1908,17 +1905,17 @@ mod tests {
                 .await
                 .expect("bind sd"),
         );
-        let e2e_registry = NoE2E;
+        let e2e = NoE2E;
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
         let publisher = Arc::new(EventPublisher::new(
             subscriptions.clone(),
             unicast_socket.clone(),
-            e2e_registry.clone(),
+            e2e.clone(),
         ));
         let handles = ServerStorage {
             factory,
             timer: TokioTimer,
-            e2e_registry,
+            e2e,
             subscriptions,
             unicast_socket,
             sd_socket,
@@ -2164,7 +2161,7 @@ mod tests {
         let deps = ServerDeps {
             factory,
             timer: TokioTimer,
-            e2e_registry: NoE2E,
+            e2e: NoE2E,
             subscriptions: subscriptions.clone(),
             non_sd_observer: None,
         };

@@ -1110,7 +1110,7 @@ where
     let config = ServerConfig::new(service_id, 1)
         .with_interface(SERVER_IP)
         .with_local_port(0);
-    let deps = ServerDeps::tokio().with_e2e_registry(server_hook);
+    let deps = ServerDeps::tokio().with_e2e(server_hook);
     let (server, _handles, _run): (Server<_, _, S, _>, _, _) =
         Server::new_with_deps(deps, config, false)
             .await
@@ -1119,7 +1119,7 @@ where
     let publisher = server.publisher();
     let server_handle = tokio::spawn(async move { server.run().await });
 
-    let deps = ClientDeps::tokio(Ipv4Addr::LOCALHOST).with_e2e_registry(client_hook);
+    let deps = ClientDeps::tokio(Ipv4Addr::LOCALHOST).with_e2e(client_hook);
     let (client, mut updates, run_fut) =
         Client::<RawPayload, _, TokioChannels>::new_with_deps(deps, false);
     let run_handle = tokio::spawn(run_fut);
@@ -1181,7 +1181,7 @@ async fn send_request_and_capture<H: E2EHandle + Clone>(
         .await
         .unwrap();
     let key = ServiceEndpointKey::udp(service_id, peer.local_addr().unwrap());
-    let deps = ClientDeps::tokio(Ipv4Addr::LOCALHOST).with_e2e_registry(hook);
+    let deps = ClientDeps::tokio(Ipv4Addr::LOCALHOST).with_e2e(hook);
     let (client, _updates, run_fut) =
         Client::<RawPayload, _, TokioChannels>::new_with_deps(deps, false);
     let run_handle = tokio::spawn(run_fut);

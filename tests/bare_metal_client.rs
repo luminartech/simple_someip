@@ -258,7 +258,7 @@ async fn client_constructible_without_client_tokio_feature() {
                 factory,
                 spawner: TokioBackedSpawner,
                 timer: MockTimer,
-                e2e_registry: e2e_handle,
+                e2e: e2e_handle,
                 interface: interface_handle,
                 buffer_provider: StaticBufferProvider(&POOL),
             },

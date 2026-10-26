@@ -249,7 +249,7 @@ async fn main() {
             ServerDeps {
                 factory,
                 timer: MockTimer,
-                e2e_registry: NoE2E,
+                e2e: NoE2E,
                 subscriptions: subs,
                 non_sd_observer: None,
             },
