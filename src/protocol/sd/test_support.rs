@@ -364,3 +364,12 @@ pub(crate) fn sd_body_with_unknown_entry_and_option_for(
     body.extend_from_slice(&endpoint).unwrap();
     body
 }
+
+/// Asserts that two errors have the same `Debug` text.
+pub(crate) fn assert_same_error(got: &impl core::fmt::Debug, want: &impl core::fmt::Debug) {
+    let mut got_text = heapless::String::<128>::new();
+    let mut want_text = heapless::String::<128>::new();
+    core::fmt::write(&mut got_text, format_args!("{got:?}")).unwrap();
+    core::fmt::write(&mut want_text, format_args!("{want:?}")).unwrap();
+    assert_eq!(got_text, want_text);
+}

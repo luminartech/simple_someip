@@ -32,6 +32,10 @@ impl<'a> Header<'a> {
             options,
         }
     }
+
+    fn options_size(&self) -> Result<usize, crate::protocol::Error> {
+        self.options.iter().map(Options::encoded_size).sum()
+    }
 }
 
 /// Zero-copy view into an SD header payload.
@@ -300,14 +304,11 @@ impl Encode for Header<'_> {
     type Error = crate::protocol::Error;
 
     fn encoded_size(&self) -> Result<usize, Self::Error> {
-        let mut size = 12 + self.entries.len() * ENTRY_SIZE;
-        for option in self.options {
-            size += option.encoded_size()?;
-        }
-        Ok(size)
+        Ok(12 + self.entries.len() * ENTRY_SIZE + self.options_size()?)
     }
 
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
+        let options_size = self.options_size()?;
         writer.write_u8(u8::from(self.flags))?;
         let reserved: [u8; 3] = [0; 3];
         writer.write_bytes(&reserved)?;
@@ -315,10 +316,6 @@ impl Encode for Header<'_> {
         writer.write_u32_be(entries_size)?;
         for entry in self.entries {
             entry.encode(writer)?;
-        }
-        let mut options_size = 0;
-        for option in self.options {
-            options_size += option.encoded_size()?;
         }
         writer.write_u32_be(u32::try_from(options_size).expect("options size fits u32"))?;
         for option in self.options {
@@ -760,5 +757,24 @@ mod tests {
         let n = h.encode(&mut buf.as_mut_slice()).unwrap();
         let (body, _rest) = SdBody::decode(&buf[..n]).unwrap();
         assert_eq!(body.entries().remaining_len(), Some(2));
+    }
+
+    #[test]
+    fn encode_writes_nothing_when_an_option_cannot_be_encoded() {
+        use crate::protocol::sd::test_support::{
+            assert_same_error, sd_body_with_unknown_entry_and_option,
+        };
+        let body = sd_body_with_unknown_entry_and_option();
+        let view = SdHeaderView::parse(&body).unwrap();
+        let entries: heapless::Vec<_, 2> = view.entries().map(|e| e.to_owned().unwrap()).collect();
+        let options: heapless::Vec<_, 2> = view.options().map(|o| o.to_owned().unwrap()).collect();
+        let header = Header::new(view.flags(), &entries, &options);
+
+        let mut buf = [0u8; 128];
+        let mut writer = buf.as_mut_slice();
+        let err = header.encode(&mut writer).unwrap_err();
+        let option_err = options[0].encoded_size().unwrap_err();
+        assert_same_error(&err, &option_err);
+        assert_eq!(writer.len(), 128, "nothing was written");
     }
 }
