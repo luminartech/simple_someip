@@ -517,9 +517,8 @@ async fn dispatch_non_sd_request<T: TransportSocket, R: E2EHandle + ?Sized>(
     let hdr = view.header();
     let id = hdr.message_id();
     let (service_id, method_id) = (id.service_id(), id.method_id());
-    // A request whose message ID the hook checks is validated and its
-    // protection header stripped; any other request passes through with
-    // status 0.
+    // A request that passes the hook's check arrives without its
+    // protection header; any other request arrives as received.
     let parsed = crate::sd_codec::ParsedDatagram {
         service_id,
         method_id,

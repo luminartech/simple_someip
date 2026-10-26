@@ -41,7 +41,8 @@ const SUB_SCRATCH_CAP: usize = 128;
 /// Capacity of the API-only send scratch (`RuntimeBuffers::publish_scratch`),
 /// shared by `publish` and `deinit`. Sized for modest events rather than a
 /// full MTU to keep the always-resident static footprint small (+512 B, not
-/// +`RX_CAP`); it caps `publish` payloads at `API_SCRATCH_CAP - 16`. Bump it
+/// +`RX_CAP`); it caps `publish` payloads at `API_SCRATCH_CAP - 16`, less
+/// any protection header the [`RuntimeConfig::e2e`] handle adds. Bump it
 /// (with the FW team's RAM sign-off) if a node must emit larger notifications.
 /// Must be `>= SD_SCRATCH_CAP` so `deinit`'s combined `StopOffer` datagram fits.
 const API_SCRATCH_CAP: usize = 512;
@@ -137,7 +138,8 @@ pub struct RuntimeBuffers {
     /// concurrently (single serial caller), so they share this one buffer.
     /// Sized at `API_SCRATCH_CAP` (512 B), not `RX_CAP`, to keep the static
     /// footprint small; it caps the max `publish` payload at
-    /// `API_SCRATCH_CAP - 16`.
+    /// `API_SCRATCH_CAP - 16`, less any protection header the
+    /// [`RuntimeConfig::e2e`] handle adds.
     pub publish_scratch: [u8; API_SCRATCH_CAP],
 }
 
@@ -665,9 +667,10 @@ fn next_publish_session() -> u16 {
     }
 }
 
-/// Publish a notification to all current subscribers. Returns subscriber
-/// count, or negative on error (`-1` not ready, `-2` payload too large,
-/// `-3` tuple not offered).
+/// Publish a notification to all current subscribers, protected through
+/// [`RuntimeConfig::e2e`]. Returns subscriber count, or negative on error
+/// (`-1` not ready, `-2` payload too large once framed, or once protected
+/// while someone subscribes, `-3` tuple not offered).
 ///
 /// # Safety
 /// `payload` must be valid for `len` bytes (or `len == 0`).

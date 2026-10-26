@@ -805,8 +805,9 @@ pub struct Server<
 /// requests / fire-and-forget calls to the offered services). The
 /// SOME/IP header is parsed in `recv_loop` and the callback receives
 /// decoded fields — the consumer never parses bytes. `payload` is the
-/// bytes after the 16-byte SOME/IP header. `e2e_status` is what the
-/// server's [`E2EHandle`] check found, or `None` when no check applied.
+/// bytes after the 16-byte SOME/IP header, without their protection header
+/// when the server's [`E2EHandle`] check passed. `e2e_status` is what that
+/// check found, or `None` when no check applied.
 /// `source` is the sender's address, currently unused by known
 /// consumers (future-proofing).
 ///
@@ -827,7 +828,10 @@ pub struct Server<
 ///
 /// The callback writes a getter's response payload into `response_out`
 /// (sized by the caller) and returns its length; the server then frames a
-/// SOME/IP RESPONSE (echoing the request id) and sends it back to `source`.
+/// SOME/IP RESPONSE (echoing the request id), protects it through its
+/// [`E2EHandle`] in the same buffer, and sends it back to `source`. A
+/// response the handle protects must leave room in `response_out` for the
+/// protection header, or the server drops it.
 /// A negative return means "no response" — a setter or fire-and-forget
 /// request the consumer handled as a side effect.
 pub type NonSdRequestCallback = fn(

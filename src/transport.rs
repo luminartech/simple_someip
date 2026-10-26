@@ -796,9 +796,11 @@ pub trait E2EHandle: Send + Sync + 'static {
     /// the part of `buf` that holds the protected payload.
     /// `upper_header` is the SOME/IP header's bytes 8..16.
     ///
-    /// It is called once for each datagram sent, including each per-target
-    /// publish and each response, so a counter kept per message ID counts
-    /// datagrams, and a receiver that gets only some of them sees gaps.
+    /// It is called once per message protected: a publish to several
+    /// subscribers sends each the same protected bytes, while each
+    /// per-target publish and each response is protected on its own. A
+    /// counter kept per message ID therefore counts protected messages, and
+    /// a receiver that gets only some of them sees gaps.
     ///
     /// # Errors
     ///
