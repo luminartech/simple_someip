@@ -41,11 +41,11 @@ impl<'a> Header<'a> {
 /// Entries of unknown type are skipped; options of unknown type keep their
 /// place.
 ///
-/// # Validation-proof invariant (candidate "c")
+/// # Invariant
 ///
 /// The type system carries no proof tying the cached `entry_count` /
 /// `option_count` to `entries_buf` / `options_buf`. `parse` validates the
-/// options once (draining the lazy L1 [`DecodeIterator`]) and caches both
+/// options once (draining their [`DecodeIterator`]) and caches both
 /// counts; [`entries`](SdHeaderView::entries) and
 /// [`options`](SdHeaderView::options) then re-slice the buffers without
 /// re-running the option length/transport checks, trusting that walk, and
@@ -80,21 +80,17 @@ impl<'a> SdHeaderView<'a> {
     /// Returns an error if the buffer is too short, `entries_size` is not a multiple of 16,
     /// or an option of a known type has an invalid length or transport protocol byte.
     pub fn parse(buf: &'a [u8]) -> Result<Self, crate::protocol::Error> {
-        // The O(1) slicing + length checks (flags/reserved, entries_size,
-        // options_size, and the section bounds, incl. overflow hardening) live
-        // in the single decode source, `SdBody::decode`. This L2 path is
-        // re-founded (Phase 4) on top of that lazy L1 layer: it runs ONE eager
-        // validating walk by draining the L1 `DecodeIterator`s over the
-        // already-sliced entries and options sections, surfacing the first
-        // `Err` via `?`, and caches the element counts. The infallible
-        // accessors then re-slice these validated buffers without re-validating
-        // (candidate "c" — see the type-level docs for the trust invariant).
+        // `SdBody::decode` does the O(1) slicing and length checks (flags,
+        // entries_size, options_size, section bounds). The entries are only
+        // counted, skipping unknown types; the options are validated by the
+        // walk below. The accessors trust both counts (see the type-level
+        // invariant).
         let (body, _rest) = SdBody::decode(buf)?;
 
         let entry_count = EntryIter::new(body.entries_buf).len();
 
-        // Eager validating walk over the options section. `OptionView`'s L1
-        // decode only slices by the length field (surfacing truncation);
+        // Validating walk over the options section. `OptionView`'s decode
+        // only slices by the length field (surfacing truncation);
         // `validate()` checks a known type's length and transport-protocol
         // byte, and passes an unknown type.
         let mut option_count = 0usize;
@@ -166,9 +162,9 @@ impl<'a> SdHeaderView<'a> {
 /// [`SdBody::decode`] performs only the O(1) flag decode and section slicing
 /// (with the accompanying length / `entries_size`-multiple checks); it does NOT
 /// walk the entries validating their type bytes, nor the options validating
-/// their type / length / transport-protocol bytes. That per-element validation
-/// is the job of the lazy [`DecodeIter`] adapters returned by [`SdBody::entries`]
-/// / [`SdBody::options`], or of [`SdHeaderView::parse`].
+/// their type / length / transport-protocol bytes. The items yielded by the
+/// lazy [`DecodeIter`] adapters returned by [`SdBody::entries`] /
+/// [`SdBody::options`] check what each accessor reads.
 ///
 /// Contrast with [`SdHeaderView`], which validates its options upfront and
 /// skips entries of unknown type, so its iterators are infallible.
@@ -459,10 +455,8 @@ mod tests {
 
     #[test]
     fn parse_options_size_below_minimum_returns_error() {
-        // The eager L2 walk now drains the L1 option `DecodeIterator`, so a
-        // truncated options section surfaces the L1 `Incomplete` (the needed /
-        // available byte counts are unchanged) rather than the old hand-rolled
-        // `IncorrectOptionsSize`.
+        // `parse` drains the option `DecodeIterator`, so a truncated options
+        // section surfaces `Incomplete` with the needed / available byte counts.
         let prefix = raw_header(0, 2);
         let mut buf = [0u8; 14];
         buf[..12].copy_from_slice(&prefix);
@@ -636,7 +630,7 @@ mod tests {
         );
     }
 
-    // --- SdBody (Phase 3 lazy L1 decode) ---
+    // --- SdBody (lazy decode) ---
 
     #[test]
     fn sd_body_decode_slices_sections() {

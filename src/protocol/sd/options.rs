@@ -403,7 +403,7 @@ impl<'a> OptionView<'a> {
     /// length and the transport-protocol byte of an IP-bearing option. An
     /// option of unknown type passes.
     ///
-    /// Used by the eager L2 validation walk in
+    /// Used by the validating walk in
     /// [`SdHeaderView::parse`](super::SdHeaderView::parse) so that its
     /// infallible option accessors can trust the buffer thereafter.
     ///
@@ -1303,7 +1303,7 @@ mod tests {
         assert_eq!(remaining, opt2);
     }
 
-    // --- Decode / DecodeIter (Phase 3 lazy L1) ---
+    // --- Decode / DecodeIter ---
 
     fn two_option_buf() -> ([u8; 24], usize, Options, Options) {
         let opt1 = Options::IpV4Endpoint {

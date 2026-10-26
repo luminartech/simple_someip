@@ -483,8 +483,7 @@ impl<'a> Decode<'a> for EntryView<'a> {
     ///
     /// This is a pure fixed-stride slice: it does NOT validate the entry-type
     /// byte. Validation is deferred to [`EntryView::entry_type`] /
-    /// [`EntryView::to_owned`] (the L2 validation pass), keeping this a lazy
-    /// zero-copy view.
+    /// [`EntryView::to_owned`], keeping this a lazy zero-copy view.
     ///
     /// # Errors
     ///
@@ -932,7 +931,7 @@ mod tests {
         assert!(iter.next().is_none());
     }
 
-    // --- Decode / DecodeIter (Phase 3 lazy L1) ---
+    // --- Decode / DecodeIter ---
 
     fn two_entry_buf(e1: &Entry, e2: &Entry) -> [u8; 32] {
         let b1 = encode_entry(e1);
