@@ -231,6 +231,9 @@ fn main() {
 
     println!("no-alloc witness:");
 
+    // The host `critical-section/std` implementation allocates on first use.
+    critical_section::with(|_| {});
+
     witness_atomic_interface_handle();
     witness_static_channels_first_claim();
     witness_static_channels_oneshot();
