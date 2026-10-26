@@ -798,54 +798,22 @@ where
                         }
                     };
 
-                    {
-                        let message_id = send_message.message.header().message_id();
-                        let upper_header: [u8; 8] =
-                            buf[8..16].try_into().expect("upper header slice");
-                        let mut protected = [0u8; UDP_BUFFER_SIZE];
-                        let protection = if message_id.is_sd() {
-                            None
-                        } else {
-                            e2e_registry.protect(
-                                message_id,
-                                &buf[16..message_length],
-                                upper_header,
-                                &mut protected,
-                            )
-                        };
-                        match protection {
-                            Some(Ok(protected_len)) => {
-                                if protected_len > protected.len() || 16 + protected_len > buf.len()
-                                {
-                                    error!(
-                                        "Protected payload ({} bytes) exceeds the scratch ({}) or claimed buffer ({}); rejecting send",
-                                        protected_len,
-                                        protected.len(),
-                                        buf.len()
-                                    );
-                                    let _ = send_message
-                                        .response
-                                        .send(Err(Error::Capacity(CapacityKind::UdpBuffer)));
-                                    continue;
-                                }
-                                #[allow(clippy::cast_possible_truncation)]
-                                let new_length: u32 = 8 + protected_len as u32;
-                                buf[4..8].copy_from_slice(&new_length.to_be_bytes());
-                                buf[16..16 + protected_len]
-                                    .copy_from_slice(&protected[..protected_len]);
-                                message_length = 16 + protected_len;
-                            }
-                            Some(Err(e)) => {
-                                error!(
-                                    "Protecting {:?} failed: {:?}; refusing to send it unprotected",
-                                    message_id, e
-                                );
-                                let _ = send_message
-                                    .response
-                                    .send(Err(Error::Capacity(CapacityKind::UdpBuffer)));
-                                continue;
-                            }
-                            None => {}
+                    match crate::transport::protect_in_place(
+                        &e2e_registry,
+                        &mut buf,
+                        message_length,
+                    ) {
+                        Ok(protected_length) => message_length = protected_length,
+                        Err(e) => {
+                            error!(
+                                "Protecting {:?} failed: {:?}; refusing to send it unprotected",
+                                send_message.message.header().message_id(),
+                                e
+                            );
+                            let _ = send_message
+                                .response
+                                .send(Err(Error::Capacity(CapacityKind::UdpBuffer)));
+                            continue;
                         }
                     }
 

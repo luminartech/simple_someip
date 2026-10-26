@@ -792,22 +792,24 @@ pub trait E2EHandle: Send + Sync + 'static {
         upper_header: [u8; 8],
     ) -> Option<(NonZeroU8, &'a [u8])>;
 
-    /// Protects `payload` into `out`.
+    /// Protects, in place, the payload in `buf[..payload_len]`; the rest of
+    /// `buf` is free for the protected payload to grow into.
     ///
     /// Returns `None` when no protection applies to `message_id`, otherwise
-    /// the number of bytes written to `out`.
+    /// the part of `buf` that holds the protected payload.
+    /// `upper_header` is the SOME/IP header's bytes 8..16.
     ///
     /// # Errors
     ///
-    /// Returns [`E2EProtectError::BufferTooSmall`] when `out` cannot hold the
+    /// Returns [`E2EProtectError::BufferTooSmall`] when `buf` cannot hold the
     /// protected payload.
-    fn protect(
+    fn protect<'b>(
         &self,
         message_id: MessageId,
-        payload: &[u8],
+        buf: &'b mut [u8],
+        payload_len: usize,
         upper_header: [u8; 8],
-        out: &mut [u8],
-    ) -> Option<Result<usize, E2EProtectError>>;
+    ) -> Option<Result<&'b [u8], E2EProtectError>>;
 
     /// Drops receive state kept for `source`. The client calls it when SD
     /// shows that `source` rebooted.
@@ -825,14 +827,14 @@ impl<T: E2EHandle + ?Sized> E2EHandle for &'static T {
         (**self).check(source, message_id, payload, upper_header)
     }
 
-    fn protect(
+    fn protect<'b>(
         &self,
         message_id: MessageId,
-        payload: &[u8],
+        buf: &'b mut [u8],
+        payload_len: usize,
         upper_header: [u8; 8],
-        out: &mut [u8],
-    ) -> Option<Result<usize, E2EProtectError>> {
-        (**self).protect(message_id, payload, upper_header, out)
+    ) -> Option<Result<&'b [u8], E2EProtectError>> {
+        (**self).protect(message_id, buf, payload_len, upper_header)
     }
 
     fn reset_source(&self, source: IpAddr) {
@@ -869,17 +871,48 @@ impl E2EHandle for NoE2E {
         None
     }
 
-    fn protect(
+    fn protect<'b>(
         &self,
         _message_id: MessageId,
-        _payload: &[u8],
+        _buf: &'b mut [u8],
+        _payload_len: usize,
         _upper_header: [u8; 8],
-        _out: &mut [u8],
-    ) -> Option<Result<usize, E2EProtectError>> {
+    ) -> Option<Result<&'b [u8], E2EProtectError>> {
         None
     }
 
     fn reset_source(&self, _source: IpAddr) {}
+}
+
+/// Protects the payload of the SOME/IP message in `datagram[..len]` in
+/// place and rewrites its length field. Returns the message's new length;
+/// an SD message, or one `e2e` does not protect, keeps `len`.
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) fn protect_in_place<R: E2EHandle + ?Sized>(
+    e2e: &R,
+    datagram: &mut [u8],
+    len: usize,
+) -> Result<usize, E2EProtectError> {
+    let message_id = MessageId::from(u32::from_be_bytes(
+        datagram[..4].try_into().expect("message ID bytes"),
+    ));
+    if message_id.is_sd() {
+        return Ok(len);
+    }
+    let upper_header: [u8; 8] = datagram[8..16].try_into().expect("upper header bytes");
+    let payload_start = datagram[16..].as_ptr().addr();
+    let (offset, protected_len) =
+        match e2e.protect(message_id, &mut datagram[16..], len - 16, upper_header) {
+            None => return Ok(len),
+            Some(result) => {
+                let protected = result?;
+                (protected.as_ptr().addr() - payload_start, protected.len())
+            }
+        };
+    datagram.copy_within(16 + offset..16 + offset + protected_len, 16);
+    let length_field = u32::try_from(8 + protected_len).expect("protected length fits u32");
+    datagram[4..8].copy_from_slice(&length_field.to_be_bytes());
+    Ok(16 + protected_len)
 }
 
 /// Shared handle to the local interface address.
@@ -1463,26 +1496,149 @@ mod tests {
             ) -> Option<(NonZeroU8, &'a [u8])> {
                 Some((NonZeroU8::MIN, &payload[1..]))
             }
-            fn protect(
+            fn protect<'b>(
                 &self,
                 _message_id: MessageId,
-                _payload: &[u8],
+                buf: &'b mut [u8],
+                _payload_len: usize,
                 _upper_header: [u8; 8],
-                out: &mut [u8],
-            ) -> Option<Result<usize, E2EProtectError>> {
+            ) -> Option<Result<&'b [u8], E2EProtectError>> {
                 Some(Err(E2EProtectError::BufferTooSmall {
-                    needed: out.len() + 1,
-                    available: out.len(),
+                    needed: buf.len() + 1,
+                    available: buf.len(),
                 }))
             }
             fn reset_source(&self, _source: IpAddr) {}
         }
         static STRIP1: Strip1 = Strip1;
 
+        /// Protects every message ID by prefixing `0xAA`.
+        #[cfg(any(feature = "client", feature = "server"))]
+        struct Prefix;
+        #[cfg(any(feature = "client", feature = "server"))]
+        impl E2EHandle for Prefix {
+            fn check<'a>(
+                &self,
+                _source: IpAddr,
+                _message_id: MessageId,
+                _payload: &'a [u8],
+                _upper_header: [u8; 8],
+            ) -> Option<(NonZeroU8, &'a [u8])> {
+                None
+            }
+            fn protect<'b>(
+                &self,
+                _message_id: MessageId,
+                buf: &'b mut [u8],
+                payload_len: usize,
+                _upper_header: [u8; 8],
+            ) -> Option<Result<&'b [u8], E2EProtectError>> {
+                let needed = payload_len + 1;
+                if buf.len() < needed {
+                    return Some(Err(E2EProtectError::BufferTooSmall {
+                        needed,
+                        available: buf.len(),
+                    }));
+                }
+                buf.copy_within(..payload_len, 1);
+                buf[0] = 0xAA;
+                Some(Ok(&buf[..needed]))
+            }
+            fn reset_source(&self, _source: IpAddr) {}
+        }
+
+        /// Leaves the payload unchanged but moves it two bytes into `buf`.
+        #[cfg(any(feature = "client", feature = "server"))]
+        struct ShiftRight2;
+        #[cfg(any(feature = "client", feature = "server"))]
+        impl E2EHandle for ShiftRight2 {
+            fn check<'a>(
+                &self,
+                _source: IpAddr,
+                _message_id: MessageId,
+                _payload: &'a [u8],
+                _upper_header: [u8; 8],
+            ) -> Option<(NonZeroU8, &'a [u8])> {
+                None
+            }
+            fn protect<'b>(
+                &self,
+                _message_id: MessageId,
+                buf: &'b mut [u8],
+                payload_len: usize,
+                _upper_header: [u8; 8],
+            ) -> Option<Result<&'b [u8], E2EProtectError>> {
+                buf.copy_within(..payload_len, 2);
+                buf[..2].fill(0xEE);
+                Some(Ok(&buf[2..payload_len + 2]))
+            }
+            fn reset_source(&self, _source: IpAddr) {}
+        }
+
+        /// A SOME/IP message with `message_id` and a 2-byte payload, and its
+        /// length, at the front of a 32-byte datagram.
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn datagram(message_id: MessageId) -> ([u8; 32], usize) {
+            let mut buf = [0u8; 32];
+            buf[..4].copy_from_slice(&message_id.message_id().to_be_bytes());
+            buf[4..8].copy_from_slice(&10u32.to_be_bytes());
+            buf[16..18].copy_from_slice(&[1, 2]);
+            (buf, 18)
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_splices_the_protected_payload_and_rewrites_the_length() {
+            let (mut buf, len) = datagram(ID);
+            let new_len = super::super::protect_in_place(&Prefix, &mut buf, len).unwrap();
+            assert_eq!(new_len, 19);
+            assert_eq!(&buf[4..8], &11u32.to_be_bytes());
+            assert_eq!(&buf[16..19], &[0xAA, 1, 2]);
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_moves_protected_bytes_to_the_front_of_the_payload() {
+            let (mut buf, len) = datagram(ID);
+            let new_len = super::super::protect_in_place(&ShiftRight2, &mut buf, len).unwrap();
+            assert_eq!(new_len, 18);
+            assert_eq!(&buf[16..18], &[1, 2]);
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_leaves_sd_and_unprotected_messages_alone() {
+            let (mut buf, len) = datagram(MessageId::SD);
+            let before = buf;
+            assert_eq!(
+                super::super::protect_in_place(&Prefix, &mut buf, len),
+                Ok(len)
+            );
+            assert_eq!(buf, before);
+            let (mut buf, len) = datagram(ID);
+            assert_eq!(
+                super::super::protect_in_place(&NoE2E, &mut buf, len),
+                Ok(len)
+            );
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_rejects_a_protected_message_the_datagram_cannot_hold() {
+            let (mut buf, len) = datagram(ID);
+            assert_eq!(
+                super::super::protect_in_place(&Prefix, &mut buf[..18], len),
+                Err(E2EProtectError::BufferTooSmall {
+                    needed: 3,
+                    available: 2
+                })
+            );
+        }
+
         #[test]
         fn no_e2e_checks_and_protects_nothing() {
             assert_eq!(NoE2E.check(SOURCE, ID, &[1, 2], [0; 8]), None);
-            assert_eq!(NoE2E.protect(ID, &[1, 2], [0; 8], &mut [0; 4]), None);
+            assert_eq!(NoE2E.protect(ID, &mut [1, 2, 0, 0], 2, [0; 8]), None);
         }
 
         #[test]
@@ -1493,7 +1649,7 @@ mod tests {
                 Some((NonZeroU8::MIN, &[8u8, 7][..]))
             );
             assert_eq!(
-                handle.protect(ID, &[1], [0; 8], &mut [0; 2]),
+                handle.protect(ID, &mut [1, 0], 1, [0; 8]),
                 Some(Err(E2EProtectError::BufferTooSmall {
                     needed: 3,
                     available: 2

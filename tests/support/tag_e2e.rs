@@ -53,56 +53,26 @@ impl E2EHandle for TagE2E {
         })
     }
 
-    fn protect(
+    fn protect<'b>(
         &self,
         message_id: MessageId,
-        payload: &[u8],
+        buf: &'b mut [u8],
+        payload_len: usize,
         _upper_header: [u8; 8],
-        out: &mut [u8],
-    ) -> Option<Result<usize, E2EProtectError>> {
+    ) -> Option<Result<&'b [u8], E2EProtectError>> {
         if !self.applies_to(message_id) {
             return None;
         }
-        let needed = payload.len() + 1;
-        if out.len() < needed {
+        let needed = payload_len + 1;
+        if buf.len() < needed {
             return Some(Err(E2EProtectError::BufferTooSmall {
                 needed,
-                available: out.len(),
+                available: buf.len(),
             }));
         }
-        out[0] = TAG;
-        out[1..needed].copy_from_slice(payload);
-        Some(Ok(needed))
-    }
-
-    fn reset_source(&self, _source: IpAddr) {}
-}
-
-/// A faulty [`E2EHandle`] whose `protect` reports one byte more than `out`
-/// holds, for every message ID.
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
-pub struct OverReportE2E;
-
-impl E2EHandle for OverReportE2E {
-    fn check<'a>(
-        &self,
-        _source: IpAddr,
-        _message_id: MessageId,
-        _payload: &'a [u8],
-        _upper_header: [u8; 8],
-    ) -> Option<(NonZeroU8, &'a [u8])> {
-        None
-    }
-
-    fn protect(
-        &self,
-        _message_id: MessageId,
-        _payload: &[u8],
-        _upper_header: [u8; 8],
-        out: &mut [u8],
-    ) -> Option<Result<usize, E2EProtectError>> {
-        Some(Ok(out.len() + 1))
+        buf.copy_within(..payload_len, 1);
+        buf[0] = TAG;
+        Some(Ok(&buf[..needed]))
     }
 
     fn reset_source(&self, _source: IpAddr) {}

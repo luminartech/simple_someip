@@ -6,7 +6,6 @@ use super::subscription_manager::{SUBSCRIBERS_PER_GROUP, SubscriptionHandle};
 use crate::CapacityKind;
 use crate::protocol::{Header, Message};
 use crate::traits::PayloadWireFormat;
-use crate::transport::E2EProtectError;
 use crate::transport::{E2EHandle, SharedHandle, TransportSocket};
 use automotive_wire_codec::Encode;
 use core::marker::PhantomData;
@@ -119,18 +118,10 @@ where
 
     /// Publish an event to all subscribers of an event group using caller-provided scratch.
     ///
-    /// The `msg_buf` and `protected_buf` slices are the two scratch areas
-    /// needed for the send path:
-    ///
-    /// - `msg_buf` — receives the serialized SOME/IP frame (including any
-    ///   protected payload's copy-back). Must be large enough to hold the full
-    ///   protected datagram: 16 header bytes plus the protected payload.
-    ///   On the bare-metal path, callers typically supply a `static [u8; N]`.
-    ///
-    /// - `protected_buf` — temporary scratch for the
-    ///   [`E2EHandle::protect`](crate::E2EHandle::protect) output, disjoint
-    ///   from `msg_buf`. Must be at least as large as the protected payload.
-    ///   Unused when the handle does not protect the message.
+    /// `msg_buf` receives the serialized SOME/IP frame, which the
+    /// [`E2EHandle`](crate::E2EHandle) protects in place. It must hold the
+    /// full protected datagram: 16 header bytes plus the protected payload.
+    /// On the bare-metal path, callers typically supply a `static [u8; N]`.
     ///
     /// # Arguments
     /// * `service_id` - Service ID
@@ -138,13 +129,12 @@ where
     /// * `event_group_id` - Event group ID
     /// * `message` - The SOME/IP message to send (must be a notification/event)
     /// * `msg_buf` - Caller-supplied scratch for the outgoing datagram
-    /// * `protected_buf` - Caller-supplied scratch for the protected payload
     ///
     /// # Errors
     ///
     /// Returns an error if the message fails to serialize, or
-    /// [`Error::Capacity`]`("udp_buffer")` if either scratch buffer is too small
-    /// for the encoded or E2E-protected frame.
+    /// [`Error::Capacity`]`(`[`CapacityKind::UdpBuffer`]`)` if `msg_buf` is
+    /// too small for the encoded or protected frame.
     ///
     /// # Panics
     ///
@@ -158,7 +148,6 @@ where
         event_group_id: u16,
         message: &Message<P>,
         msg_buf: &mut [u8],
-        protected_buf: &mut [u8],
     ) -> Result<usize, Error> {
         // Snapshot subscriber addresses into a stack-allocated buffer so
         // we can release the subscription read lock before doing async
@@ -210,44 +199,16 @@ where
             .encode_to_slice(msg_buf)
             .map_err(crate::protocol::Error::from)?;
 
-        {
-            let message_id = message.header().message_id();
-            let upper_header: [u8; 8] = msg_buf[8..16].try_into().expect("upper header slice");
-            match self.e2e_registry.protect(
-                message_id,
-                &msg_buf[16..message_length],
-                upper_header,
-                protected_buf,
-            ) {
-                Some(Ok(protected_len)) => {
-                    if protected_len > protected_buf.len() || 16 + protected_len > msg_buf.len() {
-                        crate::log::error!(
-                            "Protected payload ({} bytes) exceeds protected_buf ({}) or msg_buf ({}); dropping publish",
-                            protected_len,
-                            protected_buf.len(),
-                            msg_buf.len()
-                        );
-                        return Err(Error::Capacity(CapacityKind::UdpBuffer));
-                    }
-                    #[allow(clippy::cast_possible_truncation)]
-                    let new_length: u32 = 8 + protected_len as u32;
-                    msg_buf[4..8].copy_from_slice(&new_length.to_be_bytes());
-                    msg_buf[16..16 + protected_len]
-                        .copy_from_slice(&protected_buf[..protected_len]);
-                    message_length = 16 + protected_len;
-                }
-                Some(Err(E2EProtectError::BufferTooSmall { needed, available })) => {
+        message_length =
+            crate::transport::protect_in_place(&self.e2e_registry, msg_buf, message_length)
+                .map_err(|e| {
                     crate::log::error!(
-                        "Protecting {:?} needs {} bytes of scratch, {} available; dropping publish",
-                        message_id,
-                        needed,
-                        available
+                        "Protecting {:?} failed: {:?}; dropping publish",
+                        message.header().message_id(),
+                        e
                     );
-                    return Err(Error::Capacity(CapacityKind::UdpBuffer));
-                }
-                None => {}
-            }
-        }
+                    Error::Capacity(CapacityKind::UdpBuffer)
+                })?;
 
         let datagram = &msg_buf[..message_length];
 
@@ -296,7 +257,7 @@ where
     /// Publish an event to all subscribers of an event group.
     ///
     /// Convenience wrapper over [`Self::publish_event_with_buffers`] that
-    /// internally allocates the two scratch `Vec`s required for the send
+    /// internally allocates the scratch `Vec` required for the send
     /// path. Available only when an allocator is present (`_alloc` feature).
     /// Bare-metal callers without an allocator must supply their own
     /// scratch via [`Self::publish_event_with_buffers`] directly.
@@ -331,14 +292,12 @@ where
         for<'a> S::ForEachFuture<'a>: Send,
     {
         let mut msg_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
-        let mut protected_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
         self.publish_event_with_buffers(
             service_id,
             instance_id,
             event_group_id,
             message,
             &mut msg_buf,
-            &mut protected_buf,
         )
         .await
     }
@@ -1205,15 +1164,22 @@ mod tests {
             ) -> Option<(core::num::NonZeroU8, &'a [u8])> {
                 None
             }
-            fn protect(
+            fn protect<'b>(
                 &self,
                 _: MessageId,
-                payload: &[u8],
+                buf: &'b mut [u8],
+                payload_len: usize,
                 _: [u8; 8],
-                out: &mut [u8],
-            ) -> Option<Result<usize, E2EProtectError>> {
-                out[1..=payload.len()].copy_from_slice(payload);
-                Some(Ok(payload.len() + 1))
+            ) -> Option<Result<&'b [u8], E2EProtectError>> {
+                let needed = payload_len + 1;
+                if buf.len() < needed {
+                    return Some(Err(E2EProtectError::BufferTooSmall {
+                        needed,
+                        available: buf.len(),
+                    }));
+                }
+                buf.copy_within(..payload_len, 1);
+                Some(Ok(&buf[..needed]))
             }
             fn reset_source(&self, _: core::net::IpAddr) {}
         }
@@ -1260,64 +1226,6 @@ mod tests {
             Error::Capacity(tag) => assert_eq!(tag, CapacityKind::UdpBuffer),
             other => panic!("expected Error::Capacity(\"udp_buffer\"), got {other:?}"),
         }
-    }
-
-    /// A hook that reports more protected bytes than `protected_buf` holds
-    /// yields `Capacity`, even when `msg_buf` is large enough.
-    #[tokio::test]
-    async fn test_publish_with_a_hook_over_reporting_its_length_returns_capacity() {
-        use crate::RawPayload;
-        use crate::protocol::MessageId;
-        use crate::transport::{E2EHandle, E2EProtectError};
-
-        #[derive(Clone)]
-        struct OverReport;
-        impl E2EHandle for OverReport {
-            fn check<'a>(
-                &self,
-                _: core::net::IpAddr,
-                _: MessageId,
-                _: &'a [u8],
-                _: [u8; 8],
-            ) -> Option<(core::num::NonZeroU8, &'a [u8])> {
-                None
-            }
-            fn protect(
-                &self,
-                _: MessageId,
-                _: &[u8],
-                _: [u8; 8],
-                out: &mut [u8],
-            ) -> Option<Result<usize, E2EProtectError>> {
-                Some(Ok(out.len() + 1))
-            }
-            fn reset_source(&self, _: core::net::IpAddr) {}
-        }
-
-        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
-        {
-            let mut mgr = subscriptions.write().await;
-            mgr.subscribe(0x5B, 1, 0x01, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9998))
-                .unwrap();
-        }
-        let socket = bind_tokio_socket().await;
-        let publisher = EventPublisher::new(subscriptions, socket, OverReport);
-
-        let message_id = MessageId::new_from_service_and_method(0x5B, 0x8001);
-        let payload = RawPayload::from_payload_bytes(message_id, &[1, 2, 3, 4]).unwrap();
-        let header = Header::new_event(0x5B, 0x8001, 0x0001_0001, 0x01, 0x01, 4);
-        let message = Message::new(header, payload);
-
-        let mut msg_buf = [0u8; 200];
-        let mut protected_buf = [0u8; 20];
-        let err = publisher
-            .publish_event_with_buffers(0x5B, 1, 0x01, &message, &mut msg_buf, &mut protected_buf)
-            .await
-            .expect_err("an over-reported length must error, not panic");
-        assert!(
-            matches!(err, Error::Capacity(CapacityKind::UdpBuffer)),
-            "got {err:?}"
-        );
     }
 
     #[tokio::test]

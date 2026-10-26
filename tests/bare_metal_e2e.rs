@@ -51,7 +51,7 @@ use simple_someip::transport::{
 use simple_someip::{
     CapacityKind, Client, ClientDeps, NoE2E, RawPayload, Server, ServerDeps, UDP_BUFFER_SIZE,
 };
-use tag_e2e::{OverReportE2E, TagE2E};
+use tag_e2e::TagE2E;
 
 // ── Static-pool channel factory ───────────────────────────────────────
 //
@@ -1092,65 +1092,6 @@ async fn e2e_protect_expanding_payload_beyond_leased_buffer_returns_capacity_err
     run_handle.abort();
 }
 
-/// A hook that reports more protected bytes than its scratch holds must
-/// yield `Capacity`, even when the send buffer itself is large enough.
-#[tokio::test]
-async fn hook_over_reporting_its_length_returns_capacity_not_panic() {
-    static POOL: BufferPool<4, 2048> = BufferPool::new();
-
-    let network = SharedNetwork::new();
-    let client_factory = MockFactory {
-        tx_pipe: Arc::clone(&network.client_to_server),
-        rx_pipe: Arc::clone(&network.server_to_client),
-        next_port: Arc::new(Mutex::new(300)),
-    };
-    let deps = ClientDeps {
-        factory: client_factory,
-        spawner: TokioBackedSpawner,
-        timer: MockTimer,
-        e2e_registry: OverReportE2E,
-        interface: Arc::new(RwLock::new(Ipv4Addr::LOCALHOST)),
-        buffer_provider: StaticBufferProvider(&POOL),
-    };
-    let (client, _updates, run_fut) =
-        Client::<RawPayload, OverReportE2E, Arc<RwLock<Ipv4Addr>>, E2ETestChannels>::new_with_deps(
-            deps, false,
-        );
-    let run_handle = tokio::spawn(run_fut);
-
-    let key = ServiceEndpointKey::udp(
-        0xABCD,
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30801)),
-    );
-    client
-        .add_endpoint(key, 1, 42001)
-        .await
-        .expect("add_endpoint");
-
-    let msg_id = MessageId::new_from_service_and_method(0xABCD, 0x0001);
-    let request = Message::<RawPayload>::new(
-        Header::new(
-            msg_id,
-            0x0001_0001,
-            1,
-            1,
-            MessageTypeField::new(MessageType::Request, false),
-            ReturnCode::Ok,
-            4,
-        ),
-        RawPayload::from_payload_bytes(msg_id, &[1, 2, 3, 4]).expect("create payload"),
-    );
-    let result = client.send_to_service(key, request).await;
-
-    assert!(
-        matches!(result, Err(ClientError::Capacity(CapacityKind::UdpBuffer))),
-        "expected Err(Capacity(UdpBuffer)), got {result:?}"
-    );
-
-    client.shut_down();
-    run_handle.abort();
-}
-
 // ── Task 1 (PR 3, #125): SD send-helper buf.len() rejection ──────────────────
 //
 // The three SD send helpers (`send_unicast_offer`, `send_subscribe_ack_from_view`,
@@ -1184,14 +1125,14 @@ fn empty_vec_sd_header() -> simple_someip::VecSdHeader {
 // ── Task 4 (PR 3, #125): server EventPublisher publish paths take caller scratch ─
 
 /// Task 4 regression (server-side PR-2 lesson): E2E-protected publish whose
-/// expanded payload exceeds the caller-provided `msg_buf` / `protected_buf`
+/// expanded payload exceeds the caller-provided `msg_buf`
 /// must return `Err(ServerError::Capacity(CapacityKind::UdpBuffer))`, NOT panic from
 /// an out-of-bounds copy.
 ///
 /// # Why the window is deterministic
 ///
 /// The tag adds one byte. Unprotected frame: 16 + 24 = 40 bytes; tagged:
-/// 16 + 25 = 41 bytes; both scratch buffers: 40 bytes. Publishing must
+/// 16 + 25 = 41 bytes; `msg_buf`: 40 bytes. Publishing must
 /// return `Capacity` instead of writing past the scratch buffer.
 #[tokio::test]
 async fn e2e_publish_with_undersized_scratch_returns_capacity_not_panic() {
@@ -1244,19 +1185,11 @@ async fn e2e_publish_with_undersized_scratch_returns_capacity_not_panic() {
         payload,
     );
 
-    // ── 40-byte scratch buffers: fit the unprotected frame, not the tagged one ──
+    // ── 40-byte buffer: fits the unprotected frame, not the tagged one ──
     let mut msg_buf = [0u8; 40];
-    let mut protected_buf = [0u8; 40];
 
     let result = publisher
-        .publish_event_with_buffers(
-            service_id,
-            1,
-            0x01,
-            &message,
-            &mut msg_buf,
-            &mut protected_buf,
-        )
+        .publish_event_with_buffers(service_id, 1, 0x01, &message, &mut msg_buf)
         .await;
 
     // Must return typed Capacity error — NOT panic from out-of-bounds copy.
@@ -1417,17 +1350,10 @@ async fn future_size_witness_bm_server_publish_future() {
 
     // ── Caller-provided scratch buffers (simulate app-side static arrays) ──
     let mut msg_buf = [0u8; UDP_BUFFER_SIZE];
-    let mut protected_buf = [0u8; UDP_BUFFER_SIZE];
 
     // Construct the future WITHOUT awaiting it so we can measure its size.
-    let publish_future = publisher.publish_event_with_buffers(
-        service_id,
-        1,
-        0x01,
-        &message,
-        &mut msg_buf,
-        &mut protected_buf,
-    );
+    let publish_future =
+        publisher.publish_event_with_buffers(service_id, 1, 0x01, &message, &mut msg_buf);
 
     let future_size = core::mem::size_of_val(&publish_future);
     // Drop the future (do not drive it — no real subscribers in this witness).

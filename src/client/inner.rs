@@ -2799,13 +2799,13 @@ mod tests {
             None
         }
 
-        fn protect(
+        fn protect<'b>(
             &self,
             _message_id: crate::protocol::MessageId,
-            _payload: &[u8],
+            _buf: &'b mut [u8],
+            _payload_len: usize,
             _upper_header: [u8; 8],
-            _out: &mut [u8],
-        ) -> Option<Result<usize, crate::E2EProtectError>> {
+        ) -> Option<Result<&'b [u8], crate::E2EProtectError>> {
             None
         }
 
