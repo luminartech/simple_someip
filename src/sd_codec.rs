@@ -582,10 +582,16 @@ mod tests {
     #[test]
     fn stop_offer_is_built_whatever_the_requested_ttl() {
         let mut buf = [0u8; 512];
-        let len = build_stop_offer_service_datagram(&mut buf, &req(0x0001, 30501), 1).unwrap();
-        let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
-        let entry = view.entries().next().unwrap();
-        assert!(entry.is_stop_offer());
+        for ttl in [3, u32::MAX] {
+            let request = OfferServiceRequest {
+                ttl,
+                ..req(0x0001, 30501)
+            };
+            let len = build_stop_offer_service_datagram(&mut buf, &request, 1).unwrap();
+            let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+            let entry = view.entries().next().unwrap();
+            assert!(entry.is_stop_offer());
+        }
     }
 
     #[test]

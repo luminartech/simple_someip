@@ -262,9 +262,8 @@ impl Entry {
     fn check_ttl(&self) -> Result<(), crate::protocol::Error> {
         match self {
             Entry::OfferService(s) if s.ttl == 0 => Err(Error::InvalidTtl(0).into()),
-            Entry::FindService(s) | Entry::OfferService(s) | Entry::StopOfferService(s) => {
-                check_ttl_range(s.ttl)
-            }
+            Entry::FindService(s) | Entry::OfferService(s) => check_ttl_range(s.ttl),
+            Entry::StopOfferService(_) => Ok(()),
             Entry::SubscribeEventGroup(e) | Entry::SubscribeAckEventGroup(e) => {
                 check_ttl_range(e.ttl)
             }
@@ -318,7 +317,8 @@ impl Encode for Entry {
     /// # Errors
     ///
     /// Returns [`Error::InvalidTtl`] when the TTL is above [`MAX_TTL`], or is
-    /// 0 on an [`Entry::OfferService`].
+    /// 0 on an [`Entry::OfferService`]. An [`Entry::StopOfferService`] is
+    /// never rejected, since it encodes with a TTL of 0.
     fn encoded_size(&self) -> Result<usize, Self::Error> {
         self.check_ttl()?;
         Ok(ENTRY_SIZE)
@@ -1133,5 +1133,23 @@ mod tests {
                 Err(crate::protocol::Error::Sd(Error::InvalidTtl(t))) if t == too_long
             ));
         }
+    }
+
+    #[test]
+    fn stop_offer_encodes_with_ttl_0_whatever_its_stored_ttl() {
+        let entry = Entry::StopOfferService(ServiceEntry {
+            ttl: u32::MAX,
+            ..make_service_entry()
+        });
+        assert_eq!(entry.encoded_size().unwrap(), ENTRY_SIZE);
+        let mut buf = [0u8; ENTRY_SIZE];
+        entry.encode(&mut buf.as_mut_slice()).unwrap();
+        assert_eq!(
+            EntryView(&buf).to_owned().unwrap(),
+            Entry::StopOfferService(ServiceEntry {
+                ttl: 0,
+                ..make_service_entry()
+            })
+        );
     }
 }
