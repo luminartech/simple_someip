@@ -92,7 +92,8 @@ pub enum BuildError {
     /// An entry's TTL is above [`MAX_TTL`](crate::protocol::sd::MAX_TTL), or
     /// an offer's TTL is 0; carries the rejected TTL.
     InvalidTtl(u32),
-    /// SD or SOME/IP encoding failed mid-write.
+    /// Sizing or encoding the SD or SOME/IP datagram failed for a reason
+    /// other than [`BuildError::InvalidTtl`].
     EncodeFailed,
 }
 
@@ -110,7 +111,7 @@ impl core::fmt::Display for BuildError {
                     "SD entry TTL {ttl} is invalid: an offer needs 1..=0xFFFFFF seconds, other entries at most 0xFFFFFF"
                 )
             }
-            BuildError::EncodeFailed => f.write_str("encoding failed mid-write"),
+            BuildError::EncodeFailed => f.write_str("sizing or encoding failed"),
         }
     }
 }
@@ -127,11 +128,17 @@ impl From<EncodeToSliceError<crate::protocol::Error>> for BuildError {
     fn from(e: EncodeToSliceError<crate::protocol::Error>) -> Self {
         match e {
             EncodeToSliceError::InsufficientBuffer(ib) => BuildError::BufferTooSmall(ib),
-            EncodeToSliceError::Encode(crate::protocol::Error::Sd(
-                crate::protocol::sd::Error::InvalidTtl(ttl),
-            )) => BuildError::InvalidTtl(ttl),
-            EncodeToSliceError::Encode(_) => BuildError::EncodeFailed,
+            EncodeToSliceError::Encode(e) => encode_error(&e),
         }
+    }
+}
+
+fn encode_error(e: &crate::protocol::Error) -> BuildError {
+    match e {
+        crate::protocol::Error::Sd(crate::protocol::sd::Error::InvalidTtl(ttl)) => {
+            BuildError::InvalidTtl(*ttl)
+        }
+        _ => BuildError::EncodeFailed,
     }
 }
 
@@ -340,9 +347,7 @@ fn encode_sd_datagram(
     // computable without writing, so the SOME/IP length field is known before
     // either section is written. One linear forward pass — no backfill.
     let sd_payload = SdHeader::new(Flags::new_sd(reboot), entries, options);
-    let sd_payload_len = sd_payload
-        .encoded_size()
-        .map_err(|_| BuildError::EncodeFailed)?;
+    let sd_payload_len = sd_payload.encoded_size().map_err(|e| encode_error(&e))?;
     let total = SOMEIP_HEADER_LEN + sd_payload_len;
     if buf.len() < total {
         return Err(BuildError::BufferTooSmall(InsufficientBuffer {

@@ -870,10 +870,9 @@ where
                             }
                         }
                         Some(discovery_socket) => {
-                            // Sizing the SD header is fallible for a
-                            // downstream `PayloadWireFormat`. Report it rather
-                            // than sending a header whose declared length
-                            // disagrees with the payload that follows it.
+                            // `new_sd` sizes the header and can fail (see its
+                            // `# Errors`); report it rather than send a
+                            // mis-declared length.
                             match Message::<PayloadDefinitions>::new_sd(
                                 u32::from(discovery_socket.session_id()),
                                 &header,
@@ -1139,9 +1138,9 @@ where
                             let session_id = u32::from(discovery_socket.session_id());
                             let target =
                                 SocketAddrV4::new(*provider.ip(), protocol::sd::MULTICAST_PORT);
-                            // See the SendSD arm: a downstream SD header can
-                            // fail to size, and a mis-declared length is worse
-                            // on the wire than a reported error.
+                            // See the SendSD arm: sizing can fail, and a
+                            // mis-declared length is worse on the wire than a
+                            // reported error.
                             match Message::<PayloadDefinitions>::new_sd(session_id, &sd_header) {
                                 Ok(message) => {
                                     debug!("Sending Subscribe {:?} to {}", &message, target);

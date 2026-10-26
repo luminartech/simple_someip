@@ -23,9 +23,11 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
     ///
     /// Returns the error from [`Encode::encoded_size`] on the SD header. For the
     /// in-tree headers that is
-    /// [`UnencodableOption`](crate::protocol::sd::Error::UnencodableOption),
-    /// returned only when the header holds a received option of unknown type,
-    /// [`Options::Unknown`](crate::protocol::sd::Options::Unknown).
+    /// [`UnencodableOption`](crate::protocol::sd::Error::UnencodableOption)
+    /// when the header holds a received option of unknown type,
+    /// [`Options::Unknown`](crate::protocol::sd::Options::Unknown), or
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) when an entry's
+    /// TTL is out of range.
     pub fn new_sd(
         request_id: u32,
         sd_header: &<PayloadDefinition as PayloadWireFormat>::SdHeader,

@@ -138,17 +138,28 @@ impl EventGroupEntry {
     }
 }
 
+fn check_ttl_range(ttl: u32) -> Result<(), crate::protocol::Error> {
+    if ttl > MAX_TTL {
+        return Err(Error::InvalidTtl(ttl).into());
+    }
+    Ok(())
+}
+
 impl Encode for EventGroupEntry {
     type Error = crate::protocol::Error;
 
+    /// Returns the wire size of the entry body, 15 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidTtl`] when the TTL is above [`MAX_TTL`].
     fn encoded_size(&self) -> Result<usize, Self::Error> {
+        check_ttl_range(self.ttl)?;
         Ok(15)
     }
 
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
-        if self.ttl > MAX_TTL {
-            return Err(Error::InvalidTtl(self.ttl).into());
-        }
+        check_ttl_range(self.ttl)?;
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;
         writer.write_u8(u8::from(self.options_count))?;
@@ -204,14 +215,18 @@ impl ServiceEntry {
 impl Encode for ServiceEntry {
     type Error = crate::protocol::Error;
 
+    /// Returns the wire size of the entry body, 15 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidTtl`] when the TTL is above [`MAX_TTL`].
     fn encoded_size(&self) -> Result<usize, Self::Error> {
+        check_ttl_range(self.ttl)?;
         Ok(15)
     }
 
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
-        if self.ttl > MAX_TTL {
-            return Err(Error::InvalidTtl(self.ttl).into());
-        }
+        check_ttl_range(self.ttl)?;
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;
         writer.write_u8(u8::from(self.options_count))?;
@@ -244,6 +259,18 @@ pub enum Entry {
 }
 
 impl Entry {
+    fn check_ttl(&self) -> Result<(), crate::protocol::Error> {
+        match self {
+            Entry::OfferService(s) if s.ttl == 0 => Err(Error::InvalidTtl(0).into()),
+            Entry::FindService(s) | Entry::OfferService(s) | Entry::StopOfferService(s) => {
+                check_ttl_range(s.ttl)
+            }
+            Entry::SubscribeEventGroup(e) | Entry::SubscribeAckEventGroup(e) => {
+                check_ttl_range(e.ttl)
+            }
+        }
+    }
+
     /// Returns the number of options in the first options run.
     #[must_use]
     pub fn first_options_count(&self) -> u8 {
@@ -286,19 +313,19 @@ impl Entry {
 impl Encode for Entry {
     type Error = crate::protocol::Error;
 
+    /// Returns the wire size of every entry, 16 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidTtl`] when the TTL is above [`MAX_TTL`], or is
+    /// 0 on an [`Entry::OfferService`].
     fn encoded_size(&self) -> Result<usize, Self::Error> {
-        // 1 type byte + 15 body bytes = 16 (ENTRY_SIZE) for every variant.
+        self.check_ttl()?;
         Ok(ENTRY_SIZE)
     }
 
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
-        let ttl = match self {
-            Entry::FindService(s) | Entry::OfferService(s) | Entry::StopOfferService(s) => s.ttl,
-            Entry::SubscribeEventGroup(e) | Entry::SubscribeAckEventGroup(e) => e.ttl,
-        };
-        if ttl > MAX_TTL || (ttl == 0 && matches!(self, Entry::OfferService(_))) {
-            return Err(Error::InvalidTtl(ttl).into());
-        }
+        self.check_ttl()?;
         let body = match self {
             Entry::FindService(service_entry) => {
                 writer.write_u8(u8::from(EntryType::FindService))?;
@@ -1087,5 +1114,24 @@ mod tests {
                 available: 4,
             })
         ));
+    }
+
+    #[test]
+    fn entry_bodies_with_ttl_above_max_fail_sizing() {
+        let too_long = MAX_TTL + 1;
+        let service = ServiceEntry {
+            ttl: too_long,
+            ..make_service_entry()
+        };
+        let event_group = EventGroupEntry {
+            ttl: too_long,
+            ..make_event_group_entry()
+        };
+        for size in [service.encoded_size(), event_group.encoded_size()] {
+            assert!(matches!(
+                size,
+                Err(crate::protocol::Error::Sd(Error::InvalidTtl(t))) if t == too_long
+            ));
+        }
     }
 }

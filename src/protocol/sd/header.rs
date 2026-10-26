@@ -33,6 +33,10 @@ impl<'a> Header<'a> {
         }
     }
 
+    fn entries_size(&self) -> Result<usize, crate::protocol::Error> {
+        self.entries.iter().map(Entry::encoded_size).sum()
+    }
+
     fn options_size(&self) -> Result<usize, crate::protocol::Error> {
         self.options.iter().map(Options::encoded_size).sum()
     }
@@ -309,26 +313,25 @@ impl Encode for Header<'_> {
     ///
     /// Returns [`UnencodableOption`](super::Error::UnencodableOption) when
     /// the header holds a received option of unknown type,
-    /// [`Options::Unknown`].
+    /// [`Options::Unknown`], or [`InvalidTtl`](super::Error::InvalidTtl) when
+    /// an entry's TTL is out of range.
     fn encoded_size(&self) -> Result<usize, Self::Error> {
-        Ok(12 + self.entries.len() * ENTRY_SIZE + self.options_size()?)
+        Ok(12 + self.entries_size()? + self.options_size()?)
     }
 
     /// Writes this header to `writer`.
     ///
     /// # Errors
     ///
-    /// Returns [`UnencodableOption`](super::Error::UnencodableOption) before
-    /// writing anything when the header holds an [`Options::Unknown`],
-    /// [`InvalidTtl`](super::Error::InvalidTtl) when an entry's TTL is out of
-    /// range, or the writer's error.
+    /// Returns the [`encoded_size`](Encode::encoded_size) error before writing
+    /// anything, or the writer's error.
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
+        let entries_size = self.entries_size()?;
         let options_size = self.options_size()?;
         writer.write_u8(u8::from(self.flags))?;
         let reserved: [u8; 3] = [0; 3];
         writer.write_bytes(&reserved)?;
-        let entries_size = u32::try_from(self.entries.len() * 16).expect("entries size fits u32");
-        writer.write_u32_be(entries_size)?;
+        writer.write_u32_be(u32::try_from(entries_size).expect("entries size fits u32"))?;
         for entry in self.entries {
             entry.encode(writer)?;
         }
@@ -336,7 +339,7 @@ impl Encode for Header<'_> {
         for option in self.options {
             option.encode(writer)?;
         }
-        Ok(12 + entries_size as usize + options_size)
+        Ok(12 + entries_size + options_size)
     }
 }
 
@@ -791,5 +794,28 @@ mod tests {
         let option_err = options[0].encoded_size().unwrap_err();
         assert_same_error(&err, &option_err);
         assert_eq!(writer.len(), 128, "nothing was written");
+    }
+
+    #[test]
+    fn an_entry_with_an_invalid_ttl_fails_sizing_and_writes_nothing() {
+        let find = Entry::FindService(ServiceEntry::find(0x1234));
+        let offer = Entry::OfferService(ServiceEntry {
+            ttl: 0,
+            ..ServiceEntry::find(0x1234)
+        });
+        let entries = [find, offer];
+        let header = Header::new(Flags::new_sd(RebootFlag::RecentlyRebooted), &entries, &[]);
+
+        assert!(matches!(
+            header.encoded_size(),
+            Err(crate::protocol::Error::Sd(SdError::InvalidTtl(0)))
+        ));
+        let mut buf = [0u8; 64];
+        let mut writer = buf.as_mut_slice();
+        assert!(matches!(
+            header.encode(&mut writer),
+            Err(crate::protocol::Error::Sd(SdError::InvalidTtl(0)))
+        ));
+        assert_eq!(writer.len(), 64, "nothing was written");
     }
 }
