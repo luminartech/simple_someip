@@ -9,6 +9,8 @@
 //! eventgroup), so sibling protocol crates can share the same shape.
 
 use core::net::SocketAddr;
+#[cfg(feature = "client")]
+use core::net::{Ipv4Addr, SocketAddrV4};
 
 /// Transport protocol of a network endpoint.
 ///
@@ -51,10 +53,61 @@ impl NetEndpoint {
     }
 }
 
+/// The endpoint a peer is reached at, chosen from the IPv4 endpoint options of
+/// one SD entry: the first UDP endpoint, else the first TCP one, else `None`.
+#[cfg(feature = "client")]
+pub(crate) fn preferred_ipv4_endpoint(
+    endpoints: impl Iterator<Item = (Ipv4Addr, TransportProtocol, u16)>,
+) -> Option<NetEndpoint> {
+    let mut tcp = None;
+    for (ip, protocol, port) in endpoints {
+        let endpoint = NetEndpoint::new(SocketAddr::V4(SocketAddrV4::new(ip, port)), protocol);
+        if protocol == TransportProtocol::Udp {
+            return Some(endpoint);
+        }
+        tcp.get_or_insert(endpoint);
+    }
+    tcp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use core::net::{Ipv4Addr, SocketAddrV4};
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn prefers_udp_over_an_earlier_tcp_endpoint() {
+        let tcp = (Ipv4Addr::new(10, 0, 0, 1), TransportProtocol::Tcp, 30501);
+        let udp = (Ipv4Addr::new(10, 0, 0, 2), TransportProtocol::Udp, 30502);
+        let chosen = preferred_ipv4_endpoint([tcp, udp].into_iter());
+        assert_eq!(
+            chosen,
+            Some(NetEndpoint::udp(SocketAddr::V4(SocketAddrV4::new(
+                udp.0, udp.2
+            ))))
+        );
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn falls_back_to_the_first_tcp_endpoint() {
+        let first = (Ipv4Addr::new(10, 0, 0, 1), TransportProtocol::Tcp, 30501);
+        let second = (Ipv4Addr::new(10, 0, 0, 2), TransportProtocol::Tcp, 30502);
+        let chosen = preferred_ipv4_endpoint([first, second].into_iter());
+        assert_eq!(
+            chosen,
+            Some(NetEndpoint::tcp(SocketAddr::V4(SocketAddrV4::new(
+                first.0, first.2
+            ))))
+        );
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn no_ipv4_endpoint_is_none() {
+        assert_eq!(preferred_ipv4_endpoint(core::iter::empty()), None);
+    }
 
     #[test]
     fn constructors_set_protocol() {
