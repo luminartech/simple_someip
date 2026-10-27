@@ -1474,21 +1474,90 @@ mod tests {
         let sm_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, sm.port());
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        // A NOTIFICATION segment for service 0x1234 (TP flag set, More Segments).
-        let tp_segment = [
-            &[
-                0x12, 0x34, 0x80, 0x01, 0, 0, 0, 13, 0, 0, 0, 2, 0x01, 0x01, 0x22, 0x00,
-            ][..],
-            &[0, 0, 0, 1, 0xAA],
-        ]
-        .concat();
-        let datagram = [sd_datagram(&[1]), tp_segment, sd_datagram(&[3])].concat();
+        let datagram = [sd_datagram(&[1]), tp_segment(), sd_datagram(&[3])].concat();
         peer.send_to(&datagram, sm_addr).await.unwrap();
         peer.send_to(&sd_datagram(&[4]), sm_addr).await.unwrap();
 
         for want in [1, 3, 4] {
             assert_eq!(next_session(&mut sm).await, want);
         }
+    }
+
+    /// A NOTIFICATION segment of service 0x1234, event 0x8001, request
+    /// `0x0000_0002` (TP flag set, More Segments).
+    fn tp_segment() -> Vec<u8> {
+        [
+            &[
+                0x12, 0x34, 0x80, 0x01, 0, 0, 0, 13, 0, 0, 0, 2, 0x01, 0x01, 0x22, 0x00,
+            ][..],
+            &[0, 0, 0, 1, 0xAA],
+        ]
+        .concat()
+    }
+
+    /// A RESPONSE of service 0x1234, method 0x0001, request `0x0001_0002`,
+    /// whose Length claims `claimed` payload bytes and which carries `payload`.
+    fn response(claimed: u32, payload: &[u8]) -> Vec<u8> {
+        [
+            &[0x12, 0x34, 0x00, 0x01][..],
+            &(8 + claimed).to_be_bytes(),
+            &[0x00, 0x01, 0x00, 0x02, 0x01, 0x01, 0x80, 0x00],
+            payload,
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn a_malformed_response_after_a_tp_segment_keeps_its_own_header() {
+        let source = SocketAddr::from((Ipv4Addr::LOCALHOST, 30509));
+        let datagram = [tp_segment(), response(10, &[0xAB, 0xCD])].concat();
+        let Some(Err(err)) = split_message(&datagram) else {
+            panic!("a Length past the end of the datagram is malformed");
+        };
+
+        let received = malformed_message::<TestPayload>(&datagram, source, err)
+            .expect("the RESPONSE's header parses");
+
+        let id = received.header.message_id();
+        assert_eq!((id.service_id(), id.method_id()), (0x1234, 0x0001));
+        assert_eq!(received.header.request_id(), 0x0001_0002);
+        assert_eq!(
+            received.header.message_type().message_type(),
+            crate::protocol::MessageType::Response
+        );
+        assert!(received.payload.is_err());
+        assert_eq!(received.source, source);
+        assert_eq!(received.e2e_status, None);
+    }
+
+    #[test]
+    fn bytes_too_short_for_a_header_are_a_bare_error() {
+        let source = SocketAddr::from((Ipv4Addr::LOCALHOST, 30509));
+        let junk = [0u8; 5];
+        let Some(Err(err)) = split_message(&junk) else {
+            panic!("five bytes hold no message");
+        };
+
+        assert!(malformed_message::<TestPayload>(&junk, source, err).is_err());
+    }
+
+    #[tokio::test]
+    async fn bytes_after_the_last_message_arrive_as_an_error_after_it() {
+        let mut sm = bind_ephemeral_spawned().await;
+        let sm_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, sm.port());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let datagram = [sd_datagram(&[1]), vec![0; 5]].concat();
+        peer.send_to(&datagram, sm_addr).await.unwrap();
+        peer.send_to(&sd_datagram(&[2]), sm_addr).await.unwrap();
+
+        assert_eq!(next_session(&mut sm).await, 1);
+        let trailing = tokio::time::timeout(std::time::Duration::from_secs(2), sm.receive())
+            .await
+            .expect("timed out waiting for the trailing bytes")
+            .expect("socket loop closed");
+        assert!(trailing.is_err(), "the trailing bytes hold no message");
+        assert_eq!(next_session(&mut sm).await, 2);
     }
 
     /// A send that needs the buffer while the inbound channel is full
