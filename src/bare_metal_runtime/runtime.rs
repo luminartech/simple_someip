@@ -79,7 +79,8 @@ type RtServer = Server<
 /// non-SD observer and the runtime's notification RX path. `ctx` is the
 /// opaque word registered at [`init`]; `source` is the sender;
 /// `e2e_status` is what the [`RuntimeConfig::e2e`] handle's check found,
-/// or `None` when no check applied.
+/// or `None` when no check applied. It runs from within [`poll`]; a call
+/// to [`poll`] from it returns without polling.
 pub type DispatchFn = fn(
     ctx: usize,
     source: core::net::SocketAddrV4,
@@ -92,7 +93,8 @@ pub type DispatchFn = fn(
 
 /// Platform callback for a change in the availability of a required service
 /// (see [`RuntimeConfig::required_services`]), called once per change from
-/// within [`poll`]. `ctx` is [`RuntimeConfig::dispatch_ctx`].
+/// within [`poll`]. `ctx` is [`RuntimeConfig::dispatch_ctx`]. A call to
+/// [`poll`] from it returns without polling.
 pub type ServiceFn = fn(ctx: usize, change: ServiceChange);
 
 /// Bind a platform UDP socket / PCB for `port` and register its receive
@@ -306,6 +308,9 @@ static EXECUTOR_INIT: AtomicBool = AtomicBool::new(false);
 /// Reset on `init`'s failure paths so a corrected retry can proceed.
 static INIT_CLAIMED: AtomicBool = AtomicBool::new(false);
 static RUN_READY: AtomicBool = AtomicBool::new(false);
+/// Held while [`poll`] runs the executor, which must not be polled
+/// reentrantly.
+static POLLING: AtomicBool = AtomicBool::new(false);
 
 /// embassy's pender — we tick-poll, so wakes are a no-op.
 #[unsafe(no_mangle)]
@@ -841,12 +846,23 @@ pub fn init(config: RuntimeConfig) -> i32 {
 }
 
 /// Tick the executor once. Call every platform main-loop iteration.
+///
+/// A call made while another `poll` is running, such as from a
+/// [`DispatchFn`] or [`ServiceFn`] callback, returns without polling.
 pub fn poll() {
     if !EXECUTOR_INIT.load(Ordering::Acquire) {
         return;
     }
-    // SAFETY: single-threaded; the platform poll is the sole caller.
+    if POLLING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    // SAFETY: `POLLING` admits one caller at a time, so the executor is
+    // never polled reentrantly.
     unsafe { (*core::ptr::addr_of!(EXECUTOR)).assume_init_ref().poll() };
+    POLLING.store(false, Ordering::Release);
 }
 
 fn next_publish_session() -> u16 {
