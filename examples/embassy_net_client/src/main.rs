@@ -379,6 +379,7 @@ async fn main() {
                 e2e: server_e2e,
                 subscriptions: InMemorySubscriptions::default(),
                 non_sd_observer: None,
+                offer_observer: None,
             };
 
             // Default `H = Arc<F::Socket>`. Annotation is explicit

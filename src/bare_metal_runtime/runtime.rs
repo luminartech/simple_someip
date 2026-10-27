@@ -459,6 +459,7 @@ fn build_server(find_timing: FindTiming) -> bool {
             publisher: (*core::ptr::addr_of!(PUBLISHER)).assume_init_ref(),
             started: &SERVER_STARTED,
             non_sd_observer: Some((dispatch as crate::server::NonSdRequestCallback, 0)),
+            offer_observer: None,
         }
     };
     match Server::new_with_handles(storage, config) {
