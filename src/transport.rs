@@ -1245,6 +1245,10 @@ pub trait OneshotSend<T: Send + 'static>: Send + 'static {
     ///
     /// Returns `Err(value)` if the receiver was already dropped.
     fn send(self, value: T) -> Result<(), T>;
+
+    /// Whether the receiver has been dropped, so nothing sent can be
+    /// received.
+    fn is_closed(&self) -> bool;
 }
 
 /// The receive half of a oneshot channel. Resolves once the sender delivers a

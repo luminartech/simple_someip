@@ -47,8 +47,9 @@ pub enum CapacityKind {
     /// protection.
     UdpBuffer,
 
-    /// Bound by `PENDING_RESPONSES_CAP`. A request was enqueued but the
-    /// in-flight response table is full; the request was dropped.
+    /// Bound by `PENDING_RESPONSES_CAP`. A request was sent, but the
+    /// in-flight response table is full of requests whose callers still hold
+    /// their response handle, so its reply is not tracked.
     PendingResponses,
 
     /// Bound by `REQUEST_QUEUE_CAP`. The client's internal control-message

@@ -980,6 +980,52 @@ async fn request_answered_through<H: E2EHandle + Clone>(
     outcome
 }
 
+/// A request whose caller stopped waiting gives its tracking slot back, so
+/// unanswered requests do not use up the client's pending-response table.
+#[tokio::test]
+async fn abandoned_requests_do_not_use_up_pending_response_slots() {
+    use futures_util::FutureExt;
+
+    let service_id = next_service_id();
+    let silent_peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+    let run_handle = tokio::spawn(run_fut);
+    let key = ServiceEndpointKey::udp(service_id, silent_peer.local_addr().unwrap());
+    client.add_endpoint(key, 1, 0).await.unwrap();
+    let id = MessageId::new_from_service_and_method(service_id, 0x0001);
+    let request = || {
+        Message::new(
+            Header::new(
+                id,
+                0,
+                1,
+                1,
+                MessageTypeField::new(MessageType::Request, false),
+                ReturnCode::Ok,
+                1,
+            ),
+            RawPayload::from_payload_bytes(id, &[0x2A]).unwrap(),
+        )
+    };
+
+    for _ in 0..70 {
+        drop(client.send_to_service(key, request()).await.unwrap());
+    }
+    let awaited = client.send_to_service(key, request()).await.unwrap();
+    // The client tracks a request before it handles the next one.
+    drop(client.send_to_service(key, request()).await.unwrap());
+    let outcome = awaited.response().now_or_never();
+    assert!(
+        outcome.is_none(),
+        "the awaited request is still tracked, got {outcome:?}"
+    );
+
+    client.shut_down();
+    run_handle.abort();
+}
+
 #[tokio::test]
 async fn request_returns_the_response_payload() {
     let payload = request_answered_with(&[(MessageType::Response, ReturnCode::Ok, &[0x07])])

@@ -317,7 +317,8 @@ pub(super) struct Inner<
     /// Queue of pending control messages to process
     request_queue: Deque<ControlMessage<PayloadDefinitions, C>, REQUEST_QUEUE_CAP>,
     /// Pending request-responses keyed by `request_id` (`client_id` << 16 | `session_counter`).
-    /// Set by `SendToService`, cleared when a matching unicast arrives.
+    /// Set by `SendToService`, cleared when a matching unicast arrives or,
+    /// once the map is full, when its caller has stopped waiting.
     pending_responses: FnvIndexMap<
         u32,
         C::OneshotSender<Result<PayloadDefinitions, Error>>,
@@ -538,9 +539,10 @@ where
     }
 
     /// Tracks the caller's response channel against `request_id` so a
-    /// future unicast reply can be routed back. If the
-    /// `pending_responses` map is already at `PENDING_RESPONSES_CAP`, the
-    /// `response` sender is recovered from the failed `insert` and used
+    /// future unicast reply can be routed back. When the
+    /// `pending_responses` map is full, it first drops every entry whose
+    /// caller has stopped waiting. If the map is still at
+    /// `PENDING_RESPONSES_CAP`, the `response` sender is recovered from the failed `insert` and used
     /// to deliver `Err(Error::Capacity(CapacityKind::PendingResponses))` — the
     /// caller's `PendingResponse::response().await` resolves cleanly
     /// instead of panicking on the `RecvError` that dropping the Sender
@@ -559,6 +561,10 @@ where
         request_id: u32,
         response: C::OneshotSender<Result<PayloadDefinitions, Error>>,
     ) {
+        if self.pending_responses.len() == PENDING_RESPONSES_CAP {
+            self.pending_responses
+                .retain(|_, pending| !pending.is_closed());
+        }
         match self.pending_responses.insert(request_id, response) {
             Ok(None) => {}
             Ok(Some(displaced_response)) => {
