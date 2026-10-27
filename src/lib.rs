@@ -281,7 +281,8 @@ pub use client::{
 pub use capacity::CapacityKind;
 #[cfg(feature = "server")]
 pub use server::{
-    NonSdRequestCallback, Server, ServerDeps, ServerHandles, ServerStorage, SubscriptionHandle,
+    NonSdRequestCallback, ObservedOffer, OfferObserver, Server, ServerDeps, ServerHandles,
+    ServerStorage, SubscriptionHandle,
 };
 #[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
