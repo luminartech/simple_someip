@@ -87,6 +87,20 @@ const _SERVER_CONSUMED_EVENTGROUPS_CAP: usize = crate::from_env_or(
     option_env!("SIMPLE_SOMEIP_MAX_CONSUMED_EVENTGROUPS"),
     _DEFAULT_CONSUMED_EVENTGROUPS,
 );
+#[cfg(feature = "bare_metal")]
+const _DEFAULT_REQUIRED_SERVICES: usize = 1;
+#[cfg(not(feature = "bare_metal"))]
+const _DEFAULT_REQUIRED_SERVICES: usize = 16;
+const _SERVER_REQUIRED_SERVICES_CAP: usize = crate::from_env_or(
+    option_env!("SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES"),
+    _DEFAULT_REQUIRED_SERVICES,
+);
+const _: () = assert!(
+    crate::sd_codec::find_service_datagram_len(
+        _SERVER_CONSUMED_EVENTGROUPS_CAP + _SERVER_REQUIRED_SERVICES_CAP
+    ) <= crate::UDP_BUFFER_SIZE,
+    "SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES or SIMPLE_SOMEIP_MAX_CONSUMED_EVENTGROUPS is too large: the FindService entries for that many service instances do not fit one UDP datagram"
+);
 const _: () = assert!(
     crate::sd_codec::multi_subscribe_datagram_len(_SERVER_CONSUMED_EVENTGROUPS_CAP)
         <= crate::UDP_BUFFER_SIZE,
@@ -155,8 +169,17 @@ pub struct ServerConfig {
     /// loop, so it neither finds nor answers Offers.
     pub consumed_eventgroups:
         heapless::Vec<SubscribeEventgroupRequest, { ServerConfig::CONSUMED_EVENTGROUPS_CAP }>,
-    /// When `FindService` is sent for [`Self::consumed_eventgroups`]; see
-    /// [`FindTiming`]. Defaults to [`FindTiming::DEFAULT`].
+    /// Services this node needs. The run future sends `FindService` for each
+    /// until it is offered (see [`Self::find_timing`]), after those of
+    /// [`Self::consumed_eventgroups`]. An Offer of a required service sends no
+    /// Subscribe; only [`Self::consumed_eventgroups`] are subscribed. Each
+    /// entry names a concrete service ID, instance ID and major version, not a
+    /// wildcard. Populate via [`Self::with_required_service`]. A passive
+    /// server runs no receive loop, so it neither finds nor answers Offers.
+    pub required_services: heapless::Vec<RequiredService, { ServerConfig::REQUIRED_SERVICES_CAP }>,
+    /// When `FindService` is sent for [`Self::consumed_eventgroups`] and
+    /// [`Self::required_services`]; see [`FindTiming`]. Defaults to
+    /// [`FindTiming::DEFAULT`].
     pub find_timing: FindTiming,
     /// The SD multicast group and port: the SD socket binds this port and
     /// joins this group, and the server's multicast `OfferService` and
@@ -213,6 +236,18 @@ pub struct AcceptedOffer {
     pub event_group_id: u16,
 }
 
+/// A service instance a node needs, found with `FindService` until it is
+/// offered. See [`ServerConfig::required_services`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequiredService {
+    /// Required service ID.
+    pub service_id: u16,
+    /// Required instance ID.
+    pub instance_id: u16,
+    /// Required major version.
+    pub major_version: u8,
+}
+
 impl ServerConfig {
     /// Maximum number of event-group IDs trackable in
     /// [`Self::event_group_ids`]. Matches `EVENT_GROUPS_CAP` in the
@@ -232,10 +267,20 @@ impl ServerConfig {
     /// datagram.
     pub const CONSUMED_EVENTGROUPS_CAP: usize = _SERVER_CONSUMED_EVENTGROUPS_CAP;
 
+    /// Maximum number of entries in [`Self::required_services`], set by
+    /// `SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES` (defaults to 1 with the
+    /// `bare_metal` feature, 16 otherwise). The build fails if the
+    /// `FindService` entries for that many instances and the
+    /// [`Self::consumed_eventgroups`] do not fit one
+    /// [`UDP_BUFFER_SIZE`](crate::UDP_BUFFER_SIZE) datagram.
+    pub const REQUIRED_SERVICES_CAP: usize = _SERVER_REQUIRED_SERVICES_CAP;
+
     /// Length of the `find_send_buf` of [`Server::run_with_buffers`]: a
-    /// `FindService` for [`Self::CONSUMED_EVENTGROUPS_CAP`] service instances.
-    pub const FIND_SEND_BUF_LEN: usize =
-        crate::sd_codec::find_service_datagram_len(Self::CONSUMED_EVENTGROUPS_CAP);
+    /// `FindService` for [`Self::CONSUMED_EVENTGROUPS_CAP`] plus
+    /// [`Self::REQUIRED_SERVICES_CAP`] service instances.
+    pub const FIND_SEND_BUF_LEN: usize = crate::sd_codec::find_service_datagram_len(
+        Self::CONSUMED_EVENTGROUPS_CAP + Self::REQUIRED_SERVICES_CAP,
+    );
 
     /// Maximum number of subscribers tracked per event group. Matches
     /// `SUBSCRIBERS_PER_GROUP` in the subscription manager (sized via
@@ -294,6 +339,7 @@ impl ServerConfig {
             announce: true,
             accepted_offers: heapless::Vec::new(),
             consumed_eventgroups: heapless::Vec::new(),
+            required_services: heapless::Vec::new(),
             find_timing: FindTiming::DEFAULT,
             sd_multicast: SocketAddrV4::new(
                 crate::protocol::sd::MULTICAST_IP,
@@ -308,10 +354,11 @@ impl ServerConfig {
     /// [`Self::instance_id`] are 0.
     ///
     /// The server still receives, so it sends the `FindService` and
-    /// `SubscribeEventgroup` messages of [`Self::consumed_eventgroups`]
-    /// and the `SubscribeNack` described at [`Self::offers_service()`].
-    /// Populate the consumed eventgroups with
-    /// [`Self::with_consumed_eventgroup`].
+    /// `SubscribeEventgroup` messages of [`Self::consumed_eventgroups`],
+    /// the `FindService` messages of [`Self::required_services`], and the
+    /// `SubscribeNack` described at [`Self::offers_service()`]. Populate them
+    /// with [`Self::with_consumed_eventgroup`] and
+    /// [`Self::with_required_service`].
     #[must_use]
     pub fn consumer_only() -> Self {
         Self {
@@ -440,7 +487,8 @@ impl ServerConfig {
         self
     }
 
-    /// Set when `FindService` is sent for [`Self::consumed_eventgroups`].
+    /// Set when `FindService` is sent for [`Self::consumed_eventgroups`] and
+    /// [`Self::required_services`].
     #[must_use]
     pub fn with_find_timing(mut self, find_timing: FindTiming) -> Self {
         self.find_timing = find_timing;
@@ -467,6 +515,38 @@ impl ServerConfig {
         request: SubscribeEventgroupRequest,
     ) -> Result<Self, Self> {
         if self.consumed_eventgroups.push(request).is_ok() {
+            Ok(self)
+        } else {
+            Err(self)
+        }
+    }
+
+    /// Find `service` with `FindService` until it is offered. See
+    /// [`Self::required_services`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`Self::REQUIRED_SERVICES_CAP`] services are already
+    /// registered. Use [`Self::try_with_required_service`] for the fallible
+    /// variant.
+    #[must_use]
+    pub fn with_required_service(mut self, service: RequiredService) -> Self {
+        self.required_services
+            .push(service)
+            .expect("required_services capacity exceeded");
+        self
+    }
+
+    /// Fallible counterpart to [`Self::with_required_service`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the unmodified config (in `Err`) if registering would exceed
+    /// [`Self::REQUIRED_SERVICES_CAP`].
+    #[allow(clippy::result_large_err)]
+    #[must_use = "the returned `Result` carries the (possibly-modified) config: drop is silent"]
+    pub fn try_with_required_service(mut self, service: RequiredService) -> Result<Self, Self> {
+        if self.required_services.push(service).is_ok() {
             Ok(self)
         } else {
             Err(self)
@@ -552,6 +632,15 @@ impl ServerConfig {
             )
         }) {
             return Err(Error::WildcardConsumedEventgroup(*request));
+        }
+        if let Some(service) = self.required_services.iter().find(|service| {
+            crate::sd_codec::names_a_wildcard(
+                service.service_id,
+                service.instance_id,
+                service.major_version,
+            )
+        }) {
+            return Err(Error::WildcardRequiredService(*service));
         }
         if !self.sd_multicast.ip().is_multicast() || self.sd_multicast.port() == 0 {
             return Err(Error::InvalidSdMulticast(self.sd_multicast));
@@ -1111,6 +1200,9 @@ impl
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::WildcardRequiredService`] if an entry in
+    /// [`ServerConfig::required_services`] names a wildcard service ID,
+    /// instance ID or major version.
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
     /// Returns an error if binding the unicast or SD socket fails, or if joining the
@@ -1156,6 +1248,9 @@ impl
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
+    /// instance ID or major version.
+    /// Returns [`Error::WildcardRequiredService`] if an entry in
+    /// [`ServerConfig::required_services`] names a wildcard service ID,
     /// instance ID or major version.
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
@@ -1208,6 +1303,9 @@ impl
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
+    /// instance ID or major version.
+    /// Returns [`Error::WildcardRequiredService`] if an entry in
+    /// [`ServerConfig::required_services`] names a wildcard service ID,
     /// instance ID or major version.
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
@@ -1267,6 +1365,9 @@ where
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
+    /// instance ID or major version.
+    /// Returns [`Error::WildcardRequiredService`] if an entry in
+    /// [`ServerConfig::required_services`] names a wildcard service ID,
     /// instance ID or major version.
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
@@ -1371,6 +1472,9 @@ where
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
+    /// instance ID or major version.
+    /// Returns [`Error::WildcardRequiredService`] if an entry in
+    /// [`ServerConfig::required_services`] names a wildcard service ID,
     /// instance ID or major version.
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
@@ -1492,6 +1596,9 @@ where
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::WildcardRequiredService`] if an entry in
+    /// [`ServerConfig::required_services`] names a wildcard service ID,
+    /// instance ID or major version.
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
     /// Returns an error if querying `unicast_socket.local_addr()`
@@ -1563,6 +1670,9 @@ where
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
+    /// instance ID or major version.
+    /// Returns [`Error::WildcardRequiredService`] if an entry in
+    /// [`ServerConfig::required_services`] names a wildcard service ID,
     /// instance ID or major version.
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
@@ -2160,6 +2270,58 @@ mod tests {
                 "{request:?} is accepted"
             );
         }
+    }
+
+    #[test]
+    fn a_wildcard_required_service_is_rejected() {
+        let concrete = RequiredService {
+            service_id: 0x5C,
+            instance_id: 1,
+            major_version: 1,
+        };
+        let validate = |service| {
+            ServerConfig::consumer_only()
+                .with_required_service(service)
+                .validate()
+        };
+        assert!(validate(concrete).is_ok());
+        for service in [
+            RequiredService {
+                service_id: 0xFFFF,
+                ..concrete
+            },
+            RequiredService {
+                instance_id: 0xFFFF,
+                ..concrete
+            },
+            RequiredService {
+                major_version: 0xFF,
+                ..concrete
+            },
+        ] {
+            assert!(
+                matches!(validate(service), Err(Error::WildcardRequiredService(s)) if s == service),
+                "{service:?} is accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn try_with_required_service_returns_the_config_when_full() {
+        let service = RequiredService {
+            service_id: 0x5C,
+            instance_id: 1,
+            major_version: 1,
+        };
+        let mut config = ServerConfig::consumer_only();
+        for _ in 0..ServerConfig::REQUIRED_SERVICES_CAP {
+            config = config.try_with_required_service(service).expect("room");
+        }
+        let full = config.try_with_required_service(service).expect_err("full");
+        assert_eq!(
+            full.required_services.len(),
+            ServerConfig::REQUIRED_SERVICES_CAP
+        );
     }
 
     #[tokio::test]

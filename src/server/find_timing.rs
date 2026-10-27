@@ -4,6 +4,7 @@ use core::time::Duration;
 
 /// When the run future sends `FindService` for the
 /// [`ServerConfig::consumed_eventgroups`](super::ServerConfig::consumed_eventgroups)
+/// and [`ServerConfig::required_services`](super::ServerConfig::required_services)
 /// not yet offered: once after an initial delay in
 /// `initial_delay_min..=initial_delay_max`, then after
 /// `repetitions_base_delay` doubled each time, `repetitions_max` more times.
