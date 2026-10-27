@@ -241,7 +241,8 @@ pub struct AcceptedOffer {
 /// A service instance a node needs, found with `FindService` until it is
 /// offered. A required service that is not also consumed is found with a
 /// `FindService` TTL of 3 seconds. See [`ServerConfig::required_services`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequiredService {
     /// Required service ID.
     pub service_id: u16,

@@ -18,7 +18,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use simple_someip::bare_metal_runtime as rt;
-use simple_someip::server::FindTiming;
+use simple_someip::server::{FindTiming, RequiredService};
 
 use crate::interop::consts::*;
 use crate::interop::runtime::*;
@@ -102,7 +102,7 @@ impl SomeipUnderTest for BareMetalRt {
             .consume
             .iter()
             .flat_map(|_| [SVC, OTHER_SVC])
-            .map(|service_id| rt::RequiredEntry {
+            .map(|service_id| RequiredService {
                 service_id,
                 instance_id: INST,
                 major_version: MAJOR,
@@ -357,28 +357,21 @@ extern "C" fn now_ms() -> u32 {
 fn on_service(_ctx: usize, change: rt::ServiceChange) {
     let observation = match change {
         rt::ServiceChange::Available {
-            service_id,
-            instance_id,
-            endpoint,
-            ..
+            service, endpoint, ..
         } => {
             // The harness's `Observation` carries an IPv4 endpoint only.
             let SocketAddr::V4(endpoint) = endpoint.addr else {
                 return;
             };
             Observation::ServiceAvailable {
-                service: service_id,
-                instance: instance_id,
+                service: service.service_id,
+                instance: service.instance_id,
                 endpoint,
             }
         }
-        rt::ServiceChange::Gone {
-            service_id,
-            instance_id,
-            ..
-        } => Observation::ServiceGone {
-            service: service_id,
-            instance: instance_id,
+        rt::ServiceChange::Gone { service, .. } => Observation::ServiceGone {
+            service: service.service_id,
+            instance: service.instance_id,
         },
         _ => return,
     };

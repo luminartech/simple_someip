@@ -28,6 +28,6 @@ mod runtime;
 pub use crate::sd_availability::ServiceChange;
 #[cfg(feature = "bare-metal-runtime")]
 pub use runtime::{
-    BindFn, DispatchFn, OfferEntry, RX_CAP, RX_SLOTS, RequiredEntry, RuntimeBuffers, RuntimeConfig,
-    ServiceFn, SubEntry, deinit, init, on_rx, poll, publish,
+    BindFn, DispatchFn, OfferEntry, RX_CAP, RX_SLOTS, RuntimeBuffers, RuntimeConfig, ServiceFn,
+    SubEntry, deinit, init, on_rx, poll, publish,
 };
