@@ -542,7 +542,7 @@ jobs:
             # Same pin as the `bare-metal-runtime` job; see the reason there.
             toolchain: nightly-2026-08-21
             args: --no-default-features --features bare-metal-runtime --test interop_bare_metal
-            # d5 needs two required services at once.
+            # Every consuming scenario requires SVC and OTHER_SVC, so each needs room for two.
             env: SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES=2
     env:
       SIMPLE_SOMEIP_VSOMEIP_IMAGE: ${{ needs.vsomeip-peer-image.outputs.image }}
@@ -642,7 +642,7 @@ jobs:
             # Same pin as the `bare-metal-runtime` job; see the reason there.
             toolchain: nightly-2026-08-21
             args: --no-default-features --features bare-metal-runtime --test interop_bare_metal
-            # d5 needs two required services at once.
+            # Every consuming scenario requires SVC and OTHER_SVC, so each needs room for two.
             env: SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES=2
     env:
       SIMPLE_SOMEIP_VSOMEIP_IMAGE: ${{ needs.vsomeip-peer-image.outputs.image }}
@@ -760,7 +760,7 @@ jobs:
             # Same pin as the `bare-metal-runtime` job; see the reason there.
             toolchain: nightly-2026-08-21
             args: --no-default-features --features bare-metal-runtime --test interop_bare_metal
-            # d5 needs two required services at once.
+            # Every consuming scenario requires SVC and OTHER_SVC, so each needs room for two.
             env: SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES=2
     steps:
       - uses: actions/checkout@v6
