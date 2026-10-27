@@ -239,8 +239,6 @@ pub mod bare_metal_tasks;
 #[cfg(feature = "embassy_channels")]
 pub mod embassy_channels;
 #[cfg(any(test, feature = "bare-metal-runtime"))]
-// Only the tests call the availability table in a bare-metal-runtime build.
-#[cfg_attr(not(test), allow(dead_code))]
 mod sd_availability;
 /// No-alloc SOME/IP + SD datagram codec: transport-agnostic
 /// builders/parsers used by the server receive loop, the firmware shim,

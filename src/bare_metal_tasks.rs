@@ -147,7 +147,8 @@ where
     pub e2e: &'a R,
     /// Re-announce period (the node SD TTL).
     pub period: Duration,
-    /// Offered services packed into one combined `OfferService`.
+    /// Offered services packed into one combined `OfferService`; empty
+    /// sends none.
     pub offers: &'a [OfferServiceRequest],
     /// The SD numbering and multicast group of the server whose receive
     /// future runs beside the Offers, from [`Server::sd`](crate::server::Server::sd).
@@ -192,17 +193,25 @@ where
         dispatch_ctx,
     } = cfg;
 
-    let announce = announce_offers_future::<_, _, RUN_OFFER_CAP>(
-        sd_socket,
-        timer,
-        offers,
-        sd,
-        period,
-        offer_scratch,
-    );
+    // The announce runs only for a node that offers, and RX only for a
+    // consumer node; otherwise each idles forever so the join arity stays
+    // fixed.
+    let announce = async move {
+        if offers.is_empty() {
+            core::future::pending::<()>().await;
+        } else {
+            announce_offers_future::<_, _, RUN_OFFER_CAP>(
+                sd_socket,
+                timer,
+                offers,
+                sd,
+                period,
+                offer_scratch,
+            )
+            .await;
+        }
+    };
 
-    // RX runs only for a consumer node; for a provider-only node it idles
-    // forever so the join arity stays fixed.
     let rx_fut = async move {
         if let Some(rx_socket) = rx_socket {
             event_rx_dispatch_future(rx_socket, e2e, dispatch, dispatch_ctx, rx_buf).await;
@@ -402,5 +411,48 @@ mod tests {
             0x80,
             "reboot flag set until the session wraps"
         );
+    }
+
+    fn no_dispatch(
+        _: usize,
+        _: SocketAddrV4,
+        _: u16,
+        _: u16,
+        _: &[u8],
+        _: Option<crate::E2EStatus>,
+        _: &mut [u8],
+    ) -> i32 {
+        -1
+    }
+
+    #[test]
+    fn a_node_that_offers_nothing_sends_no_offer() {
+        let socket = RecordingSocket::default();
+        let sd_state = SdStateManager::new();
+        let mut scratch = [0u8; 256];
+        let mut rx_buf = [0u8; 256];
+
+        let run = run_someip(
+            core::future::pending::<()>(),
+            SomeipRun {
+                sd_socket: &socket,
+                rx_socket: None,
+                timer: &NeverTimer,
+                e2e: &crate::transport::NoE2E,
+                period: Duration::from_secs(1),
+                offers: &[],
+                sd: ServerSd::new(
+                    &sd_state,
+                    SocketAddrV4::new(Ipv4Addr::new(239, 255, 0, 255), 30490),
+                ),
+                offer_scratch: &mut scratch,
+                rx_buf: &mut rx_buf,
+                dispatch: no_dispatch,
+                dispatch_ctx: 0,
+            },
+        );
+        assert!(run.now_or_never().is_none());
+
+        assert!(socket.sent.lock().unwrap().is_empty());
     }
 }

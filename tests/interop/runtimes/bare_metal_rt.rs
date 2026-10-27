@@ -117,6 +117,8 @@ impl SomeipUnderTest for BareMetalRt {
             bind,
             offers: offers.leak(),
             subscription,
+            required_services: &[],
+            on_service: None,
             find_timing: find_timing(),
             mailbox: &MAILBOX,
             // SAFETY: `STARTED` was claimed above and is released only when
