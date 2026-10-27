@@ -113,16 +113,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Create the server (handles subscription requests, event publishing) ──
 
-    let config = ServerConfig {
-        interface,
-        local_port: MY_SERVER_PORT,
-        major_version: 1,
-        minor_version: 0,
-        ttl: 3,
-        ..ServerConfig::new(MY_SERVER_SERVICE_ID, MY_SERVER_INSTANCE_ID)
-            .with_interface(interface)
-            .with_local_port(MY_SERVER_PORT)
-    };
+    let config = ServerConfig::new(MY_SERVER_SERVICE_ID, MY_SERVER_INSTANCE_ID)
+        .with_interface(interface)
+        .with_local_port(MY_SERVER_PORT);
 
     // Dispatcher topology — the client drives all SD traffic via
     // its own `sd_announcements_loop`, so we suppress the server's
