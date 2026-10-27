@@ -2021,7 +2021,7 @@ mod tests {
             let sd_view = view.sd_header().expect("SD");
             let e = sd_view.entries().next().expect("one entry");
             assert_eq!(e.major_version(), 3);
-            assert!((1..=crate::protocol::sd::MAX_TTL).contains(&e.ttl()));
+            assert_eq!(e.ttl(), REQUIRED_FIND_TTL);
         }
 
         #[tokio::test]
