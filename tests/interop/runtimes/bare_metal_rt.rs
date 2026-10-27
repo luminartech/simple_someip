@@ -4,9 +4,10 @@
 //! The runtime is a process-wide singleton that starts once per process, so
 //! each scenario needs a process of its own; cargo nextest provides that.
 //!
-//! The runtime reports only inbound requests and notifications to the
-//! platform, so this adapter produces `Event` and `Request` observations and
-//! never `ServiceAvailable`, `ServiceGone`, `Subscribed` or `RuntimeError`.
+//! The runtime reports inbound requests and notifications, and the
+//! availability of the services it requires, so this adapter produces
+//! `Event`, `Request`, `ServiceAvailable` and `ServiceGone` observations and
+//! never `Subscribed` or `RuntimeError`.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -72,7 +73,8 @@ fn find_timing() -> FindTiming {
 }
 
 pub struct BareMetalRt {
-    /// The offered service, which `publish` publishes on.
+    /// The offered service, which `publish` publishes on; `SVC` when nothing
+    /// is offered.
     service: u16,
     obs: Receiver<Observation>,
     cmds: Sender<Cmd>,
@@ -83,20 +85,29 @@ impl SomeipUnderTest for BareMetalRt {
     const NAME: &'static str = "bare-metal runtime";
 
     fn start(setup: Setup) -> Self {
-        let Some(offer) = setup.offer else {
-            unsupported(
-                Self::NAME,
-                "starting without an offer (init builds its server from the first offer)",
-            )
-        };
-        let offers = vec![rt::OfferEntry {
-            service_id: offer.service,
-            instance_id: INST,
-            event_group_id: EG,
-            unicast_port: SERVER_PORT,
-            major_version: MAJOR,
-            ttl_seconds: offer.ttl_s,
-        }];
+        let offered = setup.offer.as_ref().map(|offer| offer.service);
+        let offers: Vec<_> = setup
+            .offer
+            .iter()
+            .map(|offer| rt::OfferEntry {
+                service_id: offer.service,
+                instance_id: INST,
+                event_group_id: EG,
+                unicast_port: SERVER_PORT,
+                major_version: MAJOR,
+                ttl_seconds: offer.ttl_s,
+            })
+            .collect();
+        let required: Vec<_> = setup
+            .consume
+            .iter()
+            .flat_map(|_| [SVC, OTHER_SVC])
+            .map(|service_id| rt::RequiredEntry {
+                service_id,
+                instance_id: INST,
+                major_version: MAJOR,
+            })
+            .collect();
         let subscription = setup
             .consume
             .filter(|c| c.subscribe)
@@ -117,8 +128,8 @@ impl SomeipUnderTest for BareMetalRt {
             bind,
             offers: offers.leak(),
             subscription,
-            required_services: &[],
-            on_service: None,
+            required_services: required.leak(),
+            on_service: Some(on_service),
             find_timing: find_timing(),
             mailbox: &MAILBOX,
             // SAFETY: `STARTED` was claimed above and is released only when
@@ -145,7 +156,7 @@ impl SomeipUnderTest for BareMetalRt {
             .spawn(move || run_poller(&rx))
             .expect("could not spawn the poller thread");
         Self {
-            service: offer.service,
+            service: offered.unwrap_or(SVC),
             obs,
             cmds,
             poller: Some(poller),
@@ -339,6 +350,40 @@ extern "C" fn send(local_port: u16, buf: *const u8, len: usize, dst: u32, dst_po
 extern "C" fn now_ms() -> u32 {
     // The runtime's clock wraps at `u32::MAX`, so truncation is intended.
     EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u32
+}
+
+/// The runtime's availability sink: reports each change of a required
+/// service. Endpoints other than IPv4 have no `Observation`.
+fn on_service(_ctx: usize, change: rt::ServiceChange) {
+    let observation = match change {
+        rt::ServiceChange::Available {
+            service_id,
+            instance_id,
+            endpoint,
+            ..
+        } => {
+            let SocketAddr::V4(endpoint) = endpoint.addr else {
+                return;
+            };
+            Observation::ServiceAvailable {
+                service: service_id,
+                instance: instance_id,
+                endpoint,
+            }
+        }
+        rt::ServiceChange::Gone {
+            service_id,
+            instance_id,
+            ..
+        } => Observation::ServiceGone {
+            service: service_id,
+            instance: instance_id,
+        },
+        _ => return,
+    };
+    if let Some(tx) = lock(&OBS).as_ref() {
+        let _ = tx.send(observation);
+    }
 }
 
 /// The runtime's dispatch sink. Its notification path passes no response
