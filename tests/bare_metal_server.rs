@@ -1157,7 +1157,10 @@ async fn co_offered_subscribe_with_wrong_major_version_is_rejected() {
     );
 }
 
-static OBSERVED_TAGGED: OnceLock<Mutex<Vec<(u16, Vec<u8>, Option<E2EStatus>)>>> = OnceLock::new();
+/// `(method_id, payload, e2e_status)` for each call the observer saw.
+type Recorded = Mutex<Vec<(u16, Vec<u8>, Option<E2EStatus>)>>;
+
+static OBSERVED_TAGGED: OnceLock<Recorded> = OnceLock::new();
 
 fn record_tagged(
     _ctx: usize,
@@ -1239,7 +1242,7 @@ async fn non_sd_observer_receives_the_hooks_status_and_stripped_payload() {
     let _ = handle.await;
 }
 
-static OBSERVED_EVENTS: OnceLock<Mutex<Vec<(u16, Vec<u8>, Option<E2EStatus>)>>> = OnceLock::new();
+static OBSERVED_EVENTS: OnceLock<Recorded> = OnceLock::new();
 
 fn record_event(
     _ctx: usize,

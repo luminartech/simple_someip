@@ -1329,7 +1329,7 @@ async fn hook_protects_on_publish_and_checks_on_receive() {
         TAGGED_EVENT,
     ));
     let received = publish_and_receive(
-        hook.clone(),
+        hook,
         hook,
         service_id,
         &[(TAGGED_EVENT, &[0x01, 0x02]), (OTHER_EVENT, &[0x01, 0x02])],

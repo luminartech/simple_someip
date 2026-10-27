@@ -1914,7 +1914,7 @@ mod tests {
         let publisher = Arc::new(EventPublisher::new(
             subscriptions.clone(),
             unicast_socket.clone(),
-            e2e.clone(),
+            e2e,
         ));
         let handles = ServerStorage {
             factory,

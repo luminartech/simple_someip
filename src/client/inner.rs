@@ -2643,7 +2643,7 @@ mod tests {
             session_counter: 1,
             sd_session_id: 1,
             sd_session_has_wrapped: false,
-            e2e: e2e.clone(),
+            e2e,
             multicast_loopback: false,
             dispatch: crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
