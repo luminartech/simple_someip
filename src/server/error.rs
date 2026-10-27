@@ -60,6 +60,18 @@ pub enum Error {
     /// not a multicast group with a nonzero port.
     #[error("SD address {0} is not a multicast group with a nonzero port")]
     InvalidSdMulticast(core::net::SocketAddrV4),
+    /// An entry in
+    /// [`ServerConfig::required_services`](super::ServerConfig::required_services)
+    /// names the wildcard service ID `0xFFFF`, instance ID `0xFFFF` or major
+    /// version `0xFF`. A `FindService` entry for a required service names the
+    /// service, instance and major version it looks for.
+    #[error(
+        "required service names a wildcard: service 0x{:04X}, instance 0x{:04X}, major version 0x{:02X}",
+        .0.service_id,
+        .0.instance_id,
+        .0.major_version
+    )]
+    WildcardRequiredService(super::RequiredService),
 }
 
 impl From<crate::protocol::sd::Error> for Error {
