@@ -34,23 +34,10 @@ use super::error::Error;
 fn udp_or_tcp_ipv4_endpoint<'a>(
     options: impl Iterator<Item = &'a protocol::sd::Options>,
 ) -> Option<crate::NetEndpoint> {
-    use protocol::sd::{Options, TransportProtocol};
-    let mut tcp = None;
-    for option in options {
-        if let Options::IpV4Endpoint { ip, protocol, port } = *option {
-            let endpoint = crate::NetEndpoint::new(
-                core::net::SocketAddr::V4(core::net::SocketAddrV4::new(ip, port)),
-                protocol,
-            );
-            match protocol {
-                TransportProtocol::Udp => return Some(endpoint),
-                _ => {
-                    tcp.get_or_insert(endpoint);
-                }
-            }
-        }
-    }
-    tcp
+    crate::net_endpoint::preferred_ipv4_endpoint(options.filter_map(|option| match *option {
+        protocol::sd::Options::IpV4Endpoint { ip, protocol, port } => Some((ip, protocol, port)),
+        _ => None,
+    }))
 }
 
 /// Max depth of the internal control-message queue. Each entry is one
