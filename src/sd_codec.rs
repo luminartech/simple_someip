@@ -362,15 +362,26 @@ fn build_multi_service_entry_datagram<const N: usize>(
     encode_sd_datagram(buf, &entries, &options, session)
 }
 
+/// A service instance a `FindService` entry asks for.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FindTarget {
+    pub(crate) service_id: u16,
+    pub(crate) instance_id: u16,
+    pub(crate) major_version: u8,
+    pub(crate) ttl: u32,
+}
+
 /// Encode one SD datagram with a `FindService` entry, any minor version and
 /// no options, for each element of `wanted`.
 #[cfg(feature = "server")]
 pub(crate) fn build_find_service_datagram<const N: usize>(
     buf: &mut [u8],
-    wanted: &[SubscribeEventgroupRequest],
+    wanted: impl Iterator<Item = FindTarget> + Clone,
     session: SdSession,
 ) -> Result<usize, BuildError> {
     let mut entries: heapless::Vec<Entry, N> = heapless::Vec::new();
+    let all = wanted.clone();
     for request in wanted {
         entries
             .push(Entry::FindService(ServiceEntry {
@@ -384,7 +395,7 @@ pub(crate) fn build_find_service_datagram<const N: usize>(
                 minor_version: 0xFFFF_FFFF,
             }))
             .map_err(|_| BuildError::ListFull {
-                needed: wanted.len(),
+                needed: all.clone().count(),
                 capacity: N,
             })?;
     }
@@ -1094,15 +1105,12 @@ mod tests {
     }
 
     #[cfg(feature = "server")]
-    fn find_request() -> SubscribeEventgroupRequest {
-        SubscribeEventgroupRequest {
+    fn find_request() -> FindTarget {
+        FindTarget {
             service_id: 0x0042,
             instance_id: 3,
             major_version: 2,
-            event_group_id: 1,
             ttl: 7,
-            local_ip: Ipv4Addr::new(192, 0, 2, 2),
-            local_rx_port: 30600,
         }
     }
 
@@ -1112,7 +1120,7 @@ mod tests {
         let mut buf = [0u8; 64];
         let len = build_find_service_datagram::<1>(
             &mut buf,
-            &[find_request()],
+            [find_request()].into_iter(),
             session(5, RebootFlag::Continuous),
         )
         .unwrap();
@@ -1137,7 +1145,7 @@ mod tests {
         assert!(matches!(
             build_find_service_datagram::<1>(
                 &mut buf,
-                &[find_request(), find_request()],
+                [find_request(), find_request()].into_iter(),
                 session(5, RebootFlag::Continuous)
             ),
             Err(BuildError::ListFull {
