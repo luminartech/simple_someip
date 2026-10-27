@@ -45,6 +45,11 @@ pub enum CapacityKind {
     /// The only kind the server currently produces, where it means a
     /// stack send buffer smaller than the outgoing message, before or after
     /// protection.
+    ///
+    /// On either side it also means the [`E2EHandle`](crate::E2EHandle)
+    /// cannot protect a payload that long
+    /// ([`E2EProtectError::PayloadTooLong`](crate::E2EProtectError::PayloadTooLong)),
+    /// which no larger buffer fixes; the log names which.
     UdpBuffer,
 
     /// Bound by `PENDING_RESPONSES_CAP`. A request was sent, but the

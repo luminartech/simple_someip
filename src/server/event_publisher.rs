@@ -145,7 +145,8 @@ where
     ///
     /// Returns an error if the message fails to serialize, or
     /// [`Error::Capacity`]`(`[`CapacityKind::UdpBuffer`]`)` if `msg_buf` is
-    /// too small for the encoded or protected frame.
+    /// too small for the encoded or protected frame, or the E2E hook cannot
+    /// protect a payload that long.
     ///
     /// # Panics
     ///
@@ -316,7 +317,8 @@ where
     ///
     /// Returns an error if the SOME/IP header fails to serialize, or
     /// [`Error::Capacity`]`(`[`CapacityKind::UdpBuffer`]`)` if `buf` is too
-    /// small for the frame or its protected form.
+    /// small for the frame or its protected form, or the E2E hook cannot
+    /// protect a payload that long.
     #[allow(clippy::too_many_arguments)]
     pub async fn publish_raw_event_with_buffers(
         &self,

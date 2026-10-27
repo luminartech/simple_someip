@@ -804,8 +804,10 @@ pub trait E2EHandle: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`E2EProtectError::BufferTooSmall`] when `buf` cannot hold the
-    /// protected payload.
+    /// Returns [`E2EProtectError::PayloadTooLong`] when no buffer could hold
+    /// a payload this long once protected, for example because the E2E
+    /// header's length field cannot state it, and
+    /// [`E2EProtectError::BufferTooSmall`] when only `buf` is too small.
     fn protect<'b>(
         &self,
         message_id: MessageId,
@@ -924,6 +926,15 @@ pub enum E2EProtectError {
         needed: usize,
         /// Bytes the output buffer holds.
         available: usize,
+    },
+    /// The hook cannot protect a payload this long, whatever the buffer
+    /// holds.
+    #[error("protected payload of {needed} bytes exceeds the {max}-byte E2E limit")]
+    PayloadTooLong {
+        /// Bytes the protected payload would fill.
+        needed: usize,
+        /// The largest protected payload the hook can state.
+        max: usize,
     },
 }
 
@@ -1827,6 +1838,43 @@ mod tests {
                         needed: 3,
                         available: 2
                     }
+                ))
+            );
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_refuses_a_payload_the_hook_cannot_protect() {
+            struct TooLong;
+            impl E2EHandle for TooLong {
+                fn check<'a>(
+                    &self,
+                    _source: IpAddr,
+                    _message_id: MessageId,
+                    _payload: &'a [u8],
+                    _upper_header: [u8; 8],
+                ) -> Option<E2ECheck<'a>> {
+                    None
+                }
+                fn protect<'b>(
+                    &self,
+                    _message_id: MessageId,
+                    _buf: &'b mut [u8],
+                    payload_len: usize,
+                    _upper_header: [u8; 8],
+                ) -> Option<Result<&'b [u8], E2EProtectError>> {
+                    Some(Err(E2EProtectError::PayloadTooLong {
+                        needed: payload_len + 1,
+                        max: payload_len,
+                    }))
+                }
+                fn reset_source(&self, _source: IpAddr) {}
+            }
+            let (mut buf, len) = datagram(ID);
+            assert_eq!(
+                super::super::protect_in_place(&TooLong, &mut buf, len),
+                Err(super::super::ProtectInPlaceError::Hook(
+                    E2EProtectError::PayloadTooLong { needed: 3, max: 2 }
                 ))
             );
         }
