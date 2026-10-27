@@ -238,7 +238,7 @@ pub mod bare_metal_tasks;
 /// [`static_channels`] instead.
 #[cfg(feature = "embassy_channels")]
 pub mod embassy_channels;
-#[cfg(any(test, feature = "bare-metal-runtime"))]
+#[cfg(all(feature = "server", any(test, feature = "bare-metal-runtime")))]
 mod sd_availability;
 /// No-alloc SOME/IP + SD datagram codec: transport-agnostic
 /// builders/parsers used by the server receive loop, the firmware shim,

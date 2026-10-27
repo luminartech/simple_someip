@@ -61,7 +61,6 @@ type Sock = CallbackSocket<'static, RX_SLOTS, RX_CAP>;
 type Factory = CallbackFactory<'static, RX_SLOTS, RX_CAP>;
 type Publisher =
     EventPublisher<&'static dyn E2EHandle, StaticSubscriptionHandle, &'static Sock, Sock>;
-type Required = heapless::Vec<RequiredService, { ServerConfig::REQUIRED_SERVICES_CAP }>;
 type AvailabilityTable = Availability<{ ServerConfig::REQUIRED_SERVICES_CAP }>;
 type RtServer = Server<
     Factory,
@@ -128,19 +127,6 @@ pub struct SubEntry {
     pub event_group_id: u16,
     pub method_id: u16,
     pub local_rx_port: u16,
-    pub major_version: u8,
-}
-
-/// One service instance this node needs. `#[repr(C)]`. See
-/// [`RuntimeConfig::required_services`].
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct RequiredEntry {
-    /// The SOME/IP service ID.
-    pub service_id: u16,
-    /// The SOME/IP instance ID.
-    pub instance_id: u16,
-    /// The major version of the service interface.
     pub major_version: u8,
 }
 
@@ -226,7 +212,7 @@ pub struct RuntimeConfig {
     /// subscription's service takes one of the
     /// [`ServerConfig::REQUIRED_SERVICES_CAP`] slots, and [`init`] returns
     /// `-7` past it.
-    pub required_services: &'static [RequiredEntry],
+    pub required_services: &'static [RequiredService],
     /// Called for each change in the availability of a required service;
     /// `None` reports nothing.
     pub on_service: Option<ServiceFn>,
@@ -473,39 +459,30 @@ async fn expire_offers(timer: &CallbackTimer) {
     }
 }
 
-/// The distinct services `config` requires, its subscription's first, and a
-/// table tracking them. `Err` holds the [`init`] code: `-5` for a wildcard,
+/// A table tracking the distinct services `config` requires, its
+/// subscription's first. `Err` holds the [`init`] code: `-5` for a wildcard,
 /// `-7` for more than [`ServerConfig::REQUIRED_SERVICES_CAP`] services.
-fn collect_required(config: &RuntimeConfig) -> Result<(Required, AvailabilityTable), i32> {
+fn collect_required(config: &RuntimeConfig) -> Result<AvailabilityTable, i32> {
     let subscribed = config.subscription.map(|s| RequiredService {
         service_id: s.service_id,
         instance_id: s.instance_id,
         major_version: s.major_version,
     });
-    let listed = config.required_services.iter().map(|e| RequiredService {
-        service_id: e.service_id,
-        instance_id: e.instance_id,
-        major_version: e.major_version,
-    });
-    let services = || subscribed.into_iter().chain(listed.clone());
+    let services = || {
+        subscribed
+            .into_iter()
+            .chain(config.required_services.iter().copied())
+    };
     if services().any(|s| names_a_wildcard(s.service_id, s.instance_id, s.major_version)) {
         return Err(-5);
     }
-    let mut required = Required::new();
     let mut table = AvailabilityTable::new();
     for service in services() {
-        if !table.require(
-            service.service_id,
-            service.instance_id,
-            service.major_version,
-        ) {
-            return Err(-7);
-        }
-        if !required.contains(&service) && required.push(service).is_err() {
+        if !table.require(service) {
             return Err(-7);
         }
     }
-    Ok((required, table))
+    Ok(table)
 }
 
 fn offer_requests(out: &mut [OfferServiceRequest; MAX_OFFERS]) -> usize {
@@ -544,11 +521,11 @@ fn sd_multicast() -> SocketAddrV4 {
 }
 
 /// Build the receive `Server` over the shared callback sockets, accepting
-/// subscribes for every offered service, finding every `required` service
-/// and answering Offers of the subscription's service. With no offers the
-/// server offers nothing and its unicast socket has port 0, which no
+/// subscribes for every offered service, finding every service `required`
+/// tracks and answering Offers of the subscription's service. With no offers
+/// the server offers nothing and its unicast socket has port 0, which no
 /// datagram reaches.
-fn build_server(find_timing: FindTiming, required: &Required) -> bool {
+fn build_server(find_timing: FindTiming, required: &AvailabilityTable) -> bool {
     let o = offers();
     let plat = platform();
     let factory = Factory::new(plat);
@@ -602,13 +579,17 @@ fn build_server(find_timing: FindTiming, required: &Required) -> bool {
         };
         config = c;
     }
-    for &service in required {
+    for service in required.services() {
         let Ok(c) = config.try_with_required_service(service) else {
             return false;
         };
         config = c;
     }
-    let offer_observer = (!required.is_empty()).then_some((observe_offer as OfferObserver, 0));
+    let offer_observer = required
+        .services()
+        .next()
+        .is_some()
+        .then_some((observe_offer as OfferObserver, 0));
 
     // SAFETY: storages initialized just above / are 'static.
     let storage = unsafe {
@@ -769,7 +750,7 @@ pub fn init(config: RuntimeConfig) -> i32 {
     {
         return -4;
     }
-    let (required, table) = match collect_required(&config) {
+    let required = match collect_required(&config) {
         Ok(required) => required,
         Err(code) => {
             INIT_CLAIMED.store(false, Ordering::Release);
@@ -805,7 +786,6 @@ pub fn init(config: RuntimeConfig) -> i32 {
         config.on_service.map_or(0, |f| f as usize),
         Ordering::Release,
     );
-    AVAILABILITY.lock(|t| *t.borrow_mut() = table);
     unsafe {
         *core::ptr::addr_of_mut!(MAILBOX) = Some(config.mailbox);
         *core::ptr::addr_of_mut!(E2E) = config.e2e.unwrap_or(&NO_E2E);
@@ -830,6 +810,7 @@ pub fn init(config: RuntimeConfig) -> i32 {
         INIT_CLAIMED.store(false, Ordering::Release);
         return -1;
     }
+    AVAILABILITY.lock(|t| *t.borrow_mut() = required);
 
     // SAFETY: single-init guarded by INIT_CLAIMED (claimed above).
     let spawner = unsafe {

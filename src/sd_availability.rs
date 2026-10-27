@@ -4,6 +4,7 @@
 use core::net::SocketAddr;
 
 use crate::protocol::sd::MAX_TTL;
+use crate::server::RequiredService;
 use crate::{NetEndpoint, OfferedInstance};
 
 /// A change in the availability of a required service instance, seen in the
@@ -20,12 +21,8 @@ pub enum ServiceChange {
     /// endpoint. A repeated offer with the same endpoint reports nothing.
     #[non_exhaustive]
     Available {
-        /// The SOME/IP service ID.
-        service_id: u16,
-        /// The SOME/IP instance ID.
-        instance_id: u16,
-        /// The major version of the service interface.
-        major_version: u8,
+        /// The required service instance.
+        service: RequiredService,
         /// The endpoint the offer names for the instance.
         endpoint: NetEndpoint,
     },
@@ -34,12 +31,8 @@ pub enum ServiceChange {
     /// [`MAX_TTL`](crate::protocol::sd::MAX_TTL) never runs out.
     #[non_exhaustive]
     Gone {
-        /// The SOME/IP service ID.
-        service_id: u16,
-        /// The SOME/IP instance ID.
-        instance_id: u16,
-        /// The major version of the service interface.
-        major_version: u8,
+        /// The required service instance.
+        service: RequiredService,
     },
 }
 
@@ -53,46 +46,33 @@ struct Holder {
     remaining_ms: Option<u64>,
 }
 
-/// A required (service, instance, major version).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Key {
-    service_id: u16,
-    instance_id: u16,
-    major_version: u8,
-}
-
-impl From<&OfferedInstance> for Key {
-    fn from(instance: &OfferedInstance) -> Self {
-        Self {
-            service_id: instance.service_id,
-            instance_id: instance.instance_id,
-            major_version: instance.major_version,
-        }
+/// The required service an offered `instance` is, whatever its minor version.
+fn required(instance: &OfferedInstance) -> RequiredService {
+    RequiredService {
+        service_id: instance.service_id,
+        instance_id: instance.instance_id,
+        major_version: instance.major_version,
     }
 }
 
 /// A required instance and its holder, if any.
 #[derive(Debug, Clone, Copy)]
 struct Record {
-    key: Key,
+    service: RequiredService,
     holder: Option<Holder>,
 }
 
 impl Record {
     fn available(&self, endpoint: NetEndpoint) -> ServiceChange {
         ServiceChange::Available {
-            service_id: self.key.service_id,
-            instance_id: self.key.instance_id,
-            major_version: self.key.major_version,
+            service: self.service,
             endpoint,
         }
     }
 
     fn gone(&self) -> ServiceChange {
         ServiceChange::Gone {
-            service_id: self.key.service_id,
-            instance_id: self.key.instance_id,
-            major_version: self.key.major_version,
+            service: self.service,
         }
     }
 }
@@ -126,14 +106,20 @@ impl<const N: usize> Availability<N> {
 
     /// Adds a required instance. Returns `true` when it is added or already
     /// present, `false` when the table already holds `N` others.
-    pub(crate) fn require(&mut self, service_id: u16, instance_id: u16, major_version: u8) -> bool {
-        let key = Key {
-            service_id,
-            instance_id,
-            major_version,
-        };
-        self.records.iter().any(|record| record.key == key)
-            || self.records.push(Record { key, holder: None }).is_ok()
+    pub(crate) fn require(&mut self, service: RequiredService) -> bool {
+        self.records.iter().any(|record| record.service == service)
+            || self
+                .records
+                .push(Record {
+                    service,
+                    holder: None,
+                })
+                .is_ok()
+    }
+
+    /// The required instances, in the order they were added.
+    pub(crate) fn services(&self) -> impl Iterator<Item = RequiredService> + '_ {
+        self.records.iter().map(|record| record.service)
     }
 
     /// Records an offer of `instance` from `sender` at `endpoint`, valid for
@@ -211,8 +197,10 @@ impl<const N: usize> Availability<N> {
     }
 
     fn record(&mut self, instance: &OfferedInstance) -> Option<&mut Record> {
-        let key = Key::from(instance);
-        self.records.iter_mut().find(|record| record.key == key)
+        let service = required(instance);
+        self.records
+            .iter_mut()
+            .find(|record| record.service == service)
     }
 
     fn advance(&mut self, now_ms: u32) {
@@ -262,26 +250,30 @@ mod tests {
         NetEndpoint::udp(SocketAddr::from(([192, 168, 0, 10], port)))
     }
 
-    fn available(endpoint: NetEndpoint) -> ServiceChange {
-        ServiceChange::Available {
-            service_id: SVC,
+    fn service_of(service_id: u16) -> RequiredService {
+        RequiredService {
+            service_id,
             instance_id: INST,
             major_version: MAJOR,
+        }
+    }
+
+    fn available(endpoint: NetEndpoint) -> ServiceChange {
+        ServiceChange::Available {
+            service: service_of(SVC),
             endpoint,
         }
     }
 
     fn gone() -> ServiceChange {
         ServiceChange::Gone {
-            service_id: SVC,
-            instance_id: INST,
-            major_version: MAJOR,
+            service: service_of(SVC),
         }
     }
 
     fn table() -> Availability<4> {
         let mut table = Availability::new();
-        assert!(table.require(SVC, INST, MAJOR));
+        assert!(table.require(service_of(SVC)));
         table
     }
 
@@ -484,10 +476,23 @@ mod tests {
     }
 
     #[test]
+    fn services_lists_each_required_instance_once_in_order() {
+        let mut table: Availability<4> = Availability::new();
+        assert!(table.require(service_of(OTHER_SVC)));
+        assert!(table.require(service_of(SVC)));
+        assert!(table.require(service_of(OTHER_SVC)));
+        assert!(
+            table
+                .services()
+                .eq([service_of(OTHER_SVC), service_of(SVC)])
+        );
+    }
+
+    #[test]
     fn require_deduplicates_and_reports_full() {
         let mut table: Availability<1> = Availability::new();
-        assert!(table.require(SVC, INST, MAJOR));
-        assert!(!table.require(OTHER_SVC, INST, MAJOR));
-        assert!(table.require(SVC, INST, MAJOR));
+        assert!(table.require(service_of(SVC)));
+        assert!(!table.require(service_of(OTHER_SVC)));
+        assert!(table.require(service_of(SVC)));
     }
 }
