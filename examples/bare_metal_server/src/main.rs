@@ -252,6 +252,7 @@ async fn main() {
                 e2e: NoE2E,
                 subscriptions: subs,
                 non_sd_observer: None,
+                offer_observer: None,
             },
             config,
             false, // multicast_loopback

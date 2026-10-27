@@ -9,7 +9,7 @@
 //! eventgroup), so sibling protocol crates can share the same shape.
 
 use core::net::SocketAddr;
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "server"))]
 use core::net::{Ipv4Addr, SocketAddrV4};
 
 /// Transport protocol of a network endpoint.
@@ -55,7 +55,7 @@ impl NetEndpoint {
 
 /// The endpoint a peer is reached at, chosen from the IPv4 endpoint options of
 /// one SD entry: the first UDP endpoint, else the first TCP one, else `None`.
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "server"))]
 pub(crate) fn preferred_ipv4_endpoint(
     endpoints: impl Iterator<Item = (Ipv4Addr, TransportProtocol, u16)>,
 ) -> Option<NetEndpoint> {
@@ -75,7 +75,7 @@ mod tests {
     use super::*;
     use core::net::{Ipv4Addr, SocketAddrV4};
 
-    #[cfg(feature = "client")]
+    #[cfg(any(feature = "client", feature = "server"))]
     #[test]
     fn prefers_udp_over_an_earlier_tcp_endpoint() {
         let tcp = (Ipv4Addr::new(10, 0, 0, 1), TransportProtocol::Tcp, 30501);
@@ -89,7 +89,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "client")]
+    #[cfg(any(feature = "client", feature = "server"))]
     #[test]
     fn falls_back_to_the_first_tcp_endpoint() {
         let first = (Ipv4Addr::new(10, 0, 0, 1), TransportProtocol::Tcp, 30501);
@@ -103,7 +103,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "client")]
+    #[cfg(any(feature = "client", feature = "server"))]
     #[test]
     fn no_ipv4_endpoint_is_none() {
         assert_eq!(preferred_ipv4_endpoint(core::iter::empty()), None);

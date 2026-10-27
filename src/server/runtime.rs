@@ -178,6 +178,7 @@ where
 /// Handle a Service Discovery message (Subscribe / `FindService` etc.);
 /// returns what it answered.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_sd_message<T, Sub>(
     config: &ServerConfig,
     sd_socket: &T,
@@ -186,6 +187,7 @@ pub(super) async fn handle_sd_message<T, Sub>(
     sd_view: &sd::SdHeaderView<'_>,
     sender: core::net::SocketAddr,
     send_buf: &mut [u8],
+    offer_observer: Option<(super::OfferObserver, usize)>,
 ) -> Result<Answered, Error>
 where
     T: TransportSocket,
@@ -205,6 +207,15 @@ where
         let Ok(entry_type) = entry_view.entry_type() else {
             continue;
         };
+        if let Some((observer, ctx)) = offer_observer
+            && entry_type == sd::EntryType::OfferService
+        {
+            observer(
+                ctx,
+                sender,
+                observed_offer(entry_view, entry_options.clone()),
+            );
+        }
         match entry_type {
             sd::EntryType::Subscribe => {
                 crate::log::debug!(
@@ -504,6 +515,35 @@ impl Offered {
     }
 }
 
+/// The [`ObservedOffer`](super::ObservedOffer) an `OfferService` entry
+/// reports; `options` are the options the entry references.
+fn observed_offer<'a>(
+    entry: sd::EntryView<'a>,
+    options: impl Iterator<Item = sd::OptionView<'a>>,
+) -> super::ObservedOffer {
+    let instance = crate::traits::OfferedInstance {
+        service_id: entry.service_id(),
+        instance_id: entry.instance_id(),
+        major_version: entry.major_version(),
+        minor_version: entry.minor_version(),
+    };
+    if entry.is_stop_offer() {
+        super::ObservedOffer::Stop { instance }
+    } else {
+        super::ObservedOffer::Offer {
+            instance,
+            endpoint: crate::net_endpoint::preferred_ipv4_endpoint(
+                options
+                    .filter(|option| {
+                        matches!(option.option_type(), Ok(sd::OptionType::IpV4Endpoint))
+                    })
+                    .filter_map(|option| option.as_ipv4().ok()),
+            ),
+            ttl: entry.ttl(),
+        }
+    }
+}
+
 /// Periodic SD `OfferService` announcement loop. Runs forever; intended
 /// to be combined with the receive loop via [`run_combined`].
 pub(super) async fn announce_loop<T, Tm>(
@@ -632,6 +672,7 @@ struct Receiver<'a, T, Sub, R> {
     subscriptions: &'a Sub,
     e2e: &'a R,
     non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
+    offer_observer: Option<(super::OfferObserver, usize)>,
     offered: &'a Offered,
 }
 
@@ -658,6 +699,7 @@ where
         subscriptions,
         e2e,
         non_sd_observer,
+        offer_observer,
         offered,
     } = *receiver;
     crate::log::trace!(
@@ -680,6 +722,7 @@ where
                     &sd_view,
                     addr,
                     send_buf,
+                    offer_observer,
                 )
                 .await?;
                 offered.mark(answered);
@@ -920,6 +963,7 @@ pub(super) async fn run_combined<H, T, Sub, Hsd, Tm, R>(
     announce_send_buf: &mut [u8],
     find_send_buf: &mut [u8; ServerConfig::FIND_SEND_BUF_LEN],
     non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
+    offer_observer: Option<(super::OfferObserver, usize)>,
 ) -> Result<(), Error>
 where
     H: SharedHandle<T>,
@@ -953,6 +997,7 @@ where
         subscriptions: &subscriptions,
         e2e: &e2e,
         non_sd_observer,
+        offer_observer,
         offered: &offered,
     };
     let recv_fut = recv_loop(&receiver, unicast_buf, sd_buf, recv_send_buf);
@@ -1430,6 +1475,7 @@ mod tests {
                 &sd_view,
                 core::net::SocketAddr::V4(PEER_SD),
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                None,
             )
             .await
             .expect("handle_sd_message");
@@ -1587,6 +1633,7 @@ mod tests {
                 &sd_view,
                 core::net::SocketAddr::V4(PEER_SD),
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                None,
             )
             .await
             .expect("handle_sd_message");
@@ -1677,6 +1724,7 @@ mod tests {
                 &sd_view,
                 subscriber_addr(),
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                None,
             )
             .await;
 
@@ -2051,6 +2099,7 @@ mod tests {
                 &sd_view,
                 core::net::SocketAddr::V4(PEER_SD),
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                None,
             )
             .await
             .expect("handle_sd_message");
@@ -2169,6 +2218,7 @@ mod tests {
                 &sd_view,
                 core::net::SocketAddr::V4(PEER_SD),
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                None,
             )
             .await
             .expect("handle_sd_message")
@@ -2269,6 +2319,7 @@ mod tests {
                 &mut r,
                 &mut [],
                 &mut f,
+                None,
                 None,
             );
 
@@ -2378,6 +2429,291 @@ mod tests {
     }
 
     #[cfg(feature = "server-tokio")]
+    mod offer_observer {
+        use super::consumed_eventgroups::{PEER_SD, RecordingSocket};
+        use super::*;
+        use crate::server::ObservedOffer;
+        use crate::traits::OfferedInstance;
+        use crate::{NetEndpoint, TransportProtocol};
+        use std::sync::Mutex;
+
+        type Seen = (usize, core::net::SocketAddr, ObservedOffer);
+        static SEEN: Mutex<std::vec::Vec<Seen>> = Mutex::new(std::vec::Vec::new());
+
+        fn record(ctx: usize, sender: core::net::SocketAddr, offer: ObservedOffer) {
+            SEEN.lock().unwrap().push((ctx, sender, offer));
+        }
+
+        /// What the observer registered under `ctx` has seen, in call order.
+        fn seen(ctx: usize) -> std::vec::Vec<(core::net::SocketAddr, ObservedOffer)> {
+            SEEN.lock()
+                .unwrap()
+                .iter()
+                .filter(|(c, ..)| *c == ctx)
+                .map(|&(_, sender, offer)| (sender, offer))
+                .collect()
+        }
+
+        fn service(service_id: u16, first_option: u8, options: u8, ttl: u32) -> sd::ServiceEntry {
+            sd::ServiceEntry {
+                index_first_options_run: first_option,
+                index_second_options_run: 0,
+                options_count: sd::OptionsCount::new(options, 0),
+                service_id,
+                instance_id: 3,
+                major_version: 2,
+                ttl,
+                minor_version: 7,
+            }
+        }
+
+        fn endpoint_option(port: u16, protocol: sd::TransportProtocol) -> sd::Options {
+            sd::Options::IpV4Endpoint {
+                ip: Ipv4Addr::new(10, 1, 2, 3),
+                port,
+                protocol,
+            }
+        }
+
+        fn instance(service_id: u16) -> OfferedInstance {
+            OfferedInstance {
+                service_id,
+                instance_id: 3,
+                major_version: 2,
+                minor_version: 7,
+            }
+        }
+
+        fn udp(port: u16) -> Option<NetEndpoint> {
+            Some(NetEndpoint::udp(core::net::SocketAddr::V4(
+                SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), port),
+            )))
+        }
+
+        /// Delivers an SD message of `entries` and `options` to a server whose
+        /// observer is registered under `ctx`.
+        async fn deliver(ctx: usize, entries: &[sd::Entry], options: &[sd::Options]) {
+            use automotive_wire_codec::Encode;
+
+            let header = sd::Header::new(
+                sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+                entries,
+                options,
+            );
+            let mut wire = [0u8; 512];
+            let sd_len = header.encode_to_slice(&mut wire).expect("encode");
+            let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+            let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::server::SubscriptionManager::new(),
+            ));
+            handle_sd_message(
+                &make_config(),
+                &RecordingSocket::default(),
+                &make_sd_state(),
+                &subscriptions,
+                &sd_view,
+                core::net::SocketAddr::V4(PEER_SD),
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                Some((record as crate::server::OfferObserver, ctx)),
+            )
+            .await
+            .expect("handle_sd_message");
+        }
+
+        #[tokio::test]
+        async fn observer_sees_each_offer_with_its_own_endpoint() {
+            deliver(
+                0x4F01,
+                &[
+                    sd::Entry::OfferService(service(0x6001, 0, 1, 30)),
+                    sd::Entry::OfferService(service(0x6002, 1, 1, 90)),
+                ],
+                &[
+                    endpoint_option(30501, sd::TransportProtocol::Udp),
+                    endpoint_option(30502, sd::TransportProtocol::Udp),
+                ],
+            )
+            .await;
+
+            let sender = core::net::SocketAddr::V4(PEER_SD);
+            assert_eq!(
+                seen(0x4F01),
+                [
+                    (
+                        sender,
+                        ObservedOffer::Offer {
+                            instance: instance(0x6001),
+                            endpoint: udp(30501),
+                            ttl: 30,
+                        }
+                    ),
+                    (
+                        sender,
+                        ObservedOffer::Offer {
+                            instance: instance(0x6002),
+                            endpoint: udp(30502),
+                            ttl: 90,
+                        }
+                    ),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn observer_sees_a_stop_offer() {
+            deliver(
+                0x4F02,
+                &[sd::Entry::StopOfferService(service(0x6001, 0, 1, 0))],
+                &[endpoint_option(30501, sd::TransportProtocol::Udp)],
+            )
+            .await;
+
+            assert_eq!(
+                seen(0x4F02),
+                [(
+                    core::net::SocketAddr::V4(PEER_SD),
+                    ObservedOffer::Stop {
+                        instance: instance(0x6001)
+                    }
+                )]
+            );
+        }
+
+        #[tokio::test]
+        async fn observer_gets_no_endpoint_for_an_offer_without_one() {
+            deliver(
+                0x4F03,
+                &[sd::Entry::OfferService(service(0x6001, 0, 0, 30))],
+                &[],
+            )
+            .await;
+
+            assert_eq!(
+                seen(0x4F03),
+                [(
+                    core::net::SocketAddr::V4(PEER_SD),
+                    ObservedOffer::Offer {
+                        instance: instance(0x6001),
+                        endpoint: None,
+                        ttl: 30,
+                    }
+                )]
+            );
+        }
+
+        #[tokio::test]
+        async fn observer_prefers_a_udp_endpoint_over_an_earlier_tcp_one() {
+            let mut entry = service(0x6001, 0, 2, 30);
+            entry.options_count = sd::OptionsCount::new(2, 0);
+            deliver(
+                0x4F05,
+                &[sd::Entry::OfferService(entry)],
+                &[
+                    endpoint_option(30501, sd::TransportProtocol::Tcp),
+                    endpoint_option(30502, sd::TransportProtocol::Udp),
+                ],
+            )
+            .await;
+
+            let observed = seen(0x4F05);
+            assert!(matches!(
+                observed[..],
+                [(
+                    _,
+                    ObservedOffer::Offer {
+                        endpoint: Some(NetEndpoint {
+                            protocol: TransportProtocol::Udp,
+                            ..
+                        }),
+                        ..
+                    }
+                )]
+            ));
+        }
+
+        /// An IPv4 SD endpoint option (0x24) naming UDP port 30490.
+        fn sd_endpoint_option() -> sd::Options {
+            sd::Options::IpV4SD {
+                ip: Ipv4Addr::new(10, 1, 2, 3),
+                protocol: sd::TransportProtocol::Udp,
+                port: 30490,
+            }
+        }
+
+        #[tokio::test]
+        async fn observer_reports_the_endpoint_option_and_skips_an_sd_endpoint_option() {
+            deliver(
+                0x4F06,
+                &[sd::Entry::OfferService(service(0x6001, 0, 2, 30))],
+                &[
+                    sd_endpoint_option(),
+                    endpoint_option(30502, sd::TransportProtocol::Udp),
+                ],
+            )
+            .await;
+
+            assert_eq!(
+                seen(0x4F06),
+                [(
+                    core::net::SocketAddr::V4(PEER_SD),
+                    ObservedOffer::Offer {
+                        instance: instance(0x6001),
+                        endpoint: udp(30502),
+                        ttl: 30,
+                    }
+                )]
+            );
+        }
+
+        #[tokio::test]
+        async fn observer_gets_no_endpoint_from_an_sd_endpoint_option_alone() {
+            deliver(
+                0x4F07,
+                &[sd::Entry::OfferService(service(0x6001, 0, 1, 30))],
+                &[sd_endpoint_option()],
+            )
+            .await;
+
+            assert_eq!(
+                seen(0x4F07),
+                [(
+                    core::net::SocketAddr::V4(PEER_SD),
+                    ObservedOffer::Offer {
+                        instance: instance(0x6001),
+                        endpoint: None,
+                        ttl: 30,
+                    }
+                )]
+            );
+        }
+
+        #[tokio::test]
+        async fn observer_is_not_called_for_other_entries() {
+            deliver(
+                0x4F04,
+                &[
+                    sd::Entry::FindService(sd::ServiceEntry::find(0x6001)),
+                    sd::Entry::SubscribeEventGroup(sd::EventGroupEntry {
+                        index_first_options_run: 0,
+                        index_second_options_run: 0,
+                        options_count: sd::OptionsCount::new(1, 0),
+                        service_id: 0x1234,
+                        instance_id: 1,
+                        major_version: 1,
+                        ttl: 3,
+                        counter: 0,
+                        event_group_id: 0x0001,
+                    }),
+                ],
+                &[endpoint_option(40000, sd::TransportProtocol::Udp)],
+            )
+            .await;
+
+            assert!(seen(0x4F04).is_empty());
+        }
+    }
+
+    #[cfg(feature = "server-tokio")]
     mod consumer_only {
         use super::consumed_eventgroups::{PEER_SD, RecordingSocket};
         use super::*;
@@ -2438,6 +2774,7 @@ mod tests {
                 &sd_view,
                 core::net::SocketAddr::V4(PEER_SD),
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                None,
             )
             .await
             .expect("handle_sd_message");
@@ -2575,6 +2912,7 @@ mod tests {
                 &mut r,
                 &mut a,
                 &mut f,
+                None,
                 None,
             );
 
