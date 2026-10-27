@@ -109,8 +109,11 @@ pub struct ServerConfig {
     /// Minor version
     pub minor_version: u32,
     /// Service Discovery TTL in seconds, 1 to
-    /// [`MAX_TTL`](crate::protocol::sd::MAX_TTL). The server constructors
-    /// reject a config outside that range.
+    /// [`MAX_TTL`](crate::protocol::sd::MAX_TTL), sent in each `OfferService`
+    /// and `SubscribeAck`. The server constructors reject a config outside
+    /// that range unless [`Self::offers_service()`] is `false`; a
+    /// `SubscribeAck` for an [`Self::accepted_offers`] entry then carries it
+    /// unchecked.
     pub ttl: u32,
     /// Event-group IDs the server publishes to. Used by the SD
     /// `Subscribe` handler to NACK subscriptions for unknown groups
@@ -127,7 +130,7 @@ pub struct ServerConfig {
     /// `examples/client_server` topology where a co-located `Client`'s
     /// `sd_announcements_loop` emits the offers and the server should
     /// stay silent on SD. Has no effect on passive servers, which never
-    /// announce.
+    /// announce, or when [`Self::offers_service()`] is `false`.
     pub announce: bool,
     /// Additional co-offered `(service, instance, event_group)` tuples this
     /// receive loop accepts `SubscribeEventGroup` for, beyond its own
@@ -161,6 +164,9 @@ pub struct ServerConfig {
     /// port. Defaults to
     /// [`MULTICAST_IP`](crate::protocol::sd::MULTICAST_IP):[`MULTICAST_PORT`](crate::protocol::sd::MULTICAST_PORT).
     pub sd_multicast: SocketAddrV4,
+    /// Whether the node offers [`Self::service_id`]; see
+    /// [`Self::offers_service()`].
+    offers_service: bool,
 }
 
 /// A [`Server`]'s SD numbering and SD multicast group, from [`Server::sd`].
@@ -293,7 +299,39 @@ impl ServerConfig {
                 crate::protocol::sd::MULTICAST_IP,
                 crate::protocol::sd::MULTICAST_PORT,
             ),
+            offers_service: true,
         }
+    }
+
+    /// A config for a node that offers no service: [`Self::offers_service()`]
+    /// and [`Self::announce`] are `false`, and [`Self::service_id`] and
+    /// [`Self::instance_id`] are 0.
+    ///
+    /// The server still receives, so it sends the `FindService` and
+    /// `SubscribeEventgroup` messages of [`Self::consumed_eventgroups`]
+    /// and the `SubscribeNack` described at [`Self::offers_service()`].
+    /// Populate the consumed eventgroups with
+    /// [`Self::with_consumed_eventgroup`].
+    #[must_use]
+    pub fn consumer_only() -> Self {
+        Self {
+            announce: false,
+            offers_service: false,
+            ..Self::new(0, 0)
+        }
+    }
+
+    /// Whether the node offers [`Self::service_id`]: `true` from
+    /// [`Self::new`], `false` from [`Self::consumer_only`].
+    ///
+    /// When `false` the server sends no `OfferService`, whatever
+    /// [`Self::announce`] says, and answers no `FindService`. It sends a
+    /// `SubscribeNack` for every `SubscribeEventgroup` that no
+    /// [`Self::accepted_offers`] entry accepts. The server constructors check
+    /// [`Self::ttl`] only when this is `true`.
+    #[must_use]
+    pub const fn offers_service(&self) -> bool {
+        self.offers_service
     }
 
     /// Set the local interface IP address. Defaults to
@@ -522,8 +560,10 @@ impl ServerConfig {
     }
 
     fn check_ttl(&self) -> Result<(), Error> {
-        let ttls =
-            core::iter::once(self.ttl).chain(self.consumed_eventgroups.iter().map(|r| r.ttl));
+        let offer_ttl = self.offers_service.then_some(self.ttl);
+        let ttls = offer_ttl
+            .into_iter()
+            .chain(self.consumed_eventgroups.iter().map(|r| r.ttl));
         for ttl in ttls {
             if !(1..=crate::protocol::sd::MAX_TTL).contains(&ttl) {
                 return Err(build_error(crate::sd_codec::BuildError::InvalidTtl(ttl)));
