@@ -939,14 +939,13 @@ pub(super) async fn find_loop<T, Tm>(
 /// [`Server::run_with_buffers`] resolves to once buffers are
 /// supplied.
 ///
-/// Returns `Err(Error::InvalidUsage("passive_server_run"))` if invoked
-/// on a passive server (passive servers have no SD socket bound to
-/// 30490 and rely on an external SD dispatcher).
+/// Returns `Err(Error::InvalidUsage("passive_server_run"))` if invoked on a
+/// passive server (passive servers have no SD socket bound to 30490 and rely
+/// on an external SD dispatcher).
 ///
-/// When `config.announce` is `false`, the announcement arm is skipped
-/// and only the receive loop drives — used by the dispatcher topology
-/// where a co-located `Client` emits `OfferService` on the server's
-/// behalf.
+/// When `config.announce` is `false`, the announcement arm is skipped and only
+/// the receive loop drives. The dispatcher topology uses this, where a
+/// co-located `Client` emits `OfferService` on the server's behalf.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_combined<H, T, Sub, Hsd, Tm, R>(
     config: ServerConfig,
@@ -2291,8 +2290,8 @@ mod tests {
             assert_eq!(finds_sent_by_run(config), 4);
         }
 
-        /// Polls `run_combined` once and returns the datagrams it sent to the
-        /// SD socket; the run future must still be receiving.
+        /// Polls `run_combined` once and returns how many datagrams it sent to
+        /// the SD socket; the run future must still be receiving.
         fn finds_sent_by_run(config: ServerConfig) -> usize {
             use futures_util::FutureExt;
             let sd: &'static RecordingSocket = std::boxed::Box::leak(std::boxed::Box::default());

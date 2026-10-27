@@ -15,9 +15,6 @@
 //! combined-offer announce, `FindService` and answering Offers with
 //! Subscribes, tracking and expiring the Offers of required services,
 //! notification dispatch, E2E, and the embassy executor + task.
-//!
-//! This phase exposes the callback transport and the mailbox; the executor
-//! + task + C-ABI land in later submodules.
 
 mod mailbox;
 mod transport;

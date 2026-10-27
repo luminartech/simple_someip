@@ -353,7 +353,7 @@ extern "C" fn now_ms() -> u32 {
 }
 
 /// The runtime's availability sink: reports each change of a required
-/// service. Endpoints other than IPv4 have no `Observation`.
+/// service.
 fn on_service(_ctx: usize, change: rt::ServiceChange) {
     let observation = match change {
         rt::ServiceChange::Available {
@@ -362,6 +362,7 @@ fn on_service(_ctx: usize, change: rt::ServiceChange) {
             endpoint,
             ..
         } => {
+            // The harness's `Observation` carries an IPv4 endpoint only.
             let SocketAddr::V4(endpoint) = endpoint.addr else {
                 return;
             };

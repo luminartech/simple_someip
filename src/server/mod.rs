@@ -174,8 +174,10 @@ pub struct ServerConfig {
     /// [`Self::consumed_eventgroups`]. An Offer of a required service sends no
     /// Subscribe; only [`Self::consumed_eventgroups`] are subscribed. Each
     /// entry names a concrete service ID, instance ID and major version, not a
-    /// wildcard. Populate via [`Self::with_required_service`]. A passive
-    /// server runs no receive loop, so it neither finds nor answers Offers.
+    /// wildcard. A required service that is not also consumed is found with a
+    /// `FindService` TTL of 3 seconds. Populate via
+    /// [`Self::with_required_service`]. A passive server runs no receive loop,
+    /// so it neither finds nor answers Offers.
     pub required_services: heapless::Vec<RequiredService, { ServerConfig::REQUIRED_SERVICES_CAP }>,
     /// When `FindService` is sent for [`Self::consumed_eventgroups`] and
     /// [`Self::required_services`]; see [`FindTiming`]. Defaults to
@@ -237,7 +239,8 @@ pub struct AcceptedOffer {
 }
 
 /// A service instance a node needs, found with `FindService` until it is
-/// offered. See [`ServerConfig::required_services`].
+/// offered. A required service that is not also consumed is found with a
+/// `FindService` TTL of 3 seconds. See [`ServerConfig::required_services`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequiredService {
     /// Required service ID.
@@ -718,7 +721,7 @@ impl ServerConfig {
 /// — no `Spawner` (server has no internal task spawning), no
 /// `InterfaceHandle` (interface lives in [`ServerConfig`]).
 ///
-/// All four fields are public so callers can construct the struct
+/// The fields are public so callers can construct the struct
 /// inline.
 pub struct ServerDeps<F, Tm, R, Sub>
 where
@@ -945,7 +948,7 @@ pub struct ServerHandles<Hep> {
 /// pattern (the blanket `SharedHandle<T>` impl on `&'static T`
 /// makes the `&'static …` shape a drop-in for the `Arc<…>` shape).
 ///
-/// All eight fields are public so the struct can be assembled
+/// The fields are public so the struct can be assembled
 /// inline.
 pub struct ServerStorage<F, Tm, R, Sub, H, Hsd, Hep>
 where
@@ -1173,8 +1176,8 @@ pub enum ObservedOffer {
         /// The offered service instance, as an [`OfferedInstance`](crate::OfferedInstance).
         instance: crate::traits::OfferedInstance,
         /// The [`NetEndpoint`](crate::NetEndpoint) among the entry's IPv4
-        /// endpoint options: the first UDP one, else the first TCP one. `None` when the entry
-        /// references no IPv4 endpoint option.
+        /// endpoint options: the first UDP one, else the first TCP one. `None`
+        /// when the entry references no IPv4 endpoint option.
         endpoint: Option<crate::NetEndpoint>,
         /// The entry's time to live, in seconds.
         ttl: u32,

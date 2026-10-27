@@ -222,7 +222,10 @@ pub struct RuntimeConfig {
     /// The services this node needs, each naming a concrete service ID,
     /// instance ID and major version. The runtime sends `FindService` for
     /// them and reports their availability through [`Self::on_service`]. A
-    /// service listed twice, or also subscribed to, is required once.
+    /// service listed twice, or also subscribed to, is required once. The
+    /// subscription's service takes one of the
+    /// [`ServerConfig::REQUIRED_SERVICES_CAP`] slots, and [`init`] returns
+    /// `-7` past it.
     pub required_services: &'static [RequiredEntry],
     /// Called for each change in the availability of a required service;
     /// `None` reports nothing.
