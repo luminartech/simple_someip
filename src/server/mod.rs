@@ -2487,7 +2487,6 @@ mod tests {
             &sd_view,
             sender,
             &mut [0u8; crate::UDP_BUFFER_SIZE],
-            &[],
         )
         .await;
         assert!(
@@ -2659,7 +2658,6 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                &[],
             )
             .await
             .unwrap();
@@ -2724,7 +2722,6 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                &[],
             )
             .await
             .unwrap();
@@ -2786,7 +2783,6 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                &[],
             )
             .await
             .unwrap();
@@ -2846,7 +2842,6 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                &[],
             )
             .await
             .unwrap();
@@ -2909,7 +2904,6 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                &[],
             )
             .await
             .unwrap();
@@ -2969,7 +2963,6 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                &[],
             )
             .await
             .unwrap();
@@ -3022,7 +3015,6 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                &[],
             )
             .await
             .unwrap();
@@ -3247,7 +3239,6 @@ mod tests {
             &sd_view,
             "127.0.0.1:12345".parse().unwrap(),
             &mut [0u8; crate::UDP_BUFFER_SIZE],
-            &[],
         )
         .await;
         assert!(result.is_ok());
@@ -3278,7 +3269,6 @@ mod tests {
             &sd_view,
             "127.0.0.1:45000".parse().unwrap(),
             &mut [0u8; crate::UDP_BUFFER_SIZE],
-            &[],
         )
         .await;
 
@@ -3317,7 +3307,6 @@ mod tests {
             &sd_view,
             "127.0.0.1:12345".parse().unwrap(),
             &mut [0u8; crate::UDP_BUFFER_SIZE],
-            &[],
         )
         .await;
         assert!(result.is_ok());
@@ -3359,7 +3348,6 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                &[],
             )
             .await
             .unwrap();
@@ -3689,7 +3677,6 @@ mod tests {
             &sd_view,
             sender,
             &mut [0u8; crate::UDP_BUFFER_SIZE],
-            &[],
         )
         .await
         .unwrap();

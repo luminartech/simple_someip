@@ -176,9 +176,9 @@ where
     Ok(())
 }
 
-/// Handle a Service Discovery message (Subscribe / `FindService` etc.).
+/// Handle a Service Discovery message (Subscribe / `FindService` etc.);
+/// returns the consumed eventgroups it sent a Subscribe for.
 #[allow(clippy::too_many_lines)]
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_sd_message<T, Sub>(
     config: &ServerConfig,
     sd_socket: &T,
@@ -187,8 +187,7 @@ pub(super) async fn handle_sd_message<T, Sub>(
     sd_view: &sd::SdHeaderView<'_>,
     sender: core::net::SocketAddr,
     send_buf: &mut [u8],
-    offered: &[core::sync::atomic::AtomicBool],
-) -> Result<(), Error>
+) -> Result<Subscribed, Error>
 where
     T: TransportSocket,
     Sub: SubscriptionHandle,
@@ -421,22 +420,47 @@ where
         }
     }
 
-    for (flag, _) in offered
-        .iter()
-        .zip(&answered)
-        .filter(|(_, answered)| **answered)
-    {
-        flag.store(true, core::sync::atomic::Ordering::Relaxed);
+    if !answered.contains(&true) {
+        return Ok(NONE_SUBSCRIBED);
+    }
+    match send_subscribes(send_buf, config, sd_socket, sd_state, &answered, sender).await {
+        Ok(()) => Ok(answered),
+        Err(e) => {
+            crate::log::warn!("Subscribe send failed: {e}");
+            Ok(NONE_SUBSCRIBED)
+        }
+    }
+}
+
+/// The consumed eventgroups a Subscribe was sent for, by index into
+/// [`ServerConfig::consumed_eventgroups`].
+pub(super) type Subscribed = [bool; ServerConfig::CONSUMED_EVENTGROUPS_CAP];
+
+const NONE_SUBSCRIBED: Subscribed = [false; ServerConfig::CONSUMED_EVENTGROUPS_CAP];
+
+/// The consumed eventgroups whose Offer has been answered with a Subscribe.
+/// The receive loop marks them; [`find_loop`] stops finding them.
+pub(super) struct Offered([core::sync::atomic::AtomicBool; ServerConfig::CONSUMED_EVENTGROUPS_CAP]);
+
+impl Offered {
+    pub(super) const fn new() -> Self {
+        Self(
+            [const { core::sync::atomic::AtomicBool::new(false) };
+                ServerConfig::CONSUMED_EVENTGROUPS_CAP],
+        )
     }
 
-    if answered.contains(&true)
-        && let Err(e) =
-            send_subscribes(send_buf, config, sd_socket, sd_state, &answered, sender).await
-    {
-        crate::log::warn!("Subscribe send failed: {e}");
+    pub(super) fn mark(&self, subscribed: Subscribed) {
+        for (flag, _) in self.0.iter().zip(subscribed).filter(|(_, s)| *s) {
+            flag.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
     }
 
-    Ok(())
+    fn contains(&self, index: usize) -> bool {
+        self.0
+            .get(index)
+            .is_some_and(|f| f.load(core::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 /// Periodic SD `OfferService` announcement loop. Runs forever; intended
@@ -575,7 +599,7 @@ async fn recv_loop<T, Sub, R>(
     sd_buf: &mut [u8],
     send_buf: &mut [u8],
     non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
-    offered: &[core::sync::atomic::AtomicBool],
+    offered: &Offered,
 ) -> Result<(), Error>
 where
     T: TransportSocket,
@@ -657,7 +681,7 @@ where
                     match view.sd_header() {
                         Ok(sd_view) => {
                             crate::log::trace!("SD message has {} entries", sd_view.entry_count());
-                            handle_sd_message(
+                            let subscribed = handle_sd_message(
                                 config,
                                 sd_socket,
                                 sd_state,
@@ -665,9 +689,9 @@ where
                                 &sd_view,
                                 addr,
                                 send_buf,
-                                offered,
                             )
                             .await?;
+                            offered.mark(subscribed);
                         }
                         Err(e) => {
                             crate::log::warn!("Failed to parse SD message: {:?}", e);
@@ -710,7 +734,7 @@ fn encode_finds(
     buf: &mut [u8],
     config: &ServerConfig,
     sd_state: &SdStateManager,
-    offered: &[core::sync::atomic::AtomicBool],
+    offered: &Offered,
 ) -> Result<Option<usize>, Error> {
     let consumed = &config.consumed_eventgroups;
     let same_instance = |a: &crate::sd_codec::SubscribeEventgroupRequest,
@@ -723,10 +747,7 @@ fn encode_finds(
     wanted.retain(|request| {
         let i = index;
         index += 1;
-        let is_offered = offered
-            .get(i)
-            .is_some_and(|f| f.load(core::sync::atomic::Ordering::Relaxed));
-        !is_offered
+        !offered.contains(i)
             && !consumed[..i]
                 .iter()
                 .any(|earlier| same_instance(earlier, request))
@@ -754,7 +775,7 @@ pub(super) async fn find_loop<T, Tm>(
     sd_socket: &T,
     sd_state: &SdStateManager,
     timer: &Tm,
-    offered: &[core::sync::atomic::AtomicBool],
+    offered: &Offered,
 ) where
     T: TransportSocket,
     Tm: Timer,
@@ -831,8 +852,7 @@ where
     let sd = sd_socket.get();
     let sd_state_ref = sd_state.get();
 
-    let offered = [const { core::sync::atomic::AtomicBool::new(false) };
-        ServerConfig::CONSUMED_EVENTGROUPS_CAP];
+    let offered = Offered::new();
     let recv_fut = recv_loop(
         &config,
         unicast,
@@ -1319,7 +1339,6 @@ mod tests {
                 &sd_view,
                 core::net::SocketAddr::V4(PEER_SD),
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                &offered_flags(),
             )
             .await
             .expect("handle_sd_message");
@@ -1477,7 +1496,6 @@ mod tests {
                 &sd_view,
                 core::net::SocketAddr::V4(PEER_SD),
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                &offered_flags(),
             )
             .await
             .expect("handle_sd_message");
@@ -1560,7 +1578,6 @@ mod tests {
                 &sd_view,
                 subscriber_addr(),
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                &offered_flags(),
             )
             .await;
 
@@ -1568,10 +1585,11 @@ mod tests {
         }
 
         /// Returns at once from every `sleep`, recording its duration; on
-        /// the sleep numbered `offer_at` (0-based) it marks `offered[0]`.
+        /// the sleep numbered `offer_at` (0-based) it marks the first
+        /// consumed eventgroup offered.
         struct RecordingTimer<'a> {
             sleeps: std::sync::Mutex<std::vec::Vec<core::time::Duration>>,
-            offer_at: Option<(usize, &'a [core::sync::atomic::AtomicBool])>,
+            offer_at: Option<(usize, &'a Offered)>,
         }
 
         impl<'a> RecordingTimer<'a> {
@@ -1581,7 +1599,7 @@ mod tests {
                     offer_at: None,
                 }
             }
-            fn offering_at(n: usize, offered: &'a [core::sync::atomic::AtomicBool]) -> Self {
+            fn offering_at(n: usize, offered: &'a Offered) -> Self {
                 Self {
                     sleeps: std::sync::Mutex::default(),
                     offer_at: Some((n, offered)),
@@ -1607,17 +1625,17 @@ mod tests {
                 if let Some((n, offered)) = self.offer_at
                     && sleeps.len() == n
                 {
-                    offered[0].store(true, core::sync::atomic::Ordering::Relaxed);
+                    offered.mark(first_subscribed());
                 }
                 sleeps.push(duration);
                 core::future::ready(())
             }
         }
 
-        fn offered_flags()
-        -> [core::sync::atomic::AtomicBool; ServerConfig::CONSUMED_EVENTGROUPS_CAP] {
-            [const { core::sync::atomic::AtomicBool::new(false) };
-                ServerConfig::CONSUMED_EVENTGROUPS_CAP]
+        fn first_subscribed() -> Subscribed {
+            let mut subscribed = NONE_SUBSCRIBED;
+            subscribed[0] = true;
+            subscribed
         }
 
         /// The (service, instance) of each Find entry in each datagram sent.
@@ -1655,7 +1673,7 @@ mod tests {
             let (socket, timer, offered) = (
                 RecordingSocket::default(),
                 RecordingTimer::new(),
-                offered_flags(),
+                Offered::new(),
             );
 
             find_loop(&config, &socket, &make_sd_state(), &timer, &offered).await;
@@ -1672,7 +1690,7 @@ mod tests {
             let (socket, timer, offered) = (
                 RecordingSocket::default(),
                 RecordingTimer::new(),
-                offered_flags(),
+                Offered::new(),
             );
 
             find_loop(&config, &socket, &make_sd_state(), &timer, &offered).await;
@@ -1684,7 +1702,7 @@ mod tests {
         #[tokio::test]
         async fn an_instance_offered_before_the_first_send_is_never_found() {
             let config = make_config().with_consumed_eventgroup(consumed());
-            let offered = offered_flags();
+            let offered = Offered::new();
             let (socket, timer) = (
                 RecordingSocket::default(),
                 RecordingTimer::offering_at(0, &offered),
@@ -1698,7 +1716,7 @@ mod tests {
         #[tokio::test]
         async fn an_offer_between_repetitions_stops_the_remaining_finds() {
             let config = make_config().with_consumed_eventgroup(consumed());
-            let offered = offered_flags();
+            let offered = Offered::new();
             let (socket, timer) = (
                 RecordingSocket::default(),
                 RecordingTimer::offering_at(2, &offered),
@@ -1728,7 +1746,7 @@ mod tests {
             let (socket, timer, offered) = (
                 RecordingSocket::default(),
                 RecordingTimer::new(),
-                offered_flags(),
+                Offered::new(),
             );
 
             find_loop(&config, &socket, &make_sd_state(), &timer, &offered).await;
@@ -1744,7 +1762,7 @@ mod tests {
             let (socket, timer, offered) = (
                 RecordingSocket::default(),
                 RecordingTimer::new(),
-                offered_flags(),
+                Offered::new(),
             );
 
             find_loop(&config, &socket, &make_sd_state(), &timer, &offered).await;
@@ -1760,7 +1778,7 @@ mod tests {
         #[tokio::test]
         async fn a_failed_find_send_keeps_the_schedule() {
             let config = make_config().with_consumed_eventgroup(consumed());
-            let (timer, offered) = (RecordingTimer::new(), offered_flags());
+            let (timer, offered) = (RecordingTimer::new(), Offered::new());
 
             find_loop(&config, &FailingSocket, &make_sd_state(), &timer, &offered).await;
 
@@ -1780,7 +1798,7 @@ mod tests {
             let (socket, timer, offered) = (
                 RecordingSocket::default(),
                 RecordingTimer::new(),
-                offered_flags(),
+                Offered::new(),
             );
 
             find_loop(&config, &socket, &make_sd_state(), &timer, &offered).await;
@@ -1790,31 +1808,49 @@ mod tests {
             assert!(sleeps[1..].iter().all(|d| *d == core::time::Duration::MAX));
         }
 
-        #[tokio::test]
-        async fn an_answered_offer_marks_its_instance_offered() {
+        async fn subscribed_by_an_offer<T: TransportSocket>(socket: &T) -> Subscribed {
             let config = make_config().with_consumed_eventgroup(consumed());
-            let offered = offered_flags();
-            let socket = RecordingSocket::default();
             let (wire, sd_len) = offers_wire_bytes(&[(0x5678, 1, 1)]);
             let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
             let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::server::SubscriptionManager::new(),
             ));
-
             handle_sd_message(
                 &config,
-                &socket,
+                socket,
                 &make_sd_state(),
                 &subscriptions,
                 &sd_view,
                 core::net::SocketAddr::V4(PEER_SD),
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                &offered,
             )
             .await
-            .expect("handle_sd_message");
+            .expect("handle_sd_message")
+        }
 
-            assert!(offered[0].load(core::sync::atomic::Ordering::Relaxed));
+        #[tokio::test]
+        async fn an_answered_offer_reports_its_eventgroup_subscribed() {
+            let subscribed = subscribed_by_an_offer(&RecordingSocket::default()).await;
+
+            assert_eq!(subscribed, first_subscribed());
+        }
+
+        #[tokio::test]
+        async fn an_offer_whose_subscribe_send_fails_reports_nothing_subscribed() {
+            let subscribed = subscribed_by_an_offer(&FailingSocket).await;
+
+            assert_eq!(subscribed, NONE_SUBSCRIBED);
+        }
+
+        #[test]
+        fn a_marked_eventgroup_is_no_longer_found() {
+            let config = make_config().with_consumed_eventgroup(consumed());
+            let offered = Offered::new();
+            offered.mark(first_subscribed());
+
+            let found = encode_finds(&mut [0u8; 64], &config, &make_sd_state(), &offered);
+
+            assert!(matches!(found, Ok(None)), "{found:?}");
         }
 
         #[tokio::test]
