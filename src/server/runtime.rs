@@ -771,7 +771,7 @@ pub(super) async fn find_loop<T, Tm>(
     sd_state: &SdStateManager,
     timer: &Tm,
     offered: &Offered,
-    buf: &mut [u8],
+    buf: &mut [u8; ServerConfig::FIND_SEND_BUF_LEN],
 ) where
     T: TransportSocket,
     Tm: Timer,
@@ -822,7 +822,7 @@ pub(super) async fn run_combined<H, T, Sub, Hsd, Tm, R>(
     sd_buf: &mut [u8],
     recv_send_buf: &mut [u8],
     announce_send_buf: &mut [u8],
-    find_send_buf: &mut [u8],
+    find_send_buf: &mut [u8; ServerConfig::FIND_SEND_BUF_LEN],
     non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
 ) -> Result<(), Error>
 where

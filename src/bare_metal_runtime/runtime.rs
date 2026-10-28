@@ -506,10 +506,9 @@ async fn someip_task() {
     let find_scratch: &'static mut [u8; ServerConfig::FIND_SEND_BUF_LEN] =
         unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).find_scratch) };
     let rx: &'static mut [u8; RX_CAP] = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).rx) };
-    // Recv-only: `with_announce(false)` makes `run_with_buffers` skip its
-    // announce arm (the runtime announces all offers itself), so the
-    // announce_send_buf is never touched — pass an empty slice. Recv,
-    // SubscribeAck and the Subscribe answers use unicast/sd/tx_scratch.
+    // `with_announce(false)` makes `run_with_buffers` skip its announce arm
+    // (the runtime announces all offers itself), so its announce buffer is
+    // empty.
     let recv = server.run_with_buffers(unicast, sd, tx_scratch, &mut [], find_scratch);
 
     let mut reqs = [DEFAULT_OFFER_REQUEST; MAX_OFFERS];
