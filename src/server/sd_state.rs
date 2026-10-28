@@ -47,6 +47,12 @@ impl Default for SdStateManager {
 }
 
 impl SdStateManager {
+    /// Construct numbering SD messages with `session`.
+    #[must_use]
+    pub const fn from_counter(session: SdSessionCounter) -> Self {
+        Self { session }
+    }
+
     /// Construct as if `initial` was the session ID last sent, before the
     /// counter first wrapped; see [`SdSessionCounter::resume`].
     #[must_use]

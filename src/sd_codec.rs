@@ -597,6 +597,8 @@ impl SdSessionCounter {
     /// A counter that last gave session ID `last` with the reboot flag
     /// `reboot`, as when restoring a counter kept elsewhere. The next session
     /// is `last + 1`, or 1 after 0xFFFF. `last` 0 means none was given yet.
+    /// After a reboot, start from [`Self::new`]: a resumed `Continuous`
+    /// counter hides the reboot from peers.
     #[must_use]
     pub const fn resume(last: u16, reboot: RebootFlag) -> Self {
         let wrapped = match reboot {
