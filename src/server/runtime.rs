@@ -522,7 +522,7 @@ async fn dispatch_non_sd_request<T: TransportSocket, R: E2EHandle + ?Sized>(
     let (service_id, method_id) = (id.service_id(), id.method_id());
     // A request that passes the hook's check arrives without its
     // protection header; any other request arrives as received.
-    let parsed = crate::sd_codec::ParsedDatagram::from(view);
+    let parsed = crate::sd_codec::ParsedMessage::from(view);
     let (status, body) =
         crate::sd_codec::check_parsed_e2e(e2e, core::net::IpAddr::V4(*source.ip()), &parsed);
     let resp_len = cb(

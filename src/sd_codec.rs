@@ -653,10 +653,10 @@ impl Default for SdSessionCounter {
     }
 }
 
-/// SOME/IP message fields extracted by [`parse_someip_datagram`];
+/// SOME/IP message fields extracted by [`parse_someip_message`];
 /// `payload` borrows from the input buffer.
 #[derive(Debug, Clone, Copy)]
-pub struct ParsedDatagram<'a> {
+pub struct ParsedMessage<'a> {
     pub service_id: u16,
     pub method_id: u16,
     /// Header bytes 8..16, passed to the
@@ -665,7 +665,7 @@ pub struct ParsedDatagram<'a> {
     pub payload: &'a [u8],
 }
 
-impl<'a> From<&MessageView<'a>> for ParsedDatagram<'a> {
+impl<'a> From<&MessageView<'a>> for ParsedMessage<'a> {
     fn from(view: &MessageView<'a>) -> Self {
         let header = view.header();
         let message_id = header.message_id();
@@ -679,10 +679,8 @@ impl<'a> From<&MessageView<'a>> for ParsedDatagram<'a> {
 }
 
 /// Parse the SOME/IP message at the front of `data`, as
-/// [`MessageView::parse`] does: its payload ends where its Length field says,
-/// and a SOME/IP-TP segment is returned like any message.
-/// [`messages`](crate::protocol::messages) walks every message in a datagram
-/// and skips TP segments.
+/// [`MessageView::parse`] does. [`messages`](crate::protocol::messages) walks
+/// every message in a datagram.
 ///
 /// # Errors
 /// Propagates the [`MessageView::parse`] error: [`protocol::Error::Incomplete`]
@@ -692,13 +690,13 @@ impl<'a> From<&MessageView<'a>> for ParsedDatagram<'a> {
 /// bytes yet" from "malformed".
 ///
 /// [`protocol::Error::Incomplete`]: crate::protocol::Error::Incomplete
-pub fn parse_someip_datagram(data: &[u8]) -> Result<ParsedDatagram<'_>, crate::protocol::Error> {
-    Ok(ParsedDatagram::from(&MessageView::parse(data)?))
+pub fn parse_someip_message(data: &[u8]) -> Result<ParsedMessage<'_>, crate::protocol::Error> {
+    Ok(ParsedMessage::from(&MessageView::parse(data)?))
 }
 
 /// Parse the SOME/IP message at the front of `data` as SOME/IP-SD, as
 /// [`MessageView::parse`] does, returning the inner [`SdHeaderView`] for
-/// entry/option iteration. The message ends where its Length field says.
+/// entry/option iteration.
 ///
 /// # Errors
 /// The three failure modes are distinguishable by variant:
@@ -712,7 +710,7 @@ pub fn parse_someip_datagram(data: &[u8]) -> Result<ParsedDatagram<'_>, crate::p
 /// [`protocol::Error::Incomplete`]: crate::protocol::Error::Incomplete
 /// [`protocol::Error::UnsupportedMessageID`]: crate::protocol::Error::UnsupportedMessageID
 /// [`protocol::Error::Sd`]: crate::protocol::Error::Sd
-pub fn parse_someip_sd_datagram(data: &[u8]) -> Result<SdHeaderView<'_>, crate::protocol::Error> {
+pub fn parse_someip_sd_message(data: &[u8]) -> Result<SdHeaderView<'_>, crate::protocol::Error> {
     let view = MessageView::parse(data)?;
     if !view.is_sd() {
         return Err(crate::protocol::Error::UnsupportedMessageID(
@@ -729,7 +727,7 @@ pub fn parse_someip_sd_datagram(data: &[u8]) -> Result<SdHeaderView<'_>, crate::
 pub fn check_parsed_e2e<'a, R: E2EHandle + ?Sized>(
     e2e: &R,
     source: IpAddr,
-    parsed: &ParsedDatagram<'a>,
+    parsed: &ParsedMessage<'a>,
 ) -> (Option<E2EStatus>, &'a [u8]) {
     crate::transport::check_message(
         e2e,
@@ -797,7 +795,7 @@ mod tests {
                 session(1, RebootFlag::Continuous),
             )
             .unwrap();
-            let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+            let view = parse_someip_sd_message(&buf[..len]).expect("valid SD datagram");
             let entry = view.entries().next().unwrap();
             assert!(entry.is_stop_offer());
         }
@@ -816,7 +814,7 @@ mod tests {
 
         // Parses as an SD datagram with one OfferService entry per offer,
         // each referencing its own endpoint option.
-        let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+        let view = parse_someip_sd_message(&buf[..len]).expect("valid SD datagram");
         let services: heapless::Vec<u16, 8> = view
             .entries()
             .filter_map(|e| {
@@ -831,7 +829,7 @@ mod tests {
         let payload = [0xDE, 0xAD, 0xBE, 0xEF];
         let mut buf = [0u8; 64];
         let len = build_notification_datagram(&mut buf, 0x0003, 0x8001, 9, &payload).unwrap();
-        let parsed = parse_someip_datagram(&buf[..len]).expect("valid SOME/IP datagram");
+        let parsed = parse_someip_message(&buf[..len]).expect("valid SOME/IP datagram");
         assert_eq!(parsed.service_id, 0x0003);
         assert_eq!(parsed.method_id, 0x8001);
         assert_eq!(parsed.payload, &payload);
@@ -866,34 +864,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_someip_datagram_incomplete_is_error() {
+    fn parse_someip_message_incomplete_is_error() {
         // Fewer than SOMEIP_HEADER_LEN bytes -> Incomplete, not a silent None.
-        let err = parse_someip_datagram(&[0u8; 4]).unwrap_err();
+        let err = parse_someip_message(&[0u8; 4]).unwrap_err();
         assert!(matches!(err, crate::protocol::Error::Incomplete(_)));
     }
 
     #[test]
-    fn parse_someip_datagram_payload_ends_at_the_length_field() {
+    fn parse_someip_message_payload_ends_at_the_length_field() {
         let mut buf = [0u8; 64];
         let len = build_notification_datagram(&mut buf, 0x0003, 0x8001, 9, &[0x01]).unwrap();
         buf[len..len + 3].fill(0xEE);
-        let parsed = parse_someip_datagram(&buf[..len + 3]).expect("valid SOME/IP datagram");
+        let parsed = parse_someip_message(&buf[..len + 3]).expect("valid SOME/IP datagram");
         assert_eq!(parsed.payload, &[0x01]);
         // The Length field covers a payload byte that is not in `data`.
-        let err = parse_someip_datagram(&buf[..len - 1]).unwrap_err();
+        let err = parse_someip_message(&buf[..len - 1]).unwrap_err();
         assert!(matches!(err, crate::protocol::Error::Incomplete(_)));
     }
 
     #[test]
     fn parse_sd_datagram_incomplete_vs_not_sd_vs_malformed() {
         // 1. Incomplete: too few bytes for even the SOME/IP header.
-        let err = parse_someip_sd_datagram(&[0u8; 4]).unwrap_err();
+        let err = parse_someip_sd_message(&[0u8; 4]).unwrap_err();
         assert!(matches!(err, crate::protocol::Error::Incomplete(_)));
 
         // 2. Not SD: a well-formed non-SD notification datagram.
         let mut buf = [0u8; 64];
         let len = build_notification_datagram(&mut buf, 0x0003, 0x8001, 9, &[1, 2, 3]).unwrap();
-        let err = parse_someip_sd_datagram(&buf[..len]).unwrap_err();
+        let err = parse_someip_sd_message(&buf[..len]).unwrap_err();
         assert!(matches!(
             err,
             crate::protocol::Error::UnsupportedMessageID(_)
@@ -920,7 +918,7 @@ mod tests {
         )
         .unwrap();
         let truncated = &sd_buf[..sd_len - 4];
-        let err = parse_someip_sd_datagram(truncated).unwrap_err();
+        let err = parse_someip_sd_message(truncated).unwrap_err();
         assert!(
             !matches!(err, crate::protocol::Error::UnsupportedMessageID(_)),
             "truncated SD datagram must not surface as not-SD"
@@ -939,7 +937,7 @@ mod tests {
         // The IPv4 endpoint option is the last 12 bytes; its transport byte is
         // the third-to-last.
         buf[len - 3] = 0x84;
-        let err = parse_someip_sd_datagram(&buf[..len]).unwrap_err();
+        let err = parse_someip_sd_message(&buf[..len]).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -974,8 +972,7 @@ mod tests {
         // the SD flags/reserved and entries_size fields.
         sd_buf[16 + 8] = 0xFF;
 
-        let view =
-            parse_someip_sd_datagram(&sd_buf[..sd_len]).expect("an unknown entry is skipped");
+        let view = parse_someip_sd_message(&sd_buf[..sd_len]).expect("an unknown entry is skipped");
         assert_eq!(view.entries().count(), 0);
     }
 
@@ -996,7 +993,7 @@ mod tests {
         for reboot in [RebootFlag::RecentlyRebooted, RebootFlag::Continuous] {
             let len = build_subscribe_eventgroup_datagram(&mut buf, &request, session(3, reboot))
                 .unwrap();
-            let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+            let view = parse_someip_sd_message(&buf[..len]).expect("valid SD datagram");
             let mut entries = view.entries();
             let entry = entries.next().expect("one entry");
             assert_eq!(entry.entry_type().unwrap(), EntryType::Subscribe);
@@ -1024,7 +1021,7 @@ mod tests {
             session(3, RebootFlag::Continuous),
         )
         .unwrap();
-        let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+        let view = parse_someip_sd_message(&buf[..len]).expect("valid SD datagram");
         let endpoints: std::vec::Vec<_> = view
             .entries()
             .map(|e| {
@@ -1119,7 +1116,7 @@ mod tests {
             session(5, RebootFlag::Continuous),
         )
         .unwrap();
-        let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+        let view = parse_someip_sd_message(&buf[..len]).expect("valid SD datagram");
         let entries: std::vec::Vec<_> = view.entries().collect();
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
@@ -1213,7 +1210,7 @@ mod tests {
             for reboot in [RebootFlag::RecentlyRebooted, RebootFlag::Continuous] {
                 let mut buf = [0u8; 128];
                 let len = build(&mut buf, &req(0x0001, 30501), reboot).unwrap();
-                let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+                let view = parse_someip_sd_message(&buf[..len]).expect("valid SD datagram");
                 assert_eq!(view.flags().reboot(), reboot, "{name}");
             }
         }
@@ -1260,7 +1257,7 @@ mod tests {
         for reboot in [RebootFlag::RecentlyRebooted, RebootFlag::Continuous] {
             let mut buf = [0u8; 64];
             let len = build_subscribe_ack_datagram(&mut buf, &request, session(2, reboot)).unwrap();
-            let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+            let view = parse_someip_sd_message(&buf[..len]).expect("valid SD datagram");
             assert_eq!(view.flags().reboot(), reboot);
         }
     }
@@ -1279,7 +1276,7 @@ mod tests {
         let len =
             build_subscribe_ack_datagram(&mut buf, &request, session(2, RebootFlag::Continuous))
                 .unwrap();
-        let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+        let view = parse_someip_sd_message(&buf[..len]).expect("valid SD datagram");
         assert_eq!(view.entries().next().expect("one entry").counter(), 3);
     }
 

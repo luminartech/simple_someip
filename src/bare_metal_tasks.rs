@@ -25,7 +25,7 @@ use core::time::Duration;
 
 use crate::protocol::messages;
 use crate::sd_codec::{
-    OfferServiceRequest, ParsedDatagram, build_multi_offer_service_datagram,
+    OfferServiceRequest, ParsedMessage, build_multi_offer_service_datagram,
     build_notification_datagram, check_parsed_e2e,
 };
 use crate::server::{ServerConfig, ServerSd, Subscriber, SubscriptionHandle};
@@ -104,7 +104,7 @@ pub async fn event_rx_dispatch_future<'a, S, R>(
                     continue;
                 }
             };
-            let parsed = ParsedDatagram::from(&view);
+            let parsed = ParsedMessage::from(&view);
             let (status, body) =
                 check_parsed_e2e(e2e, core::net::IpAddr::V4(*source.ip()), &parsed);
             // Notifications received on the client RX socket are events, not
