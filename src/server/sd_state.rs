@@ -2,7 +2,8 @@
 //!
 //! [`SdStateManager`] owns the session-ID counter used by every outgoing
 //! SOME/IP-SD message this server emits (`OfferService` announcements,
-//! unicast Offer replies, `SubscribeAck`, `SubscribeNack`). It also builds
+//! unicast Offer replies, `SubscribeAck`, `SubscribeNack`, and the
+//! `SubscribeEventgroup` messages that answer Offers). It also builds
 //! and sends `OfferService` announcements when given a socket.
 //!
 //! Keeping this state in its own type prepares the server for upcoming

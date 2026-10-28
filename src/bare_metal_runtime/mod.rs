@@ -2,7 +2,7 @@
 //!
 //! A platform (e.g. an AURIX/lwIP firmware) drives the full SOME/IP
 //! integration by supplying only:
-//! - its **generated catalog** (offered services + subscriptions),
+//! - its **generated catalog** (offered services and an optional subscription),
 //! - **platform callbacks**: send a UDP datagram, read a ms clock, and a
 //!   dispatch sink for inbound messages,
 //! - **RX delivery**: the platform's receive path pushes datagrams into an
@@ -10,8 +10,8 @@
 //! - **buffer memory** it owns (so the platform controls link placement).
 //!
 //! Everything else — the SD codec, subscribe-accept, the combined-offer
-//! announce, the proactive subscribe, notification dispatch, E2E, and the
-//! embassy executor + task — lives here.
+//! announce, answering Offers with Subscribes, notification dispatch, E2E,
+//! and the embassy executor + task — lives here.
 //!
 //! This phase exposes the callback transport and the mailbox; the executor
 //! + task + C-ABI land in later submodules.

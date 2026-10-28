@@ -14,7 +14,7 @@ use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 use crate::bare_metal_tasks::{SomeipRun, publish_notification, run_someip};
-use crate::protocol::sd::{self, RebootFlag};
+use crate::protocol::sd;
 use crate::sd_codec::{
     OfferServiceRequest, SubscribeEventgroupRequest, build_multi_stop_offer_service_datagram,
     next_sd_session,
@@ -35,9 +35,7 @@ pub const RX_SLOTS: usize = crate::from_env_or(option_env!("SIMPLE_SOMEIP_RX_SLO
 /// single datagrams stay under this (TP segmentation not used here).
 pub const RX_CAP: usize = 1500;
 const MAX_OFFERS: usize = crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_OFFERS"), 4);
-const MAX_SUBS: usize = crate::from_env_or(option_env!("SIMPLE_SOMEIP_MAX_SUBS"), 1);
 const SD_SCRATCH_CAP: usize = 512;
-const SUB_SCRATCH_CAP: usize = 128;
 /// Capacity of the API-only send scratch (`RuntimeBuffers::publish_scratch`),
 /// shared by `publish` and `deinit`. Sized for modest events rather than a
 /// full MTU to keep the always-resident static footprint small (+512 B, not
@@ -128,7 +126,6 @@ pub struct RuntimeBuffers {
     pub rx: [u8; RX_CAP],
     pub tx_scratch: [u8; RX_CAP],
     pub offer_scratch: [u8; SD_SCRATCH_CAP],
-    pub sub_scratch: [u8; SUB_SCRATCH_CAP],
     /// Scratch reserved for the synchronous public API (`publish` /
     /// `deinit`). Kept disjoint from the buffers the spawned `someip_task`
     /// borrows for its entire (never-resolving) lifetime: `publish`/`deinit`
@@ -159,7 +156,6 @@ impl RuntimeBuffers {
             rx: [0; RX_CAP],
             tx_scratch: [0; RX_CAP],
             offer_scratch: [0; SD_SCRATCH_CAP],
-            sub_scratch: [0; SUB_SCRATCH_CAP],
             publish_scratch: [0; API_SCRATCH_CAP],
         }
     }
@@ -185,7 +181,9 @@ pub struct RuntimeConfig {
     pub bind: BindFn,
     /// Generated catalog (borrowed for the duration of `init`).
     pub offers: &'static [OfferEntry],
-    pub subscriptions: &'static [SubEntry],
+    /// The eventgroup this node subscribes to, if any, naming a concrete
+    /// service ID, instance ID and major version.
+    pub subscription: Option<SubEntry>,
     /// RX mailbox the platform's receive path pushes into.
     pub mailbox: &'static Mailbox,
     /// Runtime buffer memory (platform-owned, placement-controlled).
@@ -217,12 +215,11 @@ static IFACE: AtomicU32 = AtomicU32::new(0);
 static DISPATCH: AtomicUsize = AtomicUsize::new(0); // DispatchFn as usize
 static DISPATCH_CTX: AtomicUsize = AtomicUsize::new(0); // opaque ctx word for DISPATCH
 static OFFER_SESSION: AtomicU16 = AtomicU16::new(1);
-static SUB_SESSION: AtomicU16 = AtomicU16::new(1);
 static STOP_SESSION: AtomicU16 = AtomicU16::new(1);
 static PUBLISH_SESSION: AtomicU16 = AtomicU16::new(1);
 
 static OFFERS_LEN: AtomicUsize = AtomicUsize::new(0);
-static SUBS_LEN: AtomicUsize = AtomicUsize::new(0);
+static SUBSCRIBED: AtomicBool = AtomicBool::new(false);
 static mut OFFERS: [OfferEntry; MAX_OFFERS] = [OfferEntry {
     service_id: 0,
     instance_id: 0,
@@ -231,14 +228,14 @@ static mut OFFERS: [OfferEntry; MAX_OFFERS] = [OfferEntry {
     major_version: 0,
     ttl_seconds: 0,
 }; MAX_OFFERS];
-static mut SUBS: [SubEntry; MAX_SUBS] = [SubEntry {
+static mut SUBSCRIPTION: SubEntry = SubEntry {
     service_id: 0,
     instance_id: 0,
     event_group_id: 0,
     method_id: 0,
     local_rx_port: 0,
     major_version: 0,
-}; MAX_SUBS];
+};
 
 static mut UNICAST_SOCK: MaybeUninit<Sock> = MaybeUninit::uninit();
 static mut SD_SOCK: MaybeUninit<Sock> = MaybeUninit::uninit();
@@ -272,9 +269,11 @@ fn offers() -> &'static [OfferEntry] {
     unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(OFFERS).cast::<OfferEntry>(), len) }
 }
 
-fn subs() -> &'static [SubEntry] {
-    let len = SUBS_LEN.load(Ordering::Acquire).min(MAX_SUBS);
-    unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(SUBS).cast::<SubEntry>(), len) }
+fn subscription() -> Option<SubEntry> {
+    // SAFETY: single writer (init) released SUBSCRIBED before readers run.
+    SUBSCRIBED
+        .load(Ordering::Acquire)
+        .then(|| unsafe { *core::ptr::addr_of!(SUBSCRIPTION) })
 }
 
 fn find_offer(
@@ -290,7 +289,7 @@ fn find_offer(
 }
 
 /// Node SD TTL in seconds (from the catalog; one node-wide value surfaced
-/// per offer). Drives the offer + subscribe cadence.
+/// per offer). Drives the offer cadence.
 fn node_sd_ttl_secs() -> u64 {
     u64::from(offer_ttl(offers().first().map_or(0, |o| o.ttl_seconds)))
 }
@@ -379,7 +378,8 @@ const DEFAULT_OFFER_REQUEST: OfferServiceRequest = OfferServiceRequest {
 };
 
 /// Build the receive `Server` over the shared callback sockets, accepting
-/// subscribes for every offered service.
+/// subscribes for every offered service and answering Offers of the
+/// subscription's service.
 fn build_server() -> bool {
     let o = offers();
     let Some(primary) = o.first() else {
@@ -426,6 +426,12 @@ fn build_server() -> bool {
             entry.event_group_id,
         );
     }
+    if let Some(request) = subscribe_request() {
+        let Ok(c) = config.try_with_consumed_eventgroup(request) else {
+            return false;
+        };
+        config = c;
+    }
 
     // SAFETY: storages initialized just above / are 'static.
     let storage = unsafe {
@@ -451,10 +457,21 @@ fn build_server() -> bool {
     }
 }
 
-const CLIENT_SUB_OFFSET_SECS: u64 = 1;
+/// The Subscribe the server sends for the catalog's subscription.
+fn subscribe_request() -> Option<SubscribeEventgroupRequest> {
+    subscription().map(|s| SubscribeEventgroupRequest {
+        service_id: s.service_id,
+        instance_id: s.instance_id,
+        major_version: s.major_version,
+        event_group_id: s.event_group_id,
+        ttl: sd::MAX_TTL,
+        local_ip: Ipv4Addr::from(IFACE.load(Ordering::Acquire).to_be_bytes()),
+        local_rx_port: s.local_rx_port,
+    })
+}
 
-/// The single composed task: receive server + combined-offer announce +
-/// proactive subscribe + notification RX/dispatch.
+/// The single composed task: receive server (which also answers Offers with
+/// Subscribes) + combined-offer announce + notification RX/dispatch.
 #[embassy_executor::task]
 async fn someip_task() {
     // SAFETY: `init` wrote SERVER + BUFS + MAILBOX before spawning. Each
@@ -474,13 +491,11 @@ async fn someip_task() {
         unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).tx_scratch) };
     let offer_scratch: &'static mut [u8; SD_SCRATCH_CAP] =
         unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).offer_scratch) };
-    let sub_scratch: &'static mut [u8; SUB_SCRATCH_CAP] =
-        unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).sub_scratch) };
     let rx: &'static mut [u8; RX_CAP] = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).rx) };
     // Recv-only: `with_announce(false)` makes `run_with_buffers` skip its
     // announce arm (the runtime announces all offers itself), so the
-    // announce_send_buf is never touched — pass an empty slice. Recv +
-    // SubscribeAck use unicast/sd/tx_scratch.
+    // announce_send_buf is never touched — pass an empty slice. Recv,
+    // SubscribeAck and the Subscribe answers use unicast/sd/tx_scratch.
     let recv = server.run_with_buffers(unicast, sd, tx_scratch, &mut []);
 
     let mut reqs = [DEFAULT_OFFER_REQUEST; MAX_OFFERS];
@@ -495,26 +510,16 @@ async fn someip_task() {
     let timer = CallbackTimer::new(plat.now_ms);
     let e2e = e2e();
 
-    let sub = subs().first().copied();
     // Client RX socket marker (its PCB is pre-bound by the platform).
     let factory = Factory::new(plat);
-    let rx_socket = factory.socket(sub.map_or(0, |s| s.local_rx_port));
-    let subscribe = sub.map(|s| SubscribeEventgroupRequest {
-        service_id: s.service_id,
-        instance_id: s.instance_id,
-        major_version: s.major_version,
-        event_group_id: s.event_group_id,
-        ttl: sd::MAX_TTL,
-        local_ip: Ipv4Addr::from(IFACE.load(Ordering::Acquire).to_be_bytes()),
-        local_rx_port: s.local_rx_port,
-    });
+    let rx_socket = subscription().map(|s| factory.socket(s.local_rx_port));
     let period = Duration::from_secs(node_sd_ttl_secs());
 
     run_someip(
         recv,
         SomeipRun {
             sd_socket,
-            rx_socket: &rx_socket,
+            rx_socket: rx_socket.as_ref(),
             timer: &timer,
             e2e: &e2e,
             sd_multicast: sd_mcast,
@@ -522,11 +527,6 @@ async fn someip_task() {
             offers: &reqs[..n_offers],
             offer_session: &OFFER_SESSION,
             offer_scratch,
-            subscribe,
-            sub_session: &SUB_SESSION,
-            sub_scratch,
-            sub_reboot: RebootFlag::RecentlyRebooted,
-            sub_offset: Duration::from_secs(CLIENT_SUB_OFFSET_SECS),
             rx_buf: rx,
             dispatch,
             // The trampoline injects DISPATCH_CTX itself; pass 0 here.
@@ -544,8 +544,10 @@ async fn someip_task() {
 /// Returns `0` on success, or a negative error code: `-1` server build
 /// failed, `-2` task spawn failed, `-4` the runtime is already initialized
 /// (a repeat or re-entrant `init` — the passed `config` and its buffers are
-/// NOT adopted). The `-1`/`-2` paths release the init claim so a corrected
-/// retry can proceed; `-4` does not (a runtime is already live).
+/// NOT adopted), `-5` `config.subscription` names a wildcard service ID,
+/// instance ID or major version. The
+/// `-1`/`-2`/`-5` paths release the init claim so a corrected retry can
+/// proceed; `-4` does not (a runtime is already live).
 #[allow(clippy::missing_panics_doc)]
 // By-value is required, not incidental: `config.buffers` is a `&'static mut`
 // reborrowed into `BUFS` (`ptr::from_mut`), which a shared `&RuntimeConfig`
@@ -562,6 +564,12 @@ pub fn init(config: RuntimeConfig) -> i32 {
         .is_err()
     {
         return -4;
+    }
+    if config.subscription.is_some_and(|s| {
+        crate::sd_codec::names_a_wildcard(s.service_id, s.instance_id, s.major_version)
+    }) {
+        INIT_CLAIMED.store(false, Ordering::Release);
+        return -5;
     }
     IFACE.store(config.interface, Ordering::Release);
     SD_PORT.store(
@@ -596,11 +604,10 @@ pub fn init(config: RuntimeConfig) -> i32 {
         unsafe { (*core::ptr::addr_of_mut!(OFFERS))[i] = *e };
     }
     OFFERS_LEN.store(n_offers, Ordering::Release);
-    let n_subs = config.subscriptions.len().min(MAX_SUBS);
-    for (i, e) in config.subscriptions.iter().take(n_subs).enumerate() {
-        unsafe { (*core::ptr::addr_of_mut!(SUBS))[i] = *e };
+    if let Some(e) = config.subscription {
+        unsafe { *core::ptr::addr_of_mut!(SUBSCRIPTION) = e };
     }
-    SUBS_LEN.store(n_subs, Ordering::Release);
+    SUBSCRIBED.store(config.subscription.is_some(), Ordering::Release);
 
     // Bind PCBs via the platform (registers the RX path → `on_rx`): the SD
     // port, each unique offered unicast port, and each subscription RX port.
@@ -610,7 +617,7 @@ pub fn init(config: RuntimeConfig) -> i32 {
         true,
         SD_MCAST.load(Ordering::Acquire),
     );
-    let mut bound: [u16; MAX_OFFERS + MAX_SUBS] = [0; MAX_OFFERS + MAX_SUBS];
+    let mut bound: [u16; MAX_OFFERS + 1] = [0; MAX_OFFERS + 1];
     let mut nb = 0usize;
     let mut bind_once = |port: u16| {
         if port != 0 && !bound[..nb].contains(&port) {
@@ -622,7 +629,7 @@ pub fn init(config: RuntimeConfig) -> i32 {
     for o in offers() {
         bind_once(o.unicast_port);
     }
-    for s in subs() {
+    if let Some(s) = subscription() {
         bind_once(s.local_rx_port);
     }
 
