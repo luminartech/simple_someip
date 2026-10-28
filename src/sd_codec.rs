@@ -81,7 +81,7 @@ pub struct SubscribeAckRequest {
 }
 
 /// Packet-construction errors.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum BuildError {
     /// `buf` is shorter than the encoded datagram. Carries the codec's
@@ -104,8 +104,8 @@ pub enum BuildError {
     /// an offer's TTL is 0; carries the rejected TTL.
     InvalidTtl(u32),
     /// Sizing or encoding the SD or SOME/IP datagram failed for a reason
-    /// other than [`BuildError::InvalidTtl`].
-    EncodeFailed,
+    /// other than [`BuildError::InvalidTtl`]; carries the encoder's error.
+    Encode(crate::protocol::Error),
 }
 
 impl core::fmt::Display for BuildError {
@@ -122,7 +122,7 @@ impl core::fmt::Display for BuildError {
                     "SD entry TTL {ttl} is invalid: an offer needs 1..=0xFFFFFF seconds, other entries at most 0xFFFFFF"
                 )
             }
-            BuildError::EncodeFailed => f.write_str("sizing or encoding failed"),
+            BuildError::Encode(e) => write!(f, "encoding failed: {e}"),
         }
     }
 }
@@ -139,17 +139,17 @@ impl From<EncodeToSliceError<crate::protocol::Error>> for BuildError {
     fn from(e: EncodeToSliceError<crate::protocol::Error>) -> Self {
         match e {
             EncodeToSliceError::InsufficientBuffer(ib) => BuildError::BufferTooSmall(ib),
-            EncodeToSliceError::Encode(e) => encode_error(&e),
+            EncodeToSliceError::Encode(e) => encode_error(e),
         }
     }
 }
 
-fn encode_error(e: &crate::protocol::Error) -> BuildError {
+fn encode_error(e: crate::protocol::Error) -> BuildError {
     match e {
         crate::protocol::Error::Sd(crate::protocol::sd::Error::InvalidTtl(ttl)) => {
-            BuildError::InvalidTtl(*ttl)
+            BuildError::InvalidTtl(ttl)
         }
-        _ => BuildError::EncodeFailed,
+        e => BuildError::Encode(e),
     }
 }
 
@@ -438,7 +438,7 @@ fn encode_sd_datagram(
     // computable without writing, so the SOME/IP length field is known before
     // either section is written. One linear forward pass — no backfill.
     let sd_payload = SdHeader::new(Flags::new_sd(reboot), entries, options);
-    let sd_payload_len = sd_payload.encoded_size().map_err(|e| encode_error(&e))?;
+    let sd_payload_len = sd_payload.encoded_size().map_err(encode_error)?;
     let total = SOMEIP_HEADER_LEN + sd_payload_len;
     if buf.len() < total {
         return Err(BuildError::BufferTooSmall(InsufficientBuffer {
@@ -497,7 +497,7 @@ pub fn build_notification_datagram(
 ///
 /// # Errors
 /// [`BuildError::BufferTooSmall`] if `buf` is shorter than the header;
-/// [`BuildError::EncodeFailed`] if header encoding fails.
+/// [`BuildError::Encode`] if header encoding fails.
 pub fn encode_response_header(
     buf: &mut [u8],
     service_id: u16,
@@ -524,7 +524,7 @@ pub fn encode_response_header(
     );
     header
         .encode_to_slice(&mut buf[..SOMEIP_HEADER_LEN])
-        .map_err(|_| BuildError::EncodeFailed)?;
+        .map_err(BuildError::from)?;
     Ok(())
 }
 
@@ -637,11 +637,11 @@ mod tests {
             ttl: 0,
             ..req(0x0001, 30501)
         };
-        assert_eq!(
+        assert!(matches!(
             build_offer_service_datagram(&mut buf, &request, 1, RebootFlag::Continuous),
             Err(BuildError::InvalidTtl(0))
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             build_multi_offer_service_datagram::<4>(
                 &mut buf,
                 &[request],
@@ -649,7 +649,7 @@ mod tests {
                 RebootFlag::Continuous
             ),
             Err(BuildError::InvalidTtl(0))
-        );
+        ));
     }
 
     #[test]
@@ -923,7 +923,7 @@ mod tests {
             local_rx_port: 30600,
         };
         let mut buf = [0u8; 256];
-        assert_eq!(
+        assert!(matches!(
             build_multi_subscribe_eventgroup_datagram::<1>(
                 &mut buf,
                 &[request, request],
@@ -934,7 +934,7 @@ mod tests {
                 needed: 2,
                 capacity: 1
             })
-        );
+        ));
     }
 
     #[cfg(feature = "server")]
@@ -979,7 +979,7 @@ mod tests {
     #[test]
     fn find_rejects_more_instances_than_its_capacity() {
         let mut buf = [0u8; 64];
-        assert_eq!(
+        assert!(matches!(
             build_find_service_datagram::<1>(
                 &mut buf,
                 &[find_request(), find_request()],
@@ -990,7 +990,7 @@ mod tests {
                 needed: 2,
                 capacity: 1
             })
-        );
+        ));
     }
 
     #[test]
@@ -1022,23 +1022,25 @@ mod tests {
     fn multi_offer_builders_reject_more_requests_than_their_capacity() {
         let mut buf = [0u8; 256];
         let requests = [req(0x0001, 30501), req(0x0002, 30502)];
-        let full = Err(BuildError::ListFull {
-            needed: 2,
-            capacity: 1,
-        });
-        assert_eq!(
+        assert!(matches!(
             build_multi_offer_service_datagram::<1>(&mut buf, &requests, 1, RebootFlag::Continuous),
-            full
-        );
-        assert_eq!(
+            Err(BuildError::ListFull {
+                needed: 2,
+                capacity: 1
+            })
+        ));
+        assert!(matches!(
             build_multi_stop_offer_service_datagram::<1>(
                 &mut buf,
                 &requests,
                 1,
                 RebootFlag::Continuous
             ),
-            full
-        );
+            Err(BuildError::ListFull {
+                needed: 2,
+                capacity: 1
+            })
+        ));
     }
 
     #[test]

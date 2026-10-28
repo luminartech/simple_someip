@@ -51,9 +51,10 @@ fn build_error(e: crate::sd_codec::BuildError) -> Error {
         BuildError::InvalidTtl(ttl) => {
             crate::protocol::Error::from(crate::protocol::sd::Error::InvalidTtl(ttl)).into()
         }
-        BuildError::BufferTooSmall(_) | BuildError::ListFull { .. } | BuildError::EncodeFailed => {
+        BuildError::BufferTooSmall(_) | BuildError::ListFull { .. } => {
             Error::Capacity(crate::CapacityKind::UdpBuffer)
         }
+        BuildError::Encode(e) => Error::Protocol(e),
     }
 }
 
