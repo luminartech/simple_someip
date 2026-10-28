@@ -585,7 +585,7 @@ scenario!(
 scenario!(
     /// PRS_SOMEIP §5.2.6.3.1 (Figure 5.13) / feat_req_someip_80, 436 — calls that time out unanswered do not stop later calls from getting responses.
     r5_unanswered_requests_do_not_stall_client,
-    std = ignore("calls that time out must not stop later calls from getting responses (#184)"),
+    std = run,
     bare_metal = ignore("the bare-metal runtime has no client-side method calls (#187)"),
     {
         let server = FrameMethodServer::start();
