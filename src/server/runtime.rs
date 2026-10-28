@@ -522,12 +522,7 @@ async fn dispatch_non_sd_request<T: TransportSocket, R: E2EHandle + ?Sized>(
     let (service_id, method_id) = (id.service_id(), id.method_id());
     // A request that passes the hook's check arrives without its
     // protection header; any other request arrives as received.
-    let parsed = crate::sd_codec::ParsedDatagram {
-        service_id,
-        method_id,
-        upper_header: hdr.upper_header_bytes(),
-        payload: view.payload_bytes(),
-    };
+    let parsed = crate::sd_codec::ParsedMessage::from(view);
     let (status, body) =
         crate::sd_codec::check_parsed_e2e(e2e, core::net::IpAddr::V4(*source.ip()), &parsed);
     let resp_len = cb(
@@ -582,29 +577,101 @@ async fn dispatch_non_sd_request<T: TransportSocket, R: E2EHandle + ?Sized>(
     }
 }
 
-/// Receive loop body — drives `recv_from` on both the unicast and SD
-/// sockets, dispatches SD messages to [`handle_sd_message`] and non-SD
-/// unicast requests to [`dispatch_non_sd_request`].
-#[allow(clippy::too_many_arguments)]
-async fn recv_loop<T, Sub, R>(
-    config: &ServerConfig,
-    unicast_socket: &T,
-    sd_socket: &T,
-    sd_state: &SdStateManager,
-    subscriptions: &Sub,
-    e2e: &R,
-    unicast_buf: &mut [u8],
-    sd_buf: &mut [u8],
-    send_buf: &mut [u8],
+/// What the receive loop answers the messages it receives with.
+struct Receiver<'a, T, Sub, R> {
+    config: &'a ServerConfig,
+    unicast_socket: &'a T,
+    sd_socket: &'a T,
+    sd_state: &'a SdStateManager,
+    subscriptions: &'a Sub,
+    e2e: &'a R,
     non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
-    offered: &Offered,
+    offered: &'a Offered,
+}
+
+/// Handles one message received from `addr`: SD messages go to
+/// [`handle_sd_message`], non-SD unicast requests to
+/// [`dispatch_non_sd_request`].
+async fn handle_message<T, Sub, R>(
+    receiver: &Receiver<'_, T, Sub, R>,
+    send_buf: &mut [u8],
+    view: &crate::protocol::MessageView<'_>,
+    addr: core::net::SocketAddr,
+    from_unicast: bool,
 ) -> Result<(), Error>
 where
     T: TransportSocket,
     Sub: SubscriptionHandle,
     R: E2EHandle + Clone,
 {
-    use crate::protocol::MessageView;
+    let Receiver {
+        config,
+        unicast_socket,
+        sd_socket,
+        sd_state,
+        subscriptions,
+        e2e,
+        non_sd_observer,
+        offered,
+    } = *receiver;
+    crate::log::trace!(
+        "SOME/IP Header: service=0x{:04X}, method=0x{:04X}, type={:?}",
+        view.header().message_id().service_id(),
+        view.header().message_id().method_id(),
+        view.header().message_type().message_type()
+    );
+
+    if view.is_sd() {
+        crate::log::trace!("This is an SD message");
+        match view.sd_header() {
+            Ok(sd_view) => {
+                crate::log::trace!("SD message has {} entries", sd_view.entry_count());
+                let subscribed = handle_sd_message(
+                    config,
+                    sd_socket,
+                    sd_state,
+                    subscriptions,
+                    &sd_view,
+                    addr,
+                    send_buf,
+                )
+                .await?;
+                offered.mark(subscribed);
+            }
+            Err(e) => {
+                crate::log::warn!("Failed to parse SD message: {:?}", e);
+            }
+        }
+    } else if from_unicast {
+        // Non-SD unicast = a method request to an offered service.
+        if let Some(observer) = non_sd_observer {
+            if let core::net::SocketAddr::V4(src_v4) = addr {
+                dispatch_non_sd_request(unicast_socket, observer, e2e, view, src_v4, send_buf)
+                    .await;
+            }
+        } else {
+            crate::log::trace!("Non-SD unicast SOME/IP message, no observer registered — ignoring");
+        }
+    } else {
+        crate::log::trace!("Non-SD multicast SOME/IP message, ignoring");
+    }
+    Ok(())
+}
+
+/// Receive loop body — drives `recv_from` on both the unicast and SD
+/// sockets and hands each message in a datagram to [`handle_message`].
+async fn recv_loop<T, Sub, R>(
+    receiver: &Receiver<'_, T, Sub, R>,
+    unicast_buf: &mut [u8],
+    sd_buf: &mut [u8],
+    send_buf: &mut [u8],
+) -> Result<(), Error>
+where
+    T: TransportSocket,
+    Sub: SubscriptionHandle,
+    R: E2EHandle + Clone,
+{
+    let (unicast_socket, sd_socket) = (receiver.unicast_socket, receiver.sd_socket);
 
     // Iteration counter used to flip `select_biased!` arm priority
     // each turn. We can't use the pseudo-random `select!` (it needs
@@ -665,64 +732,14 @@ where
         crate::log::trace!("Received {} bytes from {} on {} socket", len, addr, source);
         crate::log::trace!("Raw data: {:02X?}", &data[..len.min(64_usize)]);
 
-        match MessageView::parse(data) {
-            Ok(view) => {
-                crate::log::trace!(
-                    "SOME/IP Header: service=0x{:04X}, method=0x{:04X}, type={:?}",
-                    view.header().message_id().service_id(),
-                    view.header().message_id().method_id(),
-                    view.header().message_type().message_type()
-                );
-
-                if view.is_sd() {
-                    crate::log::trace!("This is an SD message");
-                    match view.sd_header() {
-                        Ok(sd_view) => {
-                            crate::log::trace!("SD message has {} entries", sd_view.entry_count());
-                            let subscribed = handle_sd_message(
-                                config,
-                                sd_socket,
-                                sd_state,
-                                subscriptions,
-                                &sd_view,
-                                addr,
-                                send_buf,
-                            )
-                            .await?;
-                            offered.mark(subscribed);
-                        }
-                        Err(e) => {
-                            crate::log::warn!("Failed to parse SD message: {:?}", e);
-                        }
-                    }
-                } else if from_unicast {
-                    // Non-SD unicast = a method request to an offered service.
-                    if let Some(observer) = non_sd_observer {
-                        if let core::net::SocketAddr::V4(src_v4) = addr {
-                            dispatch_non_sd_request(
-                                unicast_socket,
-                                observer,
-                                e2e,
-                                &view,
-                                src_v4,
-                                send_buf,
-                            )
-                            .await;
-                        }
-                    } else {
-                        crate::log::trace!(
-                            "Non-SD unicast SOME/IP message, no observer registered — ignoring"
-                        );
-                    }
-                } else {
-                    crate::log::trace!("Non-SD multicast SOME/IP message, ignoring");
-                }
-            }
-            Err(e) => {
-                crate::log::warn!("Failed to parse SOME/IP header from {}: {:?}", addr, e);
-                crate::log::trace!("Data: {:02X?}", &data[..len.min(32)]);
+        let mut walk = crate::protocol::messages(data);
+        for message in walk.by_ref() {
+            match message {
+                Ok(view) => handle_message(receiver, send_buf, &view, addr, from_unicast).await?,
+                Err(malformed) => malformed.log(addr),
             }
         }
+        walk.log_discarded(addr);
     }
 }
 
@@ -849,19 +866,17 @@ where
     let sd_state_ref = sd_state.get();
 
     let offered = Offered::new();
-    let recv_fut = recv_loop(
-        &config,
-        unicast,
-        sd,
-        sd_state_ref,
-        &subscriptions,
-        &e2e,
-        unicast_buf,
-        sd_buf,
-        recv_send_buf,
+    let receiver = Receiver {
+        config: &config,
+        unicast_socket: unicast,
+        sd_socket: sd,
+        sd_state: sd_state_ref,
+        subscriptions: &subscriptions,
+        e2e: &e2e,
         non_sd_observer,
-        &offered,
-    );
+        offered: &offered,
+    };
+    let recv_fut = recv_loop(&receiver, unicast_buf, sd_buf, recv_send_buf);
     let announce_fut = async {
         if config.announce {
             announce_loop(&config, sd, sd_state_ref, &timer, announce_send_buf).await;
