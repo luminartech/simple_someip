@@ -121,10 +121,8 @@ pub enum BuildError {
     BufferTooSmall(InsufficientBuffer),
     /// A fixed-capacity entry or option list could not take another element.
     ///
-    /// Distinct from [`BufferTooSmall`](Self::BufferTooSmall), whose
-    /// [`InsufficientBuffer`] fields are documented in *bytes*. Element counts
-    /// were previously reported through that variant, which read as a byte
-    /// count and would have been actively misleading if it ever fired.
+    /// Its fields count elements, not bytes as in
+    /// [`BufferTooSmall`](Self::BufferTooSmall).
     ListFull {
         /// Elements the caller tried to place.
         needed: usize,
@@ -153,12 +151,19 @@ impl core::fmt::Display for BuildError {
                     "SD entry TTL {ttl} is invalid: an offer needs 1..=0xFFFFFF seconds, other entries at most 0xFFFFFF"
                 )
             }
-            BuildError::Encode(e) => write!(f, "encoding failed: {e}"),
+            BuildError::Encode(_) => f.write_str("encoding failed"),
         }
     }
 }
 
-impl core::error::Error for BuildError {}
+impl core::error::Error for BuildError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            BuildError::Encode(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<InsufficientBuffer> for BuildError {
     fn from(ib: InsufficientBuffer) -> Self {
@@ -1117,6 +1122,15 @@ mod tests {
                 capacity: 1
             })
         ));
+    }
+
+    #[test]
+    fn an_encode_error_is_the_build_errors_source() {
+        let err = BuildError::from(EncodeToSliceError::Encode(crate::protocol::Error::from(
+            crate::protocol::sd::Error::InvalidOptionType(0x77),
+        )));
+        let source = core::error::Error::source(&err).expect("a source");
+        assert!(source.downcast_ref::<crate::protocol::Error>().is_some());
     }
 
     #[test]
