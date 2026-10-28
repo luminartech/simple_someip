@@ -556,7 +556,7 @@ fn option_ipv6_sd_golden_bytes() {
 mod sd_codec_golden {
     use simple_someip::protocol::sd::RebootFlag;
     use simple_someip::sd_codec::{
-        OfferServiceRequest, SubscribeAckRequest, SubscribeEventgroupRequest,
+        OfferServiceRequest, SubscribeAckRequest, SubscribeCounter, SubscribeEventgroupRequest,
         build_offer_service_datagram, build_subscribe_ack_datagram,
         build_subscribe_eventgroup_datagram,
     };
@@ -649,7 +649,7 @@ mod sd_codec_golden {
             event_group_id: 0x0005,
             major_version: 1,
             ttl: 10,
-            counter: 0,
+            counter: SubscribeCounter::default(),
         };
         let mut buf = [0u8; 64];
         let n =

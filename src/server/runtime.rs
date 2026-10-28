@@ -73,7 +73,7 @@ where
         event_group_id: entry_view.event_group_id(),
         major_version: entry_view.major_version(),
         ttl,
-        counter: entry_view.counter(),
+        counter: crate::sd_codec::SubscribeCounter::of_entry(entry_view),
     };
     let peer = socket_addr_v4(peer)?;
     let (session, reboot_flag) = sd_state.next_session();
@@ -1901,7 +1901,7 @@ mod tests {
                 event_group_id: 0x0001,
                 major_version: 1,
                 ttl,
-                counter: 3,
+                counter: crate::sd_codec::SubscribeCounter::new(3).unwrap(),
             };
             let mut buf = [0u8; 64];
             let len = crate::sd_codec::build_subscribe_ack_datagram(

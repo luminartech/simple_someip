@@ -75,9 +75,40 @@ pub struct SubscribeAckRequest {
     pub event_group_id: u16,
     pub major_version: u8,
     pub ttl: u32,
-    /// The counter of the `Subscribe` being answered. Only its low 4 bits
-    /// are sent; the bits above them are reserved.
-    pub counter: u16,
+    /// The counter of the `Subscribe` being answered.
+    pub counter: SubscribeCounter,
+}
+
+/// The 4-bit counter of a `SubscribeEventgroup` entry, which tells apart
+/// Subscribes to one eventgroup that differ only in their endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubscribeCounter(u8);
+
+impl SubscribeCounter {
+    /// The largest counter value.
+    pub const MAX: u8 = 0x0F;
+
+    /// The counter `value`, or `None` if it is above [`Self::MAX`].
+    #[must_use]
+    pub const fn new(value: u8) -> Option<Self> {
+        if value <= Self::MAX {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    /// The counter of `entry`, a `SubscribeEventgroup` entry.
+    #[must_use]
+    pub fn of_entry(entry: &crate::protocol::sd::EntryView<'_>) -> Self {
+        Self(entry.counter().to_be_bytes()[1] & Self::MAX)
+    }
+
+    /// The counter's value, at most [`Self::MAX`].
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
 }
 
 /// Packet-construction errors.
@@ -388,7 +419,7 @@ pub fn build_subscribe_ack_datagram(
         instance_id: request.instance_id,
         major_version: request.major_version,
         ttl: request.ttl,
-        counter: request.counter & 0x000F,
+        counter: u16::from(request.counter.get()),
         event_group_id: request.event_group_id,
     });
     encode_sd_datagram(buf, &[entry], &[], session, reboot)
@@ -1051,7 +1082,7 @@ mod tests {
             major_version: 1,
             event_group_id: 1,
             ttl: 3,
-            counter: 0,
+            counter: SubscribeCounter::default(),
         };
         for reboot in [RebootFlag::RecentlyRebooted, RebootFlag::Continuous] {
             let mut buf = [0u8; 64];
@@ -1069,7 +1100,7 @@ mod tests {
             major_version: 1,
             event_group_id: 1,
             ttl: 3,
-            counter: 3,
+            counter: SubscribeCounter::new(3).unwrap(),
         };
         let mut buf = [0u8; 64];
         let len =
@@ -1079,18 +1110,20 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_ack_sends_only_the_low_four_counter_bits() {
-        let request = SubscribeAckRequest {
-            service_id: 0x0042,
-            instance_id: 1,
-            major_version: 1,
-            event_group_id: 1,
-            ttl: 3,
-            counter: 0x0013,
-        };
-        let mut buf = [0u8; 64];
-        build_subscribe_ack_datagram(&mut buf, &request, 2, RebootFlag::Continuous).unwrap();
-        let entry = 16 + 8;
-        assert_eq!(buf[entry + 12..entry + 14], [0x00, 0x03]);
+    fn a_subscribe_counter_holds_at_most_four_bits() {
+        assert_eq!(
+            SubscribeCounter::new(SubscribeCounter::MAX).map(SubscribeCounter::get),
+            Some(0x0F)
+        );
+        assert_eq!(SubscribeCounter::new(0x10), None);
+    }
+
+    #[test]
+    fn a_subscribe_counter_read_from_an_entry_keeps_only_the_counter_bits() {
+        let mut entry = [0u8; 16];
+        entry[12..14].copy_from_slice(&[0x80, 0x37]);
+        let (view, _) =
+            <crate::protocol::sd::EntryView as crate::Decode>::decode(&entry).expect("an entry");
+        assert_eq!(SubscribeCounter::of_entry(&view).get(), 0x07);
     }
 }
