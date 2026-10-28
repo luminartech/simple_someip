@@ -1526,6 +1526,10 @@ mod tests {
         }
 
         #[tokio::test]
+        #[cfg_attr(
+            feature = "bare_metal",
+            ignore = "consumes several eventgroups; bare_metal allows one by default"
+        )]
         async fn every_eventgroup_of_an_offered_service_is_subscribed_in_one_message() {
             let second = crate::sd_codec::SubscribeEventgroupRequest {
                 event_group_id: 0x0002,
@@ -1543,6 +1547,10 @@ mod tests {
         }
 
         #[tokio::test]
+        #[cfg_attr(
+            feature = "bare_metal",
+            ignore = "consumes several eventgroups; bare_metal allows one by default"
+        )]
         async fn only_the_offered_services_are_subscribed() {
             let other = crate::sd_codec::SubscribeEventgroupRequest {
                 service_id: 0x5679,
@@ -1794,6 +1802,10 @@ mod tests {
         }
 
         #[tokio::test]
+        #[cfg_attr(
+            feature = "bare_metal",
+            ignore = "consumes several eventgroups; bare_metal allows one by default"
+        )]
         async fn eventgroups_of_one_instance_share_one_find_entry() {
             let second = crate::sd_codec::SubscribeEventgroupRequest {
                 event_group_id: 0x0002,
