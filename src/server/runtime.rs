@@ -787,7 +787,7 @@ pub(super) async fn find_loop<T, Tm>(
         timer.sleep(delay).await;
         match encode_finds(&mut buf, config, sd_state, offered) {
             Ok(Some(len)) => {
-                if let Err(e) = sd_socket.send_to(&buf[..len], timing.sd_multicast).await {
+                if let Err(e) = sd_socket.send_to(&buf[..len], config.sd_multicast).await {
                     crate::log::warn!("FindService send failed: {e:?}");
                 }
             }
@@ -1646,7 +1646,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .map(|(d, to)| {
-                    assert_eq!(*to, FindTiming::DEFAULT.sd_multicast);
+                    assert_eq!(*to, SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT));
                     let view = crate::protocol::MessageView::parse(d).expect("SOME/IP");
                     view.sd_header()
                         .expect("SD")
@@ -1851,6 +1851,33 @@ mod tests {
             let found = encode_finds(&mut [0u8; 64], &config, &make_sd_state(), &offered);
 
             assert!(matches!(found, Ok(None)), "{found:?}");
+        }
+
+        #[tokio::test]
+        async fn finds_and_offers_go_to_the_configured_sd_multicast() {
+            let group = SocketAddrV4::new(Ipv4Addr::new(239, 1, 2, 3), 30500);
+            let config = make_config()
+                .with_consumed_eventgroup(consumed())
+                .with_find_timing(once())
+                .with_sd_multicast(group);
+            let (socket, sd_state) = (RecordingSocket::default(), make_sd_state());
+
+            find_loop(
+                &config,
+                &socket,
+                &sd_state,
+                &RecordingTimer::new(),
+                &Offered::new(),
+            )
+            .await;
+            sd_state
+                .send_offer_service(&mut [0u8; 64], &config, &socket)
+                .await
+                .expect("offer");
+
+            let sent = socket.sent.lock().unwrap();
+            let destinations: std::vec::Vec<_> = sent.iter().map(|(_, to)| *to).collect();
+            assert_eq!(destinations, [group, group]);
         }
 
         #[tokio::test]

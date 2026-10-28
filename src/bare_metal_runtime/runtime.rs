@@ -379,6 +379,14 @@ const DEFAULT_OFFER_REQUEST: OfferServiceRequest = OfferServiceRequest {
     unicast_port: 0,
 };
 
+/// The SD multicast group and port `init` stored.
+fn sd_multicast() -> SocketAddrV4 {
+    SocketAddrV4::new(
+        Ipv4Addr::from(SD_MCAST.load(Ordering::Acquire).to_be_bytes()),
+        SD_PORT.load(Ordering::Acquire),
+    )
+}
+
 /// Build the receive `Server` over the shared callback sockets, accepting
 /// subscribes for every offered service and answering Offers of the
 /// subscription's service.
@@ -420,7 +428,8 @@ fn build_server(find_timing: FindTiming) -> bool {
         // the server's recv loop must stay silent on SD — otherwise the
         // primary service would be announced twice.
         .with_announce(false)
-        .with_find_timing(find_timing);
+        .with_find_timing(find_timing)
+        .with_sd_multicast(sd_multicast());
     for entry in o {
         config = config.with_accepted_offer(
             entry.service_id,
@@ -506,10 +515,7 @@ async fn someip_task() {
 
     let plat = platform();
     let sd_socket: &'static Sock = unsafe { (*core::ptr::addr_of!(SD_SOCK)).assume_init_ref() };
-    let sd_mcast = SocketAddrV4::new(
-        Ipv4Addr::from(SD_MCAST.load(Ordering::Acquire).to_be_bytes()),
-        SD_PORT.load(Ordering::Acquire),
-    );
+    let sd_mcast = sd_multicast();
     let timer = CallbackTimer::new(plat.now_ms);
     let e2e = e2e();
 
@@ -644,10 +650,6 @@ pub fn init(config: RuntimeConfig) -> i32 {
         ))),
         repetitions_base_delay: Duration::from_millis(u64::from(timing.repetitions_base_delay_ms)),
         repetitions_max: timing.repetitions_max,
-        sd_multicast: SocketAddrV4::new(
-            Ipv4Addr::from(SD_MCAST.load(Ordering::Acquire).to_be_bytes()),
-            SD_PORT.load(Ordering::Acquire),
-        ),
     };
     if !build_server(find_timing) {
         // Release the claim so the platform can retry after fixing config.
@@ -781,9 +783,14 @@ pub fn deinit() {
         session,
         sd::RebootFlag::Continuous,
     ) {
-        let dst = SD_MCAST.load(Ordering::Acquire);
-        let sd_port = SD_PORT.load(Ordering::Acquire);
-        (plat.send)(sd_port, scratch.as_ptr(), total, dst, sd_port);
+        let sd = sd_multicast();
+        (plat.send)(
+            sd.port(),
+            scratch.as_ptr(),
+            total,
+            u32::from(*sd.ip()),
+            sd.port(),
+        );
     }
 }
 

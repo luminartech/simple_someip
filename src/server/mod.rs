@@ -27,8 +27,6 @@ pub use sd_state::SdStateManager;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::Timer;
-#[cfg(feature = "_alloc")]
-use crate::protocol::sd;
 use crate::sd_codec::SubscribeEventgroupRequest;
 #[cfg(feature = "_alloc")]
 use crate::transport::SocketOptions;
@@ -155,6 +153,11 @@ pub struct ServerConfig {
     /// When `FindService` is sent for [`Self::consumed_eventgroups`]; see
     /// [`FindTiming`]. Defaults to [`FindTiming::DEFAULT`].
     pub find_timing: FindTiming,
+    /// The SD multicast group and port: the SD socket binds this port and
+    /// joins this group, and the server's multicast `OfferService` and
+    /// `FindService` go to it. Defaults to
+    /// [`MULTICAST_IP`](crate::protocol::sd::MULTICAST_IP):[`MULTICAST_PORT`](crate::protocol::sd::MULTICAST_PORT).
+    pub sd_multicast: SocketAddrV4,
 }
 
 /// A `(service, instance, event_group)` tuple a receive loop will accept
@@ -189,21 +192,14 @@ pub struct FindTiming {
     pub repetitions_base_delay: core::time::Duration,
     /// Number of repetitions after the first `FindService`; 0 sends one.
     pub repetitions_max: u8,
-    /// Where `FindService` is sent: the SD multicast group and port.
-    pub sd_multicast: SocketAddrV4,
 }
 
 impl FindTiming {
-    /// 10 ms initial delay, 100 ms base delay, 3 repetitions, sent to
-    /// [`MULTICAST_IP`](crate::protocol::sd::MULTICAST_IP):[`MULTICAST_PORT`](crate::protocol::sd::MULTICAST_PORT).
+    /// 10 ms initial delay, 100 ms base delay, 3 repetitions.
     pub const DEFAULT: Self = Self {
         initial_delay: core::time::Duration::from_millis(10),
         repetitions_base_delay: core::time::Duration::from_millis(100),
         repetitions_max: 3,
-        sd_multicast: SocketAddrV4::new(
-            crate::protocol::sd::MULTICAST_IP,
-            crate::protocol::sd::MULTICAST_PORT,
-        ),
     };
 }
 
@@ -284,6 +280,10 @@ impl ServerConfig {
             accepted_offers: heapless::Vec::new(),
             consumed_eventgroups: heapless::Vec::new(),
             find_timing: FindTiming::DEFAULT,
+            sd_multicast: SocketAddrV4::new(
+                crate::protocol::sd::MULTICAST_IP,
+                crate::protocol::sd::MULTICAST_PORT,
+            ),
         }
     }
 
@@ -397,6 +397,13 @@ impl ServerConfig {
     #[must_use]
     pub fn with_find_timing(mut self, find_timing: FindTiming) -> Self {
         self.find_timing = find_timing;
+        self
+    }
+
+    /// Set the SD multicast group and port; see [`Self::sd_multicast`].
+    #[must_use]
+    pub fn with_sd_multicast(mut self, sd_multicast: SocketAddrV4) -> Self {
+        self.sd_multicast = sd_multicast;
         self
     }
 
@@ -1246,21 +1253,19 @@ where
             config.service_id
         );
 
-        // Bind SD socket for sending/receiving SD messages (must use SD port 30490).
         let mut sd_opts = SocketOptions::new();
         sd_opts.reuse_address = true;
         sd_opts.reuse_port = true;
         sd_opts.multicast_if_v4 = Some(config.interface);
         sd_opts.multicast_loop_v4 = Some(multicast_loopback);
-        let sd_addr = SocketAddrV4::new(config.interface, sd::MULTICAST_PORT);
+        let sd_addr = SocketAddrV4::new(config.interface, config.sd_multicast.port());
         let sd_raw = factory.bind(sd_addr, &sd_opts).await?;
-        sd_raw.join_multicast_v4(sd::MULTICAST_IP, config.interface)?;
+        sd_raw.join_multicast_v4(*config.sd_multicast.ip(), config.interface)?;
         let sd_socket: H = H::wrap(sd_raw);
         crate::log::info!(
-            "Server SD socket bound to {} (expected port {}), joined multicast {}",
+            "Server SD socket bound to {}, joined multicast {}",
             sd_addr,
-            sd::MULTICAST_PORT,
-            sd::MULTICAST_IP
+            config.sd_multicast.ip()
         );
 
         let publisher = Hep::wrap(EventPublisher::new(
@@ -1906,7 +1911,7 @@ where
 #[cfg(all(test, feature = "server-tokio"))]
 mod tests {
     use super::*;
-    use crate::protocol::sd::{Entry, Flags, ServiceEntry};
+    use crate::protocol::sd::{self, Entry, Flags, ServiceEntry};
     use crate::protocol::{
         Header as SomeIpHeader, MessageType, MessageTypeField, MessageView, ReturnCode,
     };

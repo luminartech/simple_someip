@@ -5,10 +5,9 @@
 //! unicast), `FindService`, `SubscribeEventgroup`, `SubscribeAck` and
 //! `SubscribeNack`. It also builds the server's `OfferService`.
 
-use core::net::SocketAddrV4;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::protocol::sd::{self, RebootFlag};
+use crate::protocol::sd::RebootFlag;
 use crate::transport::TransportSocket;
 
 use super::{Error, ServerConfig};
@@ -205,7 +204,7 @@ impl SdStateManager {
     /// `buf` is a caller-provided scratch buffer used for encoding the
     /// outgoing frame. Returns [`Error::Capacity`]`("udp_buffer")` if the
     /// encoded frame does not fit in `buf`, a protocol error if
-    /// `config.ttl` is outside 1..=[`MAX_TTL`](sd::MAX_TTL), or the
+    /// `config.ttl` is outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL), or the
     /// socket's transport error.
     pub(super) async fn send_offer_service<T: TransportSocket>(
         &self,
@@ -214,7 +213,7 @@ impl SdStateManager {
         socket: &T,
     ) -> Result<(), Error> {
         let total_len = self.encode_offer(buf, config)?;
-        let multicast_addr = SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT);
+        let multicast_addr = config.sd_multicast;
 
         crate::log::trace!(
             "Sending OfferService: service=0x{:04X}, instance={}, port={}, size={} bytes",
