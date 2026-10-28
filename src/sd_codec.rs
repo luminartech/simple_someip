@@ -34,7 +34,8 @@ pub struct SubscribeEventgroupRequest {
     pub instance_id: u16,
     pub major_version: u8,
     pub event_group_id: u16,
-    /// Subscription TTL in seconds (24-bit).
+    /// Subscription TTL in seconds, at most
+    /// [`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     pub ttl: u32,
     pub local_ip: Ipv4Addr,
     /// Local UDP port the client receives events on.
@@ -49,8 +50,8 @@ pub struct OfferServiceRequest {
     pub instance_id: u16,
     pub major_version: u8,
     pub minor_version: u32,
-    /// Offer TTL in seconds. [`build_stop_offer_service_datagram`]
-    /// forces this to `0`.
+    /// Offer TTL in seconds, 1 to [`MAX_TTL`](crate::protocol::sd::MAX_TTL).
+    /// [`build_stop_offer_service_datagram`] sends 0 instead.
     pub ttl: u32,
     pub local_ip: Ipv4Addr,
     /// Local UDP port the service is bound to.
@@ -70,6 +71,7 @@ pub struct SubscribeAckRequest {
 
 /// Packet-construction errors.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum BuildError {
     /// `buf` is shorter than the encoded datagram. Carries the codec's
     /// [`InsufficientBuffer`] so callers see the needed / available byte
@@ -87,6 +89,9 @@ pub enum BuildError {
         /// Elements the fixed-capacity list can hold.
         capacity: usize,
     },
+    /// An entry's TTL is above [`MAX_TTL`](crate::protocol::sd::MAX_TTL), or
+    /// an offer's TTL is 0; carries the rejected TTL.
+    InvalidTtl(u32),
     /// SD or SOME/IP encoding failed mid-write.
     EncodeFailed,
 }
@@ -99,6 +104,12 @@ impl core::fmt::Display for BuildError {
                 f,
                 "fixed-capacity list full: needed {needed} elements, capacity {capacity}"
             ),
+            BuildError::InvalidTtl(ttl) => {
+                write!(
+                    f,
+                    "SD entry TTL {ttl} is invalid: an offer needs 1..=0xFFFFFF seconds, other entries at most 0xFFFFFF"
+                )
+            }
             BuildError::EncodeFailed => f.write_str("encoding failed mid-write"),
         }
     }
@@ -116,6 +127,9 @@ impl From<EncodeToSliceError<crate::protocol::Error>> for BuildError {
     fn from(e: EncodeToSliceError<crate::protocol::Error>) -> Self {
         match e {
             EncodeToSliceError::InsufficientBuffer(ib) => BuildError::BufferTooSmall(ib),
+            EncodeToSliceError::Encode(crate::protocol::Error::Sd(
+                crate::protocol::sd::Error::InvalidTtl(ttl),
+            )) => BuildError::InvalidTtl(ttl),
             EncodeToSliceError::Encode(_) => BuildError::EncodeFailed,
         }
     }
@@ -229,7 +243,7 @@ fn build_multi_service_entry_datagram<const N: usize>(
             service_id: req.service_id,
             instance_id: req.instance_id,
             major_version: req.major_version,
-            ttl: if stop { 0 } else { req.ttl },
+            ttl: req.ttl,
             minor_version: req.minor_version,
         };
         let entry = if stop {
@@ -296,7 +310,7 @@ fn encode_service_entry_datagram(
         service_id: request.service_id,
         instance_id: request.instance_id,
         major_version: request.major_version,
-        ttl: if stop { 0 } else { request.ttl },
+        ttl: request.ttl,
         minor_version: request.minor_version,
     };
     let entry = if stop {
@@ -541,6 +555,32 @@ mod tests {
             local_ip: Ipv4Addr::new(192, 0, 2, 1),
             unicast_port: port,
         }
+    }
+
+    #[test]
+    fn offer_with_zero_ttl_is_rejected() {
+        let mut buf = [0u8; 512];
+        let request = OfferServiceRequest {
+            ttl: 0,
+            ..req(0x0001, 30501)
+        };
+        assert_eq!(
+            build_offer_service_datagram(&mut buf, &request, 1),
+            Err(BuildError::InvalidTtl(0))
+        );
+        assert_eq!(
+            build_multi_offer_service_datagram::<4>(&mut buf, &[request], 1),
+            Err(BuildError::InvalidTtl(0))
+        );
+    }
+
+    #[test]
+    fn stop_offer_is_built_whatever_the_requested_ttl() {
+        let mut buf = [0u8; 512];
+        let len = build_stop_offer_service_datagram(&mut buf, &req(0x0001, 30501), 1).unwrap();
+        let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+        let entry = view.entries().next().unwrap();
+        assert!(entry.is_stop_offer());
     }
 
     #[test]

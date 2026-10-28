@@ -7,6 +7,12 @@ pub enum Error {
     /// The entry type byte is not a recognized SD entry type.
     #[error("Invalid value for Service Discovery entry type: {0:X}")]
     InvalidEntryType(u8),
+    /// An entry's TTL is above [`MAX_TTL`](super::MAX_TTL), or an
+    /// [`Entry::OfferService`](super::Entry::OfferService) has a TTL of 0.
+    #[error(
+        "invalid SD entry TTL {0}: an offer needs 1..=0xFFFFFF, any other entry at most 0xFFFFFF"
+    )]
+    InvalidTtl(u32),
     /// The option type byte is not a recognized SD option type.
     #[error("Invalid value for Service Discovery Option Type: {0:X}")]
     InvalidOptionType(u8),

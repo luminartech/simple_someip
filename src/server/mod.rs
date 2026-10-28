@@ -48,6 +48,15 @@ use std::sync::Mutex;
 #[cfg(feature = "server-tokio")]
 use tokio::sync::RwLock;
 
+fn sd_encode_error(e: automotive_wire_codec::EncodeToSliceError<crate::protocol::Error>) -> Error {
+    match e {
+        automotive_wire_codec::EncodeToSliceError::InsufficientBuffer(_) => {
+            Error::Capacity(crate::CapacityKind::UdpBuffer)
+        }
+        automotive_wire_codec::EncodeToSliceError::Encode(e) => Error::Protocol(e),
+    }
+}
+
 // Fallback caps mirror `subscription_manager`: tight on bare-metal (host build
 // injects exact values via the env vars), generous on std/host so plain std
 // consumers that never inject the env vars keep the historical capacities.
@@ -84,7 +93,9 @@ pub struct ServerConfig {
     pub major_version: u8,
     /// Minor version
     pub minor_version: u32,
-    /// Service Discovery TTL (time to live)
+    /// Service Discovery TTL in seconds, 1 to
+    /// [`MAX_TTL`](crate::protocol::sd::MAX_TTL). The server constructors
+    /// reject a config outside that range.
     pub ttl: u32,
     /// Event-group IDs the server publishes to. Used by the SD
     /// `Subscribe` handler to NACK subscriptions for unknown groups
@@ -338,16 +349,27 @@ impl ServerConfig {
     /// Set the SD announcement TTL. Defaults to 3 seconds from
     /// [`Self::new`] (typical for SOME/IP).
     ///
-    /// The SOME/IP-SD wire format encodes TTL as `u32` whole seconds;
-    /// sub-second precision in the supplied `Duration` is truncated
-    /// (rounded down). Durations exceeding `u32::MAX` seconds (~136
-    /// years) saturate to `u32::MAX`. The reserved special value
-    /// `0xFFFFFF` ("until next reboot") can be requested by passing
-    /// `Duration::from_secs(0xFFFFFF)`.
+    /// The TTL is sent in whole seconds: sub-second precision is truncated,
+    /// a TTL under 1 second becomes 1 second, and a TTL above
+    /// [`MAX_TTL`](crate::protocol::sd::MAX_TTL) becomes
+    /// [`MAX_TTL`](crate::protocol::sd::MAX_TTL) ("until next reboot").
     #[must_use]
     pub fn with_ttl(mut self, ttl: core::time::Duration) -> Self {
-        self.ttl = u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX);
+        self.ttl = u32::try_from(ttl.as_secs())
+            .unwrap_or(u32::MAX)
+            .clamp(1, crate::protocol::sd::MAX_TTL);
         self
+    }
+
+    fn check_ttl(&self) -> Result<(), Error> {
+        if (1..=crate::protocol::sd::MAX_TTL).contains(&self.ttl) {
+            Ok(())
+        } else {
+            Err(
+                crate::protocol::Error::from(crate::protocol::sd::Error::InvalidTtl(self.ttl))
+                    .into(),
+            )
+        }
     }
 
     /// Append an event-group ID to the registered set. Subscriptions
@@ -879,6 +901,9 @@ impl
     ///
     /// # Errors
     ///
+    /// Returns [`Error::Protocol`] carrying
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl` is
+    /// outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns an error if binding the unicast or SD socket fails, or if joining the
     /// SD multicast group fails.
     pub async fn new(
@@ -916,6 +941,9 @@ impl
     ///
     /// # Errors
     ///
+    /// Returns [`Error::Protocol`] carrying
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl` is
+    /// outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns an error if binding the unicast or SD socket fails, or if joining the
     /// SD multicast group fails.
     pub async fn new_with_loopback(
@@ -959,6 +987,9 @@ impl
     ///
     /// # Errors
     ///
+    /// Returns [`Error::Protocol`] carrying
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl` is
+    /// outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns an error if binding either socket fails.
     pub async fn new_passive(
         config: ServerConfig,
@@ -1009,6 +1040,9 @@ where
     ///
     /// # Errors
     ///
+    /// Returns [`Error::Protocol`] carrying
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl` is
+    /// outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns an error if binding the unicast or SD socket via
     /// [`TransportFactory::bind`] fails, or if joining the SD multicast
     /// group fails.
@@ -1024,6 +1058,7 @@ where
         ),
         Error,
     > {
+        config.check_ttl()?;
         let ServerDeps {
             factory,
             timer,
@@ -1105,6 +1140,9 @@ where
     ///
     /// # Errors
     ///
+    /// Returns [`Error::Protocol`] carrying
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl` is
+    /// outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns an error if binding either socket fails.
     pub async fn new_passive_with_deps(
         deps: ServerDeps<F, Tm, R, Sub>,
@@ -1117,6 +1155,7 @@ where
         ),
         Error,
     > {
+        config.check_ttl()?;
         let ServerDeps {
             factory,
             timer,
@@ -1215,6 +1254,9 @@ where
     ///
     /// # Errors
     ///
+    /// Returns [`Error::Protocol`] carrying
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl` is
+    /// outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns an error if querying `unicast_socket.local_addr()`
     /// fails on the underlying transport, or
     /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
@@ -1223,6 +1265,7 @@ where
         deps: ServerStorage<F, Tm, R, Sub, H, Hsd, Hep>,
         mut config: ServerConfig,
     ) -> Result<Self, Error> {
+        config.check_ttl()?;
         let bound_port = deps.unicast_socket.get().local_addr()?.port();
         if config.local_port == 0 {
             config.local_port = bound_port;
@@ -1277,6 +1320,9 @@ where
     ///
     /// # Errors
     ///
+    /// Returns [`Error::Protocol`] carrying
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl` is
+    /// outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns an error if querying `unicast_socket.local_addr()`
     /// fails on the underlying transport, or
     /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
@@ -1287,6 +1333,7 @@ where
         deps: ServerStorage<F, Tm, R, Sub, H, Hsd, Hep>,
         mut config: ServerConfig,
     ) -> Result<Self, Error> {
+        config.check_ttl()?;
         let bound_port = deps.unicast_socket.get().local_addr()?.port();
         if config.local_port == 0 {
             config.local_port = bound_port;
@@ -1792,10 +1839,33 @@ mod tests {
     }
 
     #[test]
-    fn server_config_with_ttl_saturates_overflow() {
+    fn server_config_with_ttl_clamps_to_the_largest_entry_ttl() {
         let cfg = ServerConfig::new(0x5B, 1)
-            .with_ttl(core::time::Duration::from_secs(u64::from(u32::MAX) + 1));
-        assert_eq!(cfg.ttl, u32::MAX);
+            .with_ttl(core::time::Duration::from_secs(u64::from(sd::MAX_TTL) + 1));
+        assert_eq!(cfg.ttl, sd::MAX_TTL);
+    }
+
+    #[tokio::test]
+    async fn server_new_rejects_a_ttl_outside_the_entry_range() {
+        for ttl in [0, sd::MAX_TTL + 1] {
+            let mut config = ServerConfig::new(0x5B, 1);
+            config.ttl = ttl;
+            let result = Server::new(config).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::Protocol(crate::protocol::Error::Sd(sd::Error::InvalidTtl(t)))) if t == ttl
+                ),
+                "ttl {ttl}: got {:?}",
+                result.err()
+            );
+        }
+    }
+
+    #[test]
+    fn server_config_with_ttl_raises_subsecond_to_one_second() {
+        let cfg = ServerConfig::new(0x5B, 1).with_ttl(core::time::Duration::from_millis(500));
+        assert_eq!(cfg.ttl, 1);
     }
 
     #[test]
@@ -2895,7 +2965,35 @@ mod tests {
     async fn test_handle_sd_other_entry_type() {
         let (server, _) = create_test_server(0x5B, 1).await;
 
-        // Build SD message with a StopOfferService entry (not handled by server)
+        // Build SD message with a SubscribeAck entry (not handled by server)
+        let entry =
+            sd::Entry::SubscribeAckEventGroup(sd::EventGroupEntry::new(0x5B, 1, 1, 3, 0x01));
+        let entries = [entry];
+        let sd_msg = sd::Header::new(Flags::new(true, true), &entries, &[]);
+
+        // Encode and parse through view types
+        let mut buf = [0u8; 64];
+        let n = sd_msg.encode(&mut buf.as_mut_slice()).unwrap();
+        let sd_view = sd::SdHeaderView::parse(&buf[..n]).unwrap();
+
+        // Should not panic or error
+        let result = runtime::handle_sd_message(
+            &server.config,
+            server.sd_socket.get(),
+            server.sd_state.get(),
+            &server.subscriptions,
+            &sd_view,
+            "127.0.0.1:12345".parse().unwrap(),
+            &mut [0u8; crate::UDP_BUFFER_SIZE],
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_sd_ignores_stop_offer() {
+        let (server, _) = create_test_server(0x5B, 1).await;
+
         let entry = sd::Entry::StopOfferService(sd::ServiceEntry {
             index_first_options_run: 0,
             index_second_options_run: 0,
@@ -2906,8 +3004,8 @@ mod tests {
             ttl: 0,
             minor_version: 0,
         });
-        let stop_entries = [entry];
-        let sd_msg = sd::Header::new(Flags::new(true, true), &stop_entries, &[]);
+        let entries = [entry];
+        let sd_msg = sd::Header::new(Flags::new(true, true), &entries, &[]);
 
         // Encode and parse through view types
         let mut buf = [0u8; 64];

@@ -211,9 +211,10 @@ async fn start_client(
 /// sees `ServiceAvailable` can call straight away.
 ///
 /// Entries are reported as the library interprets them: every `OfferService`
-/// (whatever its TTL) is a `ServiceAvailable` at the endpoint the library's
-/// own offered-endpoint mapping assigns it (the one its client registers),
-/// and only a `StopOfferService` that names an endpoint is a `ServiceGone`.
+/// is a `ServiceAvailable` at the endpoint the library's own offered-endpoint
+/// mapping assigns it (the one its client registers), and only a
+/// `StopOfferService` (an Offer entry with TTL 0) that names an endpoint is a
+/// `ServiceGone`.
 async fn report_updates(
     client: StdClient,
     mut updates: ClientUpdates<RawPayload, TokioChannels>,
