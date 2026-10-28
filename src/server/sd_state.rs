@@ -11,10 +11,8 @@ use crate::transport::TransportSocket;
 
 use super::{Error, ServerConfig};
 
-/// Numbers every SD message the server sends and emits its `OfferService`
-/// announcements. The numbering is an [`SdSessionCounter`]: session IDs
-/// from 1, wrapping from 0xFFFF to 1, with the reboot flag
-/// [`RebootFlag::RecentlyRebooted`] until the first wrap.
+/// Numbers every SD message the server sends, multicast and unicast, from
+/// one [`SdSessionCounter`], and emits its `OfferService` announcements.
 #[derive(Debug)]
 pub struct SdStateManager {
     session: SdSessionCounter,
@@ -49,12 +47,12 @@ impl Default for SdStateManager {
 }
 
 impl SdStateManager {
-    /// Construct as if `initial` was the session ID last sent; see
-    /// [`SdSessionCounter::with_initial`].
+    /// Construct as if `initial` was the session ID last sent, before the
+    /// counter first wrapped; see [`SdSessionCounter::resume`].
     #[must_use]
     pub const fn with_initial(initial: u16) -> Self {
         Self {
-            session: SdSessionCounter::with_initial(initial),
+            session: SdSessionCounter::resume(initial, RebootFlag::RecentlyRebooted),
         }
     }
 
@@ -64,10 +62,9 @@ impl SdStateManager {
         self.session.next()
     }
 
-    /// The next SD session ID (`client_id = 0`, session ID in the low 16
-    /// bits) and the reboot flag of the same message; see
-    /// [`Self::next_session`].
-    pub fn next_session_id_with_reboot_flag(&self) -> (u32, RebootFlag) {
+    /// The next SD session ID and the reboot flag of the same message.
+    #[cfg(test)]
+    pub(crate) fn next_session_id_with_reboot_flag(&self) -> (u32, RebootFlag) {
         let session = self.next_session();
         (u32::from(session.id()), session.reboot())
     }

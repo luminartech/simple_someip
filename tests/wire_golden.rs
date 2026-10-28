@@ -554,22 +554,17 @@ fn option_ipv6_sd_golden_bytes() {
 
 #[cfg(any(feature = "bare_metal", feature = "server"))]
 mod sd_codec_golden {
+    use simple_someip::protocol::sd::RebootFlag;
     use simple_someip::sd_codec::{
         OfferServiceRequest, SdSession, SdSessionCounter, SubscribeAckRequest, SubscribeCounter,
         SubscribeEventgroupRequest, build_offer_service_datagram, build_subscribe_ack_datagram,
         build_subscribe_eventgroup_datagram,
     };
 
-    /// The session with ID `id` from a counter that has wrapped, so its
-    /// reboot flag is `Continuous`.
+    /// The session with ID `id` (at least 1) and the reboot flag
+    /// `Continuous`.
     fn continuous_session(id: u16) -> SdSession {
-        let counter = SdSessionCounter::with_initial(u16::MAX);
-        loop {
-            let s = counter.next();
-            if s.id() == id {
-                return s;
-            }
-        }
+        SdSessionCounter::resume(id - 1, RebootFlag::Continuous).next()
     }
 
     // NOTE: `encode_sd_datagram` (src/sd_codec.rs ~line 264) is a private

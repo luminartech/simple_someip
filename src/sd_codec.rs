@@ -1,4 +1,4 @@
-//! Pure, no-alloc SOME/IP + SD datagram codec for bare-metal targets.
+//! No-alloc SOME/IP + SD datagram codec for bare-metal targets.
 //!
 //! Transport-agnostic builders and parsers: encode `OfferService` /
 //! `StopOfferService` / `SubscribeEventgroup` / `SubscribeAckEventgroup`
@@ -7,6 +7,8 @@
 //! the transmit path. These back the spawnable futures in
 //! [`crate::bare_metal_tasks`] and the firmware's publish/deinit FFI, so
 //! that no SOME/IP byte-encoding or header-parsing lives in the firmware.
+//! [`SdSessionCounter`](crate::sd_codec::SdSessionCounter) numbers the SD
+//! datagrams.
 
 use core::net::{IpAddr, Ipv4Addr};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -561,8 +563,7 @@ impl SdSession {
         self.id
     }
 
-    /// The reboot flag: [`RebootFlag::RecentlyRebooted`] until the counter
-    /// first wraps, [`RebootFlag::Continuous`] after.
+    /// The reboot flag; see [`SdSessionCounter`].
     #[must_use]
     pub const fn reboot(self) -> RebootFlag {
         self.reboot
@@ -573,6 +574,9 @@ impl SdSession {
 /// the reboot flag is [`RebootFlag::RecentlyRebooted`] until the first wrap
 /// and [`RebootFlag::Continuous`] from then on. Concurrent callers of
 /// [`Self::next`] each get a distinct session.
+///
+/// SOME/IP-SD numbers the multicast messages and the unicast messages to
+/// each peer separately, so a node keeps one counter for each.
 #[derive(Debug)]
 pub struct SdSessionCounter {
     /// Bits 0..16: the session ID last given, or 0 before the first.
@@ -587,16 +591,20 @@ impl SdSessionCounter {
     /// A counter whose first session is ID 1, recently rebooted.
     #[must_use]
     pub const fn new() -> Self {
-        Self::with_initial(0)
+        Self::resume(0, RebootFlag::RecentlyRebooted)
     }
 
-    /// A counter that has given `last` and not yet wrapped: the next session
-    /// is `last + 1`, or 1 with [`RebootFlag::Continuous`] after 0xFFFF.
-    /// 0 is the same as [`Self::new`].
+    /// A counter that last gave session ID `last` with the reboot flag
+    /// `reboot`, as when restoring a counter kept elsewhere. The next session
+    /// is `last + 1`, or 1 after 0xFFFF. `last` 0 means none was given yet.
     #[must_use]
-    pub const fn with_initial(last: u16) -> Self {
+    pub const fn resume(last: u16, reboot: RebootFlag) -> Self {
+        let wrapped = match reboot {
+            RebootFlag::RecentlyRebooted => 0,
+            RebootFlag::Continuous => WRAPPED_BIT,
+        };
         Self {
-            state: AtomicU32::new(last as u32),
+            state: AtomicU32::new(last as u32 | wrapped),
         }
     }
 
@@ -722,18 +730,9 @@ mod tests {
     use super::*;
     use crate::protocol::sd::EntryType;
 
-    /// The session with ID `id` and reboot flag `reboot`, from a counter.
+    /// The session with ID `id` (at least 1) and reboot flag `reboot`.
     fn session(id: u16, reboot: RebootFlag) -> SdSession {
-        let counter = match reboot {
-            RebootFlag::RecentlyRebooted => return SdSessionCounter::with_initial(id - 1).next(),
-            RebootFlag::Continuous => SdSessionCounter::with_initial(u16::MAX),
-        };
-        loop {
-            let s = counter.next();
-            if s.id() == id {
-                return s;
-            }
-        }
+        SdSessionCounter::resume(id - 1, reboot).next()
     }
 
     fn req(service_id: u16, port: u16) -> OfferServiceRequest {
@@ -1140,8 +1139,14 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_counter_continues_from_its_last_session_and_flag() {
+        let s = SdSessionCounter::resume(0x1233, RebootFlag::Continuous).next();
+        assert_eq!((s.id(), s.reboot()), (0x1234, RebootFlag::Continuous));
+    }
+
+    #[test]
     fn the_counter_wraps_to_one_and_stays_continuous() {
-        let counter = SdSessionCounter::with_initial(0xFFFE);
+        let counter = SdSessionCounter::resume(0xFFFE, RebootFlag::RecentlyRebooted);
         let sessions: [_; 3] = core::array::from_fn(|_| {
             let s = counter.next();
             (s.id(), s.reboot())
