@@ -167,7 +167,8 @@ impl RuntimeBuffers {
 pub struct RuntimeConfig {
     /// Local interface IPv4 as a host-order `u32`.
     pub interface: u32,
-    /// SD port (`0` → 30490) and multicast group (`0` → 239.255.0.255).
+    /// SD port (`0` → 30490) and multicast group (`0` → 239.255.0.255); the
+    /// group must be a multicast address.
     pub sd_port: u16,
     pub sd_mcast: u32,
     pub multicast_loopback: bool,
@@ -553,9 +554,9 @@ async fn someip_task() {
 /// failed, `-2` task spawn failed, `-4` the runtime is already initialized
 /// (a repeat or re-entrant `init` — the passed `config` and its buffers are
 /// NOT adopted), `-5` `config.subscription` names a wildcard service ID,
-/// instance ID or major version. The
-/// `-1`/`-2`/`-5` paths release the init claim so a corrected retry can
-/// proceed; `-4` does not (a runtime is already live).
+/// instance ID or major version, `-6` `config.sd_mcast` is not a multicast
+/// group. The `-1`/`-2`/`-5`/`-6` paths release the init claim so a corrected
+/// retry can proceed; `-4` does not (a runtime is already live).
 #[allow(clippy::missing_panics_doc)]
 // By-value is required, not incidental: `config.buffers` is a `&'static mut`
 // reborrowed into `BUFS` (`ptr::from_mut`), which a shared `&RuntimeConfig`
@@ -578,6 +579,10 @@ pub fn init(config: RuntimeConfig) -> i32 {
     }) {
         INIT_CLAIMED.store(false, Ordering::Release);
         return -5;
+    }
+    if config.sd_mcast != 0 && !Ipv4Addr::from(config.sd_mcast.to_be_bytes()).is_multicast() {
+        INIT_CLAIMED.store(false, Ordering::Release);
+        return -6;
     }
     IFACE.store(config.interface, Ordering::Release);
     SD_PORT.store(
@@ -766,18 +771,20 @@ pub fn deinit() {
     // `publish`. RX_CAP >= SD_SCRATCH_CAP, so it holds the StopOffer datagram.
     // Reborrowed through `addr_of_mut!` to retag only this field's bytes.
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).publish_scratch) };
+    // SAFETY: `RUN_READY` is set only after `init` wrote SERVER.
+    let sd = unsafe { (*core::ptr::addr_of!(SERVER)).assume_init_ref() }.sd();
     if let Ok(total) = build_multi_stop_offer_service_datagram::<MAX_OFFERS>(
         scratch,
         &reqs[..n],
-        SD_STATE.next_session(),
+        sd.next_session(),
     ) {
-        let sd = sd_multicast();
+        let group = sd.multicast();
         (plat.send)(
-            sd.port(),
+            group.port(),
             scratch.as_ptr(),
             total,
-            u32::from(*sd.ip()),
-            sd.port(),
+            u32::from(*group.ip()),
+            group.port(),
         );
     }
 }
