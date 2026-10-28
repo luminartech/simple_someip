@@ -97,9 +97,11 @@ async fn main() {
     while let Some(update) = updates.recv().await {
         match update {
             ClientUpdate::DiscoveryUpdated(msg) => { /* SD message */ }
-            ClientUpdate::Unicast { message, e2e_status } => { /* unicast reply */ }
+            ClientUpdate::Unicast { message, e2e_status, source } => { /* unicast reply */ }
+            ClientUpdate::ErrorReply { header, source, .. } => { /* unmatched error reply */ }
             ClientUpdate::SenderRebooted(addr) => { /* remote reboot detected */ }
             ClientUpdate::Error(err) => { /* error */ }
+            _ => { /* updates added in later versions */ }
         }
     }
 }

@@ -182,9 +182,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     message.header().message_id().service_id(),
                 );
             }
+            ClientUpdate::ErrorReply { header, source, .. } => {
+                warn!(
+                    "Error reply from {source}: service=0x{:04X} return code {:?}",
+                    header.message_id().service_id(),
+                    header.return_code(),
+                );
+            }
             ClientUpdate::Error(e) => {
                 error!("Error: {e:?}");
             }
+            _ => {}
         }
     }
 

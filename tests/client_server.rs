@@ -28,11 +28,13 @@
 
 use simple_someip::ServiceEndpointKey;
 use simple_someip::e2e::{E2ECheckStatus, E2EKey, E2EProfile, Profile4Config};
-use simple_someip::protocol::{Header, Message, MessageId, sd};
+use simple_someip::protocol::{
+    Header, HeaderView, Message, MessageId, MessageType, MessageTypeField, ReturnCode, sd,
+};
 use simple_someip::server::ServerConfig;
 use simple_someip::{
-    Client, ClientUpdate, ClientUpdates, PayloadWireFormat, RawPayload, Server, TokioChannels,
-    VecSdHeader,
+    Client, ClientUpdate, ClientUpdates, EncodeExt, PayloadWireFormat, RawPayload, Server,
+    TokioChannels, VecSdHeader,
 };
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -982,4 +984,198 @@ async fn test_two_devices_same_service_instance_addressed_independently() {
     client.shut_down();
     server_a_handle.abort();
     server_b_handle.abort();
+}
+
+/// Answers the first request `socket` receives with `replies`, in order, each
+/// a `(message type, return code, payload)` that echoes the request's message
+/// and request IDs. Returns once every reply is sent.
+async fn reply_with(
+    socket: tokio::net::UdpSocket,
+    replies: &'static [(MessageType, ReturnCode, &'static [u8])],
+) {
+    let mut buf = [0u8; 1500];
+    let (n, from) = socket.recv_from(&mut buf).await.expect("request");
+    let (request, _) = HeaderView::parse(&buf[..n]).expect("request header");
+    let id = request.message_id();
+    for &(message_type, return_code, payload) in replies {
+        let header = Header::new(
+            id,
+            request.request_id(),
+            1,
+            request.interface_version(),
+            MessageTypeField::new(message_type, false),
+            return_code,
+            payload.len(),
+        );
+        let reply = Message::new(
+            header,
+            RawPayload::from_payload_bytes(id, payload).expect("a raw payload always parses"),
+        );
+        let bytes = reply.encode_to_vec().expect("reply encodes");
+        socket.send_to(&bytes, from).await.expect("send reply");
+    }
+}
+
+/// Sends one request from a fresh client to a plain UDP socket that answers
+/// it with `replies` (see [`reply_with`]), and returns what `request`
+/// resolved to.
+async fn request_answered_with(
+    replies: &'static [(MessageType, ReturnCode, &'static [u8])],
+) -> Result<RawPayload, simple_someip::client::Error> {
+    let service_id = next_service_id();
+    let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let replier = tokio::spawn(reply_with(peer, replies));
+
+    let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+    let run_handle = tokio::spawn(run_fut);
+    let key = ServiceEndpointKey::udp(service_id, peer_addr);
+    client.add_endpoint(key, 1, 0).await.unwrap();
+
+    let id = MessageId::new_from_service_and_method(service_id, 0x0001);
+    let request = Message::new(
+        Header::new(
+            id,
+            0,
+            1,
+            1,
+            MessageTypeField::new(MessageType::Request, false),
+            ReturnCode::Ok,
+            1,
+        ),
+        RawPayload::from_payload_bytes(id, &[0x2A]).unwrap(),
+    );
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.request(key, request),
+    )
+    .await
+    .expect("the reply resolves the request");
+    replier.await.unwrap();
+    client.shut_down();
+    run_handle.abort();
+    outcome
+}
+
+#[tokio::test]
+async fn request_returns_the_response_payload() {
+    let payload = request_answered_with(&[(MessageType::Response, ReturnCode::Ok, &[0x07])])
+        .await
+        .expect("a RESPONSE with E_OK is a success");
+    assert_eq!(payload.raw_bytes().unwrap(), &[0x07]);
+}
+
+#[tokio::test]
+async fn request_returns_the_return_code_of_an_error_reply() {
+    let outcome = request_answered_with(&[(MessageType::Error, ReturnCode::NotOk, &[])]).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(simple_someip::client::Error::ErrorReply {
+                message_type: MessageType::Error,
+                return_code: ReturnCode::NotOk,
+                ..
+            })
+        ),
+        "got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn request_returns_the_return_code_of_a_response_that_is_not_ok() {
+    let outcome =
+        request_answered_with(&[(MessageType::Response, ReturnCode::InterfaceError(0x20), &[])])
+            .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(simple_someip::client::Error::ErrorReply {
+                message_type: MessageType::Response,
+                return_code: ReturnCode::InterfaceError(0x20),
+                ..
+            })
+        ),
+        "got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unmatched_error_reply_that_decodes_arrives_as_error_reply_with_its_payload() {
+    let service_id = next_service_id();
+    let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let replier = tokio::spawn(reply_with(
+        peer,
+        &[
+            (MessageType::Response, ReturnCode::NotOk, &[0x09]),
+            (MessageType::Response, ReturnCode::NotOk, &[0x09]),
+        ],
+    ));
+
+    let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+    let run_handle = tokio::spawn(run_fut);
+    let key = ServiceEndpointKey::udp(service_id, peer_addr);
+    client.add_endpoint(key, 1, 0).await.unwrap();
+    let id = MessageId::new_from_service_and_method(service_id, 0x0001);
+    let request = Message::new(
+        Header::new(
+            id,
+            0,
+            1,
+            1,
+            MessageTypeField::new(MessageType::Request, false),
+            ReturnCode::Ok,
+            0,
+        ),
+        RawPayload::from_payload_bytes(id, &[]).unwrap(),
+    );
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.request(key, request),
+    )
+    .await
+    .expect("the first reply resolves the request");
+    assert!(
+        matches!(
+            outcome,
+            Err(simple_someip::client::Error::ErrorReply { .. })
+        ),
+        "got {outcome:?}"
+    );
+
+    let update = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv())
+        .await
+        .expect("the second reply reaches the update stream")
+        .expect("the update stream is open");
+    replier.await.unwrap();
+    match update {
+        ClientUpdate::ErrorReply {
+            header,
+            payload: Some(payload),
+            source,
+            ..
+        } => {
+            assert_eq!(header.return_code(), ReturnCode::NotOk);
+            assert_eq!(payload.raw_bytes().unwrap(), &[0x09]);
+            assert_eq!(source, peer_addr);
+        }
+        other => panic!("expected ClientUpdate::ErrorReply with a payload, got {other:?}"),
+    }
+    client.shut_down();
+    run_handle.abort();
+}
+
+#[tokio::test]
+async fn request_is_not_resolved_by_a_notification_with_its_request_id() {
+    let payload = request_answered_with(&[
+        (MessageType::Notification, ReturnCode::Ok, &[0x01]),
+        (MessageType::Response, ReturnCode::Ok, &[0x02]),
+    ])
+    .await
+    .expect("the RESPONSE resolves the request");
+    assert_eq!(payload.raw_bytes().unwrap(), &[0x02]);
 }

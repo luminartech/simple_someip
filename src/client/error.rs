@@ -51,6 +51,25 @@ pub enum Error {
     /// [`crate::transport::TransportError`]).
     #[error(transparent)]
     Transport(#[from] crate::transport::TransportError),
+    /// A reply that is an ERROR message, or a RESPONSE whose return code is
+    /// not [`ReturnCode::Ok`](crate::protocol::ReturnCode::Ok). The request it
+    /// answers resolves to this error, without the reply's payload. A reply
+    /// that answers no pending request arrives as
+    /// [`ClientUpdate::ErrorReply`](super::ClientUpdate::ErrorReply).
+    #[error(
+        "{message_type:?} reply with return code 0x{:02X} for request ID 0x{request_id:08X}",
+        .return_code.as_u8()
+    )]
+    ErrorReply {
+        /// The reply's request ID, which names the request it answers.
+        request_id: u32,
+        /// The reply's message type:
+        /// [`MessageType::Error`](crate::protocol::MessageType::Error) or
+        /// [`MessageType::Response`](crate::protocol::MessageType::Response).
+        message_type: crate::protocol::MessageType,
+        /// The return code the reply carried.
+        return_code: crate::protocol::ReturnCode,
+    },
     /// The client's internal run-loop future has exited — either because
     /// the caller dropped it before or during polling, the executor
     /// cancelled its task, or it returned. All public `Client` methods
@@ -61,6 +80,22 @@ pub enum Error {
     /// its driver and further calls on it cannot make progress.
     #[error("client run loop is no longer running")]
     Shutdown,
+}
+
+impl Error {
+    /// The [`Error::ErrorReply`] a message with `header` is, if it is one.
+    pub(crate) fn error_reply(header: &crate::protocol::Header) -> Option<Self> {
+        use crate::protocol::{MessageType, ReturnCode};
+        let message_type = header.message_type().message_type();
+        let return_code = header.return_code();
+        let is_error = message_type == MessageType::Error
+            || (message_type == MessageType::Response && return_code != ReturnCode::Ok);
+        is_error.then(|| Error::ErrorReply {
+            request_id: header.request_id(),
+            message_type,
+            return_code,
+        })
+    }
 }
 
 #[cfg(test)]
