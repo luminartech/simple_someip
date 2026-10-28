@@ -1,21 +1,62 @@
 use crate::protocol::sd;
 use crate::protocol::{self, MessageId, sd::Flags};
 
-/// Information about a service endpoint extracted from an SD message.
-pub struct OfferedEndpoint {
+/// The service instance an SD offer or stop offer names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct OfferedInstance {
     /// The SOME/IP service ID.
     pub service_id: u16,
     /// The SOME/IP instance ID.
     pub instance_id: u16,
-    /// The major version of the offered service interface.
+    /// The major version of the service interface.
     pub major_version: u8,
-    /// The minor version of the offered service interface.
+    /// The minor version of the service interface.
     pub minor_version: u32,
-    /// The full endpoint (IPv4 socket + transport protocol) extracted
-    /// from the SD options, if present.
-    pub endpoint: Option<crate::NetEndpoint>,
-    /// `true` for `OfferService`, `false` for `StopOfferService`.
-    pub is_offer: bool,
+}
+
+/// An offer or stop offer entry of an SD message.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum ServiceOffer<'a> {
+    /// The message's sender offers `instance` at the endpoints among
+    /// `options`.
+    Offer {
+        /// The offered instance.
+        instance: OfferedInstance,
+        /// The options the offer entry references.
+        options: sd::ReferencedOptions<core::slice::Iter<'a, sd::Options>>,
+    },
+    /// The message's sender no longer offers `instance`.
+    Stop {
+        /// The instance no longer offered.
+        instance: OfferedInstance,
+    },
+}
+
+/// Visits a [`ServiceOffer`] for every offer and stop offer in `header`.
+#[cfg(any(feature = "std", feature = "bare_metal"))]
+pub(crate) fn for_each_service_offer<'a>(
+    header: sd::Header<'a>,
+    mut f: impl FnMut(ServiceOffer<'a>),
+) {
+    use sd::Entry;
+    for (entry, options) in header.entries_with_options() {
+        let (Entry::OfferService(svc) | Entry::StopOfferService(svc)) = entry else {
+            continue;
+        };
+        let instance = OfferedInstance {
+            service_id: svc.service_id,
+            instance_id: svc.instance_id,
+            major_version: svc.major_version,
+            minor_version: svc.minor_version,
+        };
+        f(if matches!(entry, Entry::StopOfferService(_)) {
+            ServiceOffer::Stop { instance }
+        } else {
+            ServiceOffer::Offer { instance, options }
+        });
+    }
 }
 
 /// Crate-local conveniences over any codec [`Encode`](automotive_wire_codec::Encode) type.
@@ -117,22 +158,20 @@ pub trait PayloadWireFormat:
     /// to provide an impl that will never be called.
     fn set_reboot_flag(_header: &mut Self::SdHeader, _reboot: sd::RebootFlag) {}
 
-    /// Visit each offered / stopped service endpoint in this SD
-    /// payload with `f`.
+    /// Visit each offer and stop offer in this SD payload with `f`, as a
+    /// [`ServiceOffer`].
     ///
     /// Visitor pattern (rather than returning a `Vec`) so the trait
-    /// is `no_std`-compatible: the implementation walks its internal
-    /// SD entries and invokes `f` for each `OfferedEndpoint`. The
-    /// `Client` run loop uses this to auto-populate its service
-    /// registry from inbound discovery messages.
+    /// is `no_std`-compatible. The `Client` run loop uses this to
+    /// auto-populate its service registry from inbound discovery messages.
     ///
     /// The default implementation visits nothing — payload types
     /// that don't carry SD entries (e.g. application payloads) leave
     /// it unimplemented; SD-bearing types (e.g. `RawPayload`'s
     /// `VecSdHeader` payload) override.
-    fn for_each_offered_endpoint<F>(&self, _f: F)
+    fn for_each_service_offer<'a, F>(&'a self, _f: F)
     where
-        F: FnMut(OfferedEndpoint),
+        F: FnMut(ServiceOffer<'a>),
     {
     }
 
@@ -144,21 +183,21 @@ pub trait PayloadWireFormat:
     /// offers) contributes to reboot detection.
     ///
     /// Visitor pattern for the same `no_std` reason as
-    /// [`Self::for_each_offered_endpoint`]; default visits nothing.
+    /// [`Self::for_each_service_offer`]; default visits nothing.
     fn for_each_service_instance<F>(&self, _f: F)
     where
         F: FnMut(u16, u16),
     {
     }
 
-    /// Convenience accessor returning all offered endpoints as a heap
-    /// `Vec`. Wraps [`Self::for_each_offered_endpoint`] so std users
+    /// Convenience accessor returning all offers and stop offers as a heap
+    /// `Vec`. Wraps [`Self::for_each_service_offer`] so std users
     /// get the original ergonomic shape; bare-metal users use the
     /// visitor directly. Gated on `feature = "std"`.
     #[cfg(feature = "std")]
-    fn offered_endpoints(&self) -> std::vec::Vec<OfferedEndpoint> {
+    fn service_offers(&self) -> std::vec::Vec<ServiceOffer<'_>> {
         let mut out = std::vec::Vec::new();
-        self.for_each_offered_endpoint(|ep| out.push(ep));
+        self.for_each_service_offer(|offer| out.push(offer));
         out
     }
 

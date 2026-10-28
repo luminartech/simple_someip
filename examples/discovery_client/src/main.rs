@@ -123,15 +123,11 @@ impl DiscoveryState {
         }
     }
 
-    fn process_entry(&mut self, entry: &Entry, options: &[Options]) {
+    fn process_entry<'a>(&mut self, entry: &Entry, options: impl Iterator<Item = &'a Options>) {
         match entry {
             Entry::OfferService(svc) => {
                 let key = (svc.service_id, svc.instance_id);
-                let endpoints = extract_endpoints(
-                    svc.index_first_options_run,
-                    svc.options_count.first_options_count,
-                    options,
-                );
+                let endpoints = extract_endpoints(options);
                 let is_new = !self.services.contains_key(&key);
                 let info = self.services.entry(key).or_insert(ServiceInfo {
                     major_version: svc.major_version,
@@ -245,12 +241,10 @@ impl DiscoveryState {
     }
 }
 
-/// Extract endpoints from the options array for a given entry's option run.
-fn extract_endpoints(option_index: u8, option_count: u8, all_options: &[Options]) -> Vec<Endpoint> {
-    let start = usize::from(option_index);
-    let end = start + usize::from(option_count);
-    (start..end.min(all_options.len()))
-        .filter_map(|i| match &all_options[i] {
+/// Extract the endpoints among the options an entry references.
+fn extract_endpoints<'a>(options: impl Iterator<Item = &'a Options>) -> Vec<Endpoint> {
+    options
+        .filter_map(|option| match option {
             Options::IpV4Endpoint { ip, protocol, port }
             | Options::IpV4Multicast { ip, protocol, port }
             | Options::IpV4SD { ip, protocol, port } => Some(Endpoint {
@@ -308,11 +302,8 @@ async fn main() -> Result<(), Error> {
                     msg.someip_header.request_id() & 0xFFFF,
                 );
 
-                let header = &msg.sd_header;
-                let options = header.options.clone();
-
-                for entry in &header.entries {
-                    state.process_entry(entry, &options);
+                for (entry, options) in msg.sd_header.as_header().entries_with_options() {
+                    state.process_entry(entry, options);
                 }
 
                 state.print_summary();

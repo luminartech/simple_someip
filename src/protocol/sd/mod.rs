@@ -18,13 +18,15 @@ pub const MESSAGE_ID_VALUE: u32 = 0xffff_8100;
 
 // Export all definitions from the service discovery mod
 
+#[cfg(all(test, feature = "server-tokio"))]
+pub(crate) use entry::OptionRuns;
 pub use entry::{
-    Entry, EntryIter, EntryType, EntryView, EventGroupEntry, MAX_TTL, OptionsCount, ServiceEntry,
+    Entry, EntryIter, EntryType, EntryView, EventGroupEntry, MAX_TTL, OptionsCount,
+    ReferencedOptions, ServiceEntry,
 };
 pub use error::Error;
 pub use flags::{Flags, RebootFlag};
 pub use header::{Header, SdBody, SdHeaderView};
 pub use options::{
-    MAX_CONFIGURATION_STRING_LENGTH, OptionIter, OptionType, OptionView, Options,
-    TransportProtocol, extract_ipv4_endpoint,
+    MAX_CONFIGURATION_STRING_LENGTH, OptionIter, OptionType, OptionView, Options, TransportProtocol,
 };

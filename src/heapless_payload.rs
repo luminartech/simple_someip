@@ -55,15 +55,24 @@ pub struct HeaplessSdHeader {
     pub options: HVec<sd::Options, OPT_CAP>,
 }
 
+impl HeaplessSdHeader {
+    /// This header as an [`sd::Header`] borrowing its entries and options,
+    /// for example to walk [`sd::Header::entries_with_options`].
+    #[must_use]
+    pub fn as_header(&self) -> sd::Header<'_> {
+        sd::Header::new(self.flags, &self.entries, &self.options)
+    }
+}
+
 impl Encode for HeaplessSdHeader {
     type Error = protocol::Error;
 
     fn encoded_size(&self) -> Result<usize, Self::Error> {
-        sd::Header::new(self.flags, &self.entries, &self.options).encoded_size()
+        self.as_header().encoded_size()
     }
 
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, protocol::Error> {
-        sd::Header::new(self.flags, &self.entries, &self.options).encode(writer)
+        self.as_header().encode(writer)
     }
 }
 
@@ -229,31 +238,15 @@ impl PayloadWireFormat for HeaplessPayload {
         header.flags = sd::Flags::new(bool::from(reboot), header.flags.unicast());
     }
 
-    fn for_each_offered_endpoint<F>(&self, mut f: F)
+    fn for_each_service_offer<'a, F>(&'a self, f: F)
     where
-        F: FnMut(crate::OfferedEndpoint),
+        F: FnMut(crate::ServiceOffer<'a>),
     {
         let header = match &self.kind {
             HeaplessPayloadKind::Sd(header) => header,
             HeaplessPayloadKind::Raw(_) => return,
         };
-        for entry in &header.entries {
-            if let sd::Entry::OfferService(svc) | sd::Entry::StopOfferService(svc) = entry {
-                let is_offer = matches!(entry, sd::Entry::OfferService(_));
-                let endpoint =
-                    sd::extract_ipv4_endpoint(&header.options).map(|(addr, protocol)| {
-                        crate::NetEndpoint::new(core::net::SocketAddr::V4(addr), protocol)
-                    });
-                f(crate::OfferedEndpoint {
-                    service_id: svc.service_id,
-                    instance_id: svc.instance_id,
-                    major_version: svc.major_version,
-                    minor_version: svc.minor_version,
-                    endpoint,
-                    is_offer,
-                });
-            }
-        }
+        crate::traits::for_each_service_offer(header.as_header(), f);
     }
 
     fn for_each_service_instance<F>(&self, mut f: F)

@@ -239,6 +239,55 @@ impl Encode for ServiceEntry {
     }
 }
 
+/// The two runs of options an entry references, each a start index into its
+/// message's options and a count.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OptionRuns {
+    first: (u8, u8),
+    second: (u8, u8),
+}
+
+impl OptionRuns {
+    pub(crate) const fn new(index_first: u8, index_second: u8, count: OptionsCount) -> Self {
+        Self {
+            first: (index_first, count.first_options_count),
+            second: (index_second, count.second_options_count),
+        }
+    }
+
+    /// The options these runs reference among `options`, the message's
+    /// options in order.
+    pub(crate) fn select<I: Iterator + Clone>(self, options: I) -> ReferencedOptions<I> {
+        let run = |options: I, (index, count): (u8, u8)| {
+            options.skip(usize::from(index)).take(usize::from(count))
+        };
+        ReferencedOptions(run(options.clone(), self.first).chain(run(options, self.second)))
+    }
+}
+
+/// The options one SD entry references in its message: its first options run,
+/// then its second. An index past the end of the message's options references
+/// nothing.
+///
+/// Yielded with each entry by [`Header::entries_with_options`](super::Header::entries_with_options)
+/// and [`SdHeaderView::entries_with_options`](super::SdHeaderView::entries_with_options).
+#[derive(Clone, Debug)]
+pub struct ReferencedOptions<I>(
+    core::iter::Chain<core::iter::Take<core::iter::Skip<I>>, core::iter::Take<core::iter::Skip<I>>>,
+);
+
+impl<I: Iterator> Iterator for ReferencedOptions<I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<I::Item> {
+        self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
 /// A decoded SD entry, wrapping a [`ServiceEntry`] or [`EventGroupEntry`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -306,6 +355,24 @@ impl Entry {
     #[must_use]
     pub fn total_options_count(&self) -> u8 {
         self.first_options_count() + self.second_options_count()
+    }
+
+    pub(crate) fn option_runs(&self) -> OptionRuns {
+        match self {
+            Entry::FindService(service_entry)
+            | Entry::OfferService(service_entry)
+            | Entry::StopOfferService(service_entry) => OptionRuns::new(
+                service_entry.index_first_options_run,
+                service_entry.index_second_options_run,
+                service_entry.options_count,
+            ),
+            Entry::SubscribeEventGroup(event_group_entry)
+            | Entry::SubscribeAckEventGroup(event_group_entry) => OptionRuns::new(
+                event_group_entry.index_first_options_run,
+                event_group_entry.index_second_options_run,
+                event_group_entry.options_count,
+            ),
+        }
     }
 }
 
@@ -401,6 +468,14 @@ impl EntryView<'_> {
     #[must_use]
     pub fn options_count(&self) -> OptionsCount {
         OptionsCount::from(self.0[3])
+    }
+
+    pub(crate) fn option_runs(self) -> OptionRuns {
+        OptionRuns::new(
+            self.index_first_options_run(),
+            self.index_second_options_run(),
+            self.options_count(),
+        )
     }
 
     /// Returns the service ID.

@@ -215,11 +215,11 @@ mod tests {
 
     #[cfg(feature = "std")]
     #[test]
-    fn test_payload_offered_endpoints_default_empty() {
+    fn test_payload_service_offers_default_empty() {
         let p = TestPayload {
             header: empty_sd_header(),
         };
-        assert!(p.offered_endpoints().is_empty());
+        assert!(p.service_offers().is_empty());
     }
 }
 

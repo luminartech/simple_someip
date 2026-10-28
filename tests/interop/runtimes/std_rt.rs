@@ -9,14 +9,14 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use simple_someip::e2e::E2ERegistry;
-use simple_someip::protocol::sd::TransportProtocol;
+use simple_someip::protocol::sd::{Options, TransportProtocol};
 use simple_someip::protocol::{
     Header, Message, MessageId, MessageType, MessageTypeField, ReturnCode,
 };
 use simple_someip::server::{EventPublisher, ServerConfig, SubscriptionManager};
 use simple_someip::{
-    Client, ClientUpdate, ClientUpdates, NetEndpoint, PayloadWireFormat, RawPayload, Server,
-    ServerDeps, ServiceEndpointKey, TokioChannels, TokioSocket,
+    Client, ClientUpdate, ClientUpdates, PayloadWireFormat, RawPayload, Server, ServerDeps,
+    ServiceEndpointKey, ServiceOffer, TokioChannels, TokioSocket,
 };
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -245,45 +245,46 @@ async fn report_updates(
                     continue;
                 }
                 let sd = RawPayload::new_sd_payload(&msg.sd_header);
-                for ep in sd.offered_endpoints() {
-                    // Like the library's registry, which skips a stop that
-                    // names no endpoint: it cannot tell which provider left.
-                    if !ep.is_offer {
-                        if ep.endpoint.is_some() {
+                for offer in sd.service_offers() {
+                    let (instance, options) = match offer {
+                        ServiceOffer::Offer { instance, options } => (instance, options),
+                        ServiceOffer::Stop { instance } => {
                             out.push(Observation::ServiceGone {
-                                service: ep.service_id,
-                                instance: ep.instance_id,
+                                service: instance.service_id,
+                                instance: instance.instance_id,
                             });
-                        } else {
-                            eprintln!(
-                                "std runtime: stop for 0x{:04X} without an endpoint; not reported",
-                                ep.service_id
-                            );
+                            continue;
                         }
-                        continue;
-                    }
-                    let endpoint = match ep.endpoint {
-                        Some(NetEndpoint {
-                            addr: SocketAddr::V4(addr),
-                            protocol: TransportProtocol::Udp,
-                        }) => addr,
                         other => {
-                            eprintln!(
-                                "std runtime: offer for 0x{:04X} without a UDP IPv4 endpoint: {other:?}",
-                                ep.service_id
-                            );
+                            eprintln!("std runtime: {other:?} not reported");
                             continue;
                         }
                     };
-                    if !found && ep.service_id == SVC && ep.instance_id == INST {
+                    let udp = options.clone().find_map(|option| match *option {
+                        Options::IpV4Endpoint {
+                            ip,
+                            protocol: TransportProtocol::Udp,
+                            port,
+                        } => Some(SocketAddrV4::new(ip, port)),
+                        _ => None,
+                    });
+                    let Some(endpoint) = udp else {
+                        eprintln!(
+                            "std runtime: offer for 0x{:04X} without a UDP IPv4 endpoint: {:?}",
+                            instance.service_id,
+                            options.collect::<Vec<_>>()
+                        );
+                        continue;
+                    };
+                    if !found && instance.service_id == SVC && instance.instance_id == INST {
                         found = true;
                         let key = ServiceEndpointKey::udp(SVC, SocketAddr::V4(endpoint));
                         *service.lock().unwrap() = Some(key);
                         out.extend(use_service(&client, key, subscribe).await);
                     }
                     out.push(Observation::ServiceAvailable {
-                        service: ep.service_id,
-                        instance: ep.instance_id,
+                        service: instance.service_id,
+                        instance: instance.instance_id,
                         endpoint,
                     });
                 }
