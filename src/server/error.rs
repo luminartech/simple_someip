@@ -56,6 +56,10 @@ pub enum Error {
         .0.major_version
     )]
     WildcardConsumedEventgroup(crate::sd_codec::SubscribeEventgroupRequest),
+    /// [`ServerConfig::sd_multicast`](super::ServerConfig::sd_multicast) is
+    /// not a multicast group with a nonzero port.
+    #[error("SD address {0} is not a multicast group with a nonzero port")]
+    InvalidSdMulticast(core::net::SocketAddrV4),
 }
 
 impl From<crate::protocol::sd::Error> for Error {

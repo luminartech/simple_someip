@@ -157,9 +157,38 @@ pub struct ServerConfig {
     pub find_timing: FindTiming,
     /// The SD multicast group and port: the SD socket binds this port and
     /// joins this group, and the server's multicast `OfferService` and
-    /// `FindService` go to it. Defaults to
+    /// `FindService` go to it. It must be a multicast group with a nonzero
+    /// port. Defaults to
     /// [`MULTICAST_IP`](crate::protocol::sd::MULTICAST_IP):[`MULTICAST_PORT`](crate::protocol::sd::MULTICAST_PORT).
     pub sd_multicast: SocketAddrV4,
+}
+
+/// A [`Server`]'s SD numbering and SD multicast group, from [`Server::sd`].
+#[derive(Debug, Clone, Copy)]
+pub struct ServerSd<'a> {
+    state: &'a SdStateManager,
+    multicast: SocketAddrV4,
+}
+
+impl ServerSd<'_> {
+    /// The session of the next SD message; see [`SdStateManager::next_session`].
+    #[must_use]
+    pub fn next_session(&self) -> crate::sd_codec::SdSession {
+        self.state.next_session()
+    }
+
+    /// The SD multicast group and port; see [`ServerConfig::sd_multicast`].
+    #[must_use]
+    pub fn multicast(&self) -> SocketAddrV4 {
+        self.multicast
+    }
+}
+
+#[cfg(test)]
+impl<'a> ServerSd<'a> {
+    pub(crate) fn new(state: &'a SdStateManager, multicast: SocketAddrV4) -> Self {
+        Self { state, multicast }
+    }
 }
 
 /// A `(service, instance, event_group)` tuple a receive loop will accept
@@ -477,16 +506,19 @@ impl ServerConfig {
 
     fn validate(&self) -> Result<(), Error> {
         self.check_ttl()?;
-        match self.consumed_eventgroups.iter().find(|request| {
+        if let Some(request) = self.consumed_eventgroups.iter().find(|request| {
             crate::sd_codec::names_a_wildcard(
                 request.service_id,
                 request.instance_id,
                 request.major_version,
             )
         }) {
-            Some(request) => Err(Error::WildcardConsumedEventgroup(*request)),
-            None => Ok(()),
+            return Err(Error::WildcardConsumedEventgroup(*request));
         }
+        if !self.sd_multicast.ip().is_multicast() || self.sd_multicast.port() == 0 {
+            return Err(Error::InvalidSdMulticast(self.sd_multicast));
+        }
+        Ok(())
     }
 
     fn check_ttl(&self) -> Result<(), Error> {
@@ -1039,6 +1071,8 @@ impl
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
+    /// is not a multicast group with a nonzero port.
     /// Returns an error if binding the unicast or SD socket fails, or if joining the
     /// SD multicast group fails.
     pub async fn new(
@@ -1083,6 +1117,8 @@ impl
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
+    /// is not a multicast group with a nonzero port.
     /// Returns an error if binding the unicast or SD socket fails, or if joining the
     /// SD multicast group fails.
     pub async fn new_with_loopback(
@@ -1133,6 +1169,8 @@ impl
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
+    /// is not a multicast group with a nonzero port.
     /// Returns an error if binding either socket fails.
     pub async fn new_passive(
         config: ServerConfig,
@@ -1190,6 +1228,8 @@ where
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
+    /// is not a multicast group with a nonzero port.
     /// Returns an error if binding the unicast or SD socket via
     /// [`TransportFactory::bind`] fails, or if joining the SD multicast
     /// group fails.
@@ -1292,6 +1332,8 @@ where
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
+    /// is not a multicast group with a nonzero port.
     /// Returns an error if binding either socket fails.
     pub async fn new_passive_with_deps(
         deps: ServerDeps<F, Tm, R, Sub>,
@@ -1410,6 +1452,8 @@ where
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
+    /// is not a multicast group with a nonzero port.
     /// Returns an error if querying `unicast_socket.local_addr()`
     /// fails on the underlying transport, or
     /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
@@ -1480,6 +1524,8 @@ where
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
+    /// is not a multicast group with a nonzero port.
     /// Returns an error if querying `unicast_socket.local_addr()`
     /// fails on the underlying transport, or
     /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
@@ -1527,6 +1573,17 @@ where
             started: deps.started,
             non_sd_observer: deps.non_sd_observer,
         })
+    }
+
+    /// This server's SD numbering and SD multicast group, for SD messages
+    /// sent beside the server, such as a combined `OfferService` of several
+    /// services.
+    #[must_use]
+    pub fn sd(&self) -> ServerSd<'_> {
+        ServerSd {
+            state: self.sd_state.get(),
+            multicast: self.config.sd_multicast,
+        }
     }
 
     /// Get a clone of the event-publisher handle for sending events.
@@ -2010,6 +2067,21 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    #[test]
+    fn validate_rejects_an_sd_address_that_is_not_a_multicast_group_and_port() {
+        for address in [
+            SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), sd::MULTICAST_PORT),
+            SocketAddrV4::new(sd::MULTICAST_IP, 0),
+        ] {
+            let config = ServerConfig::new(0x1234, 1).with_sd_multicast(address);
+            assert!(
+                matches!(config.validate(), Err(Error::InvalidSdMulticast(a)) if a == address),
+                "{address}"
+            );
+        }
+        assert!(ServerConfig::new(0x1234, 1).validate().is_ok());
     }
 
     #[test]

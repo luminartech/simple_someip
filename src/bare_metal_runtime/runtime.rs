@@ -516,7 +516,6 @@ async fn someip_task() {
 
     let plat = platform();
     let sd_socket: &'static Sock = unsafe { (*core::ptr::addr_of!(SD_SOCK)).assume_init_ref() };
-    let sd_mcast = sd_multicast();
     let timer = CallbackTimer::new(plat.now_ms);
     let e2e = e2e();
 
@@ -532,10 +531,9 @@ async fn someip_task() {
             rx_socket: rx_socket.as_ref(),
             timer: &timer,
             e2e: &e2e,
-            sd_multicast: sd_mcast,
             period,
             offers: &reqs[..n_offers],
-            sd_state: &SD_STATE,
+            sd: server.sd(),
             offer_scratch,
             rx_buf: rx,
             dispatch,

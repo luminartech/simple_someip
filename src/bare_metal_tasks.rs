@@ -27,7 +27,7 @@ use crate::sd_codec::{
     OfferServiceRequest, build_multi_offer_service_datagram, build_notification_datagram,
     check_parsed_e2e, parse_someip_datagram,
 };
-use crate::server::{SdStateManager, ServerConfig, Subscriber, SubscriptionHandle};
+use crate::server::{ServerConfig, ServerSd, Subscriber, SubscriptionHandle};
 use crate::transport::{E2EHandle, Timer, TransportSocket};
 use heapless::Vec as HeaplessVec;
 
@@ -49,17 +49,15 @@ pub type RequestDispatchFn = fn(
 
 /// Periodically multicast one combined `OfferService` SD datagram
 /// carrying every entry in `offers` (each with its own endpoint option),
-/// re-sent every `period`. Each datagram takes its session ID and reboot
-/// flag from `sd_state`, the server's SD state, so the node's multicast
-/// SD messages form one session stream. `N` bounds the
-/// number of entries packed into the datagram. `scratch` must hold the
+/// re-sent every `period`, to `sd`'s multicast group and numbered by `sd`,
+/// so the node's multicast SD messages form one session stream. `N` bounds
+/// the number of entries packed into the datagram. `scratch` must hold the
 /// encoded datagram.
 pub async fn announce_offers_future<'a, S, Tm, const N: usize>(
     sd_socket: &'a S,
     timer: &'a Tm,
     offers: &'a [OfferServiceRequest],
-    sd_multicast: SocketAddrV4,
-    sd_state: &'a SdStateManager,
+    sd: ServerSd<'a>,
     period: Duration,
     scratch: &'a mut [u8],
 ) where
@@ -67,10 +65,9 @@ pub async fn announce_offers_future<'a, S, Tm, const N: usize>(
     Tm: Timer,
 {
     loop {
-        if let Ok(len) =
-            build_multi_offer_service_datagram::<N>(scratch, offers, sd_state.next_session())
+        if let Ok(len) = build_multi_offer_service_datagram::<N>(scratch, offers, sd.next_session())
         {
-            let _ = sd_socket.send_to(&scratch[..len], sd_multicast).await;
+            let _ = sd_socket.send_to(&scratch[..len], sd.multicast()).await;
         }
         timer.sleep(period).await;
     }
@@ -136,14 +133,13 @@ where
     pub rx_socket: Option<&'a S>,
     pub timer: &'a Tm,
     pub e2e: &'a R,
-    /// SD multicast endpoint the offers are sent to.
-    pub sd_multicast: SocketAddrV4,
     /// Re-announce period (the node SD TTL).
     pub period: Duration,
     /// Offered services packed into one combined `OfferService`.
     pub offers: &'a [OfferServiceRequest],
-    /// The server's SD state: the session ID and reboot flag of each Offer.
-    pub sd_state: &'a SdStateManager,
+    /// The SD numbering and multicast group of the server whose receive
+    /// future runs beside the Offers, from [`Server::sd`](crate::server::Server::sd).
+    pub sd: ServerSd<'a>,
     pub offer_scratch: &'a mut [u8],
     pub rx_buf: &'a mut [u8],
     pub dispatch: RequestDispatchFn,
@@ -175,10 +171,9 @@ where
         rx_socket,
         timer,
         e2e,
-        sd_multicast,
         period,
         offers,
-        sd_state,
+        sd,
         offer_scratch,
         rx_buf,
         dispatch,
@@ -189,8 +184,7 @@ where
         sd_socket,
         timer,
         offers,
-        sd_multicast,
-        sd_state,
+        sd,
         period,
         offer_scratch,
     );
@@ -355,6 +349,8 @@ mod tests {
         }
     }
 
+    use crate::server::SdStateManager;
+
     #[test]
     fn offers_continue_the_server_sd_session_and_reboot_flag() {
         let sd_state = SdStateManager::new();
@@ -375,8 +371,10 @@ mod tests {
             &socket,
             &NeverTimer,
             &offers,
-            SocketAddrV4::new(Ipv4Addr::new(239, 255, 0, 255), 30490),
-            &sd_state,
+            ServerSd::new(
+                &sd_state,
+                SocketAddrV4::new(Ipv4Addr::new(239, 255, 0, 255), 30490),
+            ),
             Duration::from_secs(1),
             &mut scratch,
         );
