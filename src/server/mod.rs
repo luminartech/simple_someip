@@ -8,6 +8,7 @@
 
 mod error;
 mod event_publisher;
+mod find_timing;
 mod runtime;
 mod sd_state;
 mod service_info;
@@ -15,6 +16,7 @@ mod subscription_manager;
 
 pub use error::Error;
 pub use event_publisher::EventPublisher;
+pub use find_timing::FindTiming;
 pub use service_info::Subscriber;
 #[cfg(feature = "std")]
 pub use service_info::{EventGroupInfo, ServiceInfo};
@@ -174,33 +176,6 @@ pub struct AcceptedOffer {
     pub major_version: u8,
     /// Offered event-group ID.
     pub event_group_id: u16,
-}
-
-/// When the run future sends `FindService` for the
-/// [`ServerConfig::consumed_eventgroups`] not yet offered: once after
-/// `initial_delay`, then after `repetitions_base_delay` doubled each time,
-/// `repetitions_max` more times. No `FindService` is sent after that.
-/// Start from [`FindTiming::DEFAULT`] and set the fields to change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct FindTiming {
-    /// Delay before the first `FindService`, used as given: nodes started
-    /// together spread their first `FindService` only if each is given a
-    /// different delay.
-    pub initial_delay: core::time::Duration,
-    /// Delay before the first repetition; each later one doubles it.
-    pub repetitions_base_delay: core::time::Duration,
-    /// Number of repetitions after the first `FindService`; 0 sends one.
-    pub repetitions_max: u8,
-}
-
-impl FindTiming {
-    /// 10 ms initial delay, 100 ms base delay, 3 repetitions.
-    pub const DEFAULT: Self = Self {
-        initial_delay: core::time::Duration::from_millis(10),
-        repetitions_base_delay: core::time::Duration::from_millis(100),
-        repetitions_max: 3,
-    };
 }
 
 impl ServerConfig {

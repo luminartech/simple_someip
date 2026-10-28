@@ -24,12 +24,8 @@ pub use transport::{CallbackFactory, CallbackSocket, CallbackTimer, NowMsFn, Pla
 
 #[cfg(feature = "bare-metal-runtime")]
 mod runtime;
-#[cfg(any(feature = "bare-metal-runtime", test))]
-mod sd_timing;
 #[cfg(feature = "bare-metal-runtime")]
 pub use runtime::{
     BindFn, DispatchFn, OfferEntry, RX_CAP, RX_SLOTS, RuntimeBuffers, RuntimeConfig, SubEntry,
     deinit, init, on_rx, poll, publish,
 };
-#[cfg(feature = "bare-metal-runtime")]
-pub use sd_timing::SdTiming;

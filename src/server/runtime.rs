@@ -782,7 +782,10 @@ pub(super) async fn find_loop<T, Tm>(
 {
     let timing = config.find_timing;
     let mut buf = [0u8; FIND_BUF_LEN];
-    let mut delay = timing.initial_delay;
+    let mut delay = timing.initial_delay(super::find_timing::seed(
+        config.interface,
+        config.local_port,
+    ));
     for repetition in 0..=u32::from(timing.repetitions_max) {
         timer.sleep(delay).await;
         match encode_finds(&mut buf, config, sd_state, offered) {
@@ -1660,16 +1663,25 @@ mod tests {
                 .collect()
         }
 
+        /// [`FindTiming::DEFAULT`] with a fixed 10 ms initial delay.
+        const FIXED: FindTiming = FindTiming {
+            initial_delay_min: core::time::Duration::from_millis(10),
+            initial_delay_max: core::time::Duration::from_millis(10),
+            ..FindTiming::DEFAULT
+        };
+
         fn once() -> FindTiming {
             FindTiming {
                 repetitions_max: 0,
-                ..FindTiming::DEFAULT
+                ..FIXED
             }
         }
 
         #[tokio::test]
         async fn finds_after_the_initial_delay_then_doubling_repetitions() {
-            let config = make_config().with_consumed_eventgroup(consumed());
+            let config = make_config()
+                .with_consumed_eventgroup(consumed())
+                .with_find_timing(FIXED);
             let (socket, timer, offered) = (
                 RecordingSocket::default(),
                 RecordingTimer::new(),
@@ -1680,6 +1692,20 @@ mod tests {
 
             assert_eq!(timer.millis(), [10, 100, 200, 400]);
             assert_eq!(finds(&socket), std::vec![std::vec![(0x5678, 1)]; 4]);
+        }
+
+        #[tokio::test]
+        async fn the_first_find_waits_the_initial_delay_drawn_for_the_node() {
+            let config = make_config().with_consumed_eventgroup(consumed());
+            let (socket, timer) = (RecordingSocket::default(), RecordingTimer::new());
+
+            find_loop(&config, &socket, &make_sd_state(), &timer, &Offered::new()).await;
+
+            let first = timer.sleeps.lock().unwrap()[0];
+            let timing = FindTiming::DEFAULT;
+            assert!((timing.initial_delay_min..=timing.initial_delay_max).contains(&first));
+            let seed = crate::server::find_timing::seed(config.interface, config.local_port);
+            assert_eq!(first, timing.initial_delay(seed));
         }
 
         #[tokio::test]
@@ -1777,7 +1803,9 @@ mod tests {
 
         #[tokio::test]
         async fn a_failed_find_send_keeps_the_schedule() {
-            let config = make_config().with_consumed_eventgroup(consumed());
+            let config = make_config()
+                .with_consumed_eventgroup(consumed())
+                .with_find_timing(FIXED);
             let (timer, offered) = (RecordingTimer::new(), Offered::new());
 
             find_loop(&config, &FailingSocket, &make_sd_state(), &timer, &offered).await;

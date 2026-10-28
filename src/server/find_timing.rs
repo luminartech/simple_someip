@@ -1,0 +1,112 @@
+//! When the run future sends `FindService`, and the per-node initial delay.
+
+use core::time::Duration;
+
+/// When the run future sends `FindService` for the
+/// [`ServerConfig::consumed_eventgroups`](super::ServerConfig::consumed_eventgroups)
+/// not yet offered: once after an initial delay in
+/// `initial_delay_min..=initial_delay_max`, then after
+/// `repetitions_base_delay` doubled each time, `repetitions_max` more times.
+/// No `FindService` is sent after that. Start from [`FindTiming::DEFAULT`]
+/// and set the fields to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FindTiming {
+    /// Least delay before the first `FindService`.
+    pub initial_delay_min: Duration,
+    /// Greatest delay before the first `FindService`. The server picks the
+    /// delay in whole milliseconds from `initial_delay_min..=initial_delay_max`,
+    /// seeded by its interface address and port, and uses
+    /// `initial_delay_min` when this is below it.
+    pub initial_delay_max: Duration,
+    /// Delay before the first repetition; each later one doubles it.
+    pub repetitions_base_delay: Duration,
+    /// Number of repetitions after the first `FindService`; 0 sends one.
+    pub repetitions_max: u8,
+}
+
+impl FindTiming {
+    /// 10 to 100 ms initial delay, 100 ms base delay, 3 repetitions.
+    pub const DEFAULT: Self = Self {
+        initial_delay_min: Duration::from_millis(10),
+        initial_delay_max: Duration::from_millis(100),
+        repetitions_base_delay: Duration::from_millis(100),
+        repetitions_max: 3,
+    };
+
+    /// A delay in the initial-delay range, picked by a xorshift32 step from
+    /// `seed`; the minimum when the range is empty.
+    pub(super) fn initial_delay(&self, seed: u32) -> Duration {
+        let Some(span) = self.initial_delay_max.checked_sub(self.initial_delay_min) else {
+            return self.initial_delay_min;
+        };
+        let span_ms = u64::try_from(span.as_millis()).unwrap_or(u64::MAX);
+        let mut x = seed;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        let offset = u64::from(x) % span_ms.saturating_add(1);
+        self.initial_delay_min
+            .saturating_add(Duration::from_millis(offset))
+    }
+}
+
+/// A nonzero seed that differs between nodes on one segment.
+pub(super) fn seed(interface: core::net::Ipv4Addr, port: u16) -> u32 {
+    match u32::from(interface) ^ u32::from(port).rotate_left(16) {
+        0 => 0x9E37_79B9,
+        s => s,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::net::Ipv4Addr;
+
+    const TIMING: FindTiming = FindTiming {
+        initial_delay_min: Duration::from_millis(50),
+        initial_delay_max: Duration::from_millis(150),
+        ..FindTiming::DEFAULT
+    };
+
+    #[test]
+    fn the_initial_delay_stays_within_its_range() {
+        for s in (1..=u32::MAX).step_by(7_919_993) {
+            let d = TIMING.initial_delay(s);
+            assert!(
+                (TIMING.initial_delay_min..=TIMING.initial_delay_max).contains(&d),
+                "seed {s}: {d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_initial_delay_is_the_minimum_when_the_maximum_is_below_it() {
+        let timing = FindTiming {
+            initial_delay_min: Duration::from_millis(80),
+            initial_delay_max: Duration::from_millis(20),
+            ..FindTiming::DEFAULT
+        };
+        assert_eq!(timing.initial_delay(12345), Duration::from_millis(80));
+    }
+
+    #[test]
+    fn the_initial_delay_handles_the_full_duration_range() {
+        let timing = FindTiming {
+            initial_delay_min: Duration::ZERO,
+            initial_delay_max: Duration::MAX,
+            ..FindTiming::DEFAULT
+        };
+        let _ = timing.initial_delay(12345);
+    }
+
+    #[test]
+    fn the_seed_is_nonzero_and_differs_by_interface() {
+        assert_ne!(seed(Ipv4Addr::UNSPECIFIED, 0), 0);
+        assert_ne!(
+            seed(Ipv4Addr::LOCALHOST, 30490),
+            seed(Ipv4Addr::new(127, 0, 0, 2), 30490)
+        );
+    }
+}

@@ -26,7 +26,6 @@ use crate::server::{
 use crate::transport::{E2EHandle, NoE2E};
 
 use super::mailbox::RxMailbox;
-use super::sd_timing::{SdTiming, draw_initial_delay_ms, seed};
 use super::transport::{CallbackFactory, CallbackSocket, CallbackTimer, NowMsFn, Platform, SendFn};
 
 // ── Fixed runtime sizing (catalog-agnostic) ──────────────────────────────
@@ -186,7 +185,7 @@ pub struct RuntimeConfig {
     /// service ID, instance ID and major version.
     pub subscription: Option<SubEntry>,
     /// When the runtime sends `FindService` for its subscription.
-    pub sd_timing: SdTiming,
+    pub find_timing: FindTiming,
     /// RX mailbox the platform's receive path pushes into.
     pub mailbox: &'static Mailbox,
     /// Runtime buffer memory (platform-owned, placement-controlled).
@@ -642,16 +641,7 @@ pub fn init(config: RuntimeConfig) -> i32 {
         bind_once(s.local_rx_port);
     }
 
-    let timing = config.sd_timing;
-    let find_timing = FindTiming {
-        initial_delay: Duration::from_millis(u64::from(draw_initial_delay_ms(
-            &timing,
-            seed(config.interface, (config.now_ms)()),
-        ))),
-        repetitions_base_delay: Duration::from_millis(u64::from(timing.repetitions_base_delay_ms)),
-        repetitions_max: timing.repetitions_max,
-    };
-    if !build_server(find_timing) {
+    if !build_server(config.find_timing) {
         // Release the claim so the platform can retry after fixing config.
         INIT_CLAIMED.store(false, Ordering::Release);
         return -1;
