@@ -16,8 +16,8 @@ pub struct FindTiming {
     pub initial_delay_min: Duration,
     /// Greatest delay before the first `FindService`. The server picks the
     /// delay in whole milliseconds from `initial_delay_min..=initial_delay_max`,
-    /// seeded by its interface address and port, and uses
-    /// `initial_delay_min` when this is below it.
+    /// seeded by its interface address and port and the endpoints it
+    /// subscribes from, and uses `initial_delay_min` when this is below it.
     pub initial_delay_max: Duration,
     /// Delay before the first repetition; each later one doubles it.
     pub repetitions_base_delay: Duration,
@@ -51,9 +51,21 @@ impl FindTiming {
     }
 }
 
-/// A nonzero seed that differs between nodes on one segment.
-pub(super) fn seed(interface: core::net::Ipv4Addr, port: u16) -> u32 {
-    match u32::from(interface) ^ u32::from(port).rotate_left(16) {
+/// A nonzero seed from `config`'s interface address and port and the
+/// endpoints of its consumed eventgroups, which differ between nodes on one
+/// segment.
+pub(super) fn seed(config: &super::ServerConfig) -> u32 {
+    let endpoints = core::iter::once((config.interface, config.local_port)).chain(
+        config
+            .consumed_eventgroups
+            .iter()
+            .map(|request| (request.local_ip, request.local_rx_port)),
+    );
+    let mixed = endpoints.fold(0u32, |hash, (ip, port)| {
+        (hash.rotate_left(5) ^ u32::from(ip) ^ u32::from(port).rotate_left(16))
+            .wrapping_mul(0x9E37_79B1)
+    });
+    match mixed {
         0 => 0x9E37_79B9,
         s => s,
     }
@@ -101,12 +113,41 @@ mod tests {
         let _ = timing.initial_delay(12345);
     }
 
+    fn consumer(interface: Ipv4Addr, local_ip: Ipv4Addr) -> super::super::ServerConfig {
+        super::super::ServerConfig::new(0x1234, 1)
+            .with_interface(interface)
+            .with_local_port(30501)
+            .with_consumed_eventgroup(crate::sd_codec::SubscribeEventgroupRequest {
+                service_id: 0x5678,
+                instance_id: 1,
+                major_version: 1,
+                event_group_id: 1,
+                ttl: 3,
+                local_ip,
+                local_rx_port: 40100,
+            })
+    }
+
     #[test]
     fn the_seed_is_nonzero_and_differs_by_interface() {
-        assert_ne!(seed(Ipv4Addr::UNSPECIFIED, 0), 0);
+        assert_ne!(seed(&super::super::ServerConfig::new(0, 0)), 0);
         assert_ne!(
-            seed(Ipv4Addr::LOCALHOST, 30490),
-            seed(Ipv4Addr::new(127, 0, 0, 2), 30490)
+            seed(&consumer(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST)),
+            seed(&consumer(Ipv4Addr::new(127, 0, 0, 2), Ipv4Addr::LOCALHOST))
+        );
+    }
+
+    #[test]
+    fn the_seed_differs_by_subscribing_endpoint_when_the_interface_is_unspecified() {
+        assert_ne!(
+            seed(&consumer(
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::new(192, 0, 2, 1)
+            )),
+            seed(&consumer(
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::new(192, 0, 2, 2)
+            ))
         );
     }
 }

@@ -777,10 +777,7 @@ pub(super) async fn find_loop<T, Tm>(
     Tm: Timer,
 {
     let timing = config.find_timing;
-    let mut delay = timing.initial_delay(super::find_timing::seed(
-        config.interface,
-        config.local_port,
-    ));
+    let mut delay = timing.initial_delay(super::find_timing::seed(config));
     for repetition in 0..=u32::from(timing.repetitions_max) {
         timer.sleep(delay).await;
         match encode_finds(buf, config, sd_state, offered) {
@@ -1728,7 +1725,7 @@ mod tests {
             let first = timer.sleeps.lock().unwrap()[0];
             let timing = FindTiming::DEFAULT;
             assert!((timing.initial_delay_min..=timing.initial_delay_max).contains(&first));
-            let seed = crate::server::find_timing::seed(config.interface, config.local_port);
+            let seed = crate::server::find_timing::seed(&config);
             assert_eq!(first, timing.initial_delay(seed));
         }
 
