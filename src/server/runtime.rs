@@ -870,19 +870,19 @@ where
         if config.announce {
             announce_loop(&config, sd, sd_state_ref, &timer, announce_send_buf).await;
         }
-        core::future::pending::<()>().await;
+        core::future::pending::<core::convert::Infallible>().await
     };
     let find_fut = async {
         if !config.consumed_eventgroups.is_empty() {
             find_loop(&config, sd, sd_state_ref, &timer, &offered).await;
         }
-        core::future::pending::<()>().await;
+        core::future::pending::<core::convert::Infallible>().await
     };
-    let others = futures_util::future::join(announce_fut, find_fut);
-    pin_mut!(recv_fut, others);
-    match futures_util::future::select(recv_fut, others).await {
+    let senders = futures_util::future::join(announce_fut, find_fut);
+    pin_mut!(recv_fut, senders);
+    match futures_util::future::select(recv_fut, senders).await {
         Either::Left((recv_result, _)) => recv_result,
-        Either::Right((_, recv_pending)) => recv_pending.await,
+        Either::Right(((never, _), _)) => match never {},
     }
 }
 
