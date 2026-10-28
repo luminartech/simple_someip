@@ -567,7 +567,7 @@ mod sd_codec_golden {
         SdSessionCounter::resume(id - 1, RebootFlag::Continuous).next()
     }
 
-    // NOTE: `encode_sd_datagram` (src/sd_codec.rs ~line 264) is a private
+    // NOTE: `encode_sd_datagram` in src/sd_codec.rs is a private
     // helper, not reachable from an external integration test. Every
     // public `build_*` builder funnels through it (SOME/IP wrapper via
     // `Header::new_sd` + SD payload via `sd::Header::encode`), so pinning
