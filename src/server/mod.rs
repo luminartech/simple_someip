@@ -8,6 +8,7 @@
 
 mod error;
 mod event_publisher;
+mod find_timing;
 mod runtime;
 mod sd_state;
 mod service_info;
@@ -15,6 +16,7 @@ mod subscription_manager;
 
 pub use error::Error;
 pub use event_publisher::EventPublisher;
+pub use find_timing::FindTiming;
 pub use service_info::Subscriber;
 #[cfg(feature = "std")]
 pub use service_info::{EventGroupInfo, ServiceInfo};
@@ -27,8 +29,6 @@ pub use sd_state::SdStateManager;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::Timer;
-#[cfg(feature = "_alloc")]
-use crate::protocol::sd;
 use crate::sd_codec::SubscribeEventgroupRequest;
 #[cfg(feature = "_alloc")]
 use crate::transport::SocketOptions;
@@ -37,21 +37,24 @@ use crate::transport::WrappableSharedHandle;
 use crate::transport::{E2EHandle, SharedHandle, TransportFactory, TransportSocket};
 #[cfg(feature = "_alloc")]
 use alloc::sync::Arc;
-use core::net::Ipv4Addr;
-#[cfg(feature = "_alloc")]
-use core::net::SocketAddrV4;
+use core::net::{Ipv4Addr, SocketAddrV4};
 
 #[cfg(feature = "server-tokio")]
 use crate::transport::NoE2E;
 #[cfg(feature = "server-tokio")]
 use tokio::sync::RwLock;
 
-fn sd_encode_error(e: automotive_wire_codec::EncodeToSliceError<crate::protocol::Error>) -> Error {
+/// The server error for a datagram the SD codec could not build.
+fn build_error(e: crate::sd_codec::BuildError) -> Error {
+    use crate::sd_codec::BuildError;
     match e {
-        automotive_wire_codec::EncodeToSliceError::InsufficientBuffer(_) => {
+        BuildError::InvalidTtl(ttl) => {
+            crate::protocol::Error::from(crate::protocol::sd::Error::InvalidTtl(ttl)).into()
+        }
+        BuildError::BufferTooSmall(_) | BuildError::ListFull { .. } => {
             Error::Capacity(crate::CapacityKind::UdpBuffer)
         }
-        automotive_wire_codec::EncodeToSliceError::Encode(e) => Error::Protocol(e),
+        BuildError::Encode(e) => Error::Protocol(e),
     }
 }
 
@@ -138,14 +141,54 @@ pub struct ServerConfig {
     /// events never reach a subscriber. Populate via [`Self::with_accepted_offer`];
     /// empty preserves single-service behaviour.
     pub accepted_offers: heapless::Vec<AcceptedOffer, { ServerConfig::ACCEPTED_OFFERS_CAP }>,
-    /// Eventgroups this node subscribes to. The receive loop answers each
-    /// Offer of a matching service, instance and major version with a
-    /// unicast Subscribe to the Offer's sender. Use it on a node that runs
-    /// no `Client`; a `Client` sends its own Subscribes. Each entry names a
-    /// concrete service ID, instance ID and major version, not a wildcard.
-    /// Populate via [`Self::with_consumed_eventgroup`].
+    /// Eventgroups this node subscribes to. The run future sends `FindService`
+    /// for their service instances until each is offered (see
+    /// [`Self::find_timing`]), and answers each Offer of a matching service,
+    /// instance and major version with a unicast Subscribe to its sender.
+    /// Use it on a node that runs no `Client`; a `Client` sends its own
+    /// Subscribes. Each entry names a concrete service ID, instance ID and
+    /// major version, not a wildcard. Populate via
+    /// [`Self::with_consumed_eventgroup`]. A passive server runs no receive
+    /// loop, so it neither finds nor answers Offers.
     pub consumed_eventgroups:
         heapless::Vec<SubscribeEventgroupRequest, { ServerConfig::CONSUMED_EVENTGROUPS_CAP }>,
+    /// When `FindService` is sent for [`Self::consumed_eventgroups`]; see
+    /// [`FindTiming`]. Defaults to [`FindTiming::DEFAULT`].
+    pub find_timing: FindTiming,
+    /// The SD multicast group and port: the SD socket binds this port and
+    /// joins this group, and the server's multicast `OfferService` and
+    /// `FindService` go to it. It must be a multicast group with a nonzero
+    /// port. Defaults to
+    /// [`MULTICAST_IP`](crate::protocol::sd::MULTICAST_IP):[`MULTICAST_PORT`](crate::protocol::sd::MULTICAST_PORT).
+    pub sd_multicast: SocketAddrV4,
+}
+
+/// A [`Server`]'s SD numbering and SD multicast group, from [`Server::sd`].
+#[derive(Debug, Clone, Copy)]
+pub struct ServerSd<'a> {
+    state: &'a SdStateManager,
+    multicast: SocketAddrV4,
+}
+
+impl ServerSd<'_> {
+    /// The session of the next SD message; see [`SdStateManager::next_session`].
+    #[must_use]
+    pub fn next_session(&self) -> crate::sd_codec::SdSession {
+        self.state.next_session()
+    }
+
+    /// The SD multicast group and port; see [`ServerConfig::sd_multicast`].
+    #[must_use]
+    pub fn multicast(&self) -> SocketAddrV4 {
+        self.multicast
+    }
+}
+
+#[cfg(test)]
+impl<'a> ServerSd<'a> {
+    pub(crate) fn new(state: &'a SdStateManager, multicast: SocketAddrV4) -> Self {
+        Self { state, multicast }
+    }
 }
 
 /// A `(service, instance, event_group)` tuple a receive loop will accept
@@ -182,6 +225,11 @@ impl ServerConfig {
     /// eventgroups do not fit one [`UDP_BUFFER_SIZE`](crate::UDP_BUFFER_SIZE)
     /// datagram.
     pub const CONSUMED_EVENTGROUPS_CAP: usize = _SERVER_CONSUMED_EVENTGROUPS_CAP;
+
+    /// Length of the `find_send_buf` of [`Server::run_with_buffers`]: a
+    /// `FindService` for [`Self::CONSUMED_EVENTGROUPS_CAP`] service instances.
+    pub const FIND_SEND_BUF_LEN: usize =
+        crate::sd_codec::find_service_datagram_len(Self::CONSUMED_EVENTGROUPS_CAP);
 
     /// Maximum number of subscribers tracked per event group. Matches
     /// `SUBSCRIBERS_PER_GROUP` in the subscription manager (sized via
@@ -240,6 +288,11 @@ impl ServerConfig {
             announce: true,
             accepted_offers: heapless::Vec::new(),
             consumed_eventgroups: heapless::Vec::new(),
+            find_timing: FindTiming::DEFAULT,
+            sd_multicast: SocketAddrV4::new(
+                crate::protocol::sd::MULTICAST_IP,
+                crate::protocol::sd::MULTICAST_PORT,
+            ),
         }
     }
 
@@ -349,6 +402,20 @@ impl ServerConfig {
         self
     }
 
+    /// Set when `FindService` is sent for [`Self::consumed_eventgroups`].
+    #[must_use]
+    pub fn with_find_timing(mut self, find_timing: FindTiming) -> Self {
+        self.find_timing = find_timing;
+        self
+    }
+
+    /// Set the SD multicast group and port; see [`Self::sd_multicast`].
+    #[must_use]
+    pub fn with_sd_multicast(mut self, sd_multicast: SocketAddrV4) -> Self {
+        self.sd_multicast = sd_multicast;
+        self
+    }
+
     /// Fallible counterpart to [`Self::with_consumed_eventgroup`].
     ///
     /// # Errors
@@ -424,18 +491,34 @@ impl ServerConfig {
         self
     }
 
+    /// The `OfferService` request for this config's service.
+    pub(crate) fn offer_request(&self) -> crate::sd_codec::OfferServiceRequest {
+        crate::sd_codec::OfferServiceRequest {
+            service_id: self.service_id,
+            instance_id: self.instance_id,
+            major_version: self.major_version,
+            minor_version: self.minor_version,
+            ttl: self.ttl,
+            local_ip: self.interface,
+            unicast_port: self.local_port,
+        }
+    }
+
     fn validate(&self) -> Result<(), Error> {
         self.check_ttl()?;
-        match self.consumed_eventgroups.iter().find(|request| {
+        if let Some(request) = self.consumed_eventgroups.iter().find(|request| {
             crate::sd_codec::names_a_wildcard(
                 request.service_id,
                 request.instance_id,
                 request.major_version,
             )
         }) {
-            Some(request) => Err(Error::WildcardConsumedEventgroup(*request)),
-            None => Ok(()),
+            return Err(Error::WildcardConsumedEventgroup(*request));
         }
+        if !self.sd_multicast.ip().is_multicast() || self.sd_multicast.port() == 0 {
+            return Err(Error::InvalidSdMulticast(self.sd_multicast));
+        }
+        Ok(())
     }
 
     fn check_ttl(&self) -> Result<(), Error> {
@@ -443,10 +526,7 @@ impl ServerConfig {
             core::iter::once(self.ttl).chain(self.consumed_eventgroups.iter().map(|r| r.ttl));
         for ttl in ttls {
             if !(1..=crate::protocol::sd::MAX_TTL).contains(&ttl) {
-                return Err(
-                    crate::protocol::Error::from(crate::protocol::sd::Error::InvalidTtl(ttl))
-                        .into(),
-                );
+                return Err(build_error(crate::sd_codec::BuildError::InvalidTtl(ttl)));
             }
         }
         Ok(())
@@ -991,6 +1071,8 @@ impl
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
+    /// is not a multicast group with a nonzero port.
     /// Returns an error if binding the unicast or SD socket fails, or if joining the
     /// SD multicast group fails.
     pub async fn new(
@@ -1035,6 +1117,8 @@ impl
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
+    /// is not a multicast group with a nonzero port.
     /// Returns an error if binding the unicast or SD socket fails, or if joining the
     /// SD multicast group fails.
     pub async fn new_with_loopback(
@@ -1085,6 +1169,8 @@ impl
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
+    /// is not a multicast group with a nonzero port.
     /// Returns an error if binding either socket fails.
     pub async fn new_passive(
         config: ServerConfig,
@@ -1142,6 +1228,8 @@ where
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
+    /// is not a multicast group with a nonzero port.
     /// Returns an error if binding the unicast or SD socket via
     /// [`TransportFactory::bind`] fails, or if joining the SD multicast
     /// group fails.
@@ -1185,21 +1273,19 @@ where
             config.service_id
         );
 
-        // Bind SD socket for sending/receiving SD messages (must use SD port 30490).
         let mut sd_opts = SocketOptions::new();
         sd_opts.reuse_address = true;
         sd_opts.reuse_port = true;
         sd_opts.multicast_if_v4 = Some(config.interface);
         sd_opts.multicast_loop_v4 = Some(multicast_loopback);
-        let sd_addr = SocketAddrV4::new(config.interface, sd::MULTICAST_PORT);
+        let sd_addr = SocketAddrV4::new(config.interface, config.sd_multicast.port());
         let sd_raw = factory.bind(sd_addr, &sd_opts).await?;
-        sd_raw.join_multicast_v4(sd::MULTICAST_IP, config.interface)?;
+        sd_raw.join_multicast_v4(*config.sd_multicast.ip(), config.interface)?;
         let sd_socket: H = H::wrap(sd_raw);
         crate::log::info!(
-            "Server SD socket bound to {} (expected port {}), joined multicast {}",
+            "Server SD socket bound to {}, joined multicast {}",
             sd_addr,
-            sd::MULTICAST_PORT,
-            sd::MULTICAST_IP
+            config.sd_multicast.ip()
         );
 
         let publisher = Hep::wrap(EventPublisher::new(
@@ -1246,6 +1332,8 @@ where
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
+    /// is not a multicast group with a nonzero port.
     /// Returns an error if binding either socket fails.
     pub async fn new_passive_with_deps(
         deps: ServerDeps<F, Tm, R, Sub>,
@@ -1364,6 +1452,8 @@ where
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
+    /// is not a multicast group with a nonzero port.
     /// Returns an error if querying `unicast_socket.local_addr()`
     /// fails on the underlying transport, or
     /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
@@ -1434,6 +1524,8 @@ where
     /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
     /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
     /// instance ID or major version.
+    /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
+    /// is not a multicast group with a nonzero port.
     /// Returns an error if querying `unicast_socket.local_addr()`
     /// fails on the underlying transport, or
     /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
@@ -1481,6 +1573,17 @@ where
             started: deps.started,
             non_sd_observer: deps.non_sd_observer,
         })
+    }
+
+    /// This server's SD numbering and SD multicast group, for SD messages
+    /// sent beside the server, such as a combined `OfferService` of several
+    /// services.
+    #[must_use]
+    pub fn sd(&self) -> ServerSd<'_> {
+        ServerSd {
+            state: self.sd_state.get(),
+            multicast: self.config.sd_multicast,
+        }
     }
 
     /// Get a clone of the event-publisher handle for sending events.
@@ -1533,6 +1636,8 @@ where
     /// [`UDP_BUFFER_SIZE`](crate::UDP_BUFFER_SIZE) bytes; an answer that does
     /// not fit is not sent and a warning is logged.
     ///
+    /// `find_send_buf` is the scratch `FindService` is encoded into.
+    ///
     /// The returned future is independent of `&self` — the cheap
     /// shared-handle clones it captures own everything it needs to
     /// drive both loops, so the caller can keep using `Server` to
@@ -1554,6 +1659,7 @@ where
         sd_buf: &'a mut [u8],
         recv_send_buf: &'a mut [u8],
         announce_send_buf: &'a mut [u8],
+        find_send_buf: &'a mut [u8; ServerConfig::FIND_SEND_BUF_LEN],
     ) -> impl core::future::Future<Output = Result<(), Error>> + 'a + use<'a, F, Tm, R, Sub, H, Hsd, Hep>
     where
         Tm: 'a,
@@ -1602,6 +1708,7 @@ where
                 sd_buf,
                 recv_send_buf,
                 announce_send_buf,
+                find_send_buf,
                 non_sd_observer,
             )
             .await
@@ -1822,6 +1929,7 @@ where
             // callers pass their own via `run_with_buffers`.
             let mut recv_send_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
             let mut announce_send_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
+            let mut find_send_buf = alloc::boxed::Box::new([0u8; ServerConfig::FIND_SEND_BUF_LEN]);
             runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm, R>(
                 config,
                 unicast_socket,
@@ -1835,6 +1943,7 @@ where
                 &mut sd_buf,
                 &mut recv_send_buf,
                 &mut announce_send_buf,
+                &mut find_send_buf,
                 non_sd_observer,
             )
             .await
@@ -1845,7 +1954,7 @@ where
 #[cfg(all(test, feature = "server-tokio"))]
 mod tests {
     use super::*;
-    use crate::protocol::sd::{Entry, Flags, ServiceEntry};
+    use crate::protocol::sd::{self, Entry, Flags, ServiceEntry};
     use crate::protocol::{
         Header as SomeIpHeader, MessageType, MessageTypeField, MessageView, ReturnCode,
     };
@@ -1958,6 +2067,21 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    #[test]
+    fn validate_rejects_an_sd_address_that_is_not_a_multicast_group_and_port() {
+        for address in [
+            SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), sd::MULTICAST_PORT),
+            SocketAddrV4::new(sd::MULTICAST_IP, 0),
+        ] {
+            let config = ServerConfig::new(0x1234, 1).with_sd_multicast(address);
+            assert!(
+                matches!(config.validate(), Err(Error::InvalidSdMulticast(a)) if a == address),
+                "{address}"
+            );
+        }
+        assert!(ServerConfig::new(0x1234, 1).validate().is_ok());
     }
 
     #[test]
@@ -2254,12 +2378,14 @@ mod tests {
         let mut sd_buf = vec![0u8; 1500];
         let mut recv_send_buf = vec![0u8; 1500];
         let mut announce_send_buf = vec![0u8; 1500];
+        let mut find_send_buf = [0u8; ServerConfig::FIND_SEND_BUF_LEN];
         let result = server
             .run_with_buffers(
                 &mut unicast_buf,
                 &mut sd_buf,
                 &mut recv_send_buf,
                 &mut announce_send_buf,
+                &mut find_send_buf,
             )
             .await;
         match result {
@@ -3788,12 +3914,14 @@ mod tests {
         let mut sd_buf = vec![0u8; 1500];
         let mut recv_send_buf = vec![0u8; 1500];
         let mut announce_send_buf = vec![0u8; 1500];
+        let mut find_send_buf = [0u8; ServerConfig::FIND_SEND_BUF_LEN];
         let third = server
             .run_with_buffers(
                 &mut unicast_buf,
                 &mut sd_buf,
                 &mut recv_send_buf,
                 &mut announce_send_buf,
+                &mut find_send_buf,
             )
             .await;
         match third {

@@ -211,7 +211,8 @@ impl<'m, const SLOTS: usize, const CAP: usize> TransportFactory
     }
 }
 
-/// `Timer` backed by a monotonic-ms callback.
+/// `Timer` backed by a monotonic-ms callback. A sleep longer than
+/// [`i32::MAX`] milliseconds (about 24.8 days) ends after that long.
 #[derive(Clone, Copy)]
 pub struct CallbackTimer {
     now_ms: NowMsFn,
@@ -255,10 +256,29 @@ impl Timer for CallbackTimer {
     fn sleep(&self, duration: Duration) -> Self::SleepFuture<'_> {
         let now = (self.now_ms)();
         #[allow(clippy::cast_possible_truncation)]
-        let dur_ms = duration.as_millis().min(u128::from(u32::MAX)) as u32;
+        let dur_ms = duration
+            .as_millis()
+            .min(u128::from(i32::MAX.unsigned_abs())) as u32;
         CbSleepFuture {
             now_ms: self.now_ms,
             deadline_ms: now.wrapping_add(dur_ms),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "C" fn fixed_now() -> u32 {
+        1_000
+    }
+
+    #[test]
+    fn a_sleep_beyond_the_clock_range_does_not_expire_at_once() {
+        let timer = CallbackTimer::new(fixed_now);
+        let mut sleep = core::pin::pin!(timer.sleep(Duration::MAX));
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        assert!(sleep.as_mut().poll(&mut cx).is_pending());
     }
 }

@@ -17,11 +17,10 @@ use crate::bare_metal_tasks::{SomeipRun, publish_notification, run_someip};
 use crate::protocol::sd;
 use crate::sd_codec::{
     OfferServiceRequest, SubscribeEventgroupRequest, build_multi_stop_offer_service_datagram,
-    next_sd_session,
 };
 use crate::server::{
-    EventPublisher, SdStateManager, Server, ServerConfig, ServerStorage, StaticSubscriptionHandle,
-    StaticSubscriptionStorage, SubscriptionManager,
+    EventPublisher, FindTiming, SdStateManager, Server, ServerConfig, ServerStorage,
+    StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager,
 };
 use crate::transport::{E2EHandle, NoE2E};
 
@@ -126,6 +125,8 @@ pub struct RuntimeBuffers {
     pub rx: [u8; RX_CAP],
     pub tx_scratch: [u8; RX_CAP],
     pub offer_scratch: [u8; SD_SCRATCH_CAP],
+    /// Scratch the runtime's `FindService` is encoded into.
+    pub find_scratch: [u8; ServerConfig::FIND_SEND_BUF_LEN],
     /// Scratch reserved for the synchronous public API (`publish` /
     /// `deinit`). Kept disjoint from the buffers the spawned `someip_task`
     /// borrows for its entire (never-resolving) lifetime: `publish`/`deinit`
@@ -156,6 +157,7 @@ impl RuntimeBuffers {
             rx: [0; RX_CAP],
             tx_scratch: [0; RX_CAP],
             offer_scratch: [0; SD_SCRATCH_CAP],
+            find_scratch: [0; ServerConfig::FIND_SEND_BUF_LEN],
             publish_scratch: [0; API_SCRATCH_CAP],
         }
     }
@@ -165,7 +167,8 @@ impl RuntimeBuffers {
 pub struct RuntimeConfig {
     /// Local interface IPv4 as a host-order `u32`.
     pub interface: u32,
-    /// SD port (`0` → 30490) and multicast group (`0` → 239.255.0.255).
+    /// SD port (`0` → 30490) and multicast group (`0` → 239.255.0.255); the
+    /// group must be a multicast address.
     pub sd_port: u16,
     pub sd_mcast: u32,
     pub multicast_loopback: bool,
@@ -184,6 +187,8 @@ pub struct RuntimeConfig {
     /// The eventgroup this node subscribes to, if any, naming a concrete
     /// service ID, instance ID and major version.
     pub subscription: Option<SubEntry>,
+    /// When the runtime sends `FindService` for its subscription.
+    pub find_timing: FindTiming,
     /// RX mailbox the platform's receive path pushes into.
     pub mailbox: &'static Mailbox,
     /// Runtime buffer memory (platform-owned, placement-controlled).
@@ -214,8 +219,6 @@ static IFACE: AtomicU32 = AtomicU32::new(0);
 
 static DISPATCH: AtomicUsize = AtomicUsize::new(0); // DispatchFn as usize
 static DISPATCH_CTX: AtomicUsize = AtomicUsize::new(0); // opaque ctx word for DISPATCH
-static OFFER_SESSION: AtomicU16 = AtomicU16::new(1);
-static STOP_SESSION: AtomicU16 = AtomicU16::new(1);
 static PUBLISH_SESSION: AtomicU16 = AtomicU16::new(1);
 
 static OFFERS_LEN: AtomicUsize = AtomicUsize::new(0);
@@ -377,10 +380,18 @@ const DEFAULT_OFFER_REQUEST: OfferServiceRequest = OfferServiceRequest {
     unicast_port: 0,
 };
 
+/// The SD multicast group and port `init` stored.
+fn sd_multicast() -> SocketAddrV4 {
+    SocketAddrV4::new(
+        Ipv4Addr::from(SD_MCAST.load(Ordering::Acquire).to_be_bytes()),
+        SD_PORT.load(Ordering::Acquire),
+    )
+}
+
 /// Build the receive `Server` over the shared callback sockets, accepting
 /// subscribes for every offered service and answering Offers of the
 /// subscription's service.
-fn build_server() -> bool {
+fn build_server(find_timing: FindTiming) -> bool {
     let o = offers();
     let Some(primary) = o.first() else {
         return false;
@@ -417,7 +428,9 @@ fn build_server() -> bool {
         // (all catalog offers in one SD datagram) from its own future, so
         // the server's recv loop must stay silent on SD — otherwise the
         // primary service would be announced twice.
-        .with_announce(false);
+        .with_announce(false)
+        .with_find_timing(find_timing)
+        .with_sd_multicast(sd_multicast());
     for entry in o {
         config = config.with_accepted_offer(
             entry.service_id,
@@ -491,22 +504,19 @@ async fn someip_task() {
         unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).tx_scratch) };
     let offer_scratch: &'static mut [u8; SD_SCRATCH_CAP] =
         unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).offer_scratch) };
+    let find_scratch: &'static mut [u8; ServerConfig::FIND_SEND_BUF_LEN] =
+        unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).find_scratch) };
     let rx: &'static mut [u8; RX_CAP] = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).rx) };
-    // Recv-only: `with_announce(false)` makes `run_with_buffers` skip its
-    // announce arm (the runtime announces all offers itself), so the
-    // announce_send_buf is never touched — pass an empty slice. Recv,
-    // SubscribeAck and the Subscribe answers use unicast/sd/tx_scratch.
-    let recv = server.run_with_buffers(unicast, sd, tx_scratch, &mut []);
+    // `with_announce(false)` makes `run_with_buffers` skip its announce arm
+    // (the runtime announces all offers itself), so its announce buffer is
+    // empty.
+    let recv = server.run_with_buffers(unicast, sd, tx_scratch, &mut [], find_scratch);
 
     let mut reqs = [DEFAULT_OFFER_REQUEST; MAX_OFFERS];
     let n_offers = offer_requests(&mut reqs);
 
     let plat = platform();
     let sd_socket: &'static Sock = unsafe { (*core::ptr::addr_of!(SD_SOCK)).assume_init_ref() };
-    let sd_mcast = SocketAddrV4::new(
-        Ipv4Addr::from(SD_MCAST.load(Ordering::Acquire).to_be_bytes()),
-        SD_PORT.load(Ordering::Acquire),
-    );
     let timer = CallbackTimer::new(plat.now_ms);
     let e2e = e2e();
 
@@ -522,10 +532,9 @@ async fn someip_task() {
             rx_socket: rx_socket.as_ref(),
             timer: &timer,
             e2e: &e2e,
-            sd_multicast: sd_mcast,
             period,
             offers: &reqs[..n_offers],
-            offer_session: &OFFER_SESSION,
+            sd: server.sd(),
             offer_scratch,
             rx_buf: rx,
             dispatch,
@@ -545,9 +554,9 @@ async fn someip_task() {
 /// failed, `-2` task spawn failed, `-4` the runtime is already initialized
 /// (a repeat or re-entrant `init` — the passed `config` and its buffers are
 /// NOT adopted), `-5` `config.subscription` names a wildcard service ID,
-/// instance ID or major version. The
-/// `-1`/`-2`/`-5` paths release the init claim so a corrected retry can
-/// proceed; `-4` does not (a runtime is already live).
+/// instance ID or major version, `-6` `config.sd_mcast` is not a multicast
+/// group. The `-1`/`-2`/`-5`/`-6` paths release the init claim so a corrected
+/// retry can proceed; `-4` does not (a runtime is already live).
 #[allow(clippy::missing_panics_doc)]
 // By-value is required, not incidental: `config.buffers` is a `&'static mut`
 // reborrowed into `BUFS` (`ptr::from_mut`), which a shared `&RuntimeConfig`
@@ -570,6 +579,10 @@ pub fn init(config: RuntimeConfig) -> i32 {
     }) {
         INIT_CLAIMED.store(false, Ordering::Release);
         return -5;
+    }
+    if config.sd_mcast != 0 && !Ipv4Addr::from(config.sd_mcast.to_be_bytes()).is_multicast() {
+        INIT_CLAIMED.store(false, Ordering::Release);
+        return -6;
     }
     IFACE.store(config.interface, Ordering::Release);
     SD_PORT.store(
@@ -633,7 +646,7 @@ pub fn init(config: RuntimeConfig) -> i32 {
         bind_once(s.local_rx_port);
     }
 
-    if !build_server() {
+    if !build_server(config.find_timing) {
         // Release the claim so the platform can retry after fixing config.
         INIT_CLAIMED.store(false, Ordering::Release);
         return -1;
@@ -758,13 +771,21 @@ pub fn deinit() {
     // `publish`. RX_CAP >= SD_SCRATCH_CAP, so it holds the StopOffer datagram.
     // Reborrowed through `addr_of_mut!` to retag only this field's bytes.
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).publish_scratch) };
-    let session = next_sd_session(&STOP_SESSION);
-    if let Ok(total) =
-        build_multi_stop_offer_service_datagram::<MAX_OFFERS>(scratch, &reqs[..n], session)
-    {
-        let dst = SD_MCAST.load(Ordering::Acquire);
-        let sd_port = SD_PORT.load(Ordering::Acquire);
-        (plat.send)(sd_port, scratch.as_ptr(), total, dst, sd_port);
+    // SAFETY: `RUN_READY` is set only after `init` wrote SERVER.
+    let sd = unsafe { (*core::ptr::addr_of!(SERVER)).assume_init_ref() }.sd();
+    if let Ok(total) = build_multi_stop_offer_service_datagram::<MAX_OFFERS>(
+        scratch,
+        &reqs[..n],
+        sd.next_session(),
+    ) {
+        let group = sd.multicast();
+        (plat.send)(
+            group.port(),
+            scratch.as_ptr(),
+            total,
+            u32::from(*group.ip()),
+            group.port(),
+        );
     }
 }
 

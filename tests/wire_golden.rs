@@ -556,12 +556,18 @@ fn option_ipv6_sd_golden_bytes() {
 mod sd_codec_golden {
     use simple_someip::protocol::sd::RebootFlag;
     use simple_someip::sd_codec::{
-        OfferServiceRequest, SubscribeAckRequest, SubscribeEventgroupRequest,
-        build_offer_service_datagram, build_subscribe_ack_datagram,
+        OfferServiceRequest, SdSession, SdSessionCounter, SubscribeAckRequest, SubscribeCounter,
+        SubscribeEventgroupRequest, build_offer_service_datagram, build_subscribe_ack_datagram,
         build_subscribe_eventgroup_datagram,
     };
 
-    // NOTE: `encode_sd_datagram` (src/sd_codec.rs ~line 264) is a private
+    /// The session with ID `id` (at least 1) and the reboot flag
+    /// `Continuous`.
+    fn continuous_session(id: u16) -> SdSession {
+        SdSessionCounter::resume(id - 1, RebootFlag::Continuous).next()
+    }
+
+    // NOTE: `encode_sd_datagram` in src/sd_codec.rs is a private
     // helper, not reachable from an external integration test. Every
     // public `build_*` builder funnels through it (SOME/IP wrapper via
     // `Header::new_sd` + SD payload via `sd::Header::encode`), so pinning
@@ -580,8 +586,8 @@ mod sd_codec_golden {
             local_rx_port: 30509,
         };
         let mut buf = [0u8; 64];
-        let n = build_subscribe_eventgroup_datagram(&mut buf, &request, 7, RebootFlag::Continuous)
-            .unwrap();
+        let n =
+            build_subscribe_eventgroup_datagram(&mut buf, &request, continuous_session(7)).unwrap();
         assert_eq!(n, 56);
 
         #[rustfmt::skip]
@@ -617,7 +623,7 @@ mod sd_codec_golden {
             unicast_port: 30501,
         };
         let mut buf = [0u8; 64];
-        let n = build_offer_service_datagram(&mut buf, &request, 1).unwrap();
+        let n = build_offer_service_datagram(&mut buf, &request, continuous_session(1)).unwrap();
         assert_eq!(n, 56);
 
         #[rustfmt::skip]
@@ -648,9 +654,10 @@ mod sd_codec_golden {
             event_group_id: 0x0005,
             major_version: 1,
             ttl: 10,
+            counter: SubscribeCounter::default(),
         };
         let mut buf = [0u8; 64];
-        let n = build_subscribe_ack_datagram(&mut buf, &request, 2).unwrap();
+        let n = build_subscribe_ack_datagram(&mut buf, &request, continuous_session(2)).unwrap();
         assert_eq!(n, 44);
 
         #[rustfmt::skip]

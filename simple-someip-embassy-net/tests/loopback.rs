@@ -632,6 +632,7 @@ async fn client_receives_server_sd_announcement() {
                 Box::leak(Box::new([0u8; 65535])),
                 Box::leak(Box::new([0u8; simple_someip::UDP_BUFFER_SIZE])),
                 Box::leak(Box::new([0u8; simple_someip::UDP_BUFFER_SIZE])),
+                Box::leak(Box::new([0u8; ServerConfig::FIND_SEND_BUF_LEN])),
             ));
 
             // ── Client on stack B ────────────────────────────────

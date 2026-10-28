@@ -10,8 +10,8 @@
 //! - **buffer memory** it owns (so the platform controls link placement).
 //!
 //! Everything else — the SD codec, subscribe-accept, the combined-offer
-//! announce, answering Offers with Subscribes, notification dispatch, E2E,
-//! and the embassy executor + task — lives here.
+//! announce, `FindService` and answering Offers with Subscribes,
+//! notification dispatch, E2E, and the embassy executor + task — lives here.
 //!
 //! This phase exposes the callback transport and the mailbox; the executor
 //! + task + C-ABI land in later submodules.

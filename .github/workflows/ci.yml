@@ -362,7 +362,7 @@ jobs:
       # is gated in the nightly `bare-metal-runtime` job.) The bare-metal run
       # goes first so the host run's `junit.xml` (the comprehensive suite) is
       # the one the test-results upload below picks up.
-      - run: cargo llvm-cov --no-report nextest --no-default-features --features $ALLOC_FEATURES -E 'binary(bare_metal_e2e) | binary(bare_metal_client_local) | binary(static_channels_alloc_witness)'
+      - run: cargo llvm-cov --no-report nextest --no-default-features --features $ALLOC_FEATURES -E 'binary(bare_metal_e2e) | binary(bare_metal_client_local) | binary(static_channels_alloc_witness) | (kind(lib) & (test(/^bare_metal_runtime::/) | test(/^bare_metal_tasks::/)))'
       - run: cargo llvm-cov --no-report nextest --no-default-features --features $HOST_FEATURES
       - run: cargo llvm-cov report --lcov --output-path ./target/lcov.info
       - name: Upload Coverage report

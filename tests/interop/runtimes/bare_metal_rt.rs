@@ -17,6 +17,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use simple_someip::bare_metal_runtime as rt;
+use simple_someip::server::FindTiming;
 
 use crate::interop::consts::*;
 use crate::interop::runtime::*;
@@ -57,6 +58,17 @@ enum Cmd {
         reply: Sender<i32>,
     },
     Deinit,
+}
+
+/// The runtime's `FindService` timing in these tests.
+fn find_timing() -> FindTiming {
+    let ms = |ms: u32| Duration::from_millis(u64::from(ms));
+    let mut timing = FindTiming::DEFAULT;
+    timing.initial_delay_min = ms(FIND_INITIAL_DELAY_MS.0);
+    timing.initial_delay_max = ms(FIND_INITIAL_DELAY_MS.1);
+    timing.repetitions_base_delay = ms(FIND_BASE_DELAY_MS);
+    timing.repetitions_max = FIND_REPETITIONS;
+    timing
 }
 
 pub struct BareMetalRt {
@@ -105,6 +117,7 @@ impl SomeipUnderTest for BareMetalRt {
             bind,
             offers: offers.leak(),
             subscription,
+            find_timing: find_timing(),
             mailbox: &MAILBOX,
             // SAFETY: `STARTED` was claimed above and is released only when
             // `init` fails before spawning the task that borrows these
