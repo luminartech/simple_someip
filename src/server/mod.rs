@@ -197,6 +197,12 @@ impl ServerConfig {
     /// datagram.
     pub const CONSUMED_EVENTGROUPS_CAP: usize = _SERVER_CONSUMED_EVENTGROUPS_CAP;
 
+    /// Bytes the `find_send_buf` of [`Server::run_with_buffers`] must hold:
+    /// a `FindService` for [`Self::CONSUMED_EVENTGROUPS_CAP`] service
+    /// instances.
+    pub const FIND_SEND_BUF_LEN: usize =
+        crate::sd_codec::find_service_datagram_len(Self::CONSUMED_EVENTGROUPS_CAP);
+
     /// Maximum number of subscribers tracked per event group. Matches
     /// `SUBSCRIBERS_PER_GROUP` in the subscription manager (sized via
     /// `SIMPLE_SOMEIP_MAX_SUBS`; defaults to 1 on bare-metal, 16 on std).
@@ -1574,6 +1580,10 @@ where
     /// [`UDP_BUFFER_SIZE`](crate::UDP_BUFFER_SIZE) bytes; an answer that does
     /// not fit is not sent and a warning is logged.
     ///
+    /// `find_send_buf` is the scratch `FindService` is encoded into. It must
+    /// hold [`ServerConfig::FIND_SEND_BUF_LEN`] bytes; a `FindService` that
+    /// does not fit is not sent and a warning is logged.
+    ///
     /// The returned future is independent of `&self` — the cheap
     /// shared-handle clones it captures own everything it needs to
     /// drive both loops, so the caller can keep using `Server` to
@@ -1595,6 +1605,7 @@ where
         sd_buf: &'a mut [u8],
         recv_send_buf: &'a mut [u8],
         announce_send_buf: &'a mut [u8],
+        find_send_buf: &'a mut [u8],
     ) -> impl core::future::Future<Output = Result<(), Error>> + 'a + use<'a, F, Tm, R, Sub, H, Hsd, Hep>
     where
         Tm: 'a,
@@ -1643,6 +1654,7 @@ where
                 sd_buf,
                 recv_send_buf,
                 announce_send_buf,
+                find_send_buf,
                 non_sd_observer,
             )
             .await
@@ -1863,6 +1875,7 @@ where
             // callers pass their own via `run_with_buffers`.
             let mut recv_send_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
             let mut announce_send_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
+            let mut find_send_buf = alloc::vec![0u8; ServerConfig::FIND_SEND_BUF_LEN];
             runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm, R>(
                 config,
                 unicast_socket,
@@ -1876,6 +1889,7 @@ where
                 &mut sd_buf,
                 &mut recv_send_buf,
                 &mut announce_send_buf,
+                &mut find_send_buf,
                 non_sd_observer,
             )
             .await
@@ -2295,12 +2309,14 @@ mod tests {
         let mut sd_buf = vec![0u8; 1500];
         let mut recv_send_buf = vec![0u8; 1500];
         let mut announce_send_buf = vec![0u8; 1500];
+        let mut find_send_buf = vec![0u8; ServerConfig::FIND_SEND_BUF_LEN];
         let result = server
             .run_with_buffers(
                 &mut unicast_buf,
                 &mut sd_buf,
                 &mut recv_send_buf,
                 &mut announce_send_buf,
+                &mut find_send_buf,
             )
             .await;
         match result {
@@ -3829,12 +3845,14 @@ mod tests {
         let mut sd_buf = vec![0u8; 1500];
         let mut recv_send_buf = vec![0u8; 1500];
         let mut announce_send_buf = vec![0u8; 1500];
+        let mut find_send_buf = vec![0u8; ServerConfig::FIND_SEND_BUF_LEN];
         let third = server
             .run_with_buffers(
                 &mut unicast_buf,
                 &mut sd_buf,
                 &mut recv_send_buf,
                 &mut announce_send_buf,
+                &mut find_send_buf,
             )
             .await;
         match third {

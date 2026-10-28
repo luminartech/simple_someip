@@ -208,15 +208,25 @@ pub fn build_subscribe_eventgroup_datagram(
     )
 }
 
+/// SD header length in bytes: flags and reserved bytes, entries length,
+/// options length.
+#[cfg(feature = "server")]
+const SD_HEADER_LEN: usize = 12;
+
 /// Length of the SD datagram [`build_multi_subscribe_eventgroup_datagram`]
 /// encodes for `requests` Subscribe entries.
 #[cfg(feature = "server")]
 pub(crate) const fn multi_subscribe_datagram_len(requests: usize) -> usize {
-    // SD header: flags and reserved bytes, entries length, options length.
-    const SD_HEADER_LEN: usize = 12;
     SOMEIP_HEADER_LEN
         + SD_HEADER_LEN
         + requests * (crate::protocol::sd::ENTRY_SIZE + crate::protocol::sd::IPV4_OPTION_WIRE_SIZE)
+}
+
+/// Length of the SD datagram [`build_find_service_datagram`] encodes for
+/// `instances` service instances.
+#[cfg(feature = "server")]
+pub(crate) const fn find_service_datagram_len(instances: usize) -> usize {
+    SOMEIP_HEADER_LEN + SD_HEADER_LEN + instances * crate::protocol::sd::ENTRY_SIZE
 }
 
 /// Encode a single SD datagram carrying one `SubscribeEventgroup` entry per
@@ -1003,7 +1013,7 @@ mod tests {
         );
         assert_eq!(e.minor_version(), 0xFFFF_FFFF);
         assert_eq!(view.options().count(), 0);
-        assert_eq!(len, 16 + 12 + 16);
+        assert_eq!(len, find_service_datagram_len(1));
     }
 
     #[cfg(feature = "server")]

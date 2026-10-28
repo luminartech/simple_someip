@@ -399,6 +399,7 @@ async fn main() {
                 Box::leak(vec![0u8; 65535].into_boxed_slice()),
                 Box::leak(vec![0u8; simple_someip::UDP_BUFFER_SIZE].into_boxed_slice()),
                 Box::leak(vec![0u8; simple_someip::UDP_BUFFER_SIZE].into_boxed_slice()),
+                Box::leak(vec![0u8; ServerConfig::FIND_SEND_BUF_LEN].into_boxed_slice()),
             ));
             println!(
                 "[server] run loop spawned, emitting OfferService(0x{SERVICE_ID:04X}) every 1s"

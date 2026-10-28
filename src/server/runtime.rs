@@ -766,29 +766,28 @@ fn encode_finds(
     .map_err(super::build_error)
 }
 
-const FIND_BUF_LEN: usize = 16 + 12 + 16 * ServerConfig::CONSUMED_EVENTGROUPS_CAP;
-
 /// Send `FindService` for the consumed service instances not yet offered on
-/// [`ServerConfig::find_timing`]'s schedule; returns after the last send.
+/// [`ServerConfig::find_timing`]'s schedule, encoded into `buf`; returns
+/// after the last send.
 pub(super) async fn find_loop<T, Tm>(
     config: &ServerConfig,
     sd_socket: &T,
     sd_state: &SdStateManager,
     timer: &Tm,
     offered: &Offered,
+    buf: &mut [u8],
 ) where
     T: TransportSocket,
     Tm: Timer,
 {
     let timing = config.find_timing;
-    let mut buf = [0u8; FIND_BUF_LEN];
     let mut delay = timing.initial_delay(super::find_timing::seed(
         config.interface,
         config.local_port,
     ));
     for repetition in 0..=u32::from(timing.repetitions_max) {
         timer.sleep(delay).await;
-        match encode_finds(&mut buf, config, sd_state, offered) {
+        match encode_finds(buf, config, sd_state, offered) {
             Ok(Some(len)) => {
                 if let Err(e) = sd_socket.send_to(&buf[..len], config.sd_multicast).await {
                     crate::log::warn!("FindService send failed: {e:?}");
@@ -830,6 +829,7 @@ pub(super) async fn run_combined<H, T, Sub, Hsd, Tm, R>(
     sd_buf: &mut [u8],
     recv_send_buf: &mut [u8],
     announce_send_buf: &mut [u8],
+    find_send_buf: &mut [u8],
     non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
 ) -> Result<(), Error>
 where
@@ -877,7 +877,7 @@ where
     };
     let find_fut = async {
         if !config.consumed_eventgroups.is_empty() {
-            find_loop(&config, sd, sd_state_ref, &timer, &offered).await;
+            find_loop(&config, sd, sd_state_ref, &timer, &offered, find_send_buf).await;
         }
         core::future::pending::<core::convert::Infallible>().await
     };
@@ -1635,6 +1635,10 @@ mod tests {
             }
         }
 
+        fn find_buf() -> [u8; ServerConfig::FIND_SEND_BUF_LEN] {
+            [0; ServerConfig::FIND_SEND_BUF_LEN]
+        }
+
         fn first_subscribed() -> Subscribed {
             let mut subscribed = NONE_SUBSCRIBED;
             subscribed[0] = true;
@@ -1688,7 +1692,15 @@ mod tests {
                 Offered::new(),
             );
 
-            find_loop(&config, &socket, &make_sd_state(), &timer, &offered).await;
+            find_loop(
+                &config,
+                &socket,
+                &make_sd_state(),
+                &timer,
+                &offered,
+                &mut find_buf(),
+            )
+            .await;
 
             assert_eq!(timer.millis(), [10, 100, 200, 400]);
             assert_eq!(finds(&socket), std::vec![std::vec![(0x5678, 1)]; 4]);
@@ -1699,7 +1711,15 @@ mod tests {
             let config = make_config().with_consumed_eventgroup(consumed());
             let (socket, timer) = (RecordingSocket::default(), RecordingTimer::new());
 
-            find_loop(&config, &socket, &make_sd_state(), &timer, &Offered::new()).await;
+            find_loop(
+                &config,
+                &socket,
+                &make_sd_state(),
+                &timer,
+                &Offered::new(),
+                &mut find_buf(),
+            )
+            .await;
 
             let first = timer.sleeps.lock().unwrap()[0];
             let timing = FindTiming::DEFAULT;
@@ -1719,7 +1739,15 @@ mod tests {
                 Offered::new(),
             );
 
-            find_loop(&config, &socket, &make_sd_state(), &timer, &offered).await;
+            find_loop(
+                &config,
+                &socket,
+                &make_sd_state(),
+                &timer,
+                &offered,
+                &mut find_buf(),
+            )
+            .await;
 
             assert_eq!(timer.millis(), [10]);
             assert_eq!(finds(&socket).len(), 1);
@@ -1734,7 +1762,15 @@ mod tests {
                 RecordingTimer::offering_at(0, &offered),
             );
 
-            find_loop(&config, &socket, &make_sd_state(), &timer, &offered).await;
+            find_loop(
+                &config,
+                &socket,
+                &make_sd_state(),
+                &timer,
+                &offered,
+                &mut find_buf(),
+            )
+            .await;
 
             assert!(finds(&socket).is_empty());
         }
@@ -1748,7 +1784,15 @@ mod tests {
                 RecordingTimer::offering_at(2, &offered),
             );
 
-            find_loop(&config, &socket, &make_sd_state(), &timer, &offered).await;
+            find_loop(
+                &config,
+                &socket,
+                &make_sd_state(),
+                &timer,
+                &offered,
+                &mut find_buf(),
+            )
+            .await;
 
             assert_eq!(finds(&socket).len(), 2);
         }
@@ -1775,7 +1819,15 @@ mod tests {
                 Offered::new(),
             );
 
-            find_loop(&config, &socket, &make_sd_state(), &timer, &offered).await;
+            find_loop(
+                &config,
+                &socket,
+                &make_sd_state(),
+                &timer,
+                &offered,
+                &mut find_buf(),
+            )
+            .await;
 
             assert_eq!(finds(&socket), [std::vec![(0x5678, 1), (0x5679, 1)]]);
         }
@@ -1791,7 +1843,15 @@ mod tests {
                 Offered::new(),
             );
 
-            find_loop(&config, &socket, &make_sd_state(), &timer, &offered).await;
+            find_loop(
+                &config,
+                &socket,
+                &make_sd_state(),
+                &timer,
+                &offered,
+                &mut find_buf(),
+            )
+            .await;
 
             let sent = socket.sent.lock().unwrap();
             let view = crate::protocol::MessageView::parse(&sent[0].0).expect("SOME/IP");
@@ -1808,7 +1868,15 @@ mod tests {
                 .with_find_timing(FIXED);
             let (timer, offered) = (RecordingTimer::new(), Offered::new());
 
-            find_loop(&config, &FailingSocket, &make_sd_state(), &timer, &offered).await;
+            find_loop(
+                &config,
+                &FailingSocket,
+                &make_sd_state(),
+                &timer,
+                &offered,
+                &mut find_buf(),
+            )
+            .await;
 
             assert_eq!(timer.millis(), [10, 100, 200, 400]);
         }
@@ -1829,7 +1897,15 @@ mod tests {
                 Offered::new(),
             );
 
-            find_loop(&config, &socket, &make_sd_state(), &timer, &offered).await;
+            find_loop(
+                &config,
+                &socket,
+                &make_sd_state(),
+                &timer,
+                &offered,
+                &mut find_buf(),
+            )
+            .await;
 
             let sleeps = timer.sleeps.lock().unwrap();
             assert_eq!(sleeps.len(), 256);
@@ -1896,6 +1972,7 @@ mod tests {
                 &sd_state,
                 &RecordingTimer::new(),
                 &Offered::new(),
+                &mut find_buf(),
             )
             .await;
             sd_state
@@ -1923,6 +2000,7 @@ mod tests {
                 crate::server::SubscriptionManager::new(),
             ));
             let (mut u, mut s, mut r) = ([0u8; 64], [0u8; 64], [0u8; 512]);
+            let mut f = find_buf();
             let run = run_combined(
                 config,
                 unicast,
@@ -1936,6 +2014,7 @@ mod tests {
                 &mut s,
                 &mut r,
                 &mut [],
+                &mut f,
                 None,
             );
 

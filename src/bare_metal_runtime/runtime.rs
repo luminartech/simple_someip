@@ -126,6 +126,8 @@ pub struct RuntimeBuffers {
     pub rx: [u8; RX_CAP],
     pub tx_scratch: [u8; RX_CAP],
     pub offer_scratch: [u8; SD_SCRATCH_CAP],
+    /// Scratch the runtime's `FindService` is encoded into.
+    pub find_scratch: [u8; ServerConfig::FIND_SEND_BUF_LEN],
     /// Scratch reserved for the synchronous public API (`publish` /
     /// `deinit`). Kept disjoint from the buffers the spawned `someip_task`
     /// borrows for its entire (never-resolving) lifetime: `publish`/`deinit`
@@ -156,6 +158,7 @@ impl RuntimeBuffers {
             rx: [0; RX_CAP],
             tx_scratch: [0; RX_CAP],
             offer_scratch: [0; SD_SCRATCH_CAP],
+            find_scratch: [0; ServerConfig::FIND_SEND_BUF_LEN],
             publish_scratch: [0; API_SCRATCH_CAP],
         }
     }
@@ -502,12 +505,14 @@ async fn someip_task() {
         unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).tx_scratch) };
     let offer_scratch: &'static mut [u8; SD_SCRATCH_CAP] =
         unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).offer_scratch) };
+    let find_scratch: &'static mut [u8; ServerConfig::FIND_SEND_BUF_LEN] =
+        unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).find_scratch) };
     let rx: &'static mut [u8; RX_CAP] = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).rx) };
     // Recv-only: `with_announce(false)` makes `run_with_buffers` skip its
     // announce arm (the runtime announces all offers itself), so the
     // announce_send_buf is never touched — pass an empty slice. Recv,
     // SubscribeAck and the Subscribe answers use unicast/sd/tx_scratch.
-    let recv = server.run_with_buffers(unicast, sd, tx_scratch, &mut []);
+    let recv = server.run_with_buffers(unicast, sd, tx_scratch, &mut [], find_scratch);
 
     let mut reqs = [DEFAULT_OFFER_REQUEST; MAX_OFFERS];
     let n_offers = offer_requests(&mut reqs);
