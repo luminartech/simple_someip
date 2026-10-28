@@ -23,7 +23,7 @@ use core::pin::pin;
 use core::task::{Context, RawWaker, RawWakerVTable, Waker};
 use core::time::Duration;
 
-use crate::protocol::split_message;
+use crate::protocol::messages;
 use crate::sd_codec::{
     OfferServiceRequest, ParsedDatagram, build_multi_offer_service_datagram,
     build_notification_datagram, check_parsed_e2e,
@@ -76,9 +76,8 @@ pub async fn announce_offers_future<'a, S, Tm, const N: usize>(
 
 /// Receive notifications on `rx_socket` and, for each SOME/IP message in a
 /// datagram, run `e2e`'s check and hand the parsed `(service_id, method_id,
-/// payload, e2e_status)` to `dispatch`. Each message ends where its Length
-/// field says; SOME/IP-TP segments and the rest of a datagram from a
-/// malformed message onwards are discarded. `e2e` decides per message ID
+/// payload, e2e_status)` to `dispatch`. The messages are those
+/// [`messages`] walks. `e2e` decides per message ID
 /// whether a check applies; `e2e_status` is `None` when none does. `buf` is
 /// the receive scratch (sized to the max inbound datagram).
 pub async fn event_rx_dispatch_future<'a, S, R>(
@@ -96,9 +95,15 @@ pub async fn event_rx_dispatch_future<'a, S, R>(
             Ok(d) => (d.bytes_received, d.source),
             Err(_) => continue,
         };
-        let mut rest = &buf[..n];
-        while let Some(Ok((view, after))) = split_message(rest) {
-            rest = after;
+        let mut walk = messages(&buf[..n]);
+        for message in walk.by_ref() {
+            let view = match message {
+                Ok(view) => view,
+                Err(malformed) => {
+                    malformed.log(core::net::SocketAddr::V4(source));
+                    continue;
+                }
+            };
             let parsed = ParsedDatagram::from(&view);
             let (status, body) =
                 check_parsed_e2e(e2e, core::net::IpAddr::V4(*source.ip()), &parsed);
@@ -115,6 +120,7 @@ pub async fn event_rx_dispatch_future<'a, S, R>(
                 &mut [],
             );
         }
+        walk.log_discarded(core::net::SocketAddr::V4(source));
     }
 }
 

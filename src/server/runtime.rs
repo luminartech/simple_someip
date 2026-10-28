@@ -577,20 +577,24 @@ async fn dispatch_non_sd_request<T: TransportSocket, R: E2EHandle + ?Sized>(
     }
 }
 
+/// What the receive loop answers the messages it receives with.
+struct Receiver<'a, T, Sub, R> {
+    config: &'a ServerConfig,
+    unicast_socket: &'a T,
+    sd_socket: &'a T,
+    sd_state: &'a SdStateManager,
+    subscriptions: &'a Sub,
+    e2e: &'a R,
+    non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
+    offered: &'a Offered,
+}
+
 /// Handles one message received from `addr`: SD messages go to
 /// [`handle_sd_message`], non-SD unicast requests to
 /// [`dispatch_non_sd_request`].
-#[allow(clippy::too_many_arguments)]
 async fn handle_message<T, Sub, R>(
-    config: &ServerConfig,
-    unicast_socket: &T,
-    sd_socket: &T,
-    sd_state: &SdStateManager,
-    subscriptions: &Sub,
-    e2e: &R,
+    receiver: &Receiver<'_, T, Sub, R>,
     send_buf: &mut [u8],
-    non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
-    offered: &Offered,
     view: &crate::protocol::MessageView<'_>,
     addr: core::net::SocketAddr,
     from_unicast: bool,
@@ -600,6 +604,16 @@ where
     Sub: SubscriptionHandle,
     R: E2EHandle + Clone,
 {
+    let Receiver {
+        config,
+        unicast_socket,
+        sd_socket,
+        sd_state,
+        subscriptions,
+        e2e,
+        non_sd_observer,
+        offered,
+    } = *receiver;
     crate::log::trace!(
         "SOME/IP Header: service=0x{:04X}, method=0x{:04X}, type={:?}",
         view.header().message_id().service_id(),
@@ -646,26 +660,18 @@ where
 
 /// Receive loop body — drives `recv_from` on both the unicast and SD
 /// sockets and hands each message in a datagram to [`handle_message`].
-#[allow(clippy::too_many_arguments)]
 async fn recv_loop<T, Sub, R>(
-    config: &ServerConfig,
-    unicast_socket: &T,
-    sd_socket: &T,
-    sd_state: &SdStateManager,
-    subscriptions: &Sub,
-    e2e: &R,
+    receiver: &Receiver<'_, T, Sub, R>,
     unicast_buf: &mut [u8],
     sd_buf: &mut [u8],
     send_buf: &mut [u8],
-    non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
-    offered: &Offered,
 ) -> Result<(), Error>
 where
     T: TransportSocket,
     Sub: SubscriptionHandle,
     R: E2EHandle + Clone,
 {
-    use crate::protocol::split_message;
+    let (unicast_socket, sd_socket) = (receiver.unicast_socket, receiver.sd_socket);
 
     // Iteration counter used to flip `select_biased!` arm priority
     // each turn. We can't use the pseudo-random `select!` (it needs
@@ -726,34 +732,14 @@ where
         crate::log::trace!("Received {} bytes from {} on {} socket", len, addr, source);
         crate::log::trace!("Raw data: {:02X?}", &data[..len.min(64_usize)]);
 
-        let mut rest = data;
-        while let Some(message) = split_message(rest) {
+        let mut walk = crate::protocol::messages(data);
+        for message in walk.by_ref() {
             match message {
-                Ok((view, after)) => {
-                    rest = after;
-                    handle_message(
-                        config,
-                        unicast_socket,
-                        sd_socket,
-                        sd_state,
-                        subscriptions,
-                        e2e,
-                        send_buf,
-                        non_sd_observer,
-                        offered,
-                        &view,
-                        addr,
-                        from_unicast,
-                    )
-                    .await?;
-                }
-                Err(e) => {
-                    crate::log::warn!("Failed to parse a SOME/IP message from {}: {:?}", addr, e);
-                    crate::log::trace!("Data: {:02X?}", &rest[..rest.len().min(32)]);
-                    break;
-                }
+                Ok(view) => handle_message(receiver, send_buf, &view, addr, from_unicast).await?,
+                Err(malformed) => malformed.log(addr),
             }
         }
+        walk.log_discarded(addr);
     }
 }
 
@@ -880,19 +866,17 @@ where
     let sd_state_ref = sd_state.get();
 
     let offered = Offered::new();
-    let recv_fut = recv_loop(
-        &config,
-        unicast,
-        sd,
-        sd_state_ref,
-        &subscriptions,
-        &e2e,
-        unicast_buf,
-        sd_buf,
-        recv_send_buf,
+    let receiver = Receiver {
+        config: &config,
+        unicast_socket: unicast,
+        sd_socket: sd,
+        sd_state: sd_state_ref,
+        subscriptions: &subscriptions,
+        e2e: &e2e,
         non_sd_observer,
-        &offered,
-    );
+        offered: &offered,
+    };
+    let recv_fut = recv_loop(&receiver, unicast_buf, sd_buf, recv_send_buf);
     let announce_fut = async {
         if config.announce {
             announce_loop(&config, sd, sd_state_ref, &timer, announce_send_buf).await;

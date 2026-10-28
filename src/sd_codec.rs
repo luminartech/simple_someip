@@ -653,7 +653,7 @@ impl Default for SdSessionCounter {
     }
 }
 
-/// SOME/IP datagram fields extracted by [`parse_someip_datagram`];
+/// SOME/IP message fields extracted by [`parse_someip_datagram`];
 /// `payload` borrows from the input buffer.
 #[derive(Debug, Clone, Copy)]
 pub struct ParsedDatagram<'a> {
@@ -678,10 +678,11 @@ impl<'a> From<&MessageView<'a>> for ParsedDatagram<'a> {
     }
 }
 
-/// Parse the first SOME/IP message in `data`. Its payload ends where its
-/// Length field says; any bytes after it are not returned. Use
-/// [`split_message`](crate::protocol::split_message) to walk every message
-/// in a datagram.
+/// Parse the SOME/IP message at the front of `data`, as
+/// [`MessageView::parse`] does: its payload ends where its Length field says,
+/// and a SOME/IP-TP segment is returned like any message.
+/// [`messages`](crate::protocol::messages) walks every message in a datagram
+/// and skips TP segments.
 ///
 /// # Errors
 /// Propagates the [`MessageView::parse`] error: [`protocol::Error::Incomplete`]
@@ -695,9 +696,9 @@ pub fn parse_someip_datagram(data: &[u8]) -> Result<ParsedDatagram<'_>, crate::p
     Ok(ParsedDatagram::from(&MessageView::parse(data)?))
 }
 
-/// Parse the first SOME/IP message in `data` as SOME/IP-SD, returning the
-/// inner [`SdHeaderView`] for entry/option iteration. The message ends where
-/// its Length field says.
+/// Parse the SOME/IP message at the front of `data` as SOME/IP-SD, as
+/// [`MessageView::parse`] does, returning the inner [`SdHeaderView`] for
+/// entry/option iteration. The message ends where its Length field says.
 ///
 /// # Errors
 /// The three failure modes are distinguishable by variant:

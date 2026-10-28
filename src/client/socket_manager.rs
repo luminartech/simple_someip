@@ -44,7 +44,7 @@ use crate::CapacityKind;
 use crate::{
     UDP_BUFFER_SIZE,
     buffer_pool::BufferLease,
-    protocol::{Header, HeaderView, Message, MessageView, sd, split_message},
+    protocol::{Header, Message, MessageView, messages, sd},
     traits::PayloadWireFormat,
     transport::{
         ChannelFactory, E2EHandle, LocalSpawner, MpscRecv, MpscSend, OneshotRecv, OneshotSend,
@@ -54,7 +54,7 @@ use crate::{
 
 use super::error::Error;
 use crate::log::{debug, error, info, trace, warn};
-use automotive_wire_codec::{Decode, Encode};
+use automotive_wire_codec::Encode;
 use core::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     task::{Context, Poll},
@@ -97,6 +97,81 @@ impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> core::fmt::Debug
             .field("message", &self.message)
             .finish_non_exhaustive()
     }
+}
+
+/// The received datagram the socket loop is handing to the inbound channel.
+#[derive(Clone, Copy)]
+enum Inbound {
+    Idle,
+    /// `buf[start..end]` holds its messages not yet handed off.
+    Walking {
+        start: usize,
+        end: usize,
+        source: SocketAddr,
+    },
+}
+
+/// Why an outgoing message was not encoded.
+enum EncodeFailure {
+    Encode(crate::protocol::Error),
+    Protect(crate::transport::ProtectInPlaceError),
+}
+
+/// Encodes `message` into `buf` and protects it with `e2e`; returns the
+/// datagram's length.
+fn encode_protected<P: PayloadWireFormat, R: E2EHandle>(
+    buf: &mut [u8],
+    message: &Message<P>,
+    e2e: &R,
+) -> Result<usize, EncodeFailure> {
+    let mut writer = &mut buf[..];
+    let length = message.encode(&mut writer).map_err(EncodeFailure::Encode)?;
+    crate::transport::protect_in_place(e2e, buf, length).map_err(EncodeFailure::Protect)
+}
+
+/// Room a send leaves for the E2E protection its hook adds while `inbound`
+/// messages wait in the buffer beside it.
+const PROTECTION_HEADROOM: usize = 64;
+
+/// Makes room at the front of `buf` for a send of `required` bytes, plus
+/// [`PROTECTION_HEADROOM`], while `inbound`'s messages wait: uses the
+/// delivered part in front of them, moves them to the end of `buf`, or drops
+/// them when both do not fit. Returns how much of the front of `buf` the send
+/// may use.
+fn make_room(buf: &mut [u8], inbound: &mut Inbound, required: usize) -> usize {
+    let Inbound::Walking { start, end, source } = *inbound else {
+        return buf.len();
+    };
+    let needed = required + PROTECTION_HEADROOM;
+    if needed <= start {
+        return start;
+    }
+    let unread = end - start;
+    if needed + unread > buf.len() {
+        drop_unread(inbound);
+        return buf.len();
+    }
+    let tail = buf.len() - unread;
+    buf.copy_within(start..end, tail);
+    *inbound = Inbound::Walking {
+        start: tail,
+        end: buf.len(),
+        source,
+    };
+    tail
+}
+
+/// Drops `inbound`'s messages not yet handed off.
+fn drop_unread(inbound: &mut Inbound) {
+    if let Inbound::Walking { start, end, source } = *inbound {
+        warn!(
+            "Dropping the last {} bytes of a datagram from {}: the inbound channel is full \
+             and a send needs the buffer",
+            end - start,
+            source
+        );
+    }
+    *inbound = Inbound::Idle;
 }
 
 /// One iteration's select-outcome in `socket_loop_future`. The inner
@@ -718,10 +793,7 @@ where
         // datagrams.
         let deliver = Fuse::terminated();
         pin_mut!(deliver);
-        // The part of `buf` holding the received datagram's messages not yet
-        // delivered, as `(start, end, source)`. Sends encode into `buf`, so a
-        // send that wins while a delivery is pending discards this part.
-        let mut unwalked: Option<(usize, usize, SocketAddr)> = None;
+        let mut inbound = Inbound::Idle;
 
         loop {
             // The fresh `.fuse()`'d per-iteration futures are pinned
@@ -734,7 +806,7 @@ where
                 let send_fut = MpscRecv::recv(&mut tx_rx).fuse();
                 // A terminated future is never selected, so this disables
                 // the receive arm until the pending delivery completes.
-                let recv_fut = if deliver.is_terminated() && unwalked.is_none() {
+                let recv_fut = if matches!(inbound, Inbound::Idle) && deliver.is_terminated() {
                     socket.recv_from(&mut buf[..]).fuse()
                 } else {
                     Fuse::terminated()
@@ -786,45 +858,32 @@ where
                             .send(Err(Error::Capacity(CapacityKind::UdpBuffer)));
                         continue;
                     }
-                    if let Some((start, end, source)) = unwalked.take() {
-                        warn!(
-                            "Dropping the last {} bytes of a datagram from {}: the inbound \
-                             channel is full and a send needs the buffer",
-                            end - start,
-                            source
-                        );
-                    }
-                    // `embedded_io::Write` writer = a reborrow of `buf` that
-                    // advances as bytes are written; named to avoid `&mut &mut`.
-                    let mut writer = &mut buf[..];
-                    let mut message_length = match send_message.message.encode(&mut writer) {
-                        Ok(length) => length,
-                        Err(e) => {
-                            error!("Failed to encode message: {:?}", e);
-                            // If the sender is already closed we can't send the error back, so we shut everything down
-                            if let Ok(()) = send_message.response.send(Err(e.into())) {
-                                // Successfully sent error back to sender, carry on
+                    let room = make_room(&mut buf, &mut inbound, required);
+                    let message_length =
+                        match encode_protected(&mut buf[..room], &send_message.message, &e2e) {
+                            Ok(length) => length,
+                            Err(EncodeFailure::Encode(e)) => {
+                                error!("Failed to encode message: {:?}", e);
+                                // If the sender is already closed we can't send the error back, so we shut everything down
+                                if let Ok(()) = send_message.response.send(Err(e.into())) {
+                                    // Successfully sent error back to sender, carry on
+                                    continue;
+                                }
+                                error!("Socket owner closed channel unexpectedly, closing socket.");
+                                break;
+                            }
+                            Err(EncodeFailure::Protect(e)) => {
+                                error!(
+                                    "Protecting {:?} failed: {:?}; refusing to send it unprotected",
+                                    send_message.message.header().message_id(),
+                                    e
+                                );
+                                let _ = send_message
+                                    .response
+                                    .send(Err(Error::Capacity(CapacityKind::UdpBuffer)));
                                 continue;
                             }
-                            error!("Socket owner closed channel unexpectedly, closing socket.");
-                            break;
-                        }
-                    };
-
-                    match crate::transport::protect_in_place(&e2e, &mut buf, message_length) {
-                        Ok(protected_length) => message_length = protected_length,
-                        Err(e) => {
-                            error!(
-                                "Protecting {:?} failed: {:?}; refusing to send it unprotected",
-                                send_message.message.header().message_id(),
-                                e
-                            );
-                            let _ = send_message
-                                .response
-                                .send(Err(Error::Capacity(CapacityKind::UdpBuffer)));
-                            continue;
-                        }
-                    }
+                        };
 
                     match socket
                         .send_to(&buf[..message_length], send_message.target_addr)
@@ -900,7 +959,11 @@ where
                         );
                         continue;
                     }
-                    unwalked = Some((0, bytes_received, SocketAddr::V4(source)));
+                    inbound = Inbound::Walking {
+                        start: 0,
+                        end: bytes_received,
+                        source: SocketAddr::V4(source),
+                    };
                 }
                 Outcome::Delivered(Ok(())) => {}
                 Outcome::Delivered(Err(())) => {
@@ -946,21 +1009,32 @@ where
             // Hand the next message off to a later iteration's select rather
             // than awaiting here; see `deliver` above.
             if deliver.is_terminated()
-                && let Some((start, end, source)) = unwalked
+                && let Inbound::Walking { start, end, source } = inbound
             {
-                unwalked = None;
-                let bytes = &buf[start..end];
-                if let Some(message) = split_message(bytes) {
-                    let received = match message {
-                        Ok((view, rest)) => {
-                            if !rest.is_empty() {
-                                unwalked = Some((end - rest.len(), end, source));
-                            }
-                            Ok(received_message(&view, source, &e2e))
+                let mut walk = messages(&buf[start..end]);
+                let received = walk.next().map(|message| match message {
+                    Ok(view) => received_message(&view, source, &e2e),
+                    Err(malformed) => {
+                        malformed.log(source);
+                        ReceivedMessage {
+                            header: malformed.header().to_owned(),
+                            payload: Err(crate::protocol::Error::from(malformed).into()),
+                            source,
+                            e2e_status: None,
                         }
-                        Err(err) => malformed_message(bytes, source, err),
-                    };
-                    deliver.set(rx_tx.send(received).fuse());
+                    }
+                });
+                walk.log_discarded(source);
+                inbound = match walk.remaining().len() {
+                    0 => Inbound::Idle,
+                    left => Inbound::Walking {
+                        start: end - left,
+                        end,
+                        source,
+                    },
+                };
+                if let Some(received) = received {
+                    deliver.set(rx_tx.send(Ok(received)).fuse());
                 }
             }
         }
@@ -990,29 +1064,6 @@ fn received_message<P: PayloadWireFormat, R: E2EHandle>(
         source,
         e2e_status,
     }
-}
-
-/// Builds the [`ReceivedMessage`] for the message [`split_message`] could not
-/// split off `bytes`: its header, with `err` as its payload, so a RESPONSE
-/// that does not decode still resolves the request it answers. Returns the
-/// header's own error when the header does not decode either.
-fn malformed_message<P>(
-    mut bytes: &[u8],
-    source: SocketAddr,
-    err: crate::protocol::Error,
-) -> Result<ReceivedMessage<P>, Error> {
-    // `split_message` skips only SOME/IP-TP segments, so every message that
-    // decodes ahead of the malformed one is a segment.
-    while let Ok((_, rest)) = MessageView::decode(bytes) {
-        bytes = rest;
-    }
-    let (header, _) = HeaderView::parse(bytes)?;
-    Ok(ReceivedMessage {
-        header: header.to_owned(),
-        payload: Err(err.into()),
-        source,
-        e2e_status: None,
-    })
 }
 
 #[cfg(all(test, feature = "client-tokio"))]
@@ -1507,17 +1558,20 @@ mod tests {
         .concat()
     }
 
-    #[test]
-    fn a_malformed_response_after_a_tp_segment_keeps_its_own_header() {
-        let source = SocketAddr::from((Ipv4Addr::LOCALHOST, 30509));
+    #[tokio::test]
+    async fn a_malformed_response_after_a_tp_segment_arrives_with_its_own_header() {
+        let mut sm = bind_ephemeral_spawned().await;
+        let sm_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, sm.port());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
         let datagram = [tp_segment(), response(10, &[0xAB, 0xCD])].concat();
-        let Some(Err(err)) = split_message(&datagram) else {
-            panic!("a Length past the end of the datagram is malformed");
-        };
+        peer.send_to(&datagram, sm_addr).await.unwrap();
 
-        let received = malformed_message::<TestPayload>(&datagram, source, err)
-            .expect("the RESPONSE's header parses");
-
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), sm.receive())
+            .await
+            .expect("timed out waiting for the RESPONSE")
+            .expect("socket loop closed")
+            .expect("the RESPONSE's header decodes");
         let id = received.header.message_id();
         assert_eq!((id.service_id(), id.method_id()), (0x1234, 0x0001));
         assert_eq!(received.header.request_id(), 0x0001_0002);
@@ -1526,60 +1580,53 @@ mod tests {
             crate::protocol::MessageType::Response
         );
         assert!(received.payload.is_err());
-        assert_eq!(received.source, source);
         assert_eq!(received.e2e_status, None);
     }
 
-    #[test]
-    fn bytes_too_short_for_a_header_are_a_bare_error() {
-        let source = SocketAddr::from((Ipv4Addr::LOCALHOST, 30509));
-        let junk = [0u8; 5];
-        let Some(Err(err)) = split_message(&junk) else {
-            panic!("five bytes hold no message");
-        };
-
-        assert!(malformed_message::<TestPayload>(&junk, source, err).is_err());
-    }
-
     #[tokio::test]
-    async fn bytes_after_the_last_message_arrive_as_an_error_after_it() {
+    async fn bytes_that_hold_no_header_are_dropped() {
         let mut sm = bind_ephemeral_spawned().await;
         let sm_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, sm.port());
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        let datagram = [sd_datagram(&[1]), vec![0; 5]].concat();
-        peer.send_to(&datagram, sm_addr).await.unwrap();
+        peer.send_to(&[sd_datagram(&[1]), vec![0; 5]].concat(), sm_addr)
+            .await
+            .unwrap();
+        peer.send_to(&[0; 5], sm_addr).await.unwrap();
         peer.send_to(&sd_datagram(&[2]), sm_addr).await.unwrap();
 
         assert_eq!(next_session(&mut sm).await, 1);
-        let trailing = tokio::time::timeout(std::time::Duration::from_secs(2), sm.receive())
-            .await
-            .expect("timed out waiting for the trailing bytes")
-            .expect("socket loop closed");
-        assert!(trailing.is_err(), "the trailing bytes hold no message");
         assert_eq!(next_session(&mut sm).await, 2);
     }
 
-    /// A send that needs the buffer while the inbound channel is full
-    /// discards the messages of the held datagram not yet delivered; the
-    /// message already being delivered, and later datagrams, still arrive.
-    #[tokio::test]
-    async fn a_send_under_backpressure_drops_the_rest_of_the_held_datagram() {
-        let mut sm = bind_ephemeral_spawned().await;
+    /// Sends sessions 1 to 15, one per datagram, then one datagram holding
+    /// session 16, session 17 and `eighteenth`, and waits until the socket
+    /// loop has filled the inbound channel with 1 to 16: it then holds 17
+    /// for delivery and `eighteenth` in its buffer.
+    async fn fill_the_inbound_channel(sm: &TestSocketManager, peer: &UdpSocket, eighteenth: &[u8]) {
         let sm_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, sm.port());
-        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let peer_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, peer.local_addr().unwrap().port());
-
-        for session in 1..=16 {
+        for session in 1..=15 {
             peer.send_to(&sd_datagram(&[session]), sm_addr)
                 .await
                 .unwrap();
         }
-        peer.send_to(&sd_datagram(&[17, 18]), sm_addr)
-            .await
-            .unwrap();
-        // Let the socket loop fill the channel and hold message 17.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let held = [sd_datagram(&[16, 17]), eighteenth.to_vec()].concat();
+        peer.send_to(&held, sm_addr).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sm.receiver.len() < 16 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the inbound channel did not fill");
+    }
+
+    #[tokio::test]
+    async fn a_send_under_backpressure_keeps_the_rest_of_the_held_datagram() {
+        let mut sm = bind_ephemeral_spawned().await;
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, peer.local_addr().unwrap().port());
+        fill_the_inbound_channel(&sm, &peer, &sd_datagram(&[18])).await;
 
         let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header())
             .expect("in-tree SdHeader sizing is infallible");
@@ -1587,6 +1634,127 @@ mod tests {
             .await
             .expect("send stalled behind a full inbound channel")
             .unwrap();
+
+        for want in 1..=18 {
+            assert_eq!(next_session(&mut sm).await, want);
+        }
+    }
+
+    /// Protects every non-SD message by putting 32 bytes of 0xAA in front of
+    /// its payload.
+    #[derive(Clone)]
+    struct Grow32;
+
+    impl E2EHandle for Grow32 {
+        fn check<'a>(
+            &self,
+            _source: core::net::IpAddr,
+            _message_id: crate::protocol::MessageId,
+            _payload: &'a [u8],
+            _upper_header: [u8; 8],
+        ) -> Option<crate::transport::E2ECheck<'a>> {
+            None
+        }
+
+        fn protect<'b>(
+            &self,
+            _message_id: crate::protocol::MessageId,
+            buf: &'b mut [u8],
+            payload_len: usize,
+            _upper_header: [u8; 8],
+        ) -> Option<Result<&'b [u8], crate::transport::E2EProtectError>> {
+            let needed = payload_len + 32;
+            if buf.len() < needed {
+                return Some(Err(crate::transport::E2EProtectError::BufferTooSmall {
+                    needed,
+                    available: buf.len(),
+                }));
+            }
+            buf.copy_within(..payload_len, 32);
+            buf[..32].fill(0xAA);
+            Some(Ok(&buf[..needed]))
+        }
+
+        fn reset_source(&self, _source: core::net::IpAddr) {}
+    }
+
+    #[tokio::test]
+    async fn a_protected_send_under_backpressure_keeps_the_held_datagram() {
+        let mut sm = TestSocketManager::bind(0, Grow32).await.unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, peer.local_addr().unwrap().port());
+        fill_the_inbound_channel(&sm, &peer, &sd_datagram(&[18])).await;
+
+        let payload = TestPayload {
+            header: empty_sd_header(),
+        };
+        let payload_len = payload.encoded_size().unwrap();
+        let header = Header::new(
+            crate::protocol::MessageId::new_from_service_and_method(0x1234, 0x0001),
+            0x0001_0001,
+            0x01,
+            0x01,
+            crate::protocol::MessageTypeField::new(crate::protocol::MessageType::Request, false),
+            crate::protocol::ReturnCode::Ok,
+            payload_len,
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sm.send(peer_addr, Message::new(header, payload)),
+        )
+        .await
+        .expect("send stalled behind a full inbound channel")
+        .unwrap();
+
+        let mut sent = [0u8; 128];
+        let (len, _) = peer.recv_from(&mut sent).await.unwrap();
+        assert_eq!(len, 16 + 32 + payload_len);
+        assert_eq!(sent[16..48], [0xAA; 32]);
+        for want in 1..=18 {
+            assert_eq!(next_session(&mut sm).await, want);
+        }
+    }
+
+    /// A NOTIFICATION of session `session` whose datagram is `len` bytes.
+    fn notification(session: u8, len: usize) -> Vec<u8> {
+        let length = u32::try_from(len - 8).unwrap();
+        let mut f = vec![0x12, 0x34, 0x80, 0x01];
+        f.extend(length.to_be_bytes());
+        f.extend([0x00, 0x00, 0x00, session, 0x01, 0x01, 0x02, 0x00]);
+        f.resize(len, 0x5A);
+        f
+    }
+
+    #[tokio::test]
+    async fn a_send_that_does_not_fit_beside_the_held_datagram_drops_its_rest() {
+        let mut sm = bind_ephemeral_spawned().await;
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, peer.local_addr().unwrap().port());
+        fill_the_inbound_channel(&sm, &peer, &notification(18, 1440)).await;
+
+        let mut finds = empty_sd_header();
+        for instance in 1..=4 {
+            finds
+                .entries
+                .push(sd::Entry::FindService(sd::ServiceEntry {
+                    index_first_options_run: 0,
+                    index_second_options_run: 0,
+                    options_count: sd::OptionsCount::new(0, 0),
+                    service_id: 0x5678,
+                    instance_id: instance,
+                    major_version: 1,
+                    ttl: 3,
+                    minor_version: 0xFFFF_FFFF,
+                }))
+                .unwrap();
+        }
+        let msg = Message::<TestPayload>::new_sd(1, &finds)
+            .expect("in-tree SdHeader sizing is infallible");
+        tokio::time::timeout(std::time::Duration::from_secs(2), sm.send(peer_addr, msg))
+            .await
+            .expect("send stalled behind a full inbound channel")
+            .unwrap();
+        let sm_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, sm.port());
         peer.send_to(&sd_datagram(&[19]), sm_addr).await.unwrap();
 
         for want in (1..=17).chain([19]) {
