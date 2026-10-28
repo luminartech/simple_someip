@@ -195,11 +195,10 @@ pub struct RuntimeConfig {
     pub dispatch_ctx: usize,
     /// Bind PCBs + register the RX path; called per catalog port in `init`.
     pub bind: BindFn,
-    /// The services this node offers. [`init`] copies the first
-    /// `SIMPLE_SOMEIP_MAX_OFFERS` (4 by default) and ignores the rest. Empty
-    /// for a node that offers none: it then sends no `OfferService`, answers
-    /// no `FindService` and sends a `SubscribeNack` for every
-    /// `SubscribeEventgroup`.
+    /// The services this node offers, at most `SIMPLE_SOMEIP_MAX_OFFERS` (4 by
+    /// default); [`init`] returns `-8` past it. Empty for a node that offers
+    /// none: it then sends no `OfferService`, answers no `FindService` and
+    /// sends a `SubscribeNack` for every `SubscribeEventgroup`.
     pub offers: &'static [OfferEntry],
     /// The eventgroup this node subscribes to, if any, naming a concrete
     /// service ID, instance ID and major version. Its service is required as
@@ -730,9 +729,10 @@ fn bind_ports(bind: BindFn) {
 /// major version, `-6` `config.sd_mcast` is not a multicast group, `-7` the
 /// distinct services of `config.subscription` and
 /// `config.required_services` number more than
-/// [`ServerConfig::REQUIRED_SERVICES_CAP`]. The `-1`/`-2`/`-5`/`-6`/`-7`
-/// paths release the init claim so a corrected retry can proceed; `-4` does
-/// not (a runtime is already live).
+/// [`ServerConfig::REQUIRED_SERVICES_CAP`], `-8` `config.offers` holds more
+/// than `SIMPLE_SOMEIP_MAX_OFFERS` (4 by default) entries. The
+/// `-1`/`-2`/`-5`/`-6`/`-7`/`-8` paths release the init claim so a corrected
+/// retry can proceed; `-4` does not (a runtime is already live).
 #[allow(clippy::missing_panics_doc)]
 // By-value is required, not incidental: `config.buffers` is a `&'static mut`
 // reborrowed into `BUFS` (`ptr::from_mut`), which a shared `&RuntimeConfig`
@@ -749,6 +749,10 @@ pub fn init(config: RuntimeConfig) -> i32 {
         .is_err()
     {
         return -4;
+    }
+    if config.offers.len() > MAX_OFFERS {
+        INIT_CLAIMED.store(false, Ordering::Release);
+        return -8;
     }
     let required = match collect_required(&config) {
         Ok(required) => required,
@@ -793,11 +797,12 @@ pub fn init(config: RuntimeConfig) -> i32 {
     }
 
     // Copy catalog into static tables.
-    let n_offers = config.offers.len().min(MAX_OFFERS);
-    for (i, e) in config.offers.iter().take(n_offers).enumerate() {
-        unsafe { (*core::ptr::addr_of_mut!(OFFERS))[i] = *e };
+    // SAFETY: single-init guarded by INIT_CLAIMED; no task reads OFFERS yet.
+    let slots = unsafe { &mut *core::ptr::addr_of_mut!(OFFERS) };
+    for (slot, entry) in slots.iter_mut().zip(config.offers) {
+        *slot = *entry;
     }
-    OFFERS_LEN.store(n_offers, Ordering::Release);
+    OFFERS_LEN.store(config.offers.len(), Ordering::Release);
     if let Some(e) = config.subscription {
         unsafe { *core::ptr::addr_of_mut!(SUBSCRIPTION) = e };
     }
