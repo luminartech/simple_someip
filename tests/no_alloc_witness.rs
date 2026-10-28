@@ -24,18 +24,12 @@
 //!
 //! 1. [`AtomicInterfaceHandle`] `get` / `set` are provably alloc-free (thin
 //!    pointer to a `static AtomicU32`).
-//! 2. [`StaticE2EHandle`] `contains_key` / `protect` / `check` do not
-//!    allocate after the registry is configured. Registration itself may
-//!    allocate (the backing [`E2ERegistry`] uses a `HashMap`); that is
-//!    acceptable as a construction-time cost.
-//! 3. [`define_static_channels!`] oneshot first-claim, warm-claim, and
+//! 2. [`define_static_channels!`] oneshot first-claim, warm-claim, and
 //!    receiver-poll paths are alloc-free. First-claim is exercised on a
 //!    pool that has never been touched before (the `u64` variant), which
 //!    is the case that runs once at boot on a real bare-metal target.
 //!    `recv()` is polled with [`Waker::noop`] so we measure the channel
 //!    path without an executor.
-//! 4. Both Profile4 and Profile5 protect/check round-trips through
-//!    [`StaticE2EHandle`] are alloc-free.
 //!
 //! # What this does not witness
 //!
@@ -46,7 +40,6 @@
 //! path in a tokio-hosted context; this file extends it to the handle layer
 //! with a stricter panic harness.
 
-use core::cell::RefCell;
 use core::future::Future;
 use core::net::Ipv4Addr;
 use core::pin::Pin;
@@ -55,14 +48,8 @@ use core::task::{Context, Waker};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::process;
 
-use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-
-use simple_someip::e2e::{E2EKey, E2EProfile, E2ERegistry, Profile4Config, Profile5Config};
-use simple_someip::transport::{AtomicInterfaceHandle, OneshotRecv, OneshotSend, StaticE2EHandle};
-use simple_someip::{
-    ChannelFactory, E2ERegistryHandle, InterfaceHandle, StaticE2EStorage, define_static_channels,
-};
+use simple_someip::transport::{AtomicInterfaceHandle, OneshotRecv, OneshotSend};
+use simple_someip::{ChannelFactory, InterfaceHandle, define_static_channels};
 
 // ── Panic allocator ───────────────────────────────────────────────────────
 
@@ -170,116 +157,6 @@ fn witness_atomic_interface_handle() {
     });
 }
 
-fn witness_static_e2e_handle_reads() {
-    // Box::leak allocates — that is an accepted construction-time cost.
-    let storage: &'static StaticE2EStorage =
-        Box::leak(Box::new(BlockingMutex::<
-            CriticalSectionRawMutex,
-            RefCell<E2ERegistry>,
-        >::new(RefCell::new(E2ERegistry::new()))));
-    let handle = StaticE2EHandle::new(storage);
-
-    // register() writes into the heapless FnvIndexMap — fits within the
-    // E2E_REGISTRY_CAP, so no allocation. Done at construction-time
-    // (outside the assert_no_alloc closures below).
-    handle
-        .register(
-            E2EKey::new(0x1234, 0x0001),
-            E2EProfile::Profile4(Profile4Config::new(0xDEAD_BEEF, 15)),
-        )
-        .expect("register fits within E2E_REGISTRY_CAP");
-
-    // Hot-path reads must be alloc-free.
-    assert_no_alloc("StaticE2EHandle::contains_key (hit)", || {
-        assert!(handle.contains_key(&E2EKey::new(0x1234, 0x0001)));
-    });
-
-    assert_no_alloc("StaticE2EHandle::contains_key (miss)", || {
-        assert!(!handle.contains_key(&E2EKey::new(0xFFFF, 0x0000)));
-    });
-
-    assert_no_alloc("StaticE2EHandle::check (absent key → None)", || {
-        assert!(
-            handle
-                .check(
-                    Ipv4Addr::LOCALHOST.into(),
-                    E2EKey::new(0xFFFF, 0x0000),
-                    b"payload",
-                    [0u8; 8]
-                )
-                .is_none()
-        );
-    });
-}
-
-fn witness_static_e2e_handle_protect_check() {
-    let storage: &'static StaticE2EStorage =
-        Box::leak(Box::new(BlockingMutex::<
-            CriticalSectionRawMutex,
-            RefCell<E2ERegistry>,
-        >::new(RefCell::new(E2ERegistry::new()))));
-    let handle = StaticE2EHandle::new(storage);
-
-    handle
-        .register(
-            E2EKey::new(0x0001, 0x8001),
-            E2EProfile::Profile4(Profile4Config::new(0x1234_5678, 15)),
-        )
-        .expect("register fits within E2E_REGISTRY_CAP");
-    // Register a second profile (Profile5) so the protect/check witness
-    // covers both profile families' hot paths, not just Profile4.
-    handle
-        .register(
-            E2EKey::new(0x0002, 0x8002),
-            // data_length must equal payload length (5 = b"hello".len())
-            // — a mismatch routes through `tracing::warn!`, which is fine in
-            // production but adds noise to a no-alloc witness.
-            E2EProfile::Profile5(Profile5Config::new(0xABCD, 5, 15)),
-        )
-        .expect("register fits within E2E_REGISTRY_CAP");
-
-    let key = E2EKey::new(0x0001, 0x8001);
-    let payload = b"hello";
-    let mut protected = [0u8; 64];
-
-    assert_no_alloc(
-        "StaticE2EHandle::protect + check round-trip (Profile4)",
-        || {
-            let len = handle
-                .protect(key, payload, [0u8; 8], &mut protected)
-                .expect("profile registered")
-                .expect("protect succeeded");
-            let (status, stripped) = handle
-                .check(Ipv4Addr::LOCALHOST.into(), key, &protected[..len], [0u8; 8])
-                .expect("profile registered");
-            assert_eq!(status, simple_someip::E2ECheckStatus::Ok);
-            assert_eq!(stripped, payload);
-        },
-    );
-
-    let key5 = E2EKey::new(0x0002, 0x8002);
-    let mut protected5 = [0u8; 64];
-    assert_no_alloc(
-        "StaticE2EHandle::protect + check round-trip (Profile5)",
-        || {
-            let len = handle
-                .protect(key5, payload, [0u8; 8], &mut protected5)
-                .expect("profile registered")
-                .expect("protect succeeded");
-            let (status, stripped) = handle
-                .check(
-                    Ipv4Addr::LOCALHOST.into(),
-                    key5,
-                    &protected5[..len],
-                    [0u8; 8],
-                )
-                .expect("profile registered");
-            assert_eq!(status, simple_someip::E2ECheckStatus::Ok);
-            assert_eq!(stripped, payload);
-        },
-    );
-}
-
 fn witness_static_channels_oneshot() {
     // Warm the pool: first claim/release seeds the free-list.
     {
@@ -354,9 +231,10 @@ fn main() {
 
     println!("no-alloc witness:");
 
+    // The host `critical-section/std` implementation allocates on first use.
+    critical_section::with(|_| {});
+
     witness_atomic_interface_handle();
-    witness_static_e2e_handle_reads();
-    witness_static_e2e_handle_protect_check();
     witness_static_channels_first_claim();
     witness_static_channels_oneshot();
     witness_static_channels_oneshot_recv();

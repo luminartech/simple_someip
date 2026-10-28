@@ -228,10 +228,10 @@
 
 use core::future::Future;
 use core::net::{IpAddr, Ipv4Addr, SocketAddrV4};
-use core::time::Duration;
+use core::num::NonZeroU8;
 
-use crate::e2e::Error as E2EError;
-use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile};
+use crate::protocol::MessageId;
+use core::time::Duration;
 
 /// Portable I/O error kinds surfaced by transport implementations.
 ///
@@ -763,75 +763,266 @@ pub trait Spawner {
     fn spawn(&self, future: impl Future<Output = ()> + Send + 'static);
 }
 
-/// Shared handle to the runtime E2E configuration registry.
+/// A hook that checks received payloads and protects sent ones, for example
+/// with an end-to-end header between the SOME/IP header and the payload.
 ///
-/// Abstracts over `Arc<Mutex<E2ERegistry>>` on `std` and over
-/// critical-section-backed primitives (e.g. `embassy_sync::blocking_mutex`)
-/// on bare metal. All methods take `&self` and provide interior-mutable
-/// access. Implementations are required to be `Clone` so the handle can be
-/// cheaply shared between the `Client` (or `Server`) handle and its inner
-/// event loop.
-pub trait E2ERegistryHandle: Clone + Send + Sync + 'static {
-    /// Register an E2E profile for the given key, replacing any prior entry.
+/// The client, the server and the bare-metal runtime pass every non-SD
+/// message they send through [`protect`](Self::protect), and every non-SD
+/// message they hand to the application through [`check`](Self::check);
+/// the hook returns `None` for a message ID it does not cover. A check's
+/// status code is opaque and reaches the application inside an
+/// [`E2EStatus`]. [`NoE2E`] checks and protects nothing.
+///
+/// The client and the server clone the handle into each socket loop, so
+/// clones must share their state.
+pub trait E2EHandle: Send + Sync + 'static {
+    /// Checks a payload received from `source`.
     ///
-    /// # Errors
-    ///
-    /// Returns [`crate::e2e::E2ERegistryFull`] when the underlying registry has no
-    /// capacity for a new key. Replacing an already-registered key
-    /// always succeeds (the existing slot is reused). Implementations
-    /// that wrap [`crate::e2e::E2ERegistry`] forward this error
-    /// directly; backends with their own storage should pick an
-    /// equivalent overflow contract.
-    fn register(&self, key: E2EKey, profile: E2EProfile)
-    -> Result<(), crate::e2e::E2ERegistryFull>;
-
-    /// Remove the E2E configuration for the given key. No-op if absent.
-    fn unregister(&self, key: &E2EKey);
-
-    /// Returns `true` if a profile is registered for `key`.
-    fn contains_key(&self, key: &E2EKey) -> bool;
-
-    /// Run E2E protect for `key` if configured, writing to `output`.
-    ///
-    /// Returns `None` if no profile is registered for `key`.
-    /// Returns `Some(Err(_))` if protection fails (e.g. buffer too small).
-    /// Returns `Some(Ok(len))` on success; `len` is the number of bytes
-    /// written to `output`.
-    fn protect(
-        &self,
-        key: E2EKey,
-        payload: &[u8],
-        upper_header: [u8; 8],
-        output: &mut [u8],
-    ) -> Option<Result<usize, E2EError>>;
-
-    /// Run E2E check for `key` against `source`'s receive counter state,
-    /// if configured.
-    ///
-    /// Returns `None` if no profile is registered for `key`. Otherwise
-    /// returns the check status and the effective payload slice — the
-    /// E2E header is stripped on success; the original bytes are returned
-    /// on check failure so the caller can decide how to handle it.
-    ///
-    /// `source` keys the receive counter state: on a shared subnet several
-    /// devices send the same `(service, method)` under one instance id, so
-    /// each sender's sequence counter must be tracked independently. See
-    /// [`crate::e2e::E2ERegistry`].
-    ///
-    /// The returned slice borrows from `payload`, not from this handle.
+    /// Returns `None` when no check applies to `message_id`, otherwise
+    /// whether the check passed, with its status code.
+    /// `upper_header` is the SOME/IP header's bytes 8..16.
     fn check<'a>(
         &self,
         source: IpAddr,
-        key: E2EKey,
+        message_id: MessageId,
         payload: &'a [u8],
         upper_header: [u8; 8],
-    ) -> Option<(E2ECheckStatus, &'a [u8])>;
+    ) -> Option<E2ECheck<'a>>;
 
-    /// Drop all per-source receive counter state for `source` (e.g. when
-    /// its reboot is detected via Service Discovery), so its next frame
-    /// starts a fresh sequence. Configuration and transmit state are
-    /// untouched.
+    /// Protects, in place, the payload in `buf[..payload_len]`; the rest of
+    /// `buf` is free for the protected payload to grow into.
+    ///
+    /// Returns `None` when no protection applies to `message_id`, otherwise
+    /// the part of `buf` that holds the protected payload.
+    /// `upper_header` is the SOME/IP header's bytes 8..16.
+    ///
+    /// It is called once per message protected: a publish to several
+    /// subscribers sends each the same protected bytes, while each
+    /// per-target publish and each response is protected on its own. A
+    /// counter kept per message ID therefore counts protected messages, and
+    /// a receiver that gets only some of them sees gaps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`E2EProtectError::PayloadTooLong`] when no buffer could hold
+    /// a payload this long once protected, for example because the E2E
+    /// header's length field cannot state it, and
+    /// [`E2EProtectError::BufferTooSmall`] when only `buf` is too small.
+    fn protect<'b>(
+        &self,
+        message_id: MessageId,
+        buf: &'b mut [u8],
+        payload_len: usize,
+        upper_header: [u8; 8],
+    ) -> Option<Result<&'b [u8], E2EProtectError>>;
+
+    /// Drops receive state kept for `source`. The client calls it when SD
+    /// shows that `source` rebooted.
     fn reset_source(&self, source: IpAddr);
+}
+
+impl<T: E2EHandle + ?Sized> E2EHandle for &'static T {
+    fn check<'a>(
+        &self,
+        source: IpAddr,
+        message_id: MessageId,
+        payload: &'a [u8],
+        upper_header: [u8; 8],
+    ) -> Option<E2ECheck<'a>> {
+        (**self).check(source, message_id, payload, upper_header)
+    }
+
+    fn protect<'b>(
+        &self,
+        message_id: MessageId,
+        buf: &'b mut [u8],
+        payload_len: usize,
+        upper_header: [u8; 8],
+    ) -> Option<Result<&'b [u8], E2EProtectError>> {
+        (**self).protect(message_id, buf, payload_len, upper_header)
+    }
+
+    fn reset_source(&self, source: IpAddr) {
+        (**self).reset_source(source);
+    }
+}
+
+/// The outcome of an [`E2EHandle::check`] that applies to a message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum E2ECheck<'a> {
+    /// The check passed.
+    Passed {
+        /// The hook's status code.
+        status: NonZeroU8,
+        /// The payload without its protection header.
+        payload: &'a [u8],
+    },
+    /// The check failed; the received payload is passed on unchanged.
+    Failed {
+        /// The hook's status code.
+        status: NonZeroU8,
+    },
+}
+
+/// What an [`E2EHandle`] check found for a received message, with the
+/// hook's status code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum E2EStatus {
+    /// The check passed, and the payload is the one without its protection
+    /// header.
+    Passed(NonZeroU8),
+    /// The check failed, and the payload is the one received.
+    Failed(NonZeroU8),
+}
+
+impl E2EStatus {
+    /// The hook's status code.
+    #[must_use]
+    pub const fn code(self) -> NonZeroU8 {
+        match self {
+            Self::Passed(code) | Self::Failed(code) => code,
+        }
+    }
+
+    /// Whether the check passed.
+    #[must_use]
+    pub const fn passed(self) -> bool {
+        matches!(self, Self::Passed(_))
+    }
+}
+
+/// Runs `e2e`'s check on a message received from `source`. Returns what the
+/// check found, or `None` for an SD message or when no check applies, and
+/// the payload to decode.
+#[cfg(any(feature = "client", feature = "server", feature = "bare_metal"))]
+pub(crate) fn check_message<'a, R: E2EHandle + ?Sized>(
+    e2e: &R,
+    source: IpAddr,
+    message_id: MessageId,
+    upper_header: [u8; 8],
+    payload: &'a [u8],
+) -> (Option<E2EStatus>, &'a [u8]) {
+    if message_id.is_sd() {
+        return (None, payload);
+    }
+    match e2e.check(source, message_id, payload, upper_header) {
+        None => (None, payload),
+        Some(E2ECheck::Passed {
+            status,
+            payload: checked,
+        }) => (Some(E2EStatus::Passed(status)), checked),
+        Some(E2ECheck::Failed { status }) => (Some(E2EStatus::Failed(status)), payload),
+    }
+}
+
+/// Why an [`E2EHandle`] could not protect a payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum E2EProtectError {
+    /// The output buffer is smaller than the protected payload.
+    #[error("protected payload needs {needed} bytes, the buffer holds {available}")]
+    BufferTooSmall {
+        /// Bytes the protected payload needs.
+        needed: usize,
+        /// Bytes the output buffer holds.
+        available: usize,
+    },
+    /// The hook cannot protect a payload this long, whatever the buffer
+    /// holds.
+    #[error("protected payload of {needed} bytes exceeds the {max}-byte E2E limit")]
+    PayloadTooLong {
+        /// Bytes the protected payload would fill.
+        needed: usize,
+        /// The largest protected payload the hook can state.
+        max: usize,
+    },
+}
+
+/// An [`E2EHandle`] that checks and protects nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoE2E;
+
+impl E2EHandle for NoE2E {
+    fn check<'a>(
+        &self,
+        _source: IpAddr,
+        _message_id: MessageId,
+        _payload: &'a [u8],
+        _upper_header: [u8; 8],
+    ) -> Option<E2ECheck<'a>> {
+        None
+    }
+
+    fn protect<'b>(
+        &self,
+        _message_id: MessageId,
+        _buf: &'b mut [u8],
+        _payload_len: usize,
+        _upper_header: [u8; 8],
+    ) -> Option<Result<&'b [u8], E2EProtectError>> {
+        None
+    }
+
+    fn reset_source(&self, _source: IpAddr) {}
+}
+
+/// Why [`protect_in_place`] could not protect a message.
+#[cfg(any(feature = "client", feature = "server"))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProtectInPlaceError {
+    /// `len` is shorter than a SOME/IP header or longer than `datagram`.
+    NotAMessage,
+    /// The hook could not protect the payload.
+    Hook(E2EProtectError),
+    /// The hook returned bytes outside the buffer it was given.
+    OutsideBuffer,
+}
+
+/// Protects the payload of the SOME/IP message in `datagram[..len]` in
+/// place and rewrites its length field. Returns the message's new length;
+/// an SD message, or one `e2e` does not protect, keeps `len`.
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) fn protect_in_place<R: E2EHandle + ?Sized>(
+    e2e: &R,
+    datagram: &mut [u8],
+    len: usize,
+) -> Result<usize, ProtectInPlaceError> {
+    if len < 16 || len > datagram.len() {
+        return Err(ProtectInPlaceError::NotAMessage);
+    }
+    let message_id = MessageId::from(u32::from_be_bytes(
+        datagram[..4].try_into().expect("message ID bytes"),
+    ));
+    if message_id.is_sd() {
+        return Ok(len);
+    }
+    let upper_header: [u8; 8] = datagram[8..16].try_into().expect("upper header bytes");
+    let payload_start = datagram[16..].as_ptr().addr();
+    let payload_room = datagram.len() - 16;
+    let (offset, protected_len) =
+        match e2e.protect(message_id, &mut datagram[16..], len - 16, upper_header) {
+            None => return Ok(len),
+            Some(result) => {
+                let protected = result.map_err(ProtectInPlaceError::Hook)?;
+                let offset = if protected.is_empty() {
+                    Some(0)
+                } else {
+                    protected.as_ptr().addr().checked_sub(payload_start)
+                };
+                (offset, protected.len())
+            }
+        };
+    let Some(offset) = offset.filter(|offset| {
+        offset
+            .checked_add(protected_len)
+            .is_some_and(|end| end <= payload_room)
+    }) else {
+        return Err(ProtectInPlaceError::OutsideBuffer);
+    };
+    datagram.copy_within(16 + offset..16 + offset + protected_len, 16);
+    let length_field = u32::try_from(8 + protected_len).expect("protected length fits u32");
+    datagram[4..8].copy_from_slice(&length_field.to_be_bytes());
+    Ok(16 + protected_len)
 }
 
 /// Shared handle to the local interface address.
@@ -940,74 +1131,16 @@ impl<T: 'static> WrappableSharedHandle<T> for alloc::sync::Arc<T> {
     }
 }
 
-/// Default `std`-flavoured impls of [`E2ERegistryHandle`] /
-/// [`InterfaceHandle`] / [`SocketHandle`] backed by
+/// Default `std`-flavoured impls of [`InterfaceHandle`] /
+/// [`SocketHandle`] backed by
 /// `std::sync::{Arc, Mutex, RwLock}`. Pure std — no tokio
 /// dependency — so they live in the executor-agnostic transport
 /// module rather than the tokio backend.
 #[cfg(feature = "std")]
 mod std_handle_impls {
-    use super::{E2ERegistryHandle, InterfaceHandle};
-    use crate::e2e::Error as E2EError;
-    use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, E2ERegistryFull};
-    use core::net::{IpAddr, Ipv4Addr};
-    use std::sync::{Arc, Mutex, RwLock};
-
-    impl E2ERegistryHandle for Arc<Mutex<E2ERegistry>> {
-        fn register(&self, key: E2EKey, profile: E2EProfile) -> Result<(), E2ERegistryFull> {
-            self.lock()
-                .expect("e2e registry lock poisoned")
-                .register(key, profile)
-        }
-
-        fn unregister(&self, key: &E2EKey) {
-            self.lock()
-                .expect("e2e registry lock poisoned")
-                .unregister(key);
-        }
-
-        fn contains_key(&self, key: &E2EKey) -> bool {
-            self.lock()
-                .expect("e2e registry lock poisoned")
-                .contains_key(key)
-        }
-
-        fn protect(
-            &self,
-            key: E2EKey,
-            payload: &[u8],
-            upper_header: [u8; 8],
-            output: &mut [u8],
-        ) -> Option<Result<usize, E2EError>> {
-            self.lock().expect("e2e registry lock poisoned").protect(
-                key,
-                payload,
-                upper_header,
-                output,
-            )
-        }
-
-        fn check<'a>(
-            &self,
-            source: IpAddr,
-            key: E2EKey,
-            payload: &'a [u8],
-            upper_header: [u8; 8],
-        ) -> Option<(E2ECheckStatus, &'a [u8])> {
-            self.lock().expect("e2e registry lock poisoned").check(
-                source,
-                key,
-                payload,
-                upper_header,
-            )
-        }
-
-        fn reset_source(&self, source: IpAddr) {
-            self.lock()
-                .expect("e2e registry lock poisoned")
-                .reset_source(source);
-        }
-    }
+    use super::InterfaceHandle;
+    use core::net::Ipv4Addr;
+    use std::sync::{Arc, RwLock};
 
     impl InterfaceHandle for Arc<RwLock<Ipv4Addr>> {
         fn get(&self) -> Ipv4Addr {
@@ -1020,7 +1153,7 @@ mod std_handle_impls {
     }
 }
 
-/// Bare-metal no-alloc impls of [`E2ERegistryHandle`] and [`InterfaceHandle`].
+/// Bare-metal no-alloc impl of [`InterfaceHandle`].
 ///
 /// These types satisfy `Clone + Send + Sync + 'static` without any heap
 /// allocation. The backing storage lives in a caller-owned `static`; the
@@ -1029,44 +1162,17 @@ mod std_handle_impls {
 /// # Production pattern
 ///
 /// ```ignore
-/// use core::cell::RefCell;
-/// use core::sync::atomic::{AtomicU32, Ordering};
-/// use embassy_sync::blocking_mutex::Mutex;
-/// use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-/// use simple_someip::e2e::E2ERegistry;
-/// use simple_someip::transport::{StaticE2EHandle, AtomicInterfaceHandle};
+/// use core::sync::atomic::AtomicU32;
+/// use simple_someip::transport::AtomicInterfaceHandle;
 ///
-/// // Initialize once in main() before spawning tasks.
-/// fn init() -> (StaticE2EHandle, AtomicInterfaceHandle) {
-///     static IFACE_ADDR: AtomicU32 = AtomicU32::new(0);
-///     // E2ERegistry::new() is not const so the storage is heap-placed once.
-///     let registry_storage: &'static _ = Box::leak(Box::new(
-///         Mutex::<CriticalSectionRawMutex, RefCell<E2ERegistry>>::new(
-///             RefCell::new(E2ERegistry::new()),
-///         ),
-///     ));
-///     (StaticE2EHandle::new(registry_storage), AtomicInterfaceHandle::new(&IFACE_ADDR))
-/// }
+/// static IFACE_ADDR: AtomicU32 = AtomicU32::new(0);
+/// let iface = AtomicInterfaceHandle::new(&IFACE_ADDR);
 /// ```
-///
-/// # No-allocator targets
-///
-/// The example above uses `Box::leak` because [`crate::e2e::E2ERegistry::new()`] is not
-/// currently `const`. On a target with no allocator, swap that for a
-/// `static`-cell pattern (e.g. `static_cell::StaticCell::init`) once the
-/// registry constructor becomes `const`-friendly. The handle layer itself
-/// never allocates — only the one-time storage materialization does.
 #[cfg(feature = "bare_metal")]
 pub mod bare_metal_handle_impls {
     use super::InterfaceHandle;
     use core::net::Ipv4Addr;
     use core::sync::atomic::{AtomicU32, Ordering};
-
-    // `StaticE2EHandle` wraps `E2ERegistry`, which currently requires
-    // `feature = "std"` because its backing storage is `HashMap`. Ported
-    // separately below so the rest of this module — in particular
-    // `AtomicInterfaceHandle` — is available in pure `no_std` bare-metal
-    // builds.
 
     /// No-alloc [`InterfaceHandle`] backed by a `&'static AtomicU32`.
     ///
@@ -1118,91 +1224,8 @@ pub mod bare_metal_handle_impls {
     // pass `&SOCKET` directly into Server's no-wrap constructors.
 }
 
-/// `StaticE2EHandle` — no-alloc `E2ERegistryHandle` backed by a
-/// `&'static` critical-section mutex.
-///
-/// Available in pure `no_std` builds: [`crate::e2e::E2ERegistry`] is
-/// backed by [`heapless::index_map::FnvIndexMap`], so no allocator is
-/// required.
-#[cfg(feature = "bare_metal")]
-pub mod bare_metal_e2e_impl {
-    use super::E2ERegistryHandle;
-    use crate::e2e::{
-        E2ECheckStatus, E2EKey, E2EProfile, E2ERegistry, E2ERegistryFull, Error as E2EError,
-    };
-    use core::cell::RefCell;
-    use core::net::IpAddr;
-    use embassy_sync::blocking_mutex::Mutex;
-    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-
-    /// Convenience type alias for the embassy-sync critical-section mutex
-    /// backing [`StaticE2EHandle`].
-    pub type StaticE2EStorage = Mutex<CriticalSectionRawMutex, RefCell<E2ERegistry>>;
-
-    /// No-alloc [`E2ERegistryHandle`] backed by a `&'static` critical-section
-    /// mutex.
-    ///
-    /// All clones are the same thin pointer. Construct via [`StaticE2EHandle::new`]
-    /// and supply a `&'static StaticE2EStorage` (typically obtained via
-    /// `Box::leak` during system init, since [`E2ERegistry::new`] is not const).
-    #[derive(Clone, Copy)]
-    pub struct StaticE2EHandle(&'static StaticE2EStorage);
-
-    impl StaticE2EHandle {
-        /// Wraps a static reference to the backing mutex.
-        pub const fn new(storage: &'static StaticE2EStorage) -> Self {
-            Self(storage)
-        }
-    }
-
-    impl E2ERegistryHandle for StaticE2EHandle {
-        fn register(&self, key: E2EKey, profile: E2EProfile) -> Result<(), E2ERegistryFull> {
-            self.0.lock(|cell| cell.borrow_mut().register(key, profile))
-        }
-
-        fn unregister(&self, key: &E2EKey) {
-            self.0.lock(|cell| cell.borrow_mut().unregister(key));
-        }
-
-        fn contains_key(&self, key: &E2EKey) -> bool {
-            self.0.lock(|cell| cell.borrow().contains_key(key))
-        }
-
-        fn protect(
-            &self,
-            key: E2EKey,
-            payload: &[u8],
-            upper_header: [u8; 8],
-            output: &mut [u8],
-        ) -> Option<Result<usize, E2EError>> {
-            self.0.lock(|cell| {
-                cell.borrow_mut()
-                    .protect(key, payload, upper_header, output)
-            })
-        }
-
-        fn check<'a>(
-            &self,
-            source: IpAddr,
-            key: E2EKey,
-            payload: &'a [u8],
-            upper_header: [u8; 8],
-        ) -> Option<(E2ECheckStatus, &'a [u8])> {
-            self.0
-                .lock(|cell| cell.borrow_mut().check(source, key, payload, upper_header))
-        }
-
-        fn reset_source(&self, source: IpAddr) {
-            self.0.lock(|cell| cell.borrow_mut().reset_source(source));
-        }
-    }
-}
-
 #[cfg(feature = "bare_metal")]
 pub use bare_metal_handle_impls::AtomicInterfaceHandle;
-
-#[cfg(feature = "bare_metal")]
-pub use bare_metal_e2e_impl::{StaticE2EHandle, StaticE2EStorage};
 
 // ── Channel-handle abstraction ────────────────────────────────────────────
 //
@@ -1233,6 +1256,10 @@ pub trait OneshotSend<T: Send + 'static>: Send + 'static {
     ///
     /// Returns `Err(value)` if the receiver was already dropped.
     fn send(self, value: T) -> Result<(), T>;
+
+    /// Whether the receiver has been dropped, so nothing sent can be
+    /// received.
+    fn is_closed(&self) -> bool;
 }
 
 /// The receive half of a oneshot channel. Resolves once the sender delivers a
@@ -1450,12 +1477,11 @@ impl<const SLOTS: usize, const LEN: usize> BufferProvider for StaticBufferProvid
 #[cfg(any(test, feature = "bare_metal"))]
 pub mod probe {
     use super::{
-        E2ERegistryHandle, InterfaceHandle, ReceivedDatagram, SocketOptions, Spawner, Timer,
-        TransportError, TransportFactory, TransportSocket,
+        InterfaceHandle, ReceivedDatagram, SocketOptions, Spawner, Timer, TransportError,
+        TransportFactory, TransportSocket,
     };
-    use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile, Error as E2EError};
     use core::future::Future;
-    use core::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+    use core::net::{Ipv4Addr, SocketAddrV4};
     use core::time::Duration;
 
     /// Socket whose I/O futures resolve immediately with
@@ -1531,43 +1557,6 @@ pub mod probe {
         }
     }
 
-    /// E2E registry handle that registers nothing and checks nothing.
-    #[derive(Clone)]
-    pub struct NullE2ERegistry;
-
-    impl E2ERegistryHandle for NullE2ERegistry {
-        fn register(
-            &self,
-            _key: E2EKey,
-            _profile: E2EProfile,
-        ) -> Result<(), crate::e2e::E2ERegistryFull> {
-            Ok(())
-        }
-        fn unregister(&self, _key: &E2EKey) {}
-        fn contains_key(&self, _key: &E2EKey) -> bool {
-            false
-        }
-        fn protect(
-            &self,
-            _key: E2EKey,
-            _payload: &[u8],
-            _upper_header: [u8; 8],
-            _output: &mut [u8],
-        ) -> Option<Result<usize, E2EError>> {
-            None
-        }
-        fn check<'a>(
-            &self,
-            _source: IpAddr,
-            _key: E2EKey,
-            _payload: &'a [u8],
-            _upper_header: [u8; 8],
-        ) -> Option<(E2ECheckStatus, &'a [u8])> {
-            None
-        }
-        fn reset_source(&self, _source: IpAddr) {}
-    }
-
     /// Interface handle pinned to a fixed address.
     #[derive(Clone)]
     pub struct NullInterface(pub Ipv4Addr);
@@ -1598,8 +1587,323 @@ mod tests {
     //! trivial mock implementations compile and that defaults behave as
     //! documented.
 
-    use super::probe::{NullE2ERegistry, NullFactory, NullInterface, NullSocket, NullTimer};
+    use super::probe::{NullFactory, NullInterface, NullSocket, NullTimer};
     use super::*;
+
+    mod e2e_handle {
+        use super::super::{E2ECheck, E2EHandle, E2EProtectError, NoE2E};
+        use crate::protocol::MessageId;
+        use core::net::{IpAddr, Ipv4Addr};
+        use core::num::NonZeroU8;
+
+        const ID: MessageId = MessageId::new_from_service_and_method(0x1234, 0x0001);
+        const SOURCE: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        struct Strip1;
+        impl E2EHandle for Strip1 {
+            fn check<'a>(
+                &self,
+                _source: IpAddr,
+                _message_id: MessageId,
+                payload: &'a [u8],
+                _upper_header: [u8; 8],
+            ) -> Option<E2ECheck<'a>> {
+                Some(E2ECheck::Passed {
+                    status: NonZeroU8::MIN,
+                    payload: &payload[1..],
+                })
+            }
+            fn protect<'b>(
+                &self,
+                _message_id: MessageId,
+                buf: &'b mut [u8],
+                _payload_len: usize,
+                _upper_header: [u8; 8],
+            ) -> Option<Result<&'b [u8], E2EProtectError>> {
+                Some(Err(E2EProtectError::BufferTooSmall {
+                    needed: buf.len() + 1,
+                    available: buf.len(),
+                }))
+            }
+            fn reset_source(&self, _source: IpAddr) {}
+        }
+        static STRIP1: Strip1 = Strip1;
+
+        /// Protects every message ID by prefixing `0xAA`.
+        #[cfg(any(feature = "client", feature = "server"))]
+        struct Prefix;
+        #[cfg(any(feature = "client", feature = "server"))]
+        impl E2EHandle for Prefix {
+            fn check<'a>(
+                &self,
+                _source: IpAddr,
+                _message_id: MessageId,
+                _payload: &'a [u8],
+                _upper_header: [u8; 8],
+            ) -> Option<E2ECheck<'a>> {
+                None
+            }
+            fn protect<'b>(
+                &self,
+                _message_id: MessageId,
+                buf: &'b mut [u8],
+                payload_len: usize,
+                _upper_header: [u8; 8],
+            ) -> Option<Result<&'b [u8], E2EProtectError>> {
+                let needed = payload_len + 1;
+                if buf.len() < needed {
+                    return Some(Err(E2EProtectError::BufferTooSmall {
+                        needed,
+                        available: buf.len(),
+                    }));
+                }
+                buf.copy_within(..payload_len, 1);
+                buf[0] = 0xAA;
+                Some(Ok(&buf[..needed]))
+            }
+            fn reset_source(&self, _source: IpAddr) {}
+        }
+
+        /// Returns protected bytes that are not in `buf`.
+        #[cfg(any(feature = "client", feature = "server"))]
+        struct Elsewhere;
+        #[cfg(any(feature = "client", feature = "server"))]
+        impl E2EHandle for Elsewhere {
+            fn check<'a>(
+                &self,
+                _source: IpAddr,
+                _message_id: MessageId,
+                _payload: &'a [u8],
+                _upper_header: [u8; 8],
+            ) -> Option<E2ECheck<'a>> {
+                None
+            }
+            fn protect<'b>(
+                &self,
+                _message_id: MessageId,
+                _buf: &'b mut [u8],
+                _payload_len: usize,
+                _upper_header: [u8; 8],
+            ) -> Option<Result<&'b [u8], E2EProtectError>> {
+                static ELSEWHERE: [u8; 4] = [0xAA; 4];
+                Some(Ok(&ELSEWHERE))
+            }
+            fn reset_source(&self, _source: IpAddr) {}
+        }
+
+        /// Leaves the payload unchanged but moves it two bytes into `buf`.
+        #[cfg(any(feature = "client", feature = "server"))]
+        struct ShiftRight2;
+        #[cfg(any(feature = "client", feature = "server"))]
+        impl E2EHandle for ShiftRight2 {
+            fn check<'a>(
+                &self,
+                _source: IpAddr,
+                _message_id: MessageId,
+                _payload: &'a [u8],
+                _upper_header: [u8; 8],
+            ) -> Option<E2ECheck<'a>> {
+                None
+            }
+            fn protect<'b>(
+                &self,
+                _message_id: MessageId,
+                buf: &'b mut [u8],
+                payload_len: usize,
+                _upper_header: [u8; 8],
+            ) -> Option<Result<&'b [u8], E2EProtectError>> {
+                buf.copy_within(..payload_len, 2);
+                buf[..2].fill(0xEE);
+                Some(Ok(&buf[2..payload_len + 2]))
+            }
+            fn reset_source(&self, _source: IpAddr) {}
+        }
+
+        /// A SOME/IP message with `message_id` and a 2-byte payload, and its
+        /// length, at the front of a 32-byte datagram.
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn datagram(message_id: MessageId) -> ([u8; 32], usize) {
+            let mut buf = [0u8; 32];
+            buf[..4].copy_from_slice(&message_id.message_id().to_be_bytes());
+            buf[4..8].copy_from_slice(&10u32.to_be_bytes());
+            buf[16..18].copy_from_slice(&[1, 2]);
+            (buf, 18)
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_splices_the_protected_payload_and_rewrites_the_length() {
+            let (mut buf, len) = datagram(ID);
+            let new_len = super::super::protect_in_place(&Prefix, &mut buf, len).unwrap();
+            assert_eq!(new_len, 19);
+            assert_eq!(&buf[4..8], &11u32.to_be_bytes());
+            assert_eq!(&buf[16..19], &[0xAA, 1, 2]);
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_moves_protected_bytes_to_the_front_of_the_payload() {
+            let (mut buf, len) = datagram(ID);
+            let new_len = super::super::protect_in_place(&ShiftRight2, &mut buf, len).unwrap();
+            assert_eq!(new_len, 18);
+            assert_eq!(&buf[16..18], &[1, 2]);
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_rejects_bytes_the_hook_returns_from_outside_the_payload() {
+            let (mut buf, len) = datagram(ID);
+            let before = buf;
+            assert_eq!(
+                super::super::protect_in_place(&Elsewhere, &mut buf, len),
+                Err(super::super::ProtectInPlaceError::OutsideBuffer)
+            );
+            assert_eq!(&buf[..16], &before[..16], "header untouched");
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_accepts_an_empty_protected_payload_from_anywhere() {
+            /// Protects every payload into nothing, returning an unrelated
+            /// empty slice.
+            struct Empty;
+            impl E2EHandle for Empty {
+                fn check<'a>(
+                    &self,
+                    _source: IpAddr,
+                    _message_id: MessageId,
+                    _payload: &'a [u8],
+                    _upper_header: [u8; 8],
+                ) -> Option<E2ECheck<'a>> {
+                    None
+                }
+                fn protect<'b>(
+                    &self,
+                    _message_id: MessageId,
+                    _buf: &'b mut [u8],
+                    _payload_len: usize,
+                    _upper_header: [u8; 8],
+                ) -> Option<Result<&'b [u8], E2EProtectError>> {
+                    Some(Ok(&[]))
+                }
+                fn reset_source(&self, _source: IpAddr) {}
+            }
+            let (mut buf, len) = datagram(ID);
+            assert_eq!(
+                super::super::protect_in_place(&Empty, &mut buf, len),
+                Ok(16)
+            );
+            assert_eq!(&buf[4..8], &8u32.to_be_bytes());
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_rejects_a_datagram_shorter_than_a_header() {
+            let (mut buf, _) = datagram(ID);
+            assert_eq!(
+                super::super::protect_in_place(&Prefix, &mut buf, 15),
+                Err(super::super::ProtectInPlaceError::NotAMessage)
+            );
+            assert_eq!(
+                super::super::protect_in_place(&Prefix, &mut buf[..17], 18),
+                Err(super::super::ProtectInPlaceError::NotAMessage)
+            );
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_leaves_sd_and_unprotected_messages_alone() {
+            let (mut buf, len) = datagram(MessageId::SD);
+            let before = buf;
+            assert_eq!(
+                super::super::protect_in_place(&Prefix, &mut buf, len),
+                Ok(len)
+            );
+            assert_eq!(buf, before);
+            let (mut buf, len) = datagram(ID);
+            assert_eq!(
+                super::super::protect_in_place(&NoE2E, &mut buf, len),
+                Ok(len)
+            );
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_rejects_a_protected_message_the_datagram_cannot_hold() {
+            let (mut buf, len) = datagram(ID);
+            assert_eq!(
+                super::super::protect_in_place(&Prefix, &mut buf[..18], len),
+                Err(super::super::ProtectInPlaceError::Hook(
+                    E2EProtectError::BufferTooSmall {
+                        needed: 3,
+                        available: 2
+                    }
+                ))
+            );
+        }
+
+        #[test]
+        #[cfg(any(feature = "client", feature = "server"))]
+        fn protect_in_place_refuses_a_payload_the_hook_cannot_protect() {
+            struct TooLong;
+            impl E2EHandle for TooLong {
+                fn check<'a>(
+                    &self,
+                    _source: IpAddr,
+                    _message_id: MessageId,
+                    _payload: &'a [u8],
+                    _upper_header: [u8; 8],
+                ) -> Option<E2ECheck<'a>> {
+                    None
+                }
+                fn protect<'b>(
+                    &self,
+                    _message_id: MessageId,
+                    _buf: &'b mut [u8],
+                    payload_len: usize,
+                    _upper_header: [u8; 8],
+                ) -> Option<Result<&'b [u8], E2EProtectError>> {
+                    Some(Err(E2EProtectError::PayloadTooLong {
+                        needed: payload_len + 1,
+                        max: payload_len,
+                    }))
+                }
+                fn reset_source(&self, _source: IpAddr) {}
+            }
+            let (mut buf, len) = datagram(ID);
+            assert_eq!(
+                super::super::protect_in_place(&TooLong, &mut buf, len),
+                Err(super::super::ProtectInPlaceError::Hook(
+                    E2EProtectError::PayloadTooLong { needed: 3, max: 2 }
+                ))
+            );
+        }
+
+        #[test]
+        fn no_e2e_checks_and_protects_nothing() {
+            assert_eq!(NoE2E.check(SOURCE, ID, &[1, 2], [0; 8]), None);
+            assert_eq!(NoE2E.protect(ID, &mut [1, 2, 0, 0], 2, [0; 8]), None);
+        }
+
+        #[test]
+        fn a_static_reference_is_a_handle() {
+            let handle: &'static dyn E2EHandle = &STRIP1;
+            assert_eq!(
+                handle.check(SOURCE, ID, &[9, 8, 7], [0; 8]),
+                Some(E2ECheck::Passed {
+                    status: NonZeroU8::MIN,
+                    payload: &[8u8, 7][..]
+                })
+            );
+            assert_eq!(
+                handle.protect(ID, &mut [1, 0], 1, [0; 8]),
+                Some(Err(E2EProtectError::BufferTooSmall {
+                    needed: 3,
+                    available: 2
+                }))
+            );
+        }
+    }
 
     /// `IoErrorKind::is_transient_recv` must classify the well-known
     /// transient kinds as `true` (so they do not count toward
@@ -1705,23 +2009,6 @@ mod tests {
         let e = TransportError::Io(IoErrorKind::TimedOut);
         assert_eq!(e, TransportError::Io(IoErrorKind::TimedOut));
         assert_ne!(e, TransportError::AddressInUse);
-    }
-
-    #[test]
-    fn null_e2e_registry_compiles() {
-        let r = NullE2ERegistry;
-        let key = E2EKey::new(0, 0);
-        r.register(
-            key,
-            crate::e2e::E2EProfile::Profile4(crate::e2e::Profile4Config::new(0, 8)),
-        )
-        .expect("NullE2ERegistry::register is infallible");
-        assert!(!r.contains_key(&key));
-        assert!(
-            r.check(Ipv4Addr::LOCALHOST.into(), key, b"hello", [0; 8])
-                .is_none()
-        );
-        r.reset_source(Ipv4Addr::LOCALHOST.into()); // no-op in null impl
     }
 
     #[test]

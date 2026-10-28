@@ -42,8 +42,8 @@ What the graph doesn't show:
   `TransportFactory`. The `-tokio` variants add the defaults that make
   `Client::new` and `Server::new` work, and force `std`.
 - **`bare_metal` alone is not bare-metal-complete.** It activates embassy-sync as
-  the channel backend along with `static_channels`, `AtomicInterfaceHandle` and
-  `StaticE2EHandle` — but `client` and `server` still need your own `Spawner` and
+  the channel backend along with `static_channels` and `AtomicInterfaceHandle` —
+  but `client` and `server` still need your own `Spawner` and
   `TransportFactory` impls.
 - **`bare-metal-runtime` is server-side only.** It pulls in `server`, not
   `client` — it composes the embassy executor and the single task around the

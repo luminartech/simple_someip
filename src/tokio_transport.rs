@@ -455,6 +455,10 @@ pub struct TokioOneshotReceiver<T>(pub(crate) tokio::sync::oneshot::Receiver<T>)
 pub struct TokioUnboundedReceiver<T>(pub(crate) tokio::sync::mpsc::UnboundedReceiver<T>);
 
 impl<T: Send + 'static> OneshotSend<T> for tokio::sync::oneshot::Sender<T> {
+    fn is_closed(&self) -> bool {
+        tokio::sync::oneshot::Sender::is_closed(self)
+    }
+
     fn send(self, value: T) -> Result<(), T> {
         tokio::sync::oneshot::Sender::send(self, value)
     }
@@ -600,6 +604,14 @@ impl BufferProvider for TokioBufferProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oneshot_sender_is_closed_once_the_receiver_drops() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
+        assert!(!OneshotSend::is_closed(&tx));
+        drop(rx);
+        assert!(OneshotSend::is_closed(&tx));
+    }
 
     #[tokio::test]
     async fn bind_ephemeral_and_report_local_addr() {

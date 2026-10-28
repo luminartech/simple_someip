@@ -55,21 +55,20 @@ pub use service_registry::ServiceEndpointKey;
 pub use socket_manager::{ReceivedMessage, SendMessage};
 
 use crate::Timer;
-#[cfg(feature = "client-tokio")]
-use crate::e2e::E2ERegistry;
-use crate::e2e::{E2ECheckStatus, E2EKey, E2EProfile};
 use crate::log::info;
 #[cfg(feature = "client-tokio")]
 use crate::tokio_transport::{TokioChannels, TokioSpawner, TokioTimer};
+#[cfg(feature = "client-tokio")]
+use crate::transport::NoE2E;
 use crate::transport::{
-    BoundedPooled, ChannelFactory, E2ERegistryHandle, InterfaceHandle, MpscSend, OneshotPooled,
+    BoundedPooled, ChannelFactory, E2EHandle, InterfaceHandle, MpscSend, OneshotPooled,
     OneshotRecv, Spawner, TransportFactory, TransportSocket, UnboundedPooled, UnboundedRecv,
 };
 use crate::{protocol, protocol::Message, traits::PayloadWireFormat};
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use inner::Inner;
 #[cfg(feature = "client-tokio")]
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 /// Marker trait declaring the channel-pool entries a [`ChannelFactory`]
 /// must declare for [`Client`] to compile against it. End users do not
@@ -165,6 +164,8 @@ impl<P: Send + 'static, C: ChannelFactory> PendingResponse<P, C> {
     /// Returns [`Error::ErrorReply`] if the reply is an ERROR message or
     /// carries a return code other than
     /// [`ReturnCode::Ok`](crate::protocol::ReturnCode::Ok).
+    /// Returns [`Error::E2eCheckFailed`] if the reply is not an error reply
+    /// and failed the client's [`E2EHandle`] check.
     /// Returns [`Error::Capacity`] with tag `"pending_responses"`
     /// if the inner loop's response-tracking map was full when the request
     /// was sent — the UDP send still went out, but the reply (if any)
@@ -211,14 +212,15 @@ pub enum ClientUpdate<P: PayloadWireFormat> {
     /// Unicast message received. An error reply arrives as
     /// [`ClientUpdate::ErrorReply`] instead.
     ///
-    /// When E2E is configured for this message's key, `e2e_status` contains
-    /// the check result and the payload has its E2E header stripped.
-    /// When no E2E is configured, `e2e_status` is `None`.
+    /// When the client's [`E2EHandle`] checks this message, `e2e_status`
+    /// says whether the check passed, with the hook's status code; the
+    /// payload is the one without its protection header on a pass, and the
+    /// one received on a failure. Otherwise `e2e_status` is `None`.
     Unicast {
         /// The received SOME/IP message.
         message: Message<P>,
-        /// E2E check status, if E2E was configured for this message.
-        e2e_status: Option<E2ECheckStatus>,
+        /// What the [`E2EHandle`]'s check found, if it checked this message.
+        e2e_status: Option<crate::E2EStatus>,
         /// The sender's source address. On a shared subnet this is the only
         /// way to attribute a unicast event to a specific device, since the
         /// SOME/IP header carries no instance id.
@@ -232,8 +234,8 @@ pub enum ClientUpdate<P: PayloadWireFormat> {
         header: protocol::Header,
         /// The reply's payload, or `None` if it does not decode as `P`.
         payload: Option<P>,
-        /// E2E check status, if E2E was configured for this message.
-        e2e_status: Option<E2ECheckStatus>,
+        /// What the [`E2EHandle`]'s check found, if it checked this message.
+        e2e_status: Option<crate::E2EStatus>,
         /// The sender's source address.
         source: SocketAddr,
     },
@@ -305,7 +307,7 @@ impl<MessageDefinitions: PayloadWireFormat + 'static, C: ChannelFactory>
 
 /// Bundle of dependencies passed to [`Client::new_with_deps`]. Bundling
 /// the five pluggable infrastructure types (`TransportFactory`, `Timer`,
-/// `E2ERegistryHandle`, `InterfaceHandle`, `Spawner`) into a single
+/// `E2EHandle`, `InterfaceHandle`, `Spawner`) into a single
 /// struct keeps the constructor's argument list manageable (consumers
 /// see one named field per dependency rather than positional args six
 /// deep).
@@ -322,7 +324,7 @@ pub struct ClientDeps<F, Tm, R, I, Sp, BP>
 where
     F: TransportFactory,
     Tm: Timer,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     I: InterfaceHandle,
     BP: crate::transport::BufferProvider,
 {
@@ -330,8 +332,9 @@ where
     pub factory: F,
     /// Async sleep primitive used by the run-loop's idle tick.
     pub timer: Tm,
-    /// Shared E2E registry handle for runtime E2E configuration.
-    pub e2e_registry: R,
+    /// The [`E2EHandle`] that checks received and
+    /// protects sent payloads; [`crate::NoE2E`] for neither.
+    pub e2e: R,
     /// Shared interface-address handle. The run-loop reads its current
     /// value when `bind_*` is invoked.
     pub interface: I,
@@ -348,9 +351,9 @@ where
 ///
 /// Available under the `client-tokio` feature. Returns a `ClientDeps`
 /// pre-populated with `TokioTransport` / `TokioTimer` / `TokioSpawner`
-/// and a fresh `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<Ipv4Addr>>`.
+/// and a fresh `NoE2E` / `Arc<RwLock<Ipv4Addr>>`.
 /// Combine with the [`ClientDeps::with_factory`] / [`ClientDeps::with_timer`]
-/// / [`ClientDeps::with_e2e_registry`] / [`ClientDeps::with_interface`]
+/// / [`ClientDeps::with_e2e`] / [`ClientDeps::with_interface`]
 /// / [`ClientDeps::with_spawner`] builders to override individual
 /// fields without spelling out the rest by hand.
 ///
@@ -361,7 +364,7 @@ where
 /// use std::net::Ipv4Addr;
 /// let deps = ClientDeps::tokio(Ipv4Addr::LOCALHOST);
 /// let (_client, _updates, _run) =
-///     Client::<RawPayload, _, _, TokioChannels>::new_with_deps(deps, false);
+///     Client::<RawPayload, _, TokioChannels>::new_with_deps(deps, false);
 /// # }
 /// ```
 #[cfg(feature = "client-tokio")]
@@ -369,7 +372,7 @@ impl
     ClientDeps<
         crate::tokio_transport::TokioTransport,
         TokioTimer,
-        Arc<Mutex<E2ERegistry>>,
+        NoE2E,
         Arc<RwLock<Ipv4Addr>>,
         TokioSpawner,
         crate::tokio_transport::TokioBufferProvider,
@@ -388,7 +391,7 @@ impl
         Self {
             factory: crate::tokio_transport::TokioTransport,
             timer: TokioTimer,
-            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            e2e: NoE2E,
             interface: Arc::new(RwLock::new(interface)),
             spawner: TokioSpawner,
             buffer_provider: crate::tokio_transport::TokioBufferProvider::new(),
@@ -420,7 +423,7 @@ impl<F, Tm, R, I, Sp, BP> ClientDeps<F, Tm, R, I, Sp, BP>
 where
     F: TransportFactory,
     Tm: Timer,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     I: InterfaceHandle,
     BP: crate::transport::BufferProvider,
 {
@@ -433,7 +436,7 @@ where
         ClientDeps {
             factory,
             timer: self.timer,
-            e2e_registry: self.e2e_registry,
+            e2e: self.e2e,
             interface: self.interface,
             spawner: self.spawner,
             buffer_provider: self.buffer_provider,
@@ -446,23 +449,20 @@ where
         ClientDeps {
             factory: self.factory,
             timer,
-            e2e_registry: self.e2e_registry,
+            e2e: self.e2e,
             interface: self.interface,
             spawner: self.spawner,
             buffer_provider: self.buffer_provider,
         }
     }
 
-    /// Replace the `e2e_registry` field, returning a `ClientDeps` over
-    /// the new registry-handle type.
-    pub fn with_e2e_registry<R2: E2ERegistryHandle>(
-        self,
-        e2e_registry: R2,
-    ) -> ClientDeps<F, Tm, R2, I, Sp, BP> {
+    /// Replace the `e2e` field, returning a `ClientDeps` over
+    /// the new [`E2EHandle`] type.
+    pub fn with_e2e<R2: E2EHandle + Clone>(self, e2e: R2) -> ClientDeps<F, Tm, R2, I, Sp, BP> {
         ClientDeps {
             factory: self.factory,
             timer: self.timer,
-            e2e_registry,
+            e2e,
             interface: self.interface,
             spawner: self.spawner,
             buffer_provider: self.buffer_provider,
@@ -478,7 +478,7 @@ where
         ClientDeps {
             factory: self.factory,
             timer: self.timer,
-            e2e_registry: self.e2e_registry,
+            e2e: self.e2e,
             interface,
             spawner: self.spawner,
             buffer_provider: self.buffer_provider,
@@ -497,7 +497,7 @@ where
         ClientDeps {
             factory: self.factory,
             timer: self.timer,
-            e2e_registry: self.e2e_registry,
+            e2e: self.e2e,
             interface: self.interface,
             spawner,
             buffer_provider: self.buffer_provider,
@@ -517,7 +517,7 @@ where
         ClientDeps {
             factory: self.factory,
             timer: self.timer,
-            e2e_registry: self.e2e_registry,
+            e2e: self.e2e,
             interface: self.interface,
             spawner,
             buffer_provider: self.buffer_provider,
@@ -535,7 +535,7 @@ where
         ClientDeps {
             factory: self.factory,
             timer: self.timer,
-            e2e_registry: self.e2e_registry,
+            e2e: self.e2e,
             interface: self.interface,
             spawner: self.spawner,
             buffer_provider,
@@ -549,10 +549,10 @@ where
 /// event loop and can be used concurrently from different tasks.
 ///
 /// The optional type parameters `R` and `I` let callers substitute their own
-/// [`E2ERegistryHandle`] and [`InterfaceHandle`] implementations (for example,
+/// [`E2EHandle`] and [`InterfaceHandle`] implementations (for example,
 /// bare-metal handles backed by a critical-section mutex rather than
 /// `Arc<Mutex<_>>`). On `std + tokio`, the defaults
-/// (`Arc<Mutex<E2ERegistry>>` and `Arc<RwLock<Ipv4Addr>>`) are used by the
+/// (`NoE2E` and `Arc<RwLock<Ipv4Addr>>`) are used by the
 /// standard constructors `Self::new` / `Self::new_with_loopback` /
 /// `Self::new_with_spawner_and_loopback` (all under `client-tokio`).
 ///
@@ -560,8 +560,8 @@ where
 ///
 /// [`ClientDeps`] and `ServerDeps` share their first three
 /// generic positions (`F`, `Tm`, `R`) to read symmetrically, but the
-/// `Client` struct itself carries only `<MessageDefinitions, R, I, C>`
-/// — `F`, `Tm`, and `Sp` (Spawner) live on the run-loop future
+/// `Client` struct itself carries only `<MessageDefinitions, I, C>`
+/// — `F`, `Tm`, `R`, and `Sp` (Spawner) live on the run-loop future
 /// produced by [`Self::new_with_deps`], not on the handle. The
 /// asymmetry between `Client<…>` and `Server<F, Tm, R, Sub, …>` is
 /// structural, not an oversight: a `Client` value retains no reference
@@ -571,19 +571,16 @@ where
 #[derive(Clone)]
 pub struct Client<
     MessageDefinitions: PayloadWireFormat + Send + 'static,
-    R: E2ERegistryHandle,
     I: InterfaceHandle,
     C: ChannelFactory,
 > {
     interface: I,
     control_sender: C::BoundedSender<inner::ControlMessage<MessageDefinitions, C>, 4>,
-    e2e_registry: R,
 }
 
-impl<MessageDefinitions, R, I, C> core::fmt::Debug for Client<MessageDefinitions, R, I, C>
+impl<MessageDefinitions, I, C> core::fmt::Debug for Client<MessageDefinitions, I, C>
 where
     MessageDefinitions: PayloadWireFormat + Send + 'static,
-    R: E2ERegistryHandle,
     I: InterfaceHandle,
     C: ChannelFactory,
 {
@@ -601,8 +598,7 @@ where
 /// [`Self::new_with_spawner_and_loopback`] (always available under `client`)
 /// and supply their own channel factory + spawner.
 #[cfg(feature = "client-tokio")]
-impl<MessageDefinitions>
-    Client<MessageDefinitions, Arc<Mutex<E2ERegistry>>, Arc<RwLock<Ipv4Addr>>, TokioChannels>
+impl<MessageDefinitions> Client<MessageDefinitions, Arc<RwLock<Ipv4Addr>>, TokioChannels>
 where
     MessageDefinitions: PayloadWireFormat + Clone + core::fmt::Debug + 'static,
 {
@@ -624,7 +620,7 @@ where
     /// # use simple_someip::{Client, RawPayload};
     /// # use std::net::Ipv4Addr;
     /// # async fn demo() {
-    /// let (client, mut updates, run) = Client::<RawPayload, _, _, _>::new(Ipv4Addr::LOCALHOST);
+    /// let (client, mut updates, run) = Client::<RawPayload, _, _>::new(Ipv4Addr::LOCALHOST);
     /// let _run_task = tokio::spawn(run);
     /// // ...interact with `client` and `updates`...
     /// # let _ = (client, updates);
@@ -689,7 +685,7 @@ where
     /// #   fn spawn(&self, _: impl core::future::Future<Output = ()> + Send + 'static) {}
     /// # }
     /// let (client, mut updates, run) =
-    ///     Client::<RawPayload, _, _, _>::new_with_spawner_and_loopback(
+    ///     Client::<RawPayload, _, _>::new_with_spawner_and_loopback(
     ///         Ipv4Addr::LOCALHOST,
     ///         false,
     ///         MySpawner,
@@ -725,7 +721,7 @@ where
             ClientDeps {
                 factory: crate::tokio_transport::TokioTransport,
                 timer: TokioTimer,
-                e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+                e2e: NoE2E,
                 interface: Arc::new(RwLock::new(interface)),
                 spawner,
                 // One `TokioBufferProvider::new()` per client construction.
@@ -740,11 +736,10 @@ where
     }
 }
 
-/// Methods available on all `Client<M, R, I, C>` regardless of handle types.
-impl<MessageDefinitions, R, I, C> Client<MessageDefinitions, R, I, C>
+/// Methods available on all `Client<M, I, C>` regardless of handle types.
+impl<MessageDefinitions, I, C> Client<MessageDefinitions, I, C>
 where
     MessageDefinitions: PayloadWireFormat + Clone + core::fmt::Debug + Send + 'static,
-    R: E2ERegistryHandle,
     I: InterfaceHandle,
     C: ChannelFactory,
     Result<(), Error>: OneshotPooled<C>,
@@ -757,14 +752,14 @@ where
 {
     /// Bare-metal-friendly constructor that takes every dependency
     /// explicitly via a [`ClientDeps`] bundle: a [`TransportFactory`], a
-    /// [`Spawner`], a [`Timer`], an [`E2ERegistryHandle`], and an
+    /// [`Spawner`], a [`Timer`], an [`E2EHandle`], and an
     /// [`InterfaceHandle`].
     ///
     /// This is the no-tokio entry point. The `client-tokio` convenience
     /// constructors (`Self::new`, `Self::new_with_loopback`,
     /// `Self::new_with_spawner_and_loopback`) ultimately delegate
     /// here, supplying `TokioTransport` / `TokioTimer` / `TokioSpawner`
-    /// / `Arc<Mutex<E2ERegistry>>` / `Arc<RwLock<Ipv4Addr>>` for the
+    /// / `NoE2E` / `Arc<RwLock<Ipv4Addr>>` for the
     /// generic parameters. Bare-metal callers supply their own.
     ///
     /// `deps.interface` is consumed as an [`InterfaceHandle`]; the
@@ -783,7 +778,7 @@ where
     /// `LocalSet`-style spawner shim.
     #[allow(clippy::type_complexity)]
     #[must_use = "the returned run-loop future must be spawned (e.g. via the Spawner) for the client to make progress"]
-    pub fn new_with_deps<F, Tm, Sp, BP>(
+    pub fn new_with_deps<F, Tm, R, Sp, BP>(
         deps: ClientDeps<F, Tm, R, I, Sp, BP>,
         multicast_loopback: bool,
     ) -> (
@@ -792,6 +787,7 @@ where
         impl core::future::Future<Output = ()> + Send + 'static,
     )
     where
+        R: E2EHandle + Clone,
         F: TransportFactory + Send + Sync + 'static,
         F::Socket: Send + Sync + 'static,
         for<'a> F::BindFuture<'a>: Send,
@@ -805,7 +801,7 @@ where
         let ClientDeps {
             factory,
             timer,
-            e2e_registry,
+            e2e,
             interface,
             spawner,
             buffer_provider,
@@ -824,7 +820,7 @@ where
             bind_dispatch::SpawnerDispatch<F, Sp, BP>,
         >::build(
             initial_addr,
-            e2e_registry.clone(),
+            e2e,
             multicast_loopback,
             dispatch,
             timer,
@@ -832,7 +828,6 @@ where
         let client = Self {
             interface,
             control_sender,
-            e2e_registry,
         };
         let updates = ClientUpdates { update_receiver };
         (client, updates, run_future)
@@ -855,7 +850,7 @@ where
     /// [`Spawner`]: crate::transport::Spawner
     #[allow(clippy::type_complexity)]
     #[must_use = "the returned run-loop future must be spawned (e.g. via the LocalSpawner) for the client to make progress"]
-    pub fn new_with_deps_local<F, Tm, Sp, BP>(
+    pub fn new_with_deps_local<F, Tm, R, Sp, BP>(
         deps: ClientDeps<F, Tm, R, I, Sp, BP>,
         multicast_loopback: bool,
     ) -> (
@@ -864,6 +859,7 @@ where
         impl core::future::Future<Output = ()> + 'static,
     )
     where
+        R: E2EHandle + Clone,
         F: TransportFactory + 'static,
         F::Socket: 'static,
         Sp: crate::transport::LocalSpawner + 'static,
@@ -873,7 +869,7 @@ where
         let ClientDeps {
             factory,
             timer,
-            e2e_registry,
+            e2e,
             interface,
             spawner,
             buffer_provider,
@@ -892,7 +888,7 @@ where
             bind_dispatch::LocalSpawnerDispatch<F, Sp, BP>,
         >::build(
             initial_addr,
-            e2e_registry.clone(),
+            e2e,
             multicast_loopback,
             dispatch,
             timer,
@@ -900,7 +896,6 @@ where
         let client = Self {
             interface,
             control_sender,
-            e2e_registry,
         };
         let updates = ClientUpdates { update_receiver };
         (client, updates, run_future)
@@ -1242,6 +1237,8 @@ where
     /// Returns [`Error::ErrorReply`] if the reply is an ERROR message or
     /// carries a return code other than
     /// [`ReturnCode::Ok`](crate::protocol::ReturnCode::Ok).
+    /// Returns [`Error::E2eCheckFailed`] if the reply is not an error reply
+    /// and failed the client's [`E2EHandle`] check.
     /// Returns [`Error::UnsupportedEndpoint`] if the key's endpoint is
     /// not an IPv4/UDP socket.
     /// Returns [`Error::Capacity`] with tag `"pending_responses"` if the
@@ -1267,52 +1264,6 @@ where
         response_rx.recv().await.map_err(|_| Error::Shutdown)?
     }
 
-    /// Register an E2E profile for the given key.
-    ///
-    /// Once registered, incoming messages matching `key` will have their E2E
-    /// header checked and stripped, and outgoing messages will have E2E
-    /// protection applied automatically.
-    ///
-    /// # Shutdown semantics
-    ///
-    /// Unlike most public `Client` methods, `register_e2e` does NOT go
-    /// through the run-loop control channel — it operates directly on
-    /// the shared [`E2ERegistryHandle`]. Consequently it does not return
-    /// `Err(Error::Shutdown)` after the run-loop has exited; the
-    /// registry is still accessible via any held `Client` clone.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::e2e::E2ERegistryFull`] when the underlying
-    /// registry has no room for a new key. Replacing the profile of an
-    /// already-registered key always succeeds. Bare-metal users sizing
-    /// their E2E registry should set
-    /// [`crate::e2e::E2E_REGISTRY_CAP`]-equivalent storage to their
-    /// workload's high-water mark.
-    ///
-    /// # Panics
-    ///
-    /// May panic if the underlying [`E2ERegistryHandle`]
-    /// implementation panics (e.g., `Arc<Mutex<E2ERegistry>>` on mutex poison).
-    ///
-    /// [`E2ERegistryHandle`]: crate::transport::E2ERegistryHandle
-    pub fn register_e2e(
-        &self,
-        key: E2EKey,
-        profile: E2EProfile,
-    ) -> Result<(), crate::e2e::E2ERegistryFull> {
-        self.e2e_registry.register(key, profile)
-    }
-
-    /// Remove E2E configuration for the given key.
-    ///
-    /// Like [`Self::register_e2e`], this method bypasses the run-loop
-    /// control channel and is therefore not subject to
-    /// `Error::Shutdown`.
-    pub fn unregister_e2e(&self, key: &E2EKey) {
-        self.e2e_registry.unregister(key);
-    }
-
     /// Shuts down the client by dropping the control channel.
     ///
     /// The inner event loop will exit once all `Client` clones are dropped.
@@ -1328,10 +1279,9 @@ where
 /// weak-sender shutdown pattern. A bare-metal alternative would need a
 /// different lifecycle mechanism (phase-future).
 #[cfg(feature = "client-tokio")]
-impl<MessageDefinitions, R, I> Client<MessageDefinitions, R, I, TokioChannels>
+impl<MessageDefinitions, I> Client<MessageDefinitions, I, TokioChannels>
 where
     MessageDefinitions: PayloadWireFormat + Clone + core::fmt::Debug + 'static,
-    R: E2ERegistryHandle,
     I: InterfaceHandle,
 {
     /// Start periodic SD announcements on the client's discovery socket.
@@ -1362,12 +1312,11 @@ where
     /// ```no_run
     /// # use simple_someip::{Client, RawPayload, TokioChannels, VecSdHeader};
     /// # use simple_someip::protocol::sd::{self, RebootFlag, Flags};
-    /// # use std::sync::{Arc, Mutex, RwLock};
+    /// # use std::sync::{Arc, RwLock};
     /// # use std::net::Ipv4Addr;
     /// # async fn demo(
     /// #     client: Client<
     /// #         RawPayload,
-    /// #         Arc<Mutex<simple_someip::e2e::E2ERegistry>>,
     /// #         Arc<RwLock<Ipv4Addr>>,
     /// #         TokioChannels,
     /// #     >,
@@ -1486,8 +1435,7 @@ mod tests {
     use automotive_wire_codec::Encode;
     use std::format;
 
-    type TestClient =
-        Client<TestPayload, Arc<Mutex<E2ERegistry>>, Arc<RwLock<Ipv4Addr>>, TokioChannels>;
+    type TestClient = Client<TestPayload, Arc<RwLock<Ipv4Addr>>, TokioChannels>;
 
     #[tokio::test]
     async fn test_client_new_and_interface() {
@@ -1990,22 +1938,6 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv()).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_register_and_unregister_e2e() {
-        let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-        let _run_handle = tokio::spawn(run_fut);
-        let key = E2EKey {
-            service_id: 0x1234,
-            method_or_event_id: 0x0001,
-        };
-        let profile = E2EProfile::Profile4(crate::e2e::Profile4Config::new(42, 10));
-        client
-            .register_e2e(key, profile)
-            .expect("E2E registry has capacity for one entry");
-        client.unregister_e2e(&key);
-        client.shut_down();
     }
 
     #[tokio::test]

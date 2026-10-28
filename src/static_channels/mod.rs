@@ -238,6 +238,10 @@ pub struct StaticOneshotSender<T: Send + 'static> {
 }
 
 impl<T: Send + 'static> OneshotSend<T> for StaticOneshotSender<T> {
+    fn is_closed(&self) -> bool {
+        self.slot.state.load(Ordering::Acquire) & O_RECEIVER_ALIVE == 0
+    }
+
     fn send(mut self, value: T) -> Result<(), T> {
         // Refuse to send if the receiver has already dropped.
         // (A subsequent receiver drop between this check and try_send
@@ -1027,6 +1031,14 @@ mod tests {
             Poll::Ready(Ok(v)) => assert_eq!(v, 42),
             other => panic!("expected ready ok, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn oneshot_sender_is_closed_once_the_receiver_drops() {
+        let (tx, rx) = ONESHOT_POOL_4.claim().expect("pool not empty");
+        assert!(!tx.is_closed());
+        drop(rx);
+        assert!(tx.is_closed());
     }
 
     #[test]

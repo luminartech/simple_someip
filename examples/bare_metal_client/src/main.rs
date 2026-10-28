@@ -27,7 +27,7 @@
 //! | Transport | `MockFactory` / `MockSocket` | `embassy_net`, smoltcp, custom Ethernet ISR |
 //! | Timer | `MockTimer` using `tokio::time::sleep` | `embassy_time::Timer::after` |
 //! | Task spawner | `TokioBackedSpawner` wrapping `tokio::spawn` | `embassy_executor::Spawner` |
-//! | E2E registry handle | `StaticE2EHandle` over `&'static StaticE2EStorage` | same — already firmware-ready |
+//! | E2E hook | `NoE2E` (checks and protects nothing) | your `E2EHandle`, or `NoE2E` |
 //! | Interface handle | `AtomicInterfaceHandle` over `&'static AtomicU32` | same — already firmware-ready |
 //!
 //! All five handle/factory types except `Transport` and `Timer` are the
@@ -41,7 +41,6 @@
 //! [`Client::new_with_deps`]: simple_someip::Client::new_with_deps
 //! [`ChannelFactory`]: simple_someip::transport::ChannelFactory
 
-use core::cell::RefCell;
 use core::future::Future;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::pin::Pin;
@@ -52,19 +51,17 @@ use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use simple_someip::AtomicInterfaceHandle;
+use simple_someip::NoE2E;
 use simple_someip::client::Error as ClientError;
 use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::define_static_channels;
-use simple_someip::e2e::E2ERegistry;
 use simple_someip::protocol::sd::RebootFlag;
 use simple_someip::static_channels::BufferPool;
 use simple_someip::transport::{
     ReceivedDatagram, SocketOptions, Spawner, StaticBufferProvider, Timer, TransportError,
     TransportFactory, TransportSocket,
 };
-use simple_someip::{AtomicInterfaceHandle, StaticE2EHandle, StaticE2EStorage};
 use simple_someip::{Client, ClientDeps, RawPayload, UDP_BUFFER_SIZE};
 
 // ── Static-pool channel factory ───────────────────────────────────────
@@ -92,15 +89,9 @@ define_static_channels! {
 
 // ── Bare-metal lock-handle storage ────────────────────────────────────
 //
-// `&'static` storage for the no-alloc lock handles. `E2ERegistry::new()`
-// is `const`, so the storage lives in plain `static`s — no `Box::leak`
-// required. On real firmware you'd write the same `static` declarations
-// in boot code.
-
-static E2E_STORAGE: StaticE2EStorage =
-    BlockingMutex::<CriticalSectionRawMutex, RefCell<E2ERegistry>>::new(RefCell::new(
-        E2ERegistry::new(),
-    ));
+// `&'static` storage for the no-alloc interface handle lives in a plain
+// `static` — no `Box::leak` required. On real firmware you'd write the same
+// `static` declaration in boot code.
 
 // 127.0.0.1 packed as a big-endian u32.
 static IFACE_STORAGE: AtomicU32 = AtomicU32::new(0x7F00_0001);
@@ -280,38 +271,32 @@ async fn main() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    // Bare-metal lock handles: both pure no_std (no allocator), each
-    // backed by a `&'static` storage. The `static`s themselves are
-    // declared at module scope (see top of file) — clippy::pedantic
-    // dislikes `static` after `let` statements.
-    let e2e = StaticE2EHandle::new(&E2E_STORAGE);
+    // Bare-metal interface handle: pure no_std (no allocator), backed by
+    // `&'static` storage declared at module scope (see top of file) —
+    // clippy::pedantic dislikes `static` after `let` statements.
     let iface = AtomicInterfaceHandle::new(&IFACE_STORAGE);
 
-    let (client, _updates, run_fut) = Client::<
-        RawPayload,
-        StaticE2EHandle,
-        AtomicInterfaceHandle,
-        BareMetalChannels,
-    >::new_with_deps(
-        ClientDeps {
-            factory,
-            spawner: TokioBackedSpawner,
-            timer: MockTimer,
-            e2e_registry: e2e,
-            interface: iface,
-            // Caller-declared static buffer pool (#125): UNICAST_SOCKETS_CAP
-            // (8) + 1 discovery + 1 release-lag slack = 10 slots. An evicted
-            // socket's lease frees asynchronously, so size one above the max
-            // live socket count to avoid a transient Capacity(CapacityKind::UdpBuffer)
-            // on evict-then-rebind. On real firmware this is a `static`; here
-            // it is a function-local `static` for the example.
-            buffer_provider: {
-                static POOL: BufferPool<10, UDP_BUFFER_SIZE> = BufferPool::new();
-                StaticBufferProvider(&POOL)
+    let (client, _updates, run_fut) =
+        Client::<RawPayload, AtomicInterfaceHandle, BareMetalChannels>::new_with_deps(
+            ClientDeps {
+                factory,
+                spawner: TokioBackedSpawner,
+                timer: MockTimer,
+                e2e: NoE2E,
+                interface: iface,
+                // Caller-declared static buffer pool (#125): UNICAST_SOCKETS_CAP
+                // (8) + 1 discovery + 1 release-lag slack = 10 slots. An evicted
+                // socket's lease frees asynchronously, so size one above the max
+                // live socket count to avoid a transient Capacity(CapacityKind::UdpBuffer)
+                // on evict-then-rebind. On real firmware this is a `static`; here
+                // it is a function-local `static` for the example.
+                buffer_provider: {
+                    static POOL: BufferPool<10, UDP_BUFFER_SIZE> = BufferPool::new();
+                    StaticBufferProvider(&POOL)
+                },
             },
-        },
-        false, // multicast_loopback
-    );
+            false, // multicast_loopback
+        );
     // `_updates` is a `ClientUpdates` receiver. In production, poll it
     // for `ClientUpdate` events: discovery changes, unicast replies,
     // reboot notifications, and errors.

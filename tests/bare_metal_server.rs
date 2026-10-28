@@ -1,6 +1,6 @@
 //! Witness test: prove that `Server` can be constructed and
 //! driven without the `server-tokio` feature, using only the trait
-//! surface (`TransportFactory`, `Timer`, `E2ERegistryHandle`,
+//! surface (`TransportFactory`, `Timer`, `E2EHandle`,
 //! `SubscriptionHandle`).
 //!
 //! `simple-someip` is compiled with `default-features = false,
@@ -11,7 +11,7 @@
 //! `simple-someip::Server::new_with_deps` comes from the no-tokio side:
 //! a hand-rolled mock `TransportFactory`, a hand-rolled `Timer`, a
 //! hand-rolled `SubscriptionHandle`, and the std-backed
-//! `Arc<Mutex<E2ERegistry>>` impl that ships under the bare `transport`
+//! `NoE2E` impl that ships under the bare `transport`
 //! module.
 //!
 //! This is the gate witness for the claim that `Server` is reachable
@@ -31,14 +31,19 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
-use simple_someip::e2e::E2ERegistry;
+use simple_someip::protocol::MessageId;
 use simple_someip::server::NonSdRequestCallback;
 use simple_someip::server::ServerConfig;
 use simple_someip::server::{SubscribeError, Subscriber, SubscriptionHandle};
 use simple_someip::transport::{
     ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory, TransportSocket,
 };
+use simple_someip::{E2EStatus, NoE2E};
 use simple_someip::{Server, ServerDeps};
+
+#[path = "support/tag_e2e.rs"]
+mod tag_e2e;
+use tag_e2e::{PASSED, TAG, TagE2E};
 
 // ── Mock transport ─────────────────────────────────────────────────────
 
@@ -290,24 +295,23 @@ async fn server_constructible_without_server_tokio_feature() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let subs = MockSubscriptions::default();
 
     let config = ServerConfig::new(0x5B, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(30490);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: subs,
-            non_sd_observer: None,
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e: e2e_handle,
+        subscriptions: subs,
+        non_sd_observer: None,
+    };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -338,24 +342,23 @@ async fn passive_server_constructible_without_server_tokio_feature() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let subs = MockSubscriptions::default();
 
     let config = ServerConfig::new(0x5C, 2)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(0);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: subs,
-            non_sd_observer: None,
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e: e2e_handle,
+        subscriptions: subs,
+        non_sd_observer: None,
+    };
 
     let (_server, _handles, _run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_passive_with_deps(deps, config)
@@ -368,7 +371,7 @@ async fn passive_server_constructible_without_server_tokio_feature() {
 // Drives datagrams through the server's `recv_loop` and checks the
 // observer contract: `NonSdRequestCallback` is
 // `fn(ctx: usize, source: SocketAddrV4, service_id: u16, method_id: u16,
-//     payload: &[u8], e2e_status: u8)` — a plain function pointer, so
+//     payload: &[u8], e2e_status: Option<E2EStatus>)` — a plain function pointer, so
 // it can't capture environment. `recv_loop` parses the SOME/IP header
 // and passes decoded fields; the consumer never sees raw datagram bytes.
 // Each test parks its observation in a dedicated `OnceLock`-backed
@@ -382,8 +385,9 @@ async fn passive_server_constructible_without_server_tokio_feature() {
 
 use std::sync::OnceLock;
 
-static OBSERVED_SOME: OnceLock<Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, u8)>>> =
-    OnceLock::new();
+static OBSERVED_SOME: OnceLock<
+    Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, Option<E2EStatus>)>>,
+> = OnceLock::new();
 
 fn record_some(
     ctx: usize,
@@ -391,7 +395,7 @@ fn record_some(
     service_id: u16,
     method_id: u16,
     payload: &[u8],
-    e2e_status: u8,
+    e2e_status: Option<E2EStatus>,
     _response_out: &mut [u8],
 ) -> i32 {
     let slot = OBSERVED_SOME.get_or_init(|| Mutex::new(None));
@@ -406,10 +410,12 @@ fn record_some(
     -1 // observer only — no response
 }
 
-static OBSERVED_SD_UNICAST: OnceLock<Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, u8)>>> =
-    OnceLock::new();
-static OBSERVED_MULTICAST: OnceLock<Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, u8)>>> =
-    OnceLock::new();
+static OBSERVED_SD_UNICAST: OnceLock<
+    Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, Option<E2EStatus>)>>,
+> = OnceLock::new();
+static OBSERVED_MULTICAST: OnceLock<
+    Mutex<Option<(usize, SocketAddrV4, u16, u16, Vec<u8>, Option<E2EStatus>)>>,
+> = OnceLock::new();
 
 fn record_sd_unicast(
     ctx: usize,
@@ -417,7 +423,7 @@ fn record_sd_unicast(
     service_id: u16,
     method_id: u16,
     payload: &[u8],
-    e2e_status: u8,
+    e2e_status: Option<E2EStatus>,
     _response_out: &mut [u8],
 ) -> i32 {
     let slot = OBSERVED_SD_UNICAST.get_or_init(|| Mutex::new(None));
@@ -438,7 +444,7 @@ fn record_multicast(
     service_id: u16,
     method_id: u16,
     payload: &[u8],
-    e2e_status: u8,
+    e2e_status: Option<E2EStatus>,
     _response_out: &mut [u8],
 ) -> i32 {
     let slot = OBSERVED_MULTICAST.get_or_init(|| Mutex::new(None));
@@ -520,24 +526,23 @@ async fn non_sd_observer_some_receives_unicast_method_request() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let subs = MockSubscriptions::default();
 
     let config = ServerConfig::new(0x1234, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(30700);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: subs,
-            non_sd_observer: Some((record_some as NonSdRequestCallback, 0xC0FF_EE00)),
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e: e2e_handle,
+        subscriptions: subs,
+        non_sd_observer: Some((record_some as NonSdRequestCallback, 0xC0FF_EE00)),
+    };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -587,7 +592,7 @@ async fn non_sd_observer_some_receives_unicast_method_request() {
         [0xDE, 0xAD, 0xBE, 0xEF],
         "payload must be the bytes after the 16-byte header"
     );
-    assert_eq!(got_e2e, 0, "server-side requests are not E2E-checked today");
+    assert_eq!(got_e2e, None, "NoE2E checks nothing");
 
     handle.abort();
     let _ = handle.await;
@@ -607,22 +612,21 @@ async fn non_sd_observer_ignores_sd_message_on_unicast_socket() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let config = ServerConfig::new(0x1234, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(30702);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: MockSubscriptions::default(),
-            non_sd_observer: Some((record_sd_unicast as NonSdRequestCallback, 7)),
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e: e2e_handle,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: Some((record_sd_unicast as NonSdRequestCallback, 7)),
+    };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -674,22 +678,21 @@ async fn non_sd_observer_ignores_non_sd_on_multicast_socket() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let config = ServerConfig::new(0x1234, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(30703);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: MockSubscriptions::default(),
-            non_sd_observer: Some((record_multicast as NonSdRequestCallback, 9)),
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e: e2e_handle,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: Some((record_multicast as NonSdRequestCallback, 9)),
+    };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -741,22 +744,21 @@ async fn non_sd_observer_none_preserves_ignore_behavior() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let config = ServerConfig::new(0x1234, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(30701);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: MockSubscriptions::default(),
-            non_sd_observer: None,
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e: e2e_handle,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: None,
+    };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -828,7 +830,7 @@ fn respond_with_body(
     _service_id: u16,
     _method_id: u16,
     _payload: &[u8],
-    _e2e_status: u8,
+    _e2e_status: Option<E2EStatus>,
     response_out: &mut [u8],
 ) -> i32 {
     let body = [0x11u8, 0x22, 0x33];
@@ -845,7 +847,7 @@ fn respond_oversized(
     _service_id: u16,
     _method_id: u16,
     _payload: &[u8],
-    _e2e_status: u8,
+    _e2e_status: Option<E2EStatus>,
     response_out: &mut [u8],
 ) -> i32 {
     (response_out.len() + 100) as i32
@@ -863,22 +865,21 @@ async fn non_sd_responder_frames_and_sends_response() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let config = ServerConfig::new(0x1234, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(30702);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: MockSubscriptions::default(),
-            non_sd_observer: Some((respond_with_body as NonSdRequestCallback, 0)),
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e: e2e_handle,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: Some((respond_with_body as NonSdRequestCallback, 0)),
+    };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -925,6 +926,59 @@ async fn non_sd_responder_frames_and_sends_response() {
     let _ = handle.await;
 }
 
+/// The server's RESPONSE goes through its `E2EHandle` like any other
+/// non-SD message it sends.
+#[tokio::test]
+async fn non_sd_response_is_protected_by_the_hook() {
+    let unicast_pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        unicast_pipe: Arc::clone(&unicast_pipe),
+        sd_pipe: Arc::new(MockPipe::default()),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+    let hook = TagE2E::new(MessageId::new_from_service_and_method(0x1236, 0x0001));
+    let config = ServerConfig::new(0x1236, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30704);
+    let deps: ServerDeps<MockFactory, MockTimer, TagE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e: hook,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: Some((respond_with_body as NonSdRequestCallback, 0)),
+    };
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, TagE2E, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+    let handle = tokio::spawn(run);
+
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 111), 40011);
+    unicast_pipe.inbound.lock().unwrap().push_back((
+        build_method_request_with_id(0x1236, 0x0001, 0x0102_0304, &[TAG, 0xDE]),
+        src,
+    ));
+    if let Some(w) = unicast_pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    drive_until(|| !unicast_pipe.sent.lock().unwrap().is_empty()).await;
+
+    let (resp, _) = unicast_pipe.sent.lock().unwrap().pop_front().unwrap();
+    assert_eq!(
+        &resp[4..8],
+        &(8u32 + 4).to_be_bytes(),
+        "length covers the tag"
+    );
+    assert_eq!(&resp[16..], &[TAG, 0x11, 0x22, 0x33], "tagged body");
+
+    handle.abort();
+    let _ = handle.await;
+}
+
 /// A responder that returns a length larger than the buffer it was given
 /// (a contract violation, but the callback is consumer/FFI code) must be
 /// rejected: no datagram sent, run-future still alive — never an
@@ -938,22 +992,21 @@ async fn non_sd_responder_oversized_length_is_rejected_not_panicked() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let config = ServerConfig::new(0x1234, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(30703);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: MockSubscriptions::default(),
-            non_sd_observer: Some((respond_oversized as NonSdRequestCallback, 0)),
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e: e2e_handle,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: Some((respond_oversized as NonSdRequestCallback, 0)),
+    };
 
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -1014,7 +1067,7 @@ async fn drive_co_offer_subscribe(local_port: u16, subscribe_major: u8) -> Vec<S
         sd_pipe: Arc::clone(&sd_pipe),
         next_port: Arc::new(Mutex::new(0)),
     };
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
     let subs_log: Arc<Mutex<Vec<SubKey>>> = Arc::new(Mutex::new(Vec::new()));
     let subs = MockSubscriptions(subs_log.clone());
 
@@ -1024,16 +1077,15 @@ async fn drive_co_offer_subscribe(local_port: u16, subscribe_major: u8) -> Vec<S
         .with_local_port(local_port)
         .with_accepted_offer(0x5678, 1, 2, 0x0001);
 
-    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
-        ServerDeps {
-            factory,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            subscriptions: subs,
-            non_sd_observer: None,
-        };
+    let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e: e2e_handle,
+        subscriptions: subs,
+        non_sd_observer: None,
+    };
     let (_server, _handles, run): (
-        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
         _,
         _,
     ) = Server::new_with_deps(deps, config, false)
@@ -1102,5 +1154,309 @@ async fn co_offered_subscribe_with_wrong_major_version_is_rejected() {
         recorded.is_empty(),
         "co-offered subscribe with a mismatched major version must be rejected, \
          not silently accepted by skipping the version guard"
+    );
+}
+
+/// `(method_id, payload, e2e_status)` for each call the observer saw.
+type Recorded = Mutex<Vec<(u16, Vec<u8>, Option<E2EStatus>)>>;
+
+static OBSERVED_TAGGED: OnceLock<Recorded> = OnceLock::new();
+
+fn record_tagged(
+    _ctx: usize,
+    _source: SocketAddrV4,
+    _service_id: u16,
+    method_id: u16,
+    payload: &[u8],
+    e2e_status: Option<E2EStatus>,
+    _response_out: &mut [u8],
+) -> i32 {
+    OBSERVED_TAGGED
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push((method_id, payload.to_vec(), e2e_status));
+    -1
+}
+
+#[tokio::test]
+async fn non_sd_observer_receives_the_hooks_status_and_stripped_payload() {
+    let unicast_pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        unicast_pipe: Arc::clone(&unicast_pipe),
+        sd_pipe: Arc::new(MockPipe::default()),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+    let hook = TagE2E::new(MessageId::new_from_service_and_method(0x2345, 0x0001));
+    let config = ServerConfig::new(0x2345, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30701);
+    let deps: ServerDeps<MockFactory, MockTimer, TagE2E, MockSubscriptions> = ServerDeps {
+        factory,
+        timer: MockTimer,
+        e2e: hook,
+        subscriptions: MockSubscriptions::default(),
+        non_sd_observer: Some((record_tagged as NonSdRequestCallback, 0)),
+    };
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, TagE2E, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+    let handle = tokio::spawn(run);
+
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 101), 40001);
+    for datagram in [
+        build_method_request(0x2345, 0x0001, &[TAG, 0xAB]),
+        build_method_request(0x2345, 0x0002, &[0xCD]),
+    ] {
+        unicast_pipe
+            .inbound
+            .lock()
+            .unwrap()
+            .push_back((datagram, src));
+    }
+    if let Some(w) = unicast_pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    drive_until(|| {
+        OBSERVED_TAGGED
+            .get()
+            .is_some_and(|m| m.lock().unwrap().len() == 2)
+    })
+    .await;
+    let seen = OBSERVED_TAGGED.get().unwrap().lock().unwrap().clone();
+    assert!(
+        seen.contains(&(0x0001, vec![0xAB], Some(E2EStatus::Passed(PASSED)))),
+        "tagged: {seen:?}"
+    );
+    assert!(
+        seen.contains(&(0x0002, vec![0xCD], None)),
+        "untouched: {seen:?}"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+static OBSERVED_EVENTS: OnceLock<Recorded> = OnceLock::new();
+
+fn record_event(
+    _ctx: usize,
+    _source: SocketAddrV4,
+    _service_id: u16,
+    method_id: u16,
+    payload: &[u8],
+    e2e_status: Option<E2EStatus>,
+    _response_out: &mut [u8],
+) -> i32 {
+    OBSERVED_EVENTS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push((method_id, payload.to_vec(), e2e_status));
+    -1
+}
+
+#[tokio::test]
+async fn event_rx_dispatch_passes_the_hooks_status() {
+    let pipe = Arc::new(MockPipe::default());
+    let socket = MockSocket {
+        pipe: Arc::clone(&pipe),
+        local: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40100),
+    };
+    let hook = TagE2E::new(MessageId::new_from_service_and_method(0x3456, 0x8001));
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 7), 30509);
+    for datagram in [
+        build_method_request(0x3456, 0x8001, &[TAG, 0x11]),
+        build_method_request(0x3456, 0x8002, &[0x22]),
+    ] {
+        pipe.inbound.lock().unwrap().push_back((datagram, src));
+    }
+    let mut buf = vec![0u8; 1500];
+    let rx = simple_someip::bare_metal_tasks::event_rx_dispatch_future(
+        &socket,
+        &hook,
+        record_event,
+        0,
+        &mut buf,
+    );
+    // The receive loop never returns; give it time to drain the two datagrams.
+    let _ = tokio::time::timeout(Duration::from_millis(200), rx).await;
+    let seen = OBSERVED_EVENTS.get().unwrap().lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        [
+            (0x8001, vec![0x11], Some(E2EStatus::Passed(PASSED))),
+            (0x8002, vec![0x22], None)
+        ]
+    );
+}
+
+/// The bare-metal publish path protects the notification through the hook
+/// before it reaches any subscriber.
+#[test]
+fn publish_notification_protects_the_notification_through_the_hook() {
+    use core::cell::RefCell;
+    use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use simple_someip::server::{
+        StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager,
+    };
+
+    static SUBS: StaticSubscriptionStorage = BlockingMutex::<
+        CriticalSectionRawMutex,
+        RefCell<SubscriptionManager>,
+    >::new(RefCell::new(SubscriptionManager::new()));
+    let subscriber = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 120), 40020);
+    SUBS.lock(|m| m.borrow_mut().subscribe(0x3456, 1, 0x01, subscriber))
+        .unwrap();
+    let hook = TagE2E::new(MessageId::new_from_service_and_method(0x3456, 0x8001));
+
+    let mut scratch = [0u8; 64];
+    let mut sent = Vec::new();
+    let count = simple_someip::bare_metal_tasks::publish_notification(
+        &StaticSubscriptionHandle::new(&SUBS),
+        &hook,
+        0x3456,
+        1,
+        0x01,
+        0x8001,
+        1,
+        &[0x55],
+        &mut scratch,
+        |datagram, to| sent.push((datagram.to_vec(), to)),
+    );
+
+    assert_eq!(count, 1);
+    let (datagram, to) = &sent[0];
+    assert_eq!(*to, subscriber);
+    assert_eq!(
+        &datagram[4..8],
+        &(8u32 + 2).to_be_bytes(),
+        "length covers the tag"
+    );
+    assert_eq!(&datagram[16..], &[TAG, 0x55], "tagged payload");
+}
+
+/// With no subscribers, the bare-metal publish path does not run the hook,
+/// so the hook's state does not advance for a notification nobody gets.
+#[test]
+fn publish_notification_without_subscribers_does_not_protect() {
+    use core::cell::RefCell;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use simple_someip::server::{
+        StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager,
+    };
+    use simple_someip::{E2ECheck, E2EHandle, E2EProtectError};
+
+    static PROTECTS: AtomicUsize = AtomicUsize::new(0);
+    struct CountProtects;
+    impl E2EHandle for CountProtects {
+        fn check<'a>(
+            &self,
+            _: core::net::IpAddr,
+            _: MessageId,
+            _: &'a [u8],
+            _: [u8; 8],
+        ) -> Option<E2ECheck<'a>> {
+            None
+        }
+        fn protect<'b>(
+            &self,
+            _: MessageId,
+            buf: &'b mut [u8],
+            payload_len: usize,
+            _: [u8; 8],
+        ) -> Option<Result<&'b [u8], E2EProtectError>> {
+            PROTECTS.fetch_add(1, Ordering::SeqCst);
+            Some(Ok(&buf[..payload_len]))
+        }
+        fn reset_source(&self, _: core::net::IpAddr) {}
+    }
+
+    static SUBS: StaticSubscriptionStorage = BlockingMutex::<
+        CriticalSectionRawMutex,
+        RefCell<SubscriptionManager>,
+    >::new(RefCell::new(SubscriptionManager::new()));
+
+    let mut scratch = [0u8; 64];
+    let count = simple_someip::bare_metal_tasks::publish_notification(
+        &StaticSubscriptionHandle::new(&SUBS),
+        &CountProtects,
+        0x3457,
+        1,
+        0x01,
+        0x8001,
+        1,
+        &[0x55],
+        &mut scratch,
+        |_, _| panic!("nothing to send to"),
+    );
+
+    assert_eq!(count, 0);
+    assert_eq!(PROTECTS.load(Ordering::SeqCst), 0, "protect never ran");
+
+    let oversized = simple_someip::bare_metal_tasks::publish_notification(
+        &StaticSubscriptionHandle::new(&SUBS),
+        &CountProtects,
+        0x3457,
+        1,
+        0x01,
+        0x8001,
+        2,
+        &[0x55; 60],
+        &mut scratch,
+        |_, _| panic!("nothing to send to"),
+    );
+    assert_eq!(oversized, -2, "a frame that cannot fit is reported");
+}
+
+/// A notification that fits `scratch` framed but not protected is reported
+/// only once someone subscribes: with no subscribers it is never protected.
+#[test]
+fn publish_notification_reports_a_protected_overflow_once_subscribed() {
+    use core::cell::RefCell;
+    use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use simple_someip::server::{
+        StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager,
+    };
+
+    static SUBS: StaticSubscriptionStorage = BlockingMutex::<
+        CriticalSectionRawMutex,
+        RefCell<SubscriptionManager>,
+    >::new(RefCell::new(SubscriptionManager::new()));
+    let hook = TagE2E::new(MessageId::new_from_service_and_method(0x3458, 0x8001));
+    // 16-byte header + 4-byte payload fills `scratch`; the tag does not fit.
+    let mut scratch = [0u8; 20];
+    let publish = |scratch: &mut [u8]| {
+        simple_someip::bare_metal_tasks::publish_notification(
+            &StaticSubscriptionHandle::new(&SUBS),
+            &hook,
+            0x3458,
+            1,
+            0x01,
+            0x8001,
+            1,
+            &[1, 2, 3, 4],
+            scratch,
+            |_, _| panic!("a protected overflow sends nothing"),
+        )
+    };
+
+    assert_eq!(publish(&mut scratch), 0, "nobody subscribed");
+    let subscriber = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 121), 40021);
+    SUBS.lock(|m| m.borrow_mut().subscribe(0x3458, 1, 0x01, subscriber))
+        .unwrap();
+    assert_eq!(
+        publish(&mut scratch),
+        -2,
+        "the protected frame does not fit"
     );
 }

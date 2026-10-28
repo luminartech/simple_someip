@@ -36,19 +36,25 @@ pub enum CapacityKind {
     /// rejected because the encoded form exceeds the application-level
     /// UDP cap.
     ///
-    /// With E2E protect configured for the destination key, the
-    /// post-protect payload may add up to the protect profile's overhead
-    /// bytes (Profile 1: 4, Profile 4: 16). The pre-encode check uses the
+    /// When the [`E2EHandle`](crate::E2EHandle) protects the message, the
+    /// protected payload is larger than the raw one. The pre-encode check uses the
     /// raw size; the post-protect re-check inside the spawned send loop
     /// produces this kind if the protected datagram would overflow the
     /// cap.
     ///
     /// The only kind the server currently produces, where it means a
-    /// stack send buffer smaller than the outgoing message.
+    /// stack send buffer smaller than the outgoing message, before or after
+    /// protection.
+    ///
+    /// On either side it also means the [`E2EHandle`](crate::E2EHandle)
+    /// cannot protect a payload that long
+    /// ([`E2EProtectError::PayloadTooLong`](crate::E2EProtectError::PayloadTooLong)),
+    /// which no larger buffer fixes; the log names which.
     UdpBuffer,
 
-    /// Bound by `PENDING_RESPONSES_CAP`. A request was enqueued but the
-    /// in-flight response table is full; the request was dropped.
+    /// Bound by `PENDING_RESPONSES_CAP`. A request was sent, but the
+    /// in-flight response table is full of requests whose callers still hold
+    /// their response handle, so its reply is not tracked.
     PendingResponses,
 
     /// Bound by `REQUEST_QUEUE_CAP`. The client's internal control-message

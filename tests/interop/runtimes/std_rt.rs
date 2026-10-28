@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use simple_someip::e2e::E2ERegistry;
+use simple_someip::NoE2E;
 use simple_someip::protocol::sd::{Options, TransportProtocol};
 use simple_someip::protocol::{
     Header, Message, MessageId, MessageType, MessageTypeField, ReturnCode,
@@ -24,8 +24,8 @@ use tokio::task::JoinHandle;
 use crate::interop::consts::*;
 use crate::interop::runtime::*;
 
-type E2eHandle = Arc<Mutex<E2ERegistry>>;
-type StdClient = Client<RawPayload, E2eHandle, Arc<std::sync::RwLock<Ipv4Addr>>, TokioChannels>;
+type E2eHandle = NoE2E;
+type StdClient = Client<RawPayload, Arc<std::sync::RwLock<Ipv4Addr>>, TokioChannels>;
 type Publisher = Arc<
     EventPublisher<
         E2eHandle,
@@ -388,7 +388,7 @@ fn on_request(
     service: u16,
     method: u16,
     payload: &[u8],
-    _e2e_status: u8,
+    _e2e_status: Option<simple_someip::E2EStatus>,
     response_out: &mut [u8],
 ) -> i32 {
     if let Ok(guard) = REQUESTS.lock()

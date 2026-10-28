@@ -6,14 +6,14 @@ use core::task::Poll;
 use futures_util::{FutureExt, pin_mut, select_biased};
 use heapless::{Deque, index_map::FnvIndexMap};
 #[cfg(all(test, feature = "client-tokio"))]
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-#[cfg(all(test, feature = "client-tokio"))]
-use crate::e2e::E2ERegistry;
 #[cfg(all(test, feature = "client-tokio"))]
 use crate::tokio_transport::{
     TokioBufferProvider, TokioChannels, TokioSpawner, TokioTimer, TokioTransport,
 };
+#[cfg(all(test, feature = "client-tokio"))]
+use crate::transport::NoE2E;
 use crate::{
     Timer,
     client::{
@@ -24,7 +24,7 @@ use crate::{
     },
     protocol::{self, Message, MessageType},
     traits::{PayloadWireFormat, ServiceOffer},
-    transport::{ChannelFactory, E2ERegistryHandle, MpscRecv, OneshotSend, UnboundedSend},
+    transport::{ChannelFactory, E2EHandle, MpscRecv, OneshotSend, UnboundedSend},
 };
 
 use super::error::Error;
@@ -308,7 +308,7 @@ where
 pub(super) struct Inner<
     PayloadDefinitions: PayloadWireFormat + 'static,
     Tm: Timer,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     C: ChannelFactory,
     D,
 > {
@@ -317,7 +317,8 @@ pub(super) struct Inner<
     /// Queue of pending control messages to process
     request_queue: Deque<ControlMessage<PayloadDefinitions, C>, REQUEST_QUEUE_CAP>,
     /// Pending request-responses keyed by `request_id` (`client_id` << 16 | `session_counter`).
-    /// Set by `SendToService`, cleared when a matching unicast arrives.
+    /// Set by `SendToService`, cleared when a matching unicast arrives or,
+    /// once the map is full, when its caller has stopped waiting.
     pending_responses: FnvIndexMap<
         u32,
         C::OneshotSender<Result<PayloadDefinitions, Error>>,
@@ -351,8 +352,8 @@ pub(super) struct Inner<
     /// `unbind_discovery` + `bind_discovery` does not emit a false reboot signal.
     sd_session_id: u16,
     sd_session_has_wrapped: bool,
-    /// Shared E2E registry for runtime E2E configuration
-    e2e_registry: R,
+    /// Checks received and protects sent payloads.
+    e2e: R,
     /// Enable multicast loopback on SD sockets for same-host testing
     multicast_loopback: bool,
     /// Bind dispatch — abstracts the bind-and-spawn step over either a
@@ -370,7 +371,7 @@ pub(super) struct Inner<
     phantom: core::marker::PhantomData<PayloadDefinitions>,
 }
 
-impl<P: PayloadWireFormat, Tm: Timer, R: E2ERegistryHandle, C: ChannelFactory, D> core::fmt::Debug
+impl<P: PayloadWireFormat, Tm: Timer, R: E2EHandle + Clone, C: ChannelFactory, D> core::fmt::Debug
     for Inner<P, Tm, R, C, D>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -388,7 +389,7 @@ impl<PayloadDefinitions, Tm, R, C, D> Inner<PayloadDefinitions, Tm, R, C, D>
 where
     PayloadDefinitions: PayloadWireFormat + Clone + core::fmt::Debug + Send + 'static,
     Tm: Timer + 'static,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     C: ChannelFactory,
     D: crate::client::bind_dispatch::BindDispatch<PayloadDefinitions, C, R> + 'static,
     // Channel-bound bundle (see comment in `client::mod`).
@@ -417,7 +418,7 @@ where
     #[allow(clippy::type_complexity)]
     pub fn build(
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
         multicast_loopback: bool,
         dispatch: D,
         timer: Tm,
@@ -445,7 +446,7 @@ where
             session_counter: 1,
             sd_session_id: 1,
             sd_session_has_wrapped: false,
-            e2e_registry,
+            e2e,
             multicast_loopback,
             dispatch,
             timer,
@@ -462,7 +463,7 @@ where
                 .dispatch
                 .bind_discovery(
                     self.interface,
-                    self.e2e_registry.clone(),
+                    self.e2e.clone(),
                     self.sd_session_id,
                     self.sd_session_has_wrapped,
                     self.multicast_loopback,
@@ -475,7 +476,7 @@ where
             // unicast-domain split), so don't fail the whole bind.
             match self
                 .dispatch
-                .bind_discovery_unicast(self.interface, self.e2e_registry.clone())
+                .bind_discovery_unicast(self.interface, self.e2e.clone())
                 .await
             {
                 Ok(unicast) => self.discovery_unicast_socket = Some(unicast),
@@ -518,10 +519,7 @@ where
             );
             return Err(Error::Capacity(CapacityKind::UnicastSockets));
         }
-        let unicast_socket = self
-            .dispatch
-            .bind_unicast(port, self.e2e_registry.clone())
-            .await?;
+        let unicast_socket = self.dispatch.bind_unicast(port, self.e2e.clone()).await?;
         let bound_port = unicast_socket.port();
         // Capacity was checked above, so insert cannot report "full" here.
         // A defensive check guards against a future refactor that changes
@@ -541,9 +539,10 @@ where
     }
 
     /// Tracks the caller's response channel against `request_id` so a
-    /// future unicast reply can be routed back. If the
-    /// `pending_responses` map is already at `PENDING_RESPONSES_CAP`, the
-    /// `response` sender is recovered from the failed `insert` and used
+    /// future unicast reply can be routed back. When the
+    /// `pending_responses` map is full, it first drops every entry whose
+    /// caller has stopped waiting. If the map is still at
+    /// `PENDING_RESPONSES_CAP`, the `response` sender is recovered from the failed `insert` and used
     /// to deliver `Err(Error::Capacity(CapacityKind::PendingResponses))` — the
     /// caller's `PendingResponse::response().await` resolves cleanly
     /// instead of panicking on the `RecvError` that dropping the Sender
@@ -562,6 +561,10 @@ where
         request_id: u32,
         response: C::OneshotSender<Result<PayloadDefinitions, Error>>,
     ) {
+        if self.pending_responses.len() == PENDING_RESPONSES_CAP {
+            self.pending_responses
+                .retain(|_, pending| !pending.is_closed());
+        }
         match self.pending_responses.insert(request_id, response) {
             Ok(None) => {}
             Ok(Some(displaced_response)) => {
@@ -645,7 +648,7 @@ where
         sd_header: <PayloadDefinitions as PayloadWireFormat>::SdHeader,
         session_tracker: &mut SessionTracker,
         service_registry: &mut ServiceRegistry,
-        e2e_registry: &R,
+        e2e: &R,
         update_sender: &C::UnboundedSender<ClientUpdate<PayloadDefinitions>>,
     ) {
         // Extract session ID from SOME/IP request_id (lower 16 bits)
@@ -730,7 +733,7 @@ where
             // A rebooted sender restarts its E2E counter at zero, so drop our
             // stored per-source receive state for it; otherwise its first
             // post-reboot frame would read as out-of-sequence.
-            e2e_registry.reset_source(source.ip());
+            e2e.reset_source(source.ip());
             let _ = update_sender.send_now(ClientUpdate::SenderRebooted(source));
         }
 
@@ -1217,7 +1220,7 @@ where
                     request_queue,
                     session_tracker,
                     service_registry,
-                    e2e_registry,
+                    e2e,
                     run,
                     timer,
                     ..
@@ -1298,7 +1301,7 @@ where
                                 sd_header,
                                 session_tracker,
                                 service_registry,
-                                e2e_registry,
+                                e2e,
                                 update_sender,
                             );
                         }
@@ -1321,7 +1324,7 @@ where
                                 sd_header,
                                 session_tracker,
                                 service_registry,
-                                e2e_registry,
+                                e2e,
                                 update_sender,
                             );
                         }
@@ -1335,7 +1338,7 @@ where
                      trace!("Received unicast message: {:?}", unicast);
                      match unicast {
                          Ok(ReceivedMessage { header, payload, source, e2e_status }) => {
-                             let error_reply = Error::error_reply(&header);
+                             let error_reply = Error::error_reply(&header, e2e_status);
                              let answers_request = matches!(
                                  header.message_type().message_type(),
                                  MessageType::Response | MessageType::Error
@@ -1343,7 +1346,14 @@ where
                              if answers_request
                                  && let Some(sender) = pending_responses.remove(&header.request_id())
                              {
-                                 let _ = sender.send(error_reply.map_or(payload, Err));
+                                 let reply = match (error_reply, e2e_status) {
+                                     (Some(error_reply), _) => Err(error_reply),
+                                     (None, Some(crate::E2EStatus::Failed(status))) => {
+                                         Err(Error::E2eCheckFailed { status })
+                                     }
+                                     (None, _) => payload,
+                                 };
+                                 let _ = sender.send(reply);
                                  continue;
                              }
                              let update = match (error_reply, payload) {
@@ -1401,12 +1411,12 @@ mod tests {
     }
 
     /// Type alias for the fully-spelled `Inner` flavor used throughout
-    /// these tests: tokio everything, default `Arc<Mutex<E2ERegistry>>`
+    /// these tests: tokio everything, default `NoE2E`
     /// and `Arc<RwLock<Ipv4Addr>>` handles.
     type TestInner = Inner<
         TestPayload,
         crate::tokio_transport::TokioTimer,
-        Arc<Mutex<E2ERegistry>>,
+        NoE2E,
         TokioChannels,
         crate::client::bind_dispatch::SpawnerDispatch<
             crate::tokio_transport::TokioTransport,
@@ -1597,7 +1607,7 @@ mod tests {
             session_counter: 1,
             sd_session_id: 1,
             sd_session_has_wrapped: false,
-            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            e2e: NoE2E,
             multicast_loopback: false,
             dispatch: crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -1820,7 +1830,7 @@ mod tests {
         let mut inner: Inner<
             TestPayload,
             TokioTimer,
-            Arc<Mutex<E2ERegistry>>,
+            NoE2E,
             TokioChannels,
             crate::client::bind_dispatch::SpawnerDispatch<
                 TokioTransport,
@@ -1843,7 +1853,7 @@ mod tests {
             session_counter: 1,
             sd_session_id: 1,
             sd_session_has_wrapped: false,
-            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            e2e: NoE2E,
             multicast_loopback: false,
             dispatch: crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -1875,7 +1885,7 @@ mod tests {
     async fn test_inner_build_and_shutdown() {
         let (control_sender, mut update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -1925,7 +1935,7 @@ mod tests {
     async fn test_dropped_receiver_bind_discovery_continues() {
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -1948,7 +1958,7 @@ mod tests {
     async fn test_dropped_receiver_unbind_discovery_continues() {
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -1971,7 +1981,7 @@ mod tests {
     async fn test_dropped_receiver_set_interface_continues() {
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -1996,7 +2006,7 @@ mod tests {
     async fn test_dropped_receiver_send_sd_continues() {
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2032,7 +2042,7 @@ mod tests {
     async fn test_queued_messages_all_complete() {
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2114,7 +2124,7 @@ mod tests {
     async fn test_dropped_receiver_add_endpoint_continues() {
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2142,7 +2152,7 @@ mod tests {
     async fn test_dropped_receiver_remove_endpoint_continues() {
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2165,7 +2175,7 @@ mod tests {
     async fn test_dropped_receiver_send_to_service_send_complete_continues() {
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2203,7 +2213,7 @@ mod tests {
         // the loopback-enabled branch of SocketManager::bind_discovery.
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             true,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2224,7 +2234,7 @@ mod tests {
         // Binding discovery twice should succeed (early return on already-bound)
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2250,7 +2260,7 @@ mod tests {
         // SendSD without a bound discovery socket should auto-bind and succeed
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2277,7 +2287,7 @@ mod tests {
         // SendToService with no unicast sockets should auto-bind ephemeral
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2313,7 +2323,7 @@ mod tests {
         // Subscribe with a known endpoint and bound discovery should send the SD message
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2354,7 +2364,7 @@ mod tests {
         // Subscribe without discovery bound should auto-bind and succeed
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2389,7 +2399,7 @@ mod tests {
     async fn test_subscribe_unknown_service_returns_error() {
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2414,7 +2424,7 @@ mod tests {
         // When a unicast socket already exists, SendToService should reuse it
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2461,7 +2471,7 @@ mod tests {
         // Subscribe with no endpoint → ServiceNotFound response is dropped
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2485,7 +2495,7 @@ mod tests {
         // SetInterface to a different address exercises the interface!=current path
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2516,7 +2526,7 @@ mod tests {
         // SetInterface when discovery is already bound: unbind → change → rebind
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2553,7 +2563,7 @@ mod tests {
         // bind_unicast port-reuse path (port != 0 && already bound).
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2616,7 +2626,7 @@ mod tests {
 
         let (control_sender, control_receiver) = mpsc::channel(4);
         let (update_sender, _update_receiver) = mpsc::unbounded_channel();
-        let e2e_registry = Arc::new(Mutex::new(E2ERegistry::new()));
+        let e2e = NoE2E;
         let mut inner: TestInner = Inner {
             control_receiver,
             request_queue: Deque::new(),
@@ -2633,7 +2643,7 @@ mod tests {
             session_counter: 1,
             sd_session_id: 1,
             sd_session_has_wrapped: false,
-            e2e_registry: e2e_registry.clone(),
+            e2e,
             multicast_loopback: false,
             dispatch: crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2646,7 +2656,7 @@ mod tests {
 
         // An ephemeral socket stands in for the SD socket so the test does
         // not contend for the fixed SD port with the rest of the suite.
-        let discovery = SocketManager::bind(0, e2e_registry).await.unwrap();
+        let discovery = SocketManager::bind(0, e2e).await.unwrap();
         let discovery_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, discovery.port());
         inner.discovery_socket = Some(discovery);
         // One unicast socket shared by every Subscribe, so the burst is not
@@ -2712,7 +2722,7 @@ mod tests {
 
         let (control_sender, _update_receiver, run_fut) = TestInner::build(
             Ipv4Addr::LOCALHOST,
-            Arc::new(Mutex::new(E2ERegistry::new())),
+            NoE2E,
             false,
             crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
@@ -2779,10 +2789,116 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Default)]
+    struct CountingE2E(Arc<core::sync::atomic::AtomicUsize>);
+
+    impl CountingE2E {
+        fn resets(&self) -> usize {
+            self.0.load(core::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::E2EHandle for CountingE2E {
+        fn check<'a>(
+            &self,
+            _source: core::net::IpAddr,
+            _message_id: crate::protocol::MessageId,
+            _payload: &'a [u8],
+            _upper_header: [u8; 8],
+        ) -> Option<crate::E2ECheck<'a>> {
+            None
+        }
+
+        fn protect<'b>(
+            &self,
+            _message_id: crate::protocol::MessageId,
+            _buf: &'b mut [u8],
+            _payload_len: usize,
+            _upper_header: [u8; 8],
+        ) -> Option<Result<&'b [u8], crate::E2EProtectError>> {
+            None
+        }
+
+        fn reset_source(&self, _source: core::net::IpAddr) {
+            self.0.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_sender_reboot_resets_its_e2e_state_once() {
+        use crate::Encode;
+        use crate::RawPayload;
+        use crate::protocol::sd::{self, Entry, Options, OptionsCount, ServiceEntry};
+        use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        type CountingInner = Inner<
+            RawPayload,
+            TokioTimer,
+            CountingE2E,
+            TokioChannels,
+            crate::client::bind_dispatch::SpawnerDispatch<
+                TokioTransport,
+                TokioSpawner,
+                TokioBufferProvider,
+            >,
+        >;
+
+        const DEVICE: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 10);
+
+        fn offer(reboot: sd::RebootFlag) -> crate::VecSdHeader {
+            crate::VecSdHeader {
+                flags: sd::Flags::new_sd(reboot),
+                entries: std::vec![Entry::OfferService(ServiceEntry {
+                    index_first_options_run: 0,
+                    index_second_options_run: 0,
+                    options_count: OptionsCount::new(1, 0),
+                    service_id: 0x1234,
+                    instance_id: 1,
+                    major_version: 1,
+                    ttl: 3,
+                    minor_version: 0,
+                })],
+                options: std::vec![Options::IpV4Endpoint {
+                    ip: DEVICE,
+                    protocol: sd::TransportProtocol::Udp,
+                    port: 30_509,
+                }],
+            }
+        }
+
+        let hook = CountingE2E::default();
+        let mut session_tracker = SessionTracker::default();
+        let mut service_registry = ServiceRegistry::default();
+        let (update_sender, _update_receiver) =
+            TokioChannels::unbounded::<ClientUpdate<RawPayload>>();
+        let mut deliver = |session: u32, reboot: sd::RebootFlag| {
+            let sd_header = offer(reboot);
+            let someip_header =
+                protocol::Header::new_sd(session, sd_header.encoded_size().unwrap());
+            CountingInner::handle_discovery_datagram(
+                SocketAddr::new(IpAddr::V4(DEVICE), sd::MULTICAST_PORT),
+                TransportKind::Multicast,
+                someip_header,
+                sd_header,
+                &mut session_tracker,
+                &mut service_registry,
+                &hook,
+                &update_sender,
+            );
+        };
+
+        deliver(1, sd::RebootFlag::RecentlyRebooted);
+        deliver(2, sd::RebootFlag::Continuous);
+        deliver(3, sd::RebootFlag::Continuous);
+        assert_eq!(hook.resets(), 0, "ordinary SD traffic does not reset");
+        deliver(1, sd::RebootFlag::RecentlyRebooted);
+        assert_eq!(hook.resets(), 1, "one detected reboot resets once");
+    }
+
     type RawInner = Inner<
         crate::RawPayload,
         TokioTimer,
-        Arc<Mutex<E2ERegistry>>,
+        NoE2E,
         TokioChannels,
         crate::client::bind_dispatch::SpawnerDispatch<
             TokioTransport,
@@ -2799,7 +2915,7 @@ mod tests {
         use crate::Encode;
         let mut session_tracker = SessionTracker::default();
         let mut registry = ServiceRegistry::default();
-        let e2e_registry: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+        let e2e = NoE2E;
         let (update_sender, _updates) =
             TokioChannels::unbounded::<ClientUpdate<crate::RawPayload>>();
         for (session, (source, sd_header)) in (1..).zip(messages) {
@@ -2812,7 +2928,7 @@ mod tests {
                 sd_header,
                 &mut session_tracker,
                 &mut registry,
-                &e2e_registry,
+                &e2e,
                 &update_sender,
             );
         }
@@ -2998,7 +3114,7 @@ mod tests {
         type RawInner = Inner<
             RawPayload,
             TokioTimer,
-            Arc<Mutex<E2ERegistry>>,
+            NoE2E,
             TokioChannels,
             crate::client::bind_dispatch::SpawnerDispatch<
                 TokioTransport,
@@ -3044,7 +3160,7 @@ mod tests {
 
         let mut session_tracker = SessionTracker::default();
         let mut service_registry = ServiceRegistry::default();
-        let e2e_registry: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+        let e2e: NoE2E = NoE2E;
         let (update_sender, _update_receiver) =
             TokioChannels::unbounded::<ClientUpdate<RawPayload>>();
 
@@ -3069,7 +3185,7 @@ mod tests {
                 sd_header,
                 &mut session_tracker,
                 &mut service_registry,
-                &e2e_registry,
+                &e2e,
                 &update_sender,
             );
         }
@@ -3101,7 +3217,7 @@ mod tests {
             stop_header,
             &mut session_tracker,
             &mut service_registry,
-            &e2e_registry,
+            &e2e,
             &update_sender,
         );
 

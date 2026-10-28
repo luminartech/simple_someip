@@ -28,7 +28,7 @@
 //!
 //! **Completed abstractions:**
 //! - `Spawner` / `LocalSpawner` traits: task submission is pluggable.
-//! - `E2ERegistryHandle` / `InterfaceHandle`: lock handles abstracted
+//! - `E2EHandle` / `InterfaceHandle`: lock handles abstracted
 //!   away from `Arc<Mutex<_>>` / `Arc<RwLock<_>>`.
 //! - `ChannelFactory`: channel primitives abstracted via `TokioChannels`
 //!   (std) and `EmbassySyncChannels` / `define_static_channels!` (`bare_metal`).
@@ -36,7 +36,7 @@
 //!   `SendFuture` / `RecvFuture` associated types express `Send` bounds
 //!   for spawnable socket loops.
 //!
-//! For `no_alloc` SOME/IP usage, consume `protocol`, `e2e`, and the
+//! For `no_alloc` SOME/IP usage, consume `protocol` and the
 //! `transport` trait layer directly — the `bare_metal_client` /
 //! `bare_metal_server` example workspace members demonstrate that surface.
 
@@ -44,12 +44,11 @@ use crate::CapacityKind;
 use crate::{
     UDP_BUFFER_SIZE,
     buffer_pool::BufferLease,
-    e2e::{E2ECheckStatus, E2EKey},
     protocol::{Header, HeaderView, Message, MessageView, sd},
     traits::PayloadWireFormat,
     transport::{
-        ChannelFactory, E2ERegistryHandle, LocalSpawner, MpscRecv, MpscSend, OneshotRecv,
-        OneshotSend, ReceivedDatagram, SocketOptions, Spawner, TransportFactory, TransportSocket,
+        ChannelFactory, E2EHandle, LocalSpawner, MpscRecv, MpscSend, OneshotRecv, OneshotSend,
+        ReceivedDatagram, SocketOptions, Spawner, TransportFactory, TransportSocket,
     },
 };
 
@@ -79,7 +78,7 @@ pub struct ReceivedMessage<P> {
     pub(crate) header: Header,
     pub(crate) payload: Result<P, Error>,
     pub(crate) source: SocketAddr,
-    pub(crate) e2e_status: Option<E2ECheckStatus>,
+    pub(crate) e2e_status: Option<crate::E2EStatus>,
 }
 
 /// Structure representing a request to send a message
@@ -187,9 +186,9 @@ where
     /// `--features client` the `socket_manager` module is compiled
     /// but this convenience method is not.
     #[cfg(all(test, feature = "client-tokio"))]
-    pub async fn bind_discovery_seeded<R: E2ERegistryHandle>(
+    pub async fn bind_discovery_seeded<R: E2EHandle + Clone>(
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
@@ -203,7 +202,7 @@ where
             &TokioTransport,
             &TokioSpawner,
             interface,
-            e2e_registry,
+            e2e,
             session_id,
             session_has_wrapped,
             multicast_loopback,
@@ -250,7 +249,7 @@ where
         factory: &F,
         spawner: &S,
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
@@ -262,7 +261,7 @@ where
         for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
         for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
         S: Spawner,
-        R: E2ERegistryHandle,
+        R: E2EHandle + Clone,
     {
         let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
         let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
@@ -288,7 +287,7 @@ where
         let socket = factory.bind(bind_addr, &options).await?;
         socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
 
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e, buf);
         spawner.spawn(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -308,7 +307,7 @@ where
         factory: &F,
         spawner: &S,
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
@@ -318,7 +317,7 @@ where
         F: TransportFactory,
         F::Socket: 'static,
         S: LocalSpawner,
-        R: E2ERegistryHandle,
+        R: E2EHandle + Clone,
     {
         let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
         let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
@@ -333,7 +332,7 @@ where
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, sd::MULTICAST_PORT);
         let socket = factory.bind(bind_addr, &options).await?;
         socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e, buf);
         spawner.spawn_local(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -363,7 +362,7 @@ where
         factory: &F,
         spawner: &S,
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
         buf: BufferLease,
     ) -> Result<Self, Error>
     where
@@ -372,7 +371,7 @@ where
         for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
         for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
         S: Spawner,
-        R: E2ERegistryHandle,
+        R: E2EHandle + Clone,
     {
         let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
         let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
@@ -388,7 +387,7 @@ where
         // makes the kernel divert unicast SD here.
         let bind_addr = SocketAddrV4::new(interface, sd::MULTICAST_PORT);
         let socket = factory.bind(bind_addr, &options).await?;
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e, buf);
         spawner.spawn(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -405,14 +404,14 @@ where
         factory: &F,
         spawner: &S,
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
         buf: BufferLease,
     ) -> Result<Self, Error>
     where
         F: TransportFactory,
         F::Socket: 'static,
         S: LocalSpawner,
-        R: E2ERegistryHandle,
+        R: E2EHandle + Clone,
     {
         let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
         let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
@@ -424,7 +423,7 @@ where
         };
         let bind_addr = SocketAddrV4::new(interface, sd::MULTICAST_PORT);
         let socket = factory.bind(bind_addr, &options).await?;
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e, buf);
         spawner.spawn_local(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -448,13 +447,13 @@ where
     /// `client-tokio` feature because the convenience defaults live
     /// behind it.
     #[cfg(all(test, feature = "client-tokio"))]
-    pub async fn bind<R: E2ERegistryHandle>(port: u16, e2e_registry: R) -> Result<Self, Error> {
+    pub async fn bind<R: E2EHandle + Clone>(port: u16, e2e: R) -> Result<Self, Error> {
         use crate::tokio_transport::{TokioBufferProvider, TokioSpawner, TokioTransport};
         use crate::transport::BufferProvider;
         let buf = TokioBufferProvider::new()
             .claim()
             .ok_or(Error::Capacity(CapacityKind::UdpBuffer))?;
-        Self::bind_with_transport(&TokioTransport, &TokioSpawner, port, e2e_registry, buf).await
+        Self::bind_with_transport(&TokioTransport, &TokioSpawner, port, e2e, buf).await
     }
 
     /// Variant of [`Self::bind`] that constructs the underlying socket
@@ -472,7 +471,7 @@ where
         factory: &F,
         spawner: &S,
         port: u16,
-        e2e_registry: R,
+        e2e: R,
         buf: BufferLease,
     ) -> Result<Self, Error>
     where
@@ -481,7 +480,7 @@ where
         for<'a> <F::Socket as TransportSocket>::SendFuture<'a>: Send,
         for<'a> <F::Socket as TransportSocket>::RecvFuture<'a>: Send,
         S: Spawner,
-        R: E2ERegistryHandle,
+        R: E2EHandle + Clone,
     {
         // Standardized to N=16 across both discovery and unicast bind
         // paths (was N=4 here historically — a tokio-conservative
@@ -503,7 +502,7 @@ where
 
         let socket = factory.bind(bind_addr, &options).await?;
         let port = socket.local_addr()?.port();
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e, buf);
         spawner.spawn(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -526,14 +525,14 @@ where
         factory: &F,
         spawner: &S,
         port: u16,
-        e2e_registry: R,
+        e2e: R,
         buf: BufferLease,
     ) -> Result<Self, Error>
     where
         F: TransportFactory,
         F::Socket: 'static,
         S: LocalSpawner,
-        R: E2ERegistryHandle,
+        R: E2EHandle + Clone,
     {
         let (rx_tx, rx_rx) = C::bounded::<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>();
         let (tx_tx, tx_rx) = C::bounded::<SendMessage<MessageDefinitions, C>, 16>();
@@ -545,7 +544,7 @@ where
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
         let socket = factory.bind(bind_addr, &options).await?;
         let port = socket.local_addr()?.port();
-        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
+        let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e, buf);
         spawner.spawn_local(fut);
         Ok(Self {
             receiver: rx_rx,
@@ -678,11 +677,11 @@ where
         socket: T,
         rx_tx: C::BoundedSender<Result<ReceivedMessage<MessageDefinitions>, Error>, 16>,
         mut tx_rx: C::BoundedReceiver<SendMessage<MessageDefinitions, C>, 16>,
-        e2e_registry: R,
+        e2e: R,
         mut buf: BufferLease,
     ) where
         T: TransportSocket + 'static,
-        R: E2ERegistryHandle,
+        R: E2EHandle + Clone,
     {
         // Maximum number of consecutive `recv_from` errors tolerated before
         // the socket loop gives up. A single failure (transient I/O, peer
@@ -799,54 +798,18 @@ where
                         }
                     };
 
-                    // Apply E2E protect if configured. `protected`
-                    // is a disjoint stack buffer, so the input can
-                    // be borrowed directly out of `buf[16..]` with
-                    // no intermediate copy.
-                    {
-                        let key =
-                            E2EKey::from_message_id(send_message.message.header().message_id());
-                        if e2e_registry.contains_key(&key) {
-                            let upper_header: [u8; 8] =
-                                buf[8..16].try_into().expect("upper header slice");
-                            let mut protected = [0u8; UDP_BUFFER_SIZE];
-                            let result = e2e_registry.protect(
-                                key,
-                                &buf[16..message_length],
-                                upper_header,
-                                &mut protected,
+                    match crate::transport::protect_in_place(&e2e, &mut buf, message_length) {
+                        Ok(protected_length) => message_length = protected_length,
+                        Err(e) => {
+                            error!(
+                                "Protecting {:?} failed: {:?}; refusing to send it unprotected",
+                                send_message.message.header().message_id(),
+                                e
                             );
-                            match result {
-                                Some(Ok(protected_len)) => {
-                                    if 16 + protected_len > buf.len() {
-                                        error!(
-                                            "E2E-protected payload ({} bytes) exceeds claimed buffer ({}); rejecting send",
-                                            16 + protected_len,
-                                            buf.len()
-                                        );
-                                        let _ = send_message
-                                            .response
-                                            .send(Err(Error::Capacity(CapacityKind::UdpBuffer)));
-                                        continue;
-                                    }
-                                    #[allow(clippy::cast_possible_truncation)]
-                                    let new_length: u32 = 8 + protected_len as u32;
-                                    buf[4..8].copy_from_slice(&new_length.to_be_bytes());
-                                    buf[16..16 + protected_len]
-                                        .copy_from_slice(&protected[..protected_len]);
-                                    message_length = 16 + protected_len;
-                                }
-                                Some(Err(e)) => {
-                                    error!(
-                                        "E2E protect failed for configured key {:?}: {:?}; \
-                                         refusing to send unprotected datagram",
-                                        key, e
-                                    );
-                                    let _ = send_message.response.send(Err(Error::E2e(e)));
-                                    continue;
-                                }
-                                None => unreachable!("contains_key was true"),
-                            }
+                            let _ = send_message
+                                .response
+                                .send(Err(Error::Capacity(CapacityKind::UdpBuffer)));
+                            continue;
                         }
                     }
 
@@ -942,22 +905,14 @@ where
                                         };
                                     }
                                 };
-                                let upper_header = header.upper_header_bytes();
-                                let key = E2EKey::from_message_id(header.message_id());
-                                let payload_bytes = view.payload_bytes();
-
-                                // Apply E2E check if configured. The source IP keys
-                                // the receive counter state so interleaved senders
-                                // on a shared subnet don't collide (see `E2ERegistry`).
-                                let (e2e_status, effective_payload) = match e2e_registry.check(
-                                    source_address.ip(),
-                                    key,
-                                    payload_bytes,
-                                    upper_header,
-                                ) {
-                                    Some((status, stripped)) => (Some(status), stripped),
-                                    None => (None, payload_bytes),
-                                };
+                                let (e2e_status, effective_payload) =
+                                    crate::transport::check_message(
+                                        &e2e,
+                                        source_address.ip(),
+                                        header.message_id(),
+                                        header.upper_header_bytes(),
+                                        view.payload_bytes(),
+                                    );
 
                                 let payload = MessageDefinitions::from_payload_bytes(
                                     header.message_id(),
@@ -1022,12 +977,11 @@ where
 #[cfg(all(test, feature = "client-tokio"))]
 mod tests {
     use super::*;
-    use crate::e2e::E2ERegistry;
     use crate::protocol::sd::test_support::{TestPayload, empty_sd_header};
     use crate::tokio_transport::{TokioChannels, TokioSpawner};
+    use crate::transport::NoE2E;
     use std::boxed::Box;
     use std::format;
-    use std::sync::{Arc, Mutex};
     use std::vec;
     // Tests build ad-hoc UDP peers via tokio directly; this is not part of
     // the production code path, which goes through the `TransportSocket`
@@ -1036,8 +990,8 @@ mod tests {
 
     type TestSocketManager = SocketManager<TestPayload, TokioChannels>;
 
-    fn test_registry() -> Arc<Mutex<E2ERegistry>> {
-        Arc::new(Mutex::new(E2ERegistry::new()))
+    fn test_registry() -> NoE2E {
+        NoE2E
     }
 
     /// Claim a single socket-loop buffer for a direct `bind_with_transport`

@@ -2,7 +2,7 @@
 //!
 //! A bare-metal firmware spawns these on its own executor and provides
 //! only the I/O: a [`TransportSocket`] (lwIP/smoltcp/embassy-net), a
-//! [`Timer`], an [`E2ERegistryHandle`], a [`SubscriptionHandle`], and a
+//! [`Timer`], an [`E2EHandle`], a [`SubscriptionHandle`], and a
 //! dispatch `fn`. All SOME/IP encoding/parsing lives here and in
 //! [`crate::sd_codec`] — the firmware constructs no SOME/IP bytes.
 //!
@@ -19,18 +19,17 @@ use core::future::Future;
 use core::net::SocketAddrV4;
 use core::pin::pin;
 use core::sync::atomic::AtomicU16;
-use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use core::task::{Context, RawWaker, RawWakerVTable, Waker};
 use core::time::Duration;
 
-use crate::E2ECheckStatus;
 use crate::protocol::sd::RebootFlag;
 use crate::sd_codec::{
     OfferServiceRequest, SubscribeEventgroupRequest, build_multi_offer_service_datagram,
     build_notification_datagram, build_subscribe_eventgroup_datagram, check_parsed_e2e,
-    e2e_status_code, next_sd_session, parse_someip_datagram,
+    next_sd_session, parse_someip_datagram,
 };
 use crate::server::{ServerConfig, Subscriber, SubscriptionHandle};
-use crate::transport::{E2ERegistryHandle, Timer, TransportSocket};
+use crate::transport::{E2EHandle, Timer, TransportSocket};
 use heapless::Vec as HeaplessVec;
 
 /// Handler for one decoded inbound request. A getter fills `response_out`
@@ -45,7 +44,7 @@ pub type RequestDispatchFn = fn(
     service_id: u16,
     method_id: u16,
     payload: &[u8],
-    e2e_status: u8,
+    e2e_status: Option<crate::E2EStatus>,
     response_out: &mut [u8],
 ) -> i32;
 
@@ -104,24 +103,20 @@ pub async fn subscribe_announce_future<'a, S, Tm>(
     }
 }
 
-/// Receive notifications on `rx_socket`, parse the SOME/IP header,
-/// optionally run the E2E check in place, and hand the parsed
-/// `(service_id, method_id, payload, e2e_status)` to `dispatch`. `buf`
-/// is the receive scratch (sized to the max inbound datagram).
-///
-/// When `e2e_enabled` is false the payload is dispatched verbatim with
-/// status `0`. When true, [`check_parsed_e2e`] looks up the profile by
-/// the parsed `(service, method)` and strips/validates the E2E header.
+/// Receive notifications on `rx_socket`, parse the SOME/IP header, run
+/// `e2e`'s check, and hand the parsed `(service_id, method_id, payload,
+/// e2e_status)` to `dispatch`. `e2e` decides per message ID whether a
+/// check applies; `e2e_status` is `None` when none does. `buf` is the receive
+/// scratch (sized to the max inbound datagram).
 pub async fn event_rx_dispatch_future<'a, S, R>(
     rx_socket: &'a S,
     e2e: &'a R,
-    e2e_enabled: bool,
     dispatch: RequestDispatchFn,
     ctx: usize,
     buf: &'a mut [u8],
 ) where
     S: TransportSocket,
-    R: E2ERegistryHandle,
+    R: E2EHandle + ?Sized,
 {
     loop {
         let (n, source) = match rx_socket.recv_from(&mut *buf).await {
@@ -131,11 +126,7 @@ pub async fn event_rx_dispatch_future<'a, S, R>(
         let Ok(parsed) = parse_someip_datagram(&buf[..n]) else {
             continue;
         };
-        let (status, body) = if e2e_enabled {
-            check_parsed_e2e(e2e, core::net::IpAddr::V4(*source.ip()), &parsed)
-        } else {
-            (E2ECheckStatus::Unchecked, parsed.payload)
-        };
+        let (status, body) = check_parsed_e2e(e2e, core::net::IpAddr::V4(*source.ip()), &parsed);
         // Notifications received on the client RX socket are events, not
         // requests — there is no reply, so pass an empty response buffer and
         // ignore the (always-negative) return.
@@ -145,7 +136,7 @@ pub async fn event_rx_dispatch_future<'a, S, R>(
             parsed.service_id,
             parsed.method_id,
             body,
-            e2e_status_code(status),
+            status,
             &mut [],
         );
     }
@@ -163,7 +154,7 @@ pub struct SomeipRun<'a, S, Tm, R>
 where
     S: TransportSocket,
     Tm: Timer,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
 {
     /// SD socket used to send offers and subscribes (send-only here).
     pub sd_socket: &'a S,
@@ -188,7 +179,6 @@ where
     /// One-shot delay before the first subscribe, to phase it off the
     /// offer announce (both run at `period`).
     pub sub_offset: Duration,
-    pub sub_e2e_enabled: bool,
     pub rx_buf: &'a mut [u8],
     pub dispatch: RequestDispatchFn,
     /// Opaque context word forwarded verbatim as `dispatch`'s first arg.
@@ -212,7 +202,7 @@ pub async fn run_someip<S, Tm, R, RecvFut>(recv: RecvFut, cfg: SomeipRun<'_, S, 
 where
     S: TransportSocket,
     Tm: Timer,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     RecvFut: Future,
 {
     let SomeipRun {
@@ -230,7 +220,6 @@ where
         sub_scratch,
         sub_reboot,
         sub_offset,
-        sub_e2e_enabled,
         rx_buf,
         dispatch,
         dispatch_ctx,
@@ -269,15 +258,7 @@ where
     };
     let rx_fut = async move {
         if subscribe.is_some() {
-            event_rx_dispatch_future(
-                rx_socket,
-                e2e,
-                sub_e2e_enabled,
-                dispatch,
-                dispatch_ctx,
-                rx_buf,
-            )
-            .await;
+            event_rx_dispatch_future(rx_socket, e2e, dispatch, dispatch_ctx, rx_buf).await;
         } else {
             core::future::pending::<()>().await;
         }
@@ -303,9 +284,12 @@ const NOOP_RAW_WAKER: RawWaker = {
 ///
 /// `send(datagram, subscriber_addr)` performs the actual UDP transmit
 /// (the firmware's lwIP send). `scratch` is the caller's static TX
-/// buffer (no per-call stack buffer). Returns the number of subscribers
-/// sent to (`>= 0`), or a negative error: `-2` if `scratch` is too small
-/// for the header + payload.
+/// buffer (no per-call stack buffer), which `e2e` protects the notification
+/// in. Returns the number of subscribers sent to (`>= 0`), or a negative
+/// error: `-2` if `scratch` is too small for the header and the payload,
+/// protected or not, or if `e2e` cannot protect a payload that long. With no subscribers it returns `0` without protecting
+/// the notification, so a payload that only overflows `scratch` once
+/// protected is reported once someone subscribes.
 ///
 /// `send` is invoked *after* the subscription handle's critical section is
 /// released, not from inside the visitor: this function snapshots the
@@ -317,8 +301,9 @@ const NOOP_RAW_WAKER: RawWaker = {
 // session) plus payload, scratch, and send sink; a params struct would
 // only relocate the list.
 #[allow(clippy::too_many_arguments)]
-pub fn publish_notification<Sub, FSend>(
+pub fn publish_notification<Sub, R, FSend>(
     subscriptions: &Sub,
+    e2e: &R,
     service_id: u16,
     instance_id: u16,
     event_group_id: u16,
@@ -330,13 +315,13 @@ pub fn publish_notification<Sub, FSend>(
 ) -> i32
 where
     Sub: SubscriptionHandle,
+    R: E2EHandle + ?Sized,
     FSend: FnMut(&[u8], SocketAddrV4),
 {
     let Ok(total) = build_notification_datagram(scratch, service_id, method_id, session, payload)
     else {
         return -2;
     };
-    let datagram = &scratch[..total];
 
     // Two-phase: snapshot the subscriber endpoints under the handle's
     // critical section, then transmit after it is released. The visitor
@@ -352,7 +337,7 @@ where
     // Inner scope so the visitor's mutable borrow of `targets` (and the
     // future's borrow of the visitor) both end before the transmit loop
     // reads `targets` back.
-    let visited = {
+    {
         let mut visit = |sub: &Subscriber| {
             let _ = targets.push(sub.address);
         };
@@ -366,18 +351,22 @@ where
         // the same waker, satisfying the RawWaker contract.
         let waker = unsafe { Waker::from_raw(NOOP_RAW_WAKER) };
         let mut cx = Context::from_waker(&waker);
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(n) => n,
-            Poll::Pending => 0,
-        }
-    };
+        let _ = fut.as_mut().poll(&mut cx);
+    }
 
+    if targets.is_empty() {
+        return 0;
+    }
+    let Ok(total) = crate::transport::protect_in_place(e2e, scratch, total) else {
+        return -2;
+    };
+    let datagram = &scratch[..total];
     for target in &targets {
         send(datagram, *target);
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     {
-        visited as i32
+        targets.len() as i32
     }
 }

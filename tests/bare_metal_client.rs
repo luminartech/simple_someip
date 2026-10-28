@@ -39,10 +39,10 @@ use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use simple_someip::NoE2E;
 use simple_someip::client::Error as ClientError;
 use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::define_static_channels;
-use simple_someip::e2e::E2ERegistry;
 use simple_someip::protocol::sd::RebootFlag;
 use simple_someip::static_channels::BufferPool;
 use simple_someip::transport::{
@@ -243,31 +243,27 @@ async fn client_constructible_without_client_tokio_feature() {
         local_port: Arc::new(Mutex::new(0)),
     };
 
-    // Custom InterfaceHandle and E2ERegistryHandle that don't require
+    // Custom InterfaceHandle and E2EHandle that don't require
     // tokio. We use std Arc/Mutex/RwLock impls (which are gated by
     // `feature = "std"`, not by `client-tokio`).
     let interface_handle: Arc<std::sync::RwLock<Ipv4Addr>> =
         Arc::new(std::sync::RwLock::new(Ipv4Addr::LOCALHOST));
-    let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+    let e2e_handle: NoE2E = NoE2E;
 
     static POOL: BufferPool<9, UDP_BUFFER_SIZE> = BufferPool::new();
 
-    let (client, _updates, run_fut) = Client::<
-        RawPayload,
-        Arc<Mutex<E2ERegistry>>,
-        Arc<std::sync::RwLock<Ipv4Addr>>,
-        TestStaticChannels,
-    >::new_with_deps(
-        ClientDeps {
-            factory,
-            spawner: TokioBackedSpawner,
-            timer: MockTimer,
-            e2e_registry: e2e_handle,
-            interface: interface_handle,
-            buffer_provider: StaticBufferProvider(&POOL),
-        },
-        false,
-    );
+    let (client, _updates, run_fut) =
+        Client::<RawPayload, Arc<std::sync::RwLock<Ipv4Addr>>, TestStaticChannels>::new_with_deps(
+            ClientDeps {
+                factory,
+                spawner: TokioBackedSpawner,
+                timer: MockTimer,
+                e2e: e2e_handle,
+                interface: interface_handle,
+                buffer_provider: StaticBufferProvider(&POOL),
+            },
+            false,
+        );
 
     // Compile-time witness: the constructor accepts no-tokio types,
     // returns a `Client` + updates triple, and the run-loop future

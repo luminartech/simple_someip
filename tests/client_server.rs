@@ -27,7 +27,6 @@
 //! (which will need to abstract the port anyway).
 
 use simple_someip::ServiceEndpointKey;
-use simple_someip::e2e::{E2ECheckStatus, E2EKey, E2EProfile, Profile4Config};
 use simple_someip::protocol::{
     Header, HeaderView, Message, MessageId, MessageType, MessageTypeField, ReturnCode, sd,
 };
@@ -38,6 +37,13 @@ use simple_someip::{
 };
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU16, Ordering};
+
+use simple_someip::client::Error as ClientError;
+use simple_someip::{CapacityKind, ClientDeps, E2EHandle, E2EStatus, NoE2E, ServerDeps};
+
+#[path = "support/tag_e2e.rs"]
+mod tag_e2e;
+use tag_e2e::{PASSED, TAG, TAG_MISSING, TagE2E};
 
 /// Allocate a unique service ID per test invocation. Multiple
 /// integration tests in this file run in parallel (cargo's default) and
@@ -56,12 +62,7 @@ fn empty_sd_header() -> VecSdHeader {
     }
 }
 
-type TestClient = Client<
-    RawPayload,
-    std::sync::Arc<std::sync::Mutex<simple_someip::e2e::E2ERegistry>>,
-    std::sync::Arc<std::sync::RwLock<Ipv4Addr>>,
-    TokioChannels,
->;
+type TestClient = Client<RawPayload, std::sync::Arc<std::sync::RwLock<Ipv4Addr>>, TokioChannels>;
 
 /// Type alias bringing the tokio-flavor concrete type parameters back into
 /// scope so callers can spell `TestServer::new(...)` without chasing the
@@ -69,14 +70,14 @@ type TestClient = Client<
 type TestServer = Server<
     simple_someip::TokioTransport,
     simple_someip::TokioTimer,
-    std::sync::Arc<std::sync::Mutex<simple_someip::e2e::E2ERegistry>>,
+    simple_someip::NoE2E,
     std::sync::Arc<tokio::sync::RwLock<simple_someip::server::SubscriptionManager>>,
 >;
 
 /// Type alias for the event publisher concrete type used by `TestServer`'s
 /// publisher. Same shape rationale as [`TestServer`].
 type TestEventPublisher = simple_someip::server::EventPublisher<
-    std::sync::Arc<std::sync::Mutex<simple_someip::e2e::E2ERegistry>>,
+    simple_someip::NoE2E,
     std::sync::Arc<tokio::sync::RwLock<simple_someip::server::SubscriptionManager>>,
     std::sync::Arc<simple_someip::TokioSocket>,
     simple_someip::TokioSocket,
@@ -529,96 +530,6 @@ async fn test_client_request_resolves_via_unicast_reply() {
     server_handle.abort();
 }
 
-/// Verify that E2E protection is applied by the server and checked by the client.
-/// Exercises E2E protect in event_publisher.rs and E2E check in socket_manager.rs.
-#[tokio::test]
-async fn test_e2e_protect_on_publish_and_check_on_receive() {
-    let service_id = next_service_id();
-    let (server, server_port) = create_server(service_id, 1).await;
-    let publisher = server.publisher();
-
-    // Register E2E profile on server for the event message ID
-    let key = E2EKey {
-        service_id,
-        method_or_event_id: 0x0001,
-    };
-    let profile = E2EProfile::Profile4(Profile4Config::new(0x12345678, 15));
-    server
-        .register_e2e(key, profile.clone())
-        .expect("E2E registry has capacity for one entry");
-
-    let server_handle = tokio::spawn(async move { server.run().await });
-
-    let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
-    let _run_handle = tokio::spawn(run_fut);
-
-    // Register matching E2E profile on client
-    client
-        .register_e2e(key, profile)
-        .expect("E2E registry has capacity for one entry");
-
-    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
-    client
-        .add_endpoint(
-            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
-            1,
-            0,
-        )
-        .await
-        .unwrap();
-    client
-        .subscribe(
-            ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr)),
-            1,
-            3,
-            0x01,
-            0,
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        wait_for_subscribers(&publisher, service_id, 1, 0x01).await,
-        "server should have registered the subscriber"
-    );
-
-    // Drain SubscribeAck
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(250), updates.recv()).await;
-
-    // Publish an event — server will E2E-protect it
-    // Construct a non-SD message with service_id=service_id, method/event_id=0x0001
-    let payload_bytes = [0xAA, 0xBB];
-    let msg_id = MessageId::new_from_service_and_method(service_id, 0x0001);
-    let raw_payload = RawPayload::from_payload_bytes(msg_id, &payload_bytes).unwrap();
-    let header = Header::new_event(service_id, 0x0001, 0, 0x01, 0x01, payload_bytes.len());
-    let event_msg = Message::new(header, raw_payload);
-    let sent = publisher
-        .publish_event(service_id, 1, 0x01, &event_msg)
-        .await
-        .expect("publish_event failed");
-    assert_eq!(sent, 1);
-
-    // Client receives the unicast event with E2E status
-    let update = recv_unicast(&mut updates).await;
-    match update {
-        ClientUpdate::Unicast { e2e_status, .. } => {
-            assert!(
-                e2e_status.is_some(),
-                "expected e2e_status to be populated when E2E is configured"
-            );
-            assert_eq!(
-                e2e_status.unwrap(),
-                E2ECheckStatus::Ok,
-                "E2E check should pass for correctly protected message"
-            );
-        }
-        other => unreachable!("recv_unicast only returns Unicast, got {other:?}"),
-    }
-
-    client.shut_down();
-    server_handle.abort();
-}
-
 /// Verify that two clients can subscribe to the same server and both receive events.
 /// Exercises multi-subscriber path in event_publisher.rs.
 #[tokio::test]
@@ -1022,6 +933,14 @@ async fn reply_with(
 async fn request_answered_with(
     replies: &'static [(MessageType, ReturnCode, &'static [u8])],
 ) -> Result<RawPayload, simple_someip::client::Error> {
+    request_answered_through(NoE2E, replies).await
+}
+
+/// [`request_answered_with`] from a client whose E2E hook is `hook`.
+async fn request_answered_through<H: E2EHandle + Clone>(
+    hook: H,
+    replies: &'static [(MessageType, ReturnCode, &'static [u8])],
+) -> Result<RawPayload, simple_someip::client::Error> {
     let service_id = next_service_id();
     let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -1029,7 +948,9 @@ async fn request_answered_with(
     let peer_addr = peer.local_addr().unwrap();
     let replier = tokio::spawn(reply_with(peer, replies));
 
-    let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+    let deps = ClientDeps::tokio(Ipv4Addr::LOCALHOST).with_e2e(hook);
+    let (client, _updates, run_fut) =
+        Client::<RawPayload, _, TokioChannels>::new_with_deps(deps, false);
     let run_handle = tokio::spawn(run_fut);
     let key = ServiceEndpointKey::udp(service_id, peer_addr);
     client.add_endpoint(key, 1, 0).await.unwrap();
@@ -1059,12 +980,110 @@ async fn request_answered_with(
     outcome
 }
 
+/// A request whose caller stopped waiting gives its tracking slot back, so
+/// unanswered requests do not use up the client's pending-response table.
+#[tokio::test]
+async fn abandoned_requests_do_not_use_up_pending_response_slots() {
+    use futures_util::FutureExt;
+
+    let service_id = next_service_id();
+    let silent_peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+    let run_handle = tokio::spawn(run_fut);
+    let key = ServiceEndpointKey::udp(service_id, silent_peer.local_addr().unwrap());
+    client.add_endpoint(key, 1, 0).await.unwrap();
+    let id = MessageId::new_from_service_and_method(service_id, 0x0001);
+    let request = || {
+        Message::new(
+            Header::new(
+                id,
+                0,
+                1,
+                1,
+                MessageTypeField::new(MessageType::Request, false),
+                ReturnCode::Ok,
+                1,
+            ),
+            RawPayload::from_payload_bytes(id, &[0x2A]).unwrap(),
+        )
+    };
+
+    for _ in 0..70 {
+        drop(client.send_to_service(key, request()).await.unwrap());
+    }
+    let awaited = client.send_to_service(key, request()).await.unwrap();
+    // The client tracks a request before it handles the next one.
+    drop(client.send_to_service(key, request()).await.unwrap());
+    let outcome = awaited.response().now_or_never();
+    assert!(
+        outcome.is_none(),
+        "the awaited request is still tracked, got {outcome:?}"
+    );
+
+    client.shut_down();
+    run_handle.abort();
+}
+
 #[tokio::test]
 async fn request_returns_the_response_payload() {
     let payload = request_answered_with(&[(MessageType::Response, ReturnCode::Ok, &[0x07])])
         .await
         .expect("a RESPONSE with E_OK is a success");
     assert_eq!(payload.raw_bytes().unwrap(), &[0x07]);
+}
+
+#[tokio::test]
+async fn request_returns_the_checked_payload_of_a_reply_that_passes_the_hook() {
+    let payload = request_answered_through(
+        TagE2E::every_message(),
+        &[(MessageType::Response, ReturnCode::Ok, &[TAG, 0x07])],
+    )
+    .await
+    .expect("a reply that passes the check is a success");
+    assert_eq!(payload.raw_bytes().unwrap(), &[0x07]);
+}
+
+#[tokio::test]
+async fn request_returns_e2e_check_failed_for_a_reply_that_fails_the_hook() {
+    let outcome = request_answered_through(
+        TagE2E::every_message(),
+        &[(MessageType::Response, ReturnCode::Ok, &[0x07])],
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(simple_someip::client::Error::E2eCheckFailed {
+                status: TAG_MISSING
+            })
+        ),
+        "got {outcome:?}"
+    );
+}
+
+/// An ERROR reply returns its return code even when it fails the client's
+/// check, since peers commonly send ERROR replies unprotected; the error
+/// carries the failed check.
+#[tokio::test]
+async fn request_returns_the_return_code_of_an_error_reply_that_fails_the_hook() {
+    let outcome = request_answered_through(
+        TagE2E::every_message(),
+        &[(MessageType::Error, ReturnCode::UnknownMethod, &[])],
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(simple_someip::client::Error::ErrorReply {
+                return_code: ReturnCode::UnknownMethod,
+                e2e_status: Some(E2EStatus::Failed(TAG_MISSING)),
+                ..
+            })
+        ),
+        "got {outcome:?}"
+    );
 }
 
 #[tokio::test]
@@ -1178,4 +1197,223 @@ async fn request_is_not_resolved_by_a_notification_with_its_request_id() {
     .await
     .expect("the RESPONSE resolves the request");
     assert_eq!(payload.raw_bytes().unwrap(), &[0x02]);
+}
+
+const TAGGED_EVENT: u16 = 0x8001;
+const OTHER_EVENT: u16 = 0x8002;
+
+/// Starts a server with `server_hook` and a subscribed client with
+/// `client_hook`, publishes each `(event_id, payload)` in turn, and returns
+/// what the client received for each: `(event_id, e2e_status, payload)`.
+async fn publish_and_receive<S, C>(
+    server_hook: S,
+    client_hook: C,
+    service_id: u16,
+    events: &[(u16, &[u8])],
+) -> Vec<(u16, Option<E2EStatus>, Vec<u8>)>
+where
+    S: E2EHandle + Clone,
+    C: E2EHandle + Clone,
+{
+    let config = ServerConfig::new(service_id, 1)
+        .with_interface(SERVER_IP)
+        .with_local_port(0);
+    let deps = ServerDeps::tokio().with_e2e(server_hook);
+    let (server, _handles, _run): (Server<_, _, S, _>, _, _) =
+        Server::new_with_deps(deps, config, false)
+            .await
+            .expect("server");
+    let server_port = server.unicast_local_addr().expect("local addr").port();
+    let publisher = server.publisher();
+    let server_handle = tokio::spawn(async move { server.run().await });
+
+    let deps = ClientDeps::tokio(Ipv4Addr::LOCALHOST).with_e2e(client_hook);
+    let (client, mut updates, run_fut) =
+        Client::<RawPayload, _, TokioChannels>::new_with_deps(deps, false);
+    let run_handle = tokio::spawn(run_fut);
+    let key = ServiceEndpointKey::udp(
+        service_id,
+        SocketAddr::V4(SocketAddrV4::new(SERVER_IP, server_port)),
+    );
+    client.add_endpoint(key, 1, 0).await.unwrap();
+    client.subscribe(key, 1, 3, 0x01, 0).await.unwrap();
+    let mut subscribed = false;
+    for _ in 0..20 {
+        if publisher.has_subscribers(service_id, 1, 0x01).await {
+            subscribed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(subscribed, "server should have registered the subscriber");
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(250), updates.recv()).await;
+
+    let mut received = Vec::new();
+    for &(event_id, payload) in events {
+        let id = MessageId::new_from_service_and_method(service_id, event_id);
+        let header = Header::new_event(service_id, event_id, 0, 0x01, 0x01, payload.len());
+        let message = Message::new(header, RawPayload::from_payload_bytes(id, payload).unwrap());
+        let sent = publisher
+            .publish_event(service_id, 1, 0x01, &message)
+            .await
+            .expect("publish_event failed");
+        assert_eq!(sent, 1);
+        match recv_unicast(&mut updates).await {
+            ClientUpdate::Unicast {
+                message,
+                e2e_status,
+                ..
+            } => received.push((
+                event_id,
+                e2e_status,
+                message.payload().raw_bytes().unwrap().to_vec(),
+            )),
+            other => unreachable!("recv_unicast only returns Unicast, got {other:?}"),
+        }
+    }
+    client.shut_down();
+    run_handle.abort();
+    server_handle.abort();
+    received
+}
+
+/// Sends one request of method 0x0001 carrying `payload` from a client with
+/// `hook` to a plain UDP peer; returns the client's send result and the bytes
+/// the peer received, if any.
+async fn send_request_and_capture<H: E2EHandle + Clone>(
+    hook: H,
+    service_id: u16,
+    payload: &[u8],
+) -> (Result<(), ClientError>, Option<Vec<u8>>) {
+    let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let key = ServiceEndpointKey::udp(service_id, peer.local_addr().unwrap());
+    let deps = ClientDeps::tokio(Ipv4Addr::LOCALHOST).with_e2e(hook);
+    let (client, _updates, run_fut) =
+        Client::<RawPayload, _, TokioChannels>::new_with_deps(deps, false);
+    let run_handle = tokio::spawn(run_fut);
+    client.add_endpoint(key, 1, 0).await.unwrap();
+    let id = MessageId::new_from_service_and_method(service_id, 0x0001);
+    let request = Message::new(
+        Header::new(
+            id,
+            0,
+            1,
+            1,
+            MessageTypeField::new(MessageType::Request, false),
+            ReturnCode::Ok,
+            payload.len(),
+        ),
+        RawPayload::from_payload_bytes(id, payload).unwrap(),
+    );
+    let sent = client.send_to_service(key, request).await.map(|_| ());
+    let mut buf = [0u8; 2048];
+    let arrived = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        peer.recv_from(&mut buf),
+    )
+    .await
+    .ok()
+    .map(|r| buf[..r.unwrap().0].to_vec());
+    client.shut_down();
+    run_handle.abort();
+    (sent, arrived)
+}
+
+#[tokio::test]
+async fn hook_protects_on_publish_and_checks_on_receive() {
+    let service_id = next_service_id();
+    let hook = TagE2E::new(MessageId::new_from_service_and_method(
+        service_id,
+        TAGGED_EVENT,
+    ));
+    let received = publish_and_receive(
+        hook,
+        hook,
+        service_id,
+        &[(TAGGED_EVENT, &[0x01, 0x02]), (OTHER_EVENT, &[0x01, 0x02])],
+    )
+    .await;
+    assert_eq!(
+        received,
+        [
+            (
+                TAGGED_EVENT,
+                Some(E2EStatus::Passed(PASSED)),
+                vec![0x01, 0x02]
+            ),
+            (OTHER_EVENT, None, vec![0x01, 0x02]),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_check_delivers_the_original_bytes() {
+    let service_id = next_service_id();
+    let hook = TagE2E::new(MessageId::new_from_service_and_method(
+        service_id,
+        TAGGED_EVENT,
+    ));
+    let received = publish_and_receive(
+        NoE2E,
+        hook,
+        service_id,
+        &[(TAGGED_EVENT, &[0x07]), (TAGGED_EVENT, &[])],
+    )
+    .await;
+    assert_eq!(
+        received,
+        [
+            (
+                TAGGED_EVENT,
+                Some(E2EStatus::Failed(TAG_MISSING)),
+                vec![0x07]
+            ),
+            (TAGGED_EVENT, Some(E2EStatus::Failed(TAG_MISSING)), vec![]),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn no_hook_delivers_with_no_status() {
+    let service_id = next_service_id();
+    let received = publish_and_receive(NoE2E, NoE2E, service_id, &[(TAGGED_EVENT, &[0x07])]).await;
+    assert_eq!(received, [(TAGGED_EVENT, None, vec![0x07])]);
+}
+
+#[tokio::test]
+async fn hook_protects_a_client_request() {
+    let service_id = next_service_id();
+    let hook = TagE2E::new(MessageId::new_from_service_and_method(service_id, 0x0001));
+    let (sent, arrived) = send_request_and_capture(hook, service_id, &[0x2A]).await;
+    sent.expect("send");
+    let bytes = arrived.expect("the peer receives the request");
+    assert_eq!(&bytes[4..8], &10u32.to_be_bytes());
+    assert_eq!(&bytes[16..], &[TAG, 0x2A]);
+}
+
+#[tokio::test]
+async fn a_protected_request_that_does_not_fit_is_rejected() {
+    let service_id = next_service_id();
+    let hook = TagE2E::new(MessageId::new_from_service_and_method(service_id, 0x0001));
+    // Fills the send buffer unprotected; the tag makes it one byte too long.
+    let payload = vec![0x55; simple_someip::UDP_BUFFER_SIZE - 16];
+    let (sent, arrived) = send_request_and_capture(hook, service_id, &payload).await;
+    assert!(
+        matches!(sent, Err(ClientError::Capacity(CapacityKind::UdpBuffer))),
+        "got {sent:?}"
+    );
+    assert_eq!(arrived, None, "nothing is sent");
+}
+
+#[tokio::test]
+async fn a_hook_for_every_message_leaves_service_discovery_alone() {
+    let service_id = next_service_id();
+    let hook = TagE2E::every_message();
+    let received = publish_and_receive(hook, hook, service_id, &[(TAGGED_EVENT, &[0x01])]).await;
+    assert_eq!(
+        received,
+        [(TAGGED_EVENT, Some(E2EStatus::Passed(PASSED)), vec![0x01])]
+    );
 }

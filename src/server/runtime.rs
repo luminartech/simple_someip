@@ -19,7 +19,7 @@ use futures_util::{FutureExt, future::Either, pin_mut, select_biased};
 
 use crate::Timer;
 use crate::protocol::sd::{self, Entry, Flags, OptionsCount, ServiceEntry, TransportProtocol};
-use crate::transport::{E2ERegistryHandle, SharedHandle, TransportSocket};
+use crate::transport::{E2EHandle, SharedHandle, TransportSocket};
 
 use super::sd_state::SdStateManager;
 use super::subscription_manager::{SubscribeError, SubscriptionHandle};
@@ -505,7 +505,7 @@ pub(super) async fn announce_loop<T, Tm>(
 /// id and protocol/interface versions — and send it back to `source`.
 /// `send_buf` must be distinct from the buffer `view` borrows: the handler
 /// writes its response payload after the header slot, so they don't alias.
-async fn dispatch_non_sd_request<T: TransportSocket, R: E2ERegistryHandle>(
+async fn dispatch_non_sd_request<T: TransportSocket, R: E2EHandle + ?Sized>(
     unicast_socket: &T,
     observer: (super::NonSdRequestCallback, usize),
     e2e: &R,
@@ -517,10 +517,8 @@ async fn dispatch_non_sd_request<T: TransportSocket, R: E2ERegistryHandle>(
     let hdr = view.header();
     let id = hdr.message_id();
     let (service_id, method_id) = (id.service_id(), id.method_id());
-    // Run the same E2E check the notification path uses: a request whose
-    // (service, method) has a registered profile is validated and its E2E
-    // header stripped; one with no profile passes through unchecked (status
-    // 0).
+    // A request that passes the hook's check arrives without its
+    // protection header; any other request arrives as received.
     let parsed = crate::sd_codec::ParsedDatagram {
         service_id,
         method_id,
@@ -535,7 +533,7 @@ async fn dispatch_non_sd_request<T: TransportSocket, R: E2ERegistryHandle>(
         service_id,
         method_id,
         body,
-        crate::sd_codec::e2e_status_code(status),
+        status,
         &mut send_buf[crate::sd_codec::SOMEIP_HEADER_LEN..],
     );
     // A negative length means "no response" (a setter / fire-and-forget).
@@ -568,6 +566,13 @@ async fn dispatch_non_sd_request<T: TransportSocket, R: E2ERegistryHandle>(
     .is_ok()
     {
         let total = crate::sd_codec::SOMEIP_HEADER_LEN + payload_len;
+        let total = match crate::transport::protect_in_place(e2e, send_buf, total) {
+            Ok(total) => total,
+            Err(e) => {
+                crate::log::warn!("protecting the non-SD response failed: {:?}; dropped", e);
+                return;
+            }
+        };
         if let Err(e) = unicast_socket.send_to(&send_buf[..total], source).await {
             crate::log::warn!("non-SD response send failed: {:?}", e);
         }
@@ -593,7 +598,7 @@ async fn recv_loop<T, Sub, R>(
 where
     T: TransportSocket,
     Sub: SubscriptionHandle,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
 {
     use crate::protocol::MessageView;
 
@@ -751,7 +756,7 @@ where
     Sub: SubscriptionHandle,
     Hsd: SharedHandle<SdStateManager>,
     Tm: Timer,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
 {
     if is_passive {
         crate::log::warn!(

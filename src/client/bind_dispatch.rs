@@ -27,7 +27,7 @@ use super::error::Error;
 use super::socket_manager::SocketManager;
 use crate::traits::PayloadWireFormat;
 use crate::transport::{
-    BufferProvider, ChannelFactory, E2ERegistryHandle, LocalSpawner, Spawner, TransportFactory,
+    BufferProvider, ChannelFactory, E2EHandle, LocalSpawner, Spawner, TransportFactory,
     TransportSocket,
 };
 
@@ -37,7 +37,7 @@ pub(super) trait BindDispatch<MD, C, R>
 where
     MD: PayloadWireFormat + Clone + core::fmt::Debug + Send + 'static,
     C: ChannelFactory,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     Result<super::socket_manager::ReceivedMessage<MD>, Error>:
         crate::transport::BoundedPooled<C, 16>,
     super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
@@ -52,7 +52,7 @@ where
     fn bind_discovery(
         &self,
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
@@ -63,7 +63,7 @@ where
     fn bind_unicast(
         &self,
         port: u16,
-        e2e_registry: R,
+        e2e: R,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_;
 
     /// Bind a receive-only unicast service-discovery socket on the
@@ -74,7 +74,7 @@ where
     fn bind_discovery_unicast(
         &self,
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_;
 }
 
@@ -95,7 +95,7 @@ impl<MD, C, R, F, S, BP> BindDispatch<MD, C, R> for SpawnerDispatch<F, S, BP>
 where
     MD: PayloadWireFormat + Clone + core::fmt::Debug + Send + 'static,
     C: ChannelFactory,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     F: TransportFactory + Send + Sync + 'static,
     F::Socket: Send + Sync + 'static,
     for<'a> F::BindFuture<'a>: Send,
@@ -115,7 +115,7 @@ where
     fn bind_discovery(
         &self,
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
@@ -129,7 +129,7 @@ where
                 &self.factory,
                 &self.spawner,
                 interface,
-                e2e_registry,
+                e2e,
                 session_id,
                 session_has_wrapped,
                 multicast_loopback,
@@ -143,7 +143,7 @@ where
     fn bind_unicast(
         &self,
         port: u16,
-        e2e_registry: R,
+        e2e: R,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
         async move {
             let buf = self
@@ -154,7 +154,7 @@ where
                 &self.factory,
                 &self.spawner,
                 port,
-                e2e_registry,
+                e2e,
                 buf,
             )
             .await
@@ -165,7 +165,7 @@ where
     fn bind_discovery_unicast(
         &self,
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
         async move {
             let buf = self
@@ -176,7 +176,7 @@ where
                 &self.factory,
                 &self.spawner,
                 interface,
-                e2e_registry,
+                e2e,
                 buf,
             )
             .await
@@ -201,7 +201,7 @@ impl<MD, C, R, F, S, BP> BindDispatch<MD, C, R> for LocalSpawnerDispatch<F, S, B
 where
     MD: PayloadWireFormat + Clone + core::fmt::Debug + Send + 'static,
     C: ChannelFactory,
-    R: E2ERegistryHandle,
+    R: E2EHandle + Clone,
     F: TransportFactory + 'static,
     F::Socket: 'static,
     S: LocalSpawner + 'static,
@@ -218,7 +218,7 @@ where
     fn bind_discovery(
         &self,
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
@@ -232,7 +232,7 @@ where
                 &self.factory,
                 &self.spawner,
                 interface,
-                e2e_registry,
+                e2e,
                 session_id,
                 session_has_wrapped,
                 multicast_loopback,
@@ -246,7 +246,7 @@ where
     fn bind_unicast(
         &self,
         port: u16,
-        e2e_registry: R,
+        e2e: R,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
         async move {
             let buf = self
@@ -257,7 +257,7 @@ where
                 &self.factory,
                 &self.spawner,
                 port,
-                e2e_registry,
+                e2e,
                 buf,
             )
             .await
@@ -268,7 +268,7 @@ where
     fn bind_discovery_unicast(
         &self,
         interface: Ipv4Addr,
-        e2e_registry: R,
+        e2e: R,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
         async move {
             let buf = self
@@ -279,7 +279,7 @@ where
                 &self.factory,
                 &self.spawner,
                 interface,
-                e2e_registry,
+                e2e,
                 buf,
             )
             .await

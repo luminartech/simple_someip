@@ -19,8 +19,7 @@ use crate::protocol::sd::{
     RebootFlag, SdHeaderView, ServiceEntry, TransportProtocol,
 };
 use crate::protocol::{Header, HeaderView, MessageId, MessageType, MessageTypeField, ReturnCode};
-use crate::transport::E2ERegistryHandle;
-use crate::{E2ECheckStatus, E2EKey};
+use crate::transport::{E2EHandle, E2EStatus};
 
 /// SOME/IP header length in bytes — the offset at which an SD or
 /// notification payload begins.
@@ -454,8 +453,8 @@ pub fn next_sd_session(counter: &AtomicU16) -> u16 {
 pub struct ParsedDatagram<'a> {
     pub service_id: u16,
     pub method_id: u16,
-    /// Header bytes 8..16. Consumed by E2E Profile 5 with-header CRC for
-    /// protected messages.
+    /// Header bytes 8..16, passed to the
+    /// [`E2EHandle`] check.
     pub upper_header: [u8; 8],
     pub payload: &'a [u8],
 }
@@ -504,45 +503,22 @@ pub fn parse_someip_sd_datagram(data: &[u8]) -> Result<SdHeaderView<'_>, crate::
     SdHeaderView::parse(sd_payload)
 }
 
-/// Run an E2E check for `parsed` against `e2e`, keyed by `source`. Returns
-/// `(Unchecked, parsed.payload)` when no profile is registered for the
-/// `(service_id, method_id)` pair. Generic over [`E2ERegistryHandle`] so
-/// it works with any handle (the bare-metal `StaticE2EHandle` included).
-///
-/// `source` is the sender's IP: receive E2E counter state is tracked per
-/// source so several devices sending the same `(service, method)` on a
-/// shared subnet don't collide into spurious sequence errors. See
-/// [`crate::e2e::E2ERegistry`].
+/// Runs `e2e`'s check on `parsed`, received from `source`. Returns what the
+/// check found, or `None` for an SD message or when no check applies, and
+/// the payload to decode.
 #[must_use]
-pub fn check_parsed_e2e<'a, R: E2ERegistryHandle>(
+pub fn check_parsed_e2e<'a, R: E2EHandle + ?Sized>(
     e2e: &R,
     source: IpAddr,
     parsed: &ParsedDatagram<'a>,
-) -> (E2ECheckStatus, &'a [u8]) {
-    let key = E2EKey::from_message_id(MessageId::new_from_service_and_method(
-        parsed.service_id,
-        parsed.method_id,
-    ));
-    match e2e.check(source, key, parsed.payload, parsed.upper_header) {
-        Some((status, body)) => (status, body),
-        None => (E2ECheckStatus::Unchecked, parsed.payload),
-    }
-}
-
-/// Map an [`E2ECheckStatus`] to the 1-byte code the firmware dispatch
-/// expects (`0` = unchecked / none). Shared so the library and firmware
-/// agree on the wire mapping.
-#[must_use]
-pub fn e2e_status_code(status: E2ECheckStatus) -> u8 {
-    match status {
-        E2ECheckStatus::Ok => 1,
-        E2ECheckStatus::CrcError => 2,
-        E2ECheckStatus::Repeated => 3,
-        E2ECheckStatus::OkSomeLost => 4,
-        E2ECheckStatus::WrongSequence => 5,
-        E2ECheckStatus::BadArgument => 6,
-        E2ECheckStatus::Unchecked => 0,
-    }
+) -> (Option<E2EStatus>, &'a [u8]) {
+    crate::transport::check_message(
+        e2e,
+        source,
+        MessageId::new_from_service_and_method(parsed.service_id, parsed.method_id),
+        parsed.upper_header,
+        parsed.payload,
+    )
 }
 
 #[cfg(test)]

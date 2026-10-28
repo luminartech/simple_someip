@@ -13,10 +13,10 @@ use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use simple_someip::NoE2E;
 use simple_someip::client::Error as ClientError;
 use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::define_static_channels;
-use simple_someip::e2e::E2ERegistry;
 use simple_someip::protocol::sd::RebootFlag;
 use simple_someip::static_channels::BufferPool;
 use simple_someip::transport::{
@@ -195,13 +195,12 @@ async fn client_constructible_with_local_spawner() {
 
             let interface_handle: Arc<std::sync::RwLock<Ipv4Addr>> =
                 Arc::new(std::sync::RwLock::new(Ipv4Addr::LOCALHOST));
-            let e2e_handle: Arc<Mutex<E2ERegistry>> = Arc::new(Mutex::new(E2ERegistry::new()));
+            let e2e_handle: NoE2E = NoE2E;
 
             static POOL: BufferPool<9, UDP_BUFFER_SIZE> = BufferPool::new();
 
             let (client, _updates, run_fut) = Client::<
                 RawPayload,
-                Arc<Mutex<E2ERegistry>>,
                 Arc<std::sync::RwLock<Ipv4Addr>>,
                 LocalChannels,
             >::new_with_deps_local(
@@ -209,7 +208,7 @@ async fn client_constructible_with_local_spawner() {
                     factory,
                     spawner: LocalTokioSpawner,
                     timer: MockTimer,
-                    e2e_registry: e2e_handle,
+                    e2e: e2e_handle,
                     interface: interface_handle,
                     buffer_provider: StaticBufferProvider(&POOL),
                 },

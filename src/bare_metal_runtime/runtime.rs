@@ -14,8 +14,6 @@ use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 use crate::bare_metal_tasks::{SomeipRun, publish_notification, run_someip};
-use crate::e2e::{E2ERegistry, Profile5Config};
-use crate::protocol::MessageId;
 use crate::protocol::sd::{self, RebootFlag};
 use crate::sd_codec::{
     OfferServiceRequest, SubscribeEventgroupRequest, build_multi_stop_offer_service_datagram,
@@ -25,8 +23,7 @@ use crate::server::{
     EventPublisher, SdStateManager, Server, ServerConfig, ServerStorage, StaticSubscriptionHandle,
     StaticSubscriptionStorage, SubscriptionManager,
 };
-use crate::transport::E2ERegistryHandle;
-use crate::{E2EKey, E2EProfile, StaticE2EHandle, StaticE2EStorage};
+use crate::transport::{E2EHandle, NoE2E};
 
 use super::mailbox::RxMailbox;
 use super::transport::{CallbackFactory, CallbackSocket, CallbackTimer, NowMsFn, Platform, SendFn};
@@ -44,7 +41,8 @@ const SUB_SCRATCH_CAP: usize = 128;
 /// Capacity of the API-only send scratch (`RuntimeBuffers::publish_scratch`),
 /// shared by `publish` and `deinit`. Sized for modest events rather than a
 /// full MTU to keep the always-resident static footprint small (+512 B, not
-/// +`RX_CAP`); it caps `publish` payloads at `API_SCRATCH_CAP - 16`. Bump it
+/// +`RX_CAP`); it caps `publish` payloads at `API_SCRATCH_CAP - 16`, less
+/// any protection header the [`RuntimeConfig::e2e`] handle adds. Bump it
 /// (with the FW team's RAM sign-off) if a node must emit larger notifications.
 /// Must be `>= SD_SCRATCH_CAP` so `deinit`'s combined `StopOffer` datagram fits.
 const API_SCRATCH_CAP: usize = 512;
@@ -59,11 +57,12 @@ const DEFAULT_SD_MCAST: u32 = 0xEFFF_00FF; // 239.255.0.255
 type Mailbox = RxMailbox<RX_SLOTS, RX_CAP>;
 type Sock = CallbackSocket<'static, RX_SLOTS, RX_CAP>;
 type Factory = CallbackFactory<'static, RX_SLOTS, RX_CAP>;
-type Publisher = EventPublisher<StaticE2EHandle, StaticSubscriptionHandle, &'static Sock, Sock>;
+type Publisher =
+    EventPublisher<&'static dyn E2EHandle, StaticSubscriptionHandle, &'static Sock, Sock>;
 type RtServer = Server<
     Factory,
     CallbackTimer,
-    StaticE2EHandle,
+    &'static dyn E2EHandle,
     StaticSubscriptionHandle,
     &'static Sock,
     &'static SdStateManager,
@@ -75,15 +74,15 @@ type RtServer = Server<
 /// contract — so a platform can use one handler for both the server's
 /// non-SD observer and the runtime's notification RX path. `ctx` is the
 /// opaque word registered at [`init`]; `source` is the sender;
-/// `e2e_status` is real on the RX path (Profile-5 check) and `0`
-/// (unchecked) on the server-request path.
+/// `e2e_status` is what the [`RuntimeConfig::e2e`] handle's check found,
+/// or `None` when no check applied.
 pub type DispatchFn = fn(
     ctx: usize,
     source: core::net::SocketAddrV4,
     service_id: u16,
     method_id: u16,
     payload: &[u8],
-    e2e_status: u8,
+    e2e_status: Option<crate::E2EStatus>,
     response_out: &mut [u8],
 ) -> i32;
 
@@ -119,10 +118,6 @@ pub struct SubEntry {
     pub method_id: u16,
     pub local_rx_port: u16,
     pub major_version: u8,
-    pub e2e_enabled: bool,
-    pub e2e_data_id: u16,
-    pub e2e_data_length: u16,
-    pub e2e_max_delta: u16,
 }
 
 /// Buffer memory the platform owns (so it controls link placement) and
@@ -143,7 +138,8 @@ pub struct RuntimeBuffers {
     /// concurrently (single serial caller), so they share this one buffer.
     /// Sized at `API_SCRATCH_CAP` (512 B), not `RX_CAP`, to keep the static
     /// footprint small; it caps the max `publish` payload at
-    /// `API_SCRATCH_CAP - 16`.
+    /// `API_SCRATCH_CAP - 16`, less any protection header the
+    /// [`RuntimeConfig::e2e`] handle adds.
     pub publish_scratch: [u8; API_SCRATCH_CAP],
 }
 
@@ -194,15 +190,19 @@ pub struct RuntimeConfig {
     pub mailbox: &'static Mailbox,
     /// Runtime buffer memory (platform-owned, placement-controlled).
     pub buffers: &'static mut RuntimeBuffers,
+    /// Checks every non-SD message the runtime receives and protects every
+    /// one it sends; `None` for neither.
+    pub e2e: Option<&'static dyn E2EHandle>,
 }
 
 // ── Library-owned state ──────────────────────────────────────────────────
-#[allow(clippy::declare_interior_mutable_const)]
-const E2E_INIT: StaticE2EStorage =
-    BlockingMutex::<CriticalSectionRawMutex, RefCell<E2ERegistry>>::new(RefCell::new(
-        E2ERegistry::new(),
-    ));
-static E2E_STORAGE: StaticE2EStorage = E2E_INIT;
+static NO_E2E: NoE2E = NoE2E;
+static mut E2E: &'static dyn E2EHandle = &NO_E2E;
+
+fn e2e() -> &'static dyn E2EHandle {
+    // SAFETY: written once in `init` before any task reads it.
+    unsafe { *core::ptr::addr_of!(E2E) }
+}
 static SUBS_STORAGE: StaticSubscriptionStorage = BlockingMutex::<
     CriticalSectionRawMutex,
     RefCell<SubscriptionManager>,
@@ -238,10 +238,6 @@ static mut SUBS: [SubEntry; MAX_SUBS] = [SubEntry {
     method_id: 0,
     local_rx_port: 0,
     major_version: 0,
-    e2e_enabled: false,
-    e2e_data_id: 0,
-    e2e_data_length: 0,
-    e2e_max_delta: 0,
 }; MAX_SUBS];
 
 static mut UNICAST_SOCK: MaybeUninit<Sock> = MaybeUninit::uninit();
@@ -335,7 +331,7 @@ fn dispatch(
     service_id: u16,
     method_id: u16,
     payload: &[u8],
-    e2e_status: u8,
+    e2e_status: Option<crate::E2EStatus>,
     response_out: &mut [u8],
 ) -> i32 {
     let raw = DISPATCH.load(Ordering::Acquire);
@@ -399,7 +395,7 @@ fn build_server() -> bool {
         (*core::ptr::addr_of_mut!(UNICAST_SOCK)).write(factory.socket(unicast_port));
         (*core::ptr::addr_of_mut!(SD_SOCK)).write(factory.socket(sd_port));
         let unicast_ref: &'static Sock = (*core::ptr::addr_of!(UNICAST_SOCK)).assume_init_ref();
-        let e2e = StaticE2EHandle::new(&E2E_STORAGE);
+        let e2e = e2e();
         let subs_handle = StaticSubscriptionHandle::new(&SUBS_STORAGE);
         (*core::ptr::addr_of_mut!(PUBLISHER)).write(EventPublisher::new(
             subs_handle,
@@ -436,7 +432,7 @@ fn build_server() -> bool {
         ServerStorage {
             factory,
             timer: CallbackTimer::new(platform().now_ms),
-            e2e_registry: StaticE2EHandle::new(&E2E_STORAGE),
+            e2e: e2e(),
             subscriptions: StaticSubscriptionHandle::new(&SUBS_STORAGE),
             unicast_socket: (*core::ptr::addr_of!(UNICAST_SOCK)).assume_init_ref(),
             sd_socket: (*core::ptr::addr_of!(SD_SOCK)).assume_init_ref(),
@@ -497,7 +493,7 @@ async fn someip_task() {
         SD_PORT.load(Ordering::Acquire),
     );
     let timer = CallbackTimer::new(plat.now_ms);
-    let e2e = StaticE2EHandle::new(&E2E_STORAGE);
+    let e2e = e2e();
 
     let sub = subs().first().copied();
     // Client RX socket marker (its PCB is pre-bound by the platform).
@@ -512,7 +508,6 @@ async fn someip_task() {
         local_ip: Ipv4Addr::from(IFACE.load(Ordering::Acquire).to_be_bytes()),
         local_rx_port: s.local_rx_port,
     });
-    let sub_e2e_enabled = sub.is_some_and(|s| s.e2e_enabled);
     let period = Duration::from_secs(node_sd_ttl_secs());
 
     run_someip(
@@ -532,7 +527,6 @@ async fn someip_task() {
             sub_scratch,
             sub_reboot: RebootFlag::RecentlyRebooted,
             sub_offset: Duration::from_secs(CLIENT_SUB_OFFSET_SECS),
-            sub_e2e_enabled,
             rx_buf: rx,
             dispatch,
             // The trampoline injects DISPATCH_CTX itself; pass 0 here.
@@ -544,7 +538,7 @@ async fn someip_task() {
 
 // ── Public runtime API (the platform's C-FFI forwards to these) ──────────
 
-/// Stand up the runtime from `config`, build the server, register E2E, and
+/// Stand up the runtime from `config`, build the server, and
 /// spawn the composed task.
 ///
 /// Returns `0` on success, or a negative error code: `-1` server build
@@ -592,6 +586,7 @@ pub fn init(config: RuntimeConfig) -> i32 {
     DISPATCH_CTX.store(config.dispatch_ctx, Ordering::Release);
     unsafe {
         *core::ptr::addr_of_mut!(MAILBOX) = Some(config.mailbox);
+        *core::ptr::addr_of_mut!(E2E) = config.e2e.unwrap_or(&NO_E2E);
         *core::ptr::addr_of_mut!(BUFS) = core::ptr::from_mut(config.buffers);
     }
 
@@ -606,27 +601,6 @@ pub fn init(config: RuntimeConfig) -> i32 {
         unsafe { (*core::ptr::addr_of_mut!(SUBS))[i] = *e };
     }
     SUBS_LEN.store(n_subs, Ordering::Release);
-
-    // E2E Profile 5 for opted-in subscriptions.
-    let e2e = StaticE2EHandle::new(&E2E_STORAGE);
-    for s in subs() {
-        if !s.e2e_enabled {
-            continue;
-        }
-        let p5 = E2EProfile::Profile5WithHeader(Profile5Config::new(
-            s.e2e_data_id,
-            s.e2e_data_length,
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                s.e2e_max_delta as u8
-            },
-        ));
-        let key = E2EKey::from_message_id(MessageId::new_from_service_and_method(
-            s.service_id,
-            s.method_id,
-        ));
-        let _ = e2e.register(key, p5);
-    }
 
     // Bind PCBs via the platform (registers the RX path → `on_rx`): the SD
     // port, each unique offered unicast port, and each subscription RX port.
@@ -693,9 +667,10 @@ fn next_publish_session() -> u16 {
     }
 }
 
-/// Publish a notification to all current subscribers. Returns subscriber
-/// count, or negative on error (`-1` not ready, `-2` payload too large,
-/// `-3` tuple not offered).
+/// Publish a notification to all current subscribers, protected through
+/// [`RuntimeConfig::e2e`]. Returns subscriber count, or negative on error
+/// (`-1` not ready, `-2` payload too large once framed, or once protected
+/// while someone subscribes, `-3` tuple not offered).
 ///
 /// # Safety
 /// `payload` must be valid for `len` bytes (or `len == 0`).
@@ -738,6 +713,7 @@ pub unsafe fn publish(
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).publish_scratch) };
     publish_notification(
         &subs_handle,
+        e2e(),
         service_id,
         instance_id,
         event_group_id,

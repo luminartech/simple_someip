@@ -25,17 +25,7 @@ pub enum ReturnCode {
     MalformedMessage,
     /// The message type is wrong for the context (0x0A).
     WrongMessageType,
-    /// E2E: repeated message detected (0x0B).
-    E2ERepeated,
-    /// E2E: wrong sequence counter (0x0C).
-    E2EWrongSequence,
-    /// E2E: unspecified E2E error (0x0D).
-    E2E,
-    /// E2E: protection not available (0x0E).
-    E2ENotAvailable,
-    /// E2E: no new data (0x0F).
-    E2ENoNewData,
-    /// A generic error in the range 0x10..=0x1F.
+    /// A generic error in the range 0x0B..=0x1F.
     GenericError(u8),
     /// An interface-specific error in the range 0x20..=0x5E.
     InterfaceError(u8),
@@ -57,11 +47,6 @@ impl ReturnCode {
             ReturnCode::WrongInterfaceVersion => 0x08,
             ReturnCode::MalformedMessage => 0x09,
             ReturnCode::WrongMessageType => 0x0a,
-            ReturnCode::E2ERepeated => 0x0b,
-            ReturnCode::E2EWrongSequence => 0x0c,
-            ReturnCode::E2E => 0x0d,
-            ReturnCode::E2ENotAvailable => 0x0e,
-            ReturnCode::E2ENoNewData => 0x0f,
             ReturnCode::GenericError(value) | ReturnCode::InterfaceError(value) => value,
         }
     }
@@ -82,12 +67,7 @@ impl TryFrom<u8> for ReturnCode {
             0x08 => Ok(ReturnCode::WrongInterfaceVersion),
             0x09 => Ok(ReturnCode::MalformedMessage),
             0x0a => Ok(ReturnCode::WrongMessageType),
-            0x0b => Ok(ReturnCode::E2ERepeated),
-            0x0c => Ok(ReturnCode::E2EWrongSequence),
-            0x0d => Ok(ReturnCode::E2E),
-            0x0e => Ok(ReturnCode::E2ENotAvailable),
-            0x0f => Ok(ReturnCode::E2ENoNewData),
-            0x10..=0x1f => Ok(ReturnCode::GenericError(value)),
+            0x0b..=0x1f => Ok(ReturnCode::GenericError(value)),
             0x20..=0x5e => Ok(ReturnCode::InterfaceError(value)),
             _ => Err(Error::InvalidReturnCode(value)),
         }
@@ -108,11 +88,6 @@ impl From<ReturnCode> for u8 {
             ReturnCode::WrongInterfaceVersion => 0x08,
             ReturnCode::MalformedMessage => 0x09,
             ReturnCode::WrongMessageType => 0x0a,
-            ReturnCode::E2ERepeated => 0x0b,
-            ReturnCode::E2EWrongSequence => 0x0c,
-            ReturnCode::E2E => 0x0d,
-            ReturnCode::E2ENotAvailable => 0x0e,
-            ReturnCode::E2ENoNewData => 0x0f,
             ReturnCode::GenericError(value) | ReturnCode::InterfaceError(value) => value,
         }
     }
@@ -121,6 +96,17 @@ impl From<ReturnCode> for u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_generic_range_decodes_as_generic_error() {
+        for value in 0x0B..=0x1F_u8 {
+            assert_eq!(
+                ReturnCode::try_from(value).unwrap(),
+                ReturnCode::GenericError(value)
+            );
+            assert_eq!(u8::from(ReturnCode::GenericError(value)), value);
+        }
+    }
 
     // Every valid u8 should round-trip: TryFrom then From gives back the same byte.
     // Invalid bytes (0x5f..=0xff) must return an error.
@@ -160,21 +146,21 @@ mod tests {
             (0x08, ReturnCode::WrongInterfaceVersion),
             (0x09, ReturnCode::MalformedMessage),
             (0x0a, ReturnCode::WrongMessageType),
-            (0x0b, ReturnCode::E2ERepeated),
-            (0x0c, ReturnCode::E2EWrongSequence),
-            (0x0d, ReturnCode::E2E),
-            (0x0e, ReturnCode::E2ENotAvailable),
-            (0x0f, ReturnCode::E2ENoNewData),
+            (0x0b, ReturnCode::GenericError(0x0b)),
+            (0x0c, ReturnCode::GenericError(0x0c)),
+            (0x0d, ReturnCode::GenericError(0x0d)),
+            (0x0e, ReturnCode::GenericError(0x0e)),
+            (0x0f, ReturnCode::GenericError(0x0f)),
         ];
         for (byte, expected) in cases {
             assert_eq!(ReturnCode::try_from(byte).unwrap(), expected);
         }
     }
 
-    // GenericError range: 0x10..=0x1f
+    // GenericError range: 0x0b..=0x1f
     #[test]
     fn generic_error_range_decodes_and_preserves_value() {
-        for byte in 0x10u8..=0x1f {
+        for byte in 0x0bu8..=0x1f {
             assert_eq!(
                 ReturnCode::try_from(byte).unwrap(),
                 ReturnCode::GenericError(byte)
@@ -206,7 +192,7 @@ mod tests {
 
     #[test]
     fn generic_error_as_u8_preserves_value() {
-        for byte in 0x10u8..=0x1f {
+        for byte in 0x0bu8..=0x1f {
             assert_eq!(ReturnCode::GenericError(byte).as_u8(), byte);
         }
     }
@@ -237,10 +223,10 @@ mod tests {
         assert_eq!(ReturnCode::WrongInterfaceVersion.as_u8(), 0x08);
         assert_eq!(ReturnCode::MalformedMessage.as_u8(), 0x09);
         assert_eq!(ReturnCode::WrongMessageType.as_u8(), 0x0a);
-        assert_eq!(ReturnCode::E2ERepeated.as_u8(), 0x0b);
-        assert_eq!(ReturnCode::E2EWrongSequence.as_u8(), 0x0c);
-        assert_eq!(ReturnCode::E2E.as_u8(), 0x0d);
-        assert_eq!(ReturnCode::E2ENotAvailable.as_u8(), 0x0e);
-        assert_eq!(ReturnCode::E2ENoNewData.as_u8(), 0x0f);
+        assert_eq!(ReturnCode::GenericError(0x0b).as_u8(), 0x0b);
+        assert_eq!(ReturnCode::GenericError(0x0c).as_u8(), 0x0c);
+        assert_eq!(ReturnCode::GenericError(0x0d).as_u8(), 0x0d);
+        assert_eq!(ReturnCode::GenericError(0x0e).as_u8(), 0x0e);
+        assert_eq!(ReturnCode::GenericError(0x0f).as_u8(), 0x0f);
     }
 }

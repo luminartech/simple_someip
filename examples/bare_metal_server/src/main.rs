@@ -26,14 +26,13 @@
 //! | Transport | `MockFactory` / `MockSocket` | `embassy_net`, smoltcp, custom Ethernet ISR |
 //! | Timer | `MockTimer` using `tokio::time::sleep` | `embassy_time::Timer::after` |
 //! | Subscription table | `StaticSubscriptionHandle` over `&'static StaticSubscriptionStorage` | same — already firmware-ready |
-//! | E2E registry | `StaticE2EHandle` over `&'static StaticE2EStorage` | same — already firmware-ready |
+//! | E2E hook | `NoE2E` (checks and protects nothing) | your `E2EHandle`, or `NoE2E` |
 //!
-//! Both handles are pure `no_std` (no allocator required) and use a
-//! `&'static` critical-section mutex around the underlying state, which
-//! is the firmware-target shape. `E2ERegistry::new()` and
-//! `SubscriptionManager::new()` are both `const`, so the storage lives
-//! in plain `static` declarations at module scope (see `E2E_STORAGE`
-//! and `SUBS_STORAGE` near the top of this file).
+//! The subscription handle is pure `no_std` (no allocator required) and
+//! uses a `&'static` critical-section mutex around the underlying state,
+//! which is the firmware-target shape. `SubscriptionManager::new()` is
+//! `const`, so the storage lives in a plain `static` declaration at module
+//! scope (see `SUBS_STORAGE` near the top of this file).
 //!
 //! [`Server::new_with_deps`]: simple_someip::Server::new_with_deps
 
@@ -50,27 +49,21 @@ use std::vec::Vec;
 
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use simple_someip::e2e::E2ERegistry;
+use simple_someip::NoE2E;
 use simple_someip::server::{
     ServerConfig, StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager,
 };
 use simple_someip::transport::{
     ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory, TransportSocket,
 };
-use simple_someip::{Server, ServerDeps, StaticE2EHandle, StaticE2EStorage};
+use simple_someip::{Server, ServerDeps};
 
 // ── Bare-metal lock-handle storage ────────────────────────────────────
 //
-// `&'static` storage for the no-alloc lock handles. Both
-// `E2ERegistry::new()` and `SubscriptionManager::new()` are `const`,
-// so the storage lives in plain `static`s — no `Box::leak` required.
-// On real firmware you'd write the same `static` declarations in
-// boot code.
-
-static E2E_STORAGE: StaticE2EStorage =
-    BlockingMutex::<CriticalSectionRawMutex, RefCell<E2ERegistry>>::new(RefCell::new(
-        E2ERegistry::new(),
-    ));
+// `&'static` storage for the no-alloc subscription handle.
+// `SubscriptionManager::new()` is `const`, so the storage lives in a plain
+// `static` — no `Box::leak` required. On real firmware you'd write the same
+// `static` declaration in boot code.
 
 static SUBS_STORAGE: StaticSubscriptionStorage = BlockingMutex::<
     CriticalSectionRawMutex,
@@ -240,12 +233,10 @@ async fn main() {
         next_port: Arc::new(Mutex::new(0)),
     };
 
-    // Bare-metal lock handles: both StaticE2EHandle and
-    // StaticSubscriptionHandle are pure no_std (alloc-free) and back
-    // their state with a `&'static` critical-section mutex. The
-    // `static` storages themselves live at module scope (see top of
-    // file) — clippy::pedantic dislikes `static` after `let`.
-    let e2e = StaticE2EHandle::new(&E2E_STORAGE);
+    // Bare-metal subscription handle: pure no_std (alloc-free), backing
+    // its state with a `&'static` critical-section mutex. The `static`
+    // storage lives at module scope (see top of file) — clippy::pedantic
+    // dislikes `static` after `let`.
     let subs = StaticSubscriptionHandle::new(&SUBS_STORAGE);
 
     // service_id=0x1234, instance_id=1, bound to LOCALHOST:30490.
@@ -254,11 +245,11 @@ async fn main() {
         .with_local_port(30490);
 
     let (_server, _handles, run) =
-        Server::<MockFactory, MockTimer, StaticE2EHandle, StaticSubscriptionHandle>::new_with_deps(
+        Server::<MockFactory, MockTimer, NoE2E, StaticSubscriptionHandle>::new_with_deps(
             ServerDeps {
                 factory,
                 timer: MockTimer,
-                e2e_registry: e2e,
+                e2e: NoE2E,
                 subscriptions: subs,
                 non_sd_observer: None,
             },

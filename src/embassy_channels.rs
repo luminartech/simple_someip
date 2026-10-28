@@ -116,6 +116,10 @@ pub struct EmbassySyncOneshotReceiver<T: Send + 'static> {
 }
 
 impl<T: Send + 'static> OneshotSend<T> for EmbassySyncOneshotSender<T> {
+    fn is_closed(&self) -> bool {
+        !self.inner.receiver_alive.load(Ordering::Acquire)
+    }
+
     fn send(mut self, value: T) -> Result<(), T> {
         if !self.inner.receiver_alive.load(Ordering::Acquire) {
             return Err(value);
@@ -484,6 +488,14 @@ mod tests {
             Poll::Ready(Ok(42)) => {}
             other => panic!("expected Ready(Ok(42)), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn oneshot_sender_is_closed_once_the_receiver_drops() {
+        let (tx, rx) = <u32 as OneshotPooled<EmbassySyncChannels>>::oneshot_pair();
+        assert!(!tx.is_closed());
+        drop(rx);
+        assert!(tx.is_closed());
     }
 
     #[test]
