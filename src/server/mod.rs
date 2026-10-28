@@ -2991,6 +2991,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_sd_subscribes_past_an_unknown_entry_and_option() {
+        let (server, _) = create_test_server(0x5B, 1).await;
+        let subscribe = sd::Entry::SubscribeEventGroup(sd::EventGroupEntry {
+            index_first_options_run: 1,
+            index_second_options_run: 0,
+            options_count: sd::OptionsCount::new(1, 0),
+            service_id: 0x5B,
+            instance_id: 1,
+            major_version: 1,
+            ttl: 3,
+            counter: 0,
+            event_group_id: 0x01,
+        });
+        let body = sd::test_support::sd_body_with_unknown_entry_and_option_for(&subscribe);
+        let sd_view = sd::SdHeaderView::parse(&body).unwrap();
+
+        let result = runtime::handle_sd_message(
+            &server.config,
+            server.sd_socket.get(),
+            server.sd_state.get(),
+            &server.subscriptions,
+            &sd_view,
+            "127.0.0.1:45000".parse().unwrap(),
+            &mut [0u8; crate::UDP_BUFFER_SIZE],
+        )
+        .await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(server.subscriptions.read().await.subscription_count(), 1);
+    }
+
+    #[tokio::test]
     async fn test_handle_sd_ignores_stop_offer() {
         let (server, _) = create_test_server(0x5B, 1).await;
 

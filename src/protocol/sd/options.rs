@@ -21,6 +21,10 @@ pub(crate) const OPTION_HEADER_SIZE: usize = 4;
 pub(crate) const OPTION_LENGTH_SIZE_DELTA: usize = 3;
 /// Byte offset of the option type byte inside the fixed header.
 const OPTION_TYPE_OFFSET: usize = 2;
+/// Byte offset of the byte that holds the discardable flag.
+const OPTION_DISCARDABLE_OFFSET: usize = 3;
+/// The discardable flag, the high bit of the byte after the option type.
+const OPTION_DISCARDABLE_FLAG: u8 = 0x80;
 /// Byte offset at which per-type payload begins.
 const OPTION_PAYLOAD_OFFSET: usize = 4;
 
@@ -141,6 +145,7 @@ impl From<OptionType> for u8 {
 #[allow(clippy::large_enum_variant)]
 /// A decoded SD option.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Options {
     /// A configuration key-value string.
     Configuration {
@@ -208,10 +213,26 @@ pub enum Options {
         /// The port number.
         port: u16,
     },
+    /// A received option of a type this crate does not know. It holds its
+    /// place in the option array so later options keep their index; entries
+    /// that reference it ignore it. Its body is not kept, so it cannot be
+    /// encoded, and neither can a header that holds it. Only
+    /// [`OptionView::to_owned`] builds one.
+    #[non_exhaustive]
+    Unknown {
+        /// The option's type byte.
+        option_type: u8,
+        /// The discardable flag: set when the sender allows receivers to
+        /// discard the option.
+        discardable: bool,
+        /// The option's length field.
+        length: u16,
+    },
 }
 
 impl Options {
-    /// Returns the total wire size of this option in bytes.
+    /// Returns the total wire size of this option in bytes; for an
+    /// [`Options::Unknown`], the size it had on the wire.
     #[must_use]
     pub fn size(&self) -> usize {
         match self {
@@ -225,6 +246,7 @@ impl Options {
             Options::IpV6Endpoint { .. }
             | Options::IpV6Multicast { .. }
             | Options::IpV6SD { .. } => IPV6_OPTION_WIRE_SIZE,
+            Options::Unknown { length, .. } => usize::from(*length) + OPTION_LENGTH_SIZE_DELTA,
         }
     }
 }
@@ -232,7 +254,18 @@ impl Options {
 impl Encode for Options {
     type Error = crate::protocol::Error;
 
+    /// Returns this option's wire size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnencodableOption`] for an [`Options::Unknown`].
     fn encoded_size(&self) -> Result<usize, Self::Error> {
+        if let Options::Unknown { option_type, .. } = self {
+            return Err(Error::UnencodableOption {
+                option_type: *option_type,
+            }
+            .into());
+        }
         Ok(self.size())
     }
 
@@ -240,28 +273,28 @@ impl Encode for Options {
     ///
     /// # Errors
     ///
-    /// Returns an error if writing to the writer fails.
+    /// Returns [`Error::UnencodableOption`] for an [`Options::Unknown`], before
+    /// writing anything, or an error if writing to the writer fails.
     ///
     /// # Panics
     ///
     /// Panics if the option size minus `OPTION_LENGTH_SIZE_DELTA` exceeds `u16::MAX`
     /// (unreachable in practice).
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
-        writer.write_u16_be(
-            u16::try_from(self.size() - OPTION_LENGTH_SIZE_DELTA).expect("option size fits u16"),
-        )?;
         match self {
             Options::Configuration {
                 configuration_string,
             } => {
-                writer.write_u8(u8::from(OptionType::Configuration))?;
-                writer.write_u8(0)?;
+                write_option_header(writer, self.size(), OptionType::Configuration)?;
                 writer.write_bytes(configuration_string)?;
                 Ok(self.size())
             }
             Options::LoadBalancing { priority, weight } => {
-                writer.write_u8(u8::from(OptionType::LoadBalancing))?;
-                writer.write_u8(0)?;
+                write_option_header(
+                    writer,
+                    LOAD_BALANCING_OPTION_WIRE_SIZE,
+                    OptionType::LoadBalancing,
+                )?;
                 writer.write_u16_be(*priority)?;
                 writer.write_u16_be(*weight)?;
                 Ok(LOAD_BALANCING_OPTION_WIRE_SIZE)
@@ -284,8 +317,25 @@ impl Encode for Options {
             Options::IpV6SD { ip, protocol, port } => {
                 write_ipv6_option(writer, OptionType::IpV6SD, *ip, *protocol, *port)
             }
+            Options::Unknown { option_type, .. } => Err(Error::UnencodableOption {
+                option_type: *option_type,
+            }
+            .into()),
         }
     }
+}
+
+fn write_option_header<T: embedded_io::Write>(
+    writer: &mut T,
+    wire_size: usize,
+    option_type: OptionType,
+) -> Result<(), crate::protocol::Error> {
+    writer.write_u16_be(
+        u16::try_from(wire_size - OPTION_LENGTH_SIZE_DELTA).expect("option size fits u16"),
+    )?;
+    writer.write_u8(u8::from(option_type))?;
+    writer.write_u8(0)?;
+    Ok(())
 }
 
 fn write_ipv4_option<T: embedded_io::Write>(
@@ -295,8 +345,7 @@ fn write_ipv4_option<T: embedded_io::Write>(
     protocol: TransportProtocol,
     port: u16,
 ) -> Result<usize, crate::protocol::Error> {
-    writer.write_u8(u8::from(option_type))?;
-    writer.write_u8(0)?;
+    write_option_header(writer, IPV4_OPTION_WIRE_SIZE, option_type)?;
     writer.write_u32_be(ip.to_bits())?;
     writer.write_u8(0)?;
     writer.write_u8(u8::try_from(protocol)?)?;
@@ -311,8 +360,7 @@ fn write_ipv6_option<T: embedded_io::Write>(
     protocol: TransportProtocol,
     port: u16,
 ) -> Result<usize, crate::protocol::Error> {
-    writer.write_u8(u8::from(option_type))?;
-    writer.write_u8(0)?;
+    write_option_header(writer, IPV6_OPTION_WIRE_SIZE, option_type)?;
     writer.write_bytes(&ip.octets())?;
     writer.write_u8(0)?;
     writer.write_u8(u8::try_from(protocol)?)?;
@@ -365,17 +413,18 @@ impl<'a> OptionView<'a> {
         usize::from(length) + OPTION_LENGTH_SIZE_DELTA
     }
 
-    /// Fully validate this option's wire format (type, per-type length, and
-    /// transport-protocol byte for IP-bearing options).
+    /// Validate this option's wire format: for a known type, its per-type
+    /// length and the transport-protocol byte of an IP-bearing option. An
+    /// option of unknown type passes.
     ///
-    /// Used by the eager L2 validation walk in
+    /// Used by the validating walk in
     /// [`SdHeaderView::parse`](super::SdHeaderView::parse) so that its
     /// infallible option accessors can trust the buffer thereafter.
     ///
     /// # Errors
     ///
-    /// Returns an error if the option type, length, or transport-protocol byte
-    /// is invalid.
+    /// Returns an error if a known type's length or transport-protocol byte is
+    /// invalid.
     pub(crate) fn validate(&self) -> Result<(), Error> {
         validate_option(self.0).map(|_| ())
     }
@@ -399,10 +448,9 @@ impl<'a> OptionView<'a> {
     /// # Errors
     ///
     /// Returns [`Error::InvalidOptionTransportProtocol`] if the protocol byte is unrecognized.
-    /// Views obtained via [`SdHeaderView::parse`](super::SdHeaderView::parse) have already
-    /// had their protocol byte validated, so this error cannot occur for those callers —
-    /// it is retained only to keep the API usable if an `OptionView` is ever constructed
-    /// outside the validated parse path.
+    /// [`SdHeaderView::parse`](super::SdHeaderView::parse) has validated the protocol byte
+    /// of every IP-bearing option of known type; it does not look inside an option of
+    /// unknown type, so check [`OptionView::option_type`] first.
     pub fn as_ipv4(&self) -> Result<(Ipv4Addr, TransportProtocol, u16), Error> {
         self.ensure_body_len(IPV4_OPTION_WIRE_SIZE)?;
         let ip = Ipv4Addr::from_bits(u32::from_be_bytes([
@@ -425,10 +473,9 @@ impl<'a> OptionView<'a> {
     /// # Errors
     ///
     /// Returns [`Error::InvalidOptionTransportProtocol`] if the protocol byte is unrecognized.
-    /// Views obtained via [`SdHeaderView::parse`](super::SdHeaderView::parse) have already
-    /// had their protocol byte validated, so this error cannot occur for those callers —
-    /// it is retained only to keep the API usable if an `OptionView` is ever constructed
-    /// outside the validated parse path.
+    /// [`SdHeaderView::parse`](super::SdHeaderView::parse) has validated the protocol byte
+    /// of every IP-bearing option of known type; it does not look inside an option of
+    /// unknown type, so check [`OptionView::option_type`] first.
     pub fn as_ipv6(&self) -> Result<(Ipv6Addr, TransportProtocol, u16), Error> {
         self.ensure_body_len(IPV6_OPTION_WIRE_SIZE)?;
         let mut octets = [0u8; 16];
@@ -468,19 +515,26 @@ impl<'a> OptionView<'a> {
         Ok((priority, weight))
     }
 
-    /// Converts this view into an owned [`Options`].
+    /// Converts this view into an owned [`Options`]; an option of a type this
+    /// crate does not know becomes [`Options::Unknown`].
     ///
     /// # Errors
     ///
-    /// Returns an error if the option type is unrecognized, the transport protocol byte
-    /// is invalid, or the configuration string exceeds [`MAX_CONFIGURATION_STRING_LENGTH`].
+    /// Returns an error if the transport protocol byte is invalid, or the
+    /// configuration string exceeds [`MAX_CONFIGURATION_STRING_LENGTH`].
     ///
     /// # Panics
     ///
     /// Panics if a configuration string passes the length check but fails to fit into the
     /// heapless buffer (unreachable in practice).
     pub fn to_owned(&self) -> Result<Options, Error> {
-        let option_type = self.option_type()?;
+        let Ok(option_type) = self.option_type() else {
+            return Ok(Options::Unknown {
+                option_type: self.0[OPTION_TYPE_OFFSET],
+                discardable: self.0[OPTION_DISCARDABLE_OFFSET] & OPTION_DISCARDABLE_FLAG != 0,
+                length: u16::from_be_bytes([self.0[0], self.0[1]]),
+            });
+        };
         match option_type {
             OptionType::Configuration => {
                 let config_bytes = self.configuration_bytes();
@@ -535,9 +589,8 @@ impl<'a> Decode<'a> for OptionView<'a> {
     ///
     /// The stride comes from the option's 2-byte length field. This slices
     /// only; it does NOT validate the option type, per-type length, or
-    /// transport-protocol byte. Validation is deferred to the accessors
-    /// (`option_type` / `as_ipv4` / `to_owned`) — the L2 validation pass —
-    /// keeping this a lazy zero-copy view.
+    /// transport-protocol byte. The accessors (`option_type` / `as_ipv4` /
+    /// `to_owned`) check what they read, keeping this a lazy zero-copy view.
     ///
     /// # Errors
     ///
@@ -590,7 +643,8 @@ impl<'a> DecodeIter<'a> for OptionView<'a> {
 }
 
 /// Iterator over variable-length SD options in a validated buffer.
-/// Options are guaranteed valid (validated upfront in `SdHeaderView::parse`).
+/// Every option of a known type was validated by `SdHeaderView::parse`; an
+/// option of unknown type is yielded in its place.
 ///
 /// `OptionIter` is a thin wrapper around a borrowed byte slice and is
 /// `Clone`, so callers that need to walk the same options multiple
@@ -633,7 +687,7 @@ impl<'a> Iterator for OptionIter<'a> {
 /// Validate a single option's wire format and return its wire size.
 /// Used during `SdHeaderView::parse` for upfront validation.
 ///
-/// In addition to length/type checks, this validates the transport protocol
+/// In addition to length checks, this validates the transport protocol
 /// byte of IP-bearing options so that `OptionView::as_ipv4` / `as_ipv6` on
 /// views obtained through `SdHeaderView::parse` cannot observe an unknown
 /// protocol byte.
@@ -653,7 +707,9 @@ pub(crate) fn validate_option(buf: &[u8]) -> Result<usize, Error> {
         });
     }
     let option_type_byte = buf[OPTION_TYPE_OFFSET];
-    let option_type = OptionType::try_from(option_type_byte)?;
+    let Ok(option_type) = OptionType::try_from(option_type_byte) else {
+        return Ok(wire_size);
+    };
     // Validate expected lengths for fixed-size options
     match option_type {
         OptionType::IpV4Endpoint | OptionType::IpV4Multicast | OptionType::IpV4SD => {
@@ -820,13 +876,41 @@ mod tests {
     }
 
     #[test]
-    fn option_view_to_owned_invalid_type() {
-        let buf: [u8; 4] = [0x00, 0x00, 0xFF, 0x00]; // type = 0xFF (invalid)
-        let view = OptionView(&buf);
+    fn unknown_option_keeps_its_wire_size_and_does_not_encode() {
+        let unknown = Options::Unknown {
+            option_type: 0x77,
+            discardable: true,
+            length: 5,
+        };
+        assert_eq!(unknown.size(), 8);
         assert!(matches!(
-            view.to_owned(),
-            Err(Error::InvalidOptionType(0xFF))
+            unknown.encoded_size(),
+            Err(crate::protocol::Error::Sd(Error::UnencodableOption {
+                option_type: 0x77
+            }))
         ));
+        assert!(matches!(
+            unknown.encode(&mut [0u8; 8].as_mut_slice()),
+            Err(crate::protocol::Error::Sd(Error::UnencodableOption {
+                option_type: 0x77
+            }))
+        ));
+    }
+
+    #[test]
+    fn option_view_to_owned_of_unknown_type_is_unknown() {
+        for (flag_byte, discardable) in [(0x00, false), (0x80, true)] {
+            let buf: [u8; 4] = [0x00, 0x01, 0xFF, flag_byte];
+            let view = OptionView(&buf);
+            assert_eq!(
+                view.to_owned().unwrap(),
+                Options::Unknown {
+                    option_type: 0xFF,
+                    discardable,
+                    length: 1
+                }
+            );
+        }
     }
 
     // --- Round-trip tests for all option types ---
@@ -1242,7 +1326,7 @@ mod tests {
         assert_eq!(remaining, opt2);
     }
 
-    // --- Decode / DecodeIter (Phase 3 lazy L1) ---
+    // --- Decode / DecodeIter ---
 
     fn two_option_buf() -> ([u8; 24], usize, Options, Options) {
         let opt1 = Options::IpV4Endpoint {

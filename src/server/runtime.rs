@@ -250,7 +250,9 @@ where
     // keeping that buffer out of the run future's frame.
 
     for entry_view in sd_view.entries() {
-        let entry_type = entry_view.entry_type()?;
+        let Ok(entry_type) = entry_view.entry_type() else {
+            continue;
+        };
         match entry_type {
             sd::EntryType::Subscribe => {
                 crate::log::debug!(

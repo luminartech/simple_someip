@@ -16,6 +16,15 @@ pub enum Error {
     /// The option type byte is not a recognized SD option type.
     #[error("Invalid value for Service Discovery Option Type: {0:X}")]
     InvalidOptionType(u8),
+    /// An [`Options::Unknown`](super::Options::Unknown) was given to an
+    /// encoder. It keeps only its type, discardable flag and length, not its
+    /// body, so it cannot be written.
+    #[error("SD option of unknown type 0x{option_type:02X} cannot be encoded")]
+    #[non_exhaustive]
+    UnencodableOption {
+        /// The option's type byte.
+        option_type: u8,
+    },
     /// The transport protocol byte is not a recognized value.
     #[error("Invalid value for Service Discovery Option Transport Protocol: {0:X}")]
     InvalidOptionTransportProtocol(u8),

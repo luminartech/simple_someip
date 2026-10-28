@@ -138,17 +138,28 @@ impl EventGroupEntry {
     }
 }
 
+fn check_ttl_range(ttl: u32) -> Result<(), crate::protocol::Error> {
+    if ttl > MAX_TTL {
+        return Err(Error::InvalidTtl(ttl).into());
+    }
+    Ok(())
+}
+
 impl Encode for EventGroupEntry {
     type Error = crate::protocol::Error;
 
+    /// Returns the wire size of the entry body, 15 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidTtl`] when the TTL is above [`MAX_TTL`].
     fn encoded_size(&self) -> Result<usize, Self::Error> {
+        check_ttl_range(self.ttl)?;
         Ok(15)
     }
 
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
-        if self.ttl > MAX_TTL {
-            return Err(Error::InvalidTtl(self.ttl).into());
-        }
+        check_ttl_range(self.ttl)?;
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;
         writer.write_u8(u8::from(self.options_count))?;
@@ -204,14 +215,18 @@ impl ServiceEntry {
 impl Encode for ServiceEntry {
     type Error = crate::protocol::Error;
 
+    /// Returns the wire size of the entry body, 15 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidTtl`] when the TTL is above [`MAX_TTL`].
     fn encoded_size(&self) -> Result<usize, Self::Error> {
+        check_ttl_range(self.ttl)?;
         Ok(15)
     }
 
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
-        if self.ttl > MAX_TTL {
-            return Err(Error::InvalidTtl(self.ttl).into());
-        }
+        check_ttl_range(self.ttl)?;
         writer.write_u8(self.index_first_options_run)?;
         writer.write_u8(self.index_second_options_run)?;
         writer.write_u8(u8::from(self.options_count))?;
@@ -244,6 +259,17 @@ pub enum Entry {
 }
 
 impl Entry {
+    fn check_ttl(&self) -> Result<(), crate::protocol::Error> {
+        match self {
+            Entry::OfferService(s) if s.ttl == 0 => Err(Error::InvalidTtl(0).into()),
+            Entry::FindService(s) | Entry::OfferService(s) => check_ttl_range(s.ttl),
+            Entry::StopOfferService(_) => Ok(()),
+            Entry::SubscribeEventGroup(e) | Entry::SubscribeAckEventGroup(e) => {
+                check_ttl_range(e.ttl)
+            }
+        }
+    }
+
     /// Returns the number of options in the first options run.
     #[must_use]
     pub fn first_options_count(&self) -> u8 {
@@ -286,19 +312,20 @@ impl Entry {
 impl Encode for Entry {
     type Error = crate::protocol::Error;
 
+    /// Returns the wire size of every entry, 16 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidTtl`] when the TTL is above [`MAX_TTL`], or is
+    /// 0 on an [`Entry::OfferService`]. An [`Entry::StopOfferService`] is
+    /// never rejected, since it encodes with a TTL of 0.
     fn encoded_size(&self) -> Result<usize, Self::Error> {
-        // 1 type byte + 15 body bytes = 16 (ENTRY_SIZE) for every variant.
+        self.check_ttl()?;
         Ok(ENTRY_SIZE)
     }
 
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Self::Error> {
-        let ttl = match self {
-            Entry::FindService(s) | Entry::OfferService(s) | Entry::StopOfferService(s) => s.ttl,
-            Entry::SubscribeEventGroup(e) | Entry::SubscribeAckEventGroup(e) => e.ttl,
-        };
-        if ttl > MAX_TTL || (ttl == 0 && matches!(self, Entry::OfferService(_))) {
-            return Err(Error::InvalidTtl(ttl).into());
-        }
+        self.check_ttl()?;
         let body = match self {
             Entry::FindService(service_entry) => {
                 writer.write_u8(u8::from(EntryType::FindService))?;
@@ -483,8 +510,7 @@ impl<'a> Decode<'a> for EntryView<'a> {
     ///
     /// This is a pure fixed-stride slice: it does NOT validate the entry-type
     /// byte. Validation is deferred to [`EntryView::entry_type`] /
-    /// [`EntryView::to_owned`] (the L2 validation pass), keeping this a lazy
-    /// zero-copy view.
+    /// [`EntryView::to_owned`], keeping this a lazy zero-copy view.
     ///
     /// # Errors
     ///
@@ -526,15 +552,30 @@ impl<'a> DecodeIter<'a> for EntryView<'a> {
     }
 }
 
-/// Iterator over 16-byte SD entries in a validated buffer.
-/// Entries are guaranteed valid (validated upfront in `SdHeaderView::parse`).
+/// Iterator over the 16-byte SD entries of a known [`EntryType`] in a buffer;
+/// entries of unknown type are skipped.
 pub struct EntryIter<'a> {
     remaining: &'a [u8],
+    known: usize,
 }
 
 impl<'a> EntryIter<'a> {
     pub(crate) fn new(buf: &'a [u8]) -> Self {
-        Self { remaining: buf }
+        let known = buf
+            .as_chunks::<ENTRY_SIZE>()
+            .0
+            .iter()
+            .filter(|entry| EntryView(entry).entry_type().is_ok())
+            .count();
+        Self::with_known(buf, known)
+    }
+
+    /// `known` is the number of entries of known type in `buf`.
+    pub(crate) fn with_known(buf: &'a [u8], known: usize) -> Self {
+        Self {
+            remaining: buf,
+            known,
+        }
     }
 }
 
@@ -542,19 +583,22 @@ impl<'a> Iterator for EntryIter<'a> {
     type Item = EntryView<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining.len() < ENTRY_SIZE {
-            return None;
+        while self.remaining.len() >= ENTRY_SIZE {
+            let entry_bytes: &[u8; ENTRY_SIZE] = self.remaining[..ENTRY_SIZE]
+                .try_into()
+                .expect("length checked above");
+            self.remaining = &self.remaining[ENTRY_SIZE..];
+            let entry = EntryView(entry_bytes);
+            if entry.entry_type().is_ok() {
+                self.known -= 1;
+                return Some(entry);
+            }
         }
-        let entry_bytes: &[u8; ENTRY_SIZE] = self.remaining[..ENTRY_SIZE]
-            .try_into()
-            .expect("length checked above");
-        self.remaining = &self.remaining[ENTRY_SIZE..];
-        Some(EntryView(entry_bytes))
+        None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.remaining.len() / ENTRY_SIZE;
-        (n, Some(n))
+        (self.known, Some(self.known))
     }
 }
 
@@ -914,7 +958,7 @@ mod tests {
         assert!(iter.next().is_none());
     }
 
-    // --- Decode / DecodeIter (Phase 3 lazy L1) ---
+    // --- Decode / DecodeIter ---
 
     fn two_entry_buf(e1: &Entry, e2: &Entry) -> [u8; 32] {
         let b1 = encode_entry(e1);
@@ -1070,5 +1114,42 @@ mod tests {
                 available: 4,
             })
         ));
+    }
+
+    #[test]
+    fn entry_bodies_with_ttl_above_max_fail_sizing() {
+        let too_long = MAX_TTL + 1;
+        let service = ServiceEntry {
+            ttl: too_long,
+            ..make_service_entry()
+        };
+        let event_group = EventGroupEntry {
+            ttl: too_long,
+            ..make_event_group_entry()
+        };
+        for size in [service.encoded_size(), event_group.encoded_size()] {
+            assert!(matches!(
+                size,
+                Err(crate::protocol::Error::Sd(Error::InvalidTtl(t))) if t == too_long
+            ));
+        }
+    }
+
+    #[test]
+    fn stop_offer_encodes_with_ttl_0_whatever_its_stored_ttl() {
+        let entry = Entry::StopOfferService(ServiceEntry {
+            ttl: u32::MAX,
+            ..make_service_entry()
+        });
+        assert_eq!(entry.encoded_size().unwrap(), ENTRY_SIZE);
+        let mut buf = [0u8; ENTRY_SIZE];
+        entry.encode(&mut buf.as_mut_slice()).unwrap();
+        assert_eq!(
+            EntryView(&buf).to_owned().unwrap(),
+            Entry::StopOfferService(ServiceEntry {
+                ttl: 0,
+                ..make_service_entry()
+            })
+        );
     }
 }

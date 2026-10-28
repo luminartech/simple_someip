@@ -567,9 +567,9 @@ where
         // overload signal regardless of which path produced the oversize
         // message. Without this, an oversize encode would surface as a
         // protocol-level I/O error from inside the socket loop.
-        // Propagated, not unwrapped: `encoded_size` is fallible for any
-        // downstream `PayloadWireFormat`, and this runs in the client's async
-        // socket task. `server::EventPublisher` already uses `?` here.
+        // Propagated, not unwrapped: `encoded_size` can fail (see
+        // `Message::new_sd` for the SD cases), and this runs in the client's
+        // async socket task.
         let required = message.encoded_size()?;
         // Coarse fail-fast: `send()` has no leased buffer in scope, so
         // UDP_BUFFER_SIZE is the only bound available here.  The socket

@@ -21,10 +21,13 @@ impl<PayloadDefinition: PayloadWireFormat> Message<PayloadDefinition> {
     ///
     /// # Errors
     ///
-    /// Returns the error from [`Encode::encoded_size`] on the SD header. No
-    /// in-tree `SdHeader` can fail this -- `sd::Header::encoded_size` is
-    /// unconditionally `Ok` -- but [`PayloadWireFormat`] is public, and a
-    /// downstream implementation may.
+    /// Returns the error from [`Encode::encoded_size`] on the SD header. For the
+    /// in-tree headers that is
+    /// [`UnencodableOption`](crate::protocol::sd::Error::UnencodableOption)
+    /// when the header holds a received option of unknown type,
+    /// [`Options::Unknown`](crate::protocol::sd::Options::Unknown), or
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) when an entry's
+    /// TTL is out of range.
     pub fn new_sd(
         request_id: u32,
         sd_header: &<PayloadDefinition as PayloadWireFormat>::SdHeader,
@@ -206,7 +209,17 @@ impl<PayloadDefinition: PayloadWireFormat> Encode for Message<PayloadDefinition>
         Ok(self.header.encoded_size()? + self.payload.encoded_size()?)
     }
 
+    /// Writes this message to `writer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SD payload's [`Encode::encoded_size`] error before writing
+    /// anything. Otherwise returns the header's or the payload's encode error,
+    /// after part of the message may have been written.
     fn encode(&self, writer: &mut impl embedded_io::Write) -> Result<usize, Error> {
+        if self.is_sd() {
+            self.payload.encoded_size()?;
+        }
         Ok(self.header.encode(writer)? + self.payload.encode(writer)?)
     }
 }
@@ -552,5 +565,22 @@ mod tests {
                 "Not an SD message"
             )))
         ));
+    }
+
+    #[test]
+    fn encode_writes_nothing_when_the_sd_payload_cannot_be_encoded() {
+        use crate::protocol::sd::test_support::{
+            assert_same_error, sd_body_with_unknown_entry_and_option,
+        };
+        let body = sd_body_with_unknown_entry_and_option();
+        let payload = TestPayload::from_payload_bytes(MessageId::SD, &body).unwrap();
+        let msg = Msg::new(Header::new_sd(1, body.len()), payload);
+
+        let mut buf = [0u8; 128];
+        let mut writer = buf.as_mut_slice();
+        let err = msg.encode(&mut writer).unwrap_err();
+        let payload_err = msg.payload().encoded_size().unwrap_err();
+        assert_same_error(&err, &payload_err);
+        assert_eq!(writer.len(), 128, "nothing was written");
     }
 }

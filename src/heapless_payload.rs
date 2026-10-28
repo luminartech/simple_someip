@@ -277,3 +277,34 @@ impl PayloadWireFormat for HeaplessPayload {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::sd::test_support::{
+        UNKNOWN_OPTION_TYPE, endpoint_after_unknown_option, offer_after_unknown_entry,
+        sd_body_with_unknown_entry_and_option,
+    };
+
+    #[test]
+    fn sd_payload_skips_unknown_entries_and_keeps_unknown_option_slots() {
+        let payload = HeaplessPayload::from_payload_bytes(
+            MessageId::SD,
+            &sd_body_with_unknown_entry_and_option(),
+        )
+        .expect("unknown types do not reject the message");
+        let header = payload.as_sd_header().unwrap();
+        assert_eq!(header.entries.as_slice(), [offer_after_unknown_entry()]);
+        assert_eq!(
+            header.options.as_slice(),
+            [
+                sd::Options::Unknown {
+                    option_type: UNKNOWN_OPTION_TYPE,
+                    discardable: false,
+                    length: 5
+                },
+                endpoint_after_unknown_option()
+            ]
+        );
+    }
+}

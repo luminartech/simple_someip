@@ -237,6 +237,30 @@ mod tests {
     use automotive_wire_codec::Encode;
     use std::net::Ipv4Addr;
 
+    #[test]
+    fn sd_payload_skips_unknown_entries_and_keeps_unknown_option_slots() {
+        use crate::protocol::sd::test_support::{
+            UNKNOWN_OPTION_TYPE, endpoint_after_unknown_option, offer_after_unknown_entry,
+            sd_body_with_unknown_entry_and_option,
+        };
+        let payload =
+            RawPayload::from_payload_bytes(MessageId::SD, &sd_body_with_unknown_entry_and_option())
+                .expect("unknown types do not reject the message");
+        let header = payload.as_sd_header().unwrap();
+        assert_eq!(header.entries, [offer_after_unknown_entry()]);
+        assert_eq!(
+            header.options,
+            [
+                sd::Options::Unknown {
+                    option_type: UNKNOWN_OPTION_TYPE,
+                    discardable: false,
+                    length: 5
+                },
+                endpoint_after_unknown_option()
+            ]
+        );
+    }
+
     fn make_sd_payload() -> RawPayload {
         let header = VecSdHeader {
             flags: sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),

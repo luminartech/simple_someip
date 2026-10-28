@@ -92,7 +92,8 @@ pub enum BuildError {
     /// An entry's TTL is above [`MAX_TTL`](crate::protocol::sd::MAX_TTL), or
     /// an offer's TTL is 0; carries the rejected TTL.
     InvalidTtl(u32),
-    /// SD or SOME/IP encoding failed mid-write.
+    /// Sizing or encoding the SD or SOME/IP datagram failed for a reason
+    /// other than [`BuildError::InvalidTtl`].
     EncodeFailed,
 }
 
@@ -110,7 +111,7 @@ impl core::fmt::Display for BuildError {
                     "SD entry TTL {ttl} is invalid: an offer needs 1..=0xFFFFFF seconds, other entries at most 0xFFFFFF"
                 )
             }
-            BuildError::EncodeFailed => f.write_str("encoding failed mid-write"),
+            BuildError::EncodeFailed => f.write_str("sizing or encoding failed"),
         }
     }
 }
@@ -127,11 +128,17 @@ impl From<EncodeToSliceError<crate::protocol::Error>> for BuildError {
     fn from(e: EncodeToSliceError<crate::protocol::Error>) -> Self {
         match e {
             EncodeToSliceError::InsufficientBuffer(ib) => BuildError::BufferTooSmall(ib),
-            EncodeToSliceError::Encode(crate::protocol::Error::Sd(
-                crate::protocol::sd::Error::InvalidTtl(ttl),
-            )) => BuildError::InvalidTtl(ttl),
-            EncodeToSliceError::Encode(_) => BuildError::EncodeFailed,
+            EncodeToSliceError::Encode(e) => encode_error(&e),
         }
+    }
+}
+
+fn encode_error(e: &crate::protocol::Error) -> BuildError {
+    match e {
+        crate::protocol::Error::Sd(crate::protocol::sd::Error::InvalidTtl(ttl)) => {
+            BuildError::InvalidTtl(*ttl)
+        }
+        _ => BuildError::EncodeFailed,
     }
 }
 
@@ -340,9 +347,7 @@ fn encode_sd_datagram(
     // computable without writing, so the SOME/IP length field is known before
     // either section is written. One linear forward pass — no backfill.
     let sd_payload = SdHeader::new(Flags::new_sd(reboot), entries, options);
-    let sd_payload_len = sd_payload
-        .encoded_size()
-        .map_err(|_| BuildError::EncodeFailed)?;
+    let sd_payload_len = sd_payload.encoded_size().map_err(|e| encode_error(&e))?;
     let total = SOMEIP_HEADER_LEN + sd_payload_len;
     if buf.len() < total {
         return Err(BuildError::BufferTooSmall(InsufficientBuffer {
@@ -577,10 +582,16 @@ mod tests {
     #[test]
     fn stop_offer_is_built_whatever_the_requested_ttl() {
         let mut buf = [0u8; 512];
-        let len = build_stop_offer_service_datagram(&mut buf, &req(0x0001, 30501), 1).unwrap();
-        let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
-        let entry = view.entries().next().unwrap();
-        assert!(entry.is_stop_offer());
+        for ttl in [3, u32::MAX] {
+            let request = OfferServiceRequest {
+                ttl,
+                ..req(0x0001, 30501)
+            };
+            let len = build_stop_offer_service_datagram(&mut buf, &request, 1).unwrap();
+            let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
+            let entry = view.entries().next().unwrap();
+            assert!(entry.is_stop_offer());
+        }
     }
 
     #[test]
@@ -685,14 +696,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_sd_datagram_structurally_invalid_entry_is_sd_error() {
-        // Length-consistent SD datagram (unlike the truncation case above,
-        // which short-circuits as `Incomplete` before `SdHeaderView::parse`
-        // ever reaches the entry walk): corrupt the first entry's type byte
-        // to an unrecognized value while leaving every length field intact,
-        // so parsing gets past the `Incomplete` checks and hits
-        // `EntryView::entry_type()`'s validation, surfacing
-        // `protocol::Error::Sd(sd::Error::InvalidEntryType(_))`.
+    fn parse_sd_datagram_malformed_known_option_is_sd_error() {
+        let mut buf = [0u8; 128];
+        let len = build_offer_service_datagram(&mut buf, &req(0x0001, 30501), 1).unwrap();
+        // The IPv4 endpoint option is the last 12 bytes; its transport byte is
+        // the third-to-last.
+        buf[len - 3] = 0x84;
+        let err = parse_someip_sd_datagram(&buf[..len]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::protocol::Error::Sd(
+                    crate::protocol::sd::Error::InvalidOptionTransportProtocol(0x84)
+                )
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_sd_datagram_skips_an_entry_of_unknown_type() {
         let request = SubscribeEventgroupRequest {
             service_id: 0x0042,
             instance_id: 1,
@@ -707,21 +730,13 @@ mod tests {
             build_subscribe_eventgroup_datagram(&mut sd_buf, &request, 3, RebootFlag::Continuous)
                 .unwrap();
 
-        // Byte layout: 16-byte SOME/IP header, then flags/reserved(4) +
-        // entries_size(4), then the entries array (options_size + options
-        // follow after the entries). The first entry's type byte is
-        // therefore at offset 24.
-        let entry_type_offset: usize = 16 + 8;
-        sd_buf[entry_type_offset] = 0xFF;
+        // The first entry's type byte follows the 16-byte SOME/IP header and
+        // the SD flags/reserved and entries_size fields.
+        sd_buf[16 + 8] = 0xFF;
 
-        let err = parse_someip_sd_datagram(&sd_buf[..sd_len]).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                crate::protocol::Error::Sd(crate::protocol::sd::Error::InvalidEntryType(0xFF))
-            ),
-            "expected Sd(InvalidEntryType(0xFF)), got {err:?}"
-        );
+        let view =
+            parse_someip_sd_datagram(&sd_buf[..sd_len]).expect("an unknown entry is skipped");
+        assert_eq!(view.entries().count(), 0);
     }
 
     #[test]

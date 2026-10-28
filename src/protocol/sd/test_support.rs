@@ -223,14 +223,8 @@ mod tests {
     }
 }
 
-/// An `SdHeader` whose `encoded_size` fails, modelling a downstream
+/// An `SdHeader` whose `encoded_size` always fails, modelling a downstream
 /// [`PayloadWireFormat`] impl.
-///
-/// No in-tree `SdHeader` can fail — `sd::Header::encoded_size` is
-/// unconditionally `Ok(size)` — so the only way to exercise the error path
-/// that the trait bound permits is to write an impl that takes it. That is
-/// precisely the case the PR #153 review flagged: the bound does not require
-/// infallibility, and `PayloadWireFormat` is public.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FailingSdHeader;
 
@@ -305,4 +299,77 @@ impl PayloadWireFormat for FailingPayload {
     ) -> FailingSdHeader {
         FailingSdHeader
     }
+}
+
+/// The option type [`sd_body_with_unknown_entry_and_option`] uses for its
+/// unknown option.
+pub(crate) const UNKNOWN_OPTION_TYPE: u8 = 0x77;
+
+/// The entry type [`sd_body_with_unknown_entry_and_option`] uses for its
+/// unknown entry.
+pub(crate) const UNKNOWN_ENTRY_TYPE: u8 = 0x42;
+
+/// The Offer in [`sd_body_with_unknown_entry_and_option`].
+pub(crate) fn offer_after_unknown_entry() -> sd::Entry {
+    sd::Entry::OfferService(sd::ServiceEntry {
+        index_first_options_run: 1,
+        index_second_options_run: 0,
+        options_count: sd::OptionsCount::new(1, 0),
+        service_id: 0x1234,
+        instance_id: 1,
+        major_version: 1,
+        ttl: 3,
+        minor_version: 0,
+    })
+}
+
+/// The endpoint option, at index 1, of
+/// [`sd_body_with_unknown_entry_and_option`].
+pub(crate) fn endpoint_after_unknown_option() -> sd::Options {
+    sd::Options::IpV4Endpoint {
+        ip: core::net::Ipv4Addr::new(192, 0, 2, 1),
+        protocol: sd::TransportProtocol::Udp,
+        port: 30509,
+    }
+}
+
+/// [`sd_body_with_unknown_entry_and_option_for`] with
+/// [`offer_after_unknown_entry`].
+pub(crate) fn sd_body_with_unknown_entry_and_option() -> heapless::Vec<u8, 96> {
+    sd_body_with_unknown_entry_and_option_for(&offer_after_unknown_entry())
+}
+
+/// An SD body whose entries are one of type [`UNKNOWN_ENTRY_TYPE`] and then
+/// `entry`, and whose options are one of type [`UNKNOWN_OPTION_TYPE`] with a
+/// 4-byte body and the discardable bit clear, and then
+/// [`endpoint_after_unknown_option`], at index 1.
+pub(crate) fn sd_body_with_unknown_entry_and_option_for(
+    entry: &sd::Entry,
+) -> heapless::Vec<u8, 96> {
+    let mut entries = [0u8; 32];
+    entries[0] = UNKNOWN_ENTRY_TYPE;
+    entry.encode(&mut &mut entries[16..]).unwrap();
+    let unknown_option = [0x00, 0x05, UNKNOWN_OPTION_TYPE, 0x00, 1, 2, 3, 4];
+    let mut endpoint = [0u8; 12];
+    endpoint_after_unknown_option()
+        .encode(&mut endpoint.as_mut_slice())
+        .unwrap();
+
+    let mut body = heapless::Vec::new();
+    body.extend_from_slice(&[0xC0, 0, 0, 0]).unwrap();
+    body.extend_from_slice(&32u32.to_be_bytes()).unwrap();
+    body.extend_from_slice(&entries).unwrap();
+    body.extend_from_slice(&20u32.to_be_bytes()).unwrap();
+    body.extend_from_slice(&unknown_option).unwrap();
+    body.extend_from_slice(&endpoint).unwrap();
+    body
+}
+
+/// Asserts that two errors have the same `Debug` text.
+pub(crate) fn assert_same_error(got: &impl core::fmt::Debug, want: &impl core::fmt::Debug) {
+    let mut got_text = heapless::String::<128>::new();
+    let mut want_text = heapless::String::<128>::new();
+    core::fmt::write(&mut got_text, format_args!("{got:?}")).unwrap();
+    core::fmt::write(&mut want_text, format_args!("{want:?}")).unwrap();
+    assert_eq!(got_text, want_text);
 }

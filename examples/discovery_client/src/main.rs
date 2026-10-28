@@ -265,7 +265,7 @@ fn extract_endpoints(option_index: u8, option_count: u8, all_options: &[Options]
                 port: *port,
                 protocol: *protocol,
             }),
-            Options::Configuration { .. } | Options::LoadBalancing { .. } => None,
+            _ => None,
         })
         .collect()
 }
