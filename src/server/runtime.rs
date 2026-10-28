@@ -76,8 +76,7 @@ where
         counter: crate::sd_codec::SubscribeCounter::of_entry(entry_view),
     };
     let peer = socket_addr_v4(peer)?;
-    let (session, reboot_flag) = sd_state.next_session();
-    let len = crate::sd_codec::build_subscribe_ack_datagram(buf, &request, session, reboot_flag)
+    let len = crate::sd_codec::build_subscribe_ack_datagram(buf, &request, sd_state.next_session())
         .map_err(super::build_error)?;
     sd_socket.send_to(&buf[..len], peer).await?;
     Ok(())
@@ -148,10 +147,9 @@ fn encode_subscribes(
     let mut requests = config.consumed_eventgroups.clone();
     let mut answered = answered.iter();
     requests.retain(|_| answered.next().copied().unwrap_or(false));
-    let (session, reboot_flag) = sd_state.next_session();
     crate::sd_codec::build_multi_subscribe_eventgroup_datagram::<
         { ServerConfig::CONSUMED_EVENTGROUPS_CAP },
-    >(buf, &requests, session, reboot_flag)
+    >(buf, &requests, sd_state.next_session())
     .map_err(super::build_error)
 }
 
@@ -755,12 +753,10 @@ fn encode_finds(
     if wanted.is_empty() {
         return Ok(None);
     }
-    let (session, reboot_flag) = sd_state.next_session();
     crate::sd_codec::build_find_service_datagram::<{ ServerConfig::CONSUMED_EVENTGROUPS_CAP }>(
         buf,
         &wanted,
-        session,
-        reboot_flag,
+        sd_state.next_session(),
     )
     .map(Some)
     .map_err(super::build_error)
@@ -2041,8 +2037,7 @@ mod tests {
             let len = crate::sd_codec::build_subscribe_ack_datagram(
                 &mut buf,
                 &request,
-                1,
-                sd::RebootFlag::RecentlyRebooted,
+                crate::sd_codec::SdSessionCounter::new().next(),
             )
             .expect("build");
             buf[..len].to_vec()
@@ -2089,8 +2084,7 @@ mod tests {
             let len = crate::sd_codec::build_offer_service_datagram(
                 &mut buf,
                 &config.offer_request(),
-                1,
-                sd::RebootFlag::RecentlyRebooted,
+                crate::sd_codec::SdSessionCounter::new().next(),
             )
             .expect("build");
             buf[..len].to_vec()

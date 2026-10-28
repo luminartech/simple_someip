@@ -17,7 +17,6 @@ use crate::bare_metal_tasks::{SomeipRun, publish_notification, run_someip};
 use crate::protocol::sd;
 use crate::sd_codec::{
     OfferServiceRequest, SubscribeEventgroupRequest, build_multi_stop_offer_service_datagram,
-    next_sd_session,
 };
 use crate::server::{
     EventPublisher, FindTiming, SdStateManager, Server, ServerConfig, ServerStorage,
@@ -219,7 +218,6 @@ static IFACE: AtomicU32 = AtomicU32::new(0);
 
 static DISPATCH: AtomicUsize = AtomicUsize::new(0); // DispatchFn as usize
 static DISPATCH_CTX: AtomicUsize = AtomicUsize::new(0); // opaque ctx word for DISPATCH
-static STOP_SESSION: AtomicU16 = AtomicU16::new(1);
 static PUBLISH_SESSION: AtomicU16 = AtomicU16::new(1);
 
 static OFFERS_LEN: AtomicUsize = AtomicUsize::new(0);
@@ -771,12 +769,10 @@ pub fn deinit() {
     // `publish`. RX_CAP >= SD_SCRATCH_CAP, so it holds the StopOffer datagram.
     // Reborrowed through `addr_of_mut!` to retag only this field's bytes.
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).publish_scratch) };
-    let session = next_sd_session(&STOP_SESSION);
     if let Ok(total) = build_multi_stop_offer_service_datagram::<MAX_OFFERS>(
         scratch,
         &reqs[..n],
-        session,
-        sd::RebootFlag::Continuous,
+        SD_STATE.next_session(),
     ) {
         let sd = sd_multicast();
         (plat.send)(

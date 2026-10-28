@@ -554,12 +554,23 @@ fn option_ipv6_sd_golden_bytes() {
 
 #[cfg(any(feature = "bare_metal", feature = "server"))]
 mod sd_codec_golden {
-    use simple_someip::protocol::sd::RebootFlag;
     use simple_someip::sd_codec::{
-        OfferServiceRequest, SubscribeAckRequest, SubscribeCounter, SubscribeEventgroupRequest,
-        build_offer_service_datagram, build_subscribe_ack_datagram,
+        OfferServiceRequest, SdSession, SdSessionCounter, SubscribeAckRequest, SubscribeCounter,
+        SubscribeEventgroupRequest, build_offer_service_datagram, build_subscribe_ack_datagram,
         build_subscribe_eventgroup_datagram,
     };
+
+    /// The session with ID `id` from a counter that has wrapped, so its
+    /// reboot flag is `Continuous`.
+    fn continuous_session(id: u16) -> SdSession {
+        let counter = SdSessionCounter::with_initial(u16::MAX);
+        loop {
+            let s = counter.next();
+            if s.id() == id {
+                return s;
+            }
+        }
+    }
 
     // NOTE: `encode_sd_datagram` (src/sd_codec.rs ~line 264) is a private
     // helper, not reachable from an external integration test. Every
@@ -580,8 +591,8 @@ mod sd_codec_golden {
             local_rx_port: 30509,
         };
         let mut buf = [0u8; 64];
-        let n = build_subscribe_eventgroup_datagram(&mut buf, &request, 7, RebootFlag::Continuous)
-            .unwrap();
+        let n =
+            build_subscribe_eventgroup_datagram(&mut buf, &request, continuous_session(7)).unwrap();
         assert_eq!(n, 56);
 
         #[rustfmt::skip]
@@ -617,8 +628,7 @@ mod sd_codec_golden {
             unicast_port: 30501,
         };
         let mut buf = [0u8; 64];
-        let n =
-            build_offer_service_datagram(&mut buf, &request, 1, RebootFlag::Continuous).unwrap();
+        let n = build_offer_service_datagram(&mut buf, &request, continuous_session(1)).unwrap();
         assert_eq!(n, 56);
 
         #[rustfmt::skip]
@@ -652,8 +662,7 @@ mod sd_codec_golden {
             counter: SubscribeCounter::default(),
         };
         let mut buf = [0u8; 64];
-        let n =
-            build_subscribe_ack_datagram(&mut buf, &request, 2, RebootFlag::Continuous).unwrap();
+        let n = build_subscribe_ack_datagram(&mut buf, &request, continuous_session(2)).unwrap();
         assert_eq!(n, 44);
 
         #[rustfmt::skip]

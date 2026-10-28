@@ -5,50 +5,24 @@
 //! unicast), `FindService`, `SubscribeEventgroup`, `SubscribeAck` and
 //! `SubscribeNack`. It also builds the server's `OfferService`.
 
-use core::sync::atomic::{AtomicU32, Ordering};
-
 use crate::protocol::sd::RebootFlag;
+use crate::sd_codec::{SdSession, SdSessionCounter};
 use crate::transport::TransportSocket;
 
 use super::{Error, ServerConfig};
 
-/// Tracks the SD session-ID counter and emits `OfferService` announcements.
-///
-/// Session IDs increment with each SD message and wrap from `0xFFFF` back
-/// to `0x0001` (skipping `0`, which is reserved). Per AUTOSAR SOME/IP-SD,
-/// the reboot flag on emitted SD messages is
-/// [`RebootFlag::RecentlyRebooted`] from startup until the counter wraps
-/// once, then [`RebootFlag::Continuous`] permanently — `SdStateManager`
-/// tracks that transition and bundles the `(session_id, reboot_flag)` pair
-/// atomically through
-/// [`Self::next_session_id_with_reboot_flag`], so every SD message the
-/// server sends takes both from one source and concurrent emitters cannot
-/// race around the wrap boundary.
+/// Numbers every SD message the server sends and emits its `OfferService`
+/// announcements. The numbering is an [`SdSessionCounter`]: session IDs
+/// from 1, wrapping from 0xFFFF to 1, with the reboot flag
+/// [`RebootFlag::RecentlyRebooted`] until the first wrap.
 #[derive(Debug)]
 pub struct SdStateManager {
-    /// Packed `(has_wrapped, session_id)` state.
-    ///
-    /// - bits 0..16: the session id last sent (1..=0xFFFF), or 0 before the
-    ///   first.
-    /// - bit 16: `has_wrapped` flag — once set, never cleared.
-    /// - bits 17..32: reserved, must remain 0.
-    ///
-    /// Packed into a single `AtomicU32` so a single `fetch_update`
-    /// produces a consistent `(session_id, reboot_flag)` pair across
-    /// concurrent emitters around the `0xFFFF → 0x0001` wrap boundary.
-    /// Two separate atomics could be interleaved by another emitter
-    /// between the increment and the wrap-flag latch; with one atomic,
-    /// the pair is computed in one CAS step.
-    session_state: AtomicU32,
+    session: SdSessionCounter,
 }
 
-const SID_MASK: u32 = 0xFFFF;
-const WRAPPED_BIT: u32 = 1 << 16;
-
 impl SdStateManager {
-    /// Construct an `SdStateManager` with a fresh session counter: the
-    /// first SD message gets session ID 1 and the reboot flag
-    /// `RecentlyRebooted`.
+    /// Construct an `SdStateManager` whose first SD message gets session
+    /// ID 1 and the reboot flag `RecentlyRebooted`.
     ///
     /// `const fn` so consumers can declare a `static`-storage instance
     /// without an allocator:
@@ -75,107 +49,39 @@ impl Default for SdStateManager {
 }
 
 impl SdStateManager {
-    /// Construct as if `initial` was the session ID last sent: the next SD
-    /// message gets `initial + 1`. After 0xFFFF it gets 1, and the reboot
-    /// flag is [`RebootFlag::Continuous`] from then on. 0 means none was
-    /// sent, as in [`Self::new`].
+    /// Construct as if `initial` was the session ID last sent; see
+    /// [`SdSessionCounter::with_initial`].
     #[must_use]
     pub const fn with_initial(initial: u16) -> Self {
         Self {
-            session_state: AtomicU32::new(initial as u32),
+            session: SdSessionCounter::with_initial(initial),
         }
     }
 
-    /// Advance the counter and return the next SOME/IP-SD session ID
-    /// (`client_id = 0`, session ID in the low 16 bits) together with the
-    /// reboot flag that *belongs to this same emission*. Skips 0 on wrap,
-    /// and latches the `has_wrapped` bit the first time the counter
-    /// crosses the `0xFFFF → 0x0001` boundary so the reboot flag flips
-    /// to [`RebootFlag::Continuous`] permanently.
-    ///
-    /// `(session_id, reboot_flag)` is computed atomically inside one
-    /// `fetch_update` so concurrent emitters always agree on the pair.
-    /// A previous implementation used two separate atomics and could
-    /// race around the wrap boundary, advertising
-    /// `(0xFFFF, Continuous)` or `(0x0001, RecentlyRebooted)` — both
-    /// violations of AUTOSAR SOME/IP-SD's stated semantics that the
-    /// wrap message itself carries `Continuous`.
-    ///
-    /// # Panics
-    ///
-    /// Cannot panic in practice: the inner `fetch_update` closure
-    /// always returns `Some(_)` (the wrap step is unconditional), so
-    /// the `.unwrap()` is statically infallible. Documented for
-    /// clippy's `missing_panics_doc` and as a tripwire if the closure
-    /// is ever changed to be conditional.
+    /// The session of the next SD message: its ID and reboot flag, for the
+    /// [`sd_codec`](crate::sd_codec) builders.
+    pub fn next_session(&self) -> SdSession {
+        self.session.next()
+    }
+
+    /// The next SD session ID (`client_id = 0`, session ID in the low 16
+    /// bits) and the reboot flag of the same message; see
+    /// [`Self::next_session`].
     pub fn next_session_id_with_reboot_flag(&self) -> (u32, RebootFlag) {
-        let (session_id, reboot_flag) = self.next_session();
-        (u32::from(session_id), reboot_flag)
+        let session = self.next_session();
+        (u32::from(session.id()), session.reboot())
     }
 
-    /// The next SD session ID and the reboot flag of the same emission.
-    pub(crate) fn next_session(&self) -> (u16, RebootFlag) {
-        // Nightly deprecates `fetch_update` in favor of the renamed
-        // `try_update`, but `try_update` does not exist on stable yet and
-        // this file builds in the stable CI lanes. Switch to `try_update`
-        // (and drop this allow) once the rename reaches stable.
-        #[allow(deprecated)]
-        let prev_state = self
-            .session_state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                let prev_sid = (state & SID_MASK) as u16;
-                let prev_wrapped = (state & WRAPPED_BIT) != 0;
-                let next_sid = match prev_sid.wrapping_add(1) {
-                    0 => 1u16,
-                    n => n,
-                };
-                // Latch wrap on the 0xFFFF → 0x0001 transition.
-                let next_wrapped = prev_wrapped || prev_sid == u16::MAX;
-                let next_state =
-                    (u32::from(next_sid)) | (if next_wrapped { WRAPPED_BIT } else { 0 });
-                Some(next_state)
-            })
-            .unwrap();
-        // Re-derive the new state from the prev we observed; this is
-        // the *same* computation the closure performed and produces
-        // exactly the new state we just stored.
-        let prev_sid = (prev_state & SID_MASK) as u16;
-        let prev_wrapped = (prev_state & WRAPPED_BIT) != 0;
-        let next_sid = match prev_sid.wrapping_add(1) {
-            0 => 1u16,
-            n => n,
-        };
-        let next_wrapped = prev_wrapped || prev_sid == u16::MAX;
-        let reboot_flag = if next_wrapped {
-            RebootFlag::Continuous
-        } else {
-            RebootFlag::RecentlyRebooted
-        };
-        (next_sid, reboot_flag)
-    }
-
-    /// Convenience: advance the counter and return only the session id.
-    /// Use [`Self::next_session_id_with_reboot_flag`] when the same
-    /// emission also needs the reboot flag — calling these two methods
-    /// separately races around the wrap boundary. Only used by unit
-    /// tests; production paths take the atomic pair.
+    /// Advance the counter and return only the session id.
     #[cfg(test)]
     pub(super) fn next_session_id(&self) -> u32 {
         self.next_session_id_with_reboot_flag().0
     }
 
-    /// Current SD reboot flag for this server.
-    ///
-    /// Returns [`RebootFlag::RecentlyRebooted`] until the session counter
-    /// has wrapped past `0xFFFF` at least once, then
-    /// [`RebootFlag::Continuous`] permanently. Emission paths take the
-    /// session ID and flag together instead, to avoid a TOCTOU race around
-    /// the wrap boundary; this accessor is
-    /// `#[cfg(test)]`-only so future code cannot accidentally reach for
-    /// the racy pair.
+    /// The reboot flag the counter is at.
     #[cfg(test)]
     pub(super) fn reboot_flag(&self) -> RebootFlag {
-        if (self.session_state.load(Ordering::Acquire) & WRAPPED_BIT) != 0 {
+        if self.session.has_wrapped() {
             RebootFlag::Continuous
         } else {
             RebootFlag::RecentlyRebooted
@@ -189,12 +95,10 @@ impl SdStateManager {
         buf: &mut [u8],
         config: &ServerConfig,
     ) -> Result<usize, Error> {
-        let (session, reboot_flag) = self.next_session();
         crate::sd_codec::build_offer_service_datagram(
             buf,
             &config.offer_request(),
-            session,
-            reboot_flag,
+            self.next_session(),
         )
         .map_err(super::build_error)
     }

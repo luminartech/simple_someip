@@ -246,7 +246,7 @@ scenario!(
     /// PRS_SOMEIPSD_00842, 00364, 00157, 00255 / feat_req_someipsd_208 — our StopOffer is an Offer entry with TTL 0 that continues the offers' session and reboot flag.
     d4_our_stop_offer_wire_format,
     std = ignore("the std runtime cannot stop offering a service (#173)"),
-    bare_metal = ignore("a StopOffer must continue the offers' session ID and reboot flag (#171)"),
+    bare_metal = run,
     {
         let fp = FramePeer::start();
         let mut rt = Rt::start(offer_only());

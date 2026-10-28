@@ -9,7 +9,7 @@
 //! that no SOME/IP byte-encoding or header-parsing lives in the firmware.
 
 use core::net::{IpAddr, Ipv4Addr};
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use automotive_wire_codec::{EncodeToSliceError, InsufficientBuffer};
 
@@ -184,28 +184,17 @@ fn encode_error(e: crate::protocol::Error) -> BuildError {
     }
 }
 
-/// Encode a `SubscribeEventgroup` datagram into `buf`. Returns its
-/// length in bytes. `session` should come from [`next_sd_session`].
-///
-/// `reboot` sets the SD reboot flag: a freshly-booted client emits
-/// [`RebootFlag::RecentlyRebooted`] until its session counter wraps, so
-/// the publisher can detect the restart and re-establish the
-/// subscription.
+/// Encode a `SubscribeEventgroup` datagram into `buf`, numbered by
+/// `session`. Returns its length in bytes.
 ///
 /// # Errors
 /// See [`BuildError`].
 pub fn build_subscribe_eventgroup_datagram(
     buf: &mut [u8],
     request: &SubscribeEventgroupRequest,
-    session: u16,
-    reboot: RebootFlag,
+    session: SdSession,
 ) -> Result<usize, BuildError> {
-    build_multi_subscribe_eventgroup_datagram::<1>(
-        buf,
-        core::slice::from_ref(request),
-        session,
-        reboot,
-    )
+    build_multi_subscribe_eventgroup_datagram::<1>(buf, core::slice::from_ref(request), session)
 }
 
 /// SD header length in bytes: flags and reserved bytes, entries length,
@@ -230,9 +219,8 @@ pub(crate) const fn find_service_datagram_len(instances: usize) -> usize {
 }
 
 /// Encode a single SD datagram carrying one `SubscribeEventgroup` entry per
-/// element of `requests`, each referencing its own IPv4 endpoint option.
-/// `reboot` sets the SD reboot flag, as in
-/// [`build_subscribe_eventgroup_datagram`].
+/// element of `requests`, each referencing its own IPv4 endpoint option,
+/// numbered by `session`.
 ///
 /// # Errors
 /// Returns [`BuildError::ListFull`] if `requests` holds more than `N`
@@ -240,8 +228,7 @@ pub(crate) const fn find_service_datagram_len(instances: usize) -> usize {
 pub fn build_multi_subscribe_eventgroup_datagram<const N: usize>(
     buf: &mut [u8],
     requests: &[SubscribeEventgroupRequest],
-    session: u16,
-    reboot: RebootFlag,
+    session: SdSession,
 ) -> Result<usize, BuildError> {
     const { assert!(N <= 256, "SD option indices are one byte") };
     if requests.len() > N {
@@ -270,79 +257,69 @@ pub fn build_multi_subscribe_eventgroup_datagram<const N: usize>(
             protocol: TransportProtocol::Udp,
         });
     }
-    encode_sd_datagram(buf, &entries, &options, session, reboot)
+    encode_sd_datagram(buf, &entries, &options, session)
 }
 
-/// Encode an `OfferService` datagram into `buf`. Returns its length in
-/// bytes. `reboot` sets the SD reboot flag: pass
-/// [`RebootFlag::RecentlyRebooted`] until the counter `session` comes from
-/// first wraps from 0xFFFF to 1, and [`RebootFlag::Continuous`] after.
-/// Multicast and each unicast peer have a counter of their own.
+/// Encode an `OfferService` datagram into `buf`, numbered by `session`.
+/// Returns its length in bytes.
 ///
 /// # Errors
 /// See [`BuildError`].
 pub fn build_offer_service_datagram(
     buf: &mut [u8],
     request: &OfferServiceRequest,
-    session: u16,
-    reboot: RebootFlag,
+    session: SdSession,
 ) -> Result<usize, BuildError> {
-    encode_service_entry_datagram(buf, request, session, /*stop=*/ false, reboot)
+    encode_service_entry_datagram(buf, request, session, /*stop=*/ false)
 }
 
 /// Encode a `StopOfferService` datagram into `buf` (same shape as
-/// [`build_offer_service_datagram`], TTL forced to `0`). `reboot` sets the
-/// SD reboot flag, as in [`build_offer_service_datagram`].
+/// [`build_offer_service_datagram`], TTL forced to `0`), numbered by
+/// `session`.
 ///
 /// # Errors
 /// See [`BuildError`].
 pub fn build_stop_offer_service_datagram(
     buf: &mut [u8],
     request: &OfferServiceRequest,
-    session: u16,
-    reboot: RebootFlag,
+    session: SdSession,
 ) -> Result<usize, BuildError> {
-    encode_service_entry_datagram(buf, request, session, /*stop=*/ true, reboot)
+    encode_service_entry_datagram(buf, request, session, /*stop=*/ true)
 }
 
 /// Encode a single SD datagram carrying one `OfferService` entry per
 /// element of `requests` (up to `N`). Each entry references its own
 /// IPv4 endpoint option at the matching flat index — one coherent SD
-/// message instead of one packet per service. `reboot` sets the SD reboot
-/// flag, as in [`build_offer_service_datagram`].
+/// message instead of one packet per service. Numbered by `session`.
 ///
 /// # Errors
 /// See [`BuildError`].
 pub fn build_multi_offer_service_datagram<const N: usize>(
     buf: &mut [u8],
     requests: &[OfferServiceRequest],
-    session: u16,
-    reboot: RebootFlag,
+    session: SdSession,
 ) -> Result<usize, BuildError> {
-    build_multi_service_entry_datagram::<N>(buf, requests, session, /*stop=*/ false, reboot)
+    build_multi_service_entry_datagram::<N>(buf, requests, session, /*stop=*/ false)
 }
 
 /// Encode a single SD datagram carrying one `StopOfferService` entry per
-/// element of `requests` (up to `N`). `reboot` sets the SD reboot flag, as
-/// in [`build_offer_service_datagram`].
+/// element of `requests` (up to `N`), numbered by `session`.
 ///
 /// # Errors
 /// See [`build_multi_offer_service_datagram`].
 pub fn build_multi_stop_offer_service_datagram<const N: usize>(
     buf: &mut [u8],
     requests: &[OfferServiceRequest],
-    session: u16,
-    reboot: RebootFlag,
+    session: SdSession,
 ) -> Result<usize, BuildError> {
-    build_multi_service_entry_datagram::<N>(buf, requests, session, /*stop=*/ true, reboot)
+    build_multi_service_entry_datagram::<N>(buf, requests, session, /*stop=*/ true)
 }
 
 fn build_multi_service_entry_datagram<const N: usize>(
     buf: &mut [u8],
     requests: &[OfferServiceRequest],
-    session: u16,
+    session: SdSession,
     stop: bool,
-    reboot: RebootFlag,
 ) -> Result<usize, BuildError> {
     const { assert!(N <= 256, "SD option indices are one byte") };
     if requests.len() > N {
@@ -375,7 +352,7 @@ fn build_multi_service_entry_datagram<const N: usize>(
             protocol: TransportProtocol::Udp,
         });
     }
-    encode_sd_datagram(buf, &entries, &options, session, reboot)
+    encode_sd_datagram(buf, &entries, &options, session)
 }
 
 /// Encode one SD datagram with a `FindService` entry, any minor version and
@@ -384,8 +361,7 @@ fn build_multi_service_entry_datagram<const N: usize>(
 pub(crate) fn build_find_service_datagram<const N: usize>(
     buf: &mut [u8],
     wanted: &[SubscribeEventgroupRequest],
-    session: u16,
-    reboot: RebootFlag,
+    session: SdSession,
 ) -> Result<usize, BuildError> {
     let mut entries: heapless::Vec<Entry, N> = heapless::Vec::new();
     for request in wanted {
@@ -405,21 +381,19 @@ pub(crate) fn build_find_service_datagram<const N: usize>(
                 capacity: N,
             })?;
     }
-    encode_sd_datagram(buf, &entries, &[], session, reboot)
+    encode_sd_datagram(buf, &entries, &[], session)
 }
 
 /// Encode a `SubscribeAckEventgroup` datagram into `buf`. Caller
-/// transmits to the original `Subscribe` sender's SD endpoint. `reboot`
-/// sets the SD reboot flag of that peer's unicast session counter, as
-/// described for [`build_offer_service_datagram`].
+/// transmits to the original `Subscribe` sender's SD endpoint. Numbered by
+/// `session`.
 ///
 /// # Errors
 /// See [`BuildError`].
 pub fn build_subscribe_ack_datagram(
     buf: &mut [u8],
     request: &SubscribeAckRequest,
-    session: u16,
-    reboot: RebootFlag,
+    session: SdSession,
 ) -> Result<usize, BuildError> {
     let entry = Entry::SubscribeAckEventGroup(EventGroupEntry {
         index_first_options_run: 0,
@@ -432,15 +406,14 @@ pub fn build_subscribe_ack_datagram(
         counter: u16::from(request.counter.get()),
         event_group_id: request.event_group_id,
     });
-    encode_sd_datagram(buf, &[entry], &[], session, reboot)
+    encode_sd_datagram(buf, &[entry], &[], session)
 }
 
 fn encode_service_entry_datagram(
     buf: &mut [u8],
     request: &OfferServiceRequest,
-    session: u16,
+    session: SdSession,
     stop: bool,
-    reboot: RebootFlag,
 ) -> Result<usize, BuildError> {
     let svc = ServiceEntry {
         index_first_options_run: 0,
@@ -462,7 +435,7 @@ fn encode_service_entry_datagram(
         port: request.unicast_port,
         protocol: TransportProtocol::Udp,
     };
-    encode_sd_datagram(buf, &[entry], &[option], session, reboot)
+    encode_sd_datagram(buf, &[entry], &[option], session)
 }
 
 /// Encode `entries` + `options` as an SD payload, prefixed with the
@@ -472,13 +445,12 @@ fn encode_sd_datagram(
     buf: &mut [u8],
     entries: &[Entry],
     options: &[SdOptions],
-    session: u16,
-    reboot: RebootFlag,
+    session: SdSession,
 ) -> Result<usize, BuildError> {
     // Header-first, body-second: `sd::Header::encoded_size()` is exact and
     // computable without writing, so the SOME/IP length field is known before
     // either section is written. One linear forward pass — no backfill.
-    let sd_payload = SdHeader::new(Flags::new_sd(reboot), entries, options);
+    let sd_payload = SdHeader::new(Flags::new_sd(session.reboot()), entries, options);
     let sd_payload_len = sd_payload.encoded_size().map_err(encode_error)?;
     let total = SOMEIP_HEADER_LEN + sd_payload_len;
     if buf.len() < total {
@@ -488,7 +460,7 @@ fn encode_sd_datagram(
         }));
     }
 
-    let header = Header::new_sd(u32::from(session), sd_payload_len);
+    let header = Header::new_sd(u32::from(session.id()), sd_payload_len);
     header.encode_to_slice(&mut buf[..SOMEIP_HEADER_LEN])?;
     let written = sd_payload.encode_to_slice(&mut buf[SOMEIP_HEADER_LEN..total])?;
 
@@ -569,14 +541,100 @@ pub fn encode_response_header(
     Ok(())
 }
 
-/// Increment `counter` and return the next non-zero session ID. AUTOSAR
-/// SD session IDs wrap `0xFFFF → 1`, skipping `0`.
-pub fn next_sd_session(counter: &AtomicU16) -> u16 {
-    loop {
-        let s = counter.fetch_add(1, Ordering::Relaxed);
-        if s != 0 {
-            return s;
+/// The session ID and reboot flag of one SD message, taken together from an
+/// [`SdSessionCounter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SdSession {
+    id: u16,
+    reboot: RebootFlag,
+}
+
+impl SdSession {
+    /// The session ID, 1 to 0xFFFF.
+    #[must_use]
+    pub const fn id(self) -> u16 {
+        self.id
+    }
+
+    /// The reboot flag: [`RebootFlag::RecentlyRebooted`] until the counter
+    /// first wraps, [`RebootFlag::Continuous`] after.
+    #[must_use]
+    pub const fn reboot(self) -> RebootFlag {
+        self.reboot
+    }
+}
+
+/// Numbers SD messages. Session IDs count from 1 and wrap from 0xFFFF to 1;
+/// the reboot flag is [`RebootFlag::RecentlyRebooted`] until the first wrap
+/// and [`RebootFlag::Continuous`] from then on. Concurrent callers of
+/// [`Self::next`] each get a distinct session.
+#[derive(Debug)]
+pub struct SdSessionCounter {
+    /// Bits 0..16: the session ID last given, or 0 before the first.
+    /// Bit 16: set once the counter has wrapped.
+    state: AtomicU32,
+}
+
+const SID_MASK: u32 = 0xFFFF;
+const WRAPPED_BIT: u32 = 1 << 16;
+
+impl SdSessionCounter {
+    /// A counter whose first session is ID 1, recently rebooted.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self::with_initial(0)
+    }
+
+    /// A counter that has given `last` and not yet wrapped: the next session
+    /// is `last + 1`, or 1 with [`RebootFlag::Continuous`] after 0xFFFF.
+    /// 0 is the same as [`Self::new`].
+    #[must_use]
+    pub const fn with_initial(last: u16) -> Self {
+        Self {
+            state: AtomicU32::new(last as u32),
         }
+    }
+
+    /// The next session.
+    pub fn next(&self) -> SdSession {
+        // `fetch_update` is deprecated on nightly in favour of `try_update`,
+        // which is not yet on stable.
+        #[allow(deprecated)]
+        let (Ok(prev) | Err(prev)) =
+            self.state
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    Some(Self::after(state))
+                });
+        let next = Self::after(prev);
+        #[allow(clippy::cast_possible_truncation)]
+        let id = (next & SID_MASK) as u16;
+        SdSession {
+            id,
+            reboot: if next & WRAPPED_BIT == 0 {
+                RebootFlag::RecentlyRebooted
+            } else {
+                RebootFlag::Continuous
+            },
+        }
+    }
+
+    /// Whether the counter has wrapped.
+    #[cfg(test)]
+    pub(crate) fn has_wrapped(&self) -> bool {
+        self.state.load(Ordering::Acquire) & WRAPPED_BIT != 0
+    }
+
+    const fn after(state: u32) -> u32 {
+        let last = state & SID_MASK;
+        let wrapped = state & WRAPPED_BIT != 0 || last == SID_MASK;
+        let id = if last == SID_MASK { 1 } else { last + 1 };
+        id | if wrapped { WRAPPED_BIT } else { 0 }
+    }
+}
+
+impl Default for SdSessionCounter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -659,6 +717,20 @@ mod tests {
     use super::*;
     use crate::protocol::sd::EntryType;
 
+    /// The session with ID `id` and reboot flag `reboot`, from a counter.
+    fn session(id: u16, reboot: RebootFlag) -> SdSession {
+        let counter = match reboot {
+            RebootFlag::RecentlyRebooted => return SdSessionCounter::with_initial(id - 1).next(),
+            RebootFlag::Continuous => SdSessionCounter::with_initial(u16::MAX),
+        };
+        loop {
+            let s = counter.next();
+            if s.id() == id {
+                return s;
+            }
+        }
+    }
+
     fn req(service_id: u16, port: u16) -> OfferServiceRequest {
         OfferServiceRequest {
             service_id,
@@ -679,15 +751,14 @@ mod tests {
             ..req(0x0001, 30501)
         };
         assert!(matches!(
-            build_offer_service_datagram(&mut buf, &request, 1, RebootFlag::Continuous),
+            build_offer_service_datagram(&mut buf, &request, session(1, RebootFlag::Continuous)),
             Err(BuildError::InvalidTtl(0))
         ));
         assert!(matches!(
             build_multi_offer_service_datagram::<4>(
                 &mut buf,
                 &[request],
-                1,
-                RebootFlag::Continuous
+                session(1, RebootFlag::Continuous)
             ),
             Err(BuildError::InvalidTtl(0))
         ));
@@ -701,9 +772,12 @@ mod tests {
                 ttl,
                 ..req(0x0001, 30501)
             };
-            let len =
-                build_stop_offer_service_datagram(&mut buf, &request, 1, RebootFlag::Continuous)
-                    .unwrap();
+            let len = build_stop_offer_service_datagram(
+                &mut buf,
+                &request,
+                session(1, RebootFlag::Continuous),
+            )
+            .unwrap();
             let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
             let entry = view.entries().next().unwrap();
             assert!(entry.is_stop_offer());
@@ -714,9 +788,12 @@ mod tests {
     fn multi_offer_round_trips_through_sd_parser() {
         let offers = [req(0x0001, 30501), req(0x0002, 30502), req(0x0003, 30503)];
         let mut buf = [0u8; 512];
-        let len =
-            build_multi_offer_service_datagram::<8>(&mut buf, &offers, 7, RebootFlag::Continuous)
-                .unwrap();
+        let len = build_multi_offer_service_datagram::<8>(
+            &mut buf,
+            &offers,
+            session(7, RebootFlag::Continuous),
+        )
+        .unwrap();
 
         // Parses as an SD datagram with one OfferService entry per offer,
         // each referencing its own endpoint option.
@@ -754,9 +831,12 @@ mod tests {
         };
         // Enough for the SOME/IP header but not the SD body.
         let mut buf = [0u8; SOMEIP_HEADER_LEN];
-        let err =
-            build_subscribe_eventgroup_datagram(&mut buf, &request, 3, RebootFlag::Continuous)
-                .unwrap_err();
+        let err = build_subscribe_eventgroup_datagram(
+            &mut buf,
+            &request,
+            session(3, RebootFlag::Continuous),
+        )
+        .unwrap_err();
         match err {
             BuildError::BufferTooSmall(ib) => {
                 assert_eq!(ib.available, SOMEIP_HEADER_LEN);
@@ -802,9 +882,12 @@ mod tests {
             local_rx_port: 30600,
         };
         let mut sd_buf = [0u8; 128];
-        let sd_len =
-            build_subscribe_eventgroup_datagram(&mut sd_buf, &request, 3, RebootFlag::Continuous)
-                .unwrap();
+        let sd_len = build_subscribe_eventgroup_datagram(
+            &mut sd_buf,
+            &request,
+            session(3, RebootFlag::Continuous),
+        )
+        .unwrap();
         let truncated = &sd_buf[..sd_len - 4];
         let err = parse_someip_sd_datagram(truncated).unwrap_err();
         assert!(
@@ -816,9 +899,12 @@ mod tests {
     #[test]
     fn parse_sd_datagram_malformed_known_option_is_sd_error() {
         let mut buf = [0u8; 128];
-        let len =
-            build_offer_service_datagram(&mut buf, &req(0x0001, 30501), 1, RebootFlag::Continuous)
-                .unwrap();
+        let len = build_offer_service_datagram(
+            &mut buf,
+            &req(0x0001, 30501),
+            session(1, RebootFlag::Continuous),
+        )
+        .unwrap();
         // The IPv4 endpoint option is the last 12 bytes; its transport byte is
         // the third-to-last.
         buf[len - 3] = 0x84;
@@ -846,9 +932,12 @@ mod tests {
             local_rx_port: 30600,
         };
         let mut sd_buf = [0u8; 128];
-        let sd_len =
-            build_subscribe_eventgroup_datagram(&mut sd_buf, &request, 3, RebootFlag::Continuous)
-                .unwrap();
+        let sd_len = build_subscribe_eventgroup_datagram(
+            &mut sd_buf,
+            &request,
+            session(3, RebootFlag::Continuous),
+        )
+        .unwrap();
 
         // The first entry's type byte follows the 16-byte SOME/IP header and
         // the SD flags/reserved and entries_size fields.
@@ -874,7 +963,8 @@ mod tests {
         // Both reboot flags must encode to a parseable subscribe datagram;
         // the flag lives in the SD header flags byte (bit 7).
         for reboot in [RebootFlag::RecentlyRebooted, RebootFlag::Continuous] {
-            let len = build_subscribe_eventgroup_datagram(&mut buf, &request, 3, reboot).unwrap();
+            let len = build_subscribe_eventgroup_datagram(&mut buf, &request, session(3, reboot))
+                .unwrap();
             let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
             let mut entries = view.entries();
             let entry = entries.next().expect("one entry");
@@ -900,8 +990,7 @@ mod tests {
         let len = build_multi_subscribe_eventgroup_datagram::<2>(
             &mut buf,
             &requests,
-            3,
-            RebootFlag::Continuous,
+            session(3, RebootFlag::Continuous),
         )
         .unwrap();
         let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
@@ -944,8 +1033,7 @@ mod tests {
             let len = build_multi_subscribe_eventgroup_datagram::<3>(
                 &mut buf,
                 &requests[..n],
-                3,
-                RebootFlag::Continuous,
+                session(3, RebootFlag::Continuous),
             )
             .unwrap();
             assert_eq!(multi_subscribe_datagram_len(n), len, "{n} requests");
@@ -968,8 +1056,7 @@ mod tests {
             build_multi_subscribe_eventgroup_datagram::<1>(
                 &mut buf,
                 &[request, request],
-                3,
-                RebootFlag::Continuous
+                session(3, RebootFlag::Continuous)
             ),
             Err(BuildError::ListFull {
                 needed: 2,
@@ -998,8 +1085,7 @@ mod tests {
         let len = build_find_service_datagram::<1>(
             &mut buf,
             &[find_request()],
-            5,
-            RebootFlag::Continuous,
+            session(5, RebootFlag::Continuous),
         )
         .unwrap();
         let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
@@ -1024,8 +1110,7 @@ mod tests {
             build_find_service_datagram::<1>(
                 &mut buf,
                 &[find_request(), find_request()],
-                5,
-                RebootFlag::Continuous
+                session(5, RebootFlag::Continuous)
             ),
             Err(BuildError::ListFull {
                 needed: 2,
@@ -1035,18 +1120,47 @@ mod tests {
     }
 
     #[test]
+    fn a_new_counter_starts_at_one_recently_rebooted() {
+        let s = SdSessionCounter::new().next();
+        assert_eq!((s.id(), s.reboot()), (1, RebootFlag::RecentlyRebooted));
+    }
+
+    #[test]
+    fn the_counter_wraps_to_one_and_stays_continuous() {
+        let counter = SdSessionCounter::with_initial(0xFFFE);
+        let sessions: [_; 3] = core::array::from_fn(|_| {
+            let s = counter.next();
+            (s.id(), s.reboot())
+        });
+        assert_eq!(
+            sessions,
+            [
+                (0xFFFF, RebootFlag::RecentlyRebooted),
+                (1, RebootFlag::Continuous),
+                (2, RebootFlag::Continuous)
+            ]
+        );
+    }
+
+    #[test]
     fn offer_builders_write_the_reboot_flag_they_are_given() {
         type Builder = fn(&mut [u8], &OfferServiceRequest, RebootFlag) -> Result<usize, BuildError>;
         let builders: [(&str, Builder); 4] = [
-            ("offer", |b, r, f| build_offer_service_datagram(b, r, 1, f)),
+            ("offer", |b, r, f| {
+                build_offer_service_datagram(b, r, session(1, f))
+            }),
             ("stop", |b, r, f| {
-                build_stop_offer_service_datagram(b, r, 1, f)
+                build_stop_offer_service_datagram(b, r, session(1, f))
             }),
             ("multi offer", |b, r, f| {
-                build_multi_offer_service_datagram::<1>(b, core::slice::from_ref(r), 1, f)
+                build_multi_offer_service_datagram::<1>(b, core::slice::from_ref(r), session(1, f))
             }),
             ("multi stop", |b, r, f| {
-                build_multi_stop_offer_service_datagram::<1>(b, core::slice::from_ref(r), 1, f)
+                build_multi_stop_offer_service_datagram::<1>(
+                    b,
+                    core::slice::from_ref(r),
+                    session(1, f),
+                )
             }),
         ];
         for (name, build) in builders {
@@ -1064,7 +1178,11 @@ mod tests {
         let mut buf = [0u8; 256];
         let requests = [req(0x0001, 30501), req(0x0002, 30502)];
         assert!(matches!(
-            build_multi_offer_service_datagram::<1>(&mut buf, &requests, 1, RebootFlag::Continuous),
+            build_multi_offer_service_datagram::<1>(
+                &mut buf,
+                &requests,
+                session(1, RebootFlag::Continuous)
+            ),
             Err(BuildError::ListFull {
                 needed: 2,
                 capacity: 1
@@ -1074,8 +1192,7 @@ mod tests {
             build_multi_stop_offer_service_datagram::<1>(
                 &mut buf,
                 &requests,
-                1,
-                RebootFlag::Continuous
+                session(1, RebootFlag::Continuous)
             ),
             Err(BuildError::ListFull {
                 needed: 2,
@@ -1096,7 +1213,7 @@ mod tests {
         };
         for reboot in [RebootFlag::RecentlyRebooted, RebootFlag::Continuous] {
             let mut buf = [0u8; 64];
-            let len = build_subscribe_ack_datagram(&mut buf, &request, 2, reboot).unwrap();
+            let len = build_subscribe_ack_datagram(&mut buf, &request, session(2, reboot)).unwrap();
             let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
             assert_eq!(view.flags().reboot(), reboot);
         }
@@ -1114,7 +1231,8 @@ mod tests {
         };
         let mut buf = [0u8; 64];
         let len =
-            build_subscribe_ack_datagram(&mut buf, &request, 2, RebootFlag::Continuous).unwrap();
+            build_subscribe_ack_datagram(&mut buf, &request, session(2, RebootFlag::Continuous))
+                .unwrap();
         let view = parse_someip_sd_datagram(&buf[..len]).expect("valid SD datagram");
         assert_eq!(view.entries().next().expect("one entry").counter(), 3);
     }
