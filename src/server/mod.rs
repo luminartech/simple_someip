@@ -184,7 +184,7 @@ impl ServerSd<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "bare_metal"))]
 impl<'a> ServerSd<'a> {
     pub(crate) fn new(state: &'a SdStateManager, multicast: SocketAddrV4) -> Self {
         Self { state, multicast }
