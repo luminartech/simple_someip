@@ -424,6 +424,66 @@ mod tests {
         Delivery, FIND_SERVICE, FramePeer, OFFER_SERVICE, build, parse,
     };
 
+    extern "C" fn bind_nothing(_port: u16, _is_sd: bool, _mcast: u32) -> i32 {
+        0
+    }
+
+    extern "C" fn send_nothing(
+        _port: u16,
+        _buf: *const u8,
+        _len: usize,
+        _to: u32,
+        _at: u16,
+    ) -> i32 {
+        0
+    }
+
+    /// `init` returns -8 for more offers than `SIMPLE_SOMEIP_MAX_OFFERS`, and
+    /// a later `init` with as many offers as it holds succeeds.
+    #[test]
+    fn init_rejects_more_offers_than_the_runtime_holds() {
+        let cap = option_env!("SIMPLE_SOMEIP_MAX_OFFERS").map_or(4, |cap| {
+            cap.parse::<usize>().expect("SIMPLE_SOMEIP_MAX_OFFERS")
+        });
+        let offers = |n: u16| -> &'static [rt::OfferEntry] {
+            (0..n)
+                .map(|i| rt::OfferEntry {
+                    service_id: SVC + i,
+                    instance_id: INST,
+                    event_group_id: EG,
+                    unicast_port: SERVER_PORT,
+                    major_version: MAJOR,
+                    ttl_seconds: 3,
+                })
+                .collect::<Vec<_>>()
+                .leak()
+        };
+        let config = |offers: &'static [rt::OfferEntry]| rt::RuntimeConfig {
+            interface: u32::from(OUR_IP),
+            sd_port: SD_PORT,
+            sd_mcast: u32::from(SD_GROUP),
+            multicast_loopback: true,
+            send: send_nothing,
+            now_ms,
+            dispatch,
+            dispatch_ctx: 0,
+            bind: bind_nothing,
+            offers,
+            subscription: None,
+            required_services: &[],
+            on_service: None,
+            find_timing: find_timing(),
+            mailbox: &MAILBOX,
+            buffers: Box::leak(Box::new(rt::RuntimeBuffers::new())),
+            e2e: None,
+        };
+        let cap = u16::try_from(cap).expect("cap fits u16");
+
+        assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
+        assert_eq!(rt::init(config(offers(cap + 1))), -8);
+        assert_eq!(rt::init(config(offers(cap))), 0);
+    }
+
     /// Unicast and multicast SD both still reach the runtime when another
     /// wildcard socket is bound to the SD port after it, as vsomeip's is.
     ///
