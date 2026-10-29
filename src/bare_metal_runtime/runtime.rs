@@ -224,9 +224,10 @@ pub struct RuntimeConfig {
     /// Bind PCBs + register the RX path; called per catalog port in `init`.
     pub bind: BindFn,
     /// The services this node offers, at most `SIMPLE_SOMEIP_MAX_OFFERS` (4 by
-    /// default); [`init`] returns [`InitError::TooManyOffers`] past it. Empty for a node that offers
-    /// none: it then sends no `OfferService`, answers no `FindService` and
-    /// sends a `SubscribeNack` for every `SubscribeEventgroup`.
+    /// default); [`init`] returns [`InitError::TooManyOffers`] past it. Empty
+    /// for a node that offers none: it then sends no `OfferService`, answers
+    /// no `FindService` and sends a `SubscribeNack` for every
+    /// `SubscribeEventgroup`.
     pub offers: &'static [OfferEntry],
     /// The eventgroup this node subscribes to, if any, naming a concrete
     /// service ID, instance ID and major version. The runtime sends
@@ -234,9 +235,10 @@ pub struct RuntimeConfig {
     /// [`Self::on_service`].
     pub subscription: Option<SubEntry>,
     /// The services this node needs, at most
-    /// [`ServerConfig::REQUIRED_SERVICES_CAP`] distinct ones; [`init`]
-    /// returns [`InitError::TooManyRequiredServices`] past it. The runtime sends `FindService` for them and
-    /// reports their availability through [`Self::on_service`].
+    /// [`ServerConfig::REQUIRED_SERVICES_CAP`] distinct ones (1 by default);
+    /// [`init`] returns [`InitError::TooManyRequiredServices`] past it. The
+    /// runtime sends `FindService` for them and reports their availability
+    /// through [`Self::on_service`].
     pub required_services: &'static [RequiredEntry],
     /// Called for each change in the availability of the subscription's
     /// service or a required service; `None` reports nothing.
@@ -672,27 +674,35 @@ fn bind_ports(bind: BindFn) {
 /// Why [`init`] failed. Each variant's value is the negative code a C API
 /// over [`init`] returns for it; [`InitError::code`] gives it.
 #[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum InitError {
     /// The receive server could not be built.
+    #[error("the receive server could not be built")]
     ServerBuild = -1,
     /// The runtime task could not be spawned.
+    #[error("the runtime task could not be spawned")]
     Spawn = -2,
     /// The runtime is already initialized: a repeat or re-entrant [`init`].
     /// The passed config and its buffers are not adopted.
+    #[error("the runtime is already initialized")]
     AlreadyInitialized = -4,
     /// [`RuntimeConfig::subscription`], or an entry of
     /// [`RuntimeConfig::offers`] or [`RuntimeConfig::required_services`],
     /// names a wildcard service ID, instance ID or major version.
+    #[error("a subscription, offer or required service names a wildcard")]
     Wildcard = -5,
     /// [`RuntimeConfig::sd_mcast`] is not a multicast group.
+    #[error("the SD group is not a multicast group")]
     SdGroupNotMulticast = -6,
-    /// [`RuntimeConfig::required_services`] names more than
-    /// [`ServerConfig::REQUIRED_SERVICES_CAP`] distinct services.
+    /// [`RuntimeConfig::required_services`] names more distinct services
+    /// than the runtime holds.
+    #[error(
+        "more distinct required services than SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES (1 by default)"
+    )]
     TooManyRequiredServices = -7,
-    /// [`RuntimeConfig::offers`] holds more than `SIMPLE_SOMEIP_MAX_OFFERS`
-    /// (4 by default) entries.
+    /// [`RuntimeConfig::offers`] holds more entries than the runtime holds.
+    #[error("more offers than SIMPLE_SOMEIP_MAX_OFFERS (4 by default)")]
     TooManyOffers = -8,
 }
 
