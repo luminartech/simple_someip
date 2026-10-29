@@ -14,7 +14,7 @@
 
 use core::net::SocketAddrV4;
 
-use futures_util::future::FusedFuture;
+use futures_util::future::{FusedFuture, OptionFuture};
 use futures_util::{FutureExt, future::Either, pin_mut, select_biased};
 
 use crate::protocol::sd;
@@ -918,12 +918,11 @@ where
         sd_buf,
         recv_send_buf,
     );
-    let announce_fut = async {
-        if let Some(offering) = config
-            .offering
-            .as_ref()
-            .filter(|offering| offering.announce)
-        {
+    let announce = config
+        .offering
+        .as_ref()
+        .filter(|offering| offering.announce)
+        .map(|offering| {
             announce_loop(
                 &config,
                 offering,
@@ -932,30 +931,23 @@ where
                 &timer,
                 announce_send_buf,
             )
-            .await;
-        }
-        core::future::pending::<core::convert::Infallible>().await
-    };
-    let find_fut = async {
-        if discovered.is_empty() {
-            core::future::pending::<core::convert::Infallible>().await
-        } else {
-            find_loop(
-                &config,
-                sd,
-                sd_state_ref,
-                &timer,
-                &discovered,
-                find_send_buf,
-            )
-            .await
-        }
-    };
-    let senders = futures_util::future::join(announce_fut, find_fut);
+        });
+    let find = (!discovered.is_empty()).then(|| {
+        find_loop(
+            &config,
+            sd,
+            sd_state_ref,
+            &timer,
+            &discovered,
+            find_send_buf,
+        )
+    });
+    let senders =
+        futures_util::future::join(OptionFuture::from(announce), OptionFuture::from(find));
     pin_mut!(recv_fut, senders);
     match futures_util::future::select(recv_fut, senders).await {
         Either::Left((recv_result, _)) => recv_result,
-        Either::Right(((never, _), _)) => match never {},
+        Either::Right((_, recv_fut)) => recv_fut.await,
     }
 }
 
