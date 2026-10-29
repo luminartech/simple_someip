@@ -6,6 +6,7 @@
 //! - Event group management
 //! - Request/Response handling
 
+mod discovery;
 mod error;
 mod event_publisher;
 mod find_timing;
@@ -14,6 +15,7 @@ mod sd_state;
 mod service_info;
 mod subscription_manager;
 
+pub use discovery::{ServiceChange, ServiceObserver};
 pub use error::Error;
 pub use event_publisher::EventPublisher;
 pub use find_timing::FindTiming;
@@ -119,23 +121,25 @@ pub struct ServerConfig {
     /// `FindService` and sends a `SubscribeNack` for every
     /// `SubscribeEventgroup`. Its unicast socket binds an ephemeral port.
     pub offering: Option<Offering>,
-    /// Eventgroups this node subscribes to. The run future sends `FindService`
-    /// for their service instances until each is offered (see
-    /// [`Self::find_timing`]), and answers each Offer of a matching service
-    /// instance with a unicast Subscribe to its sender. Use it on a node that
+    /// Eventgroups this node subscribes to. The run future answers each Offer
+    /// of a matching service instance with a unicast Subscribe to its sender,
+    /// and sends `FindService` for the instance (see [`Self::find_timing`])
+    /// until an Offer naming an IPv4 endpoint has been answered, and again
+    /// once that offer is gone (see [`ServiceChange`]). Use it on a node that
     /// runs no `Client`; a `Client` sends its own Subscribes. Populate via
     /// [`Self::with_consumed_eventgroup`]. A passive server runs no receive
     /// loop, so it neither finds nor answers Offers.
     pub consumed_eventgroups:
         heapless::Vec<SubscribeEventgroupRequest, { ServerConfig::CONSUMED_EVENTGROUPS_CAP }>,
     /// Services this node needs. The run future sends `FindService` for each
-    /// until it is offered (see [`Self::find_timing`]), after those of
-    /// [`Self::consumed_eventgroups`]. An Offer of a required service sends no
-    /// Subscribe; only [`Self::consumed_eventgroups`] are subscribed. A
-    /// required service that is not also consumed is found with a
-    /// `FindService` TTL of 3 seconds. Populate via
-    /// [`Self::with_required_service`]. A passive server runs no receive loop,
-    /// so it neither finds nor answers Offers.
+    /// (see [`Self::find_timing`]), after those of
+    /// [`Self::consumed_eventgroups`], until an Offer names it with an IPv4
+    /// endpoint, and again once that offer is gone (see [`ServiceChange`]).
+    /// An Offer of a required service sends no Subscribe; only
+    /// [`Self::consumed_eventgroups`] are subscribed. A required service that
+    /// is not also consumed is found with a `FindService` TTL of 3 seconds.
+    /// Populate via [`Self::with_required_service`]. A passive server runs no
+    /// receive loop, so it neither finds nor answers Offers.
     pub required_services: heapless::Vec<ServiceInstance, { ServerConfig::REQUIRED_SERVICES_CAP }>,
     /// When `FindService` is sent for [`Self::consumed_eventgroups`] and
     /// [`Self::required_services`]; see [`FindTiming`]. Defaults to
@@ -414,8 +418,7 @@ impl ServerConfig {
         }
     }
 
-    /// Find `service` with `FindService` until it is offered. See
-    /// [`Self::required_services`].
+    /// Find `service` with `FindService`. See [`Self::required_services`].
     ///
     /// # Panics
     ///
@@ -690,10 +693,10 @@ where
     /// and the source `SocketAddrV4`; the consumer is responsible for
     /// re-parsing the SOME/IP header and any E2E check.
     pub non_sd_observer: Option<(NonSdRequestCallback, usize)>,
-    /// Optional `(callback, ctx)` pair invoked for every `OfferService` and
-    /// `StopOfferService` entry the server receives. `None` reports
-    /// nothing. See [`OfferObserver`].
-    pub offer_observer: Option<(OfferObserver, usize)>,
+    /// Optional `(callback, ctx)` pair invoked for each change in the
+    /// availability of a service instance the server finds. `None` reports
+    /// nothing. See [`ServiceChange`].
+    pub service_observer: Option<(ServiceObserver, usize)>,
 }
 
 /// Tokio-defaulted constructor.
@@ -740,7 +743,7 @@ impl
             e2e: NoE2E,
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
             non_sd_observer: None,
-            offer_observer: None,
+            service_observer: None,
         }
     }
 }
@@ -766,7 +769,7 @@ where
             e2e: self.e2e,
             subscriptions: self.subscriptions,
             non_sd_observer: self.non_sd_observer,
-            offer_observer: self.offer_observer,
+            service_observer: self.service_observer,
         }
     }
 
@@ -779,7 +782,7 @@ where
             e2e: self.e2e,
             subscriptions: self.subscriptions,
             non_sd_observer: self.non_sd_observer,
-            offer_observer: self.offer_observer,
+            service_observer: self.service_observer,
         }
     }
 
@@ -792,7 +795,7 @@ where
             e2e,
             subscriptions: self.subscriptions,
             non_sd_observer: self.non_sd_observer,
-            offer_observer: self.offer_observer,
+            service_observer: self.service_observer,
         }
     }
 
@@ -808,7 +811,7 @@ where
             e2e: self.e2e,
             subscriptions,
             non_sd_observer: self.non_sd_observer,
-            offer_observer: self.offer_observer,
+            service_observer: self.service_observer,
         }
     }
 
@@ -825,13 +828,13 @@ where
         self
     }
 
-    /// Register a `(callback, ctx)` pair invoked for every `OfferService`
-    /// and `StopOfferService` entry the server receives; see
-    /// [`OfferObserver`]. The opaque `ctx` word is passed back verbatim.
+    /// Register a `(callback, ctx)` pair invoked for each change in the
+    /// availability of a service instance the server finds; see
+    /// [`ServiceChange`]. The opaque `ctx` word is passed back verbatim.
     /// Passing `None` (the default) reports nothing.
     #[must_use]
-    pub fn with_offer_observer(mut self, observer: Option<(OfferObserver, usize)>) -> Self {
-        self.offer_observer = observer;
+    pub fn with_service_observer(mut self, observer: Option<(ServiceObserver, usize)>) -> Self {
+        self.service_observer = observer;
         self
     }
 }
@@ -939,10 +942,10 @@ where
     /// (method requests). `None` reproduces the default "non-SD
     /// ignored" behavior.
     pub non_sd_observer: Option<(NonSdRequestCallback, usize)>,
-    /// Optional `(callback, ctx)` pair for the server's received
-    /// `OfferService` and `StopOfferService` entries; see
-    /// [`OfferObserver`]. `None` reports nothing.
-    pub offer_observer: Option<(OfferObserver, usize)>,
+    /// Optional `(callback, ctx)` pair invoked for each change in the
+    /// availability of a service instance the server finds; see
+    /// [`ServiceChange`]. `None` reports nothing.
+    pub service_observer: Option<(ServiceObserver, usize)>,
 }
 
 /// SOME/IP Server that can offer services and publish events.
@@ -1058,7 +1061,7 @@ pub struct Server<
     non_sd_observer: Option<(NonSdRequestCallback, usize)>,
     /// Optional `(callback, ctx)` pair for received `OfferService` and
     /// `StopOfferService` entries.
-    offer_observer: Option<(OfferObserver, usize)>,
+    service_observer: Option<(ServiceObserver, usize)>,
 }
 
 /// Callback invoked by the server's `recv_loop` for every non-SD
@@ -1104,41 +1107,6 @@ pub type NonSdRequestCallback = fn(
     e2e_status: Option<crate::E2EStatus>,
     response_out: &mut [u8],
 ) -> i32;
-
-/// An `OfferService` or `StopOfferService` entry a server received, as
-/// [`OfferObserver`] reports it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ObservedOffer {
-    /// The sender offers `instance`.
-    #[non_exhaustive]
-    Offer {
-        /// The offered service instance, as an [`OfferedInstance`](crate::OfferedInstance).
-        instance: crate::traits::OfferedInstance,
-        /// The [`NetEndpoint`](crate::NetEndpoint) among the entry's IPv4
-        /// endpoint options: the first UDP one, else the first TCP one. `None`
-        /// when the entry references no IPv4 endpoint option.
-        endpoint: Option<crate::NetEndpoint>,
-        /// The entry's time to live, in seconds.
-        ttl: u32,
-    },
-    /// The sender withdraws `instance`.
-    #[non_exhaustive]
-    Stop {
-        /// The withdrawn service instance.
-        instance: crate::traits::OfferedInstance,
-    },
-}
-
-/// Callback invoked for every `OfferService` and `StopOfferService` entry
-/// the server receives, once per entry and in message order, whatever the
-/// service. The callback filters for the services it needs. It runs before
-/// the server sends the `SubscribeEventgroup` entries it sends in answer to
-/// an Offer in the same message.
-///
-/// `sender` is the address the SD message came from. `ctx` is the opaque
-/// word registered with the callback, passed back verbatim.
-pub type OfferObserver = fn(ctx: usize, sender: core::net::SocketAddr, offer: ObservedOffer);
 
 #[cfg(feature = "_alloc")]
 type StartedLatch = Arc<AtomicBool>;
@@ -1264,7 +1232,7 @@ impl
             e2e: NoE2E,
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
             non_sd_observer: None,
-            offer_observer: None,
+            service_observer: None,
         };
         Self::new_with_deps(deps, config, multicast_loopback).await
     }
@@ -1312,7 +1280,7 @@ impl
             e2e: NoE2E,
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
             non_sd_observer: None,
-            offer_observer: None,
+            service_observer: None,
         };
         Self::new_passive_with_deps(deps, config).await
     }
@@ -1374,7 +1342,7 @@ where
             e2e,
             subscriptions,
             non_sd_observer: deps_non_sd_observer,
-            offer_observer: deps_offer_observer,
+            service_observer: deps_service_observer,
         } = deps;
 
         // Bind unicast socket for receiving subscriptions, then wrap
@@ -1427,7 +1395,7 @@ where
             is_passive: false,
             started: Arc::new(AtomicBool::new(false)),
             non_sd_observer: deps_non_sd_observer,
-            offer_observer: deps_offer_observer,
+            service_observer: deps_service_observer,
         };
         let handles = ServerHandles {
             publisher: server.publisher(),
@@ -1471,7 +1439,7 @@ where
             e2e,
             subscriptions,
             non_sd_observer: deps_non_sd_observer,
-            offer_observer: deps_offer_observer,
+            service_observer: deps_service_observer,
         } = deps;
 
         // Bind unicast socket at the configured local_port.
@@ -1521,7 +1489,7 @@ where
             is_passive: true,
             started: Arc::new(AtomicBool::new(false)),
             non_sd_observer: deps_non_sd_observer,
-            offer_observer: deps_offer_observer,
+            service_observer: deps_service_observer,
         };
         let handles = ServerHandles {
             publisher: server.publisher(),
@@ -1615,7 +1583,7 @@ where
             is_passive: false,
             started: deps.started,
             non_sd_observer: deps.non_sd_observer,
-            offer_observer: deps.offer_observer,
+            service_observer: deps.service_observer,
         })
     }
 
@@ -1690,7 +1658,7 @@ where
             is_passive: true,
             started: deps.started,
             non_sd_observer: deps.non_sd_observer,
-            offer_observer: deps.offer_observer,
+            service_observer: deps.service_observer,
         })
     }
 
@@ -1795,7 +1763,7 @@ where
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
         let non_sd_observer = self.non_sd_observer;
-        let offer_observer = self.offer_observer;
+        let service_observer = self.service_observer;
         #[allow(noop_method_call)]
         let started = self.started.clone();
 
@@ -1829,7 +1797,7 @@ where
                 announce_send_buf,
                 find_send_buf,
                 non_sd_observer,
-                offer_observer,
+                service_observer,
             )
             .await
         }
@@ -2026,7 +1994,7 @@ where
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
         let non_sd_observer = self.non_sd_observer;
-        let offer_observer = self.offer_observer;
+        let service_observer = self.service_observer;
         let started = self.started.clone();
 
         async move {
@@ -2073,7 +2041,7 @@ where
                 &mut announce_send_buf,
                 &mut find_send_buf,
                 non_sd_observer,
-                offer_observer,
+                service_observer,
             )
             .await
         }
@@ -2355,7 +2323,7 @@ mod tests {
             publisher,
             started: Arc::new(AtomicBool::new(false)),
             non_sd_observer: None,
-            offer_observer: None,
+            service_observer: None,
         };
         (handles, bound_port)
     }
@@ -2609,7 +2577,7 @@ mod tests {
             e2e: NoE2E,
             subscriptions: subscriptions.clone(),
             non_sd_observer: None,
-            offer_observer: None,
+            service_observer: None,
         };
         let config = ServerConfig::new(
             Offering::new(ServiceInstance::new(0x5B, 1, 1).unwrap()).with_local_port(0),
@@ -2649,7 +2617,7 @@ mod tests {
             &sd_view,
             sender,
             &mut [0u8; crate::UDP_BUFFER_SIZE],
-            None,
+            &mut discovery::Discovery::leaked(&server.config),
         )
         .await;
         assert!(
@@ -2824,7 +2792,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                None,
+                &mut discovery::Discovery::leaked(&server.config),
             )
             .await
             .unwrap();
@@ -2889,7 +2857,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                None,
+                &mut discovery::Discovery::leaked(&server.config),
             )
             .await
             .unwrap();
@@ -2951,7 +2919,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                None,
+                &mut discovery::Discovery::leaked(&server.config),
             )
             .await
             .unwrap();
@@ -3011,7 +2979,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                None,
+                &mut discovery::Discovery::leaked(&server.config),
             )
             .await
             .unwrap();
@@ -3074,7 +3042,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                None,
+                &mut discovery::Discovery::leaked(&server.config),
             )
             .await
             .unwrap();
@@ -3134,7 +3102,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                None,
+                &mut discovery::Discovery::leaked(&server.config),
             )
             .await
             .unwrap();
@@ -3187,7 +3155,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                None,
+                &mut discovery::Discovery::leaked(&server.config),
             )
             .await
             .unwrap();
@@ -3413,7 +3381,7 @@ mod tests {
             &sd_view,
             "127.0.0.1:12345".parse().unwrap(),
             &mut [0u8; crate::UDP_BUFFER_SIZE],
-            None,
+            &mut discovery::Discovery::leaked(&server.config),
         )
         .await;
         assert!(result.is_ok());
@@ -3444,7 +3412,7 @@ mod tests {
             &sd_view,
             "127.0.0.1:45000".parse().unwrap(),
             &mut [0u8; crate::UDP_BUFFER_SIZE],
-            None,
+            &mut discovery::Discovery::leaked(&server.config),
         )
         .await;
 
@@ -3483,7 +3451,7 @@ mod tests {
             &sd_view,
             "127.0.0.1:12345".parse().unwrap(),
             &mut [0u8; crate::UDP_BUFFER_SIZE],
-            None,
+            &mut discovery::Discovery::leaked(&server.config),
         )
         .await;
         assert!(result.is_ok());
@@ -3525,7 +3493,7 @@ mod tests {
                 &sd_view,
                 addr,
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                None,
+                &mut discovery::Discovery::leaked(&server.config),
             )
             .await
             .unwrap();
@@ -3855,7 +3823,7 @@ mod tests {
             &sd_view,
             sender,
             &mut [0u8; crate::UDP_BUFFER_SIZE],
-            None,
+            &mut discovery::Discovery::leaked(&server.config),
         )
         .await
         .unwrap();

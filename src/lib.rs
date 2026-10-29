@@ -238,8 +238,6 @@ pub mod bare_metal_tasks;
 /// [`static_channels`] instead.
 #[cfg(feature = "embassy_channels")]
 pub mod embassy_channels;
-#[cfg(all(feature = "server", any(test, feature = "bare-metal-runtime")))]
-mod sd_availability;
 /// No-alloc SOME/IP + SD datagram codec: transport-agnostic
 /// builders/parsers used by the server receive loop, the firmware shim,
 /// and the spawnable futures in [`bare_metal_tasks`].
@@ -285,8 +283,8 @@ pub use client::{
 pub use capacity::CapacityKind;
 #[cfg(feature = "server")]
 pub use server::{
-    NonSdRequestCallback, ObservedOffer, OfferObserver, Server, ServerDeps, ServerHandles,
-    ServerStorage, SubscriptionHandle,
+    NonSdRequestCallback, Server, ServerDeps, ServerHandles, ServerStorage, ServiceChange,
+    ServiceObserver, SubscriptionHandle,
 };
 #[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};

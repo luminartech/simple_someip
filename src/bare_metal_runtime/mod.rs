@@ -6,14 +6,14 @@
 //!   optional subscription, and the services it requires),
 //! - **platform callbacks**: send a UDP datagram, read a ms clock, a
 //!   dispatch sink for inbound messages, and an optional sink for the
-//!   availability of required services,
+//!   availability of the services it subscribes to and requires,
 //! - **RX delivery**: the platform's receive path pushes datagrams into an
 //!   [`crate::bare_metal_runtime::RxMailbox`] this runtime polls, and
 //! - **buffer memory** it owns (so the platform controls link placement).
 //!
 //! Everything else lives here: the SD codec, subscribe-accept, the
 //! combined-offer announce, `FindService` and answering Offers with
-//! Subscribes, tracking and expiring the Offers of required services,
+//! Subscribes, tracking and expiring the Offers of the services it finds,
 //! notification dispatch, E2E, and the embassy executor + task.
 
 mod mailbox;
@@ -25,7 +25,7 @@ pub use transport::{CallbackFactory, CallbackSocket, CallbackTimer, NowMsFn, Pla
 #[cfg(feature = "bare-metal-runtime")]
 mod runtime;
 #[cfg(feature = "bare-metal-runtime")]
-pub use crate::sd_availability::ServiceChange;
+pub use crate::server::ServiceChange;
 #[cfg(feature = "bare-metal-runtime")]
 pub use runtime::{
     BindFn, DispatchFn, OfferEntry, RX_CAP, RX_SLOTS, RuntimeBuffers, RuntimeConfig, ServiceFn,
