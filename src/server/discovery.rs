@@ -18,9 +18,11 @@ use crate::{NetEndpoint, ServiceInstance};
 ///
 /// An instance is available once an `OfferService` names it with an IPv4
 /// endpoint. The first sender to offer it holds it until that sender's
-/// `StopOfferService`, or until the TTL of its last offer runs out; a TTL runs
-/// out between TTL and TTL + 1 s after the offer. Offers and stop offers from
-/// any other sender are ignored while it holds the instance.
+/// `StopOfferService`, or until the TTL of its last offer runs out: between
+/// TTL and TTL + 1 s after the server handled that offer, later while its
+/// receive loop is busy. While it holds the instance,
+/// only its offers are answered with a `SubscribeEventgroup`, and offers and
+/// stop offers from any other sender are ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ServiceChange {
@@ -45,8 +47,9 @@ pub enum ServiceChange {
 }
 
 /// Callback invoked for each [`ServiceChange`], in the order the server sees
-/// them. `ctx` is the opaque word registered with the callback, passed back
-/// verbatim.
+/// them, from the server's receive loop: the loop receives nothing until it
+/// returns. `ctx` is the opaque word registered with the callback, passed
+/// back verbatim.
 pub type ServiceObserver = fn(ctx: usize, change: ServiceChange);
 
 /// Most service instances a server finds: one per consumed eventgroup and
@@ -212,27 +215,28 @@ impl<'a> Discovery<'a> {
     }
 
     /// Records an offer of `service` from `sender` at `endpoint`, valid for
-    /// `ttl` seconds. An offer that names no endpoint, or that a sender other
-    /// than the holder sends, changes nothing.
+    /// `ttl` seconds; returns whether `sender` holds the instance, so its
+    /// offer is the one to answer. An offer that names no endpoint, or that a
+    /// sender other than the holder sends, changes nothing.
     pub(super) fn offer(
         &mut self,
         sender: SocketAddr,
         service: ServiceInstance,
         endpoint: Option<NetEndpoint>,
         ttl: u32,
-    ) {
+    ) -> bool {
         let (SocketAddr::V4(sender), Some(endpoint), Some(index)) =
             (sender, endpoint, self.index(service))
         else {
-            return;
+            return false;
         };
         let ticks_left = (ttl != MAX_TTL).then(|| ttl.saturating_add(1));
         let slot = &mut self.slots[index];
         match &mut slot.holder {
-            Some(holder) if holder.sender != sender => return,
+            Some(holder) if holder.sender != sender => return false,
             Some(holder) if holder.endpoint == endpoint => {
                 holder.ticks_left = ticks_left;
-                return;
+                return true;
             }
             holder => {
                 *holder = Some(Holder {
@@ -243,24 +247,23 @@ impl<'a> Discovery<'a> {
             }
         }
         self.update(index, Some(ServiceChange::Available { service, endpoint }));
+        true
     }
 
-    /// Records a stop offer of `service` from `sender`.
-    pub(super) fn stop(&mut self, sender: SocketAddr, service: ServiceInstance) {
-        let Some(index) = self.index(service) else {
-            return;
+    /// Records a stop offer of `service` from `sender`; returns whether
+    /// `sender` held the instance.
+    pub(super) fn stop(&mut self, sender: SocketAddr, service: ServiceInstance) -> bool {
+        let Some(index) = self.held_by(sender, service) else {
+            return false;
         };
-        if self.slots[index]
-            .holder
-            .is_some_and(|holder| SocketAddr::V4(holder.sender) == sender)
-        {
-            self.release(index);
-        }
+        self.release(index);
+        true
     }
 
-    /// Records that a Subscribe for `service` was sent.
-    pub(super) fn subscribed(&mut self, service: ServiceInstance) {
-        if let Some(index) = self.index(service) {
+    /// Records that a Subscribe for `service` was sent to `sender`; a sender
+    /// that does not hold the instance changes nothing.
+    pub(super) fn subscribed(&mut self, sender: SocketAddr, service: ServiceInstance) {
+        if let Some(index) = self.held_by(sender, service) {
             self.slots[index].subscribed = true;
             self.update(index, None);
         }
@@ -299,6 +302,14 @@ impl<'a> Discovery<'a> {
             .targets
             .iter()
             .position(|target| target.find.service == service)
+    }
+
+    fn held_by(&self, sender: SocketAddr, service: ServiceInstance) -> Option<usize> {
+        let index = self.index(service)?;
+        self.slots[index]
+            .holder
+            .is_some_and(|holder| SocketAddr::V4(holder.sender) == sender)
+            .then_some(index)
     }
 
     fn release(&mut self, index: usize) {
@@ -514,7 +525,7 @@ mod tests {
 
         discovery.offer(sender(1), instance(0x1234), Some(endpoint(30501)), 3);
         assert!(!found(&discovered), "offered but not subscribed");
-        discovery.subscribed(instance(0x1234));
+        discovery.subscribed(sender(1), instance(0x1234));
         assert!(found(&discovered));
         discovery.stop(sender(1), instance(0x1234));
         discovery.offer(sender(1), instance(0x1234), Some(endpoint(30501)), 3);
