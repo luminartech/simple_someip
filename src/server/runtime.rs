@@ -783,8 +783,8 @@ fn encode_finds(
 }
 
 /// Send `FindService` for the instances `discovered` has not found, on
-/// [`ServerConfig::find_timing`]'s schedule, and again on that schedule each
-/// time it loses one. Never returns.
+/// [`ServerConfig::find_timing`]'s schedule, and from the start of that
+/// schedule each time it loses one. Never returns.
 pub(super) async fn find_loop<T, Tm>(
     config: &ServerConfig,
     sd_socket: &T,
@@ -799,14 +799,16 @@ where
 {
     loop {
         discovered.forget_losses();
-        find_schedule(config, sd_socket, sd_state, timer, discovered, buf).await;
-        discovered.lost().await;
+        if !find_schedule(config, sd_socket, sd_state, timer, discovered, buf).await {
+            discovered.lost().await;
+        }
     }
 }
 
 /// Send `FindService` for the instances `discovered` has not found on
-/// [`ServerConfig::find_timing`]'s schedule, encoded into `buf`; returns
-/// after the last send, or once every instance is found.
+/// [`ServerConfig::find_timing`]'s schedule, encoded into `buf`. Returns
+/// `true` when an instance found earlier is lost while it waits for the next
+/// send, and `false` after the last send or once every instance is found.
 async fn find_schedule<T, Tm>(
     config: &ServerConfig,
     sd_socket: &T,
@@ -814,27 +816,34 @@ async fn find_schedule<T, Tm>(
     timer: &Tm,
     discovered: &Discovered,
     buf: &mut [u8; ServerConfig::FIND_SEND_BUF_LEN],
-) where
+) -> bool
+where
     T: TransportSocket,
     Tm: Timer,
 {
     let timing = config.find_timing;
     let mut delay = timing.initial_delay(super::find_timing::seed(config));
     for repetition in 0..=u32::from(timing.repetitions_max) {
-        timer.sleep(delay).await;
+        let sleep = timer.sleep(delay);
+        let lost = discovered.lost();
+        pin_mut!(sleep, lost);
+        if let Either::Right(_) = futures_util::future::select(sleep, lost).await {
+            return true;
+        }
         match encode_finds(buf, discovered, sd_state) {
             Ok(Some(len)) => {
                 if let Err(e) = sd_socket.send_to(&buf[..len], config.sd_multicast).await {
                     crate::log::warn!("FindService send failed: {e:?}");
                 }
             }
-            Ok(None) => return,
+            Ok(None) => return false,
             Err(e) => crate::log::warn!("FindService encode failed: {e:?}"),
         }
         delay = timing
             .repetitions_base_delay
             .saturating_mul(2u32.saturating_pow(repetition));
     }
+    false
 }
 
 /// Combined receive + announce loop. The single future returned from
@@ -1924,6 +1933,58 @@ mod tests {
 
             assert_eq!(timer.millis(), [10, 100, 10, 100, 200, 400]);
             assert_eq!(finds(&socket).len(), 5);
+        }
+
+        /// Completes a sleep of up to a second at once and never completes a
+        /// longer one.
+        struct ShortSleeps;
+
+        impl crate::Timer for ShortSleeps {
+            type SleepFuture<'a>
+                = futures_util::future::Either<core::future::Ready<()>, core::future::Pending<()>>
+            where
+                Self: 'a;
+            fn sleep(&self, duration: core::time::Duration) -> Self::SleepFuture<'_> {
+                if duration <= core::time::Duration::from_secs(1) {
+                    futures_util::future::Either::Left(core::future::ready(()))
+                } else {
+                    futures_util::future::Either::Right(core::future::pending())
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_loss_during_a_repetition_starts_the_schedule_again() {
+            let config = make_config()
+                .with_consumed_eventgroup(consumed())
+                .with_find_timing(FindTiming {
+                    repetitions_base_delay: core::time::Duration::MAX,
+                    ..FIXED
+                });
+            let discovered = Discovered::new(&config);
+            let (socket, sd_state) = (RecordingSocket::default(), make_sd_state());
+            let mut buf = find_buf();
+            let finding = find_loop(
+                &config,
+                &socket,
+                &sd_state,
+                &ShortSleeps,
+                &discovered,
+                &mut buf,
+            );
+            pin_mut!(finding);
+
+            assert!(futures_util::poll!(finding.as_mut()).is_pending());
+            assert_eq!(
+                finds(&socket).len(),
+                1,
+                "sleeping before the first repetition"
+            );
+            discovered.mark_found(0);
+            discovered.mark_lost(0);
+            assert!(futures_util::poll!(finding.as_mut()).is_pending());
+
+            assert_eq!(finds(&socket).len(), 2);
         }
 
         #[tokio::test]
