@@ -352,18 +352,19 @@ where
                 let Some(instance) = entry_instance(entry_view) else {
                     continue;
                 };
-                if entry_view.is_stop_offer() {
-                    discovery.stop(sender, instance);
+                let stop = entry_view.is_stop_offer();
+                let holds = if stop {
+                    discovery.stop(sender, instance)
+                } else {
+                    let endpoint = offered_endpoint(entry_options);
+                    discovery.offer(sender, instance, endpoint, entry_view.ttl())
+                };
+                if !holds {
                     continue;
                 }
-                discovery.offer(
-                    sender,
-                    instance,
-                    offered_endpoint(entry_options),
-                    entry_view.ttl(),
-                );
-                for (request, answered) in config.consumed_eventgroups.iter().zip(&mut answered) {
-                    *answered |= instance == request.service;
+                let requests = config.consumed_eventgroups.iter().zip(&mut answered);
+                for (_, subscribe) in requests.filter(|(request, _)| request.service == instance) {
+                    *subscribe = !stop;
                 }
             }
             _ => {
@@ -377,7 +378,7 @@ where
             Ok(()) => {
                 let requests = config.consumed_eventgroups.iter().zip(answered);
                 for (request, _) in requests.filter(|(_, answered)| *answered) {
-                    discovery.subscribed(request.service);
+                    discovery.subscribed(sender, request.service);
                 }
             }
             Err(e) => crate::log::warn!("Subscribe send failed: {e}"),
@@ -2096,6 +2097,135 @@ mod tests {
             .await
             .expect("handle_sd_message");
 
+            assert_eq!(discovered.unfound().count(), 1);
+        }
+
+        /// How many Subscribes `discovery`'s server sends answering an SD
+        /// message of `entries` and `options` from `sender`.
+        async fn subscribes_answering(
+            config: &ServerConfig,
+            discovery: &mut Discovery<'_>,
+            sender: SocketAddrV4,
+            entries: &[sd::Entry],
+            options: &[sd::Options],
+        ) -> usize {
+            use automotive_wire_codec::Encode;
+            let header = sd::Header::new(
+                sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+                entries,
+                options,
+            );
+            let mut wire = [0u8; 512];
+            let sd_len = header.encode_to_slice(&mut wire).expect("encode");
+            let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+            let socket = RecordingSocket::default();
+            let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::server::SubscriptionManager::new(),
+            ));
+            handle_sd_message(
+                config,
+                &socket,
+                &make_sd_state(),
+                &subscriptions,
+                &sd_view,
+                core::net::SocketAddr::V4(sender),
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                discovery,
+            )
+            .await
+            .expect("handle_sd_message");
+            socket.sent.lock().unwrap().len()
+        }
+
+        fn consumed_offer(ttl: u32, options: u8) -> sd::Entry {
+            sd::Entry::OfferService(sd::ServiceEntry {
+                index_first_options_run: 0,
+                index_second_options_run: 0,
+                options_count: sd::OptionsCount::new(options, 0),
+                service_id: 0x5678,
+                instance_id: 1,
+                major_version: 1,
+                ttl,
+                minor_version: 0,
+            })
+        }
+
+        fn consumed_stop() -> sd::Entry {
+            let sd::Entry::OfferService(entry) = consumed_offer(0, 1) else {
+                unreachable!()
+            };
+            sd::Entry::StopOfferService(entry)
+        }
+
+        fn endpoint() -> sd::Options {
+            sd::Options::IpV4Endpoint {
+                ip: *PEER_SD.ip(),
+                port: 30509,
+                protocol: sd::TransportProtocol::Udp,
+            }
+        }
+
+        #[tokio::test]
+        async fn only_the_holders_offer_is_answered_and_found() {
+            let config = make_config().with_consumed_eventgroup(consumed());
+            let discovered = Discovered::new(&config);
+            let mut discovery = Discovery::new(&discovered, None);
+            let other = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), 30490);
+
+            let holder = subscribes_answering(
+                &config,
+                &mut discovery,
+                PEER_SD,
+                &[consumed_offer(3, 1)],
+                &[endpoint()],
+            )
+            .await;
+            assert_eq!(holder, 1);
+            let second = subscribes_answering(
+                &config,
+                &mut discovery,
+                other,
+                &[consumed_offer(3, 1)],
+                &[endpoint()],
+            )
+            .await;
+
+            assert_eq!(second, 0, "a second provider gets no Subscribe");
+        }
+
+        #[tokio::test]
+        async fn an_offer_with_no_endpoint_is_not_answered() {
+            let config = make_config().with_consumed_eventgroup(consumed());
+            let discovered = Discovered::new(&config);
+
+            let sent = subscribes_answering(
+                &config,
+                &mut Discovery::new(&discovered, None),
+                PEER_SD,
+                &[consumed_offer(3, 0)],
+                &[],
+            )
+            .await;
+
+            assert_eq!(sent, 0);
+            assert_eq!(discovered.unfound().count(), 1);
+        }
+
+        #[tokio::test]
+        async fn an_offer_stopped_in_the_same_message_is_not_answered() {
+            let config = make_config().with_consumed_eventgroup(consumed());
+            let discovered = Discovered::new(&config);
+
+            let sent = subscribes_answering(
+                &config,
+                &mut Discovery::new(&discovered, None),
+                PEER_SD,
+                &[consumed_offer(3, 1), consumed_stop()],
+                &[endpoint()],
+            )
+            .await;
+
+            assert_eq!(sent, 0);
             assert_eq!(discovered.unfound().count(), 1);
         }
 
