@@ -5,29 +5,25 @@
 
 use core::cell::RefCell;
 use core::mem::MaybeUninit;
-use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use core::pin::pin;
+use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use core::time::Duration;
 
 use embassy_executor::raw::Executor;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
 
 use crate::ServiceInstance;
 use crate::bare_metal_tasks::{SomeipRun, publish_notification, run_someip};
 use crate::protocol::sd;
-use crate::sd_availability::{Availability, ServiceChange};
 use crate::sd_codec::{
     OfferServiceRequest, SubscribeEventgroupRequest, build_multi_stop_offer_service_datagram,
 };
 use crate::server::{
-    EventPublisher, FindTiming, ObservedOffer, OfferObserver, Offering, SdStateManager, Server,
-    ServerConfig, ServerStorage, StaticSubscriptionHandle, StaticSubscriptionStorage,
-    SubscriptionManager,
+    EventPublisher, FindTiming, Offering, SdStateManager, Server, ServerConfig, ServerStorage,
+    StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager,
 };
-use crate::transport::{E2EHandle, NoE2E, Timer};
+use crate::transport::{E2EHandle, NoE2E};
 
 use super::mailbox::RxMailbox;
 use super::transport::{CallbackFactory, CallbackSocket, CallbackTimer, NowMsFn, Platform, SendFn};
@@ -61,7 +57,6 @@ type Sock = CallbackSocket<'static, RX_SLOTS, RX_CAP>;
 type Factory = CallbackFactory<'static, RX_SLOTS, RX_CAP>;
 type Publisher =
     EventPublisher<&'static dyn E2EHandle, StaticSubscriptionHandle, &'static Sock, Sock>;
-type AvailabilityTable = Availability<{ ServerConfig::REQUIRED_SERVICES_CAP }>;
 type RtServer = Server<
     Factory,
     CallbackTimer,
@@ -90,11 +85,12 @@ pub type DispatchFn = fn(
     response_out: &mut [u8],
 ) -> i32;
 
-/// Platform callback for a change in the availability of a required service
-/// (see [`RuntimeConfig::required_services`]), called once per change from
-/// within [`poll`]. `ctx` is [`RuntimeConfig::dispatch_ctx`]. A call to
-/// [`poll`] from it returns without polling.
-pub type ServiceFn = fn(ctx: usize, change: ServiceChange);
+/// Platform callback for a change in the availability of the subscription's
+/// service or a required service (see [`RuntimeConfig::required_services`]),
+/// called once per change from within [`poll`]. `ctx` is
+/// [`RuntimeConfig::dispatch_ctx`]. A call to [`poll`] from it returns
+/// without polling.
+pub type ServiceFn = crate::server::ServiceObserver;
 
 /// Bind a platform UDP socket / PCB for `port` and register its receive
 /// path (which must call [`on_rx`]). `is_sd` requests the SD multicast
@@ -216,19 +212,17 @@ pub struct RuntimeConfig {
     /// sends a `SubscribeNack` for every `SubscribeEventgroup`.
     pub offers: &'static [OfferEntry],
     /// The eventgroup this node subscribes to, if any, naming a concrete
-    /// service ID, instance ID and major version. Its service is required as
-    /// if listed first in [`Self::required_services`].
+    /// service ID, instance ID and major version. The runtime sends
+    /// `FindService` for its service and reports its availability through
+    /// [`Self::on_service`].
     pub subscription: Option<SubEntry>,
-    /// The services this node needs, each naming a concrete service ID,
-    /// instance ID and major version. The runtime sends `FindService` for
-    /// them and reports their availability through [`Self::on_service`]. A
-    /// service listed twice, or also subscribed to, is required once. The
-    /// subscription's service takes one of the
-    /// [`ServerConfig::REQUIRED_SERVICES_CAP`] slots, and [`init`] returns
-    /// `-7` past it.
+    /// The services this node needs, at most
+    /// [`ServerConfig::REQUIRED_SERVICES_CAP`] distinct ones; [`init`]
+    /// returns `-7` past it. The runtime sends `FindService` for them and
+    /// reports their availability through [`Self::on_service`].
     pub required_services: &'static [ServiceInstance],
-    /// Called for each change in the availability of a required service;
-    /// `None` reports nothing.
+    /// Called for each change in the availability of the subscription's
+    /// service or a required service; `None` reports nothing.
     pub on_service: Option<ServiceFn>,
     /// When the runtime sends `FindService` for its subscription and
     /// required services.
@@ -263,12 +257,6 @@ static IFACE: AtomicU32 = AtomicU32::new(0);
 
 static DISPATCH: AtomicUsize = AtomicUsize::new(0); // DispatchFn as usize
 static DISPATCH_CTX: AtomicUsize = AtomicUsize::new(0); // opaque ctx word for DISPATCH
-static ON_SERVICE: AtomicUsize = AtomicUsize::new(0); // ServiceFn as usize, 0 for none
-static AVAILABILITY: BlockingMutex<CriticalSectionRawMutex, RefCell<AvailabilityTable>> =
-    BlockingMutex::new(RefCell::new(Availability::new()));
-/// Raised after the offer observer updates [`AVAILABILITY`], so the expiry
-/// future recomputes its deadline.
-static AVAILABILITY_CHANGED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static PUBLISH_SESSION: AtomicU16 = AtomicU16::new(1);
 
 static OFFERS_LEN: AtomicUsize = AtomicUsize::new(0);
@@ -406,101 +394,22 @@ fn dispatch(
     )
 }
 
-fn now_ms() -> u32 {
-    (platform().now_ms)()
-}
-
-/// Passes `change` to [`RuntimeConfig::on_service`], if set.
-fn report(change: ServiceChange) {
-    let raw = ON_SERVICE.load(Ordering::Acquire);
-    if raw == 0 {
-        return;
-    }
-    // SAFETY: stored from a valid ServiceFn in `init`.
-    let on_service: ServiceFn = unsafe { core::mem::transmute::<usize, ServiceFn>(raw) };
-    on_service(DISPATCH_CTX.load(Ordering::Acquire), change);
-}
-
-/// Records each `OfferService` and `StopOfferService` entry the server
-/// receives in [`AVAILABILITY`] and reports what changed, first the records
-/// whose TTL ran out. An Offer that names no endpoint is not recorded, and
-/// nothing from a sender that is not IPv4 is.
-fn observe_offer(_ctx: usize, sender: SocketAddr, offer: ObservedOffer) {
-    if !sender.is_ipv4() {
-        return;
-    }
-    let now = now_ms();
-    let (gone, change) = AVAILABILITY.lock(|table| {
-        let mut table = table.borrow_mut();
-        let gone = table.expire(now);
-        let change = match offer {
-            ObservedOffer::Offer {
-                instance,
-                endpoint: Some(endpoint),
-                ttl,
-            } => table.on_offer(now, sender, &instance, endpoint, ttl),
-            ObservedOffer::Stop { instance } => table.on_stop(now, sender, &instance),
-            ObservedOffer::Offer { endpoint: None, .. } => None,
-        };
-        (gone, change)
-    });
-    AVAILABILITY_CHANGED.signal(());
-    for change in gone.into_iter().chain(change) {
-        report(change);
-    }
-}
-
-/// Reports each required service whose Offer TTL runs out, waking at the
-/// earliest deadline or when [`observe_offer`] changes the table.
-async fn expire_offers(timer: &CallbackTimer) {
-    loop {
-        let now = now_ms();
-        let (gone, next_ms) = AVAILABILITY.lock(|table| {
-            let mut table = table.borrow_mut();
-            (table.expire(now), table.next_expiry_ms(now))
-        });
-        for change in gone {
-            report(change);
+/// The distinct services of `config.required_services`. `Err` holds the
+/// [`init`] code: `-5` for a wildcard, `-7` for more than
+/// [`ServerConfig::REQUIRED_SERVICES_CAP`].
+fn required_services(
+    config: &RuntimeConfig,
+) -> Result<heapless::Vec<ServiceInstance, { ServerConfig::REQUIRED_SERVICES_CAP }>, i32> {
+    let mut services = heapless::Vec::new();
+    for &service in config.required_services {
+        if service.names_a_wildcard() {
+            return Err(-5);
         }
-        match next_ms {
-            Some(ms) => {
-                let sleep = pin!(timer.sleep(Duration::from_millis(u64::from(ms))));
-                let changed = pin!(AVAILABILITY_CHANGED.wait());
-                futures_util::future::select(sleep, changed).await;
-            }
-            None => AVAILABILITY_CHANGED.wait().await,
-        }
-    }
-}
-
-/// A table tracking the distinct services `config` requires, its
-/// subscription's first. `Err` holds the [`init`] code: `-5` for a wildcard,
-/// `-7` for more than [`ServerConfig::REQUIRED_SERVICES_CAP`] services.
-fn collect_required(config: &RuntimeConfig) -> Result<AvailabilityTable, i32> {
-    let subscribed = match config.subscription {
-        Some(s) => Some(s.service().ok_or(-5)?),
-        None => None,
-    };
-    if config
-        .required_services
-        .iter()
-        .any(|s| s.names_a_wildcard())
-        || config.offers.iter().any(|o| o.service().is_none())
-    {
-        return Err(-5);
-    }
-    let services = || {
-        subscribed
-            .into_iter()
-            .chain(config.required_services.iter().copied())
-    };
-    let mut table = AvailabilityTable::new();
-    for service in services() {
-        if !table.require(service) {
+        if !services.contains(&service) && services.push(service).is_err() {
             return Err(-7);
         }
     }
-    Ok(table)
+    Ok(services)
 }
 
 fn offer_requests(out: &mut [OfferServiceRequest; MAX_OFFERS]) -> usize {
@@ -539,11 +448,16 @@ fn sd_multicast() -> SocketAddrV4 {
 }
 
 /// Build the receive `Server` over the shared callback sockets, accepting
-/// subscribes for every offered service, finding every service `required`
-/// tracks and answering Offers of the subscription's service. With no offers
-/// the server offers nothing and its unicast socket has port 0, which no
-/// datagram reaches.
-fn build_server(find_timing: FindTiming, required: &AvailabilityTable) -> bool {
+/// subscribes for every offered service, finding the subscription's service
+/// and every `required` service, reporting them to `on_service` and
+/// answering Offers of the subscription's service. With no offers the server
+/// offers nothing and its unicast socket has port 0, which no datagram
+/// reaches.
+fn build_server(
+    find_timing: FindTiming,
+    required: &[ServiceInstance],
+    on_service: Option<(ServiceFn, usize)>,
+) -> bool {
     let o = offers();
     let plat = platform();
     let factory = Factory::new(plat);
@@ -578,17 +492,12 @@ fn build_server(find_timing: FindTiming, required: &AvailabilityTable) -> bool {
         };
         config = c;
     }
-    for service in required.services() {
+    for &service in required {
         let Ok(c) = config.try_with_required_service(service) else {
             return false;
         };
         config = c;
     }
-    let offer_observer = required
-        .services()
-        .next()
-        .is_some()
-        .then_some((observe_offer as OfferObserver, 0));
 
     // SAFETY: storages initialized just above / are 'static.
     let storage = unsafe {
@@ -603,7 +512,7 @@ fn build_server(find_timing: FindTiming, required: &AvailabilityTable) -> bool {
             publisher: (*core::ptr::addr_of!(PUBLISHER)).assume_init_ref(),
             started: &SERVER_STARTED,
             non_sd_observer: Some((dispatch as crate::server::NonSdRequestCallback, 0)),
-            offer_observer,
+            service_observer: on_service,
         }
     };
     match Server::new_with_handles(storage, config) {
@@ -709,7 +618,7 @@ async fn someip_task() {
             dispatch_ctx: 0,
         },
     );
-    futures_util::join!(run, expire_offers(&timer));
+    run.await;
 }
 
 /// Bind PCBs via the platform (registers the RX path → `on_rx`): the SD
@@ -775,7 +684,13 @@ pub fn init(config: RuntimeConfig) -> i32 {
         INIT_CLAIMED.store(false, Ordering::Release);
         return -8;
     }
-    let required = match collect_required(&config) {
+    if config.subscription.is_some_and(|s| s.service().is_none())
+        || config.offers.iter().any(|o| o.service().is_none())
+    {
+        INIT_CLAIMED.store(false, Ordering::Release);
+        return -5;
+    }
+    let required = match required_services(&config) {
         Ok(required) => required,
         Err(code) => {
             INIT_CLAIMED.store(false, Ordering::Release);
@@ -807,10 +722,6 @@ pub fn init(config: RuntimeConfig) -> i32 {
     NOW_FN.store(config.now_ms as usize, Ordering::Release);
     DISPATCH.store(config.dispatch as usize, Ordering::Release);
     DISPATCH_CTX.store(config.dispatch_ctx, Ordering::Release);
-    ON_SERVICE.store(
-        config.on_service.map_or(0, |f| f as usize),
-        Ordering::Release,
-    );
     unsafe {
         *core::ptr::addr_of_mut!(MAILBOX) = Some(config.mailbox);
         *core::ptr::addr_of_mut!(E2E) = config.e2e.unwrap_or(&NO_E2E);
@@ -831,12 +742,12 @@ pub fn init(config: RuntimeConfig) -> i32 {
 
     bind_ports(config.bind);
 
-    if !build_server(config.find_timing, &required) {
+    let on_service = config.on_service.map(|f| (f, config.dispatch_ctx));
+    if !build_server(config.find_timing, &required, on_service) {
         // Release the claim so the platform can retry after fixing config.
         INIT_CLAIMED.store(false, Ordering::Release);
         return -1;
     }
-    AVAILABILITY.lock(|t| *t.borrow_mut() = required);
 
     // SAFETY: single-init guarded by INIT_CLAIMED (claimed above).
     let spawner = unsafe {
