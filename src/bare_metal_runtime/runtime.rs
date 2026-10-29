@@ -207,7 +207,7 @@ pub struct RuntimeConfig {
     /// Bind PCBs + register the RX path; called per catalog port in `init`.
     pub bind: BindFn,
     /// The services this node offers, at most `SIMPLE_SOMEIP_MAX_OFFERS` (4 by
-    /// default); [`init`] returns `-8` past it. Empty for a node that offers
+    /// default); [`init`] returns [`InitError::TooManyOffers`] past it. Empty for a node that offers
     /// none: it then sends no `OfferService`, answers no `FindService` and
     /// sends a `SubscribeNack` for every `SubscribeEventgroup`.
     pub offers: &'static [OfferEntry],
@@ -218,7 +218,7 @@ pub struct RuntimeConfig {
     pub subscription: Option<SubEntry>,
     /// The services this node needs, at most
     /// [`ServerConfig::REQUIRED_SERVICES_CAP`] distinct ones; [`init`]
-    /// returns `-7` past it. The runtime sends `FindService` for them and
+    /// returns [`InitError::TooManyRequiredServices`] past it. The runtime sends `FindService` for them and
     /// reports their availability through [`Self::on_service`].
     pub required_services: &'static [ServiceInstance],
     /// Called for each change in the availability of the subscription's
@@ -394,19 +394,17 @@ fn dispatch(
     )
 }
 
-/// The distinct services of `config.required_services`. `Err` holds the
-/// [`init`] code: `-5` for a wildcard, `-7` for more than
-/// [`ServerConfig::REQUIRED_SERVICES_CAP`].
+/// The distinct services of `config.required_services`.
 fn required_services(
     config: &RuntimeConfig,
-) -> Result<heapless::Vec<ServiceInstance, { ServerConfig::REQUIRED_SERVICES_CAP }>, i32> {
+) -> Result<heapless::Vec<ServiceInstance, { ServerConfig::REQUIRED_SERVICES_CAP }>, InitError> {
     let mut services = heapless::Vec::new();
     for &service in config.required_services {
         if service.names_a_wildcard() {
-            return Err(-5);
+            return Err(InitError::Wildcard);
         }
         if !services.contains(&service) && services.push(service).is_err() {
-            return Err(-7);
+            return Err(InitError::TooManyRequiredServices);
         }
     }
     Ok(services)
@@ -646,30 +644,57 @@ fn bind_ports(bind: BindFn) {
     }
 }
 
+/// Why [`init`] failed. Each variant's value is the negative code a C API
+/// over [`init`] returns for it; [`InitError::code`] gives it.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InitError {
+    /// The receive server could not be built.
+    ServerBuild = -1,
+    /// The runtime task could not be spawned.
+    Spawn = -2,
+    /// The runtime is already initialized: a repeat or re-entrant [`init`].
+    /// The passed config and its buffers are not adopted.
+    AlreadyInitialized = -4,
+    /// [`RuntimeConfig::subscription`], or an entry of
+    /// [`RuntimeConfig::offers`] or [`RuntimeConfig::required_services`],
+    /// names a wildcard service ID, instance ID or major version.
+    Wildcard = -5,
+    /// [`RuntimeConfig::sd_mcast`] is not a multicast group.
+    SdGroupNotMulticast = -6,
+    /// [`RuntimeConfig::required_services`] names more than
+    /// [`ServerConfig::REQUIRED_SERVICES_CAP`] distinct services.
+    TooManyRequiredServices = -7,
+    /// [`RuntimeConfig::offers`] holds more than `SIMPLE_SOMEIP_MAX_OFFERS`
+    /// (4 by default) entries.
+    TooManyOffers = -8,
+}
+
+impl InitError {
+    /// The negative code for this error.
+    #[must_use]
+    pub const fn code(self) -> i32 {
+        self as i32
+    }
+}
+
 // ── Public runtime API (the platform's C-FFI forwards to these) ──────────
 
 /// Stand up the runtime from `config`, build the server, and
 /// spawn the composed task.
 ///
-/// Returns `0` on success, or a negative error code: `-1` server build
-/// failed, `-2` task spawn failed, `-4` the runtime is already initialized
-/// (a repeat or re-entrant `init` — the passed `config` and its buffers are
-/// NOT adopted), `-5` `config.subscription` or an entry of
-/// `config.offers` or `config.required_services` names a wildcard service
-/// ID, instance ID or major version, `-6` `config.sd_mcast` is not a multicast group, `-7` the
-/// distinct services of `config.subscription` and
-/// `config.required_services` number more than
-/// [`ServerConfig::REQUIRED_SERVICES_CAP`], `-8` `config.offers` holds more
-/// than `SIMPLE_SOMEIP_MAX_OFFERS` (4 by default) entries. The
-/// `-1`/`-2`/`-5`/`-6`/`-7`/`-8` paths release the init claim so a corrected
-/// retry can proceed; `-4` does not (a runtime is already live).
-#[allow(clippy::missing_panics_doc)]
+/// # Errors
+///
+/// Returns the [`InitError`] that stopped it. Every error but
+/// [`InitError::AlreadyInitialized`] leaves the runtime uninitialized, so a
+/// corrected retry can proceed.
 // By-value is required, not incidental: `config.buffers` is a `&'static mut`
 // reborrowed into `BUFS` (`ptr::from_mut`), which a shared `&RuntimeConfig`
 // could not yield. This is also the FFI ownership-transfer boundary — the
 // platform hands the runtime its config and buffer memory.
 #[allow(clippy::needless_pass_by_value)]
-pub fn init(config: RuntimeConfig) -> i32 {
+pub fn init(config: RuntimeConfig) -> Result<(), InitError> {
     // Atomically claim init: only the first caller proceeds. Closes the
     // window the old `load`-then-store-at-end guard left open (a re-entrant
     // `init` via a `bind`/`send` callback, or a repeat call) during which a
@@ -678,28 +703,29 @@ pub fn init(config: RuntimeConfig) -> i32 {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return -4;
+        return Err(InitError::AlreadyInitialized);
     }
-    if config.offers.len() > MAX_OFFERS {
+    let result = init_claimed(config);
+    if result.is_err() {
         INIT_CLAIMED.store(false, Ordering::Release);
-        return -8;
+    }
+    result
+}
+
+/// [`init`] once it holds the init claim.
+#[allow(clippy::needless_pass_by_value)]
+fn init_claimed(config: RuntimeConfig) -> Result<(), InitError> {
+    if config.offers.len() > MAX_OFFERS {
+        return Err(InitError::TooManyOffers);
     }
     if config.subscription.is_some_and(|s| s.service().is_none())
         || config.offers.iter().any(|o| o.service().is_none())
     {
-        INIT_CLAIMED.store(false, Ordering::Release);
-        return -5;
+        return Err(InitError::Wildcard);
     }
-    let required = match required_services(&config) {
-        Ok(required) => required,
-        Err(code) => {
-            INIT_CLAIMED.store(false, Ordering::Release);
-            return code;
-        }
-    };
+    let required = required_services(&config)?;
     if config.sd_mcast != 0 && !Ipv4Addr::from(config.sd_mcast.to_be_bytes()).is_multicast() {
-        INIT_CLAIMED.store(false, Ordering::Release);
-        return -6;
+        return Err(InitError::SdGroupNotMulticast);
     }
     IFACE.store(config.interface, Ordering::Release);
     SD_PORT.store(
@@ -744,9 +770,7 @@ pub fn init(config: RuntimeConfig) -> i32 {
 
     let on_service = config.on_service.map(|f| (f, config.dispatch_ctx));
     if !build_server(config.find_timing, &required, on_service) {
-        // Release the claim so the platform can retry after fixing config.
-        INIT_CLAIMED.store(false, Ordering::Release);
-        return -1;
+        return Err(InitError::ServerBuild);
     }
 
     // SAFETY: single-init guarded by INIT_CLAIMED (claimed above).
@@ -756,14 +780,13 @@ pub fn init(config: RuntimeConfig) -> i32 {
         slot.assume_init_ref().spawner()
     };
     if spawner.spawn(someip_task()).is_err() {
-        INIT_CLAIMED.store(false, Ordering::Release);
-        return -2;
+        return Err(InitError::Spawn);
     }
     // Publish the poll gate LAST: `poll()` must never touch `EXECUTOR`
     // before the slot above is written and the task is spawned.
     EXECUTOR_INIT.store(true, Ordering::Release);
     RUN_READY.store(true, Ordering::Release);
-    0
+    Ok(())
 }
 
 /// Tick the executor once. Call every platform main-loop iteration.
