@@ -18,8 +18,9 @@ pub struct FindTiming {
     pub initial_delay_min: Duration,
     /// Greatest delay before the first `FindService`. The server picks the
     /// delay in whole milliseconds from `initial_delay_min..=initial_delay_max`,
-    /// seeded by its interface address and port and the endpoints it
-    /// subscribes from, and uses `initial_delay_min` when this is below it.
+    /// seeded by its interface address and port, the endpoints it subscribes
+    /// from and the services it requires, and uses `initial_delay_min` when
+    /// this is below it.
     pub initial_delay_max: Duration,
     /// Delay before the first repetition; each later one doubles it.
     pub repetitions_base_delay: Duration,
@@ -53,9 +54,9 @@ impl FindTiming {
     }
 }
 
-/// A nonzero seed from `config`'s interface address and port and the
-/// endpoints of its consumed eventgroups, which differ between nodes on one
-/// segment.
+/// A nonzero seed from `config`'s interface address and port, the endpoints
+/// of its consumed eventgroups and its required services, which differ
+/// between nodes on one segment.
 pub(super) fn seed(config: &super::ServerConfig) -> u32 {
     let endpoints = core::iter::once((config.interface, config.local_port())).chain(
         config
@@ -63,9 +64,15 @@ pub(super) fn seed(config: &super::ServerConfig) -> u32 {
             .iter()
             .map(|request| (request.local_ip, request.local_rx_port)),
     );
-    let mixed = endpoints.fold(0u32, |hash, (ip, port)| {
-        (hash.rotate_left(5) ^ u32::from(ip) ^ u32::from(port).rotate_left(16))
-            .wrapping_mul(0x9E37_79B1)
+    let words = endpoints
+        .map(|(ip, port)| u32::from(ip) ^ u32::from(port).rotate_left(16))
+        .chain(config.required_services.iter().map(|service| {
+            u32::from(service.service_id()) << 16
+                ^ u32::from(service.instance_id())
+                ^ u32::from(service.major_version()).rotate_left(8)
+        }));
+    let mixed = words.fold(0u32, |hash, word| {
+        (hash.rotate_left(5) ^ word).wrapping_mul(0x9E37_79B1)
     });
     match mixed {
         0 => 0x9E37_79B9,
@@ -143,6 +150,16 @@ mod tests {
             seed(&consumer(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST)),
             seed(&consumer(Ipv4Addr::new(127, 0, 0, 2), Ipv4Addr::LOCALHOST))
         );
+    }
+
+    #[test]
+    fn the_seed_differs_by_required_service_when_the_interface_is_unspecified() {
+        let requiring = |service_id| {
+            super::super::ServerConfig::consumer_only()
+                .with_required_service(ServiceInstance::new(service_id, 1, 1).unwrap())
+        };
+
+        assert_ne!(seed(&requiring(0x6001)), seed(&requiring(0x6002)));
     }
 
     #[test]
