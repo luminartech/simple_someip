@@ -17,7 +17,6 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use simple_someip::ServiceInstance;
 use simple_someip::bare_metal_runtime as rt;
 use simple_someip::server::FindTiming;
 
@@ -103,7 +102,11 @@ impl SomeipUnderTest for BareMetalRt {
             .consume
             .iter()
             .flat_map(|_| [SVC, OTHER_SVC])
-            .map(|service_id| ServiceInstance::new(service_id, INST, MAJOR).unwrap())
+            .map(|service_id| rt::RequiredEntry {
+                service_id,
+                instance_id: INST,
+                major_version: MAJOR,
+            })
             .collect();
         let subscription = setup
             .consume

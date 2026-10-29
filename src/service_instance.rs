@@ -6,7 +6,6 @@
 /// The wildcards are service ID `0xFFFF`, instance ID `0xFFFF` and major
 /// version `0xFF`. A `FindService` entry may use them; an offer, a
 /// subscription or a required service names one instance.
-#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ServiceInstance {
     service_id: u16,
@@ -35,15 +34,14 @@ impl ServiceInstance {
     /// ```
     #[must_use]
     pub const fn new(service_id: u16, instance_id: u16, major_version: u8) -> Option<Self> {
-        let instance = Self {
-            service_id,
-            instance_id,
-            major_version,
-        };
-        if instance.names_a_wildcard() {
+        if service_id == 0xFFFF || instance_id == 0xFFFF || major_version == 0xFF {
             None
         } else {
-            Some(instance)
+            Some(Self {
+                service_id,
+                instance_id,
+                major_version,
+            })
         }
     }
 
@@ -63,12 +61,6 @@ impl ServiceInstance {
     #[must_use]
     pub const fn major_version(self) -> u8 {
         self.major_version
-    }
-
-    /// Whether any field is a wildcard. Only a value written through the C
-    /// ABI, which bypasses [`Self::new`], can name one.
-    pub(crate) const fn names_a_wildcard(self) -> bool {
-        self.service_id == 0xFFFF || self.instance_id == 0xFFFF || self.major_version == 0xFF
     }
 }
 
