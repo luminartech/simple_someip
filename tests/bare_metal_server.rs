@@ -31,6 +31,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
+use simple_someip::ServiceInstance;
 use simple_someip::protocol::MessageId;
 use simple_someip::server::NonSdRequestCallback;
 use simple_someip::server::ServerConfig;
@@ -1149,7 +1150,7 @@ async fn drive_co_offer_subscribe(local_port: u16, subscribe_major: u8) -> Vec<S
     let config = ServerConfig::new(0x1234, 1)
         .with_interface(Ipv4Addr::LOCALHOST)
         .with_local_port(local_port)
-        .with_accepted_offer(0x5678, 1, 2, 0x0001);
+        .with_accepted_offer(ServiceInstance::new(0x5678, 1, 2).unwrap(), 0x0001);
 
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
@@ -1169,9 +1170,7 @@ async fn drive_co_offer_subscribe(local_port: u16, subscribe_major: u8) -> Vec<S
     let handle = tokio::spawn(run);
 
     let req = SubscribeEventgroupRequest {
-        service_id: 0x5678,
-        instance_id: 1,
-        major_version: subscribe_major,
+        service: ServiceInstance::new(0x5678, 1, subscribe_major).unwrap(),
         event_group_id: 0x0001,
         ttl: 0x00FF_FFFF,
         local_ip: Ipv4Addr::new(192, 0, 2, 200),

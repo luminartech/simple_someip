@@ -16,9 +16,9 @@ use core::net::SocketAddrV4;
 
 use futures_util::{FutureExt, future::Either, pin_mut, select_biased};
 
-use crate::Timer;
 use crate::protocol::sd;
 use crate::transport::{E2EHandle, SharedHandle, TransportSocket};
+use crate::{ServiceInstance, Timer};
 
 use super::sd_state::SdStateManager;
 use super::subscription_manager::{SubscribeError, SubscriptionHandle};
@@ -209,12 +209,9 @@ where
         };
         if let Some((observer, ctx)) = offer_observer
             && entry_type == sd::EntryType::OfferService
+            && let Some(offer) = observed_offer(entry_view, entry_options.clone())
         {
-            observer(
-                ctx,
-                sender,
-                observed_offer(entry_view, entry_options.clone()),
-            );
+            observer(ctx, sender, offer);
         }
         match entry_type {
             sd::EntryType::Subscribe => {
@@ -234,12 +231,9 @@ where
                 // single-service guards below are skipped for it. Empty
                 // `accepted_offers` ⇒ `co_offered` is always false ⇒ exact
                 // single-service behaviour.
-                let co_offered = config.accepts_offer(
-                    entry_view.service_id(),
-                    entry_view.instance_id(),
-                    entry_view.major_version(),
-                    entry_view.event_group_id(),
-                );
+                let co_offered = entry_instance(entry_view).is_some_and(|instance| {
+                    config.accepts_offer(instance, entry_view.event_group_id())
+                });
 
                 if !co_offered && !config.offers_service() {
                     crate::log::warn!(
@@ -439,16 +433,13 @@ where
                 }
             }
             sd::EntryType::OfferService if !entry_view.is_stop_offer() => {
+                let instance = entry_instance(entry_view);
                 for (service, offered) in config.required_services.iter().zip(&mut required_offered)
                 {
-                    *offered |= service.service_id == entry_view.service_id()
-                        && service.instance_id == entry_view.instance_id()
-                        && service.major_version == entry_view.major_version();
+                    *offered |= instance == Some(*service);
                 }
                 for (request, answered) in config.consumed_eventgroups.iter().zip(&mut answered) {
-                    *answered |= request.service_id == entry_view.service_id()
-                        && request.instance_id == entry_view.instance_id()
-                        && request.major_version == entry_view.major_version();
+                    *answered |= instance == Some(request.service);
                 }
             }
             _ => {
@@ -515,19 +506,27 @@ impl Offered {
     }
 }
 
+/// The service instance an SD entry names; `None` when it names a wildcard.
+fn entry_instance(entry: sd::EntryView<'_>) -> Option<ServiceInstance> {
+    ServiceInstance::new(
+        entry.service_id(),
+        entry.instance_id(),
+        entry.major_version(),
+    )
+}
+
 /// The [`ObservedOffer`](super::ObservedOffer) an `OfferService` entry
-/// reports; `options` are the options the entry references.
+/// reports; `options` are the options the entry references. `None` when the
+/// entry names a wildcard.
 fn observed_offer<'a>(
     entry: sd::EntryView<'a>,
     options: impl Iterator<Item = sd::OptionView<'a>>,
-) -> super::ObservedOffer {
+) -> Option<super::ObservedOffer> {
     let instance = crate::traits::OfferedInstance {
-        service_id: entry.service_id(),
-        instance_id: entry.instance_id(),
-        major_version: entry.major_version(),
+        service: entry_instance(entry)?,
         minor_version: entry.minor_version(),
     };
-    if entry.is_stop_offer() {
+    Some(if entry.is_stop_offer() {
         super::ObservedOffer::Stop { instance }
     } else {
         super::ObservedOffer::Offer {
@@ -541,7 +540,7 @@ fn observed_offer<'a>(
             ),
             ttl: entry.ttl(),
         }
-    }
+    })
 }
 
 /// Periodic SD `OfferService` announcement loop. Runs forever; intended
@@ -856,9 +855,7 @@ fn encode_finds(
         .zip(&offered.subscribed)
         .map(|(r, answered)| {
             let target = FindTarget {
-                service_id: r.service_id,
-                instance_id: r.instance_id,
-                major_version: r.major_version,
+                service: r.service,
                 ttl: r.ttl,
             };
             (answered, target)
@@ -869,15 +866,12 @@ fn encode_finds(
         .zip(&offered.required)
         .map(|(r, answered)| {
             let target = FindTarget {
-                service_id: r.service_id,
-                instance_id: r.instance_id,
-                major_version: r.major_version,
+                service: *r,
                 ttl: REQUIRED_FIND_TTL,
             };
             (answered, target)
         });
     let candidates = consumed.chain(required);
-    let instance = |t: &FindTarget| (t.service_id, t.instance_id, t.major_version);
     let wanted = candidates
         .clone()
         .enumerate()
@@ -885,7 +879,7 @@ fn encode_finds(
             let first = candidates
                 .clone()
                 .take(k)
-                .all(|(_, earlier)| instance(&earlier) != instance(&target));
+                .all(|(_, earlier)| earlier.service != target.service);
             (first && !answered.load(core::sync::atomic::Ordering::Relaxed)).then_some(target)
         });
     if wanted.clone().next().is_none() {
@@ -1370,7 +1364,8 @@ mod tests {
     #[cfg(feature = "server-tokio")]
     mod consumed_eventgroups {
         use super::*;
-        use crate::server::{FindTiming, RequiredService};
+        use crate::ServiceInstance;
+        use crate::server::FindTiming;
 
         /// Records every datagram sent through it.
         #[derive(Default)]
@@ -1413,9 +1408,7 @@ mod tests {
 
         fn consumed() -> crate::sd_codec::SubscribeEventgroupRequest {
             crate::sd_codec::SubscribeEventgroupRequest {
-                service_id: 0x5678,
-                instance_id: 1,
-                major_version: 1,
+                service: ServiceInstance::new(0x5678, 1, 1).unwrap(),
                 event_group_id: 0x0001,
                 ttl: 5,
                 local_ip: Ipv4Addr::LOCALHOST,
@@ -1691,7 +1684,7 @@ mod tests {
         )]
         async fn only_the_offered_services_are_subscribed() {
             let other = crate::sd_codec::SubscribeEventgroupRequest {
-                service_id: 0x5679,
+                service: ServiceInstance::new(0x5679, 1, 1).unwrap(),
                 event_group_id: 0x0003,
                 local_rx_port: 40102,
                 ..consumed()
@@ -1795,12 +1788,8 @@ mod tests {
             answered
         }
 
-        fn required() -> RequiredService {
-            RequiredService {
-                service_id: 0x6001,
-                instance_id: 2,
-                major_version: 3,
-            }
+        fn required() -> ServiceInstance {
+            ServiceInstance::new(0x6001, 2, 3).unwrap()
         }
 
         /// The (service, instance) of each Find entry in each datagram sent.
@@ -1967,7 +1956,7 @@ mod tests {
                 ..consumed()
             };
             let other = crate::sd_codec::SubscribeEventgroupRequest {
-                service_id: 0x5679,
+                service: ServiceInstance::new(0x5679, 1, 1).unwrap(),
                 ..consumed()
             };
             let config = make_config()
@@ -2028,11 +2017,7 @@ mod tests {
         async fn a_required_service_also_consumed_is_found_once() {
             let config = make_config()
                 .with_consumed_eventgroup(consumed())
-                .with_required_service(RequiredService {
-                    service_id: consumed().service_id,
-                    instance_id: consumed().instance_id,
-                    major_version: consumed().major_version,
-                })
+                .with_required_service(consumed().service)
                 .with_find_timing(once());
             let (socket, timer, offered) = (
                 RecordingSocket::default(),
@@ -2476,9 +2461,7 @@ mod tests {
 
         fn instance(service_id: u16) -> OfferedInstance {
             OfferedInstance {
-                service_id,
-                instance_id: 3,
-                major_version: 2,
+                service: ServiceInstance::new(service_id, 3, 2).unwrap(),
                 minor_version: 7,
             }
         }
@@ -2838,9 +2821,7 @@ mod tests {
         #[test]
         fn consumer_only_still_checks_the_subscribe_ttl() {
             let request = crate::sd_codec::SubscribeEventgroupRequest {
-                service_id: 0x5678,
-                instance_id: 1,
-                major_version: 1,
+                service: ServiceInstance::new(0x5678, 1, 1).unwrap(),
                 event_group_id: 0x0001,
                 ttl: 0,
                 local_ip: Ipv4Addr::LOCALHOST,

@@ -250,8 +250,8 @@ async fn report_updates(
                         ServiceOffer::Offer { instance, options } => (instance, options),
                         ServiceOffer::Stop { instance } => {
                             out.push(Observation::ServiceGone {
-                                service: instance.service_id,
-                                instance: instance.instance_id,
+                                service: instance.service.service_id(),
+                                instance: instance.service.instance_id(),
                             });
                             continue;
                         }
@@ -271,20 +271,23 @@ async fn report_updates(
                     let Some(endpoint) = udp else {
                         eprintln!(
                             "std runtime: offer for 0x{:04X} without a UDP IPv4 endpoint: {:?}",
-                            instance.service_id,
+                            instance.service.service_id(),
                             options.collect::<Vec<_>>()
                         );
                         continue;
                     };
-                    if !found && instance.service_id == SVC && instance.instance_id == INST {
+                    if !found
+                        && instance.service.service_id() == SVC
+                        && instance.service.instance_id() == INST
+                    {
                         found = true;
                         let key = ServiceEndpointKey::udp(SVC, SocketAddr::V4(endpoint));
                         *service.lock().unwrap() = Some(key);
                         out.extend(use_service(&client, key, subscribe).await);
                     }
                     out.push(Observation::ServiceAvailable {
-                        service: instance.service_id,
-                        instance: instance.instance_id,
+                        service: instance.service.service_id(),
+                        instance: instance.service.instance_id(),
                         endpoint,
                     });
                 }

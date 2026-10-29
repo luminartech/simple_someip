@@ -15,17 +15,16 @@ use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 
+use crate::ServiceInstance;
 use crate::bare_metal_tasks::{SomeipRun, publish_notification, run_someip};
 use crate::protocol::sd;
 use crate::sd_availability::{Availability, ServiceChange};
 use crate::sd_codec::{
     OfferServiceRequest, SubscribeEventgroupRequest, build_multi_stop_offer_service_datagram,
-    names_a_wildcard,
 };
 use crate::server::{
-    EventPublisher, FindTiming, ObservedOffer, OfferObserver, RequiredService, SdStateManager,
-    Server, ServerConfig, ServerStorage, StaticSubscriptionHandle, StaticSubscriptionStorage,
-    SubscriptionManager,
+    EventPublisher, FindTiming, ObservedOffer, OfferObserver, SdStateManager, Server, ServerConfig,
+    ServerStorage, StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager,
 };
 use crate::transport::{E2EHandle, NoE2E, Timer};
 
@@ -118,6 +117,13 @@ pub struct OfferEntry {
     pub ttl_seconds: u32,
 }
 
+impl OfferEntry {
+    /// The offered service instance; `None` when the entry names a wildcard.
+    fn service(&self) -> Option<ServiceInstance> {
+        ServiceInstance::new(self.service_id, self.instance_id, self.major_version)
+    }
+}
+
 /// One subscription (events this node consumes). `#[repr(C)]`.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -128,6 +134,14 @@ pub struct SubEntry {
     pub method_id: u16,
     pub local_rx_port: u16,
     pub major_version: u8,
+}
+
+impl SubEntry {
+    /// The subscribed service instance; `None` when the entry names a
+    /// wildcard.
+    fn service(&self) -> Option<ServiceInstance> {
+        ServiceInstance::new(self.service_id, self.instance_id, self.major_version)
+    }
 }
 
 /// Buffer memory the platform owns (so it controls link placement) and
@@ -211,7 +225,7 @@ pub struct RuntimeConfig {
     /// subscription's service takes one of the
     /// [`ServerConfig::REQUIRED_SERVICES_CAP`] slots, and [`init`] returns
     /// `-7` past it.
-    pub required_services: &'static [RequiredService],
+    pub required_services: &'static [ServiceInstance],
     /// Called for each change in the availability of a required service;
     /// `None` reports nothing.
     pub on_service: Option<ServiceFn>,
@@ -462,19 +476,23 @@ async fn expire_offers(timer: &CallbackTimer) {
 /// subscription's first. `Err` holds the [`init`] code: `-5` for a wildcard,
 /// `-7` for more than [`ServerConfig::REQUIRED_SERVICES_CAP`] services.
 fn collect_required(config: &RuntimeConfig) -> Result<AvailabilityTable, i32> {
-    let subscribed = config.subscription.map(|s| RequiredService {
-        service_id: s.service_id,
-        instance_id: s.instance_id,
-        major_version: s.major_version,
-    });
+    let subscribed = match config.subscription {
+        Some(s) => Some(s.service().ok_or(-5)?),
+        None => None,
+    };
+    if config
+        .required_services
+        .iter()
+        .any(|s| s.names_a_wildcard())
+        || config.offers.iter().any(|o| o.service().is_none())
+    {
+        return Err(-5);
+    }
     let services = || {
         subscribed
             .into_iter()
             .chain(config.required_services.iter().copied())
     };
-    if services().any(|s| names_a_wildcard(s.service_id, s.instance_id, s.major_version)) {
-        return Err(-5);
-    }
     let mut table = AvailabilityTable::new();
     for service in services() {
         if !table.require(service) {
@@ -565,12 +583,10 @@ fn build_server(find_timing: FindTiming, required: &AvailabilityTable) -> bool {
     .with_find_timing(find_timing)
     .with_sd_multicast(sd_multicast());
     for entry in o {
-        config = config.with_accepted_offer(
-            entry.service_id,
-            entry.instance_id,
-            entry.major_version,
-            entry.event_group_id,
-        );
+        let Some(service) = entry.service() else {
+            return false;
+        };
+        config = config.with_accepted_offer(service, entry.event_group_id);
     }
     if let Some(request) = subscribe_request() {
         let Ok(c) = config.try_with_consumed_eventgroup(request) else {
@@ -617,10 +633,9 @@ fn build_server(find_timing: FindTiming, required: &AvailabilityTable) -> bool {
 
 /// The Subscribe the server sends for the catalog's subscription.
 fn subscribe_request() -> Option<SubscribeEventgroupRequest> {
-    subscription().map(|s| SubscribeEventgroupRequest {
-        service_id: s.service_id,
-        instance_id: s.instance_id,
-        major_version: s.major_version,
+    let s = subscription()?;
+    Some(SubscribeEventgroupRequest {
+        service: s.service()?,
         event_group_id: s.event_group_id,
         ttl: sd::MAX_TTL,
         local_ip: Ipv4Addr::from(IFACE.load(Ordering::Acquire).to_be_bytes()),
@@ -725,8 +740,8 @@ fn bind_ports(bind: BindFn) {
 /// failed, `-2` task spawn failed, `-4` the runtime is already initialized
 /// (a repeat or re-entrant `init` — the passed `config` and its buffers are
 /// NOT adopted), `-5` `config.subscription` or an entry of
-/// `config.required_services` names a wildcard service ID, instance ID or
-/// major version, `-6` `config.sd_mcast` is not a multicast group, `-7` the
+/// `config.offers` or `config.required_services` names a wildcard service
+/// ID, instance ID or major version, `-6` `config.sd_mcast` is not a multicast group, `-7` the
 /// distinct services of `config.subscription` and
 /// `config.required_services` number more than
 /// [`ServerConfig::REQUIRED_SERVICES_CAP`], `-8` `config.offers` holds more

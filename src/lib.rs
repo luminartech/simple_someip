@@ -245,6 +245,7 @@ mod sd_availability;
 /// and the spawnable futures in [`bare_metal_tasks`].
 #[cfg(any(feature = "bare_metal", feature = "server"))]
 pub mod sd_codec;
+mod service_instance;
 /// Static-pool no-alloc primitives for [`transport::ChannelFactory`].
 /// Backs the consumer-declared static `OneshotPool` / `MpscPool`
 /// instances that the [`define_static_channels!`] macro
@@ -265,6 +266,7 @@ pub use heapless_payload::{HeaplessPayload, HeaplessSdHeader};
 pub use net_endpoint::{NetEndpoint, TransportProtocol};
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
+pub use service_instance::ServiceInstance;
 pub use traits::{EncodeExt, OfferedInstance, PayloadWireFormat, ServiceOffer};
 
 #[cfg(feature = "client")]

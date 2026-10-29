@@ -28,13 +28,13 @@ pub use sd_state::SdStateManager;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::Timer;
 use crate::sd_codec::SubscribeEventgroupRequest;
 #[cfg(feature = "_alloc")]
 use crate::transport::SocketOptions;
 #[cfg(feature = "_alloc")]
 use crate::transport::WrappableSharedHandle;
 use crate::transport::{E2EHandle, SharedHandle, TransportFactory, TransportSocket};
+use crate::{ServiceInstance, Timer};
 #[cfg(feature = "_alloc")]
 use alloc::sync::Arc;
 use core::net::{Ipv4Addr, SocketAddrV4};
@@ -178,7 +178,7 @@ pub struct ServerConfig {
     /// `FindService` TTL of 3 seconds. Populate via
     /// [`Self::with_required_service`]. A passive server runs no receive loop,
     /// so it neither finds nor answers Offers.
-    pub required_services: heapless::Vec<RequiredService, { ServerConfig::REQUIRED_SERVICES_CAP }>,
+    pub required_services: heapless::Vec<ServiceInstance, { ServerConfig::REQUIRED_SERVICES_CAP }>,
     /// When `FindService` is sent for [`Self::consumed_eventgroups`] and
     /// [`Self::required_services`]; see [`FindTiming`]. Defaults to
     /// [`FindTiming::DEFAULT`].
@@ -227,29 +227,11 @@ impl<'a> ServerSd<'a> {
 /// [`ServerConfig::accepted_offers`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AcceptedOffer {
-    /// Offered service ID.
-    pub service_id: u16,
-    /// Offered instance ID.
-    pub instance_id: u16,
-    /// Offered major version. A `SubscribeEventgroup` whose major version
-    /// does not match is rejected, mirroring the primary service's guard.
-    pub major_version: u8,
+    /// The offered service instance. A `SubscribeEventgroup` whose major
+    /// version does not match is rejected, as for the primary service.
+    pub service: ServiceInstance,
     /// Offered event-group ID.
     pub event_group_id: u16,
-}
-
-/// A service instance a node needs, found with `FindService` until it is
-/// offered. A required service that is not also consumed is found with a
-/// `FindService` TTL of 3 seconds. See [`ServerConfig::required_services`].
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RequiredService {
-    /// Required service ID.
-    pub service_id: u16,
-    /// Required instance ID.
-    pub instance_id: u16,
-    /// Required major version.
-    pub major_version: u8,
 }
 
 impl ServerConfig {
@@ -423,18 +405,10 @@ impl ServerConfig {
     /// registered. Use [`Self::try_with_accepted_offer`] for the fallible
     /// variant.
     #[must_use]
-    pub fn with_accepted_offer(
-        mut self,
-        service_id: u16,
-        instance_id: u16,
-        major_version: u8,
-        event_group_id: u16,
-    ) -> Self {
+    pub fn with_accepted_offer(mut self, service: ServiceInstance, event_group_id: u16) -> Self {
         self.accepted_offers
             .push(AcceptedOffer {
-                service_id,
-                instance_id,
-                major_version,
+                service,
                 event_group_id,
             })
             .expect("accepted_offers capacity exceeded");
@@ -454,17 +428,13 @@ impl ServerConfig {
     #[must_use = "the returned `Result` carries the (possibly-modified) config — drop is silent"]
     pub fn try_with_accepted_offer(
         mut self,
-        service_id: u16,
-        instance_id: u16,
-        major_version: u8,
+        service: ServiceInstance,
         event_group_id: u16,
     ) -> Result<Self, Self> {
         if self
             .accepted_offers
             .push(AcceptedOffer {
-                service_id,
-                instance_id,
-                major_version,
+                service,
                 event_group_id,
             })
             .is_ok()
@@ -534,7 +504,7 @@ impl ServerConfig {
     /// registered. Use [`Self::try_with_required_service`] for the fallible
     /// variant.
     #[must_use]
-    pub fn with_required_service(mut self, service: RequiredService) -> Self {
+    pub fn with_required_service(mut self, service: ServiceInstance) -> Self {
         self.required_services
             .push(service)
             .expect("required_services capacity exceeded");
@@ -549,7 +519,7 @@ impl ServerConfig {
     /// [`Self::REQUIRED_SERVICES_CAP`].
     #[allow(clippy::result_large_err)]
     #[must_use = "the returned `Result` carries the (possibly-modified) config: drop is silent"]
-    pub fn try_with_required_service(mut self, service: RequiredService) -> Result<Self, Self> {
+    pub fn try_with_required_service(mut self, service: ServiceInstance) -> Result<Self, Self> {
         if self.required_services.push(service).is_ok() {
             Ok(self)
         } else {
@@ -557,21 +527,13 @@ impl ServerConfig {
         }
     }
 
-    /// Returns `true` if `(service_id, instance_id, major_version,
-    /// event_group_id)` is registered in [`Self::accepted_offers`].
+    /// Returns `true` if `(service, event_group_id)` is registered in
+    /// [`Self::accepted_offers`].
     #[must_use]
-    pub fn accepts_offer(
-        &self,
-        service_id: u16,
-        instance_id: u16,
-        major_version: u8,
-        event_group_id: u16,
-    ) -> bool {
-        self.accepted_offers.iter().any(|o| {
-            o.service_id == service_id
-                && o.instance_id == instance_id
-                && o.major_version == major_version
-                && o.event_group_id == event_group_id
+    pub fn accepts_offer(&self, service: ServiceInstance, event_group_id: u16) -> bool {
+        self.accepted_offers.contains(&AcceptedOffer {
+            service,
+            event_group_id,
         })
     }
 
@@ -628,24 +590,6 @@ impl ServerConfig {
 
     fn validate(&self) -> Result<(), Error> {
         self.check_ttl()?;
-        if let Some(request) = self.consumed_eventgroups.iter().find(|request| {
-            crate::sd_codec::names_a_wildcard(
-                request.service_id,
-                request.instance_id,
-                request.major_version,
-            )
-        }) {
-            return Err(Error::WildcardConsumedEventgroup(*request));
-        }
-        if let Some(service) = self.required_services.iter().find(|service| {
-            crate::sd_codec::names_a_wildcard(
-                service.service_id,
-                service.instance_id,
-                service.major_version,
-            )
-        }) {
-            return Err(Error::WildcardRequiredService(*service));
-        }
         if !self.sd_multicast.ip().is_multicast() || self.sd_multicast.port() == 0 {
             return Err(Error::InvalidSdMulticast(self.sd_multicast));
         }
@@ -1262,12 +1206,6 @@ impl
     /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
-    /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
-    /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
-    /// instance ID or major version.
-    /// Returns [`Error::WildcardRequiredService`] if an entry in
-    /// [`ServerConfig::required_services`] names a wildcard service ID,
-    /// instance ID or major version.
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
     /// Returns an error if binding the unicast or SD socket fails, or if joining the
@@ -1311,12 +1249,6 @@ impl
     /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
-    /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
-    /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
-    /// instance ID or major version.
-    /// Returns [`Error::WildcardRequiredService`] if an entry in
-    /// [`ServerConfig::required_services`] names a wildcard service ID,
-    /// instance ID or major version.
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
     /// Returns an error if binding the unicast or SD socket fails, or if joining the
@@ -1367,12 +1299,6 @@ impl
     /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
-    /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
-    /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
-    /// instance ID or major version.
-    /// Returns [`Error::WildcardRequiredService`] if an entry in
-    /// [`ServerConfig::required_services`] names a wildcard service ID,
-    /// instance ID or major version.
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
     /// Returns an error if binding either socket fails.
@@ -1430,12 +1356,6 @@ where
     /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
-    /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
-    /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
-    /// instance ID or major version.
-    /// Returns [`Error::WildcardRequiredService`] if an entry in
-    /// [`ServerConfig::required_services`] names a wildcard service ID,
-    /// instance ID or major version.
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
     /// Returns an error if binding the unicast or SD socket via
@@ -1539,12 +1459,6 @@ where
     /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
-    /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
-    /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
-    /// instance ID or major version.
-    /// Returns [`Error::WildcardRequiredService`] if an entry in
-    /// [`ServerConfig::required_services`] names a wildcard service ID,
-    /// instance ID or major version.
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
     /// Returns an error if binding either socket fails.
@@ -1664,12 +1578,6 @@ where
     /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
-    /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
-    /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
-    /// instance ID or major version.
-    /// Returns [`Error::WildcardRequiredService`] if an entry in
-    /// [`ServerConfig::required_services`] names a wildcard service ID,
-    /// instance ID or major version.
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
     /// Returns an error if querying `unicast_socket.local_addr()`
@@ -1740,12 +1648,6 @@ where
     /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
-    /// Returns [`Error::WildcardConsumedEventgroup`] if an entry in
-    /// [`ServerConfig::consumed_eventgroups`] names a wildcard service ID,
-    /// instance ID or major version.
-    /// Returns [`Error::WildcardRequiredService`] if an entry in
-    /// [`ServerConfig::required_services`] names a wildcard service ID,
-    /// instance ID or major version.
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
     /// Returns an error if querying `unicast_socket.local_addr()`
@@ -2276,9 +2178,7 @@ mod tests {
         for ttl in [0, sd::MAX_TTL + 1] {
             let config =
                 ServerConfig::new(0x5B, 1).with_consumed_eventgroup(SubscribeEventgroupRequest {
-                    service_id: 0x5C,
-                    instance_id: 1,
-                    major_version: 1,
+                    service: ServiceInstance::new(0x5C, 1, 1).unwrap(),
                     event_group_id: 1,
                     ttl,
                     local_ip: Ipv4Addr::LOCALHOST,
@@ -2312,84 +2212,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_a_consumed_eventgroup_with_a_wildcard_id() {
-        let concrete = SubscribeEventgroupRequest {
-            service_id: 0x5C,
-            instance_id: 1,
-            major_version: 1,
-            event_group_id: 1,
-            ttl: 5,
-            local_ip: Ipv4Addr::LOCALHOST,
-            local_rx_port: 40100,
-        };
-        let validate = |request| {
-            ServerConfig::new(0x5B, 1)
-                .with_consumed_eventgroup(request)
-                .validate()
-        };
-        assert!(validate(concrete).is_ok());
-        for request in [
-            SubscribeEventgroupRequest {
-                service_id: 0xFFFF,
-                ..concrete
-            },
-            SubscribeEventgroupRequest {
-                instance_id: 0xFFFF,
-                ..concrete
-            },
-            SubscribeEventgroupRequest {
-                major_version: 0xFF,
-                ..concrete
-            },
-        ] {
-            assert!(
-                matches!(validate(request), Err(Error::WildcardConsumedEventgroup(_))),
-                "{request:?} is accepted"
-            );
-        }
-    }
-
-    #[test]
-    fn a_wildcard_required_service_is_rejected() {
-        let concrete = RequiredService {
-            service_id: 0x5C,
-            instance_id: 1,
-            major_version: 1,
-        };
-        let validate = |service| {
-            ServerConfig::consumer_only()
-                .with_required_service(service)
-                .validate()
-        };
-        assert!(validate(concrete).is_ok());
-        for service in [
-            RequiredService {
-                service_id: 0xFFFF,
-                ..concrete
-            },
-            RequiredService {
-                instance_id: 0xFFFF,
-                ..concrete
-            },
-            RequiredService {
-                major_version: 0xFF,
-                ..concrete
-            },
-        ] {
-            assert!(
-                matches!(validate(service), Err(Error::WildcardRequiredService(s)) if s == service),
-                "{service:?} is accepted"
-            );
-        }
-    }
-
-    #[test]
     fn try_with_required_service_returns_the_config_when_full() {
-        let service = RequiredService {
-            service_id: 0x5C,
-            instance_id: 1,
-            major_version: 1,
-        };
+        let service = ServiceInstance::new(0x5C, 1, 1).unwrap();
         let mut config = ServerConfig::consumer_only();
         for _ in 0..ServerConfig::REQUIRED_SERVICES_CAP {
             config = config.try_with_required_service(service).expect("room");
@@ -2399,47 +2223,6 @@ mod tests {
             full.required_services.len(),
             ServerConfig::REQUIRED_SERVICES_CAP
         );
-    }
-
-    #[tokio::test]
-    async fn server_new_rejects_a_consumed_eventgroup_with_a_wildcard_instance_or_version() {
-        let concrete = SubscribeEventgroupRequest {
-            service_id: 0x5C,
-            instance_id: 1,
-            major_version: 1,
-            event_group_id: 1,
-            ttl: 5,
-            local_ip: Ipv4Addr::LOCALHOST,
-            local_rx_port: 40100,
-        };
-        for request in [
-            SubscribeEventgroupRequest {
-                service_id: 0xFFFF,
-                ..concrete
-            },
-            SubscribeEventgroupRequest {
-                instance_id: 0xFFFF,
-                ..concrete
-            },
-            SubscribeEventgroupRequest {
-                major_version: 0xFF,
-                ..concrete
-            },
-        ] {
-            let config = ServerConfig::new(0x5B, 1).with_consumed_eventgroup(request);
-            let result = Server::new(config).await;
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::WildcardConsumedEventgroup(r))
-                        if r.service_id == request.service_id
-                            && r.instance_id == request.instance_id
-                            && r.major_version == request.major_version
-                ),
-                "{request:?}: got {:?}",
-                result.err()
-            );
-        }
     }
 
     #[tokio::test]

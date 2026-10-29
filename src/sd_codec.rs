@@ -15,33 +15,24 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use automotive_wire_codec::{EncodeToSliceError, InsufficientBuffer};
 
-use crate::Encode;
 use crate::protocol::sd::{
     Entry, EventGroupEntry, Flags, Header as SdHeader, Options as SdOptions, OptionsCount,
     RebootFlag, SdHeaderView, ServiceEntry, TransportProtocol,
 };
 use crate::protocol::{Header, MessageId, MessageType, MessageTypeField, MessageView, ReturnCode};
 use crate::transport::{E2EHandle, E2EStatus};
+use crate::{Encode, ServiceInstance};
 
 /// SOME/IP header length in bytes — the offset at which an SD or
 /// notification payload begins.
 pub const SOMEIP_HEADER_LEN: usize = 16;
 
-/// Whether a Subscribe for these IDs names a wildcard service ID (`0xFFFF`),
-/// instance ID (`0xFFFF`) or major version (`0xFF`). A Subscribe names the
-/// service, instance and version it subscribes to.
-#[cfg(feature = "server")]
-pub(crate) const fn names_a_wildcard(service_id: u16, instance_id: u16, major_version: u8) -> bool {
-    service_id == 0xFFFF || instance_id == 0xFFFF || major_version == 0xFF
-}
-
 /// One `SubscribeEventgroup` entry, with the local endpoint the
 /// publisher should deliver events to.
 #[derive(Clone, Copy, Debug)]
 pub struct SubscribeEventgroupRequest {
-    pub service_id: u16,
-    pub instance_id: u16,
-    pub major_version: u8,
+    /// The service instance subscribed to.
+    pub service: ServiceInstance,
     pub event_group_id: u16,
     /// Subscription TTL in seconds, at most
     /// [`MAX_TTL`](crate::protocol::sd::MAX_TTL).
@@ -251,9 +242,9 @@ pub fn build_multi_subscribe_eventgroup_datagram<const N: usize>(
             index_first_options_run: index,
             index_second_options_run: 0,
             options_count: OptionsCount::new(1, 0),
-            service_id: request.service_id,
-            instance_id: request.instance_id,
-            major_version: request.major_version,
+            service_id: request.service.service_id(),
+            instance_id: request.service.instance_id(),
+            major_version: request.service.major_version(),
             ttl: request.ttl,
             counter: 0,
             event_group_id: request.event_group_id,
@@ -366,9 +357,7 @@ fn build_multi_service_entry_datagram<const N: usize>(
 #[cfg(feature = "server")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FindTarget {
-    pub(crate) service_id: u16,
-    pub(crate) instance_id: u16,
-    pub(crate) major_version: u8,
+    pub(crate) service: ServiceInstance,
     pub(crate) ttl: u32,
 }
 
@@ -388,9 +377,9 @@ pub(crate) fn build_find_service_datagram<const N: usize>(
                 index_first_options_run: 0,
                 index_second_options_run: 0,
                 options_count: OptionsCount::new(0, 0),
-                service_id: request.service_id,
-                instance_id: request.instance_id,
-                major_version: request.major_version,
+                service_id: request.service.service_id(),
+                instance_id: request.service.instance_id(),
+                major_version: request.service.major_version(),
                 ttl: request.ttl,
                 minor_version: 0xFFFF_FFFF,
             }))
@@ -849,9 +838,7 @@ mod tests {
     #[test]
     fn build_too_small_buffer_reports_needed_and_available() {
         let request = SubscribeEventgroupRequest {
-            service_id: 0x0042,
-            instance_id: 1,
-            major_version: 1,
+            service: ServiceInstance::new(0x0042, 1, 1).unwrap(),
             event_group_id: 1,
             ttl: 3,
             local_ip: Ipv4Addr::new(192, 0, 2, 2),
@@ -913,9 +900,7 @@ mod tests {
         //    NOT reported as the not-SD (`UnsupportedMessageID`) case — the
         //    three failure modes stay distinguishable.
         let request = SubscribeEventgroupRequest {
-            service_id: 0x0042,
-            instance_id: 1,
-            major_version: 1,
+            service: ServiceInstance::new(0x0042, 1, 1).unwrap(),
             event_group_id: 1,
             ttl: 3,
             local_ip: Ipv4Addr::new(192, 0, 2, 2),
@@ -963,9 +948,7 @@ mod tests {
     #[test]
     fn parse_sd_datagram_skips_an_entry_of_unknown_type() {
         let request = SubscribeEventgroupRequest {
-            service_id: 0x0042,
-            instance_id: 1,
-            major_version: 1,
+            service: ServiceInstance::new(0x0042, 1, 1).unwrap(),
             event_group_id: 1,
             ttl: 3,
             local_ip: Ipv4Addr::new(192, 0, 2, 2),
@@ -990,9 +973,7 @@ mod tests {
     #[test]
     fn subscribe_builder_honors_reboot_flag() {
         let request = SubscribeEventgroupRequest {
-            service_id: 0x0042,
-            instance_id: 1,
-            major_version: 1,
+            service: ServiceInstance::new(0x0042, 1, 1).unwrap(),
             event_group_id: 1,
             ttl: 0x00FF_FFFF,
             local_ip: Ipv4Addr::new(192, 0, 2, 2),
@@ -1016,9 +997,7 @@ mod tests {
     #[test]
     fn multi_subscribe_entries_each_reference_their_own_endpoint() {
         let request = |event_group_id, local_rx_port| SubscribeEventgroupRequest {
-            service_id: 0x0042,
-            instance_id: 1,
-            major_version: 1,
+            service: ServiceInstance::new(0x0042, 1, 1).unwrap(),
             event_group_id,
             ttl: 5,
             local_ip: Ipv4Addr::new(192, 0, 2, 2),
@@ -1058,9 +1037,7 @@ mod tests {
     #[test]
     fn multi_subscribe_datagram_len_is_the_encoded_length() {
         let request = SubscribeEventgroupRequest {
-            service_id: 0x0042,
-            instance_id: 1,
-            major_version: 1,
+            service: ServiceInstance::new(0x0042, 1, 1).unwrap(),
             event_group_id: 1,
             ttl: 5,
             local_ip: Ipv4Addr::new(192, 0, 2, 2),
@@ -1082,9 +1059,7 @@ mod tests {
     #[test]
     fn multi_subscribe_rejects_more_requests_than_its_capacity() {
         let request = SubscribeEventgroupRequest {
-            service_id: 0x0042,
-            instance_id: 1,
-            major_version: 1,
+            service: ServiceInstance::new(0x0042, 1, 1).unwrap(),
             event_group_id: 1,
             ttl: 5,
             local_ip: Ipv4Addr::new(192, 0, 2, 2),
@@ -1107,9 +1082,7 @@ mod tests {
     #[cfg(feature = "server")]
     fn find_request() -> FindTarget {
         FindTarget {
-            service_id: 0x0042,
-            instance_id: 3,
-            major_version: 2,
+            service: ServiceInstance::new(0x0042, 3, 2).unwrap(),
             ttl: 7,
         }
     }

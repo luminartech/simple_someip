@@ -43,35 +43,10 @@ pub enum Error {
     ///   futures cannot share the same SD socket and session counter.
     #[error("invalid server usage: {0}")]
     InvalidUsage(&'static str),
-    /// An entry in
-    /// [`ServerConfig::consumed_eventgroups`](super::ServerConfig::consumed_eventgroups)
-    /// names the wildcard service ID `0xFFFF`, instance ID `0xFFFF` or major
-    /// version `0xFF`. The Subscribe that answers an Offer names the service,
-    /// instance and major version it subscribes to.
-    #[error(
-        "consumed eventgroup 0x{:04X} names a wildcard: service 0x{:04X}, instance 0x{:04X}, major version 0x{:02X}",
-        .0.event_group_id,
-        .0.service_id,
-        .0.instance_id,
-        .0.major_version
-    )]
-    WildcardConsumedEventgroup(crate::sd_codec::SubscribeEventgroupRequest),
     /// [`ServerConfig::sd_multicast`](super::ServerConfig::sd_multicast) is
     /// not a multicast group with a nonzero port.
     #[error("SD address {0} is not a multicast group with a nonzero port")]
     InvalidSdMulticast(core::net::SocketAddrV4),
-    /// An entry in
-    /// [`ServerConfig::required_services`](super::ServerConfig::required_services)
-    /// names the wildcard service ID `0xFFFF`, instance ID `0xFFFF` or major
-    /// version `0xFF`. A `FindService` entry for a required service names the
-    /// service, instance and major version it looks for.
-    #[error(
-        "required service names a wildcard: service 0x{:04X}, instance 0x{:04X}, major version 0x{:02X}",
-        .0.service_id,
-        .0.instance_id,
-        .0.major_version
-    )]
-    WildcardRequiredService(super::RequiredService),
 }
 
 impl From<crate::protocol::sd::Error> for Error {
