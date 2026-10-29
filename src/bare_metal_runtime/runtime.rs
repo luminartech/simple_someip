@@ -141,6 +141,23 @@ impl SubEntry {
     }
 }
 
+/// One service the node requires. `#[repr(C)]`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RequiredEntry {
+    pub service_id: u16,
+    pub instance_id: u16,
+    pub major_version: u8,
+}
+
+impl RequiredEntry {
+    /// The required service instance; `None` when the entry names a
+    /// wildcard.
+    fn service(self) -> Option<ServiceInstance> {
+        ServiceInstance::new(self.service_id, self.instance_id, self.major_version)
+    }
+}
+
 /// Buffer memory the platform owns (so it controls link placement) and
 /// hands to the runtime. One `&'static mut` keeps the interface narrow.
 pub struct RuntimeBuffers {
@@ -220,7 +237,7 @@ pub struct RuntimeConfig {
     /// [`ServerConfig::REQUIRED_SERVICES_CAP`] distinct ones; [`init`]
     /// returns [`InitError::TooManyRequiredServices`] past it. The runtime sends `FindService` for them and
     /// reports their availability through [`Self::on_service`].
-    pub required_services: &'static [ServiceInstance],
+    pub required_services: &'static [RequiredEntry],
     /// Called for each change in the availability of the subscription's
     /// service or a required service; `None` reports nothing.
     pub on_service: Option<ServiceFn>,
@@ -394,20 +411,61 @@ fn dispatch(
     )
 }
 
-/// The distinct services of `config.required_services`.
-fn required_services(
-    config: &RuntimeConfig,
-) -> Result<heapless::Vec<ServiceInstance, { ServerConfig::REQUIRED_SERVICES_CAP }>, InitError> {
-    let mut services = heapless::Vec::new();
-    for &service in config.required_services {
-        if service.names_a_wildcard() {
-            return Err(InitError::Wildcard);
+/// The services a [`RuntimeConfig`] names, checked.
+struct Catalog {
+    /// The first offer, accepting Subscribes for every offer; `None` for an
+    /// empty [`RuntimeConfig::offers`].
+    offering: Option<Offering>,
+    subscription: Option<SubscribeEventgroupRequest>,
+    required: heapless::Vec<ServiceInstance, { ServerConfig::REQUIRED_SERVICES_CAP }>,
+}
+
+impl Catalog {
+    fn parse(config: &RuntimeConfig) -> Result<Self, InitError> {
+        let offering = match config.offers.first() {
+            Some(primary) => {
+                let mut offering = Offering::new(primary.service().ok_or(InitError::Wildcard)?)
+                    .with_local_port(primary.unicast_port)
+                    .with_ttl(Duration::from_secs(u64::from(offer_ttl(
+                        primary.ttl_seconds,
+                    ))))
+                    .with_event_group(primary.event_group_id)
+                    // The runtime announces every offer in one combined
+                    // OfferService from its own future.
+                    .with_announce(false);
+                for entry in config.offers {
+                    let service = entry.service().ok_or(InitError::Wildcard)?;
+                    offering = offering
+                        .try_with_accepted_offer(service, entry.event_group_id)
+                        .map_err(|_| InitError::TooManyOffers)?;
+                }
+                Some(offering)
+            }
+            None => None,
+        };
+        let subscription = match config.subscription {
+            Some(entry) => Some(SubscribeEventgroupRequest {
+                service: entry.service().ok_or(InitError::Wildcard)?,
+                event_group_id: entry.event_group_id,
+                ttl: sd::MAX_TTL,
+                local_ip: Ipv4Addr::from(config.interface.to_be_bytes()),
+                local_rx_port: entry.local_rx_port,
+            }),
+            None => None,
+        };
+        let mut required = heapless::Vec::new();
+        for entry in config.required_services {
+            let service = entry.service().ok_or(InitError::Wildcard)?;
+            if !required.contains(&service) && required.push(service).is_err() {
+                return Err(InitError::TooManyRequiredServices);
+            }
         }
-        if !services.contains(&service) && services.push(service).is_err() {
-            return Err(InitError::TooManyRequiredServices);
-        }
+        Ok(Self {
+            offering,
+            subscription,
+            required,
+        })
     }
-    Ok(services)
 }
 
 fn offer_requests(out: &mut [OfferServiceRequest; MAX_OFFERS]) -> usize {
@@ -445,21 +503,22 @@ fn sd_multicast() -> SocketAddrV4 {
     )
 }
 
-/// Build the receive `Server` over the shared callback sockets, accepting
-/// subscribes for every offered service, finding the subscription's service
-/// and every `required` service, reporting them to `on_service` and
-/// answering Offers of the subscription's service. With no offers the server
-/// offers nothing and its unicast socket has port 0, which no datagram
-/// reaches.
+/// Build the receive `Server` over the shared callback sockets for
+/// `catalog`, finding its subscription's and required services, reporting
+/// them to `on_service` and answering Offers of the subscription's service.
+/// With no offering the server's unicast socket has port 0, which no
+/// datagram reaches.
 fn build_server(
     find_timing: FindTiming,
-    required: &[ServiceInstance],
+    catalog: Catalog,
     on_service: Option<(ServiceFn, usize)>,
 ) -> bool {
-    let o = offers();
     let plat = platform();
     let factory = Factory::new(plat);
-    let unicast_port = o.first().map_or(0, |primary| primary.unicast_port);
+    let unicast_port = catalog
+        .offering
+        .as_ref()
+        .map_or(0, |offering| offering.local_port);
     let sd_port = SD_PORT.load(Ordering::Acquire);
 
     // SAFETY: single-init; `init` is the sole caller.
@@ -478,19 +537,19 @@ fn build_server(
 
     let iface = Ipv4Addr::from(IFACE.load(Ordering::Acquire).to_be_bytes());
     let mut config = ServerConfig {
-        offering: catalog_offering(o),
+        offering: catalog.offering,
         ..ServerConfig::consumer_only()
     }
     .with_interface(iface)
     .with_find_timing(find_timing)
     .with_sd_multicast(sd_multicast());
-    if let Some(request) = subscribe_request() {
+    if let Some(request) = catalog.subscription {
         let Ok(c) = config.try_with_consumed_eventgroup(request) else {
             return false;
         };
         config = c;
     }
-    for &service in required {
+    for service in catalog.required {
         let Ok(c) = config.try_with_required_service(service) else {
             return false;
         };
@@ -520,40 +579,6 @@ fn build_server(
         }
         Err(_) => false,
     }
-}
-
-/// The server's offering: the first catalog entry, accepting Subscribes for
-/// every entry; `None` for an empty catalog. [`init`] refuses a catalog that
-/// names a wildcard.
-fn catalog_offering(catalog: &[OfferEntry]) -> Option<Offering> {
-    let primary = catalog.first()?;
-    let mut offering = Offering::new(primary.service()?)
-        .with_local_port(primary.unicast_port)
-        .with_ttl(Duration::from_secs(u64::from(offer_ttl(
-            primary.ttl_seconds,
-        ))))
-        .with_event_group(primary.event_group_id)
-        // The runtime drives a combined multi-offer OfferService announce
-        // (all catalog offers in one SD datagram) from its own future, so
-        // the server's recv loop must stay silent on SD, or the primary
-        // service would be announced twice.
-        .with_announce(false);
-    for entry in catalog {
-        offering = offering.with_accepted_offer(entry.service()?, entry.event_group_id);
-    }
-    Some(offering)
-}
-
-/// The Subscribe the server sends for the catalog's subscription.
-fn subscribe_request() -> Option<SubscribeEventgroupRequest> {
-    let s = subscription()?;
-    Some(SubscribeEventgroupRequest {
-        service: s.service()?,
-        event_group_id: s.event_group_id,
-        ttl: sd::MAX_TTL,
-        local_ip: Ipv4Addr::from(IFACE.load(Ordering::Acquire).to_be_bytes()),
-        local_rx_port: s.local_rx_port,
-    })
 }
 
 /// The single composed task: receive server (which also answers Offers with
@@ -718,12 +743,7 @@ fn init_claimed(config: RuntimeConfig) -> Result<(), InitError> {
     if config.offers.len() > MAX_OFFERS {
         return Err(InitError::TooManyOffers);
     }
-    if config.subscription.is_some_and(|s| s.service().is_none())
-        || config.offers.iter().any(|o| o.service().is_none())
-    {
-        return Err(InitError::Wildcard);
-    }
-    let required = required_services(&config)?;
+    let catalog = Catalog::parse(&config)?;
     if config.sd_mcast != 0 && !Ipv4Addr::from(config.sd_mcast.to_be_bytes()).is_multicast() {
         return Err(InitError::SdGroupNotMulticast);
     }
@@ -769,7 +789,7 @@ fn init_claimed(config: RuntimeConfig) -> Result<(), InitError> {
     bind_ports(config.bind);
 
     let on_service = config.on_service.map(|f| (f, config.dispatch_ctx));
-    if !build_server(config.find_timing, &required, on_service) {
+    if !build_server(config.find_timing, catalog, on_service) {
         return Err(InitError::ServerBuild);
     }
 
