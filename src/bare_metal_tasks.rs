@@ -234,9 +234,10 @@ const NOOP_RAW_WAKER: RawWaker = {
 /// buffer (no per-call stack buffer), which `e2e` protects the notification
 /// in. Returns the number of subscribers sent to (`>= 0`), or a negative
 /// error: `-2` if `scratch` is too small for the header and the payload,
-/// protected or not, or if `e2e` cannot protect a payload that long. With no subscribers it returns `0` without protecting
-/// the notification, so a payload that only overflows `scratch` once
-/// protected is reported once someone subscribes.
+/// protected or not, or if `e2e` cannot protect a payload of that length.
+/// With no subscribers it returns `0` without protecting the notification,
+/// so a payload that only overflows `scratch` once protected is reported
+/// once someone subscribes.
 ///
 /// `send` is invoked *after* the subscription handle's critical section is
 /// released, not from inside the visitor: this function snapshots the
