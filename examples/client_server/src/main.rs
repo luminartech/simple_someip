@@ -29,9 +29,11 @@
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
+use simple_someip::ServiceInstance;
 use simple_someip::protocol::sd::{
     Entry, Flags, Options, OptionsCount, RebootFlag, ServiceEntry, TransportProtocol,
 };
+use simple_someip::server::Offering;
 use simple_someip::server::{Server, ServerConfig};
 use simple_someip::{ClientUpdate, RawPayload, VecSdHeader};
 use tracing::{error, info, warn};
@@ -113,15 +115,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Create the server (handles subscription requests, event publishing) ──
 
-    let config = ServerConfig::new(MY_SERVER_SERVICE_ID, MY_SERVER_INSTANCE_ID)
-        .with_interface(interface)
-        .with_local_port(MY_SERVER_PORT);
-
-    // Dispatcher topology — the client drives all SD traffic via
-    // its own `sd_announcements_loop`, so we suppress the server's
-    // own announcement arm with `with_announce(false)`. The single
-    // returned run-future drives only the receive loop.
-    let config = config.with_announce(false);
+    let config = ServerConfig::new(
+        Offering::new(
+            ServiceInstance::new(MY_SERVER_SERVICE_ID, MY_SERVER_INSTANCE_ID, 1)
+                .expect("not a wildcard"),
+        )
+        // Dispatcher topology — the client drives all SD traffic via
+        // its own `sd_announcements_loop`, so we suppress the server's
+        // own announcement arm with `with_announce(false)`. The single
+        // returned run-future drives only the receive loop.
+        .with_local_port(MY_SERVER_PORT)
+        .with_announce(false),
+    )
+    .with_interface(interface);
     let (_server, handles, run) = Server::new(config).await?;
     info!("Server bound on port {MY_SERVER_PORT}");
 

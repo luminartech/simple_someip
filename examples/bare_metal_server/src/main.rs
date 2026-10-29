@@ -50,6 +50,8 @@ use std::vec::Vec;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use simple_someip::NoE2E;
+use simple_someip::ServiceInstance;
+use simple_someip::server::Offering;
 use simple_someip::server::{
     ServerConfig, StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager,
 };
@@ -240,9 +242,11 @@ async fn main() {
     let subs = StaticSubscriptionHandle::new(&SUBS_STORAGE);
 
     // service_id=0x1234, instance_id=1, bound to LOCALHOST:30490.
-    let config = ServerConfig::new(0x1234, 1)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(30490);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(0x1234, 1, 1).expect("not a wildcard"))
+            .with_local_port(30490),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
 
     let (_server, _handles, run) =
         Server::<MockFactory, MockTimer, NoE2E, StaticSubscriptionHandle>::new_with_deps(

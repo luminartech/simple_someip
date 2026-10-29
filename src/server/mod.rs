@@ -107,64 +107,23 @@ const _: () = assert!(
     "SIMPLE_SOMEIP_MAX_CONSUMED_EVENTGROUPS is too large: the Subscribes for that many eventgroups do not fit one UDP datagram"
 );
 
-/// Configuration for a SOME/IP service provider
+/// Configuration for a SOME/IP server: the service it offers, if any, and
+/// the services it consumes and needs.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Local interface IP address
     pub interface: Ipv4Addr,
-    /// Port to bind for receiving subscriptions and requests
-    pub local_port: u16,
-    /// Service ID being offered
-    pub service_id: u16,
-    /// Instance ID
-    pub instance_id: u16,
-    /// Major version
-    pub major_version: u8,
-    /// Minor version
-    pub minor_version: u32,
-    /// Service Discovery TTL in seconds, 1 to
-    /// [`MAX_TTL`](crate::protocol::sd::MAX_TTL), sent in each `OfferService`
-    /// and `SubscribeAck`. The server constructors reject a config outside
-    /// that range unless [`Self::offers_service()`] is `false`; a
-    /// `SubscribeAck` for an [`Self::accepted_offers`] entry then carries it
-    /// unchecked.
-    pub ttl: u32,
-    /// Event-group IDs the server publishes to. Used by the SD
-    /// `Subscribe` handler to NACK subscriptions for unknown groups
-    /// (per AUTOSAR SOME/IP-SD: an event group must be known before
-    /// subscription is granted). When empty, any event-group ID is
-    /// accepted — preserves back-compat for callers that have not
-    /// enumerated their groups; populate to opt into validation.
-    pub event_group_ids: heapless::Vec<u16, { ServerConfig::EVENT_GROUP_IDS_CAP }>,
-    /// Whether the run-future drives the SD `OfferService` announcement
-    /// loop. Defaults to `true`.
+    /// The service this node offers; `None` for a node that offers none.
     ///
-    /// Set to `false` (via [`Self::with_announce`]) when an external
-    /// component drives announcements — for example the
-    /// `examples/client_server` topology where a co-located `Client`'s
-    /// `sd_announcements_loop` emits the offers and the server should
-    /// stay silent on SD. Has no effect on passive servers, which never
-    /// announce, or when [`Self::offers_service()`] is `false`.
-    pub announce: bool,
-    /// Additional co-offered `(service, instance, event_group)` tuples this
-    /// receive loop accepts `SubscribeEventGroup` for, beyond its own
-    /// `(service_id, instance_id, event_group_ids)`.
-    ///
-    /// Bare-metal providers that co-offer several services over one shared
-    /// SD/unicast socket run a *single* receive loop (the others are
-    /// announce-only and have no receive path). That loop must accept
-    /// subscriptions for every co-offered service, not just its own —
-    /// otherwise subscribes for the siblings get a `SubscribeNack` and their
-    /// events never reach a subscriber. Populate via [`Self::with_accepted_offer`];
-    /// empty preserves single-service behaviour.
-    pub accepted_offers: heapless::Vec<AcceptedOffer, { ServerConfig::ACCEPTED_OFFERS_CAP }>,
+    /// A node that offers none sends no `OfferService`, answers no
+    /// `FindService` and sends a `SubscribeNack` for every
+    /// `SubscribeEventgroup`. Its unicast socket binds an ephemeral port.
+    pub offering: Option<Offering>,
     /// Eventgroups this node subscribes to. The run future sends `FindService`
     /// for their service instances until each is offered (see
-    /// [`Self::find_timing`]), and answers each Offer of a matching service,
-    /// instance and major version with a unicast Subscribe to its sender.
-    /// Use it on a node that runs no `Client`; a `Client` sends its own
-    /// Subscribes. Each entry names a concrete service ID, instance ID and
-    /// major version, not a wildcard. Populate via
+    /// [`Self::find_timing`]), and answers each Offer of a matching service
+    /// instance with a unicast Subscribe to its sender. Use it on a node that
+    /// runs no `Client`; a `Client` sends its own Subscribes. Populate via
     /// [`Self::with_consumed_eventgroup`]. A passive server runs no receive
     /// loop, so it neither finds nor answers Offers.
     pub consumed_eventgroups:
@@ -172,9 +131,8 @@ pub struct ServerConfig {
     /// Services this node needs. The run future sends `FindService` for each
     /// until it is offered (see [`Self::find_timing`]), after those of
     /// [`Self::consumed_eventgroups`]. An Offer of a required service sends no
-    /// Subscribe; only [`Self::consumed_eventgroups`] are subscribed. Each
-    /// entry names a concrete service ID, instance ID and major version, not a
-    /// wildcard. A required service that is not also consumed is found with a
+    /// Subscribe; only [`Self::consumed_eventgroups`] are subscribed. A
+    /// required service that is not also consumed is found with a
     /// `FindService` TTL of 3 seconds. Populate via
     /// [`Self::with_required_service`]. A passive server runs no receive loop,
     /// so it neither finds nor answers Offers.
@@ -189,9 +147,52 @@ pub struct ServerConfig {
     /// port. Defaults to
     /// [`MULTICAST_IP`](crate::protocol::sd::MULTICAST_IP):[`MULTICAST_PORT`](crate::protocol::sd::MULTICAST_PORT).
     pub sd_multicast: SocketAddrV4,
-    /// Whether the node offers [`Self::service_id`]; see
-    /// [`Self::offers_service()`].
-    offers_service: bool,
+}
+
+/// The service a server offers, and how it offers it. See
+/// [`ServerConfig::offering`].
+#[derive(Debug, Clone)]
+pub struct Offering {
+    /// The offered service instance.
+    pub service: ServiceInstance,
+    /// Minor version
+    pub minor_version: u32,
+    /// Service Discovery TTL in seconds, 1 to
+    /// [`MAX_TTL`](crate::protocol::sd::MAX_TTL), sent in each `OfferService`
+    /// and `SubscribeAck`. The server constructors reject a TTL outside that
+    /// range.
+    pub ttl: u32,
+    /// Event-group IDs the server publishes to. Used by the SD
+    /// `Subscribe` handler to NACK subscriptions for unknown groups
+    /// (per AUTOSAR SOME/IP-SD: an event group must be known before
+    /// subscription is granted). When empty, any event-group ID is
+    /// accepted — preserves back-compat for callers that have not
+    /// enumerated their groups; populate to opt into validation.
+    pub event_group_ids: heapless::Vec<u16, { ServerConfig::EVENT_GROUP_IDS_CAP }>,
+    /// Port to bind for receiving subscriptions and requests
+    pub local_port: u16,
+    /// Whether the run-future drives the SD `OfferService` announcement
+    /// loop. Defaults to `true`.
+    ///
+    /// Set to `false` (via [`Self::with_announce`]) when an external
+    /// component drives announcements — for example the
+    /// `examples/client_server` topology where a co-located `Client`'s
+    /// `sd_announcements_loop` emits the offers and the server should
+    /// stay silent on SD. Has no effect on passive servers, which never
+    /// announce.
+    pub announce: bool,
+    /// Additional co-offered `(service, instance, event_group)` tuples this
+    /// receive loop accepts `SubscribeEventGroup` for, beyond its own
+    /// `(service, event_group_ids)`.
+    ///
+    /// Bare-metal providers that co-offer several services over one shared
+    /// SD/unicast socket run a *single* receive loop (the others are
+    /// announce-only and have no receive path). That loop must accept
+    /// subscriptions for every co-offered service, not just its own —
+    /// otherwise subscribes for the siblings get a `SubscribeNack` and their
+    /// events never reach a subscriber. Populate via [`Self::with_accepted_offer`];
+    /// empty preserves single-service behaviour.
+    pub accepted_offers: heapless::Vec<AcceptedOffer, { ServerConfig::ACCEPTED_OFFERS_CAP }>,
 }
 
 /// A [`Server`]'s SD numbering and SD multicast group, from [`Server::sd`].
@@ -224,7 +225,7 @@ impl<'a> ServerSd<'a> {
 
 /// A `(service, instance, event_group)` tuple a receive loop will accept
 /// `SubscribeEventGroup` for in addition to its primary service. See
-/// [`ServerConfig::accepted_offers`].
+/// [`Offering::accepted_offers`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AcceptedOffer {
     /// The offered service instance. A `SubscribeEventgroup` whose major
@@ -236,13 +237,13 @@ pub struct AcceptedOffer {
 
 impl ServerConfig {
     /// Maximum number of event-group IDs trackable in
-    /// [`Self::event_group_ids`]. Matches `EVENT_GROUPS_CAP` in the
+    /// [`Offering::event_group_ids`]. Matches `EVENT_GROUPS_CAP` in the
     /// subscription manager.
     pub const EVENT_GROUP_IDS_CAP: usize = _SERVER_EVENT_GROUP_IDS_CAP;
 
     /// Maximum number of co-offered `(service, instance, event_group)`
     /// tuples a single receive loop can accept subscriptions for via
-    /// [`Self::accepted_offers`]. Covers any realistic shared-socket
+    /// [`Offering::accepted_offers`]. Covers any realistic shared-socket
     /// provider catalog.
     pub const ACCEPTED_OFFERS_CAP: usize = _SERVER_ACCEPTED_OFFERS_CAP;
 
@@ -275,23 +276,18 @@ impl ServerConfig {
     /// rather than assuming a fixed value.
     pub const SUBSCRIBERS_PER_GROUP_CAP: usize = subscription_manager::SUBSCRIBERS_PER_GROUP;
 
-    /// Create a new server configuration with sane defaults for
-    /// development.
+    /// A config for a node that offers `offering`.
     ///
-    /// Required arguments are the SOME/IP `service_id` and
-    /// `instance_id` — the two values that identify the offered
-    /// service. Other fields use development-friendly defaults that
-    /// production callers will typically override via the fluent
-    /// setters:
+    /// The other fields use development-friendly defaults that production
+    /// callers will typically override via the fluent setters:
     ///
     /// | Field | Default | Override via |
     /// |---|---|---|
     /// | `interface` | [`Ipv4Addr::UNSPECIFIED`] (`0.0.0.0`) | [`Self::with_interface`] |
-    /// | `local_port` | `0` (kernel-assigned ephemeral) | [`Self::with_local_port`] |
-    /// | `major_version` | `1` | [`Self::with_major_version`] |
-    /// | `minor_version` | `0` | [`Self::with_minor_version`] |
-    /// | `ttl` | 3 seconds (typical for SOME/IP) | [`Self::with_ttl`] |
-    /// | `event_group_ids` | empty (any group accepted) | [`Self::with_event_group`] |
+    /// | `consumed_eventgroups` | empty | [`Self::with_consumed_eventgroup`] |
+    /// | `required_services` | empty | [`Self::with_required_service`] |
+    /// | `find_timing` | [`FindTiming::DEFAULT`] | [`Self::with_find_timing`] |
+    /// | `sd_multicast` | [`MULTICAST_IP`](crate::protocol::sd::MULTICAST_IP):[`MULTICAST_PORT`](crate::protocol::sd::MULTICAST_PORT) | [`Self::with_sd_multicast`] |
     ///
     /// Production deployments almost always need a specific interface
     /// and port — `0.0.0.0` lets the kernel pick a binding that may
@@ -304,26 +300,36 @@ impl ServerConfig {
     /// # Example
     ///
     /// ```
-    /// use simple_someip::server::ServerConfig;
+    /// use simple_someip::ServiceInstance;
+    /// use simple_someip::server::{Offering, ServerConfig};
     /// use std::net::Ipv4Addr;
     ///
-    /// let config = ServerConfig::new(0x5BAA, 1)
-    ///     .with_interface(Ipv4Addr::new(192, 168, 1, 100))
-    ///     .with_local_port(30500);
+    /// let service = ServiceInstance::new(0x5BAA, 1, 1).expect("not a wildcard");
+    /// let config = ServerConfig::new(Offering::new(service).with_local_port(30500))
+    ///     .with_interface(Ipv4Addr::new(192, 168, 1, 100));
     /// ```
     #[must_use]
-    pub fn new(service_id: u16, instance_id: u16) -> Self {
+    pub fn new(offering: Offering) -> Self {
+        Self {
+            offering: Some(offering),
+            ..Self::consumer_only()
+        }
+    }
+
+    /// A config for a node that offers no service: [`Self::offering`] is
+    /// `None`.
+    ///
+    /// The server still receives, so it sends the `FindService` and
+    /// `SubscribeEventgroup` messages of [`Self::consumed_eventgroups`],
+    /// the `FindService` messages of [`Self::required_services`], and the
+    /// `SubscribeNack` described at [`Self::offering`]. Populate them
+    /// with [`Self::with_consumed_eventgroup`] and
+    /// [`Self::with_required_service`].
+    #[must_use]
+    pub fn consumer_only() -> Self {
         Self {
             interface: Ipv4Addr::UNSPECIFIED,
-            local_port: 0,
-            service_id,
-            instance_id,
-            major_version: 1,
-            minor_version: 0,
-            ttl: 3, // 3 seconds is typical for SOME/IP
-            event_group_ids: heapless::Vec::new(),
-            announce: true,
-            accepted_offers: heapless::Vec::new(),
+            offering: None,
             consumed_eventgroups: heapless::Vec::new(),
             required_services: heapless::Vec::new(),
             find_timing: FindTiming::DEFAULT,
@@ -331,40 +337,7 @@ impl ServerConfig {
                 crate::protocol::sd::MULTICAST_IP,
                 crate::protocol::sd::MULTICAST_PORT,
             ),
-            offers_service: true,
         }
-    }
-
-    /// A config for a node that offers no service: [`Self::offers_service()`]
-    /// and [`Self::announce`] are `false`, and [`Self::service_id`] and
-    /// [`Self::instance_id`] are 0.
-    ///
-    /// The server still receives, so it sends the `FindService` and
-    /// `SubscribeEventgroup` messages of [`Self::consumed_eventgroups`],
-    /// the `FindService` messages of [`Self::required_services`], and the
-    /// `SubscribeNack` described at [`Self::offers_service()`]. Populate them
-    /// with [`Self::with_consumed_eventgroup`] and
-    /// [`Self::with_required_service`].
-    #[must_use]
-    pub fn consumer_only() -> Self {
-        Self {
-            announce: false,
-            offers_service: false,
-            ..Self::new(0, 0)
-        }
-    }
-
-    /// Whether the node offers [`Self::service_id`]: `true` from
-    /// [`Self::new`], `false` from [`Self::consumer_only`].
-    ///
-    /// When `false` the server sends no `OfferService`, whatever
-    /// [`Self::announce`] says, and answers no `FindService`. It sends a
-    /// `SubscribeNack` for every `SubscribeEventgroup` that no
-    /// [`Self::accepted_offers`] entry accepts. The server constructors check
-    /// [`Self::ttl`] only when this is `true`.
-    #[must_use]
-    pub const fn offers_service(&self) -> bool {
-        self.offers_service
     }
 
     /// Set the local interface IP address. Defaults to
@@ -377,72 +350,18 @@ impl ServerConfig {
         self
     }
 
-    /// Set the local UDP port the server listens on for subscription
-    /// requests and unicast traffic. Defaults to `0` from
-    /// [`Self::new`] (kernel-assigned ephemeral port), which is fine
-    /// for tests but cannot be discovered by external peers and
-    /// should be set explicitly in production.
-    #[must_use]
-    pub fn with_local_port(mut self, local_port: u16) -> Self {
-        self.local_port = local_port;
-        self
+    /// The offering of a config built with [`Self::new`].
+    #[cfg(test)]
+    pub(crate) fn test_offering(&self) -> &Offering {
+        self.offering.as_ref().expect("the config offers a service")
     }
 
-    /// Returns `true` if `event_group_id` is registered, OR
-    /// [`Self::event_group_ids`] is empty (validation disabled).
-    #[must_use]
-    pub fn accepts_event_group(&self, event_group_id: u16) -> bool {
-        self.event_group_ids.is_empty() || self.event_group_ids.contains(&event_group_id)
-    }
-
-    /// Register an additional co-offered `(service, instance, event_group)`
-    /// this receive loop will accept `SubscribeEventGroup` for. See
-    /// [`Self::accepted_offers`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if more than [`Self::ACCEPTED_OFFERS_CAP`] offers have been
-    /// registered. Use [`Self::try_with_accepted_offer`] for the fallible
-    /// variant.
-    #[must_use]
-    pub fn with_accepted_offer(mut self, service: ServiceInstance, event_group_id: u16) -> Self {
-        self.accepted_offers
-            .push(AcceptedOffer {
-                service,
-                event_group_id,
-            })
-            .expect("accepted_offers capacity exceeded");
-        self
-    }
-
-    /// Fallible counterpart to [`Self::with_accepted_offer`].
-    ///
-    /// # Errors
-    ///
-    /// Returns the unmodified config (in `Err`) if registering would exceed
-    /// [`Self::ACCEPTED_OFFERS_CAP`].
-    // Fallible-builder pattern: the `Err` returns the config itself so the
-    // caller can recover it. `ServerConfig` is large by design (inline
-    // heapless Vecs), so a large `Err` is inherent, not a smell.
-    #[allow(clippy::result_large_err)]
-    #[must_use = "the returned `Result` carries the (possibly-modified) config — drop is silent"]
-    pub fn try_with_accepted_offer(
-        mut self,
-        service: ServiceInstance,
-        event_group_id: u16,
-    ) -> Result<Self, Self> {
-        if self
-            .accepted_offers
-            .push(AcceptedOffer {
-                service,
-                event_group_id,
-            })
-            .is_ok()
-        {
-            Ok(self)
-        } else {
-            Err(self)
-        }
+    /// The port the unicast socket binds: [`Offering::local_port`], or `0`
+    /// (ephemeral) for a node that offers none.
+    pub(crate) fn local_port(&self) -> u16 {
+        self.offering
+            .as_ref()
+            .map_or(0, |offering| offering.local_port)
     }
 
     /// Subscribe to `request`'s eventgroup whenever its service is offered.
@@ -527,6 +446,118 @@ impl ServerConfig {
         }
     }
 
+    fn validate(&self) -> Result<(), Error> {
+        self.check_ttl()?;
+        if !self.sd_multicast.ip().is_multicast() || self.sd_multicast.port() == 0 {
+            return Err(Error::InvalidSdMulticast(self.sd_multicast));
+        }
+        Ok(())
+    }
+
+    fn check_ttl(&self) -> Result<(), Error> {
+        let offer_ttl = self.offering.as_ref().map(|offering| offering.ttl);
+        let ttls = offer_ttl
+            .into_iter()
+            .chain(self.consumed_eventgroups.iter().map(|r| r.ttl));
+        for ttl in ttls {
+            if !(1..=crate::protocol::sd::MAX_TTL).contains(&ttl) {
+                return Err(build_error(crate::sd_codec::BuildError::InvalidTtl(ttl)));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Offering {
+    /// An offering of `service` with development-friendly defaults that
+    /// production callers will typically override via the fluent setters:
+    ///
+    /// | Field | Default | Override via |
+    /// |---|---|---|
+    /// | `minor_version` | `0` | [`Self::with_minor_version`] |
+    /// | `ttl` | 3 seconds (typical for SOME/IP) | [`Self::with_ttl`] |
+    /// | `event_group_ids` | empty (any group accepted) | [`Self::with_event_group`] |
+    /// | `local_port` | `0` (kernel-assigned ephemeral) | [`Self::with_local_port`] |
+    /// | `announce` | `true` | [`Self::with_announce`] |
+    /// | `accepted_offers` | empty | [`Self::with_accepted_offer`] |
+    #[must_use]
+    pub fn new(service: ServiceInstance) -> Self {
+        Self {
+            service,
+            minor_version: 0,
+            ttl: 3,
+            event_group_ids: heapless::Vec::new(),
+            local_port: 0,
+            announce: true,
+            accepted_offers: heapless::Vec::new(),
+        }
+    }
+
+    /// Set the local UDP port the server listens on for subscription
+    /// requests and unicast traffic. Defaults to `0` from
+    /// [`Self::new`] (kernel-assigned ephemeral port), which is fine
+    /// for tests but cannot be discovered by external peers and
+    /// should be set explicitly in production.
+    #[must_use]
+    pub fn with_local_port(mut self, local_port: u16) -> Self {
+        self.local_port = local_port;
+        self
+    }
+
+    /// Returns `true` if `event_group_id` is registered, OR
+    /// [`Self::event_group_ids`] is empty (validation disabled).
+    #[must_use]
+    pub fn accepts_event_group(&self, event_group_id: u16) -> bool {
+        self.event_group_ids.is_empty() || self.event_group_ids.contains(&event_group_id)
+    }
+
+    /// Register an additional co-offered `(service, instance, event_group)`
+    /// this receive loop will accept `SubscribeEventGroup` for. See
+    /// [`Self::accepted_offers`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if more than [`ServerConfig::ACCEPTED_OFFERS_CAP`] offers have been
+    /// registered. Use [`Self::try_with_accepted_offer`] for the fallible
+    /// variant.
+    #[must_use]
+    pub fn with_accepted_offer(mut self, service: ServiceInstance, event_group_id: u16) -> Self {
+        self.accepted_offers
+            .push(AcceptedOffer {
+                service,
+                event_group_id,
+            })
+            .expect("accepted_offers capacity exceeded");
+        self
+    }
+
+    /// Fallible counterpart to [`Self::with_accepted_offer`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the unmodified offering (in `Err`) if registering would exceed
+    /// [`ServerConfig::ACCEPTED_OFFERS_CAP`].
+    #[allow(clippy::result_large_err)]
+    #[must_use = "the returned `Result` carries the (possibly-modified) offering — drop is silent"]
+    pub fn try_with_accepted_offer(
+        mut self,
+        service: ServiceInstance,
+        event_group_id: u16,
+    ) -> Result<Self, Self> {
+        if self
+            .accepted_offers
+            .push(AcceptedOffer {
+                service,
+                event_group_id,
+            })
+            .is_ok()
+        {
+            Ok(self)
+        } else {
+            Err(self)
+        }
+    }
+
     /// Returns `true` if `(service, event_group_id)` is registered in
     /// [`Self::accepted_offers`].
     #[must_use]
@@ -535,21 +566,6 @@ impl ServerConfig {
             service,
             event_group_id,
         })
-    }
-
-    // ── Fluent builder ───────────────────────────────────────────────
-    //
-    // Each `with_*` setter consumes and returns `self` so callers can
-    // chain overrides starting from `Self::new(...)`. The struct's
-    // public fields stay available; the builder is just a less-noisy
-    // path for the common "constructor + a couple of overrides" shape.
-
-    /// Set the SOME/IP major version. Defaults to `1` from
-    /// [`Self::new`].
-    #[must_use]
-    pub fn with_major_version(mut self, major_version: u8) -> Self {
-        self.major_version = major_version;
-        self
     }
 
     /// Set the SOME/IP minor version. Defaults to `0` from
@@ -575,38 +591,20 @@ impl ServerConfig {
         self
     }
 
-    /// The `OfferService` request for this config's service.
-    pub(crate) fn offer_request(&self) -> crate::sd_codec::OfferServiceRequest {
+    /// The `OfferService` request for this service at `interface`.
+    pub(crate) fn offer_request(
+        &self,
+        interface: Ipv4Addr,
+    ) -> crate::sd_codec::OfferServiceRequest {
         crate::sd_codec::OfferServiceRequest {
-            service_id: self.service_id,
-            instance_id: self.instance_id,
-            major_version: self.major_version,
+            service_id: self.service.service_id(),
+            instance_id: self.service.instance_id(),
+            major_version: self.service.major_version(),
             minor_version: self.minor_version,
             ttl: self.ttl,
-            local_ip: self.interface,
+            local_ip: interface,
             unicast_port: self.local_port,
         }
-    }
-
-    fn validate(&self) -> Result<(), Error> {
-        self.check_ttl()?;
-        if !self.sd_multicast.ip().is_multicast() || self.sd_multicast.port() == 0 {
-            return Err(Error::InvalidSdMulticast(self.sd_multicast));
-        }
-        Ok(())
-    }
-
-    fn check_ttl(&self) -> Result<(), Error> {
-        let offer_ttl = self.offers_service.then_some(self.ttl);
-        let ttls = offer_ttl
-            .into_iter()
-            .chain(self.consumed_eventgroups.iter().map(|r| r.ttl));
-        for ttl in ttls {
-            if !(1..=crate::protocol::sd::MAX_TTL).contains(&ttl) {
-                return Err(build_error(crate::sd_codec::BuildError::InvalidTtl(ttl)));
-            }
-        }
-        Ok(())
     }
 
     /// Append an event-group ID to the registered set. Subscriptions
@@ -615,7 +613,7 @@ impl ServerConfig {
     ///
     /// # Panics
     ///
-    /// Panics if more than [`Self::EVENT_GROUP_IDS_CAP`] groups have
+    /// Panics if more than [`ServerConfig::EVENT_GROUP_IDS_CAP`] groups have
     /// been registered. Use [`Self::try_with_event_group`] for the
     /// fallible variant.
     #[must_use]
@@ -630,13 +628,10 @@ impl ServerConfig {
     ///
     /// # Errors
     ///
-    /// Returns the unmodified config (in `Err`) if registering would
-    /// exceed [`Self::EVENT_GROUP_IDS_CAP`].
-    // Large `Err` is inherent to the fallible-builder pattern (the config is
-    // returned for recovery); surfaced here once `accepted_offers` grew
-    // `ServerConfig` past the lint threshold.
+    /// Returns the unmodified offering (in `Err`) if registering would
+    /// exceed [`ServerConfig::EVENT_GROUP_IDS_CAP`].
     #[allow(clippy::result_large_err)]
-    #[must_use = "the returned `Result` carries the (possibly-modified) config — drop is silent"]
+    #[must_use = "the returned `Result` carries the (possibly-modified) offering — drop is silent"]
     pub fn try_with_event_group(mut self, event_group_id: u16) -> Result<Self, Self> {
         if self.event_group_ids.push(event_group_id).is_ok() {
             Ok(self)
@@ -714,11 +709,12 @@ where
 /// ```no_run
 /// # #[cfg(feature = "server-tokio")]
 /// # async fn demo() -> Result<(), simple_someip::server::Error> {
-/// use simple_someip::{Server, ServerDeps};
-/// use simple_someip::server::ServerConfig;
+/// use simple_someip::{Server, ServerDeps, ServiceInstance};
+/// use simple_someip::server::{Offering, ServerConfig};
 /// use std::net::Ipv4Addr;
 /// let deps = ServerDeps::tokio();
-/// let config = ServerConfig::new(0x1234, 1).with_interface(Ipv4Addr::LOCALHOST).with_local_port(0);
+/// let service = ServiceInstance::new(0x1234, 1, 1).expect("not a wildcard");
+/// let config = ServerConfig::new(Offering::new(service)).with_interface(Ipv4Addr::LOCALHOST);
 /// // The binding-site type fixes Server's `H`/`Hsd`/`Hep` to their
 /// // `Arc<…>` defaults so type inference doesn't have to chase them.
 /// let (_server, _handles, _run): (Server<_, _, _, _>, _, _) =
@@ -857,12 +853,11 @@ where
 /// ```no_run
 /// # #[cfg(feature = "server-tokio")]
 /// # async fn demo() -> Result<(), simple_someip::server::Error> {
-/// use simple_someip::Server;
-/// use simple_someip::server::ServerConfig;
+/// use simple_someip::{Server, ServiceInstance};
+/// use simple_someip::server::{Offering, ServerConfig};
 /// use std::net::Ipv4Addr;
-/// let config = ServerConfig::new(0x1234, 1)
-///     .with_interface(Ipv4Addr::LOCALHOST)
-///     .with_local_port(0);
+/// let service = ServiceInstance::new(0x1234, 1, 1).expect("not a wildcard");
+/// let config = ServerConfig::new(Offering::new(service)).with_interface(Ipv4Addr::LOCALHOST);
 /// let (_server, handles, run) = Server::new(config).await?;
 /// let _publisher = handles.publisher;
 /// tokio::spawn(run);
@@ -1182,17 +1177,16 @@ impl
     /// destructuring the [`EventPublisher`] up front, and a single
     /// combined run-future the caller spawns to drive both the
     /// receive loop and (unless suppressed via
-    /// [`ServerConfig::with_announce`]) the SD announcement loop.
+    /// [`Offering::with_announce`]) the SD announcement loop.
     ///
     /// ```no_run
     /// # #[cfg(feature = "server-tokio")]
     /// # async fn demo() -> Result<(), simple_someip::server::Error> {
-    /// use simple_someip::Server;
-    /// use simple_someip::server::ServerConfig;
+    /// use simple_someip::{Server, ServiceInstance};
+    /// use simple_someip::server::{Offering, ServerConfig};
     /// use std::net::Ipv4Addr;
-    /// let config = ServerConfig::new(0x1234, 1)
-    ///     .with_interface(Ipv4Addr::LOCALHOST)
-    ///     .with_local_port(0);
+    /// let service = ServiceInstance::new(0x1234, 1, 1).expect("not a wildcard");
+    /// let config = ServerConfig::new(Offering::new(service)).with_interface(Ipv4Addr::LOCALHOST);
     /// let (_server, handles, run) = Server::new(config).await?;
     /// let _publisher = handles.publisher;
     /// tokio::spawn(run);
@@ -1203,7 +1197,7 @@ impl
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] carrying
-    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if [`Offering::ttl`], or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
@@ -1246,7 +1240,7 @@ impl
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] carrying
-    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if [`Offering::ttl`], or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
@@ -1277,7 +1271,7 @@ impl
 
     /// Create a passive SOME/IP server.
     ///
-    /// A passive server binds its unicast socket at `config.local_port` as
+    /// A passive server binds its unicast socket at [`Offering::local_port`] as
     /// usual (so `publish_raw_event` has a real source port matching the
     /// endpoint advertised in external `OfferService` messages), but binds
     /// its SD socket to an ephemeral port instead of the SOME/IP SD port
@@ -1296,7 +1290,7 @@ impl
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] carrying
-    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if [`Offering::ttl`], or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
@@ -1353,7 +1347,7 @@ where
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] carrying
-    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if [`Offering::ttl`], or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
@@ -1387,20 +1381,17 @@ where
         // through `WrappableSocketHandle` so the rest of the Server
         // sees the caller's chosen shared-storage type rather than
         // the raw `F::Socket`.
-        let unicast_addr = SocketAddrV4::new(config.interface, config.local_port);
+        let unicast_addr = SocketAddrV4::new(config.interface, config.local_port());
         let unicast_raw = factory.bind(unicast_addr, &SocketOptions::new()).await?;
         let bound_port = unicast_raw.local_addr()?.port();
         let unicast_socket: H = H::wrap(unicast_raw);
         // If the caller passed local_port = 0, the kernel picked an
         // ephemeral port. Back-fill the config so SD offers and event
         // publishers advertise the actual bound port instead of 0.
-        config.local_port = bound_port;
-        crate::log::info!(
-            "Server bound to {}:{} for service 0x{:04X}",
-            config.interface,
-            bound_port,
-            config.service_id
-        );
+        if let Some(offering) = &mut config.offering {
+            offering.local_port = bound_port;
+        }
+        crate::log::info!("Server bound to {}:{}", config.interface, bound_port,);
 
         let mut sd_opts = SocketOptions::new();
         sd_opts.reuse_address = true;
@@ -1456,7 +1447,7 @@ where
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] carrying
-    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if [`Offering::ttl`], or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
@@ -1484,17 +1475,18 @@ where
         } = deps;
 
         // Bind unicast socket at the configured local_port.
-        let unicast_addr = SocketAddrV4::new(config.interface, config.local_port);
+        let unicast_addr = SocketAddrV4::new(config.interface, config.local_port());
         let unicast_raw = factory.bind(unicast_addr, &SocketOptions::new()).await?;
         let bound_port = unicast_raw.local_addr()?.port();
         let unicast_socket: H = H::wrap(unicast_raw);
         // Back-fill the actual bound port if the caller passed 0.
-        config.local_port = bound_port;
+        if let Some(offering) = &mut config.offering {
+            offering.local_port = bound_port;
+        }
         crate::log::info!(
-            "Passive server bound to {}:{} for service 0x{:04X}",
+            "Passive server bound to {}:{}",
             config.interface,
             bound_port,
-            config.service_id
         );
 
         // Placeholder SD socket on an ephemeral port — no multicast options,
@@ -1564,7 +1556,7 @@ where
     /// handles into whatever shared-storage their target uses
     /// (`Arc<...>` on alloc, `&'static ...` on no-alloc).
     ///
-    /// `config.local_port` is back-filled from
+    /// [`Offering::local_port`] is back-filled from
     /// `unicast_socket.local_addr()?.port()` *only when the caller
     /// passed `local_port = 0`*. If the caller supplied a non-zero
     /// `local_port`, it must equal the actual bound port — otherwise
@@ -1575,14 +1567,14 @@ where
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] carrying
-    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if [`Offering::ttl`], or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
     /// Returns an error if querying `unicast_socket.local_addr()`
     /// fails on the underlying transport, or
-    /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
+    /// [`Error::InvalidUsage`] if [`Offering::local_port`] is non-zero
     /// and does not equal the unicast socket's bound port.
     pub fn new_with_handles(
         deps: ServerStorage<F, Tm, R, Sub, H, Hsd, Hep>,
@@ -1590,23 +1582,24 @@ where
     ) -> Result<Self, Error> {
         config.validate()?;
         let bound_port = deps.unicast_socket.get().local_addr()?.port();
-        if config.local_port == 0 {
-            config.local_port = bound_port;
-        } else if config.local_port != bound_port {
+        if let Some(offering) = &mut config.offering
+            && offering.local_port == 0
+        {
+            offering.local_port = bound_port;
+        } else if config.local_port() != bound_port {
             crate::log::error!(
-                "ServerConfig.local_port ({}) does not match unicast socket's \
+                "Offering.local_port ({}) does not match unicast socket's \
                  bound port ({}); SD offers would lie. Pass local_port = 0 to \
                  auto-fill from the bound port instead.",
-                config.local_port,
+                config.local_port(),
                 bound_port,
             );
             return Err(Error::InvalidUsage("new_with_handles_local_port_mismatch"));
         }
         crate::log::info!(
-            "Server (handles) bound to {}:{} for service 0x{:04X}",
+            "Server (handles) bound to {}:{}",
             config.interface,
             bound_port,
-            config.service_id
         );
 
         Ok(Self {
@@ -1645,14 +1638,14 @@ where
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] carrying
-    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if `config.ttl`, or
+    /// [`InvalidTtl`](crate::protocol::sd::Error::InvalidTtl) if [`Offering::ttl`], or
     /// the TTL of an entry in [`ServerConfig::consumed_eventgroups`], is outside
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
     /// Returns an error if querying `unicast_socket.local_addr()`
     /// fails on the underlying transport, or
-    /// [`Error::InvalidUsage`] if `config.local_port` is non-zero
+    /// [`Error::InvalidUsage`] if [`Offering::local_port`] is non-zero
     /// and does not equal the unicast socket's bound port (same
     /// back-fill-only-on-zero discipline as
     /// [`Self::new_with_handles`]).
@@ -1662,14 +1655,16 @@ where
     ) -> Result<Self, Error> {
         config.validate()?;
         let bound_port = deps.unicast_socket.get().local_addr()?.port();
-        if config.local_port == 0 {
-            config.local_port = bound_port;
-        } else if config.local_port != bound_port {
+        if let Some(offering) = &mut config.offering
+            && offering.local_port == 0
+        {
+            offering.local_port = bound_port;
+        } else if config.local_port() != bound_port {
             crate::log::error!(
-                "ServerConfig.local_port ({}) does not match unicast socket's \
+                "Offering.local_port ({}) does not match unicast socket's \
                  bound port ({}); event publishers would advertise a port \
                  nothing is listening on. Pass local_port = 0 to auto-fill.",
-                config.local_port,
+                config.local_port(),
                 bound_port,
             );
             return Err(Error::InvalidUsage(
@@ -1677,10 +1672,9 @@ where
             ));
         }
         crate::log::info!(
-            "Passive server (handles) bound to {}:{} for service 0x{:04X}",
+            "Passive server (handles) bound to {}:{}",
             config.interface,
             bound_port,
-            config.service_id
         );
 
         Ok(Self {
@@ -1743,7 +1737,7 @@ where
     /// 1-Hz `OfferService` announcement loop. The two are combined
     /// into a single future so callers cannot forget to spawn the
     /// announcement side; passing
-    /// [`ServerConfig::with_announce`] with `false` suppresses the
+    /// [`Offering::with_announce`] with `false` suppresses the
     /// announcement arm for dispatcher topologies where a co-located
     /// `Client` drives SD on the server's behalf.
     ///
@@ -1813,10 +1807,9 @@ where
                 .is_err()
             {
                 crate::log::warn!(
-                    "Server::run_with_buffers already started for service 0x{:04X}; \
+                    "Server::run_with_buffers already started; \
                      a second run-future cannot share the same sockets \
-                     and session counter",
-                    config.service_id
+                     and session counter"
                 );
                 return Err(Error::InvalidUsage("server_already_running"));
             }
@@ -1892,8 +1885,12 @@ where
         let sd_state = self.sd_state.clone();
         let timer = self.timer.clone();
         async move {
+            let Some(offering) = &config.offering else {
+                return core::future::pending().await;
+            };
             runtime::announce_loop(
                 &config,
+                offering,
                 sd_socket.get(),
                 sd_state.get(),
                 &timer,
@@ -1949,8 +1946,12 @@ where
             // that cannot use the allocator should call
             // `announce_only_with_buffer` with a static scratch buffer.
             let mut announce_send_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
+            let Some(offering) = &config.offering else {
+                return core::future::pending().await;
+            };
             runtime::announce_loop(
                 &config,
+                offering,
                 sd_socket.get(),
                 sd_state.get(),
                 &timer,
@@ -1963,7 +1964,7 @@ where
     /// Run the server event loop with heap-allocated 64 KiB receive
     /// buffers — the convenience entry point for std and alloc-using
     /// bare-metal builds. Drives both the receive loop and (unless
-    /// suppressed via [`ServerConfig::with_announce`]) the
+    /// suppressed via [`Offering::with_announce`]) the
     /// announcement loop in a single future.
     ///
     /// The returned future is `Send + 'static` under the where-clause
@@ -2040,10 +2041,9 @@ where
                 .is_err()
             {
                 crate::log::warn!(
-                    "Server::run already started for service 0x{:04X}; \
+                    "Server::run already started; \
                      a second run-future cannot share the same sockets \
-                     and session counter",
-                    config.service_id
+                     and session counter"
                 );
                 return Err(Error::InvalidUsage("server_already_running"));
             }
@@ -2104,9 +2104,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_creation() {
-        let config = ServerConfig::new(0x5B, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(30682);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0x5B, 1, 1).unwrap()).with_local_port(30682),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
 
         let result = TestServer::new(config).await;
         assert!(result.is_ok());
@@ -2114,31 +2115,39 @@ mod tests {
 
     #[test]
     fn server_config_builder_chain_overrides_each_field() {
-        let cfg = ServerConfig::new(0x5B, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(30683)
-            .with_major_version(2)
-            .with_minor_version(7)
-            .with_ttl(core::time::Duration::from_secs(10))
-            .with_event_group(0x42)
-            .with_event_group(0x43);
+        let cfg = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0x5B, 1, 2).unwrap())
+                .with_local_port(30683)
+                .with_minor_version(7)
+                .with_ttl(core::time::Duration::from_secs(10))
+                .with_event_group(0x42)
+                .with_event_group(0x43),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         assert_eq!(cfg.interface, Ipv4Addr::LOCALHOST);
-        assert_eq!(cfg.local_port, 30683);
-        assert_eq!(cfg.major_version, 2);
-        assert_eq!(cfg.minor_version, 7);
-        assert_eq!(cfg.ttl, 10);
-        assert!(cfg.accepts_event_group(0x42));
-        assert!(cfg.accepts_event_group(0x43));
-        assert!(!cfg.accepts_event_group(0x44));
+        assert_eq!(cfg.local_port(), 30683);
+        assert_eq!(cfg.test_offering().service.major_version(), 2);
+        assert_eq!(cfg.test_offering().minor_version, 7);
+        assert_eq!(cfg.test_offering().ttl, 10);
+        assert!(cfg.test_offering().accepts_event_group(0x42));
+        assert!(cfg.test_offering().accepts_event_group(0x43));
+        assert!(!cfg.test_offering().accepts_event_group(0x44));
     }
 
     #[test]
     fn server_config_with_ttl_truncates_subsecond_precision() {
-        let cfg = ServerConfig::new(0x5B, 1).with_ttl(core::time::Duration::from_millis(2_999));
-        assert_eq!(cfg.ttl, 2, "sub-second is truncated, not rounded");
+        let cfg = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0x5B, 1, 1).unwrap())
+                .with_ttl(core::time::Duration::from_millis(2_999)),
+        );
+        assert_eq!(
+            cfg.test_offering().ttl,
+            2,
+            "sub-second is truncated, not rounded"
+        );
     }
 
-    /// `announce` defaults to `true` from `ServerConfig::new`, and
+    /// `announce` defaults to `true` from `Offering::new`, and
     /// `with_announce(false)` flips it. The dispatcher topology in
     /// `examples/client_server` depends on this default-vs-override
     /// being load-bearing — see
@@ -2147,10 +2156,10 @@ mod tests {
     /// honours the flag.
     #[test]
     fn server_config_with_announce_toggles_field() {
-        let default_cfg = ServerConfig::new(0x5B, 1);
+        let default_cfg = Offering::new(ServiceInstance::new(0x5B, 1, 1).unwrap());
         assert!(
             default_cfg.announce,
-            "announce must default to true so a fresh `ServerConfig` emits SD offers"
+            "announce must default to true so a fresh `Offering` emits SD offers"
         );
 
         let suppressed = default_cfg.clone().with_announce(false);
@@ -2168,22 +2177,25 @@ mod tests {
 
     #[test]
     fn server_config_with_ttl_clamps_to_the_largest_entry_ttl() {
-        let cfg = ServerConfig::new(0x5B, 1)
-            .with_ttl(core::time::Duration::from_secs(u64::from(sd::MAX_TTL) + 1));
-        assert_eq!(cfg.ttl, sd::MAX_TTL);
+        let cfg = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0x5B, 1, 1).unwrap())
+                .with_ttl(core::time::Duration::from_secs(u64::from(sd::MAX_TTL) + 1)),
+        );
+        assert_eq!(cfg.test_offering().ttl, sd::MAX_TTL);
     }
 
     #[tokio::test]
     async fn server_new_rejects_a_consumed_eventgroup_ttl_outside_the_entry_range() {
         for ttl in [0, sd::MAX_TTL + 1] {
             let config =
-                ServerConfig::new(0x5B, 1).with_consumed_eventgroup(SubscribeEventgroupRequest {
-                    service: ServiceInstance::new(0x5C, 1, 1).unwrap(),
-                    event_group_id: 1,
-                    ttl,
-                    local_ip: Ipv4Addr::LOCALHOST,
-                    local_rx_port: 40100,
-                });
+                ServerConfig::new(Offering::new(ServiceInstance::new(0x5B, 1, 1).unwrap()))
+                    .with_consumed_eventgroup(SubscribeEventgroupRequest {
+                        service: ServiceInstance::new(0x5C, 1, 1).unwrap(),
+                        event_group_id: 1,
+                        ttl,
+                        local_ip: Ipv4Addr::LOCALHOST,
+                        local_rx_port: 40100,
+                    });
             let result = Server::new(config).await;
             assert!(
                 matches!(
@@ -2202,13 +2214,19 @@ mod tests {
             SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), sd::MULTICAST_PORT),
             SocketAddrV4::new(sd::MULTICAST_IP, 0),
         ] {
-            let config = ServerConfig::new(0x1234, 1).with_sd_multicast(address);
+            let config =
+                ServerConfig::new(Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()))
+                    .with_sd_multicast(address);
             assert!(
                 matches!(config.validate(), Err(Error::InvalidSdMulticast(a)) if a == address),
                 "{address}"
             );
         }
-        assert!(ServerConfig::new(0x1234, 1).validate().is_ok());
+        assert!(
+            ServerConfig::new(Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()))
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2228,8 +2246,9 @@ mod tests {
     #[tokio::test]
     async fn server_new_rejects_a_ttl_outside_the_entry_range() {
         for ttl in [0, sd::MAX_TTL + 1] {
-            let mut config = ServerConfig::new(0x5B, 1);
-            config.ttl = ttl;
+            let mut config =
+                ServerConfig::new(Offering::new(ServiceInstance::new(0x5B, 1, 1).unwrap()));
+            config.offering.as_mut().unwrap().ttl = ttl;
             let result = Server::new(config).await;
             assert!(
                 matches!(
@@ -2244,19 +2263,21 @@ mod tests {
 
     #[test]
     fn server_config_with_ttl_raises_subsecond_to_one_second() {
-        let cfg = ServerConfig::new(0x5B, 1).with_ttl(core::time::Duration::from_millis(500));
-        assert_eq!(cfg.ttl, 1);
+        let cfg = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0x5B, 1, 1).unwrap())
+                .with_ttl(core::time::Duration::from_millis(500)),
+        );
+        assert_eq!(cfg.test_offering().ttl, 1);
     }
 
     #[test]
     fn server_config_try_with_event_group_rejects_at_capacity() {
-        let mut cfg = ServerConfig::new(0x5B, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(30684);
+        let mut cfg =
+            Offering::new(ServiceInstance::new(0x5B, 1, 1).unwrap()).with_local_port(30684);
         for i in 0..u16::try_from(ServerConfig::EVENT_GROUP_IDS_CAP).unwrap() {
             cfg = cfg.try_with_event_group(i).expect("under cap");
         }
-        // One more should be rejected and return the unmodified config.
+        // One more should be rejected and return the unmodified offering.
         let cap = ServerConfig::EVENT_GROUP_IDS_CAP;
         let result = cfg.try_with_event_group(0xFFFF);
         let returned = result.expect_err("at-cap insert must fail");
@@ -2268,7 +2289,7 @@ mod tests {
     //
     // These constructors take pre-built socket handles instead of
     // calling `factory.bind()` themselves, and validate that the
-    // caller-supplied `config.local_port` matches the actual bound
+    // caller-supplied `config.local_port()` matches the actual bound
     // port (back-fill-only-on-zero). The validation logic only
     // exercises through these tests; the production code paths use
     // `new` / `new_with_deps`.
@@ -2347,14 +2368,16 @@ mod tests {
             "test precondition: kernel must assign a real ephemeral port",
         );
         // Port 0 → caller asks for back-fill from the bound port.
-        let config = ServerConfig::new(0xFE10, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(0);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0xFE10, 1, 1).unwrap()).with_local_port(0),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let server = TestServer::new_with_handles(handles, config)
             .expect("new_with_handles must accept local_port = 0");
         assert_eq!(
-            server.config.local_port, bound_port,
-            "config.local_port must be back-filled from the unicast socket's bound port",
+            server.config.local_port(),
+            bound_port,
+            "config.local_port() must be back-filled from the unicast socket's bound port",
         );
     }
 
@@ -2362,12 +2385,13 @@ mod tests {
     async fn new_with_handles_accepts_matching_local_port() {
         let (handles, bound_port) = build_test_handles(0).await;
         // Caller supplies the matching port explicitly.
-        let config = ServerConfig::new(0xFE11, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(bound_port);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0xFE11, 1, 1).unwrap()).with_local_port(bound_port),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let server = TestServer::new_with_handles(handles, config)
             .expect("matching local_port must be accepted");
-        assert_eq!(server.config.local_port, bound_port);
+        assert_eq!(server.config.local_port(), bound_port);
     }
 
     #[tokio::test]
@@ -2380,9 +2404,10 @@ mod tests {
         // distinct from `bound_port`.
         let bogus_port = bound_port.wrapping_add(1);
         assert_ne!(bogus_port, bound_port);
-        let config = ServerConfig::new(0xFE12, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(bogus_port);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0xFE12, 1, 1).unwrap()).with_local_port(bogus_port),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let result = TestServer::new_with_handles(handles, config);
         match result {
             Err(Error::InvalidUsage(tag)) => {
@@ -2400,12 +2425,13 @@ mod tests {
     #[tokio::test]
     async fn new_passive_with_handles_back_fills_local_port_on_zero() {
         let (handles, bound_port) = build_test_handles(0).await;
-        let config = ServerConfig::new(0xFE13, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(0);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0xFE13, 1, 1).unwrap()).with_local_port(0),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let server = TestServer::new_passive_with_handles(handles, config)
             .expect("new_passive_with_handles must accept local_port = 0");
-        assert_eq!(server.config.local_port, bound_port);
+        assert_eq!(server.config.local_port(), bound_port);
         assert!(server.is_passive, "passive constructor must set is_passive");
     }
 
@@ -2414,9 +2440,10 @@ mod tests {
         let (handles, bound_port) = build_test_handles(0).await;
         let bogus_port = bound_port.wrapping_add(1);
         assert_ne!(bogus_port, bound_port);
-        let config = ServerConfig::new(0xFE14, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(bogus_port);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0xFE14, 1, 1).unwrap()).with_local_port(bogus_port),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let result = TestServer::new_passive_with_handles(handles, config);
         match result {
             Err(Error::InvalidUsage(tag)) => {
@@ -2433,9 +2460,10 @@ mod tests {
     #[tokio::test]
     async fn passive_server_run_with_buffers_returns_invalid_usage() {
         let (handles, _) = build_test_handles(0).await;
-        let config = ServerConfig::new(0xFE15, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(0);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0xFE15, 1, 1).unwrap()).with_local_port(0),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let server = TestServer::new_passive_with_handles(handles, config).expect("passive ctor");
         let mut unicast_buf = vec![0u8; 1500];
         let mut sd_buf = vec![0u8; 1500];
@@ -2471,27 +2499,30 @@ mod tests {
     /// working) and validate strictly when populated.
     #[test]
     fn server_config_accepts_event_group_empty_means_any() {
-        let config = ServerConfig::new(0x5B, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(30490);
-        assert!(config.event_group_ids.is_empty());
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0x5B, 1, 1).unwrap()).with_local_port(30490),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
+        assert!(config.test_offering().event_group_ids.is_empty());
         // Empty list: every group accepted.
-        assert!(config.accepts_event_group(0x0001));
-        assert!(config.accepts_event_group(0xBEEF));
-        assert!(config.accepts_event_group(0xFFFF));
+        assert!(config.test_offering().accepts_event_group(0x0001));
+        assert!(config.test_offering().accepts_event_group(0xBEEF));
+        assert!(config.test_offering().accepts_event_group(0xFFFF));
     }
 
     #[test]
     fn server_config_accepts_event_group_populated_validates() {
-        let mut config = ServerConfig::new(0x5B, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(30490);
-        config.event_group_ids.push(0x0001).unwrap();
-        config.event_group_ids.push(0x0042).unwrap();
-        assert!(config.accepts_event_group(0x0001));
-        assert!(config.accepts_event_group(0x0042));
-        assert!(!config.accepts_event_group(0x0002));
-        assert!(!config.accepts_event_group(0xBEEF));
+        let mut config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0x5B, 1, 1).unwrap()).with_local_port(30490),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
+        let offering = config.offering.as_mut().unwrap();
+        offering.event_group_ids.push(0x0001).unwrap();
+        offering.event_group_ids.push(0x0042).unwrap();
+        assert!(config.test_offering().accepts_event_group(0x0001));
+        assert!(config.test_offering().accepts_event_group(0x0042));
+        assert!(!config.test_offering().accepts_event_group(0x0002));
+        assert!(!config.test_offering().accepts_event_group(0xBEEF));
     }
 
     /// Regression for H3: when `subscribe` succeeds but the
@@ -2580,9 +2611,10 @@ mod tests {
             non_sd_observer: None,
             offer_observer: None,
         };
-        let config = ServerConfig::new(0x5B, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(0);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0x5B, 1, 1).unwrap()).with_local_port(0),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         // Explicit `Arc<FailingSocket>` H so the compiler doesn't have
         // to invent it across the deps-bundle indirection.
         let (server, _handles, _run): (Server<_, _, _, _, Arc<FailingSocket>>, _, _) =
@@ -2649,9 +2681,10 @@ mod tests {
         // when the test binary runs tests in parallel. The SD socket binds
         // the SD multicast port (30490) and relies on SO_REUSEPORT, the same
         // as `test_server_creation`.
-        let config = ServerConfig::new(0x5C, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(30683);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0x5C, 1, 1).unwrap()).with_local_port(30683),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
 
         let (server, _handles, _run) = TestServer::new_with_loopback(config, true)
             .await
@@ -2699,13 +2732,15 @@ mod tests {
     /// Helper: create a server on an ephemeral port and return (Server, port)
     async fn create_test_server(service_id: u16, instance_id: u16) -> (TestServer, u16) {
         // Use port 0 to get an ephemeral port
-        let config = ServerConfig::new(service_id, instance_id)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(0);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(service_id, instance_id, 1).unwrap())
+                .with_local_port(0),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let (server, _handles, _run) = TestServer::new(config)
             .await
             .expect("Failed to create server");
-        // Constructor already back-filled `config.local_port` from the
+        // Constructor already back-filled `config.local_port()` from the
         // kernel-assigned bound port; just read it back via
         // `unicast_local_addr` for the test return.
         let port = match server.unicast_local_addr().unwrap() {
@@ -3191,6 +3226,7 @@ mod tests {
         runtime::send_unicast_offer(
             &mut [0u8; crate::UDP_BUFFER_SIZE],
             &server.config,
+            server.config.test_offering(),
             server.sd_socket.get(),
             server.sd_state.get(),
             recv_addr,
@@ -3858,9 +3894,11 @@ mod tests {
     /// Construct a passive server on loopback with an ephemeral unicast
     /// port. Tests use this as a standard fixture.
     async fn make_passive_server(service_id: u16, instance_id: u16) -> TestServer {
-        let config = ServerConfig::new(service_id, instance_id)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(0);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(service_id, instance_id, 1).unwrap())
+                .with_local_port(0),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let (server, _handles, _run) = TestServer::new_passive(config)
             .await
             .expect("new_passive should succeed");
@@ -4053,9 +4091,10 @@ mod tests {
             rs
         };
 
-        let config = ServerConfig::new(SID, IID)
-            .with_interface(iface)
-            .with_local_port(30501);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(SID, IID, 1).unwrap()).with_local_port(30501),
+        )
+        .with_interface(iface);
         let (_server, _handles, run) = TestServer::new_with_loopback(config, true).await.unwrap();
         // `Server::run` is the combined receive+announce future. The
         // receive arm here just waits for traffic that never arrives
@@ -4152,10 +4191,12 @@ mod tests {
             rs
         };
 
-        let config = ServerConfig::new(SID, IID)
-            .with_interface(iface)
-            .with_local_port(30502)
-            .with_announce(false);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(SID, IID, 1).unwrap())
+                .with_local_port(30502)
+                .with_announce(false),
+        )
+        .with_interface(iface);
         let (_server, _handles, run) = TestServer::new_with_loopback(config, true).await.unwrap();
         let handle = tokio::spawn(async move {
             let _ = run.await;
@@ -4236,9 +4277,11 @@ mod tests {
             core::net::SocketAddr::V6(_) => panic!("expected IPv4"),
         };
 
-        let config = ServerConfig::new(0x005C, 0x0001)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(blocker_port);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0x005C, 0x0001, 1).unwrap())
+                .with_local_port(blocker_port),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let result = TestServer::new_passive(config).await;
         let Err(err) = result else {
             panic!("new_passive must fail when the unicast port is taken");
@@ -4373,9 +4416,11 @@ mod tests {
         // Pick a service_id and unicast port that do not collide with
         // the other loopback-enabled server test in this file.
         let service_id = 0xFE02;
-        let config = ServerConfig::new(service_id, 0x43)
-            .with_interface(interface)
-            .with_local_port(30684);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(service_id, 0x43, 1).unwrap())
+                .with_local_port(30684),
+        )
+        .with_interface(interface);
 
         // Receiver joined to the SD multicast group on loopback.
         let raw_rx = socket2::Socket::new(
@@ -4444,9 +4489,10 @@ mod tests {
     async fn future_size_witness_tokio_server() {
         // Port 0: kernel-assigned, back-filled by the constructor —
         // avoids collisions with sibling tests running in parallel.
-        let config = ServerConfig::new(0x5B, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(0);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(0x5B, 1, 1).unwrap()).with_local_port(0),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let (_server, _handles, run) = TestServer::new(config).await.expect("Server::new");
 
         let run_size = core::mem::size_of_val(&run);

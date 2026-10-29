@@ -30,11 +30,12 @@ use crate::sd_codec::FindTarget;
 ///
 /// `buf` is a caller-provided scratch buffer used for encoding the outgoing
 /// frame. Returns [`Error::Capacity`]`("udp_buffer")` if the encoded frame
-/// does not fit in `buf`, a protocol error if `config.ttl` is outside
+/// does not fit in `buf`, a protocol error if `offering.ttl` is outside
 /// 1..=[`MAX_TTL`](sd::MAX_TTL), or the socket's transport error.
 pub(super) async fn send_unicast_offer<T>(
     buf: &mut [u8],
     config: &ServerConfig,
+    offering: &super::Offering,
     sd_socket: &T,
     sd_state: &SdStateManager,
     target: core::net::SocketAddr,
@@ -43,12 +44,12 @@ where
     T: TransportSocket,
 {
     let target_v4 = socket_addr_v4(target)?;
-    let total_len = sd_state.encode_offer(buf, config)?;
+    let total_len = sd_state.encode_offer(buf, offering, config.interface)?;
     sd_socket.send_to(&buf[..total_len], target_v4).await?;
     crate::log::debug!(
         "Sent unicast OfferService to {} for service 0x{:04X}",
         target,
-        config.service_id
+        offering.service.service_id()
     );
 
     Ok(())
@@ -90,7 +91,7 @@ where
 /// does not fit in `buf`.
 pub(super) async fn send_subscribe_ack_from_view<T>(
     buf: &mut [u8],
-    config: &ServerConfig,
+    offering: &super::Offering,
     sd_socket: &T,
     sd_state: &SdStateManager,
     entry_view: &sd::EntryView<'_>,
@@ -99,7 +100,15 @@ pub(super) async fn send_subscribe_ack_from_view<T>(
 where
     T: TransportSocket,
 {
-    send_subscribe_answer(buf, sd_socket, sd_state, entry_view, config.ttl, subscriber).await?;
+    send_subscribe_answer(
+        buf,
+        sd_socket,
+        sd_state,
+        entry_view,
+        offering.ttl,
+        subscriber,
+    )
+    .await?;
     crate::log::debug!(
         "Sent SubscribeAck to {} for service 0x{:04X}, eventgroup 0x{:04X}",
         subscriber,
@@ -223,23 +232,8 @@ where
                     entry_view.event_group_id()
                 );
 
-                // A co-offered `(service, instance, major_version,
-                // event_group)` registered via `with_accepted_offer` is
-                // accepted on this shared recv loop even though it is not the
-                // primary service — its tuple (major version included) is
-                // fully validated by the `accepts_offer` match, so the four
-                // single-service guards below are skipped for it. Empty
-                // `accepted_offers` ⇒ `co_offered` is always false ⇒ exact
-                // single-service behaviour.
-                let co_offered = entry_instance(entry_view).is_some_and(|instance| {
-                    config.accepts_offer(instance, entry_view.event_group_id())
-                });
-
-                if !co_offered && !config.offers_service() {
-                    crate::log::warn!(
-                        "Subscribe for service 0x{:04X} on a server that offers nothing",
-                        entry_view.service_id()
-                    );
+                let offering = accepting_offering(config.offering.as_ref(), entry_view);
+                if let Err(reason) = offering {
                     if let Err(e) = send_subscribe_nack_from_view(
                         send_buf,
                         config,
@@ -247,89 +241,15 @@ where
                         sd_state,
                         &entry_view,
                         sender,
-                        "service_not_offered",
+                        reason,
                     )
                     .await
                     {
                         crate::log::warn!("SubscribeNack send failed: {e}");
                     }
-                } else if !co_offered && entry_view.service_id() != config.service_id {
-                    crate::log::warn!(
-                        "Subscribe for wrong service: expected 0x{:04X}, got 0x{:04X}",
-                        config.service_id,
-                        entry_view.service_id()
-                    );
-                    if let Err(e) = send_subscribe_nack_from_view(
-                        send_buf,
-                        config,
-                        sd_socket,
-                        sd_state,
-                        &entry_view,
-                        sender,
-                        "wrong_service_id",
-                    )
-                    .await
-                    {
-                        crate::log::warn!("SubscribeNack send failed: {e}");
-                    }
-                } else if !co_offered && entry_view.instance_id() != config.instance_id {
-                    crate::log::warn!(
-                        "Subscribe for wrong instance: expected {}, got {}",
-                        config.instance_id,
-                        entry_view.instance_id()
-                    );
-                    if let Err(e) = send_subscribe_nack_from_view(
-                        send_buf,
-                        config,
-                        sd_socket,
-                        sd_state,
-                        &entry_view,
-                        sender,
-                        "wrong_instance_id",
-                    )
-                    .await
-                    {
-                        crate::log::warn!("SubscribeNack send failed: {e}");
-                    }
-                } else if !co_offered && entry_view.major_version() != config.major_version {
-                    crate::log::warn!(
-                        "Subscribe for wrong major_version: expected {}, got {}",
-                        config.major_version,
-                        entry_view.major_version()
-                    );
-                    if let Err(e) = send_subscribe_nack_from_view(
-                        send_buf,
-                        config,
-                        sd_socket,
-                        sd_state,
-                        &entry_view,
-                        sender,
-                        "wrong_major_version",
-                    )
-                    .await
-                    {
-                        crate::log::warn!("SubscribeNack send failed: {e}");
-                    }
-                } else if !co_offered && !config.accepts_event_group(entry_view.event_group_id()) {
-                    crate::log::warn!(
-                        "Subscribe for unknown event_group_id 0x{:04X} (service 0x{:04X})",
-                        entry_view.event_group_id(),
-                        entry_view.service_id()
-                    );
-                    if let Err(e) = send_subscribe_nack_from_view(
-                        send_buf,
-                        config,
-                        sd_socket,
-                        sd_state,
-                        &entry_view,
-                        sender,
-                        "unknown_event_group",
-                    )
-                    .await
-                    {
-                        crate::log::warn!("SubscribeNack send failed: {e}");
-                    }
-                } else if let Some(endpoint_addr) = extract_subscriber_endpoint(entry_options) {
+                } else if let Ok(offering) = offering
+                    && let Some(endpoint_addr) = extract_subscriber_endpoint(entry_options)
+                {
                     let subscribe_result = subscriptions
                         .subscribe(
                             entry_view.service_id(),
@@ -343,7 +263,7 @@ where
                         Ok(()) => {
                             if let Err(e) = send_subscribe_ack_from_view(
                                 send_buf,
-                                config,
+                                offering,
                                 sd_socket,
                                 sd_state,
                                 &entry_view,
@@ -411,17 +331,19 @@ where
             }
             sd::EntryType::FindService => {
                 let find_service_id = entry_view.service_id();
-                if config.offers_service()
-                    && (find_service_id == config.service_id || find_service_id == 0xFFFF)
+                if let Some(offering) = &config.offering
+                    && (find_service_id == offering.service.service_id()
+                        || find_service_id == 0xFFFF)
                 {
                     crate::log::debug!(
                         "Received FindService from {} for service 0x{:04X} (ours: 0x{:04X}), sending unicast offer",
                         sender,
                         find_service_id,
-                        config.service_id
+                        offering.service.service_id()
                     );
                     if let Err(e) =
-                        send_unicast_offer(send_buf, config, sd_socket, sd_state, sender).await
+                        send_unicast_offer(send_buf, config, offering, sd_socket, sd_state, sender)
+                            .await
                     {
                         crate::log::warn!("Unicast OfferService send failed: {e}");
                     }
@@ -515,6 +437,59 @@ fn entry_instance(entry: sd::EntryView<'_>) -> Option<ServiceInstance> {
     )
 }
 
+/// The offering that accepts the Subscribe `entry`: `offering` itself, or one
+/// of its [`accepted_offers`](super::Offering::accepted_offers). `Err` holds
+/// the reason for the `SubscribeNack`.
+fn accepting_offering<'a>(
+    offering: Option<&'a super::Offering>,
+    entry: sd::EntryView<'_>,
+) -> Result<&'a super::Offering, &'static str> {
+    let Some(offering) = offering else {
+        crate::log::warn!(
+            "Subscribe for service 0x{:04X} on a server that offers nothing",
+            entry.service_id()
+        );
+        return Err("service_not_offered");
+    };
+    if entry_instance(entry)
+        .is_some_and(|instance| offering.accepts_offer(instance, entry.event_group_id()))
+    {
+        return Ok(offering);
+    }
+    let ours = offering.service;
+    if entry.service_id() != ours.service_id() {
+        crate::log::warn!(
+            "Subscribe for wrong service: expected 0x{:04X}, got 0x{:04X}",
+            ours.service_id(),
+            entry.service_id()
+        );
+        Err("wrong_service_id")
+    } else if entry.instance_id() != ours.instance_id() {
+        crate::log::warn!(
+            "Subscribe for wrong instance: expected {}, got {}",
+            ours.instance_id(),
+            entry.instance_id()
+        );
+        Err("wrong_instance_id")
+    } else if entry.major_version() != ours.major_version() {
+        crate::log::warn!(
+            "Subscribe for wrong major_version: expected {}, got {}",
+            ours.major_version(),
+            entry.major_version()
+        );
+        Err("wrong_major_version")
+    } else if !offering.accepts_event_group(entry.event_group_id()) {
+        crate::log::warn!(
+            "Subscribe for unknown event_group_id 0x{:04X} (service 0x{:04X})",
+            entry.event_group_id(),
+            entry.service_id()
+        );
+        Err("unknown_event_group")
+    } else {
+        Ok(offering)
+    }
+}
+
 /// The [`ObservedOffer`](super::ObservedOffer) an `OfferService` entry
 /// reports; `options` are the options the entry references. `None` when the
 /// entry names a wildcard.
@@ -547,6 +522,7 @@ fn observed_offer<'a>(
 /// to be combined with the receive loop via [`run_combined`].
 pub(super) async fn announce_loop<T, Tm>(
     config: &ServerConfig,
+    offering: &super::Offering,
     sd_socket: &T,
     sd_state: &SdStateManager,
     timer: &Tm,
@@ -555,13 +531,10 @@ pub(super) async fn announce_loop<T, Tm>(
     T: TransportSocket,
     Tm: Timer,
 {
-    if !config.offers_service() {
-        core::future::pending::<()>().await;
-    }
     let mut announcement_count = 0u32;
     loop {
         match sd_state
-            .send_offer_service(announce_send_buf, config, sd_socket)
+            .send_offer_service(announce_send_buf, config, offering, sd_socket)
             .await
         {
             Ok(()) => {
@@ -569,13 +542,13 @@ pub(super) async fn announce_loop<T, Tm>(
                 if announcement_count == 1 {
                     crate::log::info!(
                         "Sent first SD announcement for service 0x{:04X}",
-                        config.service_id
+                        offering.service.service_id()
                     );
                 } else {
                     crate::log::debug!(
                         "Sent {} SD announcements for service 0x{:04X}",
                         announcement_count,
-                        config.service_id
+                        offering.service.service_id()
                     );
                 }
             }
@@ -937,7 +910,8 @@ pub(super) async fn find_loop<T, Tm>(
 /// passive server (passive servers have no SD socket bound to 30490 and rely
 /// on an external SD dispatcher).
 ///
-/// When `config.announce` is `false`, the announcement arm is skipped and only
+/// When the config offers no service, or its [`Offering::announce`](super::Offering::announce)
+/// is `false`, the announcement arm is skipped and only
 /// the receive loop drives. The dispatcher topology uses this, where a
 /// co-located `Client` emits `OfferService` on the server's behalf.
 #[allow(clippy::too_many_arguments)]
@@ -968,11 +942,10 @@ where
 {
     if is_passive {
         crate::log::warn!(
-            "run called on passive Server for service 0x{:04X}; \
+            "run called on passive Server; \
              SD receive must be driven externally (e.g. via the \
              Client's discovery socket, routing Subscribes to \
-             `EventPublisher::register_subscriber`)",
-            config.service_id
+             `EventPublisher::register_subscriber`)"
         );
         return Err(Error::InvalidUsage("passive_server_run"));
     }
@@ -995,8 +968,20 @@ where
     };
     let recv_fut = recv_loop(&receiver, unicast_buf, sd_buf, recv_send_buf);
     let announce_fut = async {
-        if config.announce {
-            announce_loop(&config, sd, sd_state_ref, &timer, announce_send_buf).await;
+        if let Some(offering) = config
+            .offering
+            .as_ref()
+            .filter(|offering| offering.announce)
+        {
+            announce_loop(
+                &config,
+                offering,
+                sd,
+                sd_state_ref,
+                &timer,
+                announce_send_buf,
+            )
+            .await;
         }
         core::future::pending::<core::convert::Infallible>().await
     };
@@ -1085,6 +1070,7 @@ pub(super) fn extract_subscriber_endpoint<'a>(
 mod tests {
     use super::*;
     use crate::CapacityKind;
+    use crate::server::Offering;
 
     use core::net::{Ipv4Addr, SocketAddrV4};
 
@@ -1146,9 +1132,10 @@ mod tests {
     }
 
     fn make_config() -> ServerConfig {
-        ServerConfig::new(0x1234, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(30500)
+        ServerConfig::new(
+            Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()).with_local_port(30500),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST)
     }
 
     fn make_sd_state() -> SdStateManager {
@@ -1170,7 +1157,15 @@ mod tests {
         let socket = NullSocket;
         let target = subscriber_addr();
 
-        let result = send_unicast_offer(&mut [0u8; 24], &config, &socket, &sd_state, target).await;
+        let result = send_unicast_offer(
+            &mut [0u8; 24],
+            &config,
+            config.test_offering(),
+            &socket,
+            &sd_state,
+            target,
+        )
+        .await;
 
         assert!(
             matches!(result, Err(Error::Capacity(CapacityKind::UdpBuffer))),
@@ -1187,7 +1182,15 @@ mod tests {
         let socket = NullSocket;
         let target = subscriber_addr();
 
-        let result = send_unicast_offer(&mut [0u8; 8], &config, &socket, &sd_state, target).await;
+        let result = send_unicast_offer(
+            &mut [0u8; 8],
+            &config,
+            config.test_offering(),
+            &socket,
+            &sd_state,
+            target,
+        )
+        .await;
 
         assert!(
             matches!(result, Err(Error::Capacity(CapacityKind::UdpBuffer))),
@@ -1206,6 +1209,7 @@ mod tests {
         let result = send_unicast_offer(
             &mut [0u8; crate::UDP_BUFFER_SIZE],
             &config,
+            config.test_offering(),
             &socket,
             &sd_state,
             target,
@@ -1266,7 +1270,7 @@ mod tests {
 
         let result = send_subscribe_ack_from_view(
             &mut [0u8; 24],
-            &config,
+            config.test_offering(),
             &socket,
             &sd_state,
             &entry_view,
@@ -1294,7 +1298,7 @@ mod tests {
 
         let result = send_subscribe_ack_from_view(
             &mut [0u8; crate::UDP_BUFFER_SIZE],
-            &config,
+            config.test_offering(),
             &socket,
             &sd_state,
             &entry_view,
@@ -1701,7 +1705,8 @@ mod tests {
 
         #[tokio::test]
         async fn a_failed_subscribe_nack_send_does_not_end_sd_handling() {
-            let config = ServerConfig::new(0x9999, 1);
+            let config =
+                ServerConfig::new(Offering::new(ServiceInstance::new(0x9999, 1, 1).unwrap()));
             let (wire, sd_len) = subscribe_wire_bytes();
             let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
             let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -2252,7 +2257,7 @@ mod tests {
             )
             .await;
             sd_state
-                .send_offer_service(&mut [0u8; 64], &config, &socket)
+                .send_offer_service(&mut [0u8; 64], &config, config.test_offering(), &socket)
                 .await
                 .expect("offer");
 
@@ -2263,9 +2268,8 @@ mod tests {
 
         #[tokio::test]
         async fn run_keeps_receiving_after_the_find_arm_finishes() {
-            let config = make_config()
-                .with_consumed_eventgroup(consumed())
-                .with_announce(false);
+            let mut config = make_config().with_consumed_eventgroup(consumed());
+            config.offering.as_mut().unwrap().announce = false;
             assert_eq!(finds_sent_by_run(config), 4, "the Find arm ran inside run");
         }
 
@@ -2343,7 +2347,7 @@ mod tests {
             let socket = RecordingSocket::default();
             send_subscribe_ack_from_view(
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                &config,
+                config.test_offering(),
                 &socket,
                 &make_sd_state(),
                 &entry_view,
@@ -2364,7 +2368,7 @@ mod tests {
             .expect("nack");
 
             let sent = socket.sent.lock().unwrap();
-            assert_eq!(sent[0].0, codec_answer(config.ttl), "ack");
+            assert_eq!(sent[0].0, codec_answer(config.test_offering().ttl), "ack");
             assert_eq!(sent[1].0, codec_answer(0), "nack");
         }
 
@@ -2373,7 +2377,7 @@ mod tests {
             let mut buf = [0u8; 64];
             let len = crate::sd_codec::build_offer_service_datagram(
                 &mut buf,
-                &config.offer_request(),
+                &config.test_offering().offer_request(config.interface),
                 crate::sd_codec::SdSessionCounter::new().next(),
             )
             .expect("build");
@@ -2382,12 +2386,14 @@ mod tests {
 
         #[tokio::test]
         async fn the_server_offers_are_the_codec_offer() {
-            let config = make_config().with_minor_version(7);
+            let mut config = make_config();
+            config.offering.as_mut().unwrap().minor_version = 7;
 
             let unicast = RecordingSocket::default();
             send_unicast_offer(
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
                 &config,
+                config.test_offering(),
                 &unicast,
                 &make_sd_state(),
                 subscriber_addr(),
@@ -2396,7 +2402,12 @@ mod tests {
             .expect("unicast offer");
             let multicast = RecordingSocket::default();
             make_sd_state()
-                .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &multicast)
+                .send_offer_service(
+                    &mut [0u8; crate::UDP_BUFFER_SIZE],
+                    &config,
+                    config.test_offering(),
+                    &multicast,
+                )
                 .await
                 .expect("multicast offer");
 
@@ -2808,14 +2819,11 @@ mod tests {
         }
 
         #[test]
-        fn consumer_only_validates_without_an_offer_ttl() {
-            let mut config = ServerConfig::consumer_only();
-            config.ttl = 0;
-            assert!(config.validate().is_ok());
-
-            let mut offering = ServerConfig::new(0x1234, 1);
-            offering.ttl = 0;
-            assert!(offering.validate().is_err());
+        fn an_offering_ttl_outside_the_entry_range_is_rejected() {
+            let mut config =
+                ServerConfig::new(Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()));
+            config.offering.as_mut().unwrap().ttl = 0;
+            assert!(config.validate().is_err());
         }
 
         #[test]
@@ -2846,23 +2854,8 @@ mod tests {
         }
 
         #[test]
-        fn the_announce_loop_of_a_consumer_only_server_sends_nothing_and_never_ends() {
-            let mut config = ServerConfig::consumer_only();
-            config.announce = true;
-            let socket = RecordingSocket::default();
-            let state = SdStateManager::new();
-            let mut buf = [0u8; crate::UDP_BUFFER_SIZE];
-
-            let done = announce_loop(&config, &socket, &state, &PendingTimer, &mut buf);
-
-            assert!(futures_util::FutureExt::now_or_never(done).is_none());
-            assert!(socket.sent.lock().unwrap().is_empty());
-        }
-
-        #[test]
-        fn consumer_only_announces_nothing_whatever_announce_says() {
-            let mut config = ServerConfig::consumer_only();
-            config.announce = true;
+        fn consumer_only_announces_nothing() {
+            let config = ServerConfig::consumer_only();
             let sd: &'static RecordingSocket = std::boxed::Box::leak(std::boxed::Box::default());
             let unicast: &'static RecordingSocket =
                 std::boxed::Box::leak(std::boxed::Box::default());

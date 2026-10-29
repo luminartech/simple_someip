@@ -56,7 +56,7 @@ impl FindTiming {
 /// endpoints of its consumed eventgroups, which differ between nodes on one
 /// segment.
 pub(super) fn seed(config: &super::ServerConfig) -> u32 {
-    let endpoints = core::iter::once((config.interface, config.local_port)).chain(
+    let endpoints = core::iter::once((config.interface, config.local_port())).chain(
         config
             .consumed_eventgroups
             .iter()
@@ -76,6 +76,7 @@ pub(super) fn seed(config: &super::ServerConfig) -> u32 {
 mod tests {
     use super::*;
     use crate::ServiceInstance;
+    use crate::server::Offering;
     use core::net::Ipv4Addr;
 
     const TIMING: FindTiming = FindTiming {
@@ -116,21 +117,27 @@ mod tests {
     }
 
     fn consumer(interface: Ipv4Addr, local_ip: Ipv4Addr) -> super::super::ServerConfig {
-        super::super::ServerConfig::new(0x1234, 1)
-            .with_interface(interface)
-            .with_local_port(30501)
-            .with_consumed_eventgroup(crate::sd_codec::SubscribeEventgroupRequest {
-                service: ServiceInstance::new(0x5678, 1, 1).unwrap(),
-                event_group_id: 1,
-                ttl: 3,
-                local_ip,
-                local_rx_port: 40100,
-            })
+        super::super::ServerConfig::new(
+            Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()).with_local_port(30501),
+        )
+        .with_interface(interface)
+        .with_consumed_eventgroup(crate::sd_codec::SubscribeEventgroupRequest {
+            service: ServiceInstance::new(0x5678, 1, 1).unwrap(),
+            event_group_id: 1,
+            ttl: 3,
+            local_ip,
+            local_rx_port: 40100,
+        })
     }
 
     #[test]
     fn the_seed_is_nonzero_and_differs_by_interface() {
-        assert_ne!(seed(&super::super::ServerConfig::new(0, 0)), 0);
+        assert_ne!(
+            seed(&super::super::ServerConfig::new(Offering::new(
+                ServiceInstance::new(0, 0, 1).unwrap()
+            ))),
+            0
+        );
         assert_ne!(
             seed(&consumer(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST)),
             seed(&consumer(Ipv4Addr::new(127, 0, 0, 2), Ipv4Addr::LOCALHOST))
