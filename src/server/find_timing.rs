@@ -75,6 +75,7 @@ pub(super) fn seed(config: &super::ServerConfig) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ServiceInstance;
     use core::net::Ipv4Addr;
 
     const TIMING: FindTiming = FindTiming {
@@ -119,9 +120,7 @@ mod tests {
             .with_interface(interface)
             .with_local_port(30501)
             .with_consumed_eventgroup(crate::sd_codec::SubscribeEventgroupRequest {
-                service_id: 0x5678,
-                instance_id: 1,
-                major_version: 1,
+                service: ServiceInstance::new(0x5678, 1, 1).unwrap(),
                 event_group_id: 1,
                 ttl: 3,
                 local_ip,

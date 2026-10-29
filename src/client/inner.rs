@@ -665,17 +665,17 @@ where
         sd_payload.for_each_service_offer(|offer| match offer {
             ServiceOffer::Stop { instance } => {
                 let removed = service_registry.remove_offered_instance(
-                    instance.service_id,
-                    instance.instance_id,
-                    instance.major_version,
+                    instance.service.service_id(),
+                    instance.service.instance_id(),
+                    instance.service.major_version(),
                     source.ip(),
                 );
                 trace!(
                     "Registry: removed {} endpoint(s) of 0x{:04X}.0x{:04X} v{} offered by {}",
                     removed,
-                    instance.service_id,
-                    instance.instance_id,
-                    instance.major_version,
+                    instance.service.service_id(),
+                    instance.service.instance_id(),
+                    instance.service.major_version(),
                     source.ip(),
                 );
             }
@@ -683,7 +683,8 @@ where
                 let Some(endpoint) = udp_or_tcp_ipv4_endpoint(options) else {
                     debug!(
                         "Offer for 0x{:04X}.0x{:04X} references no IPv4 endpoint, skipping",
-                        instance.service_id, instance.instance_id,
+                        instance.service.service_id(),
+                        instance.service.instance_id(),
                     );
                     return;
                 };
@@ -692,25 +693,28 @@ where
                 // instance id is data, stored in the value for use by
                 // SubscribeEventgroup entries.
                 let key = ServiceEndpointKey {
-                    service_id: instance.service_id,
+                    service_id: instance.service.service_id(),
                     endpoint,
                 };
                 let info = ServiceEndpointInfo {
-                    instance_id: instance.instance_id,
+                    instance_id: instance.service.instance_id(),
                     local_port: 0,
-                    major_version: instance.major_version,
+                    major_version: instance.service.major_version(),
                     minor_version: instance.minor_version,
                     offered_by: Some(source.ip()),
                 };
                 if service_registry.record_offer(key, info).is_ok() {
                     trace!(
                         "Registry: added 0x{:04X} -> {:?} (instance 0x{:04X})",
-                        instance.service_id, endpoint, instance.instance_id,
+                        instance.service.service_id(),
+                        endpoint,
+                        instance.service.instance_id(),
                     );
                 } else {
                     warn!(
                         "Registry full; dropped offer for 0x{:04X} at {:?}",
-                        instance.service_id, endpoint,
+                        instance.service.service_id(),
+                        endpoint,
                     );
                 }
             }

@@ -17,8 +17,9 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use simple_someip::ServiceInstance;
 use simple_someip::bare_metal_runtime as rt;
-use simple_someip::server::{FindTiming, RequiredService};
+use simple_someip::server::FindTiming;
 
 use crate::interop::consts::*;
 use crate::interop::runtime::*;
@@ -102,11 +103,7 @@ impl SomeipUnderTest for BareMetalRt {
             .consume
             .iter()
             .flat_map(|_| [SVC, OTHER_SVC])
-            .map(|service_id| RequiredService {
-                service_id,
-                instance_id: INST,
-                major_version: MAJOR,
-            })
+            .map(|service_id| ServiceInstance::new(service_id, INST, MAJOR).unwrap())
             .collect();
         let subscription = setup
             .consume
@@ -364,14 +361,14 @@ fn on_service(_ctx: usize, change: rt::ServiceChange) {
                 return;
             };
             Observation::ServiceAvailable {
-                service: service.service_id,
-                instance: service.instance_id,
+                service: service.service_id(),
+                instance: service.instance_id(),
                 endpoint,
             }
         }
         rt::ServiceChange::Gone { service, .. } => Observation::ServiceGone {
-            service: service.service_id,
-            instance: service.instance_id,
+            service: service.service_id(),
+            instance: service.instance_id(),
         },
         _ => return,
     };

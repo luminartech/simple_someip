@@ -484,7 +484,7 @@ mod tests {
                             _ => None,
                         })
                         .collect();
-                    (instance.service_id, ports)
+                    (instance.service.service_id(), ports)
                 }
                 other => panic!("expected an offer, got {other:?}"),
             })
@@ -513,7 +513,7 @@ mod tests {
         let [crate::ServiceOffer::Offer { instance, options }] = offers.as_slice() else {
             panic!("expected one offer, got {offers:?}");
         };
-        assert_eq!(instance.service_id, 0x5B);
+        assert_eq!(instance.service.service_id(), 0x5B);
         assert_eq!(options.clone().collect::<Vec<_>>(), [&endpoint]);
     }
 
@@ -532,7 +532,31 @@ mod tests {
         let [crate::ServiceOffer::Stop { instance }] = offers.as_slice() else {
             panic!("expected one stop, got {offers:?}");
         };
-        assert_eq!(instance.service_id, 0x5B);
+        assert_eq!(instance.service.service_id(), 0x5B);
+    }
+
+    #[test]
+    fn service_offers_skip_an_entry_that_names_a_wildcard() {
+        let endpoint = sd::Options::IpV4Endpoint {
+            ip: Ipv4Addr::LOCALHOST,
+            protocol: sd::TransportProtocol::Udp,
+            port: 30000,
+        };
+        let header = VecSdHeader {
+            flags: sd::Flags::new_sd(sd::RebootFlag::Continuous),
+            entries: std::vec![
+                sd::Entry::OfferService(make_offer_entry(0xFFFF, 1)),
+                sd::Entry::OfferService(make_offer_entry(0x5B, 0xFFFF)),
+                sd::Entry::OfferService(make_offer_entry(0x5B, 1)),
+            ],
+            options: std::vec![endpoint],
+        };
+        let payload = RawPayload::new_sd_payload(&header);
+        let offers = payload.service_offers();
+        let [crate::ServiceOffer::Offer { instance, .. }] = offers.as_slice() else {
+            panic!("expected one offer, got {offers:?}");
+        };
+        assert_eq!(instance.service.instance_id(), 1);
     }
 
     #[test]

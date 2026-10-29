@@ -3,8 +3,8 @@
 
 use core::net::SocketAddr;
 
+use crate::ServiceInstance;
 use crate::protocol::sd::MAX_TTL;
-use crate::server::RequiredService;
 use crate::{NetEndpoint, OfferedInstance};
 
 /// A change in the availability of a required service instance, seen in the
@@ -22,7 +22,7 @@ pub enum ServiceChange {
     #[non_exhaustive]
     Available {
         /// The required service instance.
-        service: RequiredService,
+        service: ServiceInstance,
         /// The endpoint the offer names for the instance.
         endpoint: NetEndpoint,
     },
@@ -32,7 +32,7 @@ pub enum ServiceChange {
     #[non_exhaustive]
     Gone {
         /// The required service instance.
-        service: RequiredService,
+        service: ServiceInstance,
     },
 }
 
@@ -46,19 +46,10 @@ struct Holder {
     remaining_ms: Option<u64>,
 }
 
-/// The required service an offered `instance` is, whatever its minor version.
-fn required(instance: &OfferedInstance) -> RequiredService {
-    RequiredService {
-        service_id: instance.service_id,
-        instance_id: instance.instance_id,
-        major_version: instance.major_version,
-    }
-}
-
 /// A required instance and its holder, if any.
 #[derive(Debug, Clone, Copy)]
 struct Record {
-    service: RequiredService,
+    service: ServiceInstance,
     holder: Option<Holder>,
 }
 
@@ -106,7 +97,7 @@ impl<const N: usize> Availability<N> {
 
     /// Adds a required instance. Returns `true` when it is added or already
     /// present, `false` when the table already holds `N` others.
-    pub(crate) fn require(&mut self, service: RequiredService) -> bool {
+    pub(crate) fn require(&mut self, service: ServiceInstance) -> bool {
         self.records.iter().any(|record| record.service == service)
             || self
                 .records
@@ -118,7 +109,7 @@ impl<const N: usize> Availability<N> {
     }
 
     /// The required instances, in the order they were added.
-    pub(crate) fn services(&self) -> impl Iterator<Item = RequiredService> + '_ {
+    pub(crate) fn services(&self) -> impl Iterator<Item = ServiceInstance> + '_ {
         self.records.iter().map(|record| record.service)
     }
 
@@ -197,7 +188,7 @@ impl<const N: usize> Availability<N> {
     }
 
     fn record(&mut self, instance: &OfferedInstance) -> Option<&mut Record> {
-        let service = required(instance);
+        let service = instance.service;
         self.records
             .iter_mut()
             .find(|record| record.service == service)
@@ -231,9 +222,7 @@ mod tests {
 
     fn instance_of(service_id: u16, instance_id: u16, major_version: u8) -> OfferedInstance {
         OfferedInstance {
-            service_id,
-            instance_id,
-            major_version,
+            service: ServiceInstance::new(service_id, instance_id, major_version).unwrap(),
             minor_version: 0,
         }
     }
@@ -250,12 +239,8 @@ mod tests {
         NetEndpoint::udp(SocketAddr::from(([192, 168, 0, 10], port)))
     }
 
-    fn service_of(service_id: u16) -> RequiredService {
-        RequiredService {
-            service_id,
-            instance_id: INST,
-            major_version: MAJOR,
-        }
+    fn service_of(service_id: u16) -> ServiceInstance {
+        ServiceInstance::new(service_id, INST, MAJOR).unwrap()
     }
 
     fn available(endpoint: NetEndpoint) -> ServiceChange {
