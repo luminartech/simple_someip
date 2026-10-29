@@ -30,6 +30,7 @@ use crate::sd_codec::{
 };
 use crate::server::{ServerConfig, ServerSd, Subscriber, SubscriptionHandle};
 use crate::transport::{E2EHandle, Timer, TransportSocket};
+use futures_util::future::OptionFuture;
 use heapless::Vec as HeaplessVec;
 
 /// Handler for one decoded inbound request. A getter fills `response_out`
@@ -170,8 +171,9 @@ where
 /// glue.
 ///
 /// `recv` is taken as an opaque `Future` so this stays generic over just
-/// `S/Tm/R` instead of the receive server's full bound set. The future
-/// never resolves (every branch loops forever); spawn and forget.
+/// `S/Tm/R` instead of the receive server's full bound set. The announce
+/// and RX loop forever, so the future resolves only once `recv` resolves on
+/// a node with no offers and no RX socket; spawn and forget.
 pub async fn run_someip<S, Tm, R, RecvFut>(recv: RecvFut, cfg: SomeipRun<'_, S, Tm, R>)
 where
     S: TransportSocket,
@@ -193,35 +195,20 @@ where
         dispatch_ctx,
     } = cfg;
 
-    // The announce runs only for a node that offers, and RX only for a
-    // consumer node; otherwise each idles forever so the join arity stays
-    // fixed.
-    let announce = async move {
-        if offers.is_empty() {
-            core::future::pending::<()>().await;
-        } else {
-            announce_offers_future::<_, _, RUN_OFFER_CAP>(
-                sd_socket,
-                timer,
-                offers,
-                sd,
-                period,
-                offer_scratch,
-            )
-            .await;
-        }
-    };
+    let announce = (!offers.is_empty()).then(|| {
+        announce_offers_future::<_, _, RUN_OFFER_CAP>(
+            sd_socket,
+            timer,
+            offers,
+            sd,
+            period,
+            offer_scratch,
+        )
+    });
+    let rx = rx_socket
+        .map(|rx_socket| event_rx_dispatch_future(rx_socket, e2e, dispatch, dispatch_ctx, rx_buf));
 
-    let rx_fut = async move {
-        if let Some(rx_socket) = rx_socket {
-            event_rx_dispatch_future(rx_socket, e2e, dispatch, dispatch_ctx, rx_buf).await;
-        } else {
-            core::future::pending::<()>().await;
-        }
-    };
-
-    // All three loop forever; the join never resolves.
-    futures_util::join!(recv, announce, rx_fut);
+    futures_util::join!(recv, OptionFuture::from(announce), OptionFuture::from(rx));
 }
 
 // No-op waker to drive the synchronous `for_each_subscriber` future in
