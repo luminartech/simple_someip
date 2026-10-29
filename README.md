@@ -109,25 +109,23 @@ async fn main() {
 ### Server
 
 ```rust
-use simple_someip::server::{Server, ServerConfig};
+use simple_someip::ServiceInstance;
+use simple_someip::server::{Offering, Server, ServerConfig};
 use std::net::Ipv4Addr;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = ServerConfig::new(Ipv4Addr::new(192, 168, 1, 200), 30500, 0x1234, 1);
-    let mut server = Server::new(config).await?;
-    let announce_handle = tokio::spawn(server.announcement_loop()?);
-
-    let publisher = server.publisher();
-    let run_handle = tokio::spawn(async move { server.run().await });
+    let service = ServiceInstance::new(0x1234, 1, 1).expect("not a wildcard");
+    let config = ServerConfig::new(Offering::new(service).with_local_port(30500))
+        .with_interface(Ipv4Addr::new(192, 168, 1, 200));
+    // `run` drives the receive loop and the OfferService announcements.
+    let (_server, handles, run) = Server::new(config).await?;
+    let publisher = handles.publisher;
 
     // Publish events to subscribers, e.g.:
     // publisher.publish_event(0x1234, 1, 0x01, &message).await?;
 
-    tokio::select! {
-        res = announce_handle => eprintln!("announcement loop exited unexpectedly: {res:?}"),
-        res = run_handle      => eprintln!("server run loop exited: {res:?}"),
-    }
+    run.await?;
     Ok(())
 }
 ```

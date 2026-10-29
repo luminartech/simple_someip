@@ -53,10 +53,12 @@ use embassy_net::driver::{Capabilities, Driver, HardwareAddress, LinkState, RxTo
 use embassy_net::{Config, Stack, StackResources, StaticConfigV4};
 
 use simple_someip::NoE2E;
+use simple_someip::ServiceInstance;
 use simple_someip::client::Error as ClientError;
 use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::define_static_channels;
 use simple_someip::protocol::sd::RebootFlag;
+use simple_someip::server::Offering;
 use simple_someip::server::{ServerConfig, SubscribeError, Subscriber, SubscriptionHandle};
 use simple_someip::static_channels::BufferPool;
 use simple_someip::transport::{LocalSpawner, StaticBufferProvider, Timer};
@@ -369,9 +371,13 @@ async fn main() {
                 Box::leak(Box::new(SocketPool::new()));
             let server_factory = EmbassyNetFactory::new(stack_a, server_pool);
             let server_e2e: NoE2E = NoE2E;
-            let server_config = ServerConfig::new(SERVICE_ID, INSTANCE_ID)
-                .with_interface(IP_A)
-                .with_local_port(30500);
+            let server_config = ServerConfig::new(
+                Offering::new(
+                    ServiceInstance::new(SERVICE_ID, INSTANCE_ID, 1).expect("not a wildcard"),
+                )
+                .with_local_port(30500),
+            )
+            .with_interface(IP_A);
 
             let server_deps = ServerDeps {
                 factory: server_factory,

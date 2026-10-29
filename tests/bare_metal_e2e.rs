@@ -29,9 +29,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use simple_someip::Encode;
 use simple_someip::PayloadWireFormat;
 use simple_someip::ServiceEndpointKey;
+use simple_someip::ServiceInstance;
 use simple_someip::client::Error as ClientError;
 use simple_someip::client::{ClientUpdate, ControlMessage, ReceivedMessage, SendMessage};
 use simple_someip::define_static_channels;
+use simple_someip::server::Offering;
 
 #[path = "support/tag_e2e.rs"]
 mod tag_e2e;
@@ -377,9 +379,10 @@ async fn client_receives_server_sd_announcement() {
     // Create server
     let server_e2e: NoE2E = NoE2E;
     let server_subs = MockSubscriptions::default();
-    let server_config = ServerConfig::new(0x1234, 1)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(30500);
+    let server_config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()).with_local_port(30500),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
 
     let server_deps = ServerDeps {
         factory: server_factory,
@@ -476,9 +479,11 @@ async fn client_send_request_server_runloop_stable() {
     let service_id = 0x5678_u16;
     let instance_id = 1_u16;
     let server_port = 30600_u16;
-    let server_config = ServerConfig::new(service_id, instance_id)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(server_port);
+    let server_config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(service_id, instance_id, 1).unwrap())
+            .with_local_port(server_port),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
 
     let server_deps = ServerDeps {
         factory: server_factory,
@@ -649,9 +654,10 @@ async fn future_size_witness_bare_metal_channels() {
         next_port: Arc::new(Mutex::new(0)),
     };
     let server_e2e: NoE2E = NoE2E;
-    let server_config = ServerConfig::new(0x1234, 1)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(30600);
+    let server_config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()).with_local_port(30600),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
     let server_deps = ServerDeps {
         factory: server_factory,
         timer: MockTimer,

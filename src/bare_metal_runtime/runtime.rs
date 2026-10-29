@@ -23,8 +23,9 @@ use crate::sd_codec::{
     OfferServiceRequest, SubscribeEventgroupRequest, build_multi_stop_offer_service_datagram,
 };
 use crate::server::{
-    EventPublisher, FindTiming, ObservedOffer, OfferObserver, SdStateManager, Server, ServerConfig,
-    ServerStorage, StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager,
+    EventPublisher, FindTiming, ObservedOffer, OfferObserver, Offering, SdStateManager, Server,
+    ServerConfig, ServerStorage, StaticSubscriptionHandle, StaticSubscriptionStorage,
+    SubscriptionManager,
 };
 use crate::transport::{E2EHandle, NoE2E, Timer};
 
@@ -564,30 +565,13 @@ fn build_server(find_timing: FindTiming, required: &AvailabilityTable) -> bool {
     }
 
     let iface = Ipv4Addr::from(IFACE.load(Ordering::Acquire).to_be_bytes());
-    let mut config = match o.first() {
-        Some(primary) => ServerConfig::new(primary.service_id, primary.instance_id)
-            .with_local_port(primary.unicast_port)
-            .with_major_version(primary.major_version)
-            .with_ttl(Duration::from_secs(u64::from(offer_ttl(
-                primary.ttl_seconds,
-            ))))
-            .with_event_group(primary.event_group_id)
-            // The runtime drives a combined multi-offer OfferService announce
-            // (all catalog offers in one SD datagram) from its own future, so
-            // the server's recv loop must stay silent on SD, or the primary
-            // service would be announced twice.
-            .with_announce(false),
-        None => ServerConfig::consumer_only(),
+    let mut config = ServerConfig {
+        offering: catalog_offering(o),
+        ..ServerConfig::consumer_only()
     }
     .with_interface(iface)
     .with_find_timing(find_timing)
     .with_sd_multicast(sd_multicast());
-    for entry in o {
-        let Some(service) = entry.service() else {
-            return false;
-        };
-        config = config.with_accepted_offer(service, entry.event_group_id);
-    }
     if let Some(request) = subscribe_request() {
         let Ok(c) = config.try_with_consumed_eventgroup(request) else {
             return false;
@@ -629,6 +613,28 @@ fn build_server(find_timing: FindTiming, required: &AvailabilityTable) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// The server's offering: the first catalog entry, accepting Subscribes for
+/// every entry; `None` for an empty catalog. [`init`] refuses a catalog that
+/// names a wildcard.
+fn catalog_offering(catalog: &[OfferEntry]) -> Option<Offering> {
+    let primary = catalog.first()?;
+    let mut offering = Offering::new(primary.service()?)
+        .with_local_port(primary.unicast_port)
+        .with_ttl(Duration::from_secs(u64::from(offer_ttl(
+            primary.ttl_seconds,
+        ))))
+        .with_event_group(primary.event_group_id)
+        // The runtime drives a combined multi-offer OfferService announce
+        // (all catalog offers in one SD datagram) from its own future, so
+        // the server's recv loop must stay silent on SD, or the primary
+        // service would be announced twice.
+        .with_announce(false);
+    for entry in catalog {
+        offering = offering.with_accepted_offer(entry.service()?, entry.event_group_id);
+    }
+    Some(offering)
 }
 
 /// The Subscribe the server sends for the catalog's subscription.
