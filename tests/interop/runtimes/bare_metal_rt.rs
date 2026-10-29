@@ -136,11 +136,11 @@ impl SomeipUnderTest for BareMetalRt {
             e2e: None,
         });
         match rc {
-            0 => {}
-            -4 => panic!("{ALREADY_STARTED}"),
-            rc => {
+            Ok(()) => {}
+            Err(rt::InitError::AlreadyInitialized) => panic!("{ALREADY_STARTED}"),
+            Err(e) => {
                 STARTED.store(false, Ordering::Release);
-                panic!("{}: init failed with {rc}", Self::NAME);
+                panic!("{}: init failed with {e:?}", Self::NAME);
             }
         }
         let errors = lock(&BIND_ERRORS);
@@ -435,7 +435,7 @@ mod tests {
         0
     }
 
-    /// `init` returns -8 for more offers than `SIMPLE_SOMEIP_MAX_OFFERS`, and
+    /// `init` refuses more offers than `SIMPLE_SOMEIP_MAX_OFFERS`, and
     /// a later `init` with as many offers as it holds succeeds.
     #[test]
     fn init_rejects_more_offers_than_the_runtime_holds() {
@@ -477,8 +477,12 @@ mod tests {
         let cap = u16::try_from(cap).expect("cap fits u16");
 
         assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
-        assert_eq!(rt::init(config(offers(cap + 1))), -8);
-        assert_eq!(rt::init(config(offers(cap))), 0);
+        assert_eq!(
+            rt::init(config(offers(cap + 1))),
+            Err(rt::InitError::TooManyOffers)
+        );
+        assert_eq!(rt::InitError::TooManyOffers.code(), -8);
+        assert_eq!(rt::init(config(offers(cap))), Ok(()));
     }
 
     /// Unicast and multicast SD both still reach the runtime when another
