@@ -360,6 +360,29 @@ impl ServerConfig {
         self.offering.as_ref().expect("the config offers a service")
     }
 
+    /// Sets a zero [`Offering::local_port`] to `bound_port`, the port the
+    /// unicast socket is bound to; `false` when the offering names another
+    /// port.
+    fn adopt_bound_port(&mut self, bound_port: u16) -> bool {
+        match &mut self.offering {
+            Some(offering) if offering.local_port == 0 => {
+                offering.local_port = bound_port;
+                true
+            }
+            Some(offering) => offering.local_port == bound_port,
+            None => true,
+        }
+    }
+
+    /// [`Self::validate`] for a passive server, which publishes the events
+    /// of its offering and so needs one.
+    fn validate_passive(&self) -> Result<(), Error> {
+        if self.offering.is_none() {
+            return Err(Error::InvalidUsage("passive_server_without_offering"));
+        }
+        self.validate()
+    }
+
     /// The port the unicast socket binds: [`Offering::local_port`], or `0`
     /// (ephemeral) for a node that offers none.
     pub(crate) fn local_port(&self) -> u16 {
@@ -1263,6 +1286,8 @@ impl
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
+    /// Returns [`Error::InvalidUsage`] if `config` has no
+    /// [`ServerConfig::offering`].
     /// Returns an error if binding either socket fails.
     pub async fn new_passive(
         config: ServerConfig,
@@ -1420,6 +1445,8 @@ where
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
+    /// Returns [`Error::InvalidUsage`] if `config` has no
+    /// [`ServerConfig::offering`].
     /// Returns an error if binding either socket fails.
     pub async fn new_passive_with_deps(
         deps: ServerDeps<F, Tm, R, Sub>,
@@ -1432,7 +1459,7 @@ where
         ),
         Error,
     > {
-        config.validate()?;
+        config.validate_passive()?;
         let ServerDeps {
             factory,
             timer,
@@ -1550,11 +1577,7 @@ where
     ) -> Result<Self, Error> {
         config.validate()?;
         let bound_port = deps.unicast_socket.get().local_addr()?.port();
-        if let Some(offering) = &mut config.offering
-            && offering.local_port == 0
-        {
-            offering.local_port = bound_port;
-        } else if config.local_port() != bound_port {
+        if !config.adopt_bound_port(bound_port) {
             crate::log::error!(
                 "Offering.local_port ({}) does not match unicast socket's \
                  bound port ({}); SD offers would lie. Pass local_port = 0 to \
@@ -1611,6 +1634,8 @@ where
     /// 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL).
     /// Returns [`Error::InvalidSdMulticast`] if [`ServerConfig::sd_multicast`]
     /// is not a multicast group with a nonzero port.
+    /// Returns [`Error::InvalidUsage`] if `config` has no
+    /// [`ServerConfig::offering`].
     /// Returns an error if querying `unicast_socket.local_addr()`
     /// fails on the underlying transport, or
     /// [`Error::InvalidUsage`] if [`Offering::local_port`] is non-zero
@@ -1621,13 +1646,9 @@ where
         deps: ServerStorage<F, Tm, R, Sub, H, Hsd, Hep>,
         mut config: ServerConfig,
     ) -> Result<Self, Error> {
-        config.validate()?;
+        config.validate_passive()?;
         let bound_port = deps.unicast_socket.get().local_addr()?.port();
-        if let Some(offering) = &mut config.offering
-            && offering.local_port == 0
-        {
-            offering.local_port = bound_port;
-        } else if config.local_port() != bound_port {
+        if !config.adopt_bound_port(bound_port) {
             crate::log::error!(
                 "Offering.local_port ({}) does not match unicast socket's \
                  bound port ({}); event publishers would advertise a port \
@@ -2388,6 +2409,34 @@ mod tests {
                 )
             }
         }
+    }
+
+    #[tokio::test]
+    async fn new_with_handles_accepts_a_consumer_only_config_on_any_port() {
+        let (handles, bound_port) = build_test_handles(0).await;
+        assert_ne!(bound_port, 0, "test precondition: an ephemeral port");
+        let config = ServerConfig::consumer_only().with_interface(Ipv4Addr::LOCALHOST);
+
+        let result = TestServer::new_with_handles(handles, config);
+
+        assert!(result.is_ok(), "got {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn a_passive_server_needs_an_offering() {
+        let (handles, _) = build_test_handles(0).await;
+        let config = ServerConfig::consumer_only().with_interface(Ipv4Addr::LOCALHOST);
+
+        let result = TestServer::new_passive_with_handles(handles, config);
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::InvalidUsage("passive_server_without_offering"))
+            ),
+            "got {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]

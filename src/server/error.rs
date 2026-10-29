@@ -33,14 +33,16 @@ pub enum Error {
     /// A `Server` API was called in a way that violates its
     /// preconditions. The argument is a `&'static str` tag naming the
     /// misuse; current tags:
-    /// - `"passive_server_announcement_loop"` — `announcement_loop`
-    ///   was called on a server constructed via `new_passive`. Passive
-    ///   servers have no real SD socket bound to port 30490, so any
-    ///   announcements would go out with an incorrect source port.
-    ///   Drive announcements from the client side instead.
-    /// - `"announcement_loop_already_started"` — `announcement_loop`
-    ///   was called twice on the same server. Two announcement
-    ///   futures cannot share the same SD socket and session counter.
+    /// - `"passive_server_run"` — the run future of a passive server was
+    ///   polled. A passive server's SD receive is driven externally.
+    /// - `"server_already_running"` — a second run future of one server was
+    ///   polled. Two run futures cannot share the sockets and session counter.
+    /// - `"new_with_handles_local_port_mismatch"`,
+    ///   `"new_passive_with_handles_local_port_mismatch"` — a nonzero
+    ///   [`Offering::local_port`](super::Offering::local_port) is not the
+    ///   port of the unicast socket handed in.
+    /// - `"passive_server_without_offering"` — a passive server was built
+    ///   from a config with no [`Offering`](super::Offering).
     #[error("invalid server usage: {0}")]
     InvalidUsage(&'static str),
     /// [`ServerConfig::sd_multicast`](super::ServerConfig::sd_multicast) is
