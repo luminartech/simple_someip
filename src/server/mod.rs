@@ -154,8 +154,10 @@ pub struct ServerConfig {
 }
 
 /// The service a server offers, and how it offers it. See
-/// [`ServerConfig::offering`].
+/// [`ServerConfig::offering`]. Build it with [`Offering::new`] and the
+/// `with_*` setters.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Offering {
     /// The offered service instance.
     pub service: ServiceInstance,
@@ -166,36 +168,23 @@ pub struct Offering {
     /// and `SubscribeAck`. The server constructors reject a TTL outside that
     /// range.
     pub ttl: u32,
-    /// Event-group IDs the server publishes to. Used by the SD
-    /// `Subscribe` handler to NACK subscriptions for unknown groups
-    /// (per AUTOSAR SOME/IP-SD: an event group must be known before
-    /// subscription is granted). When empty, any event-group ID is
-    /// accepted — preserves back-compat for callers that have not
-    /// enumerated their groups; populate to opt into validation.
+    /// Event-group IDs the server publishes to. A `SubscribeEventgroup` for
+    /// any other group is answered with a `SubscribeNack`; when empty, any
+    /// event-group ID is accepted.
     pub event_group_ids: heapless::Vec<u16, { ServerConfig::EVENT_GROUP_IDS_CAP }>,
     /// Port to bind for receiving subscriptions and requests
     pub local_port: u16,
-    /// Whether the run-future drives the SD `OfferService` announcement
-    /// loop. Defaults to `true`.
-    ///
-    /// Set to `false` (via [`Self::with_announce`]) when an external
-    /// component drives announcements — for example the
-    /// `examples/client_server` topology where a co-located `Client`'s
-    /// `sd_announcements_loop` emits the offers and the server should
-    /// stay silent on SD. Has no effect on passive servers, which never
-    /// announce.
+    /// Whether the run future sends the `OfferService` announcements.
+    /// Defaults to `true`. Set it to `false` when another component
+    /// announces the service, such as a co-located `Client`'s
+    /// `sd_announcements_loop` in the `examples/client_server` topology. A
+    /// passive server never announces.
     pub announce: bool,
-    /// Additional co-offered `(service, instance, event_group)` tuples this
-    /// receive loop accepts `SubscribeEventGroup` for, beyond its own
-    /// `(service, event_group_ids)`.
-    ///
-    /// Bare-metal providers that co-offer several services over one shared
-    /// SD/unicast socket run a *single* receive loop (the others are
-    /// announce-only and have no receive path). That loop must accept
-    /// subscriptions for every co-offered service, not just its own —
-    /// otherwise subscribes for the siblings get a `SubscribeNack` and their
-    /// events never reach a subscriber. Populate via [`Self::with_accepted_offer`];
-    /// empty preserves single-service behaviour.
+    /// Further `(service, event_group)` pairs this receive loop accepts a
+    /// `SubscribeEventgroup` for, besides its own `service` and
+    /// `event_group_ids`: the services offered over the same sockets by
+    /// announce-only servers, which have no receive loop of their own.
+    /// Populate via [`Self::with_accepted_offer`].
     pub accepted_offers: heapless::Vec<AcceptedOffer, { ServerConfig::ACCEPTED_OFFERS_CAP }>,
 }
 
@@ -293,13 +282,7 @@ impl ServerConfig {
     /// | `find_timing` | [`FindTiming::DEFAULT`] | [`Self::with_find_timing`] |
     /// | `sd_multicast` | [`MULTICAST_IP`](crate::protocol::sd::MULTICAST_IP):[`MULTICAST_PORT`](crate::protocol::sd::MULTICAST_PORT) | [`Self::with_sd_multicast`] |
     ///
-    /// Production deployments almost always need a specific interface
-    /// and port — `0.0.0.0` lets the kernel pick a binding that may
-    /// not match the service's E/E-architecture wiring expectations,
-    /// and an ephemeral port can't be discovered by peers without a
-    /// separate side-channel. Treat the defaults as "good enough to
-    /// stand up a test server in three lines" rather than
-    /// production-ready.
+    /// A deployment sets the interface its wiring expects.
     ///
     /// # Example
     ///
@@ -666,14 +649,7 @@ impl Offering {
         }
     }
 
-    /// Set whether the run-future drives the SD `OfferService`
-    /// announcement loop. Defaults to `true` from [`Self::new`].
-    ///
-    /// Pass `false` for the dispatcher topology where a co-located
-    /// `Client` drives SD via its own `sd_announcements_loop` and the
-    /// server should stay silent on the SD socket. Passive servers
-    /// (constructed via `Server::new_passive*`) ignore this setting —
-    /// they never announce regardless.
+    /// Set [`Self::announce`].
     #[must_use]
     pub fn with_announce(mut self, announce: bool) -> Self {
         self.announce = announce;
@@ -4161,7 +4137,7 @@ mod tests {
         let (svc, inst, major, ttl) = offer_fields;
         assert_eq!(svc, SID, "emitted service_id must match server config");
         assert_eq!(inst, IID, "emitted instance_id must match server config");
-        assert_eq!(major, 1, "default major_version from ServerConfig::new");
+        assert_eq!(major, 1, "emitted major_version must match server config");
         assert!(
             ttl > 0,
             "OfferService TTL must be non-zero (TTL=0 means StopOffering)",
@@ -4170,7 +4146,7 @@ mod tests {
         handle.abort();
     }
 
-    /// `ServerConfig::with_announce(false)` is the contract the
+    /// `Offering::with_announce(false)` is the contract the
     /// dispatcher topology relies on (`examples/client_server`). It
     /// MUST suppress the announce arm of the combined run-future,
     /// even though the receive arm keeps running. This is the

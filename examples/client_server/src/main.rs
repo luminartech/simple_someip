@@ -10,11 +10,11 @@
 //! This ensures remote nodes see a single coherent network identity for
 //! multicast announcements.
 //!
-//! The server's built-in `announcement_loop()` is NOT used — instead, the
-//! client's `sd_announcements_loop()` handles periodic multicast
-//! announcements. The server's `run()` loop still handles unicast SD
-//! traffic (e.g. `SubscribeAck`/`SubscribeNack` responses) on its own
-//! socket, which is necessary for subscription management.
+//! The server sends no `OfferService` of its own
+//! (`Offering::with_announce(false)`); the client's `sd_announcements_loop()`
+//! sends the periodic multicast announcements. The server's run future still
+//! answers SD traffic such as `SubscribeEventgroup` with
+//! `SubscribeAck`/`SubscribeNack`.
 //!
 //! Usage:
 //! ```text
