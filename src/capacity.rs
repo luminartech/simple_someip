@@ -47,8 +47,9 @@ pub enum CapacityKind {
     /// protection.
     ///
     /// On either side it also means the [`E2EHandle`](crate::E2EHandle)
-    /// cannot protect a payload that long
-    /// ([`E2EProtectError::PayloadTooLong`](crate::E2EProtectError::PayloadTooLong)),
+    /// cannot protect a payload of that length
+    /// ([`E2EProtectError::PayloadTooLong`](crate::E2EProtectError::PayloadTooLong),
+    /// [`E2EProtectError::LengthMismatch`](crate::E2EProtectError::LengthMismatch)),
     /// which no larger buffer fixes; the log names which.
     UdpBuffer,
 

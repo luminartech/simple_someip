@@ -806,8 +806,10 @@ pub trait E2EHandle: Send + Sync + 'static {
     ///
     /// Returns [`E2EProtectError::PayloadTooLong`] when no buffer could hold
     /// a payload this long once protected, for example because the E2E
-    /// header's length field cannot state it, and
-    /// [`E2EProtectError::BufferTooSmall`] when only `buf` is too small.
+    /// header's length field cannot state it,
+    /// [`E2EProtectError::LengthMismatch`] when the hook protects payloads of
+    /// another length only, and [`E2EProtectError::BufferTooSmall`] when only
+    /// `buf` is too small.
     fn protect<'b>(
         &self,
         message_id: MessageId,
@@ -935,6 +937,15 @@ pub enum E2EProtectError {
         needed: usize,
         /// The largest protected payload the hook can state.
         max: usize,
+    },
+    /// The hook protects payloads of one length only for this message ID,
+    /// and the payload has another.
+    #[error("E2E protection expects a payload of {expected} bytes, got {actual}")]
+    LengthMismatch {
+        /// Payload bytes the hook protects for this message ID.
+        expected: usize,
+        /// Payload bytes given to protect.
+        actual: usize,
     },
 }
 
@@ -1845,8 +1856,8 @@ mod tests {
         #[test]
         #[cfg(any(feature = "client", feature = "server"))]
         fn protect_in_place_refuses_a_payload_the_hook_cannot_protect() {
-            struct TooLong;
-            impl E2EHandle for TooLong {
+            struct Refuses(E2EProtectError);
+            impl E2EHandle for Refuses {
                 fn check<'a>(
                     &self,
                     _source: IpAddr,
@@ -1860,22 +1871,39 @@ mod tests {
                     &self,
                     _message_id: MessageId,
                     _buf: &'b mut [u8],
-                    payload_len: usize,
+                    _payload_len: usize,
                     _upper_header: [u8; 8],
                 ) -> Option<Result<&'b [u8], E2EProtectError>> {
-                    Some(Err(E2EProtectError::PayloadTooLong {
-                        needed: payload_len + 1,
-                        max: payload_len,
-                    }))
+                    Some(Err(self.0))
                 }
                 fn reset_source(&self, _source: IpAddr) {}
             }
-            let (mut buf, len) = datagram(ID);
+            for refusal in [
+                E2EProtectError::PayloadTooLong { needed: 3, max: 2 },
+                E2EProtectError::LengthMismatch {
+                    expected: 8,
+                    actual: 2,
+                },
+            ] {
+                let (mut buf, len) = datagram(ID);
+                assert_eq!(
+                    super::super::protect_in_place(&Refuses(refusal), &mut buf, len),
+                    Err(super::super::ProtectInPlaceError::Hook(refusal))
+                );
+            }
+        }
+
+        #[test]
+        #[cfg(feature = "std")]
+        fn a_length_mismatch_names_both_payload_lengths() {
+            use std::string::ToString;
             assert_eq!(
-                super::super::protect_in_place(&TooLong, &mut buf, len),
-                Err(super::super::ProtectInPlaceError::Hook(
-                    E2EProtectError::PayloadTooLong { needed: 3, max: 2 }
-                ))
+                E2EProtectError::LengthMismatch {
+                    expected: 8,
+                    actual: 6,
+                }
+                .to_string(),
+                "E2E protection expects a payload of 8 bytes, got 6"
             );
         }
 
