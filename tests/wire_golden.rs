@@ -577,9 +577,7 @@ mod sd_codec_golden {
     #[test]
     fn build_subscribe_eventgroup_datagram_golden_bytes() {
         let request = SubscribeEventgroupRequest {
-            service_id: 0x1234,
-            instance_id: 0x0001,
-            major_version: 1,
+            service: simple_someip::ServiceInstance::new(0x1234, 0x0001, 1).unwrap(),
             event_group_id: 0x0001,
             ttl: 5,
             local_ip: core::net::Ipv4Addr::new(10, 0, 0, 5),

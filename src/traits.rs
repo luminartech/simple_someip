@@ -5,12 +5,8 @@ use crate::protocol::{self, MessageId, sd::Flags};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct OfferedInstance {
-    /// The SOME/IP service ID.
-    pub service_id: u16,
-    /// The SOME/IP instance ID.
-    pub instance_id: u16,
-    /// The major version of the service interface.
-    pub major_version: u8,
+    /// The service instance.
+    pub service: crate::ServiceInstance,
     /// The minor version of the service interface.
     pub minor_version: u32,
 }
@@ -34,7 +30,8 @@ pub enum ServiceOffer<'a> {
     },
 }
 
-/// Visits a [`ServiceOffer`] for every offer and stop offer in `header`.
+/// Visits a [`ServiceOffer`] for every offer and stop offer in `header` that
+/// names no wildcard.
 #[cfg(any(feature = "std", feature = "bare_metal"))]
 pub(crate) fn for_each_service_offer<'a>(
     header: sd::Header<'a>,
@@ -45,10 +42,13 @@ pub(crate) fn for_each_service_offer<'a>(
         let (Entry::OfferService(svc) | Entry::StopOfferService(svc)) = entry else {
             continue;
         };
+        let Some(service) =
+            crate::ServiceInstance::new(svc.service_id, svc.instance_id, svc.major_version)
+        else {
+            continue;
+        };
         let instance = OfferedInstance {
-            service_id: svc.service_id,
-            instance_id: svc.instance_id,
-            major_version: svc.major_version,
+            service,
             minor_version: svc.minor_version,
         };
         f(if matches!(entry, Entry::StopOfferService(_)) {
@@ -159,7 +159,8 @@ pub trait PayloadWireFormat:
     fn set_reboot_flag(_header: &mut Self::SdHeader, _reboot: sd::RebootFlag) {}
 
     /// Visit each offer and stop offer in this SD payload with `f`, as a
-    /// [`ServiceOffer`].
+    /// [`ServiceOffer`]. An entry that names a wildcard is not a
+    /// [`ServiceInstance`](crate::ServiceInstance) and is skipped.
     ///
     /// Visitor pattern (rather than returning a `Vec`) so the trait
     /// is `no_std`-compatible. The `Client` run loop uses this to

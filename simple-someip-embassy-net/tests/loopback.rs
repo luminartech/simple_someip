@@ -42,6 +42,8 @@ use std::sync::{Arc, Mutex};
 use embassy_net::driver::{Capabilities, Driver, HardwareAddress, LinkState, RxToken, TxToken};
 use embassy_net::{Config, Stack, StackResources, StaticConfigV4};
 
+use simple_someip::ServiceInstance;
+use simple_someip::server::Offering;
 use simple_someip::static_channels::BufferPool;
 use simple_someip::transport::{
     SocketOptions, StaticBufferProvider, TransportFactory, TransportSocket,
@@ -596,9 +598,10 @@ async fn client_receives_server_sd_announcement() {
             let server_subs = MockSubscriptions::default();
             // Service id 0x5BAA (just a witness) at port 30500 on
             // stack A's interface IP.
-            let server_config = ServerConfig::new(0x5BAA, 1)
-                .with_interface(IP_A)
-                .with_local_port(30500);
+            let server_config = ServerConfig::new(
+                Offering::new(ServiceInstance::new(0x5BAA, 1, 1).unwrap()).with_local_port(30500),
+            )
+            .with_interface(IP_A);
 
             let server_deps = ServerDeps {
                 factory: server_factory,
@@ -606,6 +609,7 @@ async fn client_receives_server_sd_announcement() {
                 e2e: server_e2e,
                 subscriptions: server_subs,
                 non_sd_observer: None,
+                service_observer: None,
             };
 
             // Default `H = Arc<F::Socket>`. `Arc<T>:
@@ -723,9 +727,11 @@ async fn client_send_request_server_runloop_stable() {
             let service_id = 0x5BBB_u16;
             let instance_id = 1_u16;
             let server_port = 30600_u16;
-            let server_config = ServerConfig::new(service_id, instance_id)
-                .with_interface(IP_A)
-                .with_local_port(server_port);
+            let server_config = ServerConfig::new(
+                Offering::new(ServiceInstance::new(service_id, instance_id, 1).unwrap())
+                    .with_local_port(server_port),
+            )
+            .with_interface(IP_A);
 
             let server_deps = ServerDeps {
                 factory: server_factory,
@@ -733,6 +739,7 @@ async fn client_send_request_server_runloop_stable() {
                 e2e: server_e2e,
                 subscriptions: server_subs,
                 non_sd_observer: None,
+                service_observer: None,
             };
 
             // Explicit `Arc<EmbassyNetSocket>` `H` so the compiler

@@ -68,32 +68,17 @@ pub(super) fn server() -> Setup {
 
 /// The runtime as a client of `SVC`.
 ///
-/// The bare-metal runtime cannot start without an offer, so it also offers
-/// an unrelated service. Its client scenarios are ignored; the offer lets
-/// them reach the missing call API when they are run anyway.
+/// The bare-metal client scenarios are ignored because the runtime makes no
+/// client-side calls.
 fn client() -> Setup {
-    let unrelated = Offer {
-        service: 0x5678,
-        ttl_s: 3,
-        events: vec![],
-        fields: vec![],
-        methods: vec![],
-    };
     Setup {
-        offer: cfg!(feature = "bare-metal-runtime").then_some(unrelated),
+        offer: None,
         consume: Some(Consume { subscribe: false }),
     }
 }
 
 /// Waits until the runtime has found `SVC`, so its calls can reach it.
-///
-/// The bare-metal runtime reports no discovered services and makes no
-/// calls, so on it this returns at once and the call that follows names
-/// that gap.
 fn await_service(rt: &mut Rt) {
-    if cfg!(feature = "bare-metal-runtime") {
-        return;
-    }
     rt.expect("ServiceAvailable for 0x1234", SD_WAIT, |o| {
         matches!(
             o,
@@ -600,7 +585,7 @@ scenario!(
 scenario!(
     /// PRS_SOMEIP §5.2.6.3.1 (Figure 5.13) / feat_req_someip_80, 436 — calls that time out unanswered do not stop later calls from getting responses.
     r5_unanswered_requests_do_not_stall_client,
-    std = ignore("calls that time out must not stop later calls from getting responses (#184)"),
+    std = run,
     bare_metal = ignore("the bare-metal runtime has no client-side method calls (#187)"),
     {
         let server = FrameMethodServer::start();

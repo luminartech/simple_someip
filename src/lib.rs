@@ -243,6 +243,7 @@ pub mod embassy_channels;
 /// and the spawnable futures in [`bare_metal_tasks`].
 #[cfg(any(feature = "bare_metal", feature = "server"))]
 pub mod sd_codec;
+mod service_instance;
 /// Static-pool no-alloc primitives for [`transport::ChannelFactory`].
 /// Backs the consumer-declared static `OneshotPool` / `MpscPool`
 /// instances that the [`define_static_channels!`] macro
@@ -263,6 +264,7 @@ pub use heapless_payload::{HeaplessPayload, HeaplessSdHeader};
 pub use net_endpoint::{NetEndpoint, TransportProtocol};
 #[cfg(feature = "std")]
 pub use raw_payload::{RawPayload, VecSdHeader};
+pub use service_instance::ServiceInstance;
 pub use traits::{EncodeExt, OfferedInstance, PayloadWireFormat, ServiceOffer};
 
 #[cfg(feature = "client")]
@@ -281,7 +283,8 @@ pub use client::{
 pub use capacity::CapacityKind;
 #[cfg(feature = "server")]
 pub use server::{
-    NonSdRequestCallback, Server, ServerDeps, ServerHandles, ServerStorage, SubscriptionHandle,
+    NonSdRequestCallback, Server, ServerDeps, ServerHandles, ServerStorage, ServiceChange,
+    ServiceObserver, SubscriptionHandle,
 };
 #[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};

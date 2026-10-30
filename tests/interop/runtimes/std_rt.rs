@@ -9,10 +9,12 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use simple_someip::NoE2E;
+use simple_someip::ServiceInstance;
 use simple_someip::protocol::sd::{Options, TransportProtocol};
 use simple_someip::protocol::{
     Header, Message, MessageId, MessageType, MessageTypeField, ReturnCode,
 };
+use simple_someip::server::Offering;
 use simple_someip::server::{EventPublisher, ServerConfig, SubscriptionManager};
 use simple_someip::{
     Client, ClientUpdate, ClientUpdates, PayloadWireFormat, RawPayload, Server, ServerDeps,
@@ -250,8 +252,8 @@ async fn report_updates(
                         ServiceOffer::Offer { instance, options } => (instance, options),
                         ServiceOffer::Stop { instance } => {
                             out.push(Observation::ServiceGone {
-                                service: instance.service_id,
-                                instance: instance.instance_id,
+                                service: instance.service.service_id(),
+                                instance: instance.service.instance_id(),
                             });
                             continue;
                         }
@@ -271,20 +273,23 @@ async fn report_updates(
                     let Some(endpoint) = udp else {
                         eprintln!(
                             "std runtime: offer for 0x{:04X} without a UDP IPv4 endpoint: {:?}",
-                            instance.service_id,
+                            instance.service.service_id(),
                             options.collect::<Vec<_>>()
                         );
                         continue;
                     };
-                    if !found && instance.service_id == SVC && instance.instance_id == INST {
+                    if !found
+                        && instance.service.service_id() == SVC
+                        && instance.service.instance_id() == INST
+                    {
                         found = true;
                         let key = ServiceEndpointKey::udp(SVC, SocketAddr::V4(endpoint));
                         *service.lock().unwrap() = Some(key);
                         out.extend(use_service(&client, key, subscribe).await);
                     }
                     out.push(Observation::ServiceAvailable {
-                        service: instance.service_id,
-                        instance: instance.instance_id,
+                        service: instance.service.service_id(),
+                        instance: instance.service.instance_id(),
                         endpoint,
                     });
                 }
@@ -360,12 +365,13 @@ async fn start_server(
     tasks: &mut Vec<JoinHandle<()>>,
 ) -> Publisher {
     *REQUESTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
-    let config = ServerConfig::new(offer.service, INST)
-        .with_interface(OUR_IP)
-        .with_local_port(SERVER_PORT)
-        .with_major_version(MAJOR)
-        .with_ttl(Duration::from_secs(u64::from(offer.ttl_s)))
-        .with_event_group(EG);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(offer.service, INST, MAJOR).unwrap())
+            .with_local_port(SERVER_PORT)
+            .with_ttl(Duration::from_secs(u64::from(offer.ttl_s)))
+            .with_event_group(EG),
+    )
+    .with_interface(OUR_IP);
     let deps = ServerDeps::tokio().with_non_sd_observer(Some((on_request, 0)));
     let (server, handles, _run): (Server<_, _, _, _>, _, _) =
         Server::new_with_deps(deps, config, true)

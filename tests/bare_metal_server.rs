@@ -31,8 +31,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
+use simple_someip::ServiceInstance;
 use simple_someip::protocol::MessageId;
 use simple_someip::server::NonSdRequestCallback;
+use simple_someip::server::Offering;
 use simple_someip::server::ServerConfig;
 use simple_someip::server::{SubscribeError, Subscriber, SubscriptionHandle};
 use simple_someip::transport::{
@@ -298,9 +300,10 @@ async fn server_constructible_without_server_tokio_feature() {
     let e2e_handle: NoE2E = NoE2E;
     let subs = MockSubscriptions::default();
 
-    let config = ServerConfig::new(0x5B, 1)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(30490);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(0x5B, 1, 1).unwrap()).with_local_port(30490),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
 
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
@@ -308,6 +311,7 @@ async fn server_constructible_without_server_tokio_feature() {
         e2e: e2e_handle,
         subscriptions: subs,
         non_sd_observer: None,
+        service_observer: None,
     };
 
     let (_server, _handles, run): (
@@ -345,9 +349,10 @@ async fn passive_server_constructible_without_server_tokio_feature() {
     let e2e_handle: NoE2E = NoE2E;
     let subs = MockSubscriptions::default();
 
-    let config = ServerConfig::new(0x5C, 2)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(0);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(0x5C, 2, 1).unwrap()).with_local_port(0),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
 
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
@@ -355,6 +360,7 @@ async fn passive_server_constructible_without_server_tokio_feature() {
         e2e: e2e_handle,
         subscriptions: subs,
         non_sd_observer: None,
+        service_observer: None,
     };
 
     let (_server, _handles, _run): (
@@ -529,9 +535,10 @@ async fn non_sd_observer_some_receives_unicast_method_request() {
     let e2e_handle: NoE2E = NoE2E;
     let subs = MockSubscriptions::default();
 
-    let config = ServerConfig::new(0x1234, 1)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(30700);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()).with_local_port(30700),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
 
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
@@ -539,6 +546,7 @@ async fn non_sd_observer_some_receives_unicast_method_request() {
         e2e: e2e_handle,
         subscriptions: subs,
         non_sd_observer: Some((record_some as NonSdRequestCallback, 0xC0FF_EE00)),
+        service_observer: None,
     };
 
     let (_server, _handles, run): (
@@ -613,9 +621,10 @@ async fn non_sd_observer_ignores_sd_message_on_unicast_socket() {
     };
 
     let e2e_handle: NoE2E = NoE2E;
-    let config = ServerConfig::new(0x1234, 1)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(30702);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()).with_local_port(30702),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
 
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
@@ -623,6 +632,7 @@ async fn non_sd_observer_ignores_sd_message_on_unicast_socket() {
         e2e: e2e_handle,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: Some((record_sd_unicast as NonSdRequestCallback, 7)),
+        service_observer: None,
     };
 
     let (_server, _handles, run): (
@@ -679,9 +689,10 @@ async fn non_sd_observer_ignores_non_sd_on_multicast_socket() {
     };
 
     let e2e_handle: NoE2E = NoE2E;
-    let config = ServerConfig::new(0x1234, 1)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(30703);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()).with_local_port(30703),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
 
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
@@ -689,6 +700,7 @@ async fn non_sd_observer_ignores_non_sd_on_multicast_socket() {
         e2e: e2e_handle,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: Some((record_multicast as NonSdRequestCallback, 9)),
+        service_observer: None,
     };
 
     let (_server, _handles, run): (
@@ -745,9 +757,10 @@ async fn non_sd_observer_none_preserves_ignore_behavior() {
     };
 
     let e2e_handle: NoE2E = NoE2E;
-    let config = ServerConfig::new(0x1234, 1)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(30701);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()).with_local_port(30701),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
 
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
@@ -755,6 +768,7 @@ async fn non_sd_observer_none_preserves_ignore_behavior() {
         e2e: e2e_handle,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: None,
+        service_observer: None,
     };
 
     let (_server, _handles, run): (
@@ -866,9 +880,10 @@ async fn non_sd_responder_frames_and_sends_response() {
     };
 
     let e2e_handle: NoE2E = NoE2E;
-    let config = ServerConfig::new(0x1234, 1)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(30702);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()).with_local_port(30702),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
 
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
@@ -876,6 +891,7 @@ async fn non_sd_responder_frames_and_sends_response() {
         e2e: e2e_handle,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: Some((respond_with_body as NonSdRequestCallback, 0)),
+        service_observer: None,
     };
 
     let (_server, _handles, run): (
@@ -936,15 +952,17 @@ async fn non_sd_responder_answers_every_request_in_a_datagram() {
         sd_pipe: Arc::new(MockPipe::default()),
         next_port: Arc::new(Mutex::new(0)),
     };
-    let config = ServerConfig::new(0x1234, 1)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(30704);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()).with_local_port(30704),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
         timer: MockTimer,
         e2e: NoE2E,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: Some((respond_with_body as NonSdRequestCallback, 0)),
+        service_observer: None,
     };
     let (_server, _handles, run): (
         Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
@@ -1002,15 +1020,17 @@ async fn non_sd_response_is_protected_by_the_hook() {
         next_port: Arc::new(Mutex::new(0)),
     };
     let hook = TagE2E::new(MessageId::new_from_service_and_method(0x1236, 0x0001));
-    let config = ServerConfig::new(0x1236, 1)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(30704);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(0x1236, 1, 1).unwrap()).with_local_port(30704),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
     let deps: ServerDeps<MockFactory, MockTimer, TagE2E, MockSubscriptions> = ServerDeps {
         factory,
         timer: MockTimer,
         e2e: hook,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: Some((respond_with_body as NonSdRequestCallback, 0)),
+        service_observer: None,
     };
     let (_server, _handles, run): (
         Server<MockFactory, MockTimer, TagE2E, MockSubscriptions>,
@@ -1058,9 +1078,10 @@ async fn non_sd_responder_oversized_length_is_rejected_not_panicked() {
     };
 
     let e2e_handle: NoE2E = NoE2E;
-    let config = ServerConfig::new(0x1234, 1)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(30703);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()).with_local_port(30703),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
 
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
@@ -1068,6 +1089,7 @@ async fn non_sd_responder_oversized_length_is_rejected_not_panicked() {
         e2e: e2e_handle,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: Some((respond_oversized as NonSdRequestCallback, 0)),
+        service_observer: None,
     };
 
     let (_server, _handles, run): (
@@ -1136,10 +1158,12 @@ async fn drive_co_offer_subscribe(local_port: u16, subscribe_major: u8) -> Vec<S
     let subs = MockSubscriptions(subs_log.clone());
 
     // Primary service 0x1234 (major 1); co-offer service 0x5678 at major 2.
-    let config = ServerConfig::new(0x1234, 1)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(local_port)
-        .with_accepted_offer(0x5678, 1, 2, 0x0001);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap())
+            .with_local_port(local_port)
+            .with_accepted_offer(ServiceInstance::new(0x5678, 1, 2).unwrap(), 0x0001),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
 
     let deps: ServerDeps<MockFactory, MockTimer, NoE2E, MockSubscriptions> = ServerDeps {
         factory,
@@ -1147,6 +1171,7 @@ async fn drive_co_offer_subscribe(local_port: u16, subscribe_major: u8) -> Vec<S
         e2e: e2e_handle,
         subscriptions: subs,
         non_sd_observer: None,
+        service_observer: None,
     };
     let (_server, _handles, run): (
         Server<MockFactory, MockTimer, NoE2E, MockSubscriptions>,
@@ -1158,9 +1183,7 @@ async fn drive_co_offer_subscribe(local_port: u16, subscribe_major: u8) -> Vec<S
     let handle = tokio::spawn(run);
 
     let req = SubscribeEventgroupRequest {
-        service_id: 0x5678,
-        instance_id: 1,
-        major_version: subscribe_major,
+        service: ServiceInstance::new(0x5678, 1, subscribe_major).unwrap(),
         event_group_id: 0x0001,
         ttl: 0x00FF_FFFF,
         local_ip: Ipv4Addr::new(192, 0, 2, 200),
@@ -1252,15 +1275,17 @@ async fn non_sd_observer_receives_the_hooks_status_and_stripped_payload() {
         next_port: Arc::new(Mutex::new(0)),
     };
     let hook = TagE2E::new(MessageId::new_from_service_and_method(0x2345, 0x0001));
-    let config = ServerConfig::new(0x2345, 1)
-        .with_interface(Ipv4Addr::LOCALHOST)
-        .with_local_port(30701);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(0x2345, 1, 1).unwrap()).with_local_port(30701),
+    )
+    .with_interface(Ipv4Addr::LOCALHOST);
     let deps: ServerDeps<MockFactory, MockTimer, TagE2E, MockSubscriptions> = ServerDeps {
         factory,
         timer: MockTimer,
         e2e: hook,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: Some((record_tagged as NonSdRequestCallback, 0)),
+        service_observer: None,
     };
     let (_server, _handles, run): (
         Server<MockFactory, MockTimer, TagE2E, MockSubscriptions>,

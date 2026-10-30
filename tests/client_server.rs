@@ -27,9 +27,11 @@
 //! (which will need to abstract the port anyway).
 
 use simple_someip::ServiceEndpointKey;
+use simple_someip::ServiceInstance;
 use simple_someip::protocol::{
     Header, HeaderView, Message, MessageId, MessageType, MessageTypeField, ReturnCode, sd,
 };
+use simple_someip::server::Offering;
 use simple_someip::server::ServerConfig;
 use simple_someip::{
     Client, ClientUpdate, ClientUpdates, EncodeExt, PayloadWireFormat, RawPayload, Server,
@@ -112,9 +114,10 @@ async fn create_server_on(
     service_id: u16,
     instance_id: u16,
 ) -> (TestServer, u16) {
-    let config = ServerConfig::new(service_id, instance_id)
-        .with_interface(interface)
-        .with_local_port(0);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(service_id, instance_id, 1).unwrap()).with_local_port(0),
+    )
+    .with_interface(interface);
     let (server, _handles, _run): (TestServer, _, _) =
         TestServer::new(config).await.expect("Server::new failed");
     // Constructor already back-filled `config.local_port` from the
@@ -1215,9 +1218,10 @@ where
     S: E2EHandle + Clone,
     C: E2EHandle + Clone,
 {
-    let config = ServerConfig::new(service_id, 1)
-        .with_interface(SERVER_IP)
-        .with_local_port(0);
+    let config = ServerConfig::new(
+        Offering::new(ServiceInstance::new(service_id, 1, 1).unwrap()).with_local_port(0),
+    )
+    .with_interface(SERVER_IP);
     let deps = ServerDeps::tokio().with_e2e(server_hook);
     let (server, _handles, _run): (Server<_, _, S, _>, _, _) =
         Server::new_with_deps(deps, config, false)

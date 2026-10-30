@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "simple-someip"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "automotive-wire-codec",
  "critical-section",

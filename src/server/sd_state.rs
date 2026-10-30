@@ -91,42 +91,45 @@ impl SdStateManager {
         }
     }
 
-    /// Encode `config`'s `OfferService` into `buf` as the next SD message
-    /// of this manager; returns its length.
+    /// Encode the `OfferService` of `offering` at `interface` into `buf` as
+    /// the next SD message of this manager; returns its length.
     pub(super) fn encode_offer(
         &self,
         buf: &mut [u8],
-        config: &ServerConfig,
+        offering: &super::Offering,
+        interface: core::net::Ipv4Addr,
     ) -> Result<usize, Error> {
         crate::sd_codec::build_offer_service_datagram(
             buf,
-            &config.offer_request(),
+            &offering.offer_request(interface),
             self.next_session(),
         )
         .map_err(super::build_error)
     }
 
-    /// Send a multicast `OfferService` announcement for the given config.
+    /// Send a multicast `OfferService` announcement of `offering` from the
+    /// server `config` configures.
     ///
     /// `buf` is a caller-provided scratch buffer used for encoding the
     /// outgoing frame. Returns [`Error::Capacity`]`("udp_buffer")` if the
     /// encoded frame does not fit in `buf`, a protocol error if
-    /// `config.ttl` is outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL), or the
+    /// `offering.ttl` is outside 1..=[`MAX_TTL`](crate::protocol::sd::MAX_TTL), or the
     /// socket's transport error.
     pub(super) async fn send_offer_service<T: TransportSocket>(
         &self,
         buf: &mut [u8],
         config: &ServerConfig,
+        offering: &super::Offering,
         socket: &T,
     ) -> Result<(), Error> {
-        let total_len = self.encode_offer(buf, config)?;
+        let total_len = self.encode_offer(buf, offering, config.interface)?;
         let multicast_addr = config.sd_multicast;
 
         crate::log::trace!(
             "Sending OfferService: service=0x{:04X}, instance={}, port={}, size={} bytes",
-            config.service_id,
-            config.instance_id,
-            config.local_port,
+            offering.service.service_id(),
+            offering.service.instance_id(),
+            offering.local_port,
             total_len
         );
         crate::log::trace!("OfferService data: {:02X?}", &buf[..total_len.min(64)]);
@@ -147,8 +150,10 @@ impl SdStateManager {
 #[cfg(all(test, feature = "server-tokio"))]
 mod tests {
     use super::{Error, SdStateManager, ServerConfig};
+    use crate::ServiceInstance;
     use crate::protocol::sd::{self, EntryType, Flags, RebootFlag, TransportProtocol};
     use crate::protocol::{MessageType, MessageView, ReturnCode};
+    use crate::server::Offering;
     use crate::tokio_transport::TokioSocket;
     use crate::transport::{SocketOptions, TransportFactory};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -465,31 +470,47 @@ mod tests {
         assert_eq!(sd_view.options().count(), 1);
         let entry = sd_view.entries().next().unwrap();
         assert!(matches!(entry.entry_type(), Ok(EntryType::OfferService),));
-        assert_eq!(entry.service_id(), config.service_id);
-        assert_eq!(entry.instance_id(), config.instance_id);
-        assert_eq!(entry.major_version(), config.major_version);
-        assert_eq!(entry.ttl(), config.ttl);
-        assert_eq!(entry.minor_version(), config.minor_version);
+        assert_eq!(
+            entry.service_id(),
+            config.test_offering().service.service_id()
+        );
+        assert_eq!(
+            entry.instance_id(),
+            config.test_offering().service.instance_id()
+        );
+        assert_eq!(
+            entry.major_version(),
+            config.test_offering().service.major_version()
+        );
+        assert_eq!(entry.ttl(), config.test_offering().ttl);
+        assert_eq!(entry.minor_version(), config.test_offering().minor_version);
         let opts_count = entry.options_count();
         assert_eq!(opts_count.first_options_count, 1);
         assert_eq!(opts_count.second_options_count, 0);
         let option = sd_view.options().next().unwrap();
         let (ip, protocol, port) = option.as_ipv4().expect("ipv4 endpoint option");
         assert_eq!(ip, config.interface);
-        assert_eq!(port, config.local_port);
+        assert_eq!(port, config.local_port());
         assert_eq!(protocol, TransportProtocol::Udp);
     }
 
     #[tokio::test]
     async fn send_offer_service_through_mock_emits_full_someip_sd_envelope() {
-        let config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(TEST_ADVERTISED_PORT);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(TEST_SERVICE_ID, TEST_INSTANCE_ID, 1).unwrap())
+                .with_local_port(TEST_ADVERTISED_PORT),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = CapturingSocket::new();
 
         sd_state
-            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
+            .send_offer_service(
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &config,
+                config.test_offering(),
+                &sock,
+            )
             .await
             .expect("send_offer_service should succeed against the mock");
 
@@ -509,18 +530,30 @@ mod tests {
 
     #[tokio::test]
     async fn send_offer_service_through_mock_advances_session_id_across_calls() {
-        let config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(TEST_ADVERTISED_PORT);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(TEST_SERVICE_ID, TEST_INSTANCE_ID, 1).unwrap())
+                .with_local_port(TEST_ADVERTISED_PORT),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = CapturingSocket::new();
 
         sd_state
-            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
+            .send_offer_service(
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &config,
+                config.test_offering(),
+                &sock,
+            )
             .await
             .unwrap();
         sd_state
-            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
+            .send_offer_service(
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &config,
+                config.test_offering(),
+                &sock,
+            )
             .await
             .unwrap();
 
@@ -534,20 +567,32 @@ mod tests {
 
     #[tokio::test]
     async fn send_offer_service_through_mock_reboot_flag_flips_on_wrap() {
-        let config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(TEST_ADVERTISED_PORT);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(TEST_SERVICE_ID, TEST_INSTANCE_ID, 1).unwrap())
+                .with_local_port(TEST_ADVERTISED_PORT),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         // Seed so the FIRST send takes 0xFFFE → 0xFFFF (still
         // RecentlyRebooted) and the SECOND sees the wrap to 0x0001
         // (Continuous).
         let sd_state = SdStateManager::with_initial(0xFFFE);
         let sock = CapturingSocket::new();
         sd_state
-            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
+            .send_offer_service(
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &config,
+                config.test_offering(),
+                &sock,
+            )
             .await
             .unwrap();
         sd_state
-            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
+            .send_offer_service(
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &config,
+                config.test_offering(),
+                &sock,
+            )
             .await
             .unwrap();
 
@@ -575,14 +620,21 @@ mod tests {
 
     #[tokio::test]
     async fn send_offer_service_rejects_zero_ttl_without_sending() {
-        let mut config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(TEST_ADVERTISED_PORT);
-        config.ttl = 0;
+        let mut config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(TEST_SERVICE_ID, TEST_INSTANCE_ID, 1).unwrap())
+                .with_local_port(TEST_ADVERTISED_PORT),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
+        config.offering.as_mut().unwrap().ttl = 0;
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = CapturingSocket::new();
         let result = sd_state
-            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
+            .send_offer_service(
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &config,
+                config.test_offering(),
+                &sock,
+            )
             .await;
 
         assert!(
@@ -599,13 +651,20 @@ mod tests {
 
     #[tokio::test]
     async fn send_offer_service_through_mock_propagates_socket_errors() {
-        let config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(TEST_ADVERTISED_PORT);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(TEST_SERVICE_ID, TEST_INSTANCE_ID, 1).unwrap())
+                .with_local_port(TEST_ADVERTISED_PORT),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let sd_state = SdStateManager::with_initial(0x1233);
         let sock = FailingSocket;
         let result = sd_state
-            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
+            .send_offer_service(
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &config,
+                config.test_offering(),
+                &sock,
+            )
             .await;
         // Narrow assertion: the error must specifically be the
         // `Io(NetworkUnreachable)` propagated from `FailingSocket::send_to`.
@@ -788,14 +847,26 @@ mod tests {
         assert_eq!(offer.flags.reboot(), expected_reboot);
         assert!(offer.flags.unicast());
         // OfferService entry
-        assert_eq!(offer.entry_service_id, config.service_id);
-        assert_eq!(offer.entry_instance_id, config.instance_id);
-        assert_eq!(offer.entry_major_version, config.major_version);
-        assert_eq!(offer.entry_minor_version, config.minor_version);
-        assert_eq!(offer.entry_ttl, config.ttl);
+        assert_eq!(
+            offer.entry_service_id,
+            config.test_offering().service.service_id()
+        );
+        assert_eq!(
+            offer.entry_instance_id,
+            config.test_offering().service.instance_id()
+        );
+        assert_eq!(
+            offer.entry_major_version,
+            config.test_offering().service.major_version()
+        );
+        assert_eq!(
+            offer.entry_minor_version,
+            config.test_offering().minor_version
+        );
+        assert_eq!(offer.entry_ttl, config.test_offering().ttl);
         // Endpoint option
         assert_eq!(offer.endpoint_ip, config.interface);
-        assert_eq!(offer.endpoint_port, config.local_port);
+        assert_eq!(offer.endpoint_port, config.local_port());
         assert_eq!(offer.endpoint_protocol, TransportProtocol::Udp);
     }
 
@@ -814,19 +885,31 @@ mod tests {
                 loopback multicast is available."]
     #[tokio::test]
     async fn send_offer_service_emits_parseable_offer_to_multicast() {
-        let config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(TEST_ADVERTISED_PORT);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(TEST_SERVICE_ID, TEST_INSTANCE_ID, 1).unwrap())
+                .with_local_port(TEST_ADVERTISED_PORT),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let (rx, tx) = mcast_rx_tx().await;
 
         // Seed with a recognisable value so on-wire session_id is exact.
         let sd_state = SdStateManager::with_initial(0x1233);
         sd_state
-            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx)
+            .send_offer_service(
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &config,
+                config.test_offering(),
+                &tx,
+            )
             .await
             .expect("send_offer_service should succeed on a configured socket");
 
-        let offer = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
+        let offer = recv_our_offer(
+            &rx,
+            config.test_offering().service.service_id(),
+            Duration::from_secs(2),
+        )
+        .await;
         // next_session_id advances 0x1233 -> 0x1234; client_id is zero.
         // Fresh SdStateManager: counter has not wrapped, reboot flag is
         // RecentlyRebooted.
@@ -841,23 +924,45 @@ mod tests {
         // Back-to-back sends must consume distinct, incrementing session
         // IDs — catches a regression where `send_offer_service` reads the
         // counter without advancing it, or reuses a cached value.
-        let config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(TEST_ADVERTISED_PORT);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(TEST_SERVICE_ID, TEST_INSTANCE_ID, 1).unwrap())
+                .with_local_port(TEST_ADVERTISED_PORT),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let (rx, tx) = mcast_rx_tx().await;
 
         let sd_state = SdStateManager::with_initial(0x1233);
         sd_state
-            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx)
+            .send_offer_service(
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &config,
+                config.test_offering(),
+                &tx,
+            )
             .await
             .unwrap();
         sd_state
-            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx)
+            .send_offer_service(
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &config,
+                config.test_offering(),
+                &tx,
+            )
             .await
             .unwrap();
 
-        let first = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
-        let second = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
+        let first = recv_our_offer(
+            &rx,
+            config.test_offering().service.service_id(),
+            Duration::from_secs(2),
+        )
+        .await;
+        let second = recv_our_offer(
+            &rx,
+            config.test_offering().service.service_id(),
+            Duration::from_secs(2),
+        )
+        .await;
         assert_eq!(first.request_id, 0x0000_1234);
         assert_eq!(second.request_id, 0x0000_1235);
     }
@@ -870,23 +975,45 @@ mod tests {
         // Session counter wrap must be visible on the wire: 0xFFFE -> 0xFFFF
         // -> 0x0001 (skipping the reserved 0). Exercises the wrap branch
         // *through* the send path, not only the unit test of next_session_id.
-        let config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(TEST_ADVERTISED_PORT);
+        let config = ServerConfig::new(
+            Offering::new(ServiceInstance::new(TEST_SERVICE_ID, TEST_INSTANCE_ID, 1).unwrap())
+                .with_local_port(TEST_ADVERTISED_PORT),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST);
         let (rx, tx) = mcast_rx_tx().await;
 
         let sd_state = SdStateManager::with_initial(0xFFFE);
         sd_state
-            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx)
+            .send_offer_service(
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &config,
+                config.test_offering(),
+                &tx,
+            )
             .await
             .unwrap();
         sd_state
-            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &tx)
+            .send_offer_service(
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &config,
+                config.test_offering(),
+                &tx,
+            )
             .await
             .unwrap();
 
-        let first = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
-        let second = recv_our_offer(&rx, config.service_id, Duration::from_secs(2)).await;
+        let first = recv_our_offer(
+            &rx,
+            config.test_offering().service.service_id(),
+            Duration::from_secs(2),
+        )
+        .await;
+        let second = recv_our_offer(
+            &rx,
+            config.test_offering().service.service_id(),
+            Duration::from_secs(2),
+        )
+        .await;
         assert_eq!(first.request_id, 0x0000_FFFF);
         assert_eq!(
             second.request_id, 0x0000_0001,
