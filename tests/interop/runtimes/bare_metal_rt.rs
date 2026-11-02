@@ -131,6 +131,7 @@ impl SomeipUnderTest for BareMetalRt {
             required_services: required.leak(),
             on_service: Some(on_service),
             find_timing: find_timing(),
+            offer_timing: rt::OfferTiming::DEFAULT,
             mailbox: &MAILBOX,
             // SAFETY: `STARTED` was claimed above and is released only when
             // `init` fails before spawning the task that borrows these
@@ -473,6 +474,7 @@ mod tests {
             required_services: &[],
             on_service: None,
             find_timing: find_timing(),
+            offer_timing: rt::OfferTiming::DEFAULT,
             mailbox: &MAILBOX,
             buffers: Box::leak(Box::new(rt::RuntimeBuffers::new())),
             e2e: None,
@@ -690,10 +692,86 @@ mod tests {
         rt::deinit();
         DEINIT_DONE.store(true, Ordering::Release);
 
-        // Two and a half Offer periods of the 1 s TTL.
+        // Two and a half periods of the default 1 s cyclic Offer delay.
         poll_for(Duration::from_millis(2500));
 
         assert_eq!(SENT_AFTER_DEINIT.load(Ordering::Acquire), 0);
+    }
+
+    /// A node that offers nothing sends no cyclic Offers, so `init` does not
+    /// check their delay.
+    #[test]
+    fn init_ignores_the_cyclic_offer_delay_of_a_node_that_offers_nothing() {
+        assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
+        let mut config = config(&[], bind_nothing, send_nothing);
+        config.offer_timing.cyclic_delay = Duration::ZERO;
+
+        assert_eq!(rt::init(config), Ok(()));
+    }
+
+    /// When each SD datagram was sent, which is a cyclic Offer while the
+    /// runtime requires and subscribes to nothing.
+    static SD_SENDS: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
+
+    extern "C" fn send_recording_sd(
+        port: u16,
+        _buf: *const u8,
+        _len: usize,
+        _to: u32,
+        _at: u16,
+    ) -> i32 {
+        if port == SD_PORT {
+            lock(&SD_SENDS).push(Instant::now());
+        }
+        0
+    }
+
+    /// With the default cyclic Offer delay, Offers with a 3 s TTL are sent
+    /// every second, so one lost Offer does not let the service expire.
+    #[test]
+    fn offers_repeat_every_second_by_default() {
+        assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
+        assert_eq!(
+            rt::init(config(offers(1, 3), bind_nothing, send_recording_sd)),
+            Ok(())
+        );
+
+        poll_for(Duration::from_millis(2500));
+
+        let sends = lock(&SD_SENDS).clone();
+        assert!(sends.len() >= 2, "{} Offers in 2.5 s", sends.len());
+        for gap in sends.windows(2).map(|w| w[1] - w[0]) {
+            assert!(
+                gap > Duration::from_millis(900) && gap < Duration::from_millis(1500),
+                "Offers {gap:?} apart"
+            );
+        }
+    }
+
+    /// `init` refuses a cyclic Offer delay under a millisecond or longer than
+    /// an Offer's TTL, and accepts one equal to the TTL.
+    #[test]
+    fn init_rejects_a_cyclic_offer_delay_out_of_range() {
+        assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
+        let with_delay = |cyclic_delay: Duration| {
+            let mut config = config(offers(1, 3), bind_nothing, send_nothing);
+            config.offer_timing.cyclic_delay = cyclic_delay;
+            config
+        };
+        for delay in [
+            Duration::ZERO,
+            Duration::from_micros(999),
+            Duration::from_millis(3001),
+        ] {
+            assert_eq!(
+                rt::init(with_delay(delay)),
+                Err(rt::InitError::CyclicOfferDelayOutOfRange),
+                "{delay:?}"
+            );
+        }
+        assert_eq!(rt::InitError::CyclicOfferDelayOutOfRange.code(), -10);
+
+        assert_eq!(rt::init(with_delay(Duration::from_secs(3))), Ok(()));
     }
 
     /// Unicast and multicast SD both still reach the runtime when another

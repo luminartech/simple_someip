@@ -159,6 +159,41 @@ impl RequiredEntry {
     }
 }
 
+/// When the runtime sends its cyclic `OfferService` messages. Start from
+/// [`OfferTiming::DEFAULT`] and set the fields to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OfferTiming {
+    /// The delay between cyclic Offers, from 1 ms up to the shortest TTL among
+    /// [`RuntimeConfig::offers`]; [`init`] returns
+    /// [`InitError::CyclicOfferDelayOutOfRange`] outside it, unless the node
+    /// offers nothing. A peer keeps the service through one lost Offer when
+    /// the TTL is at least twice the delay.
+    pub cyclic_delay: Duration,
+}
+
+impl OfferTiming {
+    /// Cyclic Offers every second.
+    pub const DEFAULT: Self = Self {
+        cyclic_delay: Duration::from_secs(1),
+    };
+
+    /// [`Self::cyclic_delay`], checked against `offers`; unchecked when there
+    /// are none, since nothing is then offered cyclically.
+    fn checked_cyclic_delay(&self, offers: &[OfferEntry]) -> Result<Duration, InitError> {
+        let delay = self.cyclic_delay;
+        let in_range = |o: &OfferEntry| {
+            delay >= Duration::from_millis(1)
+                && delay <= Duration::from_secs(u64::from(offer_ttl(o.ttl_seconds)))
+        };
+        if offers.iter().all(in_range) {
+            Ok(delay)
+        } else {
+            Err(InitError::CyclicOfferDelayOutOfRange)
+        }
+    }
+}
+
 /// Buffer memory the platform owns (so it controls link placement) and
 /// hands to the runtime. One `&'static mut` keeps the interface narrow.
 pub struct RuntimeBuffers {
@@ -247,6 +282,8 @@ pub struct RuntimeConfig {
     /// When the runtime sends `FindService` for its subscription and
     /// required services.
     pub find_timing: FindTiming,
+    /// When the runtime sends its cyclic `OfferService` messages.
+    pub offer_timing: OfferTiming,
     /// RX mailbox the platform's receive path pushes into.
     pub mailbox: &'static Mailbox,
     /// Runtime buffer memory (platform-owned, placement-controlled).
@@ -371,12 +408,6 @@ fn find_offer(
             && o.instance_id == instance_id
             && o.event_group_id == event_group_id
     })
-}
-
-/// Node SD TTL in seconds (from the catalog; one node-wide value surfaced
-/// per offer). Drives the offer cadence; unused when nothing is offered.
-fn node_sd_ttl_secs() -> u64 {
-    u64::from(offer_ttl(offers().first().map_or(0, |o| o.ttl_seconds)))
 }
 
 /// The TTL an offer is sent with: `ttl_seconds`, with 0 meaning 3 seconds and
@@ -628,7 +659,7 @@ fn build_server(
 /// Subscribes) + combined-offer announce + notification RX/dispatch + Offer
 /// expiry.
 #[embassy_executor::task]
-async fn someip_task() {
+async fn someip_task(period: Duration) {
     // SAFETY: `init` wrote SERVER + BUFS + MAILBOX before spawning. Each
     // buffer is reborrowed individually through a raw pointer to its own
     // field — deliberately NOT via a whole-struct `&mut *BUFS`. A
@@ -665,7 +696,6 @@ async fn someip_task() {
     // Client RX socket marker (its PCB is pre-bound by the platform).
     let factory = Factory::new(plat);
     let rx_socket = subscription().map(|s| factory.socket(s.local_rx_port));
-    let period = Duration::from_secs(node_sd_ttl_secs());
 
     let run = run_someip(
         recv,
@@ -779,6 +809,10 @@ pub enum InitError {
     /// it bound before that one stay bound.
     #[error("the platform could not bind a port")]
     Bind = -9,
+    /// [`OfferTiming::cyclic_delay`] is under a millisecond, or longer than
+    /// the TTL of an entry of [`RuntimeConfig::offers`].
+    #[error("the cyclic Offer delay is under 1 ms or longer than an Offer's TTL")]
+    CyclicOfferDelayOutOfRange = -10,
 }
 
 impl InitError {
@@ -827,6 +861,7 @@ fn init_claimed(config: RuntimeConfig) -> Result<(), InitError> {
     if config.offers.len() > MAX_OFFERS {
         return Err(InitError::TooManyOffers);
     }
+    let cyclic_delay = config.offer_timing.checked_cyclic_delay(config.offers)?;
     let catalog = Catalog::parse(&config)?;
     if config.sd_mcast != 0 && !Ipv4Addr::from(config.sd_mcast.to_be_bytes()).is_multicast() {
         return Err(InitError::SdGroupNotMulticast);
@@ -884,7 +919,7 @@ fn init_claimed(config: RuntimeConfig) -> Result<(), InitError> {
         slot.write(Executor::new(core::ptr::null_mut()));
         slot.assume_init_ref().spawner()
     };
-    if spawner.spawn(someip_task()).is_err() {
+    if spawner.spawn(someip_task(cyclic_delay)).is_err() {
         return Err(InitError::Spawn);
     }
     Ok(())
