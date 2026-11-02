@@ -217,6 +217,25 @@ where
             continue;
         };
         match entry_type {
+            sd::EntryType::Subscribe if entry_view.is_stop_subscribe() => {
+                crate::log::debug!(
+                    "Received StopSubscribe from {}: service=0x{:04X}, instance={}, eventgroup=0x{:04X}",
+                    sender,
+                    entry_view.service_id(),
+                    entry_view.instance_id(),
+                    entry_view.event_group_id()
+                );
+                if let Some(endpoint_addr) = extract_subscriber_endpoint(entry_options) {
+                    subscriptions
+                        .unsubscribe(
+                            entry_view.service_id(),
+                            entry_view.instance_id(),
+                            entry_view.event_group_id(),
+                            endpoint_addr,
+                        )
+                        .await;
+                }
+            }
             sd::EntryType::Subscribe => {
                 crate::log::debug!(
                     "Received Subscribe from {}: service=0x{:04X}, instance={}, eventgroup=0x{:04X}",
@@ -1176,6 +1195,12 @@ mod tests {
     /// Encode a minimal Subscribe SD payload and return `(wire_bytes, sd_len)` so
     /// callers can parse an `SdHeaderView` and extract an `EntryView`.
     fn subscribe_wire_bytes() -> ([u8; 512], usize) {
+        subscribe_wire_bytes_with_ttl(3)
+    }
+
+    /// [`subscribe_wire_bytes`] with the entry's TTL set to `ttl`; a TTL of 0
+    /// makes it a `StopSubscribeEventgroup`.
+    fn subscribe_wire_bytes_with_ttl(ttl: u32) -> ([u8; 512], usize) {
         use automotive_wire_codec::Encode;
 
         let entry = sd::Entry::SubscribeEventGroup(sd::EventGroupEntry {
@@ -1185,7 +1210,7 @@ mod tests {
             service_id: 0x1234,
             instance_id: 1,
             major_version: 1,
-            ttl: 3,
+            ttl,
             counter: 3,
             event_group_id: 0x0001,
         });
@@ -1315,6 +1340,67 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "full-size buf must succeed, got {result:?}");
+    }
+
+    #[cfg(feature = "server-tokio")]
+    mod stop_subscribe {
+        use super::consumed_eventgroups::RecordingSocket;
+        use super::*;
+
+        type Subscriptions =
+            std::sync::Arc<tokio::sync::RwLock<crate::server::SubscriptionManager>>;
+
+        async fn handle_subscribe(
+            config: &ServerConfig,
+            subscriptions: &Subscriptions,
+            socket: &RecordingSocket,
+            ttl: u32,
+        ) {
+            let (wire, sd_len) = subscribe_wire_bytes_with_ttl(ttl);
+            let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+            handle_sd_message(
+                config,
+                socket,
+                &make_sd_state(),
+                subscriptions,
+                &sd_view,
+                subscriber_addr(),
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &mut Discovery::leaked(config),
+            )
+            .await
+            .expect("handle_sd_message");
+        }
+
+        #[tokio::test]
+        async fn a_stop_subscribe_removes_the_subscriber_and_is_not_answered() {
+            let config = make_config();
+            let subscriptions = Subscriptions::default();
+            let socket = RecordingSocket::default();
+
+            handle_subscribe(&config, &subscriptions, &socket, 3).await;
+            assert_eq!(subscriptions.read().await.subscription_count(), 1);
+            handle_subscribe(&config, &subscriptions, &socket, 0).await;
+
+            assert_eq!(subscriptions.read().await.subscription_count(), 0);
+            assert_eq!(
+                socket.sent.lock().unwrap().len(),
+                1,
+                "only the Subscribe is answered"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_stop_subscribe_without_a_subscription_is_not_answered() {
+            let config = make_config();
+            let subscriptions = Subscriptions::default();
+            let socket = RecordingSocket::default();
+
+            handle_subscribe(&config, &subscriptions, &socket, 0).await;
+
+            assert_eq!(subscriptions.read().await.subscription_count(), 0);
+            assert!(socket.sent.lock().unwrap().is_empty());
+        }
     }
 
     #[cfg(feature = "server-tokio")]
