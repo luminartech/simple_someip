@@ -510,6 +510,13 @@ impl EntryView<'_> {
         self.0[0] == u8::from(EntryType::OfferService) && self.ttl() == 0
     }
 
+    /// Returns `true` if this entry is a stop subscribe: an
+    /// [`EntryType::Subscribe`] entry with a TTL of 0.
+    #[must_use]
+    pub fn is_stop_subscribe(&self) -> bool {
+        self.0[0] == u8::from(EntryType::Subscribe) && self.ttl() == 0
+    }
+
     /// Minor version (only valid for service entries).
     #[must_use]
     pub fn minor_version(&self) -> u32 {
@@ -966,6 +973,19 @@ mod tests {
         assert!(view(&stop));
         assert!(!view(&offer));
         assert!(!view(&stop_subscribe));
+    }
+
+    #[test]
+    fn entry_view_is_stop_subscribe_only_for_subscribe_type_with_zero_ttl() {
+        let subscribe = encode_entry(&Entry::SubscribeEventGroup(make_event_group_entry()));
+        let mut stop_subscribe = subscribe;
+        stop_subscribe[9..12].fill(0);
+        let stop_offer = encode_entry(&Entry::StopOfferService(make_service_entry()));
+        let view =
+            |b: &[u8; 17]| EntryView(b[..ENTRY_SIZE].try_into().unwrap()).is_stop_subscribe();
+        assert!(view(&stop_subscribe));
+        assert!(!view(&subscribe));
+        assert!(!view(&stop_offer));
     }
 
     #[test]
