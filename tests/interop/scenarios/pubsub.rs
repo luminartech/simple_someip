@@ -613,8 +613,8 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00388, 00389 — no events reach an endpoint after its StopSubscribe.
     p6_unsubscribe_stops_events,
-    std = ignore("a StopSubscribe must stop the events to that subscriber (#179)"),
-    bare_metal = ignore("a StopSubscribe must stop the events to that subscriber (#179)"),
+    std = run,
+    bare_metal = run,
     {
         let mut client = FrameClient::start(REBOOT | UNICAST);
         let mut rt = Rt::start(server());
