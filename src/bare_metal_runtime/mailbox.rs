@@ -47,6 +47,7 @@ impl<const CAP: usize> RxSlot<CAP> {
 /// Fixed-capacity shared RX pool: `SLOTS` slots of `CAP` bytes each.
 pub struct RxMailbox<const SLOTS: usize, const CAP: usize> {
     slots: [RxSlot<CAP>; SLOTS],
+    dropped: AtomicU32,
 }
 
 impl<const SLOTS: usize, const CAP: usize> Default for RxMailbox<SLOTS, CAP> {
@@ -61,7 +62,15 @@ impl<const SLOTS: usize, const CAP: usize> RxMailbox<SLOTS, CAP> {
     pub const fn new() -> Self {
         Self {
             slots: [const { RxSlot::new() }; SLOTS],
+            dropped: AtomicU32::new(0),
         }
+    }
+
+    /// How many datagrams [`Self::push`] dropped because every slot was full,
+    /// wrapping at `u32::MAX`.
+    #[must_use]
+    pub fn dropped(&self) -> u32 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Per-slot datagram capacity in bytes.
@@ -71,8 +80,8 @@ impl<const SLOTS: usize, const CAP: usize> RxMailbox<SLOTS, CAP> {
     }
 
     /// Push one inbound datagram into the first free slot. Returns `false`
-    /// if the pool was full (datagram dropped). Oversized payloads are
-    /// truncated to `CAP`.
+    /// if the pool was full: the datagram is dropped and counted in
+    /// [`Self::dropped`]. Oversized payloads are truncated to `CAP`.
     ///
     /// # Safety
     /// `buf` must be valid for `len` bytes.
@@ -101,6 +110,7 @@ impl<const SLOTS: usize, const CAP: usize> RxMailbox<SLOTS, CAP> {
             slot.has_datagram.store(true, Ordering::Release);
             return true;
         }
+        self.dropped.fetch_add(1, Ordering::Relaxed);
         false
     }
 
@@ -165,6 +175,7 @@ mod tests {
         assert!(unsafe { mb.push(1, 0, 0, d.as_ptr(), d.len()) });
         // Pool full (1 slot) -> second push dropped.
         assert!(!unsafe { mb.push(1, 0, 0, d.as_ptr(), d.len()) });
+        assert_eq!(mb.dropped(), 1);
     }
 
     #[test]

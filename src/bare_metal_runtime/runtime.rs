@@ -29,7 +29,11 @@ use super::mailbox::RxMailbox;
 use super::transport::{CallbackFactory, CallbackSocket, CallbackTimer, NowMsFn, Platform, SendFn};
 
 // ── Fixed runtime sizing (catalog-agnostic) ──────────────────────────────
-/// RX mailbox slots.
+/// RX mailbox slots, shared by every port the runtime receives on
+/// (`SIMPLE_SOMEIP_RX_SLOTS`, 2 by default). A datagram that arrives while
+/// every slot is full is dropped and counted in [`RxMailbox::dropped`]. After
+/// a subscription to fields is acknowledged, the `SubscribeAck` and one initial
+/// value per field arrive at once; size the mailbox to hold that burst.
 pub const RX_SLOTS: usize = crate::from_env_or(option_env!("SIMPLE_SOMEIP_RX_SLOTS"), 2);
 /// Per-slot / per-buffer capacity. One Ethernet-MTU-ish datagram; SOME/IP
 /// single datagrams stay under this (TP segmentation not used here).
@@ -1025,8 +1029,9 @@ pub unsafe fn publish(
 }
 
 /// Best-effort `StopOfferService` (one combined datagram) so peers drop us
-/// immediately, then stop: later [`poll`] and [`publish`] calls do nothing,
-/// and [`init`] returns [`InitError::AlreadyInitialized`]. Idempotent.
+/// immediately, then stop: later [`poll`], [`publish`] and [`on_rx`] calls do
+/// nothing, and [`init`] returns [`InitError::AlreadyInitialized`].
+/// Idempotent.
 pub fn deinit() {
     if !Lifecycle::advance(Lifecycle::Running, Lifecycle::Stopped) {
         Lifecycle::advance(Lifecycle::Initializing, Lifecycle::Stopped);
@@ -1062,15 +1067,17 @@ pub fn deinit() {
 }
 
 /// Push one received datagram into the RX mailbox. The platform's receive
-/// path calls this for every inbound UDP datagram.
+/// path calls this for every inbound UDP datagram. It discards the datagram
+/// unless [`init`] has succeeded and [`deinit`] has not run.
 ///
 /// # Safety
 /// `buf` must be valid for `len` bytes.
 pub unsafe fn on_rx(local_port: u16, src_addr: u32, src_port: u16, buf: *const u8, len: usize) {
-    if buf.is_null() || len == 0 {
+    if buf.is_null() || len == 0 || Lifecycle::now() != Lifecycle::Running {
         return;
     }
-    // SAFETY: set in init before the platform starts delivering RX.
+    // SAFETY: `init` writes MAILBOX only while `Initializing`, never once
+    // the runtime is `Running`.
     if let Some(mailbox) = unsafe { *core::ptr::addr_of!(MAILBOX) } {
         unsafe {
             let _ = mailbox.push(local_port, src_addr, src_port, buf, len);

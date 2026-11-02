@@ -23,9 +23,12 @@ Run the std runtime's interop tests:
     cargo nextest run --profile interop --features std,tracing,client,client-tokio,server,server-tokio --test interop_std
 
 Run the bare-metal runtime's interop tests (nightly toolchain). The scenarios
-require two services at once, so the runtime's table needs room for both:
+require two services at once, so the runtime's table needs room for both, and
+`x4_initial_value_burst_is_delivered` receives a SubscribeAck and two initial
+values at once, so the mailbox needs three slots; the command gives it one to
+spare:
 
-    SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES=2 cargo +nightly-2026-08-21 nextest run --profile interop --no-default-features --features bare-metal-runtime --test interop_bare_metal
+    SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES=2 SIMPLE_SOMEIP_RX_SLOTS=4 cargo +nightly-2026-08-21 nextest run --profile interop --no-default-features --features bare-metal-runtime --test interop_bare_metal
 
 Add `--run-ignored only` to see which known gaps are still open; each ignored
 test names the issue that tracks it.

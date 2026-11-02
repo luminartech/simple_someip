@@ -774,6 +774,89 @@ mod tests {
         assert_eq!(rt::init(with_delay(Duration::from_secs(3))), Ok(()));
     }
 
+    /// Datagrams that arrive while every mailbox slot is full are dropped and
+    /// counted.
+    #[test]
+    fn a_full_mailbox_counts_the_datagrams_it_drops() {
+        assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
+        assert_eq!(
+            rt::init(config(offers(1, 3), bind_nothing, send_nothing)),
+            Ok(())
+        );
+        let datagram = [0u8; 16];
+
+        // Not polled, so nothing takes a datagram out of the mailbox.
+        for _ in 0..rt::RX_SLOTS + 2 {
+            // SAFETY: `datagram` is valid for its length.
+            unsafe {
+                rt::on_rx(
+                    SERVER_PORT,
+                    u32::from(OUR_IP),
+                    CLIENT_PORT,
+                    datagram.as_ptr(),
+                    datagram.len(),
+                );
+            }
+        }
+
+        assert_eq!(MAILBOX.dropped(), 2);
+    }
+
+    /// After a failed `init` the mailbox takes nothing in, though the ports
+    /// bound before the failure still deliver to `on_rx`.
+    #[test]
+    fn rx_after_a_failed_init_is_not_taken_in() {
+        assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
+        assert_eq!(
+            rt::init(config(offers(1, 3), bind_fails, send_nothing)),
+            Err(rt::InitError::Bind)
+        );
+        let datagram = [0u8; 16];
+
+        for _ in 0..rt::RX_SLOTS + 2 {
+            // SAFETY: `datagram` is valid for its length.
+            unsafe {
+                rt::on_rx(
+                    SERVER_PORT,
+                    u32::from(OUR_IP),
+                    CLIENT_PORT,
+                    datagram.as_ptr(),
+                    datagram.len(),
+                );
+            }
+        }
+
+        assert_eq!(MAILBOX.dropped(), 0);
+    }
+
+    /// After `deinit` the mailbox takes nothing in, so a platform that keeps
+    /// its ports bound sees no drops for traffic that arrives afterwards.
+    #[test]
+    fn rx_after_deinit_is_not_counted_as_dropped() {
+        assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
+        assert_eq!(
+            rt::init(config(offers(1, 3), bind_nothing, send_nothing)),
+            Ok(())
+        );
+        rt::deinit();
+        let datagram = [0u8; 16];
+
+        for _ in 0..rt::RX_SLOTS + 2 {
+            // SAFETY: `datagram` is valid for its length.
+            unsafe {
+                rt::on_rx(
+                    SERVER_PORT,
+                    u32::from(OUR_IP),
+                    CLIENT_PORT,
+                    datagram.as_ptr(),
+                    datagram.len(),
+                );
+            }
+        }
+
+        assert_eq!(MAILBOX.dropped(), 0);
+    }
+
     /// Unicast and multicast SD both still reach the runtime when another
     /// wildcard socket is bound to the SD port after it, as vsomeip's is.
     ///

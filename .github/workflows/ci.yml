@@ -543,7 +543,8 @@ jobs:
             toolchain: nightly-2026-08-21
             args: --no-default-features --features bare-metal-runtime --test interop_bare_metal
             # Every consuming scenario requires SVC and OTHER_SVC, so each needs room for two.
-            env: SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES=2
+            # x4 receives a SubscribeAck and two initial values at once: three slots, and one to spare.
+            env: SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES=2 SIMPLE_SOMEIP_RX_SLOTS=4
     env:
       SIMPLE_SOMEIP_VSOMEIP_IMAGE: ${{ needs.vsomeip-peer-image.outputs.image }}
     steps:
@@ -643,7 +644,8 @@ jobs:
             toolchain: nightly-2026-08-21
             args: --no-default-features --features bare-metal-runtime --test interop_bare_metal
             # Every consuming scenario requires SVC and OTHER_SVC, so each needs room for two.
-            env: SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES=2
+            # x4 receives a SubscribeAck and two initial values at once: three slots, and one to spare.
+            env: SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES=2 SIMPLE_SOMEIP_RX_SLOTS=4
     env:
       SIMPLE_SOMEIP_VSOMEIP_IMAGE: ${{ needs.vsomeip-peer-image.outputs.image }}
     steps:
@@ -761,7 +763,8 @@ jobs:
             toolchain: nightly-2026-08-21
             args: --no-default-features --features bare-metal-runtime --test interop_bare_metal
             # Every consuming scenario requires SVC and OTHER_SVC, so each needs room for two.
-            env: SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES=2
+            # x4 receives a SubscribeAck and two initial values at once: three slots, and one to spare.
+            env: SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES=2 SIMPLE_SOMEIP_RX_SLOTS=4
     steps:
       - uses: actions/checkout@v6
         with:
