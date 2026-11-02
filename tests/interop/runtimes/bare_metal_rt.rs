@@ -35,8 +35,8 @@ static mut BUFFERS: rt::RuntimeBuffers = rt::RuntimeBuffers::new();
 static STARTED: AtomicBool = AtomicBool::new(false);
 /// The host sockets, by local port.
 static SOCKETS: Mutex<Vec<(u16, UdpSocket)>> = Mutex::new(Vec::new());
-/// Ports the host transport could not bind (the runtime ignores `bind`'s
-/// result, so `start` checks this instead).
+/// Why the host transport could not bind a port, which `init` reports only
+/// as `InitError::Bind`.
 static BIND_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Serializes `rt::on_rx`: the mailbox takes one producer at a time, and
 /// every bound socket has its own reader thread.
@@ -143,12 +143,10 @@ impl SomeipUnderTest for BareMetalRt {
             Err(rt::InitError::AlreadyInitialized) => panic!("{ALREADY_STARTED}"),
             Err(e) => {
                 STARTED.store(false, Ordering::Release);
-                panic!("{}: init failed with {e:?}", Self::NAME);
+                let errors = lock(&BIND_ERRORS).join("; ");
+                panic!("{}: init failed with {e:?} {errors}", Self::NAME);
             }
         }
-        let errors = lock(&BIND_ERRORS);
-        assert!(errors.is_empty(), "{}: {}", Self::NAME, errors.join("; "));
-        drop(errors);
 
         let (cmds, rx) = mpsc::channel();
         let poller = std::thread::Builder::new()
@@ -438,36 +436,38 @@ mod tests {
         0
     }
 
-    /// `init` refuses more offers than `SIMPLE_SOMEIP_MAX_OFFERS`, and
-    /// a later `init` with as many offers as it holds succeeds.
-    #[test]
-    fn init_rejects_more_offers_than_the_runtime_holds() {
-        let cap = option_env!("SIMPLE_SOMEIP_MAX_OFFERS").map_or(4, |cap| {
-            cap.parse::<usize>().expect("SIMPLE_SOMEIP_MAX_OFFERS")
-        });
-        let offers = |n: u16| -> &'static [rt::OfferEntry] {
-            (0..n)
-                .map(|i| rt::OfferEntry {
-                    service_id: SVC + i,
-                    instance_id: INST,
-                    event_group_id: EG,
-                    unicast_port: SERVER_PORT,
-                    major_version: MAJOR,
-                    ttl_seconds: 3,
-                })
-                .collect::<Vec<_>>()
-                .leak()
-        };
-        let config = |offers: &'static [rt::OfferEntry]| rt::RuntimeConfig {
+    /// `n` offers of consecutive services from `SVC`, each with `ttl_seconds`.
+    fn offers(n: u16, ttl_seconds: u32) -> &'static [rt::OfferEntry] {
+        (0..n)
+            .map(|i| rt::OfferEntry {
+                service_id: SVC + i,
+                instance_id: INST,
+                event_group_id: EG,
+                unicast_port: SERVER_PORT,
+                major_version: MAJOR,
+                ttl_seconds,
+            })
+            .collect::<Vec<_>>()
+            .leak()
+    }
+
+    /// A config that offers `offers` through the platform callbacks `bind` and
+    /// `send`, with buffers of its own.
+    fn config(
+        offers: &'static [rt::OfferEntry],
+        bind: rt::BindFn,
+        send: rt::SendFn,
+    ) -> rt::RuntimeConfig {
+        rt::RuntimeConfig {
             interface: u32::from(OUR_IP),
             sd_port: SD_PORT,
             sd_mcast: u32::from(SD_GROUP),
             multicast_loopback: true,
-            send: send_nothing,
+            send,
             now_ms,
             dispatch,
             dispatch_ctx: 0,
-            bind: bind_nothing,
+            bind,
             offers,
             subscription: None,
             required_services: &[],
@@ -476,16 +476,104 @@ mod tests {
             mailbox: &MAILBOX,
             buffers: Box::leak(Box::new(rt::RuntimeBuffers::new())),
             e2e: None,
-        };
+        }
+    }
+
+    /// `init` refuses more offers than `SIMPLE_SOMEIP_MAX_OFFERS`, and
+    /// a later `init` with as many offers as it holds succeeds.
+    #[test]
+    fn init_rejects_more_offers_than_the_runtime_holds() {
+        let cap = option_env!("SIMPLE_SOMEIP_MAX_OFFERS").map_or(4, |cap| {
+            cap.parse::<usize>().expect("SIMPLE_SOMEIP_MAX_OFFERS")
+        });
         let cap = u16::try_from(cap).expect("cap fits u16");
 
         assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
         assert_eq!(
-            rt::init(config(offers(cap + 1))),
+            rt::init(config(offers(cap + 1, 3), bind_nothing, send_nothing)),
             Err(rt::InitError::TooManyOffers)
         );
         assert_eq!(rt::InitError::TooManyOffers.code(), -8);
-        assert_eq!(rt::init(config(offers(cap))), Ok(()));
+        assert_eq!(
+            rt::init(config(offers(cap, 3), bind_nothing, send_nothing)),
+            Ok(())
+        );
+    }
+
+    /// Every port `bind_recording` was asked to bind, in order.
+    static BIND_CALLS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    /// Makes `bind_recording` fail once for `SERVER_PORT`.
+    static FAIL_SERVER_PORT_ONCE: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn bind_recording(port: u16, _is_sd: bool, _mcast: u32) -> i32 {
+        lock(&BIND_CALLS).push(port);
+        if port == SERVER_PORT && FAIL_SERVER_PORT_ONCE.swap(false, Ordering::AcqRel) {
+            -1
+        } else {
+            0
+        }
+    }
+
+    fn binds_of(port: u16) -> usize {
+        lock(&BIND_CALLS).iter().filter(|&&p| p == port).count()
+    }
+
+    /// An offer on the SD port does not bind that port a second time.
+    #[test]
+    fn init_binds_the_sd_port_once_when_an_offer_shares_it() {
+        assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
+        let on_sd_port: &'static [rt::OfferEntry] = vec![rt::OfferEntry {
+            unicast_port: SD_PORT,
+            ..offers(1, 3)[0]
+        }]
+        .leak();
+
+        assert_eq!(
+            rt::init(config(on_sd_port, bind_recording, send_nothing)),
+            Ok(())
+        );
+
+        assert_eq!(binds_of(SD_PORT), 1);
+    }
+
+    /// A retry after a failed bind binds only the ports the failed `init` did
+    /// not bind.
+    #[test]
+    fn init_retried_after_a_failed_bind_does_not_bind_a_port_again() {
+        assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
+        FAIL_SERVER_PORT_ONCE.store(true, Ordering::Release);
+        assert_eq!(
+            rt::init(config(offers(1, 3), bind_recording, send_nothing)),
+            Err(rt::InitError::Bind)
+        );
+
+        assert_eq!(
+            rt::init(config(offers(1, 3), bind_recording, send_nothing)),
+            Ok(())
+        );
+
+        assert_eq!(binds_of(SD_PORT), 1);
+        assert_eq!(binds_of(SERVER_PORT), 2);
+    }
+
+    extern "C" fn bind_fails(_port: u16, _is_sd: bool, _mcast: u32) -> i32 {
+        -1
+    }
+
+    /// `init` reports a port the platform could not bind, and a later `init`
+    /// whose binds succeed starts the runtime.
+    #[test]
+    fn init_reports_a_failed_bind() {
+        assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
+        assert_eq!(
+            rt::init(config(offers(1, 3), bind_fails, send_nothing)),
+            Err(rt::InitError::Bind)
+        );
+        assert_eq!(rt::InitError::Bind.code(), -9);
+        assert_eq!(
+            rt::init(config(offers(1, 3), bind_nothing, send_nothing)),
+            Ok(())
+        );
     }
 
     /// Unicast and multicast SD both still reach the runtime when another

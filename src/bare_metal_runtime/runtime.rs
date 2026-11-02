@@ -94,9 +94,10 @@ pub type ServiceFn = crate::server::ServiceObserver;
 
 /// Bind a platform UDP socket / PCB for `port` and register its receive
 /// path (which must call [`on_rx`]). `is_sd` requests the SD multicast
-/// group (`mcast`) be joined. Returns 0 on success. The runtime calls this
-/// during [`init`] for the SD port + every unique unicast/RX port in the
-/// catalog, so the platform doesn't walk the catalog itself.
+/// group (`mcast`) be joined. Returns 0 on success; any other value makes
+/// [`init`] return [`InitError::Bind`]. The runtime calls this during
+/// [`init`] for the SD port + every unique unicast/RX port in the catalog,
+/// so the platform doesn't walk the catalog itself.
 pub type BindFn = extern "C" fn(port: u16, is_sd: bool, mcast: u32) -> i32;
 
 /// One offered service. Layout matches a platform's generated catalog
@@ -647,27 +648,57 @@ async fn someip_task() {
 }
 
 /// Bind PCBs via the platform (registers the RX path → `on_rx`): the SD
-/// port, each unique offered unicast port, and each subscription RX port.
-fn bind_ports(bind: BindFn) {
-    bind(
-        SD_PORT.load(Ordering::Acquire),
-        true,
-        SD_MCAST.load(Ordering::Acquire),
-    );
-    let mut bound: [u16; MAX_OFFERS + 1] = [0; MAX_OFFERS + 1];
-    let mut nb = 0usize;
-    let mut bind_once = |port: u16| {
-        if port != 0 && !bound[..nb].contains(&port) {
-            bind(port, false, 0);
-            bound[nb] = port;
-            nb += 1;
+/// port, each unique offered unicast port, and each subscription RX port,
+/// skipping the ports an earlier, failed `init` bound. Stops at the first
+/// port `bind` fails for.
+fn bind_ports(bind: BindFn) -> Result<(), InitError> {
+    let sd_port = SD_PORT.load(Ordering::Acquire);
+    let ports = core::iter::once(sd_port)
+        .chain(offers().iter().map(|o| o.unicast_port))
+        .chain(subscription().map(|s| s.local_rx_port));
+    for port in ports {
+        if port == 0 || BOUND_PORTS.contains(port) {
+            continue;
         }
-    };
-    for o in offers() {
-        bind_once(o.unicast_port);
+        let (is_sd, mcast) = if port == sd_port {
+            (true, SD_MCAST.load(Ordering::Acquire))
+        } else {
+            (false, 0)
+        };
+        if bind(port, is_sd, mcast) != 0 {
+            return Err(InitError::Bind);
+        }
+        BOUND_PORTS.insert(port);
     }
-    if let Some(s) = subscription() {
-        bind_once(s.local_rx_port);
+    Ok(())
+}
+
+/// The ports [`bind_ports`] has bound, which stay bound for the life of the
+/// program: the SD port plus at most one per offer and one for the
+/// subscription per `init` attempt.
+static BOUND_PORTS: BoundPorts = BoundPorts::new();
+
+struct BoundPorts {
+    ports: [AtomicU16; MAX_OFFERS + 2],
+}
+
+impl BoundPorts {
+    const fn new() -> Self {
+        Self {
+            ports: [const { AtomicU16::new(0) }; MAX_OFFERS + 2],
+        }
+    }
+
+    fn contains(&self, port: u16) -> bool {
+        self.ports.iter().any(|p| p.load(Ordering::Acquire) == port)
+    }
+
+    /// Records `port` in the first free entry; a full table records nothing,
+    /// so a later `init` binds that port again.
+    fn insert(&self, port: u16) {
+        if let Some(free) = self.ports.iter().find(|p| p.load(Ordering::Acquire) == 0) {
+            free.store(port, Ordering::Release);
+        }
     }
 }
 
@@ -704,6 +735,10 @@ pub enum InitError {
     /// [`RuntimeConfig::offers`] holds more entries than the runtime holds.
     #[error("more offers than SIMPLE_SOMEIP_MAX_OFFERS (4 by default)")]
     TooManyOffers = -8,
+    /// [`RuntimeConfig::bind`] returned a nonzero value for a port. The ports
+    /// it bound before that one stay bound.
+    #[error("the platform could not bind a port")]
+    Bind = -9,
 }
 
 impl InitError {
@@ -723,7 +758,8 @@ impl InitError {
 ///
 /// Returns the [`InitError`] that stopped it. Every error but
 /// [`InitError::AlreadyInitialized`] leaves the runtime uninitialized, so a
-/// corrected retry can proceed.
+/// corrected retry can proceed. The ports [`RuntimeConfig::bind`] bound before
+/// the error stay bound, and the retry does not bind them again.
 // By-value is required, not incidental: `config.buffers` is a `&'static mut`
 // reborrowed into `BUFS` (`ptr::from_mut`), which a shared `&RuntimeConfig`
 // could not yield. This is also the FFI ownership-transfer boundary — the
@@ -796,7 +832,7 @@ fn init_claimed(config: RuntimeConfig) -> Result<(), InitError> {
     }
     SUBSCRIBED.store(config.subscription.is_some(), Ordering::Release);
 
-    bind_ports(config.bind);
+    bind_ports(config.bind)?;
 
     let on_service = config.on_service.map(|f| (f, config.dispatch_ctx));
     if !build_server(config.find_timing, catalog, on_service) {
