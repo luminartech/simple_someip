@@ -576,6 +576,126 @@ mod tests {
         );
     }
 
+    /// Datagrams sent after `deinit` returned.
+    static SENT_AFTER_DEINIT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static DEINIT_DONE: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn send_counting(
+        _port: u16,
+        _buf: *const u8,
+        _len: usize,
+        _to: u32,
+        _at: u16,
+    ) -> i32 {
+        if DEINIT_DONE.load(Ordering::Acquire) {
+            SENT_AFTER_DEINIT.fetch_add(1, Ordering::AcqRel);
+        }
+        0
+    }
+
+    fn poll_for(duration: Duration) {
+        let end = Instant::now() + duration;
+        while Instant::now() < end {
+            rt::poll();
+            std::thread::sleep(TICK);
+        }
+    }
+
+    /// A dispatch callback that answers the request after calling `deinit`.
+    fn dispatch_deinit(
+        ctx: usize,
+        source: SocketAddrV4,
+        service: u16,
+        method: u16,
+        payload: &[u8],
+        e2e_status: Option<simple_someip::E2EStatus>,
+        response_out: &mut [u8],
+    ) -> i32 {
+        rt::deinit();
+        DEINIT_DONE.store(true, Ordering::Release);
+        dispatch(
+            ctx,
+            source,
+            service,
+            method,
+            payload,
+            e2e_status,
+            response_out,
+        )
+    }
+
+    /// A `deinit` from a dispatch callback inside `poll` stops the runtime
+    /// at once: the request that triggered it gets no response after the
+    /// StopOffer.
+    #[test]
+    fn deinit_from_a_dispatch_callback_sends_nothing_after_it() {
+        assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
+        let mut config = config(offers(1, 3), bind_nothing, send_counting);
+        config.dispatch = dispatch_deinit;
+        assert_eq!(rt::init(config), Ok(()));
+        let payload = [7u8; 4];
+        let mut request = build::someip_header(SVC, METHOD, 1, 1, 0x00, 0x00, payload.len());
+        request.extend(payload);
+
+        // SAFETY: `request` is valid for its length.
+        unsafe {
+            rt::on_rx(
+                SERVER_PORT,
+                u32::from(OUR_IP),
+                CLIENT_PORT,
+                request.as_ptr(),
+                request.len(),
+            );
+        }
+        poll_for(Duration::from_millis(100));
+
+        assert!(
+            DEINIT_DONE.load(Ordering::Acquire),
+            "the request was not dispatched"
+        );
+        assert_eq!(SENT_AFTER_DEINIT.load(Ordering::Acquire), 0);
+    }
+
+    extern "C" fn bind_then_deinit(_port: u16, _is_sd: bool, _mcast: u32) -> i32 {
+        rt::deinit();
+        0
+    }
+
+    /// A `deinit` during `init` leaves the runtime stopped once `init` returns.
+    #[test]
+    fn deinit_during_init_leaves_the_runtime_stopped() {
+        assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
+        assert_eq!(
+            rt::init(config(offers(1, 1), bind_then_deinit, send_counting)),
+            Ok(())
+        );
+        DEINIT_DONE.store(true, Ordering::Release);
+
+        poll_for(Duration::from_millis(1500));
+
+        assert_eq!(SENT_AFTER_DEINIT.load(Ordering::Acquire), 0);
+    }
+
+    /// A platform that keeps calling `poll` after `deinit` sends nothing more:
+    /// no Offer follows the StopOffer.
+    #[test]
+    fn poll_after_deinit_sends_nothing() {
+        assert!(!STARTED.swap(true, Ordering::AcqRel), "{ALREADY_STARTED}");
+        assert_eq!(
+            rt::init(config(offers(1, 1), bind_nothing, send_counting)),
+            Ok(())
+        );
+        poll_for(Duration::from_millis(100));
+        rt::deinit();
+        DEINIT_DONE.store(true, Ordering::Release);
+
+        // Two and a half Offer periods of the 1 s TTL.
+        poll_for(Duration::from_millis(2500));
+
+        assert_eq!(SENT_AFTER_DEINIT.load(Ordering::Acquire), 0);
+    }
+
     /// Unicast and multicast SD both still reach the runtime when another
     /// wildcard socket is bound to the SD port after it, as vsomeip's is.
     ///

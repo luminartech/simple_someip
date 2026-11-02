@@ -6,7 +6,7 @@
 use core::cell::RefCell;
 use core::mem::MaybeUninit;
 use core::net::{Ipv4Addr, SocketAddrV4};
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use core::time::Duration;
 
 use embassy_executor::raw::Executor;
@@ -308,17 +308,38 @@ static SEND_FN: AtomicUsize = AtomicUsize::new(0); // SendFn as usize
 static NOW_FN: AtomicUsize = AtomicUsize::new(0); // NowMsFn as usize
 
 static mut EXECUTOR: MaybeUninit<Executor> = MaybeUninit::uninit();
-/// Set once the `EXECUTOR` slot is written and the task is spawned — the
-/// gate `poll()` checks. Stays false through all of `init`'s fallible work
-/// so `poll()` never touches an uninitialized executor.
-static EXECUTOR_INIT: AtomicBool = AtomicBool::new(false);
-/// Claimed atomically at the top of `init` to make it idempotent and
-/// re-entrancy-safe: only the first caller proceeds; a second concurrent or
-/// repeat call is rejected (it must NOT adopt the new config or it would
-/// silently leak the platform's freshly-handed `&'static mut` buffers).
-/// Reset on `init`'s failure paths so a corrected retry can proceed.
-static INIT_CLAIMED: AtomicBool = AtomicBool::new(false);
-static RUN_READY: AtomicBool = AtomicBool::new(false);
+/// Where the runtime is in its life, a [`Lifecycle`] as `u8`.
+static LIFECYCLE: AtomicU8 = AtomicU8::new(Lifecycle::Idle as u8);
+
+/// The runtime's states. `init` moves it from `Idle` to `Initializing`, then
+/// to `Running`, or back to `Idle` when it fails; `deinit` moves it from
+/// `Running` or `Initializing` to `Stopped`, which it never leaves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Lifecycle {
+    Idle,
+    Initializing,
+    Running,
+    Stopped,
+}
+
+impl Lifecycle {
+    fn now() -> Self {
+        match LIFECYCLE.load(Ordering::Acquire) {
+            0 => Self::Idle,
+            1 => Self::Initializing,
+            2 => Self::Running,
+            _ => Self::Stopped,
+        }
+    }
+
+    /// Moves to `to` if the runtime is in `from`; `false` if it is not.
+    fn advance(from: Self, to: Self) -> bool {
+        LIFECYCLE
+            .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
 /// Held while [`poll`] runs the executor, which must not be polled
 /// reentrantly.
 static POLLING: AtomicBool = AtomicBool::new(false);
@@ -368,15 +389,34 @@ fn offer_ttl(ttl_seconds: u32) -> u32 {
     }
 }
 
+/// The platform's [`RuntimeConfig::send`].
+fn platform_send() -> SendFn {
+    // SAFETY: `init` stores a `SendFn` before any reader.
+    unsafe { core::mem::transmute::<usize, SendFn>(SEND_FN.load(Ordering::Acquire)) }
+}
+
+/// [`platform_send`] while the runtime is `Running`; -1 without sending
+/// otherwise.
+extern "C" fn send_while_running(
+    local_port: u16,
+    buf: *const u8,
+    len: usize,
+    dst: u32,
+    dst_port: u16,
+) -> i32 {
+    if Lifecycle::now() != Lifecycle::Running {
+        return -1;
+    }
+    platform_send()(local_port, buf, len, dst, dst_port)
+}
+
 fn platform() -> Platform<'static, RX_SLOTS, RX_CAP> {
     // SAFETY: set once in `init` before any reader.
     let mailbox = unsafe { (*core::ptr::addr_of!(MAILBOX)).expect("mailbox set in init") };
-    let send: SendFn =
-        unsafe { core::mem::transmute::<usize, SendFn>(SEND_FN.load(Ordering::Acquire)) };
     let now: NowMsFn =
         unsafe { core::mem::transmute::<usize, NowMsFn>(NOW_FN.load(Ordering::Acquire)) };
     Platform {
-        send,
+        send: send_while_running,
         now_ms: now,
         mailbox,
         interface: IFACE.load(Ordering::Acquire),
@@ -766,20 +806,18 @@ impl InitError {
 // platform hands the runtime its config and buffer memory.
 #[allow(clippy::needless_pass_by_value)]
 pub fn init(config: RuntimeConfig) -> Result<(), InitError> {
-    // Atomically claim init: only the first caller proceeds. Closes the
-    // window the old `load`-then-store-at-end guard left open (a re-entrant
-    // `init` via a `bind`/`send` callback, or a repeat call) during which a
-    // second caller would re-alias `BUFS` and silently leak its buffers.
-    if INIT_CLAIMED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    if !Lifecycle::advance(Lifecycle::Idle, Lifecycle::Initializing) {
         return Err(InitError::AlreadyInitialized);
     }
     let result = init_claimed(config);
-    if result.is_err() {
-        INIT_CLAIMED.store(false, Ordering::Release);
-    }
+    Lifecycle::advance(
+        Lifecycle::Initializing,
+        if result.is_ok() {
+            Lifecycle::Running
+        } else {
+            Lifecycle::Idle
+        },
+    );
     result
 }
 
@@ -821,7 +859,8 @@ fn init_claimed(config: RuntimeConfig) -> Result<(), InitError> {
     }
 
     // Copy catalog into static tables.
-    // SAFETY: single-init guarded by INIT_CLAIMED; no task reads OFFERS yet.
+    // SAFETY: only the one `init` in `Initializing` gets here; no task reads
+    // OFFERS yet.
     let slots = unsafe { &mut *core::ptr::addr_of_mut!(OFFERS) };
     for (slot, entry) in slots.iter_mut().zip(config.offers) {
         *slot = *entry;
@@ -839,7 +878,7 @@ fn init_claimed(config: RuntimeConfig) -> Result<(), InitError> {
         return Err(InitError::ServerBuild);
     }
 
-    // SAFETY: single-init guarded by INIT_CLAIMED (claimed above).
+    // SAFETY: only the one `init` in `Initializing` gets here.
     let spawner = unsafe {
         let slot = &mut *core::ptr::addr_of_mut!(EXECUTOR);
         slot.write(Executor::new(core::ptr::null_mut()));
@@ -848,19 +887,16 @@ fn init_claimed(config: RuntimeConfig) -> Result<(), InitError> {
     if spawner.spawn(someip_task()).is_err() {
         return Err(InitError::Spawn);
     }
-    // Publish the poll gate LAST: `poll()` must never touch `EXECUTOR`
-    // before the slot above is written and the task is spawned.
-    EXECUTOR_INIT.store(true, Ordering::Release);
-    RUN_READY.store(true, Ordering::Release);
     Ok(())
 }
 
 /// Tick the executor once. Call every platform main-loop iteration.
 ///
 /// A call made while another `poll` is running, such as from a
-/// [`DispatchFn`] or [`ServiceFn`] callback, returns without polling.
+/// [`DispatchFn`] or [`ServiceFn`] callback, or after [`deinit`], returns
+/// without polling.
 pub fn poll() {
-    if !EXECUTOR_INIT.load(Ordering::Acquire) {
+    if Lifecycle::now() != Lifecycle::Running {
         return;
     }
     if POLLING
@@ -886,11 +922,13 @@ fn next_publish_session() -> u16 {
 
 /// Publish a notification to all current subscribers, protected through
 /// [`RuntimeConfig::e2e`]. Returns subscriber count, or negative on error
-/// (`-1` not ready, `-2` payload too large once framed, or once protected
-/// while someone subscribes, `-3` tuple not offered).
+/// (`-1` before [`init`], after [`deinit`], or for a null `payload` with a
+/// nonzero `len`, `-2` payload too large once framed, or once protected while
+/// someone subscribes, `-3` tuple not offered).
 ///
 /// # Safety
 /// `payload` must be valid for `len` bytes (or `len == 0`).
+#[must_use]
 pub unsafe fn publish(
     service_id: u16,
     instance_id: u16,
@@ -899,7 +937,7 @@ pub unsafe fn publish(
     payload: *const u8,
     len: usize,
 ) -> i32 {
-    if !RUN_READY.load(Ordering::Acquire) {
+    if Lifecycle::now() != Lifecycle::Running {
         return -1;
     }
     let Some(offer) = find_offer(service_id, instance_id, event_group_id) else {
@@ -952,9 +990,11 @@ pub unsafe fn publish(
 }
 
 /// Best-effort `StopOfferService` (one combined datagram) so peers drop us
-/// immediately. Idempotent.
+/// immediately, then stop: later [`poll`] and [`publish`] calls do nothing,
+/// and [`init`] returns [`InitError::AlreadyInitialized`]. Idempotent.
 pub fn deinit() {
-    if !RUN_READY.swap(false, Ordering::AcqRel) {
+    if !Lifecycle::advance(Lifecycle::Running, Lifecycle::Stopped) {
+        Lifecycle::advance(Lifecycle::Initializing, Lifecycle::Stopped);
         return;
     }
     let mut reqs = [DEFAULT_OFFER_REQUEST; MAX_OFFERS];
@@ -962,13 +1002,13 @@ pub fn deinit() {
     if n == 0 {
         return;
     }
-    let plat = platform();
     // SAFETY: `publish_scratch` is the API-reserved buffer (see `publish`),
     // never borrowed by `someip_task`; `deinit` is terminal and serial with
     // `publish`. RX_CAP >= SD_SCRATCH_CAP, so it holds the StopOffer datagram.
     // Reborrowed through `addr_of_mut!` to retag only this field's bytes.
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).publish_scratch) };
-    // SAFETY: `RUN_READY` is set only after `init` wrote SERVER.
+    // SAFETY: the runtime was `Running`, which `init` enters only after it
+    // wrote SERVER.
     let sd = unsafe { (*core::ptr::addr_of!(SERVER)).assume_init_ref() }.sd();
     if let Ok(total) = build_multi_stop_offer_service_datagram::<MAX_OFFERS>(
         scratch,
@@ -976,7 +1016,7 @@ pub fn deinit() {
         sd.next_session(),
     ) {
         let group = sd.multicast();
-        (plat.send)(
+        platform_send()(
             group.port(),
             scratch.as_ptr(),
             total,
