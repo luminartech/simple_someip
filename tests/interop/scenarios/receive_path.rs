@@ -384,7 +384,7 @@ scenario!(
     /// own lands inside a burst.
     x4_initial_value_burst_is_delivered,
     std = run,
-    bare_metal = ignore("initial values sent right after the Ack must all be delivered (#191)"),
+    bare_metal = run,
     {
         let mut server = FrameServer::start(REBOOT | UNICAST, Answer::Ack);
         server.after_first_ack = initial_value_notifications(1);
