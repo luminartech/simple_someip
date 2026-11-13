@@ -469,7 +469,7 @@ scenario!(
 scenario!(
     /// PRS_SOMEIP_00939, 00924 — our fire-and-forget request is a REQUEST_NO_RETURN with session ID 0x0000 (vsomeip's view).
     r4_fire_and_forget_uses_session_zero,
-    std = ignore("a fire-and-forget request must use session ID 0x0000 (#185)"),
+    std = run,
     bare_metal = ignore("the bare-metal runtime has no client-side method calls (#187)"),
     {
         let mut peer = VsomeipPeer::start();
@@ -505,7 +505,7 @@ scenario!(
 scenario!(
     /// PRS_SOMEIP_00939, 00924 — our fire-and-forget request is a REQUEST_NO_RETURN with session ID 0x0000 and return code E_OK (wire bytes).
     r4_fire_and_forget_uses_session_zero_frame,
-    std = ignore("a fire-and-forget request must use session ID 0x0000 (#185)"),
+    std = run,
     bare_metal = ignore("the bare-metal runtime has no client-side method calls (#187)"),
     {
         let server = FrameMethodServer::start();
