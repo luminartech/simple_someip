@@ -1182,6 +1182,12 @@ where
     ///
     /// Call `.response()` on the returned handle to await the reply payload.
     ///
+    /// The client sets the message's request ID to its client ID and the next
+    /// session ID. A
+    /// [`RequestNoReturn`](crate::protocol::MessageType::RequestNoReturn)
+    /// message without the TP flag is sent with session ID `0x0000` instead and
+    /// gets no reply, so its handle can be dropped.
+    ///
     /// # Saturation behavior
     ///
     /// Response tracking uses a fixed-capacity internal map. If it is

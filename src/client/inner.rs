@@ -316,7 +316,7 @@ pub(super) struct Inner<
     control_receiver: C::BoundedReceiver<ControlMessage<PayloadDefinitions, C>, 4>,
     /// Queue of pending control messages to process
     request_queue: Deque<ControlMessage<PayloadDefinitions, C>, REQUEST_QUEUE_CAP>,
-    /// Pending request-responses keyed by `request_id` (`client_id` << 16 | `session_counter`).
+    /// Pending request-responses keyed by `request_id` (`client_id` << 16 | session ID).
     /// Set by `SendToService`, cleared when a matching unicast arrives or,
     /// once the map is full, when its caller has stopped waiting.
     pending_responses: FnvIndexMap<
@@ -346,7 +346,7 @@ pub(super) struct Inner<
     run: bool,
     /// Client ID for SOME/IP request headers (upper 16 bits of request ID)
     client_id: u16,
-    /// Incrementing session counter for SOME/IP request headers (lower 16 bits of request ID)
+    /// Session ID for the next request that uses session handling (lower 16 bits of request ID)
     session_counter: u16,
     /// SD session state persisted across discovery socket rebinds so that
     /// `unbind_discovery` + `bind_discovery` does not emit a false reboot signal.
@@ -1021,8 +1021,19 @@ where
                     // space — under transient transport failure that
                     // could wrap toward in-flight pending_responses
                     // far faster than expected.
-                    let request_id =
-                        (u32::from(self.client_id) << 16) | u32::from(self.session_counter);
+                    //
+                    // A REQUEST_NO_RETURN outside SOME/IP-TP carries
+                    // session ID 0x0000 (PRS_SOMEIP_00939) and does not
+                    // use up a session ID.
+                    let message_type = message.header().message_type();
+                    let uses_session = message_type.message_type() != MessageType::RequestNoReturn
+                        || message_type.is_tp();
+                    let session_id = if uses_session {
+                        self.session_counter
+                    } else {
+                        0
+                    };
+                    let request_id = (u32::from(self.client_id) << 16) | u32::from(session_id);
                     message.set_request_id(request_id);
 
                     let send_result = socket.send(target, message).await;
@@ -1030,9 +1041,11 @@ where
                         Ok(()) => {
                             // Advance the counter only after a real
                             // wire transmission. Skip 0 on wrap.
-                            self.session_counter = self.session_counter.wrapping_add(1);
-                            if self.session_counter == 0 {
-                                self.session_counter = 1;
+                            if uses_session {
+                                self.session_counter = self.session_counter.wrapping_add(1);
+                                if self.session_counter == 0 {
+                                    self.session_counter = 1;
+                                }
                             }
                             let _ = send_complete.send(Ok(()));
                             self.track_or_reject_pending_response(request_id, response);
@@ -2464,6 +2477,73 @@ mod tests {
             result.is_ok(),
             "second send should reuse socket: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn fire_and_forget_uses_session_zero_and_keeps_the_counter() {
+        let (control_sender, _update_receiver, run_fut) = TestInner::build(
+            Ipv4Addr::LOCALHOST,
+            NoE2E,
+            false,
+            crate::client::bind_dispatch::SpawnerDispatch {
+                factory: TokioTransport,
+                spawner: TokioSpawner,
+                buffer_provider: TokioBufferProvider::new(),
+            },
+            TokioTimer,
+        );
+        let _run_handle = tokio::spawn(run_fut);
+
+        let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let peer_port = peer.local_addr().unwrap().port();
+        let key = lh_key(0x1234, peer_port);
+        let (rx, msg) = TestControl::add_endpoint(key, 0x0001, 0);
+        control_sender.send(msg).await.unwrap();
+        rx.recv().await.unwrap().unwrap();
+
+        let message = |kind, tp| {
+            let payload = TestPayload {
+                header: empty_sd_header(),
+            };
+            let len = automotive_wire_codec::Encode::encoded_size(&payload).unwrap();
+            Message::new(
+                protocol::Header::new(
+                    protocol::MessageId::new_from_service_and_method(0x1234, 0x0001),
+                    0,
+                    1,
+                    1,
+                    protocol::MessageTypeField::new(kind, tp),
+                    protocol::ReturnCode::Ok,
+                    len,
+                ),
+                payload,
+            )
+        };
+        let mut sessions = std::vec::Vec::new();
+        for (kind, tp) in [
+            (MessageType::Request, false),
+            (MessageType::RequestNoReturn, false),
+            (MessageType::RequestNoReturn, true),
+            (MessageType::Request, false),
+        ] {
+            let (send_rx, _resp_rx, msg) = TestControl::send_to_service(key, message(kind, tp));
+            control_sender.send(msg).await.unwrap();
+            send_rx.recv().await.unwrap().unwrap();
+            let mut buf = [0u8; 1500];
+            let (n, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), peer.recv_from(&mut buf))
+                    .await
+                    .expect("timed out waiting for the request")
+                    .unwrap();
+            assert!(n >= 16, "short datagram: {n} bytes");
+            assert_eq!(u16::from_be_bytes([buf[8], buf[9]]), 0x1234, "client ID");
+            sessions.push(u16::from_be_bytes([buf[10], buf[11]]));
+        }
+        // A REQUEST_NO_RETURN without TP carries session 0 and leaves the
+        // counter alone; with TP it is session-handled like a request.
+        assert_eq!(sessions, [1, 0, 2, 3]);
     }
 
     #[tokio::test]
