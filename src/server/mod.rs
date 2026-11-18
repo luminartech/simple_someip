@@ -90,16 +90,16 @@ const SERVER_CONSUMED_EVENTGROUPS_CAP: usize = crate::from_env_or(
     DEFAULT_CONSUMED_EVENTGROUPS,
 );
 #[cfg(feature = "bare_metal")]
-const _DEFAULT_REQUIRED_SERVICES: usize = 1;
+const DEFAULT_REQUIRED_SERVICES: usize = 1;
 #[cfg(not(feature = "bare_metal"))]
-const _DEFAULT_REQUIRED_SERVICES: usize = 16;
-const _SERVER_REQUIRED_SERVICES_CAP: usize = crate::from_env_or(
+const DEFAULT_REQUIRED_SERVICES: usize = 16;
+const SERVER_REQUIRED_SERVICES_CAP: usize = crate::from_env_or(
     option_env!("SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES"),
-    _DEFAULT_REQUIRED_SERVICES,
+    DEFAULT_REQUIRED_SERVICES,
 );
 const _: () = assert!(
     crate::sd_codec::find_service_datagram_len(
-        _SERVER_CONSUMED_EVENTGROUPS_CAP + _SERVER_REQUIRED_SERVICES_CAP
+        SERVER_CONSUMED_EVENTGROUPS_CAP + SERVER_REQUIRED_SERVICES_CAP
     ) <= crate::UDP_BUFFER_SIZE,
     "SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES or SIMPLE_SOMEIP_MAX_CONSUMED_EVENTGROUPS is too large: the FindService entries for that many service instances do not fit one UDP datagram"
 );
@@ -253,7 +253,7 @@ impl ServerConfig {
     /// `FindService` entries for that many instances and the
     /// [`Self::consumed_eventgroups`] do not fit one
     /// [`UDP_BUFFER_SIZE`](crate::UDP_BUFFER_SIZE) datagram.
-    pub const REQUIRED_SERVICES_CAP: usize = _SERVER_REQUIRED_SERVICES_CAP;
+    pub const REQUIRED_SERVICES_CAP: usize = SERVER_REQUIRED_SERVICES_CAP;
 
     /// Length of the `find_send_buf` of [`Server::run_with_buffers`]: a
     /// `FindService` for [`Self::CONSUMED_EVENTGROUPS_CAP`] plus
