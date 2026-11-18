@@ -22,9 +22,10 @@ Run the std runtime's interop tests:
 
     cargo nextest run --profile interop --features std,tracing,client,client-tokio,server,server-tokio --test interop_std
 
-Run the bare-metal runtime's interop tests (nightly toolchain):
+Run the bare-metal runtime's interop tests (nightly toolchain). The scenarios
+require two services at once, so the runtime's table needs room for both:
 
-    cargo +nightly-2026-08-21 nextest run --profile interop --no-default-features --features bare-metal-runtime --test interop_bare_metal
+    SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES=2 cargo +nightly-2026-08-21 nextest run --profile interop --no-default-features --features bare-metal-runtime --test interop_bare_metal
 
 Add `--run-ignored only` to see which known gaps are still open; each ignored
 test names the issue that tracks it.

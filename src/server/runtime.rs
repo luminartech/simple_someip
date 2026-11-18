@@ -14,12 +14,14 @@
 
 use core::net::SocketAddrV4;
 
+use futures_util::future::{FusedFuture, OptionFuture};
 use futures_util::{FutureExt, future::Either, pin_mut, select_biased};
 
-use crate::Timer;
 use crate::protocol::sd;
 use crate::transport::{E2EHandle, SharedHandle, TransportSocket};
+use crate::{ServiceInstance, Timer};
 
+use super::discovery::{Discovered, Discovery};
 use super::sd_state::SdStateManager;
 use super::subscription_manager::{SubscribeError, SubscriptionHandle};
 use super::{Error, ServerConfig};
@@ -29,11 +31,12 @@ use super::{Error, ServerConfig};
 ///
 /// `buf` is a caller-provided scratch buffer used for encoding the outgoing
 /// frame. Returns [`Error::Capacity`]`("udp_buffer")` if the encoded frame
-/// does not fit in `buf`, a protocol error if `config.ttl` is outside
+/// does not fit in `buf`, a protocol error if `offering.ttl` is outside
 /// 1..=[`MAX_TTL`](sd::MAX_TTL), or the socket's transport error.
 pub(super) async fn send_unicast_offer<T>(
     buf: &mut [u8],
     config: &ServerConfig,
+    offering: &super::Offering,
     sd_socket: &T,
     sd_state: &SdStateManager,
     target: core::net::SocketAddr,
@@ -42,12 +45,12 @@ where
     T: TransportSocket,
 {
     let target_v4 = socket_addr_v4(target)?;
-    let total_len = sd_state.encode_offer(buf, config)?;
+    let total_len = sd_state.encode_offer(buf, offering, config.interface)?;
     sd_socket.send_to(&buf[..total_len], target_v4).await?;
     crate::log::debug!(
         "Sent unicast OfferService to {} for service 0x{:04X}",
         target,
-        config.service_id
+        offering.service.service_id()
     );
 
     Ok(())
@@ -89,7 +92,7 @@ where
 /// does not fit in `buf`.
 pub(super) async fn send_subscribe_ack_from_view<T>(
     buf: &mut [u8],
-    config: &ServerConfig,
+    offering: &super::Offering,
     sd_socket: &T,
     sd_state: &SdStateManager,
     entry_view: &sd::EntryView<'_>,
@@ -98,7 +101,15 @@ pub(super) async fn send_subscribe_ack_from_view<T>(
 where
     T: TransportSocket,
 {
-    send_subscribe_answer(buf, sd_socket, sd_state, entry_view, config.ttl, subscriber).await?;
+    send_subscribe_answer(
+        buf,
+        sd_socket,
+        sd_state,
+        entry_view,
+        offering.ttl,
+        subscriber,
+    )
+    .await?;
     crate::log::debug!(
         "Sent SubscribeAck to {} for service 0x{:04X}, eventgroup 0x{:04X}",
         subscriber,
@@ -174,9 +185,10 @@ where
     Ok(())
 }
 
-/// Handle a Service Discovery message (Subscribe / `FindService` etc.);
-/// returns the consumed eventgroups it sent a Subscribe for.
+/// Handle a Service Discovery message (Subscribe / `FindService` etc.),
+/// recording the offers and stop offers it carries in `discovery`.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_sd_message<T, Sub>(
     config: &ServerConfig,
     sd_socket: &T,
@@ -185,7 +197,8 @@ pub(super) async fn handle_sd_message<T, Sub>(
     sd_view: &sd::SdHeaderView<'_>,
     sender: core::net::SocketAddr,
     send_buf: &mut [u8],
-) -> Result<Subscribed, Error>
+    discovery: &mut Discovery<'_>,
+) -> Result<(), Error>
 where
     T: TransportSocket,
     Sub: SubscriptionHandle,
@@ -213,27 +226,8 @@ where
                     entry_view.event_group_id()
                 );
 
-                // A co-offered `(service, instance, major_version,
-                // event_group)` registered via `with_accepted_offer` is
-                // accepted on this shared recv loop even though it is not the
-                // primary service — its tuple (major version included) is
-                // fully validated by the `accepts_offer` match, so the four
-                // single-service guards below are skipped for it. Empty
-                // `accepted_offers` ⇒ `co_offered` is always false ⇒ exact
-                // single-service behaviour.
-                let co_offered = config.accepts_offer(
-                    entry_view.service_id(),
-                    entry_view.instance_id(),
-                    entry_view.major_version(),
-                    entry_view.event_group_id(),
-                );
-
-                if !co_offered && entry_view.service_id() != config.service_id {
-                    crate::log::warn!(
-                        "Subscribe for wrong service: expected 0x{:04X}, got 0x{:04X}",
-                        config.service_id,
-                        entry_view.service_id()
-                    );
+                let offering = accepting_offering(config.offering.as_ref(), entry_view);
+                if let Err(reason) = offering {
                     if let Err(e) = send_subscribe_nack_from_view(
                         send_buf,
                         config,
@@ -241,70 +235,15 @@ where
                         sd_state,
                         &entry_view,
                         sender,
-                        "wrong_service_id",
+                        reason,
                     )
                     .await
                     {
                         crate::log::warn!("SubscribeNack send failed: {e}");
                     }
-                } else if !co_offered && entry_view.instance_id() != config.instance_id {
-                    crate::log::warn!(
-                        "Subscribe for wrong instance: expected {}, got {}",
-                        config.instance_id,
-                        entry_view.instance_id()
-                    );
-                    if let Err(e) = send_subscribe_nack_from_view(
-                        send_buf,
-                        config,
-                        sd_socket,
-                        sd_state,
-                        &entry_view,
-                        sender,
-                        "wrong_instance_id",
-                    )
-                    .await
-                    {
-                        crate::log::warn!("SubscribeNack send failed: {e}");
-                    }
-                } else if !co_offered && entry_view.major_version() != config.major_version {
-                    crate::log::warn!(
-                        "Subscribe for wrong major_version: expected {}, got {}",
-                        config.major_version,
-                        entry_view.major_version()
-                    );
-                    if let Err(e) = send_subscribe_nack_from_view(
-                        send_buf,
-                        config,
-                        sd_socket,
-                        sd_state,
-                        &entry_view,
-                        sender,
-                        "wrong_major_version",
-                    )
-                    .await
-                    {
-                        crate::log::warn!("SubscribeNack send failed: {e}");
-                    }
-                } else if !co_offered && !config.accepts_event_group(entry_view.event_group_id()) {
-                    crate::log::warn!(
-                        "Subscribe for unknown event_group_id 0x{:04X} (service 0x{:04X})",
-                        entry_view.event_group_id(),
-                        entry_view.service_id()
-                    );
-                    if let Err(e) = send_subscribe_nack_from_view(
-                        send_buf,
-                        config,
-                        sd_socket,
-                        sd_state,
-                        &entry_view,
-                        sender,
-                        "unknown_event_group",
-                    )
-                    .await
-                    {
-                        crate::log::warn!("SubscribeNack send failed: {e}");
-                    }
-                } else if let Some(endpoint_addr) = extract_subscriber_endpoint(entry_options) {
+                } else if let Ok(offering) = offering
+                    && let Some(endpoint_addr) = extract_subscriber_endpoint(entry_options)
+                {
                     let subscribe_result = subscriptions
                         .subscribe(
                             entry_view.service_id(),
@@ -318,7 +257,7 @@ where
                         Ok(()) => {
                             if let Err(e) = send_subscribe_ack_from_view(
                                 send_buf,
-                                config,
+                                offering,
                                 sd_socket,
                                 sd_state,
                                 &entry_view,
@@ -386,15 +325,19 @@ where
             }
             sd::EntryType::FindService => {
                 let find_service_id = entry_view.service_id();
-                if find_service_id == config.service_id || find_service_id == 0xFFFF {
+                if let Some(offering) = &config.offering
+                    && (find_service_id == offering.service.service_id()
+                        || find_service_id == 0xFFFF)
+                {
                     crate::log::debug!(
                         "Received FindService from {} for service 0x{:04X} (ours: 0x{:04X}), sending unicast offer",
                         sender,
                         find_service_id,
-                        config.service_id
+                        offering.service.service_id()
                     );
                     if let Err(e) =
-                        send_unicast_offer(send_buf, config, sd_socket, sd_state, sender).await
+                        send_unicast_offer(send_buf, config, offering, sd_socket, sd_state, sender)
+                            .await
                     {
                         crate::log::warn!("Unicast OfferService send failed: {e}");
                     }
@@ -405,11 +348,23 @@ where
                     );
                 }
             }
-            sd::EntryType::OfferService if !entry_view.is_stop_offer() => {
-                for (request, answered) in config.consumed_eventgroups.iter().zip(&mut answered) {
-                    *answered |= request.service_id == entry_view.service_id()
-                        && request.instance_id == entry_view.instance_id()
-                        && request.major_version == entry_view.major_version();
+            sd::EntryType::OfferService => {
+                let Some(instance) = entry_instance(entry_view) else {
+                    continue;
+                };
+                let stop = entry_view.is_stop_offer();
+                let holds = if stop {
+                    discovery.stop(sender, instance)
+                } else {
+                    let endpoint = offered_endpoint(entry_options);
+                    discovery.offer(sender, instance, endpoint, entry_view.ttl())
+                };
+                if !holds {
+                    continue;
+                }
+                let requests = config.consumed_eventgroups.iter().zip(&mut answered);
+                for (_, subscribe) in requests.filter(|(request, _)| request.service == instance) {
+                    *subscribe = !stop;
                 }
             }
             _ => {
@@ -418,53 +373,99 @@ where
         }
     }
 
-    if !answered.contains(&true) {
-        return Ok(NONE_SUBSCRIBED);
-    }
-    match send_subscribes(send_buf, config, sd_socket, sd_state, &answered, sender).await {
-        Ok(()) => Ok(answered),
-        Err(e) => {
-            crate::log::warn!("Subscribe send failed: {e}");
-            Ok(NONE_SUBSCRIBED)
+    if answered.contains(&true) {
+        match send_subscribes(send_buf, config, sd_socket, sd_state, &answered, sender).await {
+            Ok(()) => {
+                let requests = config.consumed_eventgroups.iter().zip(answered);
+                for (request, _) in requests.filter(|(_, answered)| *answered) {
+                    discovery.subscribed(sender, request.service);
+                }
+            }
+            Err(e) => crate::log::warn!("Subscribe send failed: {e}"),
         }
+    }
+    Ok(())
+}
+
+/// The service instance an SD entry names; `None` when it names a wildcard.
+fn entry_instance(entry: sd::EntryView<'_>) -> Option<ServiceInstance> {
+    ServiceInstance::new(
+        entry.service_id(),
+        entry.instance_id(),
+        entry.major_version(),
+    )
+}
+
+/// The offering that accepts the Subscribe `entry`: `offering` itself, or one
+/// of its [`accepted_offers`](super::Offering::accepted_offers). `Err` holds
+/// the reason for the `SubscribeNack`.
+fn accepting_offering<'a>(
+    offering: Option<&'a super::Offering>,
+    entry: sd::EntryView<'_>,
+) -> Result<&'a super::Offering, &'static str> {
+    let Some(offering) = offering else {
+        crate::log::warn!(
+            "Subscribe for service 0x{:04X} on a server that offers nothing",
+            entry.service_id()
+        );
+        return Err("service_not_offered");
+    };
+    if entry_instance(entry)
+        .is_some_and(|instance| offering.accepts_offer(instance, entry.event_group_id()))
+    {
+        return Ok(offering);
+    }
+    let ours = offering.service;
+    if entry.service_id() != ours.service_id() {
+        crate::log::warn!(
+            "Subscribe for wrong service: expected 0x{:04X}, got 0x{:04X}",
+            ours.service_id(),
+            entry.service_id()
+        );
+        Err("wrong_service_id")
+    } else if entry.instance_id() != ours.instance_id() {
+        crate::log::warn!(
+            "Subscribe for wrong instance: expected {}, got {}",
+            ours.instance_id(),
+            entry.instance_id()
+        );
+        Err("wrong_instance_id")
+    } else if entry.major_version() != ours.major_version() {
+        crate::log::warn!(
+            "Subscribe for wrong major_version: expected {}, got {}",
+            ours.major_version(),
+            entry.major_version()
+        );
+        Err("wrong_major_version")
+    } else if !offering.accepts_event_group(entry.event_group_id()) {
+        crate::log::warn!(
+            "Subscribe for unknown event_group_id 0x{:04X} (service 0x{:04X})",
+            entry.event_group_id(),
+            entry.service_id()
+        );
+        Err("unknown_event_group")
+    } else {
+        Ok(offering)
     }
 }
 
-/// The consumed eventgroups a Subscribe was sent for, by index into
-/// [`ServerConfig::consumed_eventgroups`].
-pub(super) type Subscribed = [bool; ServerConfig::CONSUMED_EVENTGROUPS_CAP];
-
-const NONE_SUBSCRIBED: Subscribed = [false; ServerConfig::CONSUMED_EVENTGROUPS_CAP];
-
-/// The consumed eventgroups whose Offer has been answered with a Subscribe.
-/// The receive loop marks them; [`find_loop`] stops finding them.
-pub(super) struct Offered([core::sync::atomic::AtomicBool; ServerConfig::CONSUMED_EVENTGROUPS_CAP]);
-
-impl Offered {
-    pub(super) const fn new() -> Self {
-        Self(
-            [const { core::sync::atomic::AtomicBool::new(false) };
-                ServerConfig::CONSUMED_EVENTGROUPS_CAP],
-        )
-    }
-
-    pub(super) fn mark(&self, subscribed: Subscribed) {
-        for (flag, _) in self.0.iter().zip(subscribed).filter(|(_, s)| *s) {
-            flag.store(true, core::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    fn contains(&self, index: usize) -> bool {
-        self.0
-            .get(index)
-            .is_some_and(|f| f.load(core::sync::atomic::Ordering::Relaxed))
-    }
+/// The endpoint an `OfferService` entry names among `options`, the options it
+/// references: see [`preferred_ipv4_endpoint`](crate::net_endpoint::preferred_ipv4_endpoint).
+fn offered_endpoint<'a>(
+    options: impl Iterator<Item = sd::OptionView<'a>>,
+) -> Option<crate::NetEndpoint> {
+    crate::net_endpoint::preferred_ipv4_endpoint(
+        options
+            .filter(|option| matches!(option.option_type(), Ok(sd::OptionType::IpV4Endpoint)))
+            .filter_map(|option| option.as_ipv4().ok()),
+    )
 }
 
 /// Periodic SD `OfferService` announcement loop. Runs forever; intended
 /// to be combined with the receive loop via [`run_combined`].
 pub(super) async fn announce_loop<T, Tm>(
     config: &ServerConfig,
+    offering: &super::Offering,
     sd_socket: &T,
     sd_state: &SdStateManager,
     timer: &Tm,
@@ -476,7 +477,7 @@ pub(super) async fn announce_loop<T, Tm>(
     let mut announcement_count = 0u32;
     loop {
         match sd_state
-            .send_offer_service(announce_send_buf, config, sd_socket)
+            .send_offer_service(announce_send_buf, config, offering, sd_socket)
             .await
         {
             Ok(()) => {
@@ -484,13 +485,13 @@ pub(super) async fn announce_loop<T, Tm>(
                 if announcement_count == 1 {
                     crate::log::info!(
                         "Sent first SD announcement for service 0x{:04X}",
-                        config.service_id
+                        offering.service.service_id()
                     );
                 } else {
                     crate::log::debug!(
                         "Sent {} SD announcements for service 0x{:04X}",
                         announcement_count,
-                        config.service_id
+                        offering.service.service_id()
                     );
                 }
             }
@@ -586,7 +587,6 @@ struct Receiver<'a, T, Sub, R> {
     subscriptions: &'a Sub,
     e2e: &'a R,
     non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
-    offered: &'a Offered,
 }
 
 /// Handles one message received from `addr`: SD messages go to
@@ -594,6 +594,7 @@ struct Receiver<'a, T, Sub, R> {
 /// [`dispatch_non_sd_request`].
 async fn handle_message<T, Sub, R>(
     receiver: &Receiver<'_, T, Sub, R>,
+    discovery: &mut Discovery<'_>,
     send_buf: &mut [u8],
     view: &crate::protocol::MessageView<'_>,
     addr: core::net::SocketAddr,
@@ -612,7 +613,6 @@ where
         subscriptions,
         e2e,
         non_sd_observer,
-        offered,
     } = *receiver;
     crate::log::trace!(
         "SOME/IP Header: service=0x{:04X}, method=0x{:04X}, type={:?}",
@@ -626,7 +626,7 @@ where
         match view.sd_header() {
             Ok(sd_view) => {
                 crate::log::trace!("SD message has {} entries", sd_view.entry_count());
-                let subscribed = handle_sd_message(
+                handle_sd_message(
                     config,
                     sd_socket,
                     sd_state,
@@ -634,9 +634,9 @@ where
                     &sd_view,
                     addr,
                     send_buf,
+                    discovery,
                 )
                 .await?;
-                offered.mark(subscribed);
             }
             Err(e) => {
                 crate::log::warn!("Failed to parse SD message: {:?}", e);
@@ -660,8 +660,10 @@ where
 
 /// Receive loop body — drives `recv_from` on both the unicast and SD
 /// sockets and hands each message in a datagram to [`handle_message`].
-async fn recv_loop<T, Sub, R>(
+async fn recv_loop<T, Sub, R, Tm>(
     receiver: &Receiver<'_, T, Sub, R>,
+    discovery: &mut Discovery<'_>,
+    timer: &Tm,
     unicast_buf: &mut [u8],
     sd_buf: &mut [u8],
     send_buf: &mut [u8],
@@ -670,8 +672,13 @@ where
     T: TransportSocket,
     Sub: SubscriptionHandle,
     R: E2EHandle + Clone,
+    Tm: Timer,
 {
     let (unicast_socket, sd_socket) = (receiver.unicast_socket, receiver.sd_socket);
+    // Runs while an offer can run out; kept across iterations so a steady
+    // stream of datagrams does not restart it.
+    let tick = futures_util::future::Fuse::<Tm::SleepFuture<'_>>::terminated();
+    pin_mut!(tick);
 
     // Iteration counter used to flip `select_biased!` arm priority
     // each turn. We can't use the pseudo-random `select!` (it needs
@@ -681,6 +688,9 @@ where
     // other arm.
     let mut prefer_sd_first = false;
     loop {
+        if tick.is_terminated() && discovery.ticking() {
+            tick.set(timer.sleep(super::discovery::TICK).fuse());
+        }
         // Both arms call `TransportSocket::recv_from`, whose contract
         // (see the trait docs) requires the returned future be
         // cancel-safe — dropping a non-selected arm must not lose
@@ -695,21 +705,27 @@ where
         // below. Each arm returns just `(datagram, from_unicast)`;
         // the `(len, addr, source)` derivation lives once below the
         // select so the arm-flip pattern doesn't duplicate it.
-        let (datagram, from_unicast) = {
+        let datagram = {
             let unicast_fut = unicast_socket.recv_from(&mut *unicast_buf).fuse();
             let sd_fut = sd_socket.recv_from(&mut *sd_buf).fuse();
             pin_mut!(unicast_fut, sd_fut);
             if prefer_sd_first {
                 select_biased! {
-                    result = sd_fut => (result?, false),
-                    result = unicast_fut => (result?, true),
+                    () = tick.as_mut() => None,
+                    result = sd_fut => Some((result?, false)),
+                    result = unicast_fut => Some((result?, true)),
                 }
             } else {
                 select_biased! {
-                    result = unicast_fut => (result?, true),
-                    result = sd_fut => (result?, false),
+                    () = tick.as_mut() => None,
+                    result = unicast_fut => Some((result?, true)),
+                    result = sd_fut => Some((result?, false)),
                 }
             }
+        };
+        let Some((datagram, from_unicast)) = datagram else {
+            discovery.tick();
+            continue;
         };
         prefer_sd_first = !prefer_sd_first;
         let len = datagram.bytes_received;
@@ -735,7 +751,10 @@ where
         let mut walk = crate::protocol::messages(data);
         for message in walk.by_ref() {
             match message {
-                Ok(view) => handle_message(receiver, send_buf, &view, addr, from_unicast).await?,
+                Ok(view) => {
+                    handle_message(receiver, discovery, send_buf, &view, addr, from_unicast)
+                        .await?;
+                }
                 Err(malformed) => malformed.log(addr),
             }
         }
@@ -743,73 +762,88 @@ where
     }
 }
 
-/// Encode one SD message with a `FindService` entry for each consumed
-/// service instance not yet offered; `None` when every one is.
+/// Encode one SD message with a `FindService` entry for each instance
+/// `discovered` has not found; `None` when it has found every one.
 fn encode_finds(
     buf: &mut [u8],
-    config: &ServerConfig,
+    discovered: &Discovered,
     sd_state: &SdStateManager,
-    offered: &Offered,
 ) -> Result<Option<usize>, Error> {
-    let consumed = &config.consumed_eventgroups;
-    let same_instance = |a: &crate::sd_codec::SubscribeEventgroupRequest,
-                         b: &crate::sd_codec::SubscribeEventgroupRequest| {
-        (a.service_id, a.instance_id, a.major_version)
-            == (b.service_id, b.instance_id, b.major_version)
-    };
-    let mut wanted = consumed.clone();
-    let mut index = 0;
-    wanted.retain(|request| {
-        let i = index;
-        index += 1;
-        !offered.contains(i)
-            && !consumed[..i]
-                .iter()
-                .any(|earlier| same_instance(earlier, request))
-    });
-    if wanted.is_empty() {
+    let wanted = discovered.unfound();
+    if wanted.clone().next().is_none() {
         return Ok(None);
     }
-    crate::sd_codec::build_find_service_datagram::<{ ServerConfig::CONSUMED_EVENTGROUPS_CAP }>(
+    crate::sd_codec::build_find_service_datagram::<{ super::discovery::FIND_TARGETS_CAP }>(
         buf,
-        &wanted,
+        wanted,
         sd_state.next_session(),
     )
     .map(Some)
     .map_err(super::build_error)
 }
 
-/// Send `FindService` for the consumed service instances not yet offered on
-/// [`ServerConfig::find_timing`]'s schedule, encoded into `buf`; returns
-/// after the last send.
+/// Send `FindService` for the instances `discovered` has not found, on
+/// [`ServerConfig::find_timing`]'s schedule, and from the start of that
+/// schedule each time it loses one. Never returns.
 pub(super) async fn find_loop<T, Tm>(
     config: &ServerConfig,
     sd_socket: &T,
     sd_state: &SdStateManager,
     timer: &Tm,
-    offered: &Offered,
+    discovered: &Discovered,
     buf: &mut [u8; ServerConfig::FIND_SEND_BUF_LEN],
-) where
+) -> core::convert::Infallible
+where
+    T: TransportSocket,
+    Tm: Timer,
+{
+    loop {
+        discovered.forget_losses();
+        if !find_schedule(config, sd_socket, sd_state, timer, discovered, buf).await {
+            discovered.lost().await;
+        }
+    }
+}
+
+/// Send `FindService` for the instances `discovered` has not found on
+/// [`ServerConfig::find_timing`]'s schedule, encoded into `buf`. Returns
+/// `true` when an instance found earlier is lost while it waits for the next
+/// send, and `false` after the last send or once every instance is found.
+async fn find_schedule<T, Tm>(
+    config: &ServerConfig,
+    sd_socket: &T,
+    sd_state: &SdStateManager,
+    timer: &Tm,
+    discovered: &Discovered,
+    buf: &mut [u8; ServerConfig::FIND_SEND_BUF_LEN],
+) -> bool
+where
     T: TransportSocket,
     Tm: Timer,
 {
     let timing = config.find_timing;
     let mut delay = timing.initial_delay(super::find_timing::seed(config));
     for repetition in 0..=u32::from(timing.repetitions_max) {
-        timer.sleep(delay).await;
-        match encode_finds(buf, config, sd_state, offered) {
+        let sleep = timer.sleep(delay);
+        let lost = discovered.lost();
+        pin_mut!(sleep, lost);
+        if let Either::Right(_) = futures_util::future::select(sleep, lost).await {
+            return true;
+        }
+        match encode_finds(buf, discovered, sd_state) {
             Ok(Some(len)) => {
                 if let Err(e) = sd_socket.send_to(&buf[..len], config.sd_multicast).await {
                     crate::log::warn!("FindService send failed: {e:?}");
                 }
             }
-            Ok(None) => return,
+            Ok(None) => return false,
             Err(e) => crate::log::warn!("FindService encode failed: {e:?}"),
         }
         delay = timing
             .repetitions_base_delay
             .saturating_mul(2u32.saturating_pow(repetition));
     }
+    false
 }
 
 /// Combined receive + announce loop. The single future returned from
@@ -817,14 +851,14 @@ pub(super) async fn find_loop<T, Tm>(
 /// [`Server::run_with_buffers`] resolves to once buffers are
 /// supplied.
 ///
-/// Returns `Err(Error::InvalidUsage("passive_server_run"))` if invoked
-/// on a passive server (passive servers have no SD socket bound to
-/// 30490 and rely on an external SD dispatcher).
+/// Returns `Err(Error::InvalidUsage("passive_server_run"))` if invoked on a
+/// passive server (passive servers have no SD socket bound to 30490 and rely
+/// on an external SD dispatcher).
 ///
-/// When `config.announce` is `false`, the announcement arm is skipped
-/// and only the receive loop drives — used by the dispatcher topology
-/// where a co-located `Client` emits `OfferService` on the server's
-/// behalf.
+/// When the config offers no service, or its [`Offering::announce`](super::Offering::announce)
+/// is `false`, the announcement arm is skipped and only
+/// the receive loop drives. The dispatcher topology uses this, where a
+/// co-located `Client` emits `OfferService` on the server's behalf.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_combined<H, T, Sub, Hsd, Tm, R>(
     config: ServerConfig,
@@ -841,6 +875,7 @@ pub(super) async fn run_combined<H, T, Sub, Hsd, Tm, R>(
     announce_send_buf: &mut [u8],
     find_send_buf: &mut [u8; ServerConfig::FIND_SEND_BUF_LEN],
     non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
+    service_observer: Option<(super::ServiceObserver, usize)>,
 ) -> Result<(), Error>
 where
     H: SharedHandle<T>,
@@ -852,11 +887,10 @@ where
 {
     if is_passive {
         crate::log::warn!(
-            "run called on passive Server for service 0x{:04X}; \
+            "run called on passive Server; \
              SD receive must be driven externally (e.g. via the \
              Client's discovery socket, routing Subscribes to \
-             `EventPublisher::register_subscriber`)",
-            config.service_id
+             `EventPublisher::register_subscriber`)"
         );
         return Err(Error::InvalidUsage("passive_server_run"));
     }
@@ -865,7 +899,8 @@ where
     let sd = sd_socket.get();
     let sd_state_ref = sd_state.get();
 
-    let offered = Offered::new();
+    let discovered = Discovered::new(&config);
+    let mut discovery = Discovery::new(&discovered, service_observer);
     let receiver = Receiver {
         config: &config,
         unicast_socket: unicast,
@@ -874,26 +909,45 @@ where
         subscriptions: &subscriptions,
         e2e: &e2e,
         non_sd_observer,
-        offered: &offered,
     };
-    let recv_fut = recv_loop(&receiver, unicast_buf, sd_buf, recv_send_buf);
-    let announce_fut = async {
-        if config.announce {
-            announce_loop(&config, sd, sd_state_ref, &timer, announce_send_buf).await;
-        }
-        core::future::pending::<core::convert::Infallible>().await
-    };
-    let find_fut = async {
-        if !config.consumed_eventgroups.is_empty() {
-            find_loop(&config, sd, sd_state_ref, &timer, &offered, find_send_buf).await;
-        }
-        core::future::pending::<core::convert::Infallible>().await
-    };
-    let senders = futures_util::future::join(announce_fut, find_fut);
+    let recv_fut = recv_loop(
+        &receiver,
+        &mut discovery,
+        &timer,
+        unicast_buf,
+        sd_buf,
+        recv_send_buf,
+    );
+    let announce = config
+        .offering
+        .as_ref()
+        .filter(|offering| offering.announce)
+        .map(|offering| {
+            announce_loop(
+                &config,
+                offering,
+                sd,
+                sd_state_ref,
+                &timer,
+                announce_send_buf,
+            )
+        });
+    let find = (!discovered.is_empty()).then(|| {
+        find_loop(
+            &config,
+            sd,
+            sd_state_ref,
+            &timer,
+            &discovered,
+            find_send_buf,
+        )
+    });
+    let senders =
+        futures_util::future::join(OptionFuture::from(announce), OptionFuture::from(find));
     pin_mut!(recv_fut, senders);
     match futures_util::future::select(recv_fut, senders).await {
         Either::Left((recv_result, _)) => recv_result,
-        Either::Right(((never, _), _)) => match never {},
+        Either::Right((_, recv_fut)) => recv_fut.await,
     }
 }
 
@@ -968,6 +1022,7 @@ pub(super) fn extract_subscriber_endpoint<'a>(
 mod tests {
     use super::*;
     use crate::CapacityKind;
+    use crate::server::Offering;
 
     use core::net::{Ipv4Addr, SocketAddrV4};
 
@@ -1029,9 +1084,10 @@ mod tests {
     }
 
     fn make_config() -> ServerConfig {
-        ServerConfig::new(0x1234, 1)
-            .with_interface(Ipv4Addr::LOCALHOST)
-            .with_local_port(30500)
+        ServerConfig::new(
+            Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()).with_local_port(30500),
+        )
+        .with_interface(Ipv4Addr::LOCALHOST)
     }
 
     fn make_sd_state() -> SdStateManager {
@@ -1053,7 +1109,15 @@ mod tests {
         let socket = NullSocket;
         let target = subscriber_addr();
 
-        let result = send_unicast_offer(&mut [0u8; 24], &config, &socket, &sd_state, target).await;
+        let result = send_unicast_offer(
+            &mut [0u8; 24],
+            &config,
+            config.test_offering(),
+            &socket,
+            &sd_state,
+            target,
+        )
+        .await;
 
         assert!(
             matches!(result, Err(Error::Capacity(CapacityKind::UdpBuffer))),
@@ -1070,7 +1134,15 @@ mod tests {
         let socket = NullSocket;
         let target = subscriber_addr();
 
-        let result = send_unicast_offer(&mut [0u8; 8], &config, &socket, &sd_state, target).await;
+        let result = send_unicast_offer(
+            &mut [0u8; 8],
+            &config,
+            config.test_offering(),
+            &socket,
+            &sd_state,
+            target,
+        )
+        .await;
 
         assert!(
             matches!(result, Err(Error::Capacity(CapacityKind::UdpBuffer))),
@@ -1089,6 +1161,7 @@ mod tests {
         let result = send_unicast_offer(
             &mut [0u8; crate::UDP_BUFFER_SIZE],
             &config,
+            config.test_offering(),
             &socket,
             &sd_state,
             target,
@@ -1149,7 +1222,7 @@ mod tests {
 
         let result = send_subscribe_ack_from_view(
             &mut [0u8; 24],
-            &config,
+            config.test_offering(),
             &socket,
             &sd_state,
             &entry_view,
@@ -1177,7 +1250,7 @@ mod tests {
 
         let result = send_subscribe_ack_from_view(
             &mut [0u8; crate::UDP_BUFFER_SIZE],
-            &config,
+            config.test_offering(),
             &socket,
             &sd_state,
             &entry_view,
@@ -1247,12 +1320,13 @@ mod tests {
     #[cfg(feature = "server-tokio")]
     mod consumed_eventgroups {
         use super::*;
+        use crate::ServiceInstance;
         use crate::server::FindTiming;
 
         /// Records every datagram sent through it.
         #[derive(Default)]
-        struct RecordingSocket {
-            sent: std::sync::Mutex<std::vec::Vec<(std::vec::Vec<u8>, SocketAddrV4)>>,
+        pub(super) struct RecordingSocket {
+            pub(super) sent: std::sync::Mutex<std::vec::Vec<(std::vec::Vec<u8>, SocketAddrV4)>>,
         }
 
         impl TransportSocket for RecordingSocket {
@@ -1285,13 +1359,12 @@ mod tests {
             }
         }
 
-        const PEER_SD: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 30490);
+        pub(super) const PEER_SD: SocketAddrV4 =
+            SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 30490);
 
         fn consumed() -> crate::sd_codec::SubscribeEventgroupRequest {
             crate::sd_codec::SubscribeEventgroupRequest {
-                service_id: 0x5678,
-                instance_id: 1,
-                major_version: 1,
+                service: ServiceInstance::new(0x5678, 1, 1).unwrap(),
                 event_group_id: 0x0001,
                 ttl: 5,
                 local_ip: Ipv4Addr::LOCALHOST,
@@ -1350,6 +1423,7 @@ mod tests {
                 &sd_view,
                 core::net::SocketAddr::V4(PEER_SD),
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &mut Discovery::leaked(config),
             )
             .await
             .expect("handle_sd_message");
@@ -1453,6 +1527,35 @@ mod tests {
 
         /// An SD payload with an Offer entry for each of `offers`
         /// (`service_id`, `instance_id`, `major_version`).
+        /// [`offers_wire_bytes`] with no option, so no offer names an endpoint.
+        fn offers_without_endpoint_wire_bytes(offers: &[(u16, u16, u8)]) -> ([u8; 512], usize) {
+            use automotive_wire_codec::Encode;
+
+            let entries: std::vec::Vec<_> = offers
+                .iter()
+                .map(|&(service_id, instance_id, major_version)| {
+                    sd::Entry::OfferService(sd::ServiceEntry {
+                        index_first_options_run: 0,
+                        index_second_options_run: 0,
+                        options_count: sd::OptionsCount::new(0, 0),
+                        service_id,
+                        instance_id,
+                        major_version,
+                        ttl: 3,
+                        minor_version: 0,
+                    })
+                })
+                .collect();
+            let sd_payload = sd::Header::new(
+                sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+                &entries,
+                &[],
+            );
+            let mut wire = [0u8; 512];
+            let sd_len = sd_payload.encode_to_slice(&mut wire).expect("encode");
+            (wire, sd_len)
+        }
+
         fn offers_wire_bytes(offers: &[(u16, u16, u8)]) -> ([u8; 512], usize) {
             use automotive_wire_codec::Encode;
 
@@ -1507,6 +1610,7 @@ mod tests {
                 &sd_view,
                 core::net::SocketAddr::V4(PEER_SD),
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &mut Discovery::leaked(config),
             )
             .await
             .expect("handle_sd_message");
@@ -1565,7 +1669,7 @@ mod tests {
         )]
         async fn only_the_offered_services_are_subscribed() {
             let other = crate::sd_codec::SubscribeEventgroupRequest {
-                service_id: 0x5679,
+                service: ServiceInstance::new(0x5679, 1, 1).unwrap(),
                 event_group_id: 0x0003,
                 local_rx_port: 40102,
                 ..consumed()
@@ -1582,7 +1686,8 @@ mod tests {
 
         #[tokio::test]
         async fn a_failed_subscribe_nack_send_does_not_end_sd_handling() {
-            let config = ServerConfig::new(0x9999, 1);
+            let config =
+                ServerConfig::new(Offering::new(ServiceInstance::new(0x9999, 1, 1).unwrap()));
             let (wire, sd_len) = subscribe_wire_bytes();
             let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
             let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -1597,6 +1702,7 @@ mod tests {
                 &sd_view,
                 subscriber_addr(),
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &mut Discovery::leaked(&config),
             )
             .await;
 
@@ -1605,10 +1711,10 @@ mod tests {
 
         /// Returns at once from every `sleep`, recording its duration; on
         /// the sleep numbered `offer_at` (0-based) it marks the first
-        /// consumed eventgroup offered.
+        /// instance found.
         struct RecordingTimer<'a> {
             sleeps: std::sync::Mutex<std::vec::Vec<core::time::Duration>>,
-            offer_at: Option<(usize, &'a Offered)>,
+            offer_at: Option<(usize, &'a Discovered)>,
         }
 
         impl<'a> RecordingTimer<'a> {
@@ -1618,10 +1724,10 @@ mod tests {
                     offer_at: None,
                 }
             }
-            fn offering_at(n: usize, offered: &'a Offered) -> Self {
+            fn offering_at(n: usize, discovered: &'a Discovered) -> Self {
                 Self {
                     sleeps: std::sync::Mutex::default(),
-                    offer_at: Some((n, offered)),
+                    offer_at: Some((n, discovered)),
                 }
             }
             fn millis(&self) -> std::vec::Vec<u128> {
@@ -1641,10 +1747,10 @@ mod tests {
                 Self: 'a;
             fn sleep(&self, duration: core::time::Duration) -> Self::SleepFuture<'_> {
                 let mut sleeps = self.sleeps.lock().unwrap();
-                if let Some((n, offered)) = self.offer_at
+                if let Some((n, discovered)) = self.offer_at
                     && sleeps.len() == n
                 {
-                    offered.mark(first_subscribed());
+                    discovered.mark_found(0);
                 }
                 sleeps.push(duration);
                 core::future::ready(())
@@ -1655,10 +1761,8 @@ mod tests {
             [0; ServerConfig::FIND_SEND_BUF_LEN]
         }
 
-        fn first_subscribed() -> Subscribed {
-            let mut subscribed = NONE_SUBSCRIBED;
-            subscribed[0] = true;
-            subscribed
+        fn required() -> ServiceInstance {
+            ServiceInstance::new(0x6001, 2, 3).unwrap()
         }
 
         /// The (service, instance) of each Find entry in each datagram sent.
@@ -1697,26 +1801,33 @@ mod tests {
             }
         }
 
+        /// Runs one find schedule for `config` on `socket`, with nothing
+        /// found; returns the timer.
+        async fn schedule(
+            config: &ServerConfig,
+            socket: &RecordingSocket,
+        ) -> RecordingTimer<'static> {
+            let timer = RecordingTimer::new();
+            find_schedule(
+                config,
+                socket,
+                &make_sd_state(),
+                &timer,
+                &Discovered::new(config),
+                &mut find_buf(),
+            )
+            .await;
+            timer
+        }
+
         #[tokio::test]
         async fn finds_after_the_initial_delay_then_doubling_repetitions() {
             let config = make_config()
                 .with_consumed_eventgroup(consumed())
                 .with_find_timing(FIXED);
-            let (socket, timer, offered) = (
-                RecordingSocket::default(),
-                RecordingTimer::new(),
-                Offered::new(),
-            );
+            let socket = RecordingSocket::default();
 
-            find_loop(
-                &config,
-                &socket,
-                &make_sd_state(),
-                &timer,
-                &offered,
-                &mut find_buf(),
-            )
-            .await;
+            let timer = schedule(&config, &socket).await;
 
             assert_eq!(timer.millis(), [10, 100, 200, 400]);
             assert_eq!(finds(&socket), std::vec![std::vec![(0x5678, 1)]; 4]);
@@ -1725,17 +1836,8 @@ mod tests {
         #[tokio::test]
         async fn the_first_find_waits_the_initial_delay_drawn_for_the_node() {
             let config = make_config().with_consumed_eventgroup(consumed());
-            let (socket, timer) = (RecordingSocket::default(), RecordingTimer::new());
 
-            find_loop(
-                &config,
-                &socket,
-                &make_sd_state(),
-                &timer,
-                &Offered::new(),
-                &mut find_buf(),
-            )
-            .await;
+            let timer = schedule(&config, &RecordingSocket::default()).await;
 
             let first = timer.sleeps.lock().unwrap()[0];
             let timing = FindTiming::DEFAULT;
@@ -1749,21 +1851,9 @@ mod tests {
             let config = make_config()
                 .with_consumed_eventgroup(consumed())
                 .with_find_timing(once());
-            let (socket, timer, offered) = (
-                RecordingSocket::default(),
-                RecordingTimer::new(),
-                Offered::new(),
-            );
+            let socket = RecordingSocket::default();
 
-            find_loop(
-                &config,
-                &socket,
-                &make_sd_state(),
-                &timer,
-                &offered,
-                &mut find_buf(),
-            )
-            .await;
+            let timer = schedule(&config, &socket).await;
 
             assert_eq!(timer.millis(), [10]);
             assert_eq!(finds(&socket).len(), 1);
@@ -1772,18 +1862,18 @@ mod tests {
         #[tokio::test]
         async fn an_instance_offered_before_the_first_send_is_never_found() {
             let config = make_config().with_consumed_eventgroup(consumed());
-            let offered = Offered::new();
+            let discovered = Discovered::new(&config);
             let (socket, timer) = (
                 RecordingSocket::default(),
-                RecordingTimer::offering_at(0, &offered),
+                RecordingTimer::offering_at(0, &discovered),
             );
 
-            find_loop(
+            find_schedule(
                 &config,
                 &socket,
                 &make_sd_state(),
                 &timer,
-                &offered,
+                &discovered,
                 &mut find_buf(),
             )
             .await;
@@ -1794,21 +1884,97 @@ mod tests {
         #[tokio::test]
         async fn an_offer_between_repetitions_stops_the_remaining_finds() {
             let config = make_config().with_consumed_eventgroup(consumed());
-            let offered = Offered::new();
+            let discovered = Discovered::new(&config);
             let (socket, timer) = (
                 RecordingSocket::default(),
-                RecordingTimer::offering_at(2, &offered),
+                RecordingTimer::offering_at(2, &discovered),
             );
 
-            find_loop(
+            find_schedule(
                 &config,
                 &socket,
                 &make_sd_state(),
                 &timer,
-                &offered,
+                &discovered,
                 &mut find_buf(),
             )
             .await;
+
+            assert_eq!(finds(&socket).len(), 2);
+        }
+
+        #[tokio::test]
+        async fn finding_starts_over_when_a_found_instance_is_lost() {
+            let config = make_config()
+                .with_consumed_eventgroup(consumed())
+                .with_find_timing(FIXED);
+            let discovered = Discovered::new(&config);
+            let (socket, timer, sd_state) = (
+                RecordingSocket::default(),
+                RecordingTimer::offering_at(1, &discovered),
+                make_sd_state(),
+            );
+            let mut buf = find_buf();
+            let finding = find_loop(&config, &socket, &sd_state, &timer, &discovered, &mut buf);
+            pin_mut!(finding);
+
+            assert!(futures_util::poll!(finding.as_mut()).is_pending());
+            assert_eq!(finds(&socket).len(), 1, "found after the first Find");
+            discovered.mark_lost(0);
+            assert!(futures_util::poll!(finding.as_mut()).is_pending());
+
+            assert_eq!(timer.millis(), [10, 100, 10, 100, 200, 400]);
+            assert_eq!(finds(&socket).len(), 5);
+        }
+
+        /// Completes a sleep of up to a second at once and never completes a
+        /// longer one.
+        struct ShortSleeps;
+
+        impl crate::Timer for ShortSleeps {
+            type SleepFuture<'a>
+                = futures_util::future::Either<core::future::Ready<()>, core::future::Pending<()>>
+            where
+                Self: 'a;
+            fn sleep(&self, duration: core::time::Duration) -> Self::SleepFuture<'_> {
+                if duration <= core::time::Duration::from_secs(1) {
+                    futures_util::future::Either::Left(core::future::ready(()))
+                } else {
+                    futures_util::future::Either::Right(core::future::pending())
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_loss_during_a_repetition_starts_the_schedule_again() {
+            let config = make_config()
+                .with_consumed_eventgroup(consumed())
+                .with_find_timing(FindTiming {
+                    repetitions_base_delay: core::time::Duration::MAX,
+                    ..FIXED
+                });
+            let discovered = Discovered::new(&config);
+            let (socket, sd_state) = (RecordingSocket::default(), make_sd_state());
+            let mut buf = find_buf();
+            let finding = find_loop(
+                &config,
+                &socket,
+                &sd_state,
+                &ShortSleeps,
+                &discovered,
+                &mut buf,
+            );
+            pin_mut!(finding);
+
+            assert!(futures_util::poll!(finding.as_mut()).is_pending());
+            assert_eq!(
+                finds(&socket).len(),
+                1,
+                "sleeping before the first repetition"
+            );
+            discovered.mark_found(0);
+            discovered.mark_lost(0);
+            assert!(futures_util::poll!(finding.as_mut()).is_pending());
 
             assert_eq!(finds(&socket).len(), 2);
         }
@@ -1825,7 +1991,7 @@ mod tests {
                 ..consumed()
             };
             let other = crate::sd_codec::SubscribeEventgroupRequest {
-                service_id: 0x5679,
+                service: ServiceInstance::new(0x5679, 1, 1).unwrap(),
                 ..consumed()
             };
             let config = make_config()
@@ -1833,23 +1999,287 @@ mod tests {
                 .with_consumed_eventgroup(second)
                 .with_consumed_eventgroup(other)
                 .with_find_timing(once());
-            let (socket, timer, offered) = (
-                RecordingSocket::default(),
-                RecordingTimer::new(),
-                Offered::new(),
-            );
+            let socket = RecordingSocket::default();
 
-            find_loop(
-                &config,
+            schedule(&config, &socket).await;
+
+            assert_eq!(finds(&socket), [std::vec![(0x5678, 1), (0x5679, 1)]]);
+        }
+
+        #[tokio::test]
+        async fn finds_a_required_service_that_is_not_subscribed() {
+            let config = ServerConfig::consumer_only()
+                .with_required_service(required())
+                .with_find_timing(once());
+            let socket = RecordingSocket::default();
+
+            schedule(&config, &socket).await;
+
+            assert_eq!(finds(&socket), [std::vec![(0x6001, 2)]]);
+            let sent = socket.sent.lock().unwrap();
+            let view = crate::protocol::MessageView::parse(&sent[0].0).expect("SOME/IP");
+            let sd_view = view.sd_header().expect("SD");
+            let e = sd_view.entries().next().expect("one entry");
+            assert_eq!(e.major_version(), 3);
+            assert_eq!(e.ttl(), 3);
+        }
+
+        #[tokio::test]
+        async fn a_required_service_also_consumed_is_found_once() {
+            let config = make_config()
+                .with_consumed_eventgroup(consumed())
+                .with_required_service(consumed().service)
+                .with_find_timing(once());
+            let socket = RecordingSocket::default();
+
+            schedule(&config, &socket).await;
+
+            assert_eq!(finds(&socket), [std::vec![(0x5678, 1)]]);
+        }
+
+        #[tokio::test]
+        async fn consumed_instances_are_found_before_required_ones() {
+            let config = make_config()
+                .with_required_service(required())
+                .with_consumed_eventgroup(consumed())
+                .with_find_timing(once());
+            let socket = RecordingSocket::default();
+
+            schedule(&config, &socket).await;
+
+            assert_eq!(finds(&socket), [std::vec![(0x5678, 1), (0x6001, 2)]]);
+        }
+
+        /// The Finds one schedule sends after `discovery` handled `offers`
+        /// from [`PEER_SD`]; `with_endpoint` decides whether each offer
+        /// names an IPv4 endpoint.
+        async fn finds_after_offers(
+            config: &ServerConfig,
+            offers: &[(u16, u16, u8)],
+            with_endpoint: bool,
+        ) -> std::vec::Vec<std::vec::Vec<(u16, u16)>> {
+            let discovered = Discovered::new(config);
+            let socket = RecordingSocket::default();
+            let (wire, sd_len) = if with_endpoint {
+                offers_wire_bytes(offers)
+            } else {
+                offers_without_endpoint_wire_bytes(offers)
+            };
+            let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+            let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::server::SubscriptionManager::new(),
+            ));
+            handle_sd_message(
+                config,
                 &socket,
                 &make_sd_state(),
-                &timer,
-                &offered,
+                &subscriptions,
+                &sd_view,
+                core::net::SocketAddr::V4(PEER_SD),
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &mut Discovery::new(&discovered, None),
+            )
+            .await
+            .expect("handle_sd_message");
+
+            let find_socket = RecordingSocket::default();
+            find_schedule(
+                config,
+                &find_socket,
+                &make_sd_state(),
+                &RecordingTimer::new(),
+                &discovered,
                 &mut find_buf(),
             )
             .await;
+            finds(&find_socket)
+        }
 
-            assert_eq!(finds(&socket), [std::vec![(0x5678, 1), (0x5679, 1)]]);
+        #[tokio::test]
+        async fn an_offer_of_a_required_service_stops_its_finds() {
+            let config = make_config()
+                .with_consumed_eventgroup(consumed())
+                .with_required_service(required());
+
+            let finds = finds_after_offers(&config, &[(0x6001, 2, 3)], true).await;
+
+            assert_eq!(finds, std::vec![std::vec![(0x5678, 1)]; 4]);
+        }
+
+        #[tokio::test]
+        async fn an_offer_with_no_endpoint_does_not_stop_the_finds() {
+            let config = ServerConfig::consumer_only()
+                .with_required_service(required())
+                .with_find_timing(once());
+
+            let finds = finds_after_offers(&config, &[(0x6001, 2, 3)], false).await;
+
+            assert_eq!(finds, [std::vec![(0x6001, 2)]]);
+        }
+
+        #[tokio::test]
+        async fn an_answered_offer_stops_the_finds_of_its_eventgroup() {
+            let config = make_config().with_consumed_eventgroup(consumed());
+
+            let finds = finds_after_offers(&config, &[(0x5678, 1, 1)], true).await;
+
+            assert!(finds.is_empty(), "{finds:?}");
+        }
+
+        #[tokio::test]
+        async fn an_offer_whose_subscribe_send_fails_keeps_finding_its_eventgroup() {
+            let config = make_config()
+                .with_consumed_eventgroup(consumed())
+                .with_find_timing(once());
+            let discovered = Discovered::new(&config);
+            let (wire, sd_len) = offers_wire_bytes(&[(0x5678, 1, 1)]);
+            let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+            let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::server::SubscriptionManager::new(),
+            ));
+            handle_sd_message(
+                &config,
+                &FailingSocket,
+                &make_sd_state(),
+                &subscriptions,
+                &sd_view,
+                core::net::SocketAddr::V4(PEER_SD),
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &mut Discovery::new(&discovered, None),
+            )
+            .await
+            .expect("handle_sd_message");
+
+            assert_eq!(discovered.unfound().count(), 1);
+        }
+
+        /// How many Subscribes `discovery`'s server sends answering an SD
+        /// message of `entries` and `options` from `sender`.
+        async fn subscribes_answering(
+            config: &ServerConfig,
+            discovery: &mut Discovery<'_>,
+            sender: SocketAddrV4,
+            entries: &[sd::Entry],
+            options: &[sd::Options],
+        ) -> usize {
+            use automotive_wire_codec::Encode;
+            let header = sd::Header::new(
+                sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+                entries,
+                options,
+            );
+            let mut wire = [0u8; 512];
+            let sd_len = header.encode_to_slice(&mut wire).expect("encode");
+            let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+            let socket = RecordingSocket::default();
+            let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::server::SubscriptionManager::new(),
+            ));
+            handle_sd_message(
+                config,
+                &socket,
+                &make_sd_state(),
+                &subscriptions,
+                &sd_view,
+                core::net::SocketAddr::V4(sender),
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                discovery,
+            )
+            .await
+            .expect("handle_sd_message");
+            socket.sent.lock().unwrap().len()
+        }
+
+        fn consumed_offer(ttl: u32, options: u8) -> sd::Entry {
+            sd::Entry::OfferService(sd::ServiceEntry {
+                index_first_options_run: 0,
+                index_second_options_run: 0,
+                options_count: sd::OptionsCount::new(options, 0),
+                service_id: 0x5678,
+                instance_id: 1,
+                major_version: 1,
+                ttl,
+                minor_version: 0,
+            })
+        }
+
+        fn consumed_stop() -> sd::Entry {
+            let sd::Entry::OfferService(entry) = consumed_offer(0, 1) else {
+                unreachable!()
+            };
+            sd::Entry::StopOfferService(entry)
+        }
+
+        fn endpoint() -> sd::Options {
+            sd::Options::IpV4Endpoint {
+                ip: *PEER_SD.ip(),
+                port: 30509,
+                protocol: sd::TransportProtocol::Udp,
+            }
+        }
+
+        #[tokio::test]
+        async fn only_the_holders_offer_is_answered_and_found() {
+            let config = make_config().with_consumed_eventgroup(consumed());
+            let discovered = Discovered::new(&config);
+            let mut discovery = Discovery::new(&discovered, None);
+            let other = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), 30490);
+
+            let holder = subscribes_answering(
+                &config,
+                &mut discovery,
+                PEER_SD,
+                &[consumed_offer(3, 1)],
+                &[endpoint()],
+            )
+            .await;
+            assert_eq!(holder, 1);
+            let second = subscribes_answering(
+                &config,
+                &mut discovery,
+                other,
+                &[consumed_offer(3, 1)],
+                &[endpoint()],
+            )
+            .await;
+
+            assert_eq!(second, 0, "a second provider gets no Subscribe");
+        }
+
+        #[tokio::test]
+        async fn an_offer_with_no_endpoint_is_not_answered() {
+            let config = make_config().with_consumed_eventgroup(consumed());
+            let discovered = Discovered::new(&config);
+
+            let sent = subscribes_answering(
+                &config,
+                &mut Discovery::new(&discovered, None),
+                PEER_SD,
+                &[consumed_offer(3, 0)],
+                &[],
+            )
+            .await;
+
+            assert_eq!(sent, 0);
+            assert_eq!(discovered.unfound().count(), 1);
+        }
+
+        #[tokio::test]
+        async fn an_offer_stopped_in_the_same_message_is_not_answered() {
+            let config = make_config().with_consumed_eventgroup(consumed());
+            let discovered = Discovered::new(&config);
+
+            let sent = subscribes_answering(
+                &config,
+                &mut Discovery::new(&discovered, None),
+                PEER_SD,
+                &[consumed_offer(3, 1), consumed_stop()],
+                &[endpoint()],
+            )
+            .await;
+
+            assert_eq!(sent, 0);
+            assert_eq!(discovered.unfound().count(), 1);
         }
 
         #[tokio::test]
@@ -1857,21 +2287,9 @@ mod tests {
             let config = make_config()
                 .with_consumed_eventgroup(consumed())
                 .with_find_timing(once());
-            let (socket, timer, offered) = (
-                RecordingSocket::default(),
-                RecordingTimer::new(),
-                Offered::new(),
-            );
+            let socket = RecordingSocket::default();
 
-            find_loop(
-                &config,
-                &socket,
-                &make_sd_state(),
-                &timer,
-                &offered,
-                &mut find_buf(),
-            )
-            .await;
+            schedule(&config, &socket).await;
 
             let sent = socket.sent.lock().unwrap();
             let view = crate::protocol::MessageView::parse(&sent[0].0).expect("SOME/IP");
@@ -1886,14 +2304,14 @@ mod tests {
             let config = make_config()
                 .with_consumed_eventgroup(consumed())
                 .with_find_timing(FIXED);
-            let (timer, offered) = (RecordingTimer::new(), Offered::new());
+            let timer = RecordingTimer::new();
 
-            find_loop(
+            find_schedule(
                 &config,
                 &FailingSocket,
                 &make_sd_state(),
                 &timer,
-                &offered,
+                &Discovered::new(&config),
                 &mut find_buf(),
             )
             .await;
@@ -1911,68 +2329,21 @@ mod tests {
             let config = make_config()
                 .with_consumed_eventgroup(consumed())
                 .with_find_timing(timing);
-            let (socket, timer, offered) = (
-                RecordingSocket::default(),
-                RecordingTimer::new(),
-                Offered::new(),
-            );
 
-            find_loop(
-                &config,
-                &socket,
-                &make_sd_state(),
-                &timer,
-                &offered,
-                &mut find_buf(),
-            )
-            .await;
+            let timer = schedule(&config, &RecordingSocket::default()).await;
 
             let sleeps = timer.sleeps.lock().unwrap();
             assert_eq!(sleeps.len(), 256);
             assert!(sleeps[1..].iter().all(|d| *d == core::time::Duration::MAX));
         }
 
-        async fn subscribed_by_an_offer<T: TransportSocket>(socket: &T) -> Subscribed {
-            let config = make_config().with_consumed_eventgroup(consumed());
-            let (wire, sd_len) = offers_wire_bytes(&[(0x5678, 1, 1)]);
-            let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
-            let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::server::SubscriptionManager::new(),
-            ));
-            handle_sd_message(
-                &config,
-                socket,
-                &make_sd_state(),
-                &subscriptions,
-                &sd_view,
-                core::net::SocketAddr::V4(PEER_SD),
-                &mut [0u8; crate::UDP_BUFFER_SIZE],
-            )
-            .await
-            .expect("handle_sd_message")
-        }
-
-        #[tokio::test]
-        async fn an_answered_offer_reports_its_eventgroup_subscribed() {
-            let subscribed = subscribed_by_an_offer(&RecordingSocket::default()).await;
-
-            assert_eq!(subscribed, first_subscribed());
-        }
-
-        #[tokio::test]
-        async fn an_offer_whose_subscribe_send_fails_reports_nothing_subscribed() {
-            let subscribed = subscribed_by_an_offer(&FailingSocket).await;
-
-            assert_eq!(subscribed, NONE_SUBSCRIBED);
-        }
-
         #[test]
-        fn a_marked_eventgroup_is_no_longer_found() {
+        fn a_found_instance_is_no_longer_found() {
             let config = make_config().with_consumed_eventgroup(consumed());
-            let offered = Offered::new();
-            offered.mark(first_subscribed());
+            let discovered = Discovered::new(&config);
+            discovered.mark_found(0);
 
-            let found = encode_finds(&mut [0u8; 64], &config, &make_sd_state(), &offered);
+            let found = encode_finds(&mut [0u8; 64], &discovered, &make_sd_state());
 
             assert!(matches!(found, Ok(None)), "{found:?}");
         }
@@ -1986,17 +2357,17 @@ mod tests {
                 .with_sd_multicast(group);
             let (socket, sd_state) = (RecordingSocket::default(), make_sd_state());
 
-            find_loop(
+            find_schedule(
                 &config,
                 &socket,
                 &sd_state,
                 &RecordingTimer::new(),
-                &Offered::new(),
+                &Discovered::new(&config),
                 &mut find_buf(),
             )
             .await;
             sd_state
-                .send_offer_service(&mut [0u8; 64], &config, &socket)
+                .send_offer_service(&mut [0u8; 64], &config, config.test_offering(), &socket)
                 .await
                 .expect("offer");
 
@@ -2007,10 +2378,21 @@ mod tests {
 
         #[tokio::test]
         async fn run_keeps_receiving_after_the_find_arm_finishes() {
+            let mut config = make_config().with_consumed_eventgroup(consumed());
+            config.offering.as_mut().unwrap().announce = false;
+            assert_eq!(finds_sent_by_run(config), 4, "the Find arm ran inside run");
+        }
+
+        #[tokio::test]
+        async fn run_finds_required_services_with_no_consumed_eventgroup() {
+            let config = ServerConfig::consumer_only().with_required_service(required());
+            assert_eq!(finds_sent_by_run(config), 4);
+        }
+
+        /// Polls `run_combined` once and returns how many datagrams it sent to
+        /// the SD socket; the run future must still be receiving.
+        fn finds_sent_by_run(config: ServerConfig) -> usize {
             use futures_util::FutureExt;
-            let config = make_config()
-                .with_consumed_eventgroup(consumed())
-                .with_announce(false);
             let sd: &'static RecordingSocket = std::boxed::Box::leak(std::boxed::Box::default());
             let unicast: &'static RecordingSocket =
                 std::boxed::Box::leak(std::boxed::Box::default());
@@ -2036,14 +2418,12 @@ mod tests {
                 &mut [],
                 &mut f,
                 None,
+                None,
             );
 
             assert!(run.now_or_never().is_none(), "run must still be receiving");
-            assert_eq!(
-                sd.sent.lock().unwrap().len(),
-                4,
-                "the Find arm ran inside run"
-            );
+            let sent = sd.sent.lock().unwrap().len();
+            sent
         }
 
         /// The datagram the codec builds for the answer to
@@ -2077,7 +2457,7 @@ mod tests {
             let socket = RecordingSocket::default();
             send_subscribe_ack_from_view(
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
-                &config,
+                config.test_offering(),
                 &socket,
                 &make_sd_state(),
                 &entry_view,
@@ -2098,7 +2478,7 @@ mod tests {
             .expect("nack");
 
             let sent = socket.sent.lock().unwrap();
-            assert_eq!(sent[0].0, codec_answer(config.ttl), "ack");
+            assert_eq!(sent[0].0, codec_answer(config.test_offering().ttl), "ack");
             assert_eq!(sent[1].0, codec_answer(0), "nack");
         }
 
@@ -2107,7 +2487,7 @@ mod tests {
             let mut buf = [0u8; 64];
             let len = crate::sd_codec::build_offer_service_datagram(
                 &mut buf,
-                &config.offer_request(),
+                &config.test_offering().offer_request(config.interface),
                 crate::sd_codec::SdSessionCounter::new().next(),
             )
             .expect("build");
@@ -2116,12 +2496,14 @@ mod tests {
 
         #[tokio::test]
         async fn the_server_offers_are_the_codec_offer() {
-            let config = make_config().with_minor_version(7);
+            let mut config = make_config();
+            config.offering.as_mut().unwrap().minor_version = 7;
 
             let unicast = RecordingSocket::default();
             send_unicast_offer(
                 &mut [0u8; crate::UDP_BUFFER_SIZE],
                 &config,
+                config.test_offering(),
                 &unicast,
                 &make_sd_state(),
                 subscriber_addr(),
@@ -2130,7 +2512,12 @@ mod tests {
             .expect("unicast offer");
             let multicast = RecordingSocket::default();
             make_sd_state()
-                .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &multicast)
+                .send_offer_service(
+                    &mut [0u8; crate::UDP_BUFFER_SIZE],
+                    &config,
+                    config.test_offering(),
+                    &multicast,
+                )
                 .await
                 .expect("multicast offer");
 
@@ -2143,6 +2530,595 @@ mod tests {
                 multicast[0].1,
                 SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT)
             );
+        }
+    }
+
+    #[cfg(feature = "server-tokio")]
+    mod service_observer {
+        use super::consumed_eventgroups::{PEER_SD, RecordingSocket};
+        use super::*;
+        use crate::server::ServiceChange;
+        use crate::{NetEndpoint, TransportProtocol};
+        use std::sync::Mutex;
+
+        static SEEN: Mutex<std::vec::Vec<(usize, ServiceChange)>> =
+            Mutex::new(std::vec::Vec::new());
+
+        fn record(ctx: usize, change: ServiceChange) {
+            SEEN.lock().unwrap().push((ctx, change));
+        }
+
+        /// What the observer registered under `ctx` has seen, in call order.
+        fn seen(ctx: usize) -> std::vec::Vec<ServiceChange> {
+            SEEN.lock()
+                .unwrap()
+                .iter()
+                .filter(|(c, _)| *c == ctx)
+                .map(|&(_, change)| change)
+                .collect()
+        }
+
+        fn service(service_id: u16, first_option: u8, options: u8, ttl: u32) -> sd::ServiceEntry {
+            sd::ServiceEntry {
+                index_first_options_run: first_option,
+                index_second_options_run: 0,
+                options_count: sd::OptionsCount::new(options, 0),
+                service_id,
+                instance_id: 3,
+                major_version: 2,
+                ttl,
+                minor_version: 7,
+            }
+        }
+
+        fn endpoint_option(port: u16, protocol: sd::TransportProtocol) -> sd::Options {
+            sd::Options::IpV4Endpoint {
+                ip: Ipv4Addr::new(10, 1, 2, 3),
+                port,
+                protocol,
+            }
+        }
+
+        fn instance(service_id: u16) -> ServiceInstance {
+            ServiceInstance::new(service_id, 3, 2).unwrap()
+        }
+
+        fn udp(port: u16) -> NetEndpoint {
+            NetEndpoint::udp(core::net::SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(10, 1, 2, 3),
+                port,
+            )))
+        }
+
+        fn available(service_id: u16, endpoint: NetEndpoint) -> ServiceChange {
+            ServiceChange::Available {
+                service: instance(service_id),
+                endpoint,
+            }
+        }
+
+        /// A discovery of services 0x6001 and 0x6002 reporting to the observer
+        /// registered under `ctx`.
+        fn discovery(ctx: usize) -> Discovery<'static> {
+            let config = ServerConfig::consumer_only()
+                .with_required_service(instance(0x6001))
+                .with_required_service(instance(0x6002));
+            let discovered = std::boxed::Box::leak(std::boxed::Box::new(Discovered::new(&config)));
+            Discovery::new(discovered, Some((record, ctx)))
+        }
+
+        /// Delivers an SD message of `entries` and `options` from
+        /// [`PEER_SD`] to a server with `discovery`.
+        async fn deliver(
+            discovery: &mut Discovery<'_>,
+            entries: &[sd::Entry],
+            options: &[sd::Options],
+        ) {
+            use automotive_wire_codec::Encode;
+
+            let header = sd::Header::new(
+                sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+                entries,
+                options,
+            );
+            let mut wire = [0u8; 512];
+            let sd_len = header.encode_to_slice(&mut wire).expect("encode");
+            let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+            let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::server::SubscriptionManager::new(),
+            ));
+            handle_sd_message(
+                &make_config(),
+                &RecordingSocket::default(),
+                &make_sd_state(),
+                &subscriptions,
+                &sd_view,
+                core::net::SocketAddr::V4(PEER_SD),
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                discovery,
+            )
+            .await
+            .expect("handle_sd_message");
+        }
+
+        #[tokio::test]
+        async fn each_offer_is_available_at_its_own_endpoint() {
+            deliver(
+                &mut discovery(0x4F01),
+                &[
+                    sd::Entry::OfferService(service(0x6001, 0, 1, 30)),
+                    sd::Entry::OfferService(service(0x6002, 1, 1, 90)),
+                ],
+                &[
+                    endpoint_option(30501, sd::TransportProtocol::Udp),
+                    endpoint_option(30502, sd::TransportProtocol::Udp),
+                ],
+            )
+            .await;
+
+            assert_eq!(
+                seen(0x4F01),
+                [available(0x6001, udp(30501)), available(0x6002, udp(30502))]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_stop_offer_of_the_holder_is_gone() {
+            let mut discovery = discovery(0x4F02);
+            let options = [endpoint_option(30501, sd::TransportProtocol::Udp)];
+            deliver(
+                &mut discovery,
+                &[sd::Entry::OfferService(service(0x6001, 0, 1, 30))],
+                &options,
+            )
+            .await;
+            deliver(
+                &mut discovery,
+                &[sd::Entry::StopOfferService(service(0x6001, 0, 1, 0))],
+                &options,
+            )
+            .await;
+
+            assert_eq!(
+                seen(0x4F02),
+                [
+                    available(0x6001, udp(30501)),
+                    ServiceChange::Gone {
+                        service: instance(0x6001)
+                    }
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn an_offer_without_an_endpoint_reports_nothing() {
+            deliver(
+                &mut discovery(0x4F03),
+                &[sd::Entry::OfferService(service(0x6001, 0, 0, 30))],
+                &[],
+            )
+            .await;
+
+            assert!(seen(0x4F03).is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_udp_endpoint_is_preferred_over_an_earlier_tcp_one() {
+            let mut entry = service(0x6001, 0, 2, 30);
+            entry.options_count = sd::OptionsCount::new(2, 0);
+            deliver(
+                &mut discovery(0x4F05),
+                &[sd::Entry::OfferService(entry)],
+                &[
+                    endpoint_option(30501, sd::TransportProtocol::Tcp),
+                    endpoint_option(30502, sd::TransportProtocol::Udp),
+                ],
+            )
+            .await;
+
+            assert!(matches!(
+                seen(0x4F05)[..],
+                [ServiceChange::Available {
+                    endpoint: NetEndpoint {
+                        protocol: TransportProtocol::Udp,
+                        ..
+                    },
+                    ..
+                }]
+            ));
+        }
+
+        /// An IPv4 SD endpoint option (0x24) naming UDP port 30490.
+        fn sd_endpoint_option() -> sd::Options {
+            sd::Options::IpV4SD {
+                ip: Ipv4Addr::new(10, 1, 2, 3),
+                protocol: sd::TransportProtocol::Udp,
+                port: 30490,
+            }
+        }
+
+        #[tokio::test]
+        async fn an_sd_endpoint_option_is_not_the_service_endpoint() {
+            deliver(
+                &mut discovery(0x4F06),
+                &[sd::Entry::OfferService(service(0x6001, 0, 2, 30))],
+                &[
+                    sd_endpoint_option(),
+                    endpoint_option(30502, sd::TransportProtocol::Udp),
+                ],
+            )
+            .await;
+
+            assert_eq!(seen(0x4F06), [available(0x6001, udp(30502))]);
+        }
+
+        #[tokio::test]
+        async fn an_sd_endpoint_option_alone_reports_nothing() {
+            deliver(
+                &mut discovery(0x4F07),
+                &[sd::Entry::OfferService(service(0x6001, 0, 1, 30))],
+                &[sd_endpoint_option()],
+            )
+            .await;
+
+            assert!(seen(0x4F07).is_empty());
+        }
+
+        #[tokio::test]
+        async fn other_entries_report_nothing() {
+            deliver(
+                &mut discovery(0x4F04),
+                &[
+                    sd::Entry::FindService(sd::ServiceEntry::find(0x6001)),
+                    sd::Entry::SubscribeEventGroup(sd::EventGroupEntry {
+                        index_first_options_run: 0,
+                        index_second_options_run: 0,
+                        options_count: sd::OptionsCount::new(1, 0),
+                        service_id: 0x1234,
+                        instance_id: 1,
+                        major_version: 1,
+                        ttl: 3,
+                        counter: 0,
+                        event_group_id: 0x0001,
+                    }),
+                ],
+                &[endpoint_option(40000, sd::TransportProtocol::Udp)],
+            )
+            .await;
+
+            assert!(seen(0x4F04).is_empty());
+        }
+
+        /// A socket whose first receive is one SD message offering 0x6001
+        /// for `ttl` seconds from [`PEER_SD`], and whose later receives
+        /// never complete.
+        struct OneOffer {
+            ttl: u32,
+            delivered: core::sync::atomic::AtomicBool,
+        }
+
+        impl TransportSocket for OneOffer {
+            type SendFuture<'a> = NullSend;
+            type RecvFuture<'a> = futures_util::future::Either<
+                core::future::Ready<Result<ReceivedDatagram, TransportError>>,
+                NullRecv,
+            >;
+
+            fn send_to<'a>(
+                &'a self,
+                _buf: &'a [u8],
+                _target: SocketAddrV4,
+            ) -> Self::SendFuture<'a> {
+                NullSend
+            }
+            fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+                use automotive_wire_codec::Encode;
+                if self
+                    .delivered
+                    .swap(true, core::sync::atomic::Ordering::Relaxed)
+                {
+                    return futures_util::future::Either::Right(NullRecv);
+                }
+                let entries = [sd::Entry::OfferService(service(0x6001, 0, 1, self.ttl))];
+                let options = [endpoint_option(30501, sd::TransportProtocol::Udp)];
+                let header = sd::Header::new(
+                    sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+                    &entries,
+                    &options,
+                );
+                let mut sd_data = std::vec::Vec::new();
+                header.encode(&mut sd_data).expect("encode");
+                let mut bytes = std::vec::Vec::new();
+                crate::protocol::Header::new_sd(1, sd_data.len())
+                    .encode(&mut bytes)
+                    .expect("encode");
+                bytes.extend_from_slice(&sd_data);
+                let len = bytes.len();
+                buf[..len].copy_from_slice(&bytes);
+                futures_util::future::Either::Left(core::future::ready(Ok(ReceivedDatagram {
+                    bytes_received: len,
+                    source: PEER_SD,
+                    truncated: false,
+                })))
+            }
+            fn local_addr(&self) -> Result<SocketAddrV4, TransportError> {
+                Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            }
+            fn join_multicast_v4(
+                &self,
+                _group: Ipv4Addr,
+                _iface: Ipv4Addr,
+            ) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn leave_multicast_v4(
+                &self,
+                _group: Ipv4Addr,
+                _iface: Ipv4Addr,
+            ) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        /// Sleeps that complete at once, counted.
+        #[derive(Default)]
+        struct CountingTimer(core::sync::atomic::AtomicUsize);
+
+        impl crate::Timer for CountingTimer {
+            type SleepFuture<'a>
+                = core::future::Ready<()>
+            where
+                Self: 'a;
+            fn sleep(&self, _duration: core::time::Duration) -> Self::SleepFuture<'_> {
+                self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                core::future::ready(())
+            }
+        }
+
+        /// What the receive loop reports, and how many ticks it slept, after
+        /// it receives an offer of 0x6001 for `ttl` seconds.
+        fn receive_one_offer(ctx: usize, ttl: u32) -> (std::vec::Vec<ServiceChange>, usize) {
+            use futures_util::FutureExt;
+            let config = make_config().with_required_service(instance(0x6001));
+            let discovered = Discovered::new(&config);
+            let mut discovery = Discovery::new(&discovered, Some((record, ctx)));
+            let socket = OneOffer {
+                ttl,
+                delivered: core::sync::atomic::AtomicBool::new(false),
+            };
+            let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::server::SubscriptionManager::new(),
+            ));
+            let receiver = Receiver {
+                config: &config,
+                unicast_socket: &socket,
+                sd_socket: &socket,
+                sd_state: &make_sd_state(),
+                subscriptions: &subscriptions,
+                e2e: &crate::NoE2E,
+                non_sd_observer: None,
+            };
+            let timer = CountingTimer::default();
+            let (mut u, mut s, mut r) = ([0u8; 512], [0u8; 512], [0u8; 512]);
+            let receiving = recv_loop(&receiver, &mut discovery, &timer, &mut u, &mut s, &mut r);
+
+            assert!(
+                receiving.now_or_never().is_none(),
+                "the loop keeps receiving"
+            );
+            (seen(ctx), timer.0.into_inner())
+        }
+
+        #[test]
+        fn the_receive_loop_reports_an_offer_gone_once_its_ttl_runs_out() {
+            let (changes, ticks) = receive_one_offer(0x4F08, 3);
+
+            assert_eq!(
+                changes,
+                [
+                    available(0x6001, udp(30501)),
+                    ServiceChange::Gone {
+                        service: instance(0x6001)
+                    }
+                ]
+            );
+            assert_eq!(ticks, 4, "between TTL and TTL + 1 s");
+        }
+
+        #[test]
+        fn an_offer_for_the_maximum_ttl_never_runs_out() {
+            let (changes, ticks) = receive_one_offer(0x4F09, sd::MAX_TTL);
+
+            assert_eq!(changes, [available(0x6001, udp(30501))]);
+            assert_eq!(ticks, 0);
+        }
+    }
+
+    #[cfg(feature = "server-tokio")]
+    mod consumer_only {
+        use super::consumed_eventgroups::{PEER_SD, RecordingSocket};
+        use super::*;
+
+        /// An SD payload holding `entry` and one IPv4 endpoint option.
+        fn wire_bytes(entry: sd::Entry) -> ([u8; 512], usize) {
+            use automotive_wire_codec::Encode;
+
+            let entries = [entry];
+            let options = [sd::Options::IpV4Endpoint {
+                ip: Ipv4Addr::LOCALHOST,
+                port: 40000,
+                protocol: sd::TransportProtocol::Udp,
+            }];
+            let sd_payload = sd::Header::new(
+                sd::Flags::new_sd(sd::RebootFlag::RecentlyRebooted),
+                &entries,
+                &options,
+            );
+            let mut wire = [0u8; 512];
+            let sd_len = sd_payload.encode_to_slice(&mut wire).expect("encode");
+            (wire, sd_len)
+        }
+
+        fn find_wire_bytes(service_id: u16) -> ([u8; 512], usize) {
+            wire_bytes(sd::Entry::FindService(sd::ServiceEntry::find(service_id)))
+        }
+
+        fn subscribe_to(service_id: u16, instance_id: u16) -> ([u8; 512], usize) {
+            wire_bytes(sd::Entry::SubscribeEventGroup(sd::EventGroupEntry {
+                index_first_options_run: 0,
+                index_second_options_run: 0,
+                options_count: sd::OptionsCount::new(1, 0),
+                service_id,
+                instance_id,
+                major_version: 1,
+                ttl: 3,
+                counter: 0,
+                event_group_id: 0x0001,
+            }))
+        }
+
+        /// The datagrams `config` sends in answer to the SD message `wire`.
+        async fn answer(
+            config: &ServerConfig,
+            &(wire, sd_len): &([u8; 512], usize),
+        ) -> RecordingSocket {
+            let socket = RecordingSocket::default();
+            let sd_view = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+            let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::server::SubscriptionManager::new(),
+            ));
+            handle_sd_message(
+                config,
+                &socket,
+                &make_sd_state(),
+                &subscriptions,
+                &sd_view,
+                core::net::SocketAddr::V4(PEER_SD),
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+                &mut Discovery::leaked(config),
+            )
+            .await
+            .expect("handle_sd_message");
+            socket
+        }
+
+        #[tokio::test]
+        async fn consumer_only_answers_no_find_service() {
+            let config = ServerConfig::consumer_only();
+
+            for service_id in [0x0000, 0xFFFF] {
+                let socket = answer(&config, &find_wire_bytes(service_id)).await;
+                assert!(
+                    socket.sent.lock().unwrap().is_empty(),
+                    "FindService for 0x{service_id:04X} is answered"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn an_offering_server_still_answers_find_service() {
+            let config = make_config();
+
+            let socket = answer(&config, &find_wire_bytes(0xFFFF)).await;
+
+            assert_eq!(socket.sent.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn consumer_only_nacks_a_subscribe() {
+            let config = ServerConfig::consumer_only();
+
+            let socket = answer(&config, &subscribe_to(0x0000, 0)).await;
+
+            let sent = socket.sent.lock().unwrap();
+            assert_eq!(sent.len(), 1, "one SubscribeNack");
+            let view = crate::protocol::MessageView::parse(&sent[0].0).expect("SOME/IP");
+            let entry = view
+                .sd_header()
+                .expect("SD")
+                .entries()
+                .next()
+                .expect("one entry");
+            assert!(matches!(
+                entry.entry_type(),
+                Ok(sd::EntryType::SubscribeAck)
+            ));
+            assert_eq!(entry.ttl(), 0, "a Nack carries TTL 0");
+        }
+
+        #[test]
+        fn an_offering_ttl_outside_the_entry_range_is_rejected() {
+            let mut config =
+                ServerConfig::new(Offering::new(ServiceInstance::new(0x1234, 1, 1).unwrap()));
+            config.offering.as_mut().unwrap().ttl = 0;
+            assert!(config.validate().is_err());
+        }
+
+        #[test]
+        fn consumer_only_still_checks_the_subscribe_ttl() {
+            let request = crate::sd_codec::SubscribeEventgroupRequest {
+                service: ServiceInstance::new(0x5678, 1, 1).unwrap(),
+                event_group_id: 0x0001,
+                ttl: 0,
+                local_ip: Ipv4Addr::LOCALHOST,
+                local_rx_port: 40100,
+            };
+            let config = ServerConfig::consumer_only().with_consumed_eventgroup(request);
+
+            assert!(config.validate().is_err());
+        }
+
+        /// A timer whose first sleep never completes.
+        struct PendingTimer;
+
+        impl crate::Timer for PendingTimer {
+            type SleepFuture<'a>
+                = core::future::Pending<()>
+            where
+                Self: 'a;
+            fn sleep(&self, _duration: core::time::Duration) -> Self::SleepFuture<'_> {
+                core::future::pending()
+            }
+        }
+
+        #[test]
+        fn consumer_only_announces_nothing() {
+            let config = ServerConfig::consumer_only();
+            let sd: &'static RecordingSocket = std::boxed::Box::leak(std::boxed::Box::default());
+            let unicast: &'static RecordingSocket =
+                std::boxed::Box::leak(std::boxed::Box::default());
+            let sd_state: &'static SdStateManager =
+                std::boxed::Box::leak(std::boxed::Box::new(SdStateManager::new()));
+            let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::server::SubscriptionManager::new(),
+            ));
+            let (mut u, mut s, mut r, mut a, mut f) = (
+                [0u8; 64],
+                [0u8; 64],
+                [0u8; 512],
+                [0u8; crate::UDP_BUFFER_SIZE],
+                [0u8; ServerConfig::FIND_SEND_BUF_LEN],
+            );
+            let run = run_combined(
+                config,
+                unicast,
+                sd,
+                subscriptions,
+                sd_state,
+                crate::NoE2E,
+                PendingTimer,
+                false,
+                &mut u,
+                &mut s,
+                &mut r,
+                &mut a,
+                &mut f,
+                None,
+                None,
+            );
+
+            assert!(futures_util::FutureExt::now_or_never(run).is_none());
+            assert!(sd.sent.lock().unwrap().is_empty());
         }
     }
 }

@@ -49,7 +49,7 @@ const RENEWING_OFFERS: [Duration; 2] = [Duration::from_millis(800), Duration::fr
 const OFFER_GAP: Duration = Duration::from_millis(2500);
 
 /// A service of the runtime's own that has nothing to do with `SVC`.
-const UNRELATED_SVC: u16 = 0x5678;
+const UNRELATED_SVC: u16 = 0x9ABC;
 
 /// The field's value in the runtime's offer.
 const FIELD_VALUE: [u8; 1] = [0x2A];
@@ -74,11 +74,10 @@ fn server() -> Setup {
 
 /// The runtime as a client of `SVC`, subscribing to `EG`.
 ///
-/// The bare-metal runtime cannot start without an offer, and a deployed node
-/// offers its own services while it subscribes, so it also offers an
-/// unrelated service. The std runtime runs a Client alone: a std Server in
-/// the same process would bind the SD port too and split unicast SD with
-/// the Client.
+/// A deployed bare-metal node offers its own services while it subscribes,
+/// so the bare-metal runtime also offers an unrelated service. The std
+/// runtime runs a Client alone: a std Server in the same process would bind
+/// the SD port too and split unicast SD with the Client.
 pub(super) fn client() -> Setup {
     let unrelated = Offer {
         service: UNRELATED_SVC,

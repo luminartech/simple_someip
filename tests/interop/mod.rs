@@ -14,6 +14,10 @@ pub mod consts {
     pub const SVC: u16 = 0x1234;
     pub const INST: u16 = 0x0001;
     pub const MAJOR: u8 = 1;
+    /// A second service, alongside `SVC`.
+    pub const OTHER_SVC: u16 = 0x5678;
+    /// The second service's port.
+    pub const OTHER_PORT: u16 = 30600;
     pub const EG: u16 = 0x0001;
     pub const EVENT: u16 = 0x8001;
     pub const FIELD: u16 = 0x8002;

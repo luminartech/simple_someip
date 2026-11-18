@@ -13,13 +13,14 @@ use embassy_executor::raw::Executor;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
+use crate::ServiceInstance;
 use crate::bare_metal_tasks::{SomeipRun, publish_notification, run_someip};
 use crate::protocol::sd;
 use crate::sd_codec::{
     OfferServiceRequest, SubscribeEventgroupRequest, build_multi_stop_offer_service_datagram,
 };
 use crate::server::{
-    EventPublisher, FindTiming, SdStateManager, Server, ServerConfig, ServerStorage,
+    EventPublisher, FindTiming, Offering, SdStateManager, Server, ServerConfig, ServerStorage,
     StaticSubscriptionHandle, StaticSubscriptionStorage, SubscriptionManager,
 };
 use crate::transport::{E2EHandle, NoE2E};
@@ -72,7 +73,8 @@ type RtServer = Server<
 /// non-SD observer and the runtime's notification RX path. `ctx` is the
 /// opaque word registered at [`init`]; `source` is the sender;
 /// `e2e_status` is what the [`RuntimeConfig::e2e`] handle's check found,
-/// or `None` when no check applied.
+/// or `None` when no check applied. It runs from within [`poll`]; a call
+/// to [`poll`] from it returns without polling.
 pub type DispatchFn = fn(
     ctx: usize,
     source: core::net::SocketAddrV4,
@@ -82,6 +84,13 @@ pub type DispatchFn = fn(
     e2e_status: Option<crate::E2EStatus>,
     response_out: &mut [u8],
 ) -> i32;
+
+/// Platform callback for a change in the availability of the subscription's
+/// service or a required service (see [`RuntimeConfig::required_services`]),
+/// called once per change from within [`poll`]. `ctx` is
+/// [`RuntimeConfig::dispatch_ctx`]. A call to [`poll`] from it returns
+/// without polling.
+pub type ServiceFn = crate::server::ServiceObserver;
 
 /// Bind a platform UDP socket / PCB for `port` and register its receive
 /// path (which must call [`on_rx`]). `is_sd` requests the SD multicast
@@ -105,6 +114,13 @@ pub struct OfferEntry {
     pub ttl_seconds: u32,
 }
 
+impl OfferEntry {
+    /// The offered service instance; `None` when the entry names a wildcard.
+    fn service(&self) -> Option<ServiceInstance> {
+        ServiceInstance::new(self.service_id, self.instance_id, self.major_version)
+    }
+}
+
 /// One subscription (events this node consumes). `#[repr(C)]`.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -115,6 +131,31 @@ pub struct SubEntry {
     pub method_id: u16,
     pub local_rx_port: u16,
     pub major_version: u8,
+}
+
+impl SubEntry {
+    /// The subscribed service instance; `None` when the entry names a
+    /// wildcard.
+    fn service(&self) -> Option<ServiceInstance> {
+        ServiceInstance::new(self.service_id, self.instance_id, self.major_version)
+    }
+}
+
+/// One service the node requires. `#[repr(C)]`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RequiredEntry {
+    pub service_id: u16,
+    pub instance_id: u16,
+    pub major_version: u8,
+}
+
+impl RequiredEntry {
+    /// The required service instance; `None` when the entry names a
+    /// wildcard.
+    fn service(self) -> Option<ServiceInstance> {
+        ServiceInstance::new(self.service_id, self.instance_id, self.major_version)
+    }
 }
 
 /// Buffer memory the platform owns (so it controls link placement) and
@@ -182,12 +223,28 @@ pub struct RuntimeConfig {
     pub dispatch_ctx: usize,
     /// Bind PCBs + register the RX path; called per catalog port in `init`.
     pub bind: BindFn,
-    /// Generated catalog (borrowed for the duration of `init`).
+    /// The services this node offers, at most `SIMPLE_SOMEIP_MAX_OFFERS` (4 by
+    /// default); [`init`] returns [`InitError::TooManyOffers`] past it. Empty
+    /// for a node that offers none: it then sends no `OfferService`, answers
+    /// no `FindService` and sends a `SubscribeNack` for every
+    /// `SubscribeEventgroup`.
     pub offers: &'static [OfferEntry],
     /// The eventgroup this node subscribes to, if any, naming a concrete
-    /// service ID, instance ID and major version.
+    /// service ID, instance ID and major version. The runtime sends
+    /// `FindService` for its service and reports its availability through
+    /// [`Self::on_service`].
     pub subscription: Option<SubEntry>,
-    /// When the runtime sends `FindService` for its subscription.
+    /// The services this node needs, at most
+    /// [`ServerConfig::REQUIRED_SERVICES_CAP`] distinct ones (1 by default);
+    /// [`init`] returns [`InitError::TooManyRequiredServices`] past it. The
+    /// runtime sends `FindService` for them and reports their availability
+    /// through [`Self::on_service`].
+    pub required_services: &'static [RequiredEntry],
+    /// Called for each change in the availability of the subscription's
+    /// service or a required service; `None` reports nothing.
+    pub on_service: Option<ServiceFn>,
+    /// When the runtime sends `FindService` for its subscription and
+    /// required services.
     pub find_timing: FindTiming,
     /// RX mailbox the platform's receive path pushes into.
     pub mailbox: &'static Mailbox,
@@ -261,6 +318,9 @@ static EXECUTOR_INIT: AtomicBool = AtomicBool::new(false);
 /// Reset on `init`'s failure paths so a corrected retry can proceed.
 static INIT_CLAIMED: AtomicBool = AtomicBool::new(false);
 static RUN_READY: AtomicBool = AtomicBool::new(false);
+/// Held while [`poll`] runs the executor, which must not be polled
+/// reentrantly.
+static POLLING: AtomicBool = AtomicBool::new(false);
 
 /// embassy's pender — we tick-poll, so wakes are a no-op.
 #[unsafe(no_mangle)]
@@ -292,7 +352,7 @@ fn find_offer(
 }
 
 /// Node SD TTL in seconds (from the catalog; one node-wide value surfaced
-/// per offer). Drives the offer cadence.
+/// per offer). Drives the offer cadence; unused when nothing is offered.
 fn node_sd_ttl_secs() -> u64 {
     u64::from(offer_ttl(offers().first().map_or(0, |o| o.ttl_seconds)))
 }
@@ -353,6 +413,63 @@ fn dispatch(
     )
 }
 
+/// The services a [`RuntimeConfig`] names, checked.
+struct Catalog {
+    /// The first offer, accepting Subscribes for every offer; `None` for an
+    /// empty [`RuntimeConfig::offers`].
+    offering: Option<Offering>,
+    subscription: Option<SubscribeEventgroupRequest>,
+    required: heapless::Vec<ServiceInstance, { ServerConfig::REQUIRED_SERVICES_CAP }>,
+}
+
+impl Catalog {
+    fn parse(config: &RuntimeConfig) -> Result<Self, InitError> {
+        let offering = match config.offers.first() {
+            Some(primary) => {
+                let mut offering = Offering::new(primary.service().ok_or(InitError::Wildcard)?)
+                    .with_local_port(primary.unicast_port)
+                    .with_ttl(Duration::from_secs(u64::from(offer_ttl(
+                        primary.ttl_seconds,
+                    ))))
+                    .with_event_group(primary.event_group_id)
+                    // The runtime announces every offer in one combined
+                    // OfferService from its own future.
+                    .with_announce(false);
+                for entry in config.offers {
+                    let service = entry.service().ok_or(InitError::Wildcard)?;
+                    offering = offering
+                        .try_with_accepted_offer(service, entry.event_group_id)
+                        .map_err(|_| InitError::TooManyOffers)?;
+                }
+                Some(offering)
+            }
+            None => None,
+        };
+        let subscription = match config.subscription {
+            Some(entry) => Some(SubscribeEventgroupRequest {
+                service: entry.service().ok_or(InitError::Wildcard)?,
+                event_group_id: entry.event_group_id,
+                ttl: sd::MAX_TTL,
+                local_ip: Ipv4Addr::from(config.interface.to_be_bytes()),
+                local_rx_port: entry.local_rx_port,
+            }),
+            None => None,
+        };
+        let mut required = heapless::Vec::new();
+        for entry in config.required_services {
+            let service = entry.service().ok_or(InitError::Wildcard)?;
+            if !required.contains(&service) && required.push(service).is_err() {
+                return Err(InitError::TooManyRequiredServices);
+            }
+        }
+        Ok(Self {
+            offering,
+            subscription,
+            required,
+        })
+    }
+}
+
 fn offer_requests(out: &mut [OfferServiceRequest; MAX_OFFERS]) -> usize {
     let iface = Ipv4Addr::from(IFACE.load(Ordering::Acquire).to_be_bytes());
     let o = offers();
@@ -388,17 +505,22 @@ fn sd_multicast() -> SocketAddrV4 {
     )
 }
 
-/// Build the receive `Server` over the shared callback sockets, accepting
-/// subscribes for every offered service and answering Offers of the
-/// subscription's service.
-fn build_server(find_timing: FindTiming) -> bool {
-    let o = offers();
-    let Some(primary) = o.first() else {
-        return false;
-    };
+/// Build the receive `Server` over the shared callback sockets for
+/// `catalog`, finding its subscription's and required services, reporting
+/// them to `on_service` and answering Offers of the subscription's service.
+/// With no offering the server's unicast socket has port 0, which no
+/// datagram reaches.
+fn build_server(
+    find_timing: FindTiming,
+    catalog: Catalog,
+    on_service: Option<(ServiceFn, usize)>,
+) -> bool {
     let plat = platform();
     let factory = Factory::new(plat);
-    let unicast_port = primary.unicast_port;
+    let unicast_port = catalog
+        .offering
+        .as_ref()
+        .map_or(0, |offering| offering.local_port);
     let sd_port = SD_PORT.load(Ordering::Acquire);
 
     // SAFETY: single-init; `init` is the sole caller.
@@ -416,31 +538,21 @@ fn build_server(find_timing: FindTiming) -> bool {
     }
 
     let iface = Ipv4Addr::from(IFACE.load(Ordering::Acquire).to_be_bytes());
-    let mut config = ServerConfig::new(primary.service_id, primary.instance_id)
-        .with_interface(iface)
-        .with_local_port(primary.unicast_port)
-        .with_major_version(primary.major_version)
-        .with_ttl(Duration::from_secs(u64::from(offer_ttl(
-            primary.ttl_seconds,
-        ))))
-        .with_event_group(primary.event_group_id)
-        // The runtime drives a combined multi-offer OfferService announce
-        // (all catalog offers in one SD datagram) from its own future, so
-        // the server's recv loop must stay silent on SD — otherwise the
-        // primary service would be announced twice.
-        .with_announce(false)
-        .with_find_timing(find_timing)
-        .with_sd_multicast(sd_multicast());
-    for entry in o {
-        config = config.with_accepted_offer(
-            entry.service_id,
-            entry.instance_id,
-            entry.major_version,
-            entry.event_group_id,
-        );
+    let mut config = ServerConfig {
+        offering: catalog.offering,
+        ..ServerConfig::consumer_only()
     }
-    if let Some(request) = subscribe_request() {
+    .with_interface(iface)
+    .with_find_timing(find_timing)
+    .with_sd_multicast(sd_multicast());
+    if let Some(request) = catalog.subscription {
         let Ok(c) = config.try_with_consumed_eventgroup(request) else {
+            return false;
+        };
+        config = c;
+    }
+    for service in catalog.required {
+        let Ok(c) = config.try_with_required_service(service) else {
             return false;
         };
         config = c;
@@ -459,6 +571,7 @@ fn build_server(find_timing: FindTiming) -> bool {
             publisher: (*core::ptr::addr_of!(PUBLISHER)).assume_init_ref(),
             started: &SERVER_STARTED,
             non_sd_observer: Some((dispatch as crate::server::NonSdRequestCallback, 0)),
+            service_observer: on_service,
         }
     };
     match Server::new_with_handles(storage, config) {
@@ -470,21 +583,9 @@ fn build_server(find_timing: FindTiming) -> bool {
     }
 }
 
-/// The Subscribe the server sends for the catalog's subscription.
-fn subscribe_request() -> Option<SubscribeEventgroupRequest> {
-    subscription().map(|s| SubscribeEventgroupRequest {
-        service_id: s.service_id,
-        instance_id: s.instance_id,
-        major_version: s.major_version,
-        event_group_id: s.event_group_id,
-        ttl: sd::MAX_TTL,
-        local_ip: Ipv4Addr::from(IFACE.load(Ordering::Acquire).to_be_bytes()),
-        local_rx_port: s.local_rx_port,
-    })
-}
-
 /// The single composed task: receive server (which also answers Offers with
-/// Subscribes) + combined-offer announce + notification RX/dispatch.
+/// Subscribes) + combined-offer announce + notification RX/dispatch + Offer
+/// expiry.
 #[embassy_executor::task]
 async fn someip_task() {
     // SAFETY: `init` wrote SERVER + BUFS + MAILBOX before spawning. Each
@@ -525,7 +626,7 @@ async fn someip_task() {
     let rx_socket = subscription().map(|s| factory.socket(s.local_rx_port));
     let period = Duration::from_secs(node_sd_ttl_secs());
 
-    run_someip(
+    let run = run_someip(
         recv,
         SomeipRun {
             sd_socket,
@@ -541,8 +642,76 @@ async fn someip_task() {
             // The trampoline injects DISPATCH_CTX itself; pass 0 here.
             dispatch_ctx: 0,
         },
-    )
-    .await;
+    );
+    run.await;
+}
+
+/// Bind PCBs via the platform (registers the RX path → `on_rx`): the SD
+/// port, each unique offered unicast port, and each subscription RX port.
+fn bind_ports(bind: BindFn) {
+    bind(
+        SD_PORT.load(Ordering::Acquire),
+        true,
+        SD_MCAST.load(Ordering::Acquire),
+    );
+    let mut bound: [u16; MAX_OFFERS + 1] = [0; MAX_OFFERS + 1];
+    let mut nb = 0usize;
+    let mut bind_once = |port: u16| {
+        if port != 0 && !bound[..nb].contains(&port) {
+            bind(port, false, 0);
+            bound[nb] = port;
+            nb += 1;
+        }
+    };
+    for o in offers() {
+        bind_once(o.unicast_port);
+    }
+    if let Some(s) = subscription() {
+        bind_once(s.local_rx_port);
+    }
+}
+
+/// Why [`init`] failed. Each variant's value is the negative code a C API
+/// over [`init`] returns for it; [`InitError::code`] gives it.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum InitError {
+    /// The receive server could not be built.
+    #[error("the receive server could not be built")]
+    ServerBuild = -1,
+    /// The runtime task could not be spawned.
+    #[error("the runtime task could not be spawned")]
+    Spawn = -2,
+    /// The runtime is already initialized: a repeat or re-entrant [`init`].
+    /// The passed config and its buffers are not adopted.
+    #[error("the runtime is already initialized")]
+    AlreadyInitialized = -4,
+    /// [`RuntimeConfig::subscription`], or an entry of
+    /// [`RuntimeConfig::offers`] or [`RuntimeConfig::required_services`],
+    /// names a wildcard service ID, instance ID or major version.
+    #[error("a subscription, offer or required service names a wildcard")]
+    Wildcard = -5,
+    /// [`RuntimeConfig::sd_mcast`] is not a multicast group.
+    #[error("the SD group is not a multicast group")]
+    SdGroupNotMulticast = -6,
+    /// [`RuntimeConfig::required_services`] names more distinct services
+    /// than the runtime holds.
+    #[error(
+        "more distinct required services than SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES (1 by default)"
+    )]
+    TooManyRequiredServices = -7,
+    /// [`RuntimeConfig::offers`] holds more entries than the runtime holds.
+    #[error("more offers than SIMPLE_SOMEIP_MAX_OFFERS (4 by default)")]
+    TooManyOffers = -8,
+}
+
+impl InitError {
+    /// The negative code for this error.
+    #[must_use]
+    pub const fn code(self) -> i32 {
+        self as i32
+    }
 }
 
 // ── Public runtime API (the platform's C-FFI forwards to these) ──────────
@@ -550,20 +719,17 @@ async fn someip_task() {
 /// Stand up the runtime from `config`, build the server, and
 /// spawn the composed task.
 ///
-/// Returns `0` on success, or a negative error code: `-1` server build
-/// failed, `-2` task spawn failed, `-4` the runtime is already initialized
-/// (a repeat or re-entrant `init` — the passed `config` and its buffers are
-/// NOT adopted), `-5` `config.subscription` names a wildcard service ID,
-/// instance ID or major version, `-6` `config.sd_mcast` is not a multicast
-/// group. The `-1`/`-2`/`-5`/`-6` paths release the init claim so a corrected
-/// retry can proceed; `-4` does not (a runtime is already live).
-#[allow(clippy::missing_panics_doc)]
+/// # Errors
+///
+/// Returns the [`InitError`] that stopped it. Every error but
+/// [`InitError::AlreadyInitialized`] leaves the runtime uninitialized, so a
+/// corrected retry can proceed.
 // By-value is required, not incidental: `config.buffers` is a `&'static mut`
 // reborrowed into `BUFS` (`ptr::from_mut`), which a shared `&RuntimeConfig`
 // could not yield. This is also the FFI ownership-transfer boundary — the
 // platform hands the runtime its config and buffer memory.
 #[allow(clippy::needless_pass_by_value)]
-pub fn init(config: RuntimeConfig) -> i32 {
+pub fn init(config: RuntimeConfig) -> Result<(), InitError> {
     // Atomically claim init: only the first caller proceeds. Closes the
     // window the old `load`-then-store-at-end guard left open (a re-entrant
     // `init` via a `bind`/`send` callback, or a repeat call) during which a
@@ -572,17 +738,24 @@ pub fn init(config: RuntimeConfig) -> i32 {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return -4;
+        return Err(InitError::AlreadyInitialized);
     }
-    if config.subscription.is_some_and(|s| {
-        crate::sd_codec::names_a_wildcard(s.service_id, s.instance_id, s.major_version)
-    }) {
+    let result = init_claimed(config);
+    if result.is_err() {
         INIT_CLAIMED.store(false, Ordering::Release);
-        return -5;
     }
+    result
+}
+
+/// [`init`] once it holds the init claim.
+#[allow(clippy::needless_pass_by_value)]
+fn init_claimed(config: RuntimeConfig) -> Result<(), InitError> {
+    if config.offers.len() > MAX_OFFERS {
+        return Err(InitError::TooManyOffers);
+    }
+    let catalog = Catalog::parse(&config)?;
     if config.sd_mcast != 0 && !Ipv4Addr::from(config.sd_mcast.to_be_bytes()).is_multicast() {
-        INIT_CLAIMED.store(false, Ordering::Release);
-        return -6;
+        return Err(InitError::SdGroupNotMulticast);
     }
     IFACE.store(config.interface, Ordering::Release);
     SD_PORT.store(
@@ -612,44 +785,22 @@ pub fn init(config: RuntimeConfig) -> i32 {
     }
 
     // Copy catalog into static tables.
-    let n_offers = config.offers.len().min(MAX_OFFERS);
-    for (i, e) in config.offers.iter().take(n_offers).enumerate() {
-        unsafe { (*core::ptr::addr_of_mut!(OFFERS))[i] = *e };
+    // SAFETY: single-init guarded by INIT_CLAIMED; no task reads OFFERS yet.
+    let slots = unsafe { &mut *core::ptr::addr_of_mut!(OFFERS) };
+    for (slot, entry) in slots.iter_mut().zip(config.offers) {
+        *slot = *entry;
     }
-    OFFERS_LEN.store(n_offers, Ordering::Release);
+    OFFERS_LEN.store(config.offers.len(), Ordering::Release);
     if let Some(e) = config.subscription {
         unsafe { *core::ptr::addr_of_mut!(SUBSCRIPTION) = e };
     }
     SUBSCRIBED.store(config.subscription.is_some(), Ordering::Release);
 
-    // Bind PCBs via the platform (registers the RX path → `on_rx`): the SD
-    // port, each unique offered unicast port, and each subscription RX port.
-    let bind = config.bind;
-    bind(
-        SD_PORT.load(Ordering::Acquire),
-        true,
-        SD_MCAST.load(Ordering::Acquire),
-    );
-    let mut bound: [u16; MAX_OFFERS + 1] = [0; MAX_OFFERS + 1];
-    let mut nb = 0usize;
-    let mut bind_once = |port: u16| {
-        if port != 0 && !bound[..nb].contains(&port) {
-            bind(port, false, 0);
-            bound[nb] = port;
-            nb += 1;
-        }
-    };
-    for o in offers() {
-        bind_once(o.unicast_port);
-    }
-    if let Some(s) = subscription() {
-        bind_once(s.local_rx_port);
-    }
+    bind_ports(config.bind);
 
-    if !build_server(config.find_timing) {
-        // Release the claim so the platform can retry after fixing config.
-        INIT_CLAIMED.store(false, Ordering::Release);
-        return -1;
+    let on_service = config.on_service.map(|f| (f, config.dispatch_ctx));
+    if !build_server(config.find_timing, catalog, on_service) {
+        return Err(InitError::ServerBuild);
     }
 
     // SAFETY: single-init guarded by INIT_CLAIMED (claimed above).
@@ -659,23 +810,33 @@ pub fn init(config: RuntimeConfig) -> i32 {
         slot.assume_init_ref().spawner()
     };
     if spawner.spawn(someip_task()).is_err() {
-        INIT_CLAIMED.store(false, Ordering::Release);
-        return -2;
+        return Err(InitError::Spawn);
     }
     // Publish the poll gate LAST: `poll()` must never touch `EXECUTOR`
     // before the slot above is written and the task is spawned.
     EXECUTOR_INIT.store(true, Ordering::Release);
     RUN_READY.store(true, Ordering::Release);
-    0
+    Ok(())
 }
 
 /// Tick the executor once. Call every platform main-loop iteration.
+///
+/// A call made while another `poll` is running, such as from a
+/// [`DispatchFn`] or [`ServiceFn`] callback, returns without polling.
 pub fn poll() {
     if !EXECUTOR_INIT.load(Ordering::Acquire) {
         return;
     }
-    // SAFETY: single-threaded; the platform poll is the sole caller.
+    if POLLING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    // SAFETY: `POLLING` admits one caller at a time, so the executor is
+    // never polled reentrantly.
     unsafe { (*core::ptr::addr_of!(EXECUTOR)).assume_init_ref().poll() };
+    POLLING.store(false, Ordering::Release);
 }
 
 fn next_publish_session() -> u16 {

@@ -39,33 +39,24 @@ The server implementation provides:
 ### Basic Server Setup
 
 ```rust
-use simple_someip::server::{Server, ServerConfig};
+use simple_someip::ServiceInstance;
+use simple_someip::server::{Offering, Server, ServerConfig};
 use std::net::Ipv4Addr;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Configure the server
-    let config = ServerConfig::new(
-        Ipv4Addr::new(192, 168, 1, 200), // Local interface
-        30500,                            // Local port
-        0x1234,                           // Service ID
-        1,                                // Instance ID
-    );
+    // Configure the offered service and the local interface
+    let service = ServiceInstance::new(0x1234, 1, 1).expect("not a wildcard");
+    let config = ServerConfig::new(Offering::new(service).with_local_port(30500))
+        .with_interface(Ipv4Addr::new(192, 168, 1, 200));
 
-    // Create the server
-    let mut server = Server::new(config).await?;
-
-    // Start announcing the service (sends OfferService every 1s).
-    // Spawn the announcement loop future on the Tokio runtime.
-    tokio::spawn(server.announcement_loop()?);
-
-    // Get event publisher for sending events
-    let publisher = server.publisher();
-
-    // Spawn the server run loop to handle subscriptions
+    // Create the server. `run` drives the receive loop and sends an
+    // OfferService every 1 s.
+    let (_server, handles, run) = Server::new(config).await?;
+    let publisher = handles.publisher;
     tokio::spawn(async move {
-        if let Err(e) = server.run().await {
-            eprintln!("Server error: {:?}", e);
+        if let Err(e) = run.await {
+            eprintln!("Server error: {e:?}");
         }
     });
 
@@ -75,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         1,         // instance_id
         0x01,      // event_group_id
         0x8001,    // event_id
-        0,         // session_id
+        0,         // request_id
         1,         // protocol_version
         1,         // interface_version
         &[0x01],   // payload
@@ -139,24 +130,33 @@ This is common in automotive SOME/IP deployments where control commands are broa
 
 ### `ServerConfig`
 
-Configuration for a SOME/IP service provider:
+Configuration for a SOME/IP server:
 
 - `interface: Ipv4Addr` - Local network interface
-- `local_port: u16` - Port to bind for receiving subscriptions
-- `service_id: u16` - SOME/IP service ID
-- `instance_id: u16` - Service instance ID
-- `major_version: u8` - Service major version (default: 1)
+- `offering: Option<Offering>` - The offered service; `None` from `ServerConfig::consumer_only()`
+- `consumed_eventgroups` - Eventgroups the server finds and subscribes to
+- `required_services` - Service instances the server finds
+- `find_timing: FindTiming` - When `FindService` is sent
+- `sd_multicast: SocketAddrV4` - SD multicast group and port (default: `239.255.0.255:30490`)
+
+### `Offering`
+
+The offered service:
+
+- `service: ServiceInstance` - Service ID, instance ID and major version
 - `minor_version: u32` - Service minor version (default: 0)
 - `ttl: u32` - Service Discovery TTL in seconds (default: 3)
+- `event_group_ids` - Event groups accepted in a Subscribe (default: any)
+- `local_port: u16` - Port to bind for receiving subscriptions (default: ephemeral)
+- `announce: bool` - Whether the server sends `OfferService` itself (default: `true`)
+- `accepted_offers` - Co-offered `(service, event_group)` pairs accepted in a Subscribe
 
 ### `Server`
 
 Main server struct:
 
-- `new(config: ServerConfig) -> Result<Self, Error>` - Create new server
-- `announcement_loop() -> Result<impl Future<Output = ()> + Send + 'static, Error>` - Build the SD announcement future; caller spawns on the Tokio runtime
-- `publisher() -> Arc<EventPublisher>` - Get event publisher
-- `run() -> Result<(), Error>` - Run event loop (handles subscriptions)
+- `new(config: ServerConfig) -> Result<(Server, ServerHandles, impl Future<Output = Result<(), Error>>), Error>` - Create a server; the returned future drives the receive loop and the announcements
+- `publisher() -> Hep` - The event publisher, also in `ServerHandles::publisher`
 
 ### `EventPublisher`
 

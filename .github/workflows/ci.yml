@@ -542,6 +542,8 @@ jobs:
             # Same pin as the `bare-metal-runtime` job; see the reason there.
             toolchain: nightly-2026-08-21
             args: --no-default-features --features bare-metal-runtime --test interop_bare_metal
+            # Every consuming scenario requires SVC and OTHER_SVC, so each needs room for two.
+            env: SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES=2
     env:
       SIMPLE_SOMEIP_VSOMEIP_IMAGE: ${{ needs.vsomeip-peer-image.outputs.image }}
     steps:
@@ -610,10 +612,12 @@ jobs:
         env:
           TOOLCHAIN: ${{ matrix.toolchain }}
           ARGS: ${{ matrix.args }}
+          RUN_ENV: ${{ matrix.env }}
         # `--no-fail-fast` so a red run lists every failing scenario.
         run: |
           read -ra args <<< "$ARGS"
-          cargo "+$TOOLCHAIN" nextest run --profile interop --no-fail-fast "${args[@]}"
+          # shellcheck disable=SC2086 # RUN_ENV is NAME=value words, or empty.
+          env $RUN_ENV cargo "+$TOOLCHAIN" nextest run --profile interop --no-fail-fast "${args[@]}"
 
   interop-pending:
     # Runs only the `#[ignore]`d known gaps and lists in the job summary any
@@ -638,6 +642,8 @@ jobs:
             # Same pin as the `bare-metal-runtime` job; see the reason there.
             toolchain: nightly-2026-08-21
             args: --no-default-features --features bare-metal-runtime --test interop_bare_metal
+            # Every consuming scenario requires SVC and OTHER_SVC, so each needs room for two.
+            env: SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES=2
     env:
       SIMPLE_SOMEIP_VSOMEIP_IMAGE: ${{ needs.vsomeip-peer-image.outputs.image }}
     steps:
@@ -706,12 +712,14 @@ jobs:
         env:
           TOOLCHAIN: ${{ matrix.toolchain }}
           ARGS: ${{ matrix.args }}
+          RUN_ENV: ${{ matrix.env }}
         run: |
           read -ra args <<< "$ARGS"
           # nextest exits 100 when tests fail, which is what a known gap
           # does. Any other failure (a build error, say) fails the step.
           code=0
-          cargo "+$TOOLCHAIN" nextest run --profile interop --run-ignored only \
+          # shellcheck disable=SC2086 # RUN_ENV is NAME=value words, or empty.
+          env $RUN_ENV cargo "+$TOOLCHAIN" nextest run --profile interop --run-ignored only \
             --no-fail-fast --no-tests=pass "${args[@]}" || code=$?
           if [ "$code" -ne 0 ] && [ "$code" -ne 100 ]; then
             exit "$code"
@@ -752,6 +760,8 @@ jobs:
             # Same pin as the `bare-metal-runtime` job; see the reason there.
             toolchain: nightly-2026-08-21
             args: --no-default-features --features bare-metal-runtime --test interop_bare_metal
+            # Every consuming scenario requires SVC and OTHER_SVC, so each needs room for two.
+            env: SIMPLE_SOMEIP_MAX_REQUIRED_SERVICES=2
     steps:
       - uses: actions/checkout@v6
         with:
@@ -856,12 +866,14 @@ jobs:
         env:
           TOOLCHAIN: ${{ matrix.toolchain }}
           ARGS: ${{ matrix.args }}
+          RUN_ENV: ${{ matrix.env }}
           SIMPLE_SOMEIP_VSOMEIP_IMAGE: ${{ matrix.peer == 'latest' && steps.latest.outputs.image || steps.peer.outputs.image }}
         run: |
           read -ra args <<< "$ARGS"
           for i in 1 2 3 4 5; do
             echo "::group::Run $i of 5"
-            if ! cargo "+$TOOLCHAIN" nextest run --profile interop "${args[@]}"; then
+            # shellcheck disable=SC2086 # RUN_ENV is NAME=value words, or empty.
+            if ! env $RUN_ENV cargo "+$TOOLCHAIN" nextest run --profile interop "${args[@]}"; then
               echo "::error::Run $i of 5 failed."
               exit 1
             fi
