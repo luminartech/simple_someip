@@ -146,7 +146,7 @@ where
     pub rx_socket: Option<&'a S>,
     pub timer: &'a Tm,
     pub e2e: &'a R,
-    /// Re-announce period (the node SD TTL).
+    /// Delay between the cyclic Offers.
     pub period: Duration,
     /// Offered services packed into one combined `OfferService`; empty
     /// sends none.

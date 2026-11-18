@@ -6,7 +6,7 @@
 use core::cell::RefCell;
 use core::mem::MaybeUninit;
 use core::net::{Ipv4Addr, SocketAddrV4};
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use core::time::Duration;
 
 use embassy_executor::raw::Executor;
@@ -29,7 +29,11 @@ use super::mailbox::RxMailbox;
 use super::transport::{CallbackFactory, CallbackSocket, CallbackTimer, NowMsFn, Platform, SendFn};
 
 // ── Fixed runtime sizing (catalog-agnostic) ──────────────────────────────
-/// RX mailbox slots.
+/// RX mailbox slots, shared by every port the runtime receives on
+/// (`SIMPLE_SOMEIP_RX_SLOTS`, 2 by default). A datagram that arrives while
+/// every slot is full is dropped and counted in [`RxMailbox::dropped`]. After
+/// a subscription to fields is acknowledged, the `SubscribeAck` and one initial
+/// value per field arrive at once; size the mailbox to hold that burst.
 pub const RX_SLOTS: usize = crate::from_env_or(option_env!("SIMPLE_SOMEIP_RX_SLOTS"), 2);
 /// Per-slot / per-buffer capacity. One Ethernet-MTU-ish datagram; SOME/IP
 /// single datagrams stay under this (TP segmentation not used here).
@@ -94,9 +98,10 @@ pub type ServiceFn = crate::server::ServiceObserver;
 
 /// Bind a platform UDP socket / PCB for `port` and register its receive
 /// path (which must call [`on_rx`]). `is_sd` requests the SD multicast
-/// group (`mcast`) be joined. Returns 0 on success. The runtime calls this
-/// during [`init`] for the SD port + every unique unicast/RX port in the
-/// catalog, so the platform doesn't walk the catalog itself.
+/// group (`mcast`) be joined. Returns 0 on success; any other value makes
+/// [`init`] return [`InitError::Bind`]. The runtime calls this during
+/// [`init`] for the SD port + every unique unicast/RX port in the catalog,
+/// so the platform doesn't walk the catalog itself.
 pub type BindFn = extern "C" fn(port: u16, is_sd: bool, mcast: u32) -> i32;
 
 /// One offered service. Layout matches a platform's generated catalog
@@ -155,6 +160,41 @@ impl RequiredEntry {
     /// wildcard.
     fn service(self) -> Option<ServiceInstance> {
         ServiceInstance::new(self.service_id, self.instance_id, self.major_version)
+    }
+}
+
+/// When the runtime sends its cyclic `OfferService` messages. Start from
+/// [`OfferTiming::DEFAULT`] and set the fields to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OfferTiming {
+    /// The delay between cyclic Offers, from 1 ms up to the shortest TTL among
+    /// [`RuntimeConfig::offers`]; [`init`] returns
+    /// [`InitError::CyclicOfferDelayOutOfRange`] outside it, unless the node
+    /// offers nothing. A peer keeps the service through one lost Offer when
+    /// the TTL is at least twice the delay.
+    pub cyclic_delay: Duration,
+}
+
+impl OfferTiming {
+    /// Cyclic Offers every second.
+    pub const DEFAULT: Self = Self {
+        cyclic_delay: Duration::from_secs(1),
+    };
+
+    /// [`Self::cyclic_delay`], checked against `offers`; unchecked when there
+    /// are none, since nothing is then offered cyclically.
+    fn checked_cyclic_delay(&self, offers: &[OfferEntry]) -> Result<Duration, InitError> {
+        let delay = self.cyclic_delay;
+        let in_range = |o: &OfferEntry| {
+            delay >= Duration::from_millis(1)
+                && delay <= Duration::from_secs(u64::from(offer_ttl(o.ttl_seconds)))
+        };
+        if offers.iter().all(in_range) {
+            Ok(delay)
+        } else {
+            Err(InitError::CyclicOfferDelayOutOfRange)
+        }
     }
 }
 
@@ -246,6 +286,8 @@ pub struct RuntimeConfig {
     /// When the runtime sends `FindService` for its subscription and
     /// required services.
     pub find_timing: FindTiming,
+    /// When the runtime sends its cyclic `OfferService` messages.
+    pub offer_timing: OfferTiming,
     /// RX mailbox the platform's receive path pushes into.
     pub mailbox: &'static Mailbox,
     /// Runtime buffer memory (platform-owned, placement-controlled).
@@ -307,17 +349,38 @@ static SEND_FN: AtomicUsize = AtomicUsize::new(0); // SendFn as usize
 static NOW_FN: AtomicUsize = AtomicUsize::new(0); // NowMsFn as usize
 
 static mut EXECUTOR: MaybeUninit<Executor> = MaybeUninit::uninit();
-/// Set once the `EXECUTOR` slot is written and the task is spawned — the
-/// gate `poll()` checks. Stays false through all of `init`'s fallible work
-/// so `poll()` never touches an uninitialized executor.
-static EXECUTOR_INIT: AtomicBool = AtomicBool::new(false);
-/// Claimed atomically at the top of `init` to make it idempotent and
-/// re-entrancy-safe: only the first caller proceeds; a second concurrent or
-/// repeat call is rejected (it must NOT adopt the new config or it would
-/// silently leak the platform's freshly-handed `&'static mut` buffers).
-/// Reset on `init`'s failure paths so a corrected retry can proceed.
-static INIT_CLAIMED: AtomicBool = AtomicBool::new(false);
-static RUN_READY: AtomicBool = AtomicBool::new(false);
+/// Where the runtime is in its life, a [`Lifecycle`] as `u8`.
+static LIFECYCLE: AtomicU8 = AtomicU8::new(Lifecycle::Idle as u8);
+
+/// The runtime's states. `init` moves it from `Idle` to `Initializing`, then
+/// to `Running`, or back to `Idle` when it fails; `deinit` moves it from
+/// `Running` or `Initializing` to `Stopped`, which it never leaves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Lifecycle {
+    Idle,
+    Initializing,
+    Running,
+    Stopped,
+}
+
+impl Lifecycle {
+    fn now() -> Self {
+        match LIFECYCLE.load(Ordering::Acquire) {
+            0 => Self::Idle,
+            1 => Self::Initializing,
+            2 => Self::Running,
+            _ => Self::Stopped,
+        }
+    }
+
+    /// Moves to `to` if the runtime is in `from`; `false` if it is not.
+    fn advance(from: Self, to: Self) -> bool {
+        LIFECYCLE
+            .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
 /// Held while [`poll`] runs the executor, which must not be polled
 /// reentrantly.
 static POLLING: AtomicBool = AtomicBool::new(false);
@@ -351,12 +414,6 @@ fn find_offer(
     })
 }
 
-/// Node SD TTL in seconds (from the catalog; one node-wide value surfaced
-/// per offer). Drives the offer cadence; unused when nothing is offered.
-fn node_sd_ttl_secs() -> u64 {
-    u64::from(offer_ttl(offers().first().map_or(0, |o| o.ttl_seconds)))
-}
-
 /// The TTL an offer is sent with: `ttl_seconds`, with 0 meaning 3 seconds and
 /// anything above [`sd::MAX_TTL`] capped to it.
 fn offer_ttl(ttl_seconds: u32) -> u32 {
@@ -367,15 +424,34 @@ fn offer_ttl(ttl_seconds: u32) -> u32 {
     }
 }
 
+/// The platform's [`RuntimeConfig::send`].
+fn platform_send() -> SendFn {
+    // SAFETY: `init` stores a `SendFn` before any reader.
+    unsafe { core::mem::transmute::<usize, SendFn>(SEND_FN.load(Ordering::Acquire)) }
+}
+
+/// [`platform_send`] while the runtime is `Running`; -1 without sending
+/// otherwise.
+extern "C" fn send_while_running(
+    local_port: u16,
+    buf: *const u8,
+    len: usize,
+    dst: u32,
+    dst_port: u16,
+) -> i32 {
+    if Lifecycle::now() != Lifecycle::Running {
+        return -1;
+    }
+    platform_send()(local_port, buf, len, dst, dst_port)
+}
+
 fn platform() -> Platform<'static, RX_SLOTS, RX_CAP> {
     // SAFETY: set once in `init` before any reader.
     let mailbox = unsafe { (*core::ptr::addr_of!(MAILBOX)).expect("mailbox set in init") };
-    let send: SendFn =
-        unsafe { core::mem::transmute::<usize, SendFn>(SEND_FN.load(Ordering::Acquire)) };
     let now: NowMsFn =
         unsafe { core::mem::transmute::<usize, NowMsFn>(NOW_FN.load(Ordering::Acquire)) };
     Platform {
-        send,
+        send: send_while_running,
         now_ms: now,
         mailbox,
         interface: IFACE.load(Ordering::Acquire),
@@ -587,7 +663,7 @@ fn build_server(
 /// Subscribes) + combined-offer announce + notification RX/dispatch + Offer
 /// expiry.
 #[embassy_executor::task]
-async fn someip_task() {
+async fn someip_task(period: Duration) {
     // SAFETY: `init` wrote SERVER + BUFS + MAILBOX before spawning. Each
     // buffer is reborrowed individually through a raw pointer to its own
     // field — deliberately NOT via a whole-struct `&mut *BUFS`. A
@@ -624,7 +700,6 @@ async fn someip_task() {
     // Client RX socket marker (its PCB is pre-bound by the platform).
     let factory = Factory::new(plat);
     let rx_socket = subscription().map(|s| factory.socket(s.local_rx_port));
-    let period = Duration::from_secs(node_sd_ttl_secs());
 
     let run = run_someip(
         recv,
@@ -647,27 +722,57 @@ async fn someip_task() {
 }
 
 /// Bind PCBs via the platform (registers the RX path → `on_rx`): the SD
-/// port, each unique offered unicast port, and each subscription RX port.
-fn bind_ports(bind: BindFn) {
-    bind(
-        SD_PORT.load(Ordering::Acquire),
-        true,
-        SD_MCAST.load(Ordering::Acquire),
-    );
-    let mut bound: [u16; MAX_OFFERS + 1] = [0; MAX_OFFERS + 1];
-    let mut nb = 0usize;
-    let mut bind_once = |port: u16| {
-        if port != 0 && !bound[..nb].contains(&port) {
-            bind(port, false, 0);
-            bound[nb] = port;
-            nb += 1;
+/// port, each unique offered unicast port, and each subscription RX port,
+/// skipping the ports an earlier, failed `init` bound. Stops at the first
+/// port `bind` fails for.
+fn bind_ports(bind: BindFn) -> Result<(), InitError> {
+    let sd_port = SD_PORT.load(Ordering::Acquire);
+    let ports = core::iter::once(sd_port)
+        .chain(offers().iter().map(|o| o.unicast_port))
+        .chain(subscription().map(|s| s.local_rx_port));
+    for port in ports {
+        if port == 0 || BOUND_PORTS.contains(port) {
+            continue;
         }
-    };
-    for o in offers() {
-        bind_once(o.unicast_port);
+        let (is_sd, mcast) = if port == sd_port {
+            (true, SD_MCAST.load(Ordering::Acquire))
+        } else {
+            (false, 0)
+        };
+        if bind(port, is_sd, mcast) != 0 {
+            return Err(InitError::Bind);
+        }
+        BOUND_PORTS.insert(port);
     }
-    if let Some(s) = subscription() {
-        bind_once(s.local_rx_port);
+    Ok(())
+}
+
+/// The ports [`bind_ports`] has bound, which stay bound for the life of the
+/// program: the SD port plus at most one per offer and one for the
+/// subscription per `init` attempt.
+static BOUND_PORTS: BoundPorts = BoundPorts::new();
+
+struct BoundPorts {
+    ports: [AtomicU16; MAX_OFFERS + 2],
+}
+
+impl BoundPorts {
+    const fn new() -> Self {
+        Self {
+            ports: [const { AtomicU16::new(0) }; MAX_OFFERS + 2],
+        }
+    }
+
+    fn contains(&self, port: u16) -> bool {
+        self.ports.iter().any(|p| p.load(Ordering::Acquire) == port)
+    }
+
+    /// Records `port` in the first free entry; a full table records nothing,
+    /// so a later `init` binds that port again.
+    fn insert(&self, port: u16) {
+        if let Some(free) = self.ports.iter().find(|p| p.load(Ordering::Acquire) == 0) {
+            free.store(port, Ordering::Release);
+        }
     }
 }
 
@@ -704,6 +809,14 @@ pub enum InitError {
     /// [`RuntimeConfig::offers`] holds more entries than the runtime holds.
     #[error("more offers than SIMPLE_SOMEIP_MAX_OFFERS (4 by default)")]
     TooManyOffers = -8,
+    /// [`RuntimeConfig::bind`] returned a nonzero value for a port. The ports
+    /// it bound before that one stay bound.
+    #[error("the platform could not bind a port")]
+    Bind = -9,
+    /// [`OfferTiming::cyclic_delay`] is under a millisecond, or longer than
+    /// the TTL of an entry of [`RuntimeConfig::offers`].
+    #[error("the cyclic Offer delay is under 1 ms or longer than an Offer's TTL")]
+    CyclicOfferDelayOutOfRange = -10,
 }
 
 impl InitError {
@@ -723,27 +836,26 @@ impl InitError {
 ///
 /// Returns the [`InitError`] that stopped it. Every error but
 /// [`InitError::AlreadyInitialized`] leaves the runtime uninitialized, so a
-/// corrected retry can proceed.
+/// corrected retry can proceed. The ports [`RuntimeConfig::bind`] bound before
+/// the error stay bound, and the retry does not bind them again.
 // By-value is required, not incidental: `config.buffers` is a `&'static mut`
 // reborrowed into `BUFS` (`ptr::from_mut`), which a shared `&RuntimeConfig`
 // could not yield. This is also the FFI ownership-transfer boundary — the
 // platform hands the runtime its config and buffer memory.
 #[allow(clippy::needless_pass_by_value)]
 pub fn init(config: RuntimeConfig) -> Result<(), InitError> {
-    // Atomically claim init: only the first caller proceeds. Closes the
-    // window the old `load`-then-store-at-end guard left open (a re-entrant
-    // `init` via a `bind`/`send` callback, or a repeat call) during which a
-    // second caller would re-alias `BUFS` and silently leak its buffers.
-    if INIT_CLAIMED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    if !Lifecycle::advance(Lifecycle::Idle, Lifecycle::Initializing) {
         return Err(InitError::AlreadyInitialized);
     }
     let result = init_claimed(config);
-    if result.is_err() {
-        INIT_CLAIMED.store(false, Ordering::Release);
-    }
+    Lifecycle::advance(
+        Lifecycle::Initializing,
+        if result.is_ok() {
+            Lifecycle::Running
+        } else {
+            Lifecycle::Idle
+        },
+    );
     result
 }
 
@@ -753,6 +865,7 @@ fn init_claimed(config: RuntimeConfig) -> Result<(), InitError> {
     if config.offers.len() > MAX_OFFERS {
         return Err(InitError::TooManyOffers);
     }
+    let cyclic_delay = config.offer_timing.checked_cyclic_delay(config.offers)?;
     let catalog = Catalog::parse(&config)?;
     if config.sd_mcast != 0 && !Ipv4Addr::from(config.sd_mcast.to_be_bytes()).is_multicast() {
         return Err(InitError::SdGroupNotMulticast);
@@ -785,7 +898,8 @@ fn init_claimed(config: RuntimeConfig) -> Result<(), InitError> {
     }
 
     // Copy catalog into static tables.
-    // SAFETY: single-init guarded by INIT_CLAIMED; no task reads OFFERS yet.
+    // SAFETY: only the one `init` in `Initializing` gets here; no task reads
+    // OFFERS yet.
     let slots = unsafe { &mut *core::ptr::addr_of_mut!(OFFERS) };
     for (slot, entry) in slots.iter_mut().zip(config.offers) {
         *slot = *entry;
@@ -796,35 +910,32 @@ fn init_claimed(config: RuntimeConfig) -> Result<(), InitError> {
     }
     SUBSCRIBED.store(config.subscription.is_some(), Ordering::Release);
 
-    bind_ports(config.bind);
+    bind_ports(config.bind)?;
 
     let on_service = config.on_service.map(|f| (f, config.dispatch_ctx));
     if !build_server(config.find_timing, catalog, on_service) {
         return Err(InitError::ServerBuild);
     }
 
-    // SAFETY: single-init guarded by INIT_CLAIMED (claimed above).
+    // SAFETY: only the one `init` in `Initializing` gets here.
     let spawner = unsafe {
         let slot = &mut *core::ptr::addr_of_mut!(EXECUTOR);
         slot.write(Executor::new(core::ptr::null_mut()));
         slot.assume_init_ref().spawner()
     };
-    if spawner.spawn(someip_task()).is_err() {
+    if spawner.spawn(someip_task(cyclic_delay)).is_err() {
         return Err(InitError::Spawn);
     }
-    // Publish the poll gate LAST: `poll()` must never touch `EXECUTOR`
-    // before the slot above is written and the task is spawned.
-    EXECUTOR_INIT.store(true, Ordering::Release);
-    RUN_READY.store(true, Ordering::Release);
     Ok(())
 }
 
 /// Tick the executor once. Call every platform main-loop iteration.
 ///
 /// A call made while another `poll` is running, such as from a
-/// [`DispatchFn`] or [`ServiceFn`] callback, returns without polling.
+/// [`DispatchFn`] or [`ServiceFn`] callback, or after [`deinit`], returns
+/// without polling.
 pub fn poll() {
-    if !EXECUTOR_INIT.load(Ordering::Acquire) {
+    if Lifecycle::now() != Lifecycle::Running {
         return;
     }
     if POLLING
@@ -850,11 +961,13 @@ fn next_publish_session() -> u16 {
 
 /// Publish a notification to all current subscribers, protected through
 /// [`RuntimeConfig::e2e`]. Returns subscriber count, or negative on error
-/// (`-1` not ready, `-2` payload too large once framed, or once protected
-/// while someone subscribes, `-3` tuple not offered).
+/// (`-1` before [`init`], after [`deinit`], or for a null `payload` with a
+/// nonzero `len`, `-2` payload too large once framed, or once protected while
+/// someone subscribes, `-3` tuple not offered).
 ///
 /// # Safety
 /// `payload` must be valid for `len` bytes (or `len == 0`).
+#[must_use]
 pub unsafe fn publish(
     service_id: u16,
     instance_id: u16,
@@ -863,7 +976,7 @@ pub unsafe fn publish(
     payload: *const u8,
     len: usize,
 ) -> i32 {
-    if !RUN_READY.load(Ordering::Acquire) {
+    if Lifecycle::now() != Lifecycle::Running {
         return -1;
     }
     let Some(offer) = find_offer(service_id, instance_id, event_group_id) else {
@@ -916,9 +1029,12 @@ pub unsafe fn publish(
 }
 
 /// Best-effort `StopOfferService` (one combined datagram) so peers drop us
-/// immediately. Idempotent.
+/// immediately, then stop: later [`poll`], [`publish`] and [`on_rx`] calls do
+/// nothing, and [`init`] returns [`InitError::AlreadyInitialized`].
+/// Idempotent.
 pub fn deinit() {
-    if !RUN_READY.swap(false, Ordering::AcqRel) {
+    if !Lifecycle::advance(Lifecycle::Running, Lifecycle::Stopped) {
+        Lifecycle::advance(Lifecycle::Initializing, Lifecycle::Stopped);
         return;
     }
     let mut reqs = [DEFAULT_OFFER_REQUEST; MAX_OFFERS];
@@ -926,13 +1042,13 @@ pub fn deinit() {
     if n == 0 {
         return;
     }
-    let plat = platform();
     // SAFETY: `publish_scratch` is the API-reserved buffer (see `publish`),
     // never borrowed by `someip_task`; `deinit` is terminal and serial with
     // `publish`. RX_CAP >= SD_SCRATCH_CAP, so it holds the StopOffer datagram.
     // Reborrowed through `addr_of_mut!` to retag only this field's bytes.
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!((*BUFS).publish_scratch) };
-    // SAFETY: `RUN_READY` is set only after `init` wrote SERVER.
+    // SAFETY: the runtime was `Running`, which `init` enters only after it
+    // wrote SERVER.
     let sd = unsafe { (*core::ptr::addr_of!(SERVER)).assume_init_ref() }.sd();
     if let Ok(total) = build_multi_stop_offer_service_datagram::<MAX_OFFERS>(
         scratch,
@@ -940,7 +1056,7 @@ pub fn deinit() {
         sd.next_session(),
     ) {
         let group = sd.multicast();
-        (plat.send)(
+        platform_send()(
             group.port(),
             scratch.as_ptr(),
             total,
@@ -951,15 +1067,17 @@ pub fn deinit() {
 }
 
 /// Push one received datagram into the RX mailbox. The platform's receive
-/// path calls this for every inbound UDP datagram.
+/// path calls this for every inbound UDP datagram. It discards the datagram
+/// unless [`init`] has succeeded and [`deinit`] has not run.
 ///
 /// # Safety
 /// `buf` must be valid for `len` bytes.
 pub unsafe fn on_rx(local_port: u16, src_addr: u32, src_port: u16, buf: *const u8, len: usize) {
-    if buf.is_null() || len == 0 {
+    if buf.is_null() || len == 0 || Lifecycle::now() != Lifecycle::Running {
         return;
     }
-    // SAFETY: set in init before the platform starts delivering RX.
+    // SAFETY: `init` writes MAILBOX only while `Initializing`, never once
+    // the runtime is `Running`.
     if let Some(mailbox) = unsafe { *core::ptr::addr_of!(MAILBOX) } {
         unsafe {
             let _ = mailbox.push(local_port, src_addr, src_port, buf, len);
