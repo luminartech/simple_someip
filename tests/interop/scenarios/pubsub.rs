@@ -509,7 +509,8 @@ scenario!(
     /// PRS_SOMEIPSD_00120, 00464 / feat_req_someipsd_691 — a new subscription gets the field's initial value right after the Ack.
     p2_field_initial_value_after_ack,
     std = ignore("a new subscription to a field must get its initial value after the Ack (#180)"),
-    bare_metal = ignore("a new subscription to a field must get its initial value after the Ack (#180)"),
+    bare_metal =
+        ignore("a new subscription to a field must get its initial value after the Ack (#180)"),
     {
         let mut peer = VsomeipPeer::start();
         let _rt = Rt::start(server());
@@ -525,8 +526,10 @@ scenario!(
 scenario!(
     /// feat_req_someipsd_1188, 109 — a Subscribe with Initial Data Requested set gets the field's initial value.
     p3_initial_value_on_initial_data_requested,
-    std = ignore("a Subscribe with Initial Data Requested must get the field's initial value (#180)"),
-    bare_metal = ignore("a Subscribe with Initial Data Requested must get the field's initial value (#180)"),
+    std =
+        ignore("a Subscribe with Initial Data Requested must get the field's initial value (#180)"),
+    bare_metal =
+        ignore("a Subscribe with Initial Data Requested must get the field's initial value (#180)"),
     {
         let mut client = FrameClient::start(REBOOT | UNICAST | EXPLICIT_INITIAL_DATA_CONTROL);
         let _rt = Rt::start(server());
@@ -539,8 +542,12 @@ scenario!(
 scenario!(
     /// PRS_SOMEIPSD_00122 / feat_req_someipsd_833 — a StopSubscribe and a Subscribe in one message trigger the field's initial value again.
     p4_initial_value_on_stop_subscribe_then_subscribe,
-    std = ignore("a StopSubscribe and a Subscribe must trigger the field's initial value again (#180)"),
-    bare_metal = ignore("a StopSubscribe and a Subscribe must trigger the field's initial value again (#180)"),
+    std = ignore(
+        "a StopSubscribe and a Subscribe must trigger the field's initial value again (#180)"
+    ),
+    bare_metal = ignore(
+        "a StopSubscribe and a Subscribe must trigger the field's initial value again (#180)"
+    ),
     {
         let mut client = FrameClient::start(REBOOT | UNICAST);
         let _rt = Rt::start(server());
@@ -550,7 +557,10 @@ scenario!(
         let first = client.notifications(FIELD, QUIET).len();
         client.subscribe(
             "StopSubscribe and Subscribe",
-            &[subscribe_entry(0, false), subscribe_entry(SUBSCRIBE_TTL, false)],
+            &[
+                subscribe_entry(0, false),
+                subscribe_entry(SUBSCRIBE_TTL, false),
+            ],
         );
         client.expect_initial_value(&format!(
             "the second Ack ({first} notifications for the first subscription)"
@@ -671,11 +681,17 @@ scenario!(
 scenario!(
     /// feat_req_someipsd_1191, 1188 — our first Subscribe to a server that sets Explicit Initial Data Control requests initial data.
     p7_client_requests_initial_values,
-    std = ignore("the first Subscribe to a server with Explicit Initial Data Control must request initial data (#181)"),
-    bare_metal = ignore("the first Subscribe to a server with Explicit Initial Data Control must request initial data (#181)"),
+    std = ignore(
+        "the first Subscribe to a server with Explicit Initial Data Control must request initial data (#181)"
+    ),
+    bare_metal = ignore(
+        "the first Subscribe to a server with Explicit Initial Data Control must request initial data (#181)"
+    ),
     {
-        let mut server =
-            FrameServer::start(REBOOT | UNICAST | EXPLICIT_INITIAL_DATA_CONTROL, Answer::Ack);
+        let mut server = FrameServer::start(
+            REBOOT | UNICAST | EXPLICIT_INITIAL_DATA_CONTROL,
+            Answer::Ack,
+        );
         let _rt = Rt::start(client());
         let first = server.first_subscribe();
         assert!(

@@ -28,14 +28,14 @@ scenario!(
     /// PRS_SOMEIPSD_00842 (OfferService) / feat_req_someipsd_208 — the peer's offer is discovered.
     d1_peer_offer_is_discovered,
     std = run,
-    bare_metal = ignore("the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"),
+    bare_metal = ignore(
+        "the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"
+    ),
     {
         let mut peer = VsomeipPeer::start();
         let mut rt = Rt::start(Setup {
             offer: None,
-            consume: Some(Consume {
-                subscribe: false,
-            }),
+            consume: Some(Consume { subscribe: false }),
         });
         peer.send("offer 1234 0001 1 0001 8001 8002 0001");
         rt.expect("ServiceAvailable", SD_WAIT, |o| {
@@ -169,7 +169,9 @@ scenario!(
     /// PRS_SOMEIPSD_00842, 00364 / feat_req_someipsd_208 — a StopOffer (type 0x01, TTL 0) from vsomeip removes the service.
     d3_stop_offer_removes_service_vsomeip,
     std = run,
-    bare_metal = ignore("the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"),
+    bare_metal = ignore(
+        "the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"
+    ),
     {
         let mut peer = VsomeipPeer::start();
         let mut rt = Rt::start(consume_only());
@@ -186,15 +188,29 @@ scenario!(
     /// PRS_SOMEIPSD_00842, 00364 / feat_req_someipsd_208 — a StopOffer (type 0x01, TTL 0) from a hand-built frame removes the service.
     d3_stop_offer_removes_service_frame,
     std = run,
-    bare_metal = ignore("the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"),
+    bare_metal = ignore(
+        "the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"
+    ),
     {
         let fp = FramePeer::start();
         let mut rt = Rt::start(consume_only());
         let offer = svc_offer(0, 1, 3);
-        fp.send_sd_multicast(&build::sd_message(1, true, true, &[offer], &[peer_endpoint()]));
+        fp.send_sd_multicast(&build::sd_message(
+            1,
+            true,
+            true,
+            &[offer],
+            &[peer_endpoint()],
+        ));
         rt.expect("ServiceAvailable", SD_WAIT, is_svc_available);
         let stop = svc_offer(0, 1, 0);
-        fp.send_sd_multicast(&build::sd_message(2, true, true, &[stop], &[peer_endpoint()]));
+        fp.send_sd_multicast(&build::sd_message(
+            2,
+            true,
+            true,
+            &[stop],
+            &[peer_endpoint()],
+        ));
         rt.expect("ServiceGone", SD_REPLY, is_svc_gone);
     }
 );
@@ -203,12 +219,20 @@ scenario!(
     /// PRS_SOMEIPSD_00842 / feat_req_someipsd_208 — a StopOffer that references no endpoint option removes the service.
     d3_stop_offer_without_endpoint_removes_service_frame,
     std = run,
-    bare_metal = ignore("the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"),
+    bare_metal = ignore(
+        "the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"
+    ),
     {
         let fp = FramePeer::start();
         let mut rt = Rt::start(consume_only());
         let offer = svc_offer(0, 1, 3);
-        fp.send_sd_multicast(&build::sd_message(1, true, true, &[offer], &[peer_endpoint()]));
+        fp.send_sd_multicast(&build::sd_message(
+            1,
+            true,
+            true,
+            &[offer],
+            &[peer_endpoint()],
+        ));
         rt.expect("ServiceAvailable", SD_WAIT, is_svc_available);
         let stop = svc_offer(0, 0, 0);
         fp.send_sd_multicast(&build::sd_message(2, true, true, &[stop], &[]));
@@ -312,7 +336,9 @@ scenario!(
     /// PRS_SOMEIPSD_00268 (index of the first options run) — each Offer in one message uses the endpoint it references.
     d5_each_offer_uses_its_own_endpoint,
     std = run,
-    bare_metal = ignore("the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"),
+    bare_metal = ignore(
+        "the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"
+    ),
     {
         let fp = FramePeer::start();
         let mut rt = Rt::start(consume_only());
@@ -366,7 +392,9 @@ scenario!(
     /// PRS_SOMEIPSD_00231 / feat_req_someipsd_1142 — an Offer still applies when it also references a discardable option of unknown type.
     d6_unknown_option_is_skipped_client,
     std = run,
-    bare_metal = ignore("the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"),
+    bare_metal = ignore(
+        "the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"
+    ),
     {
         let fp = FramePeer::start();
         let mut rt = Rt::start(consume_only());
@@ -395,8 +423,13 @@ scenario!(
         let _rt = Rt::start(offer_only());
         first_offer(&fp);
         let unknown = build::discardable_option(UNKNOWN_OPTION, &[0; 4]);
-        let ttl = subscribe_and_wait_for_ack(&fp, &[eg_subscribe(0, 2)], &[unknown, peer_endpoint()]);
-        assert!(ttl > 0, "{}: the Subscribe was answered with a Nack", Rt::NAME);
+        let ttl =
+            subscribe_and_wait_for_ack(&fp, &[eg_subscribe(0, 2)], &[unknown, peer_endpoint()]);
+        assert!(
+            ttl > 0,
+            "{}: the Subscribe was answered with a Nack",
+            Rt::NAME
+        );
     }
 );
 
@@ -404,7 +437,9 @@ scenario!(
     /// PRS_SOMEIPSD_00841 — an Offer still applies when it follows an entry of unknown type.
     d7_unknown_entry_type_is_skipped_client,
     std = run,
-    bare_metal = ignore("the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"),
+    bare_metal = ignore(
+        "the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"
+    ),
     {
         let fp = FramePeer::start();
         let mut rt = Rt::start(consume_only());
@@ -430,8 +465,13 @@ scenario!(
         let _rt = Rt::start(offer_only());
         first_offer(&fp);
         let unknown = build::service_entry(UNKNOWN_ENTRY, 0, 0, 0, 0, SVC, INST, MAJOR, 3, 0);
-        let ttl = subscribe_and_wait_for_ack(&fp, &[unknown, eg_subscribe(0, 1)], &[peer_endpoint()]);
-        assert!(ttl > 0, "{}: the Subscribe was answered with a Nack", Rt::NAME);
+        let ttl =
+            subscribe_and_wait_for_ack(&fp, &[unknown, eg_subscribe(0, 1)], &[peer_endpoint()]);
+        assert!(
+            ttl > 0,
+            "{}: the Subscribe was answered with a Nack",
+            Rt::NAME
+        );
     }
 );
 
@@ -439,20 +479,44 @@ scenario!(
     /// PRS_SOMEIPSD_00449, 00258 — a detected peer reboot is handled as a StopOffer, then the new Offer applies.
     d8_peer_reboot_is_a_stop_offer,
     std = ignore("a detected server reboot must be handled as a StopOffer (#170)"),
-    bare_metal = ignore("the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"),
+    bare_metal = ignore(
+        "the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"
+    ),
     {
         let fp = FramePeer::start();
         let mut rt = Rt::start(consume_only());
         let offer = || [svc_offer(0, 1, 3)];
-        fp.send_sd_multicast(&build::sd_message(5, true, true, &offer(), &[peer_endpoint()]));
+        fp.send_sd_multicast(&build::sd_message(
+            5,
+            true,
+            true,
+            &offer(),
+            &[peer_endpoint()],
+        ));
         rt.expect("ServiceAvailable", SD_WAIT, is_svc_available);
         // Control: the session ID moving on is not a reboot.
-        fp.send_sd_multicast(&build::sd_message(6, true, true, &offer(), &[peer_endpoint()]));
+        fp.send_sd_multicast(&build::sd_message(
+            6,
+            true,
+            true,
+            &offer(),
+            &[peer_endpoint()],
+        ));
         rt.expect_none("ServiceGone without a reboot", QUIET, is_svc_gone);
         // Reboot flag set both times and the session ID going back: a reboot.
-        fp.send_sd_multicast(&build::sd_message(1, true, true, &offer(), &[peer_endpoint()]));
+        fp.send_sd_multicast(&build::sd_message(
+            1,
+            true,
+            true,
+            &offer(),
+            &[peer_endpoint()],
+        ));
         rt.expect("ServiceGone after the reboot", SD_REPLY, is_svc_gone);
-        rt.expect("ServiceAvailable after the reboot", SD_REPLY, is_svc_available);
+        rt.expect(
+            "ServiceAvailable after the reboot",
+            SD_REPLY,
+            is_svc_available,
+        );
     }
 );
 
@@ -497,11 +561,19 @@ scenario!(
     /// PRS_SOMEIPSD_00356 (Offer TTL) — an Offer that is not renewed expires after its TTL.
     d10_offer_ttl_expiry_removes_service,
     std = ignore("a service must be removed when its Offer's TTL expires (#169)"),
-    bare_metal = ignore("the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"),
+    bare_metal = ignore(
+        "the bare-metal runtime does not report discovered services and cannot start without offering one (#192, #193)"
+    ),
     {
         let fp = FramePeer::start();
         let mut rt = Rt::start(consume_only());
-        fp.send_sd_multicast(&build::sd_message(1, true, true, &[svc_offer(0, 1, 3)], &[peer_endpoint()]));
+        fp.send_sd_multicast(&build::sd_message(
+            1,
+            true,
+            true,
+            &[svc_offer(0, 1, 3)],
+            &[peer_endpoint()],
+        ));
         let sent = Instant::now();
         rt.expect("ServiceAvailable", SD_WAIT, is_svc_available);
         // Not before the TTL is nearly up...
@@ -552,7 +624,9 @@ fn finds_svc(d: &[u8]) -> bool {
 scenario!(
     /// feat_req_someipsd_62, 64, 67, 73, 76, 866 — we find a wanted service after a random initial delay, repeat with doubling delays, then stop; feat_req_someipsd_631 — the Offer that answers a Find is answered with a Subscribe.
     d12_client_finds_until_offered,
-    std = ignore("the std Client sends FindService only through the caller's periodic announcements (#209)"),
+    std = ignore(
+        "the std Client sends FindService only through the caller's periodic announcements (#209)"
+    ),
     bare_metal = run,
     {
         let fp = FramePeer::start();

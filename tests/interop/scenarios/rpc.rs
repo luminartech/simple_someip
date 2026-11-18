@@ -412,7 +412,8 @@ scenario!(
     /// stack answers with E_UNKNOWN_METHOD, in a RESPONSE or an ERROR message.
     r3_unknown_method_gets_error,
     std = ignore("a call of an unknown method must get E_UNKNOWN_METHOD, not a success (#182)"),
-    bare_metal = ignore("a call of an unknown method must get E_UNKNOWN_METHOD, not a success (#182)"),
+    bare_metal =
+        ignore("a call of an unknown method must get E_UNKNOWN_METHOD, not a success (#182)"),
     {
         let mut peer = VsomeipPeer::start();
         let _rt = Rt::start(server());
@@ -420,8 +421,9 @@ scenario!(
         // Control: a call of the method we have succeeds, so the server is up,
         // and it does not answer every method with an error.
         peer.send("call 1234 0001 0001 03");
-        let control =
-            peer.next_where("RESPONSE", CALL_WAIT, |l| l.hex("method") == u32::from(METHOD));
+        let control = peer.next_where("RESPONSE", CALL_WAIT, |l| {
+            l.hex("method") == u32::from(METHOD)
+        });
         let succeeded = control
             .as_ref()
             .is_some_and(|l| field(l, "type") == "response" && l.hex("return_code") == 0);
