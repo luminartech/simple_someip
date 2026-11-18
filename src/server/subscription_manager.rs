@@ -277,8 +277,7 @@ impl SubscriptionManager {
         let key = (service_id, instance_id, event_group_id);
         self.subscriptions
             .get(&key)
-            .map(|list| list.iter().cloned().collect())
-            .unwrap_or_default()
+            .map_or_else(alloc::vec::Vec::new, |list| list.iter().cloned().collect())
     }
 
     /// Get total number of active subscriptions

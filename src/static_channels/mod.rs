@@ -175,9 +175,9 @@ impl<T: Send + 'static, const POOL_SIZE: usize> OneshotPool<T, POOL_SIZE> {
                 return;
             }
             // Link slots[0] -> slots[1] -> ... -> slots[N-1] -> 0.
-            for i in 0..POOL_SIZE {
+            for (i, slot) in self.slots.iter().enumerate() {
                 let next = if i + 1 < POOL_SIZE { i + 2 } else { 0 };
-                self.slots[i].next_free.store(next, Ordering::Release);
+                slot.next_free.store(next, Ordering::Release);
             }
             h.set(1);
             self.seeded.store(true, Ordering::Release);
@@ -464,9 +464,9 @@ impl<T: Send + 'static, const POOL_SIZE: usize, const SLOT_CAP: usize>
             if self.seeded.load(Ordering::Acquire) {
                 return;
             }
-            for i in 0..POOL_SIZE {
+            for (i, slot) in self.slots.iter().enumerate() {
                 let next = if i + 1 < POOL_SIZE { i + 2 } else { 0 };
-                self.slots[i].next_free.store(next, Ordering::Release);
+                slot.next_free.store(next, Ordering::Release);
             }
             h.set(1);
             self.seeded.store(true, Ordering::Release);
