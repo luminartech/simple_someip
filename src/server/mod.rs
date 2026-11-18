@@ -62,33 +62,33 @@ fn build_error(e: crate::sd_codec::BuildError) -> Error {
 // injects exact values via the env vars), generous on std/host so plain std
 // consumers that never inject the env vars keep the historical capacities.
 #[cfg(feature = "bare_metal")]
-const _DEFAULT_EVENT_GROUP_IDS: usize = 1;
+const DEFAULT_EVENT_GROUP_IDS: usize = 1;
 #[cfg(not(feature = "bare_metal"))]
-const _DEFAULT_EVENT_GROUP_IDS: usize = 32;
+const DEFAULT_EVENT_GROUP_IDS: usize = 32;
 #[cfg(feature = "bare_metal")]
-const _DEFAULT_ACCEPTED_OFFERS: usize = 4;
+const DEFAULT_ACCEPTED_OFFERS: usize = 4;
 #[cfg(not(feature = "bare_metal"))]
-const _DEFAULT_ACCEPTED_OFFERS: usize = 16;
+const DEFAULT_ACCEPTED_OFFERS: usize = 16;
 
 #[cfg(feature = "bare_metal")]
-const _DEFAULT_CONSUMED_EVENTGROUPS: usize = 1;
+const DEFAULT_CONSUMED_EVENTGROUPS: usize = 1;
 #[cfg(not(feature = "bare_metal"))]
-const _DEFAULT_CONSUMED_EVENTGROUPS: usize = 16;
+const DEFAULT_CONSUMED_EVENTGROUPS: usize = 16;
 
-const _SERVER_EVENT_GROUP_IDS_CAP: usize = crate::from_env_or(
+const SERVER_EVENT_GROUP_IDS_CAP: usize = crate::from_env_or(
     option_env!("SIMPLE_SOMEIP_MAX_SUBS"),
-    _DEFAULT_EVENT_GROUP_IDS,
+    DEFAULT_EVENT_GROUP_IDS,
 );
-const _SERVER_ACCEPTED_OFFERS_CAP: usize = crate::from_env_or(
+const SERVER_ACCEPTED_OFFERS_CAP: usize = crate::from_env_or(
     option_env!("SIMPLE_SOMEIP_MAX_OFFERS"),
-    _DEFAULT_ACCEPTED_OFFERS,
+    DEFAULT_ACCEPTED_OFFERS,
 );
-const _SERVER_CONSUMED_EVENTGROUPS_CAP: usize = crate::from_env_or(
+const SERVER_CONSUMED_EVENTGROUPS_CAP: usize = crate::from_env_or(
     option_env!("SIMPLE_SOMEIP_MAX_CONSUMED_EVENTGROUPS"),
-    _DEFAULT_CONSUMED_EVENTGROUPS,
+    DEFAULT_CONSUMED_EVENTGROUPS,
 );
 const _: () = assert!(
-    crate::sd_codec::multi_subscribe_datagram_len(_SERVER_CONSUMED_EVENTGROUPS_CAP)
+    crate::sd_codec::multi_subscribe_datagram_len(SERVER_CONSUMED_EVENTGROUPS_CAP)
         <= crate::UDP_BUFFER_SIZE,
     "SIMPLE_SOMEIP_MAX_CONSUMED_EVENTGROUPS is too large: the Subscribes for that many eventgroups do not fit one UDP datagram"
 );
@@ -211,20 +211,20 @@ impl ServerConfig {
     /// Maximum number of event-group IDs trackable in
     /// [`Self::event_group_ids`]. Matches `EVENT_GROUPS_CAP` in the
     /// subscription manager.
-    pub const EVENT_GROUP_IDS_CAP: usize = _SERVER_EVENT_GROUP_IDS_CAP;
+    pub const EVENT_GROUP_IDS_CAP: usize = SERVER_EVENT_GROUP_IDS_CAP;
 
     /// Maximum number of co-offered `(service, instance, event_group)`
     /// tuples a single receive loop can accept subscriptions for via
     /// [`Self::accepted_offers`]. Covers any realistic shared-socket
     /// provider catalog.
-    pub const ACCEPTED_OFFERS_CAP: usize = _SERVER_ACCEPTED_OFFERS_CAP;
+    pub const ACCEPTED_OFFERS_CAP: usize = SERVER_ACCEPTED_OFFERS_CAP;
 
     /// Maximum number of entries in [`Self::consumed_eventgroups`], set by
     /// `SIMPLE_SOMEIP_MAX_CONSUMED_EVENTGROUPS` (defaults to 1 with the
     /// `bare_metal` feature, 16 otherwise). The build fails if the Subscribes for that many
     /// eventgroups do not fit one [`UDP_BUFFER_SIZE`](crate::UDP_BUFFER_SIZE)
     /// datagram.
-    pub const CONSUMED_EVENTGROUPS_CAP: usize = _SERVER_CONSUMED_EVENTGROUPS_CAP;
+    pub const CONSUMED_EVENTGROUPS_CAP: usize = SERVER_CONSUMED_EVENTGROUPS_CAP;
 
     /// Length of the `find_send_buf` of [`Server::run_with_buffers`]: a
     /// `FindService` for [`Self::CONSUMED_EVENTGROUPS_CAP`] service instances.

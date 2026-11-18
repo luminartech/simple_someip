@@ -110,7 +110,11 @@ scenario!(
         let o = &d[44..56];
         f.check("option length", u16_at(o, 0), 9);
         f.check("option type", o[2], IPV4_ENDPOINT);
-        f.check("endpoint address", [o[4], o[5], o[6], o[7]], OUR_IP.octets());
+        f.check(
+            "endpoint address",
+            [o[4], o[5], o[6], o[7]],
+            OUR_IP.octets(),
+        );
         f.check("endpoint L4 protocol", o[9], UDP);
         f.check("endpoint port", u16_at(o, 10), SERVER_PORT);
 
