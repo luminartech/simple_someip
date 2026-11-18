@@ -2,6 +2,50 @@
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/luminartech/simple_someip/compare/v0.14.0...v0.15.0) - 2026-11-18
+
+### Added
+
+- *(bare-metal)* count the datagrams a full RX mailbox drops
+- *(bare-metal)* [**breaking**] send cyclic Offers on an OfferTiming delay, 1 s by default
+- *(bare-metal)* implement Display and Error for InitError
+- *(server)* [**breaking**] track the found instances in the server and find them again when gone
+- *(bare-metal)* [**breaking**] report required services and run without offering
+- track required service availability with Offer expiry
+- *(server)* report each Offer and StopOffer to an observer
+- *(server)* [**breaking**] send FindService for required services
+- *(server)* [**breaking**] run a server that offers no service
+- *(e2e)* let a hook report a payload of a length it does not protect
+
+### Changed
+
+- *(server)* [**breaking**] make Offering non-exhaustive
+- *(server)* join the run future's announce and find as optional futures
+- *(bare-metal)* [**breaking**] parse the C catalog once in init
+- *(bare-metal)* join run_someip's announce and RX as optional futures
+- *(bare-metal)* [**breaking**] report init failures as an InitError
+- *(server)* [**breaking**] hold the offered service in one Option<Offering>
+- [**breaking**] name a service instance with one ServiceInstance type
+- *(bare-metal)* [**breaking**] name a required service with one type
+- share the UDP-over-TCP Offer endpoint choice
+
+### Documentation
+
+- state the bare-metal discovery contracts as they stand
+
+### Fixed
+
+- *(bare-metal)* stop polling after deinit so Offers do not resume
+- *(bare-metal)* return InitError::Bind when the platform cannot bind a port
+- *(server)* end a subscription on a StopSubscribe instead of acknowledging it
+- *(server)* [**breaking**] check only an offering's port against a handed-in socket
+- *(server)* start the find schedule over when an instance is lost mid-schedule
+- *(server)* answer only the Offer of the sender that holds an instance
+- *(server)* seed the find delay with the required services too
+- *(bare-metal)* [**breaking**] reject more offers than the runtime holds
+- *(bare-metal)* make a reentrant poll return without polling the executor
+- *(lint)* clear the clippy pedantic findings new in Rust 1.100
+
 ## [0.13.1](https://github.com/luminartech/simple_someip/compare/v0.13.0...v0.13.1) - 2026-09-29
 
 ### Documentation
