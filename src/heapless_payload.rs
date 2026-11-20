@@ -16,7 +16,8 @@
 //!   than 2–3 entries in practice; 8 covers vsomeip-class
 //!   peers that fold multiple OfferService / SubscribeAck into one
 //!   datagram.
-//! - `OPT_CAP` = 8: typically 1–2 IpV4Endpoint options per entry.
+//! - `OPT_CAP` = 8: typically 1–2 IpV4Endpoint options per entry. A
+//!   received option that no entry references takes no slot.
 //! - `PAYLOAD_CAP` = 2048: matches the application-level UDP cap
 //!   most firmware targets land on (`UDP_BUFFER_SIZE`).
 //!
@@ -36,7 +37,8 @@ use automotive_wire_codec::Encode;
 
 /// Max SD entries in a single payload. See module-level docs.
 pub const ENTRY_CAP: usize = 8;
-/// Max SD options in a single payload. See module-level docs.
+/// Max SD options in a single payload, counting only those its entries
+/// reference. See module-level docs.
 pub const OPT_CAP: usize = 8;
 /// Max raw (non-SD) payload byte length. See module-level docs.
 /// Halo / bare-metal tight-BSS sizing: 256 covers halo's expected
@@ -51,7 +53,8 @@ pub struct HeaplessSdHeader {
     pub flags: sd::Flags,
     /// SD entries.
     pub entries: HVec<sd::Entry, ENTRY_CAP>,
-    /// SD options.
+    /// The SD options the entries reference, in order. Each entry's option
+    /// runs index into this list.
     pub options: HVec<sd::Options, OPT_CAP>,
 }
 
@@ -159,13 +162,7 @@ impl PayloadWireFormat for HeaplessPayload {
                     .push(entry)
                     .map_err(|_| protocol::Error::Io(embedded_io::ErrorKind::OutOfMemory))?;
             }
-            let mut options: HVec<sd::Options, OPT_CAP> = HVec::new();
-            for ov in view.options() {
-                let opt = ov.to_owned()?;
-                options
-                    .push(opt)
-                    .map_err(|_| protocol::Error::Io(embedded_io::ErrorKind::OutOfMemory))?;
-            }
+            let options = keep_referenced_options(&view, &mut entries)?;
             Ok(Self {
                 message_id,
                 kind: HeaplessPayloadKind::Sd(HeaplessSdHeader {
@@ -271,6 +268,38 @@ impl PayloadWireFormat for HeaplessPayload {
     }
 }
 
+/// The options of `view` that `entries` reference, in order, with each entry's
+/// option runs moved to index into them.
+fn keep_referenced_options(
+    view: &sd::SdHeaderView<'_>,
+    entries: &mut [sd::Entry],
+) -> Result<HVec<sd::Options, OPT_CAP>, protocol::Error> {
+    fn out_of_memory<T>(_: T) -> protocol::Error {
+        protocol::Error::Io(embedded_io::ErrorKind::OutOfMemory)
+    }
+    let mut options = HVec::new();
+    let mut kept: HVec<usize, OPT_CAP> = HVec::new();
+    for (index, option) in view.options().enumerate() {
+        if entries
+            .iter()
+            .any(|entry| entry.option_runs().covers(index))
+        {
+            options.push(option.to_owned()?).map_err(out_of_memory)?;
+            kept.push(index).map_err(out_of_memory)?;
+        }
+    }
+    // `kept` ascends, so a run's new start is the number of kept options
+    // before its old one. Every option a run covers is kept, so its count holds.
+    for entry in entries {
+        entry.move_option_runs(|start| {
+            kept.iter()
+                .take_while(|&&index| index < usize::from(start))
+                .fold(0, |before, _| before + 1)
+        });
+    }
+    Ok(options)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,25 +308,166 @@ mod tests {
         sd_body_with_unknown_entry_and_option,
     };
 
-    #[test]
-    fn sd_payload_skips_unknown_entries_and_keeps_unknown_option_slots() {
-        let payload = HeaplessPayload::from_payload_bytes(
-            MessageId::SD,
-            &sd_body_with_unknown_entry_and_option(),
-        )
-        .expect("unknown types do not reject the message");
+    /// An Offer of service 0x1234 whose first run is `first` and second run
+    /// is `second`, each a start index and a count.
+    fn offer(first: (u8, u8), second: (u8, u8)) -> sd::Entry {
+        sd::Entry::OfferService(sd::ServiceEntry {
+            index_first_options_run: first.0,
+            index_second_options_run: second.0,
+            options_count: sd::OptionsCount::new(first.1, second.1),
+            service_id: 0x1234,
+            instance_id: 1,
+            major_version: 1,
+            ttl: 3,
+            minor_version: 0,
+        })
+    }
+
+    /// An IPv4 UDP endpoint option on 192.0.2.1 at `port`, encoded.
+    fn endpoint(port: u16) -> [u8; 12] {
+        let mut bytes = [0u8; 12];
+        sd::Options::IpV4Endpoint {
+            ip: core::net::Ipv4Addr::new(192, 0, 2, 1),
+            protocol: sd::TransportProtocol::Udp,
+            port,
+        }
+        .encode(&mut bytes.as_mut_slice())
+        .unwrap();
+        bytes
+    }
+
+    /// An option of type [`UNKNOWN_OPTION_TYPE`] with a 4-byte body.
+    fn unknown_option(discardable: bool) -> [u8; 8] {
+        let flags = if discardable { 0x80 } else { 0x00 };
+        [0x00, 0x05, UNKNOWN_OPTION_TYPE, flags, 1, 2, 3, 4]
+    }
+
+    /// An SD body carrying `entries`, then `options` in order.
+    fn sd_body(entries: &[sd::Entry], options: &[&[u8]]) -> HVec<u8, 512> {
+        let mut body = HVec::new();
+        body.extend_from_slice(&[0xC0, 0, 0, 0]).unwrap();
+        let entries_length = u32::try_from(entries.len() * 16).unwrap();
+        body.extend_from_slice(&entries_length.to_be_bytes())
+            .unwrap();
+        for entry in entries {
+            let mut bytes = [0u8; 16];
+            entry.encode(&mut bytes.as_mut_slice()).unwrap();
+            body.extend_from_slice(&bytes).unwrap();
+        }
+        let options_length = u32::try_from(options.iter().map(|o| o.len()).sum::<usize>()).unwrap();
+        body.extend_from_slice(&options_length.to_be_bytes())
+            .unwrap();
+        for option in options {
+            body.extend_from_slice(option).unwrap();
+        }
+        body
+    }
+
+    type EntryOptions = HVec<HVec<sd::Options, 16>, ENTRY_CAP>;
+
+    /// The options each entry of `body` references, read off the wire.
+    fn wire_entry_options(body: &[u8]) -> EntryOptions {
+        let view = sd::SdHeaderView::parse(body).unwrap();
+        view.entries_with_options()
+            .map(|(_, options)| options.map(|o| o.to_owned().unwrap()).collect())
+            .collect()
+    }
+
+    /// The options each entry of `payload` references.
+    fn entry_options(payload: &HeaplessPayload) -> EntryOptions {
         let header = payload.as_sd_header().unwrap();
-        assert_eq!(header.entries.as_slice(), [offer_after_unknown_entry()]);
-        assert_eq!(
-            header.options.as_slice(),
-            [
-                sd::Options::Unknown {
-                    option_type: UNKNOWN_OPTION_TYPE,
-                    discardable: false,
-                    length: 5
-                },
-                endpoint_after_unknown_option()
-            ]
+        header
+            .as_header()
+            .entries_with_options()
+            .map(|(_, options)| options.cloned().collect())
+            .collect()
+    }
+
+    #[test]
+    fn sd_payload_skips_unknown_entries_and_unreferenced_options() {
+        let body = sd_body_with_unknown_entry_and_option();
+        let payload = HeaplessPayload::from_payload_bytes(MessageId::SD, &body)
+            .expect("unknown types do not reject the message");
+        let header = payload.as_sd_header().unwrap();
+        assert_eq!(header.options.as_slice(), [endpoint_after_unknown_option()]);
+        let mut offer = offer_after_unknown_entry();
+        offer.move_option_runs(|_| 0);
+        assert_eq!(header.entries.as_slice(), [offer]);
+        assert_eq!(entry_options(&payload), wire_entry_options(&body));
+    }
+
+    #[test]
+    fn offer_applies_when_unreferenced_options_exceed_opt_cap() {
+        let unknown = unknown_option(true);
+        let (first, second) = (endpoint(30509), endpoint(30510));
+        let mut options: HVec<&[u8], 16> = HVec::new();
+        for _ in 0..7 {
+            options.push(&unknown).unwrap();
+        }
+        options.push(&first).unwrap();
+        options.push(&second).unwrap();
+        assert!(options.len() > OPT_CAP);
+        let body = sd_body(&[offer((7, 2), (0, 0))], &options);
+
+        let payload = HeaplessPayload::from_payload_bytes(MessageId::SD, &body)
+            .expect("only the referenced options count against OPT_CAP");
+
+        assert_eq!(payload.as_sd_header().unwrap().options.len(), 2);
+        assert_eq!(entry_options(&payload), wire_entry_options(&body));
+        let mut offered = 0;
+        payload.for_each_service_offer(|offer| {
+            assert!(matches!(offer, crate::ServiceOffer::Offer { .. }));
+            offered += 1;
+        });
+        assert_eq!(offered, 1);
+    }
+
+    #[test]
+    fn referenced_unknown_option_is_kept_in_both_runs() {
+        let (dropped, kept) = (unknown_option(true), unknown_option(false));
+        let (first, second) = (endpoint(30509), endpoint(30510));
+        let body = sd_body(
+            &[offer((1, 2), (4, 1)), offer((4, 1), (0, 0))],
+            &[&dropped, &first, &kept, &dropped, &second],
         );
+
+        let payload = HeaplessPayload::from_payload_bytes(MessageId::SD, &body).unwrap();
+
+        assert_eq!(payload.as_sd_header().unwrap().options.len(), 3);
+        let options = entry_options(&payload);
+        assert_eq!(options, wire_entry_options(&body));
+        assert!(matches!(
+            options[0][1],
+            sd::Options::Unknown {
+                discardable: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn runs_past_the_last_option_reference_the_same_options() {
+        let unknown = unknown_option(true);
+        let first = endpoint(30509);
+        let body = sd_body(&[offer((1, 3), (5, 1))], &[&unknown, &first]);
+
+        let payload = HeaplessPayload::from_payload_bytes(MessageId::SD, &body).unwrap();
+
+        assert_eq!(entry_options(&payload), wire_entry_options(&body));
+    }
+
+    #[test]
+    fn more_referenced_options_than_opt_cap_is_out_of_memory() {
+        let first = endpoint(30509);
+        let options = [&first[..]; OPT_CAP + 1];
+        let count = u8::try_from(OPT_CAP + 1).unwrap();
+        let body = sd_body(&[offer((0, count), (0, 0))], &options);
+
+        let result = HeaplessPayload::from_payload_bytes(MessageId::SD, &body);
+
+        assert!(matches!(
+            result,
+            Err(protocol::Error::Io(embedded_io::ErrorKind::OutOfMemory))
+        ));
     }
 }

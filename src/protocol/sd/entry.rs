@@ -263,6 +263,15 @@ impl OptionRuns {
         };
         ReferencedOptions(run(options.clone(), self.first).chain(run(options, self.second)))
     }
+
+    /// Whether one of these runs covers the option at `index`.
+    #[cfg(feature = "bare_metal")]
+    pub(crate) fn covers(self, index: usize) -> bool {
+        [self.first, self.second].into_iter().any(|(start, count)| {
+            let start = usize::from(start);
+            (start..start + usize::from(count)).contains(&index)
+        })
+    }
 }
 
 /// The options one SD entry references in its message: its first options run,
@@ -373,6 +382,27 @@ impl Entry {
                 event_group_entry.options_count,
             ),
         }
+    }
+
+    /// Replaces the start index of each of this entry's option runs with
+    /// `start(index)`, leaving the counts as they are.
+    #[cfg(feature = "bare_metal")]
+    pub(crate) fn move_option_runs(&mut self, start: impl Fn(u8) -> u8) {
+        let (first, second) = match self {
+            Entry::FindService(service_entry)
+            | Entry::OfferService(service_entry)
+            | Entry::StopOfferService(service_entry) => (
+                &mut service_entry.index_first_options_run,
+                &mut service_entry.index_second_options_run,
+            ),
+            Entry::SubscribeEventGroup(event_group_entry)
+            | Entry::SubscribeAckEventGroup(event_group_entry) => (
+                &mut event_group_entry.index_first_options_run,
+                &mut event_group_entry.index_second_options_run,
+            ),
+        };
+        *first = start(*first);
+        *second = start(*second);
     }
 }
 
