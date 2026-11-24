@@ -196,7 +196,8 @@ pub struct ServerSd<'a> {
 }
 
 impl ServerSd<'_> {
-    /// The session of the next SD message; see [`SdStateManager::next_session`].
+    /// The session of the next multicast SD message; see
+    /// [`SdStateManager::next_session`].
     #[must_use]
     pub fn next_session(&self) -> crate::sd_codec::SdSession {
         self.state.next_session()

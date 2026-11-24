@@ -633,10 +633,14 @@ impl SdSessionCounter {
         }
     }
 
-    /// Whether the counter has wrapped.
-    #[cfg(test)]
-    pub(crate) fn has_wrapped(&self) -> bool {
-        self.state.load(Ordering::Acquire) & WRAPPED_BIT != 0
+    /// The reboot flag of the session last given, or
+    /// [`RebootFlag::RecentlyRebooted`] before the first.
+    pub fn reboot_flag(&self) -> RebootFlag {
+        if self.state.load(Ordering::Acquire) & WRAPPED_BIT == 0 {
+            RebootFlag::RecentlyRebooted
+        } else {
+            RebootFlag::Continuous
+        }
     }
 
     const fn after(state: u32) -> u32 {
@@ -648,6 +652,82 @@ impl SdSessionCounter {
 }
 
 impl Default for SdSessionCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Numbers the SD messages one node sends: one [`SdSessionCounter`] for its
+/// multicast messages and one for its unicast messages to each peer, for up
+/// to `N` peers. The unicast messages to further peers share one more
+/// counter. Concurrent callers of [`Self::next_to`] each get a distinct
+/// session.
+#[derive(Debug)]
+pub struct SdSessions<const N: usize> {
+    multicast: SdSessionCounter,
+    /// The peer address each `unicast` counter numbers messages to, or 0
+    /// while it is free. Claimed in order and never freed.
+    peers: [AtomicU32; N],
+    unicast: [SdSessionCounter; N],
+    overflow: SdSessionCounter,
+}
+
+impl<const N: usize> SdSessions<N> {
+    /// Sessions whose every relation starts at ID 1, recently rebooted.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self::with_multicast(SdSessionCounter::new())
+    }
+
+    /// Sessions whose multicast messages are numbered by `multicast` and
+    /// whose unicast relations start at ID 1, recently rebooted.
+    #[must_use]
+    pub const fn with_multicast(multicast: SdSessionCounter) -> Self {
+        Self {
+            multicast,
+            peers: [const { AtomicU32::new(0) }; N],
+            unicast: [const { SdSessionCounter::new() }; N],
+            overflow: SdSessionCounter::new(),
+        }
+    }
+
+    /// The counter of the multicast SD messages.
+    #[must_use]
+    pub const fn multicast(&self) -> &SdSessionCounter {
+        &self.multicast
+    }
+
+    /// The session of the next SD message sent to `destination`: the next
+    /// multicast session when `destination` is a multicast or the broadcast
+    /// address, otherwise the next session of the unicast relation with
+    /// `destination`.
+    pub fn next_to(&self, destination: Ipv4Addr) -> SdSession {
+        if destination.is_multicast() || destination.is_broadcast() {
+            self.multicast.next()
+        } else {
+            self.unicast_counter(destination).next()
+        }
+    }
+
+    fn unicast_counter(&self, peer: Ipv4Addr) -> &SdSessionCounter {
+        let key = u32::from(peer);
+        if key == 0 {
+            return &self.overflow;
+        }
+        // The first free slot is the only one a claim can take, so a peer
+        // already holding a slot is found before any free one.
+        for (slot, counter) in self.peers.iter().zip(&self.unicast) {
+            match slot.compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return counter,
+                Err(held) if held == key => return counter,
+                Err(_) => {}
+            }
+        }
+        &self.overflow
+    }
+}
+
+impl<const N: usize> Default for SdSessions<N> {
     fn default() -> Self {
         Self::new()
     }
@@ -1164,6 +1244,90 @@ mod tests {
                 (2, RebootFlag::Continuous)
             ]
         );
+    }
+
+    const PEER_A: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 10);
+    const PEER_B: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 11);
+    const PEER_C: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 12);
+    const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 0, 255);
+
+    fn ids<const N: usize>(sessions: &SdSessions<N>, to: &[Ipv4Addr]) -> std::vec::Vec<u16> {
+        to.iter().map(|&d| sessions.next_to(d).id()).collect()
+    }
+
+    #[test]
+    fn multicast_and_each_unicast_peer_count_from_one_on_their_own() {
+        let sessions = SdSessions::<4>::new();
+        assert_eq!(
+            ids(&sessions, &[GROUP, PEER_A, GROUP, PEER_B, PEER_A, GROUP]),
+            [1, 1, 2, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn the_multicast_counter_continues_the_multicast_relation() {
+        let sessions = SdSessions::<1>::new();
+        assert_eq!(sessions.next_to(GROUP).id(), 1);
+        assert_eq!(sessions.multicast().next().id(), 2);
+        assert_eq!(sessions.next_to(PEER_A).id(), 1);
+    }
+
+    #[test]
+    fn the_broadcast_address_is_numbered_as_multicast() {
+        let sessions = SdSessions::<1>::new();
+        assert_eq!(ids(&sessions, &[GROUP, Ipv4Addr::BROADCAST]), [1, 2]);
+    }
+
+    #[test]
+    fn peers_beyond_the_capacity_share_one_counter() {
+        let sessions = SdSessions::<1>::new();
+        assert_eq!(
+            ids(&sessions, &[PEER_A, PEER_B, PEER_C, PEER_A, PEER_B]),
+            [1, 1, 2, 2, 3]
+        );
+    }
+
+    #[test]
+    fn with_multicast_resumes_only_the_multicast_relation() {
+        let sessions = SdSessions::<1>::with_multicast(SdSessionCounter::resume(
+            0xFFFF,
+            RebootFlag::Continuous,
+        ));
+        let multicast = sessions.next_to(GROUP);
+        let unicast = sessions.next_to(PEER_A);
+        assert_eq!(
+            [
+                (multicast.id(), multicast.reboot()),
+                (unicast.id(), unicast.reboot())
+            ],
+            [
+                (1, RebootFlag::Continuous),
+                (1, RebootFlag::RecentlyRebooted)
+            ]
+        );
+    }
+
+    #[test]
+    fn concurrent_first_sends_to_one_peer_share_its_counter() {
+        use std::sync::Arc;
+        for _trial in 0..20 {
+            let sessions = Arc::new(SdSessions::<4>::new());
+            let handles: std::vec::Vec<_> = (0..16)
+                .map(|i| {
+                    let sessions = Arc::clone(&sessions);
+                    let peer = if i % 2 == 0 { PEER_A } else { PEER_B };
+                    std::thread::spawn(move || (peer, sessions.next_to(peer).id()))
+                })
+                .collect();
+            let mut seen: std::vec::Vec<_> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+            seen.sort_unstable();
+            let want: std::vec::Vec<_> = (1..=8)
+                .map(|id| (PEER_A, id))
+                .chain((1..=8).map(|id| (PEER_B, id)))
+                .collect();
+            assert_eq!(seen, want);
+        }
     }
 
     #[test]

@@ -45,7 +45,7 @@ where
     T: TransportSocket,
 {
     let target_v4 = socket_addr_v4(target)?;
-    let total_len = sd_state.encode_offer(buf, offering, config.interface)?;
+    let total_len = sd_state.encode_offer(buf, offering, config.interface, *target_v4.ip())?;
     sd_socket.send_to(&buf[..total_len], target_v4).await?;
     crate::log::debug!(
         "Sent unicast OfferService to {} for service 0x{:04X}",
@@ -79,8 +79,12 @@ where
         counter: crate::sd_codec::SubscribeCounter::of_entry(entry_view),
     };
     let peer = socket_addr_v4(peer)?;
-    let len = crate::sd_codec::build_subscribe_ack_datagram(buf, &request, sd_state.next_session())
-        .map_err(super::build_error)?;
+    let len = crate::sd_codec::build_subscribe_ack_datagram(
+        buf,
+        &request,
+        sd_state.next_session_to(*peer.ip()),
+    )
+    .map_err(super::build_error)?;
     sd_socket.send_to(&buf[..len], peer).await?;
     Ok(())
 }
@@ -147,20 +151,21 @@ where
     Ok(())
 }
 
-/// Encode into `buf` one SD message carrying a Subscribe entry for each
-/// consumed eventgroup marked in `answered`; returns its length.
+/// Encode into `buf` one SD message to `server` carrying a Subscribe entry
+/// for each consumed eventgroup marked in `answered`; returns its length.
 fn encode_subscribes(
     buf: &mut [u8],
     config: &ServerConfig,
     sd_state: &SdStateManager,
     answered: &[bool],
+    server: SocketAddrV4,
 ) -> Result<usize, Error> {
     let mut requests = config.consumed_eventgroups.clone();
     let mut answered = answered.iter();
     requests.retain(|_| answered.next().copied().unwrap_or(false));
     crate::sd_codec::build_multi_subscribe_eventgroup_datagram::<
         { ServerConfig::CONSUMED_EVENTGROUPS_CAP },
-    >(buf, &requests, sd_state.next_session())
+    >(buf, &requests, sd_state.next_session_to(*server.ip()))
     .map_err(super::build_error)
 }
 
@@ -177,10 +182,9 @@ async fn send_subscribes<T>(
 where
     T: TransportSocket,
 {
-    let len = encode_subscribes(buf, config, sd_state, answered)?;
-    sd_socket
-        .send_to(&buf[..len], socket_addr_v4(server)?)
-        .await?;
+    let server_v4 = socket_addr_v4(server)?;
+    let len = encode_subscribes(buf, config, sd_state, answered, server_v4)?;
+    sd_socket.send_to(&buf[..len], server_v4).await?;
     crate::log::debug!("Sent Subscribe to {}", server);
     Ok(())
 }
@@ -3108,6 +3112,53 @@ mod tests {
             let socket = answer(&config, &find_wire_bytes(0xFFFF)).await;
 
             assert_eq!(socket.sent.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_find_is_answered_from_the_peers_own_session_counter() {
+            let config = make_config();
+            let offering = config.offering.as_ref().expect("an offering");
+            let sd_state = make_sd_state();
+            let socket = RecordingSocket::default();
+            let subscriptions = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::server::SubscriptionManager::new(),
+            ));
+            let mut buf = [0u8; crate::UDP_BUFFER_SIZE];
+            let (wire, sd_len) = find_wire_bytes(0xFFFF);
+            let find = sd::SdHeaderView::parse(&wire[..sd_len]).expect("parse");
+
+            for _ in 0..2 {
+                sd_state
+                    .send_offer_service(&mut buf, &config, offering, &socket)
+                    .await
+                    .expect("multicast Offer");
+            }
+            handle_sd_message(
+                &config,
+                &socket,
+                &sd_state,
+                &subscriptions,
+                &find,
+                core::net::SocketAddr::V4(PEER_SD),
+                &mut buf,
+                &mut Discovery::leaked(&config),
+            )
+            .await
+            .expect("handle_sd_message");
+            sd_state
+                .send_offer_service(&mut buf, &config, offering, &socket)
+                .await
+                .expect("multicast Offer");
+
+            let sessions: std::vec::Vec<_> = socket
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(d, to)| (u16::from_be_bytes([d[10], d[11]]), *to))
+                .collect();
+            let group = config.sd_multicast;
+            assert_eq!(sessions, [(1, group), (2, group), (1, PEER_SD), (3, group)]);
         }
 
         #[tokio::test]

@@ -6,21 +6,26 @@
 //! `SubscribeNack`. It also builds the server's `OfferService`.
 
 use crate::protocol::sd::RebootFlag;
-use crate::sd_codec::{SdSession, SdSessionCounter};
+use crate::sd_codec::{SdSession, SdSessionCounter, SdSessions};
 use crate::transport::TransportSocket;
 
 use super::{Error, ServerConfig};
 
-/// Numbers every SD message the server sends, multicast and unicast, from
-/// one [`SdSessionCounter`], and emits its `OfferService` announcements.
+/// Numbers every SD message the server sends, the multicast messages and
+/// the unicast messages to each peer on their own, and emits its
+/// `OfferService` announcements.
 #[derive(Debug)]
 pub struct SdStateManager {
-    session: SdSessionCounter,
+    sessions: SdSessions<{ SdStateManager::UNICAST_PEERS_CAP }>,
 }
 
 impl SdStateManager {
-    /// Construct an `SdStateManager` whose first SD message gets session
-    /// ID 1 and the reboot flag `RecentlyRebooted`.
+    /// The number of peers whose unicast SD messages are numbered on their
+    /// own; see [`SdSessions`].
+    pub const UNICAST_PEERS_CAP: usize = 16;
+
+    /// Construct an `SdStateManager` whose first SD message on each
+    /// relation gets session ID 1 and the reboot flag `RecentlyRebooted`.
     ///
     /// `const fn` so consumers can declare a `static`-storage instance
     /// without an allocator:
@@ -47,25 +52,34 @@ impl Default for SdStateManager {
 }
 
 impl SdStateManager {
-    /// Construct numbering SD messages with `session`.
+    /// Construct numbering multicast SD messages with `session`.
     #[must_use]
     pub const fn from_counter(session: SdSessionCounter) -> Self {
-        Self { session }
-    }
-
-    /// Construct as if `initial` was the session ID last sent, before the
-    /// counter first wrapped; see [`SdSessionCounter::resume`].
-    #[must_use]
-    pub const fn with_initial(initial: u16) -> Self {
         Self {
-            session: SdSessionCounter::resume(initial, RebootFlag::RecentlyRebooted),
+            sessions: SdSessions::with_multicast(session),
         }
     }
 
-    /// The session of the next SD message: its ID and reboot flag, for the
-    /// [`sd_codec`](crate::sd_codec) builders.
+    /// Construct as if `initial` was the multicast session ID last sent,
+    /// before the counter first wrapped; see [`SdSessionCounter::resume`].
+    #[must_use]
+    pub const fn with_initial(initial: u16) -> Self {
+        Self::from_counter(SdSessionCounter::resume(
+            initial,
+            RebootFlag::RecentlyRebooted,
+        ))
+    }
+
+    /// The session of the next multicast SD message: its ID and reboot
+    /// flag, for the [`sd_codec`](crate::sd_codec) builders.
     pub fn next_session(&self) -> SdSession {
-        self.session.next()
+        self.sessions.multicast().next()
+    }
+
+    /// The session of the next SD message sent to `destination`; see
+    /// [`SdSessions::next_to`].
+    pub fn next_session_to(&self, destination: core::net::Ipv4Addr) -> SdSession {
+        self.sessions.next_to(destination)
     }
 
     /// The next SD session ID and the reboot flag of the same message.
@@ -81,28 +95,26 @@ impl SdStateManager {
         self.next_session_id_with_reboot_flag().0
     }
 
-    /// The reboot flag the counter is at.
+    /// The reboot flag the multicast counter is at.
     #[cfg(test)]
     pub(super) fn reboot_flag(&self) -> RebootFlag {
-        if self.session.has_wrapped() {
-            RebootFlag::Continuous
-        } else {
-            RebootFlag::RecentlyRebooted
-        }
+        self.sessions.multicast().reboot_flag()
     }
 
     /// Encode the `OfferService` of `offering` at `interface` into `buf` as
-    /// the next SD message of this manager; returns its length.
+    /// the next SD message of this manager to `destination`; returns its
+    /// length.
     pub(super) fn encode_offer(
         &self,
         buf: &mut [u8],
         offering: &super::Offering,
         interface: core::net::Ipv4Addr,
+        destination: core::net::Ipv4Addr,
     ) -> Result<usize, Error> {
         crate::sd_codec::build_offer_service_datagram(
             buf,
             &offering.offer_request(interface),
-            self.next_session(),
+            self.next_session_to(destination),
         )
         .map_err(super::build_error)
     }
@@ -122,8 +134,8 @@ impl SdStateManager {
         offering: &super::Offering,
         socket: &T,
     ) -> Result<(), Error> {
-        let total_len = self.encode_offer(buf, offering, config.interface)?;
         let multicast_addr = config.sd_multicast;
+        let total_len = self.encode_offer(buf, offering, config.interface, *multicast_addr.ip())?;
 
         crate::log::trace!(
             "Sending OfferService: service=0x{:04X}, instance={}, port={}, size={} bytes",
