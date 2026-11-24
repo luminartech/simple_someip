@@ -633,10 +633,14 @@ impl SdSessionCounter {
         }
     }
 
-    /// Whether the counter has wrapped.
-    #[cfg(test)]
-    pub(crate) fn has_wrapped(&self) -> bool {
-        self.state.load(Ordering::Acquire) & WRAPPED_BIT != 0
+    /// The reboot flag of the session last given, or
+    /// [`RebootFlag::RecentlyRebooted`] before the first.
+    pub fn reboot_flag(&self) -> RebootFlag {
+        if self.state.load(Ordering::Acquire) & WRAPPED_BIT == 0 {
+            RebootFlag::RecentlyRebooted
+        } else {
+            RebootFlag::Continuous
+        }
     }
 
     const fn after(state: u32) -> u32 {
@@ -687,9 +691,10 @@ impl<const N: usize> SdSessions<N> {
         }
     }
 
-    /// The session of the next multicast SD message.
-    pub fn next_multicast(&self) -> SdSession {
-        self.multicast.next()
+    /// The counter of the multicast SD messages.
+    #[must_use]
+    pub const fn multicast(&self) -> &SdSessionCounter {
+        &self.multicast
     }
 
     /// The session of the next SD message sent to `destination`: the next
@@ -702,12 +707,6 @@ impl<const N: usize> SdSessions<N> {
         } else {
             self.unicast_counter(destination).next()
         }
-    }
-
-    /// Whether the multicast counter has wrapped.
-    #[cfg(test)]
-    pub(crate) fn multicast_has_wrapped(&self) -> bool {
-        self.multicast.has_wrapped()
     }
 
     fn unicast_counter(&self, peer: Ipv4Addr) -> &SdSessionCounter {
@@ -1266,10 +1265,10 @@ mod tests {
     }
 
     #[test]
-    fn next_multicast_continues_the_multicast_relation() {
+    fn the_multicast_counter_continues_the_multicast_relation() {
         let sessions = SdSessions::<1>::new();
         assert_eq!(sessions.next_to(GROUP).id(), 1);
-        assert_eq!(sessions.next_multicast().id(), 2);
+        assert_eq!(sessions.multicast().next().id(), 2);
         assert_eq!(sessions.next_to(PEER_A).id(), 1);
     }
 

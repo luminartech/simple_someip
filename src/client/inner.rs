@@ -23,11 +23,16 @@ use crate::{
         socket_manager::{ReceivedMessage, SocketManager},
     },
     protocol::{self, Message, MessageType},
+    sd_codec::SdSessions,
     traits::{PayloadWireFormat, ServiceOffer},
     transport::{ChannelFactory, E2EHandle, MpscRecv, OneshotSend, UnboundedSend},
 };
 
 use super::error::Error;
+
+/// The number of peers whose unicast SD messages the client numbers on
+/// their own; see [`SdSessions`].
+const SD_UNICAST_PEERS_CAP: usize = 16;
 
 /// The UDP IPv4 endpoint among `options`, or the first TCP one if there is no
 /// UDP one.
@@ -86,10 +91,9 @@ pub enum ControlMessage<P: PayloadWireFormat + 'static, C: ChannelFactory> {
         response: C::OneshotSender<Result<(), Error>>,
     },
     QueryRebootFlag(C::OneshotSender<Result<crate::protocol::sd::RebootFlag, Error>>),
-    /// Test-only: force `sd_session_has_wrapped` to simulate the state a
-    /// long-running client reaches after its SD session counter wraps past
-    /// `0xFFFF`, without actually sending 65k SD messages. Fires the
-    /// accompanying oneshot once the mutation is applied.
+    /// Test-only: restart the SD session counters, with the multicast one
+    /// wrapped or not, to simulate a long-running client without sending
+    /// 65k SD messages. Fires the accompanying oneshot once applied.
     #[cfg(all(test, feature = "client-tokio"))]
     ForceSdSessionWrappedForTest(bool, C::OneshotSender<Result<(), Error>>),
 }
@@ -335,10 +339,9 @@ pub(super) struct Inner<
     client_id: u16,
     /// Incrementing session counter for SOME/IP request headers (lower 16 bits of request ID)
     session_counter: u16,
-    /// SD session state persisted across discovery socket rebinds so that
-    /// `unbind_discovery` + `bind_discovery` does not emit a false reboot signal.
-    sd_session_id: u16,
-    sd_session_has_wrapped: bool,
+    /// Numbers the SD messages the client sends. Kept across discovery
+    /// socket rebinds, which would otherwise signal a reboot to peers.
+    sd_sessions: SdSessions<SD_UNICAST_PEERS_CAP>,
     /// Checks received and protects sent payloads.
     e2e: R,
     /// Enable multicast loopback on SD sockets for same-host testing
@@ -431,8 +434,7 @@ where
             run: true,
             client_id: 0x1234,
             session_counter: 1,
-            sd_session_id: 1,
-            sd_session_has_wrapped: false,
+            sd_sessions: SdSessions::new(),
             e2e,
             multicast_loopback,
             dispatch,
@@ -448,13 +450,7 @@ where
         } else {
             let socket = self
                 .dispatch
-                .bind_discovery(
-                    self.interface,
-                    self.e2e.clone(),
-                    self.sd_session_id,
-                    self.sd_session_has_wrapped,
-                    self.multicast_loopback,
-                )
+                .bind_discovery(self.interface, self.e2e.clone(), self.multicast_loopback)
                 .await?;
             self.discovery_socket = Some(socket);
             // Receive-only unicast SD socket bound to the interface IP — see
@@ -477,9 +473,6 @@ where
     async fn unbind_discovery(&mut self) {
         debug!("Unbinding Discovery socket.");
         if let Some(socket) = self.discovery_socket.take() {
-            self.sd_session_id = socket.session_id();
-            self.sd_session_has_wrapped =
-                socket.reboot_flag() == crate::protocol::sd::RebootFlag::Continuous;
             socket.shut_down().await;
         }
         if let Some(socket) = self.discovery_unicast_socket.take() {
@@ -864,7 +857,7 @@ where
                         debug!("UnbindDiscovery: caller dropped the response receiver");
                     }
                 }
-                ControlMessage::SendSD(target, header, response) => {
+                ControlMessage::SendSD(target, mut header, response) => {
                     // SD Message, If the discovery socket is not bound, bind it
                     match &mut self.discovery_socket {
                         None => {
@@ -894,21 +887,18 @@ where
                             }
                         }
                         Some(discovery_socket) => {
+                            let session = self.sd_sessions.next_to(*target.ip());
+                            PayloadDefinitions::set_reboot_flag(&mut header, session.reboot());
                             // `new_sd` sizes the header and can fail (see its
                             // `# Errors`); report it rather than send a
                             // mis-declared length.
                             match Message::<PayloadDefinitions>::new_sd(
-                                u32::from(discovery_socket.session_id()),
+                                u32::from(session.id()),
                                 &header,
                             ) {
                                 Ok(message) => {
                                     debug!("Sending {:?} to {}", &message, target);
-                                    let send_result = self
-                                        .discovery_socket
-                                        .as_mut()
-                                        .unwrap()
-                                        .send(target, message)
-                                        .await;
+                                    let send_result = discovery_socket.send(target, message).await;
                                     if response.send(send_result).is_err() {
                                         debug!("SendSD: caller dropped the response receiver");
                                     }
@@ -1035,25 +1025,18 @@ where
                 }
                 #[cfg(all(test, feature = "client-tokio"))]
                 ControlMessage::ForceSdSessionWrappedForTest(wrapped, response) => {
-                    self.sd_session_has_wrapped = wrapped;
-                    let _ = response.send(Ok(()));
-                }
-                ControlMessage::QueryRebootFlag(response) => {
-                    // Prefer the live socket's tracked flag when bound. When
-                    // unbound, fall back to `sd_session_has_wrapped`, which
-                    // persists wrap state across unbind/rebind (updated in
-                    // `unbind_discovery` from the socket manager before it's
-                    // dropped). Without this fallback, a long-running client
-                    // that wraps past 0xFFFF and then unbinds discovery
-                    // would erroneously revert to `RecentlyRebooted` on the
-                    // next `reboot_flag()` call.
-                    let flag = if let Some(socket) = self.discovery_socket.as_ref() {
-                        socket.reboot_flag()
-                    } else if self.sd_session_has_wrapped {
+                    let reboot = if wrapped {
                         crate::protocol::sd::RebootFlag::Continuous
                     } else {
                         crate::protocol::sd::RebootFlag::RecentlyRebooted
                     };
+                    self.sd_sessions = SdSessions::with_multicast(
+                        crate::sd_codec::SdSessionCounter::resume(0, reboot),
+                    );
+                    let _ = response.send(Ok(()));
+                }
+                ControlMessage::QueryRebootFlag(response) => {
+                    let flag = self.sd_sessions.multicast().reboot_flag();
                     if response.send(Ok(flag)).is_err() {
                         debug!("QueryRebootFlag: caller dropped the response receiver");
                     }
@@ -1142,6 +1125,9 @@ where
                             }
                         },
                         Some(discovery_socket) => {
+                            let target =
+                                SocketAddrV4::new(*provider.ip(), protocol::sd::MULTICAST_PORT);
+                            let session = self.sd_sessions.next_to(*target.ip());
                             let sd_header = PayloadDefinitions::new_subscription_sd_header(
                                 key.service_id,
                                 instance_id,
@@ -1151,23 +1137,16 @@ where
                                 self.interface,
                                 crate::protocol::sd::TransportProtocol::Udp,
                                 unicast_port,
-                                discovery_socket.reboot_flag(),
+                                session.reboot(),
                             );
-                            let session_id = u32::from(discovery_socket.session_id());
-                            let target =
-                                SocketAddrV4::new(*provider.ip(), protocol::sd::MULTICAST_PORT);
+                            let session_id = u32::from(session.id());
                             // See the SendSD arm: sizing can fail, and a
                             // mis-declared length is worse on the wire than a
                             // reported error.
                             match Message::<PayloadDefinitions>::new_sd(session_id, &sd_header) {
                                 Ok(message) => {
                                     debug!("Sending Subscribe {:?} to {}", &message, target);
-                                    let send_result = self
-                                        .discovery_socket
-                                        .as_mut()
-                                        .unwrap()
-                                        .send(target, message)
-                                        .await;
+                                    let send_result = discovery_socket.send(target, message).await;
                                     if response.send(send_result).is_err() {
                                         debug!(
                                             "Subscribe: caller dropped the response receiver (expected for subscribe_no_wait)"
@@ -1596,8 +1575,7 @@ mod tests {
             run: true,
             client_id: 0x1234,
             session_counter: 1,
-            sd_session_id: 1,
-            sd_session_has_wrapped: false,
+            sd_sessions: SdSessions::new(),
             e2e: NoE2E,
             multicast_loopback: false,
             dispatch: crate::client::bind_dispatch::SpawnerDispatch {
@@ -1842,8 +1820,7 @@ mod tests {
             run: true,
             client_id: 0x1234,
             session_counter: 1,
-            sd_session_id: 1,
-            sd_session_has_wrapped: false,
+            sd_sessions: SdSessions::new(),
             e2e: NoE2E,
             multicast_loopback: false,
             dispatch: crate::client::bind_dispatch::SpawnerDispatch {
@@ -2632,8 +2609,7 @@ mod tests {
             run: true,
             client_id: 0x1234,
             session_counter: 1,
-            sd_session_id: 1,
-            sd_session_has_wrapped: false,
+            sd_sessions: SdSessions::new(),
             e2e,
             multicast_loopback: false,
             dispatch: crate::client::bind_dispatch::SpawnerDispatch {
@@ -2777,6 +2753,106 @@ mod tests {
         assert_eq!(
             reboot_flag_after, reboot_flag_before,
             "reboot_flag should be preserved across rebind"
+        );
+    }
+
+    /// Every datagram a [`RecordingSocket`] sent, with its target.
+    type Sent = Arc<std::sync::Mutex<std::vec::Vec<(SocketAddrV4, std::vec::Vec<u8>)>>>;
+
+    /// Records what it sends; receives nothing.
+    struct RecordingSocket {
+        addr: SocketAddrV4,
+        sent: Sent,
+    }
+
+    impl crate::transport::TransportSocket for RecordingSocket {
+        type SendFuture<'a> = core::future::Ready<Result<(), crate::transport::TransportError>>;
+        type RecvFuture<'a> = core::future::Pending<
+            Result<crate::transport::ReceivedDatagram, crate::transport::TransportError>,
+        >;
+
+        fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddrV4) -> Self::SendFuture<'a> {
+            self.sent.lock().unwrap().push((target, buf.to_vec()));
+            core::future::ready(Ok(()))
+        }
+        fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
+            core::future::pending()
+        }
+        fn local_addr(&self) -> Result<SocketAddrV4, crate::transport::TransportError> {
+            Ok(self.addr)
+        }
+        fn join_multicast_v4(
+            &self,
+            _group: Ipv4Addr,
+            _iface: Ipv4Addr,
+        ) -> Result<(), crate::transport::TransportError> {
+            Ok(())
+        }
+        fn leave_multicast_v4(
+            &self,
+            _group: Ipv4Addr,
+            _iface: Ipv4Addr,
+        ) -> Result<(), crate::transport::TransportError> {
+            Ok(())
+        }
+    }
+
+    struct RecordingFactory(Sent);
+
+    impl crate::transport::TransportFactory for RecordingFactory {
+        type Socket = RecordingSocket;
+        type BindFuture<'a> =
+            core::future::Ready<Result<RecordingSocket, crate::transport::TransportError>>;
+
+        fn bind<'a>(
+            &'a self,
+            addr: SocketAddrV4,
+            _options: &'a crate::transport::SocketOptions,
+        ) -> Self::BindFuture<'a> {
+            core::future::ready(Ok(RecordingSocket {
+                addr,
+                sent: Arc::clone(&self.0),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn sd_messages_to_a_peer_are_numbered_apart_from_multicast_ones() {
+        let sent = Sent::default();
+        let (control_sender, _update_receiver, run_fut) =
+            Inner::<TestPayload, TokioTimer, NoE2E, TokioChannels, _>::build(
+                Ipv4Addr::LOCALHOST,
+                NoE2E,
+                false,
+                crate::client::bind_dispatch::SpawnerDispatch {
+                    factory: RecordingFactory(Arc::clone(&sent)),
+                    spawner: TokioSpawner,
+                    buffer_provider: TokioBufferProvider::new(),
+                },
+                TokioTimer,
+            );
+        let _run_handle = tokio::spawn(run_fut);
+        let group = SocketAddrV4::new(
+            crate::protocol::sd::MULTICAST_IP,
+            crate::protocol::sd::MULTICAST_PORT,
+        );
+        let peer = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 10), 30490);
+
+        for target in [group, peer, group, peer, group] {
+            let (rx, msg) = TestControl::send_sd(target, empty_sd_header());
+            control_sender.send(msg).await.unwrap();
+            rx.recv().await.unwrap().unwrap();
+        }
+
+        let sessions: std::vec::Vec<_> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(to, d)| (*to, u16::from_be_bytes([d[10], d[11]])))
+            .collect();
+        assert_eq!(
+            sessions,
+            [(group, 1), (peer, 1), (group, 2), (peer, 2), (group, 3)]
         );
     }
 

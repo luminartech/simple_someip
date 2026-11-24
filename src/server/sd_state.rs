@@ -73,7 +73,7 @@ impl SdStateManager {
     /// The session of the next multicast SD message: its ID and reboot
     /// flag, for the [`sd_codec`](crate::sd_codec) builders.
     pub fn next_session(&self) -> SdSession {
-        self.sessions.next_multicast()
+        self.sessions.multicast().next()
     }
 
     /// The session of the next SD message sent to `destination`; see
@@ -95,14 +95,10 @@ impl SdStateManager {
         self.next_session_id_with_reboot_flag().0
     }
 
-    /// The reboot flag the counter is at.
+    /// The reboot flag the multicast counter is at.
     #[cfg(test)]
     pub(super) fn reboot_flag(&self) -> RebootFlag {
-        if self.sessions.multicast_has_wrapped() {
-            RebootFlag::Continuous
-        } else {
-            RebootFlag::RecentlyRebooted
-        }
+        self.sessions.multicast().reboot_flag()
     }
 
     /// Encode the `OfferService` of `offering` at `interface` into `buf` as

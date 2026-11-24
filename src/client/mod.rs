@@ -1037,29 +1037,19 @@ where
         let _ = self.control_sender.send(message).await;
     }
 
-    /// Returns the current SD reboot flag tracked by the client.
+    /// Returns the reboot flag of the client's multicast SD messages.
     ///
-    /// Per AUTOSAR SOME/IP-SD, the reboot flag is
+    /// The flag is
     /// [`RebootFlag::RecentlyRebooted`](protocol::sd::RebootFlag::RecentlyRebooted)
-    /// from startup until the session counter wraps from `0xFFFF` to `1`, then
-    /// [`RebootFlag::Continuous`](protocol::sd::RebootFlag::Continuous) permanently.
+    /// until the multicast session counter first wraps from `0xFFFF` to `1`,
+    /// and [`RebootFlag::Continuous`](protocol::sd::RebootFlag::Continuous)
+    /// from then on. The client's session counters are kept across
+    /// [`unbind_discovery`](Self::unbind_discovery) and
+    /// [`bind_discovery`](Self::bind_discovery).
     ///
-    /// While discovery is bound, the returned value is the discovery socket's
-    /// live reboot flag. While discovery is **unbound**, the inner loop's
-    /// persisted wrap state is used instead — so this method correctly returns
-    /// [`RebootFlag::Continuous`](protocol::sd::RebootFlag::Continuous) even
-    /// between `unbind_discovery` and a subsequent `bind_discovery`, provided
-    /// the session counter had already wrapped at least once. On a fresh
-    /// client that has never bound discovery (or that unbound before any
-    /// wrap),
-    /// [`RebootFlag::RecentlyRebooted`](protocol::sd::RebootFlag::RecentlyRebooted)
-    /// is returned.
-    ///
-    /// Call this before manually building an SD header (e.g. one passed to
-    /// [`send_sd_message`](Self::send_sd_message)) so the reboot flag reflects
-    /// the current tracked state instead of a stale value baked at call time.
-    /// Headers passed to `sd_announcements_loop` (under `client-tokio`)
-    /// are refreshed automatically per-tick and do not need this call.
+    /// [`send_sd_message`](Self::send_sd_message) writes into each header the
+    /// reboot flag of the session it numbers the message with, so a header
+    /// needs no flag set beforehand.
     ///
     /// # Errors
     ///
@@ -1097,6 +1087,13 @@ where
     }
 
     /// Sends an SD message to a specific target address.
+    ///
+    /// The message is numbered with the next session of the client's
+    /// multicast relation when `target` is a multicast or the broadcast
+    /// address, and of its unicast relation with `target` otherwise. The
+    /// reboot flag of that session, set with
+    /// [`PayloadWireFormat::set_reboot_flag`], replaces the one in
+    /// `sd_header`.
     ///
     /// # Errors
     ///
@@ -1295,13 +1292,9 @@ where
     /// they share the same source address as the client's `Subscribe` and
     /// `FindService` messages.
     ///
-    /// **Reboot flag auto-refresh:** the SD header's reboot bit is overridden
-    /// at each tick with the client's currently tracked reboot flag (via
-    /// [`PayloadWireFormat::set_reboot_flag`]). The reboot bit the caller
-    /// supplies on `sd_header` is therefore ignored. This ensures the flag
-    /// transitions from `RecentlyRebooted` to `Continuous` once the session
-    /// counter wraps past `0xFFFF`, rather than staying stuck on whatever
-    /// value was baked at call time.
+    /// Each announcement is sent with
+    /// [`send_sd_message`](Self::send_sd_message), which replaces the reboot
+    /// bit the caller supplies on `sd_header`.
     ///
     /// Returns an `impl Future<Output = ()> + Send + 'static` that the
     /// caller drives on their executor (typically via `tokio::spawn`).
@@ -1362,37 +1355,11 @@ where
             loop {
                 timer.sleep(interval).await;
 
-                let (flag_rx, flag_msg) =
-                    ControlMessage::<MessageDefinitions, TokioChannels>::query_reboot_flag();
-                let Some(sender) = weak_sender.upgrade() else {
-                    crate::log::info!("Client shut down, stopping SD announcements");
-                    break;
-                };
-                let enqueue_ok = sender.send(flag_msg).await.is_ok();
-                drop(sender);
-                if !enqueue_ok {
-                    crate::log::warn!("SD announcement channel closed, stopping");
-                    break;
-                }
-                let reboot = match flag_rx.recv().await {
-                    Ok(Ok(flag)) => flag,
-                    Ok(Err(e)) => {
-                        crate::log::warn!(
-                            "SD announcement reboot-flag query returned error ({:?}), skipping tick",
-                            e
-                        );
-                        continue;
-                    }
-                    Err(_) => {
-                        crate::log::warn!("SD announcement reboot-flag query dropped, stopping");
-                        break;
-                    }
-                };
-                let mut header = sd_header.clone();
-                MessageDefinitions::set_reboot_flag(&mut header, reboot);
-
                 let (response, message) =
-                    ControlMessage::<MessageDefinitions, TokioChannels>::send_sd(target, header);
+                    ControlMessage::<MessageDefinitions, TokioChannels>::send_sd(
+                        target,
+                        sd_header.clone(),
+                    );
 
                 let Some(sender) = weak_sender.upgrade() else {
                     crate::log::info!("Client shut down, stopping SD announcements");
@@ -2102,47 +2069,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reboot_flag_uses_persisted_wrap_state_when_unbound() {
-        // Regression test for Copilot comment #5 on PR 73: when discovery
-        // is not bound, `reboot_flag()` must consult the inner loop's
-        // persisted `sd_session_has_wrapped` (set on every unbind from the
-        // departing socket's reboot_flag) rather than blindly returning
-        // `RecentlyRebooted`. Otherwise a long-running client that wrapped
-        // past 0xFFFF would regress to `RecentlyRebooted` on the next
-        // `reboot_flag()` call after unbind — falsely advertising a reboot
-        // to peers on the next manually-built SD header.
+    async fn reboot_flag_reports_the_multicast_counter_across_rebinds() {
         let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
         let _run_handle = tokio::spawn(run_fut);
-
-        // No discovery bound. Fallback should reflect persisted state.
-        // Default (unwrapped) → RecentlyRebooted.
-        assert_eq!(
-            client.reboot_flag().await.expect("reboot_flag"),
-            crate::protocol::sd::RebootFlag::RecentlyRebooted
-        );
-
-        // Simulate post-wrap state (normally set by `unbind_discovery`
-        // reading the departing socket's `reboot_flag`).
         client
             .force_sd_session_wrapped_for_test(true)
             .await
             .expect("force_sd_session_wrapped_for_test");
-        assert_eq!(
-            client.reboot_flag().await.expect("reboot_flag"),
-            crate::protocol::sd::RebootFlag::Continuous,
-            "reboot_flag must report Continuous from persisted state while \
-             discovery is unbound"
-        );
 
-        // Rebinding with persisted wrap state seeds the socket via
-        // `bind_discovery_seeded`, so the live flag agrees.
+        let unbound = client.reboot_flag().await.expect("reboot_flag");
         client.bind_discovery().await.unwrap();
-        assert_eq!(
-            client.reboot_flag().await.expect("reboot_flag"),
-            crate::protocol::sd::RebootFlag::Continuous,
-            "seeded socket must report Continuous after wrapped rebind"
-        );
+        let bound = client.reboot_flag().await.expect("reboot_flag");
+        client.unbind_discovery().await.unwrap();
+        let unbound_again = client.reboot_flag().await.expect("reboot_flag");
 
+        assert_eq!(
+            [unbound, bound, unbound_again],
+            [crate::protocol::sd::RebootFlag::Continuous; 3]
+        );
         client.shut_down();
     }
 

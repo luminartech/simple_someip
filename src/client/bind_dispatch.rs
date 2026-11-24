@@ -53,8 +53,6 @@ where
         &self,
         interface: Ipv4Addr,
         e2e: R,
-        session_id: u16,
-        session_has_wrapped: bool,
         multicast_loopback: bool,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_;
 
@@ -116,8 +114,6 @@ where
         &self,
         interface: Ipv4Addr,
         e2e: R,
-        session_id: u16,
-        session_has_wrapped: bool,
         multicast_loopback: bool,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
         async move {
@@ -125,13 +121,11 @@ where
                 .buffer_provider
                 .claim()
                 .ok_or(Error::Capacity(CapacityKind::UdpBuffer))?;
-            SocketManager::<MD, C>::bind_discovery_seeded_with_transport(
+            SocketManager::<MD, C>::bind_discovery_with_transport(
                 &self.factory,
                 &self.spawner,
                 interface,
                 e2e,
-                session_id,
-                session_has_wrapped,
                 multicast_loopback,
                 buf,
             )
@@ -219,8 +213,6 @@ where
         &self,
         interface: Ipv4Addr,
         e2e: R,
-        session_id: u16,
-        session_has_wrapped: bool,
         multicast_loopback: bool,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
         async move {
@@ -228,13 +220,11 @@ where
                 .buffer_provider
                 .claim()
                 .ok_or(Error::Capacity(CapacityKind::UdpBuffer))?;
-            SocketManager::<MD, C>::bind_discovery_seeded_with_transport_local(
+            SocketManager::<MD, C>::bind_discovery_with_transport_local(
                 &self.factory,
                 &self.spawner,
                 interface,
                 e2e,
-                session_id,
-                session_has_wrapped,
                 multicast_loopback,
                 buf,
             )

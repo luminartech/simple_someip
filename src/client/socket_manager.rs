@@ -2,7 +2,7 @@
 //!
 //! Each bound socket is backed by a transport socket (concrete
 //! `TokioSocket` on `std + tokio`, pluggable via [`TransportFactory`] on
-//! bare-metal — see the `bind_discovery_seeded_with_transport` docstring
+//! bare-metal — see the `bind_discovery_with_transport` docstring
 //! for the RTN-gap analysis) with its I/O loop running on a
 //! caller-supplied [`crate::transport::Spawner`]. The `Spawner` trait
 //! makes the task-submission point pluggable; on `std + tokio` consumers
@@ -212,11 +212,6 @@ pub struct SocketManager<PayloadDefinitions: Send + 'static, C: ChannelFactory> 
     receiver: C::BoundedReceiver<Result<ReceivedMessage<PayloadDefinitions>, Error>, 16>,
     sender: C::BoundedSender<SendMessage<PayloadDefinitions, C>, 16>,
     local_port: u16,
-    session_id: u16,
-    /// Set to true once `session_id` has wrapped from 0xFFFF → 1.
-    /// Per AUTOSAR SOME/IP-SD, the reboot flag must be cleared after the
-    /// first counter wrap and stay cleared.
-    session_has_wrapped: bool,
 }
 
 impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> core::fmt::Debug
@@ -225,7 +220,6 @@ impl<P: PayloadWireFormat + Send + 'static, C: ChannelFactory> core::fmt::Debug
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SocketManager")
             .field("local_port", &self.local_port)
-            .field("session_id", &self.session_id)
             .finish_non_exhaustive()
     }
 }
@@ -238,58 +232,9 @@ where
     SendMessage<MessageDefinitions, C>: crate::transport::BoundedPooled<C, 16>,
     Result<ReceivedMessage<MessageDefinitions>, Error>: crate::transport::BoundedPooled<C, 16>,
 {
-    /// Bind the SD multicast socket, seeding the session counter and wrap
-    /// state from a previous socket when rebinding. Pass `(1, false)` for a
-    /// fresh bind. Preserving state across rebinds avoids emitting a false
-    /// reboot signal (`reboot_flag=1`) to peers after
-    /// `unbind_discovery` + `bind_discovery`.
-    ///
-    /// Uses the default `crate::tokio_transport::TokioTransport` and
-    /// `crate::tokio_transport::TokioSpawner` backends (rendered as
-    /// code literals because `tokio_transport` is only compiled with
-    /// the `client`/`server` features and an intra-doc link would
-    /// break default-feature rustdoc builds).
-    /// For tests or alternate bind logic (e.g. an interceptor factory
-    /// around `TokioTransport`), use
-    /// [`Self::bind_discovery_seeded_with_transport`].
-    ///
-    /// Currently `#[cfg(test)]`-gated: production callers reach the
-    /// socket through the `_with_transport` variant so the `Spawner`
-    /// trait can be exercised end-to-end. Additionally requires the
-    /// `client-tokio` feature because the convenience defaults
-    /// (`TokioTransport`, `TokioSpawner`) live behind it; under
-    /// `--features client` the `socket_manager` module is compiled
-    /// but this convenience method is not.
-    #[cfg(all(test, feature = "client-tokio"))]
-    pub async fn bind_discovery_seeded<R: E2EHandle + Clone>(
-        interface: Ipv4Addr,
-        e2e: R,
-        session_id: u16,
-        session_has_wrapped: bool,
-        multicast_loopback: bool,
-    ) -> Result<Self, Error> {
-        use crate::tokio_transport::{TokioBufferProvider, TokioSpawner, TokioTransport};
-        use crate::transport::BufferProvider;
-        let buf = TokioBufferProvider::new()
-            .claim()
-            .ok_or(Error::Capacity(CapacityKind::UdpBuffer))?;
-        Self::bind_discovery_seeded_with_transport(
-            &TokioTransport,
-            &TokioSpawner,
-            interface,
-            e2e,
-            session_id,
-            session_has_wrapped,
-            multicast_loopback,
-            buf,
-        )
-        .await
-    }
-
-    /// Variant of [`Self::bind_discovery_seeded`] that constructs the
-    /// underlying socket through a caller-supplied [`TransportFactory`]
-    /// and submits the socket's I/O loop through a caller-supplied
-    /// [`Spawner`].
+    /// Bind the SD multicast socket through a caller-supplied
+    /// [`TransportFactory`] and submit its I/O loop through a
+    /// caller-supplied [`Spawner`].
     ///
     /// # Socket bounds
     ///
@@ -320,13 +265,11 @@ where
     /// `Send + Sync + 'static` and its `SendFuture` / `RecvFuture` GAT
     /// projections are `Send` for every borrow lifetime.
     #[allow(clippy::too_many_arguments)] // +1 for the #125 caller-provided buffer lease
-    pub async fn bind_discovery_seeded_with_transport<F, S, R>(
+    pub async fn bind_discovery_with_transport<F, S, R>(
         factory: &F,
         spawner: &S,
         interface: Ipv4Addr,
         e2e: R,
-        session_id: u16,
-        session_has_wrapped: bool,
         multicast_loopback: bool,
         buf: BufferLease,
     ) -> Result<Self, Error>
@@ -368,23 +311,19 @@ where
             receiver: rx_rx,
             sender: tx_tx,
             local_port: sd::MULTICAST_PORT,
-            session_id: session_id.max(1),
-            session_has_wrapped,
         })
     }
 
-    /// `!Send` counterpart to [`Self::bind_discovery_seeded_with_transport`].
+    /// `!Send` counterpart to [`Self::bind_discovery_with_transport`].
     ///
     /// Called by [`super::bind_dispatch::LocalSpawnerDispatch`] which is
     /// wired through [`super::Client::new_with_deps_local`].
     #[allow(clippy::too_many_arguments)] // +1 for the #125 caller-provided buffer lease
-    pub async fn bind_discovery_seeded_with_transport_local<F, S, R>(
+    pub async fn bind_discovery_with_transport_local<F, S, R>(
         factory: &F,
         spawner: &S,
         interface: Ipv4Addr,
         e2e: R,
-        session_id: u16,
-        session_has_wrapped: bool,
         multicast_loopback: bool,
         buf: BufferLease,
     ) -> Result<Self, Error>
@@ -413,8 +352,6 @@ where
             receiver: rx_rx,
             sender: tx_tx,
             local_port: sd::MULTICAST_PORT,
-            session_id: session_id.max(1),
-            session_has_wrapped,
         })
     }
 
@@ -468,8 +405,6 @@ where
             receiver: rx_rx,
             sender: tx_tx,
             local_port: sd::MULTICAST_PORT,
-            session_id: 1,
-            session_has_wrapped: false,
         })
     }
 
@@ -504,17 +439,15 @@ where
             receiver: rx_rx,
             sender: tx_tx,
             local_port: sd::MULTICAST_PORT,
-            session_id: 1,
-            session_has_wrapped: false,
         })
     }
 
     /// Bind a unicast SOME/IP socket on `port` using the default
     /// `crate::tokio_transport::TokioTransport` and
     /// `crate::tokio_transport::TokioSpawner` backends (rendered as
-    /// code literals for the same rustdoc-feature-gating reason
-    /// described on [`Self::bind_discovery_seeded`]). See
-    /// [`Self::bind_with_transport`] for the generic variant.
+    /// code literals because `tokio_transport` is only compiled with the
+    /// `client`/`server` features). See [`Self::bind_with_transport`] for
+    /// the generic variant.
     ///
     /// Currently `#[cfg(test)]`-gated: production callers reach the
     /// socket through the `_with_transport` variant so the `Spawner`
@@ -583,8 +516,6 @@ where
             receiver: rx_rx,
             sender: tx_tx,
             local_port: port,
-            session_id: 1,
-            session_has_wrapped: false,
         })
     }
 
@@ -625,8 +556,6 @@ where
             receiver: rx_rx,
             sender: tx_tx,
             local_port: port,
-            session_id: 1,
-            session_has_wrapped: false,
         })
     }
 
@@ -670,22 +599,7 @@ where
             debug!("send result channel dropped (socket loop gone)");
             Error::SocketClosedUnexpectedly
         })??;
-        if self.session_id == u16::MAX {
-            self.session_id = 1;
-            self.session_has_wrapped = true;
-        } else {
-            self.session_id += 1;
-        }
         Ok(())
-    }
-
-    /// Returns the SD reboot flag value to use in outgoing SD messages.
-    ///
-    /// Per AUTOSAR SOME/IP-SD, this is [`RebootFlag::RecentlyRebooted`] from startup
-    /// until the session counter wraps from `0xFFFF` to `1`, then
-    /// [`RebootFlag::Continuous`] permanently.
-    pub fn reboot_flag(&self) -> crate::protocol::sd::RebootFlag {
-        crate::protocol::sd::RebootFlag::from(!self.session_has_wrapped)
     }
 
     pub async fn receive(&mut self) -> Option<Result<ReceivedMessage<MessageDefinitions>, Error>> {
@@ -699,10 +613,6 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<ReceivedMessage<MessageDefinitions>, Error>>> {
         self.receiver.poll_recv(cx)
-    }
-
-    pub fn session_id(&self) -> u16 {
-        self.session_id
     }
 
     pub fn port(&self) -> u16 {
@@ -1128,7 +1038,7 @@ mod tests {
     /// Spike for the per-transport SD fix (#130 forward-port): prove the
     /// kernel splits SD multicast from unicast across two sockets sharing the
     /// SD port — the multicast socket bound to `INADDR_ANY` + joined
-    /// (Windows-portable, and what `bind_discovery_seeded_with_transport`
+    /// (Windows-portable, and what `bind_discovery_with_transport`
     /// does), and a more-specific socket bound to the host interface IP (not
     /// joined, what `bind_discovery_unicast_with_transport` does).
     /// "Most-specific bind wins" must divert the sensor's unicast SD to the
@@ -1261,7 +1171,6 @@ mod tests {
     async fn test_bind_ephemeral_port() {
         let sm = bind_ephemeral_spawned().await;
         assert!(sm.port() > 0);
-        assert_eq!(sm.session_id(), 1);
     }
 
     #[tokio::test]
@@ -1356,13 +1265,6 @@ mod tests {
         let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header())
             .expect("in-tree SdHeader sizing is infallible");
         sm.send(target, msg).await.unwrap();
-        assert_eq!(sm.session_id(), 2);
-
-        // Second send increments session
-        let msg = Message::<TestPayload>::new_sd(1, &empty_sd_header())
-            .expect("in-tree SdHeader sizing is infallible");
-        sm.send(target, msg).await.unwrap();
-        assert_eq!(sm.session_id(), 3);
     }
 
     #[tokio::test]
@@ -1410,7 +1312,6 @@ mod tests {
         let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_port);
 
         sm.send(target, msg.clone()).await.unwrap();
-        assert_eq!(sm.session_id(), 2);
 
         // Verify the raw socket received data
         let mut recv_buf = vec![0u8; 1400];
@@ -1760,68 +1661,6 @@ mod tests {
         for want in (1..=17).chain([19]) {
             assert_eq!(next_session(&mut sm).await, want);
         }
-    }
-
-    #[tokio::test]
-    async fn test_bind_discovery_seeded_normalizes_zero_session_id() {
-        let sm = TestSocketManager::bind_discovery_seeded(
-            Ipv4Addr::LOCALHOST,
-            test_registry(),
-            0,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(sm.session_id(), 1, "session_id 0 must be normalized to 1");
-    }
-
-    #[tokio::test]
-    async fn test_session_id_wraps_to_one_and_clears_reboot_flag() {
-        use crate::protocol::sd::RebootFlag;
-        let mut sm = bind_ephemeral_spawned().await;
-        let raw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let target =
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw_socket.local_addr().unwrap().port());
-        let msg = || {
-            Message::<TestPayload>::new_sd(1, &empty_sd_header())
-                .expect("in-tree SdHeader sizing is infallible")
-        };
-
-        // Set session_id to one before the wrap point
-        sm.session_id = u16::MAX - 1;
-        assert_eq!(
-            sm.reboot_flag(),
-            RebootFlag::RecentlyRebooted,
-            "reboot flag should be RecentlyRebooted before wrap"
-        );
-
-        // Send one message: session_id reaches MAX
-        sm.send(target, msg()).await.unwrap();
-        assert_eq!(sm.session_id(), u16::MAX);
-        assert_eq!(
-            sm.reboot_flag(),
-            RebootFlag::RecentlyRebooted,
-            "reboot flag should still be RecentlyRebooted at MAX"
-        );
-
-        // Send one more: triggers the wrap, session_id becomes 1
-        sm.send(target, msg()).await.unwrap();
-        assert_eq!(sm.session_id(), 1, "session_id should wrap to 1, not 0");
-        assert_eq!(
-            sm.reboot_flag(),
-            RebootFlag::Continuous,
-            "reboot flag should be Continuous after wrap"
-        );
-
-        // Subsequent sends continue incrementing normally from 1
-        sm.send(target, msg()).await.unwrap();
-        assert_eq!(sm.session_id(), 2);
-        assert_eq!(
-            sm.reboot_flag(),
-            RebootFlag::Continuous,
-            "reboot flag stays Continuous after wrap"
-        );
     }
 
     // `send_e2e_protected_payload_exceeding_udp_buffer_returns_capacity_error`
